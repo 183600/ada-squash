@@ -33,7 +33,7 @@ from adasquash import (
 ABLATIONS = {
     # ---- Per-channel ----
     "dyt_no_perchannel": dict(norm="dyt"),
-    "dytc_no_perchannel": dict(norm="dytcd", learnable_p=False, alpha_init=0.0),
+    "dytc_no_perchannel": dict(norm="dytc", learnable_p=False),
     "dytcd_full": dict(norm="dytcd"),
     # ---- Depth-cond ----
     "dyt_no_depth": dict(norm="dyt"),

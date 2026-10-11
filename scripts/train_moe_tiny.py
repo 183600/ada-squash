@@ -91,12 +91,14 @@ class MoELayer(nn.Module):
         y = self.drop(y)
         y = y.view(B, T, C)
 
-        # Load balancing auxiliary loss
-        # mean tokens-per-expert
+        # Load balancing auxiliary loss (Switch Transformer style):
+        # aux = n_experts * sum_i(f_i * P_i) where f_i is the fraction of
+        # tokens routed to expert i and P_i is the mean router probability.
         tokens_per_expert = route.sum(0)  # [E]
-        avg = tokens_per_expert.mean()
-        # standard MoE aux loss
-        aux = (route.mean(0) * (route.mean(0) / (route.sum(0) / avg + 1e-6))).sum() * self.n_experts
+        n_tokens = x_flat.shape[0]
+        f_i = tokens_per_expert / n_tokens
+        p_i = logits.softmax(-1).mean(dim=0)
+        aux = self.n_experts * (f_i * p_i).sum()
         return y, aux, tokens_per_expert.detach()
 
 

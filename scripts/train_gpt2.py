@@ -206,6 +206,7 @@ def main():
     depth_override = os.environ.get("ADASQUASH_DEPTH_OVERRIDE")
     if depth_override:
         new_depth = int(depth_override)
+        args._depth_override = new_depth
         print(f"[depth-override] {model.cfg.n_layers} -> {new_depth}")
         # Rebuild with the new depth, keeping the rest of the config.
         cfg_dict = {k: getattr(model.cfg, k) for k in vars(model.cfg)}

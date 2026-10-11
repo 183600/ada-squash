@@ -176,9 +176,12 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
-    # freqs_cis: [T, hd//2] -> broadcast to [1,1,T,hd]
-    cos = freqs_cis.cos().unsqueeze(0).unsqueeze(0)
-    sin = freqs_cis.sin().unsqueeze(0).unsqueeze(0)
+    # freqs_cis: [T, hd//2] complex (exp(i*theta)); take real/imag as the
+    # rotation factors and expand to [T, hd] to match the head dim.
+    cos = freqs_cis.real
+    sin = freqs_cis.imag
+    cos = torch.cat([cos, cos], dim=-1).unsqueeze(0).unsqueeze(0)
+    sin = torch.cat([sin, sin], dim=-1).unsqueeze(0).unsqueeze(0)
     q_d = q.float()
     k_d = k.float()
     q_out = (q_d * cos) + (rotate_half(q_d) * sin)

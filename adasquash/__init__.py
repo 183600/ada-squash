@@ -20,7 +20,7 @@ from .norms import (
     NORM_REGISTRY,
 )
 from .attention import CausalSelfAttention
-from .model import GPTConfig, GPT, LayerConfig
+from .model import GPTConfig, GPT, LayerConfig, build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 from .utils import (
     ActivationStats,
     LossSpikeCounter,
@@ -44,6 +44,9 @@ __all__ = [
     "GPTConfig",
     "GPT",
     "LayerConfig",
+    "build_gpt_124m",
+    "build_gpt_350m",
+    "build_llama_tiny_1b",
     "ActivationStats",
     "LossSpikeCounter",
     "KurtosisMeter",
