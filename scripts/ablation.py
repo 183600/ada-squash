@@ -32,28 +32,28 @@ from adasquash import (
 
 ABLATIONS = {
     # ---- Per-channel ----
-    "dyt_no_perchannel": dict(norm="dyt"),
-    "dytc_no_perchannel": dict(norm="dytc", learnable_p=False),
-    "dytcd_full": dict(norm="dytcd"),
+    "dyt_no_perchannel": dict(norm_name="dyt"),
+    "dytc_no_perchannel": dict(norm_name="dytc", learnable_p=False),
+    "dytcd_perchannel_ref": dict(norm_name="dytcd"),
     # ---- Depth-cond ----
-    "dyt_no_depth": dict(norm="dyt"),
-    "dytd_k0": dict(norm="dytd", k_init=0.0),
-    "dytd_full": dict(norm="dytd"),
-    "dytcd_full": dict(norm="dytcd"),
+    "dyt_no_depth": dict(norm_name="dyt"),
+    "dytd_k0": dict(norm_name="dytd", k_init=0.0),
+    "dytd_full": dict(norm_name="dytd"),
+    "dytcd_full": dict(norm_name="dytcd"),
     # ---- LayerScale ----
-    "dytcd_no_ls": dict(norm="dytcd", use_layerscale=False),
-    "dytcd_ls1e5": dict(norm="dytcd", layerscale_init=1e-5),
-    "dytcd_ls1e3": dict(norm="dytcd", layerscale_init=1e-3),
+    "dytcd_no_ls": dict(norm_name="dytcd", use_layerscale=False),
+    "dytcd_ls1e5": dict(norm_name="dytcd", layerscale_init=1e-5),
+    "dytcd_ls1e3": dict(norm_name="dytcd", layerscale_init=1e-3),
     # ---- tanh vs softsign family ----
-    "dytc_p1_softsign": dict(norm="dytc", p_init=1.0, learnable_p=False),
-    "dytc_p2_softsign": dict(norm="dytc", p_init=2.0, learnable_p=False),
-    "dytc_p4_softsign": dict(norm="dytc", p_init=4.0, learnable_p=False),
-    "dytc_plearnable": dict(norm="dytc", p_init=2.0, learnable_p=True),
-    "dytc_tanh_eq": dict(norm="dytc", p_init=64.0, learnable_p=False),  # p->inf == tanh
+    "dytc_p1_softsign": dict(norm_name="dytc", p_init=1.0, learnable_p=False),
+    "dytc_p2_softsign": dict(norm_name="dytc", p_init=2.0, learnable_p=False),
+    "dytc_p4_softsign": dict(norm_name="dytc", p_init=4.0, learnable_p=False),
+    "dytc_plearnable": dict(norm_name="dytc", p_init=2.0, learnable_p=True),
+    "dytc_tanh_eq": dict(norm_name="dytc", p_init=64.0, learnable_p=False),  # p->inf == tanh
     # ---- alpha init grid ----
-    "dyt_alpha_0.3": dict(norm="dyt", alpha_init=0.3),
-    "dyt_alpha_0.5": dict(norm="dyt", alpha_init=0.5),
-    "dyt_alpha_1.0": dict(norm="dyt", alpha_init=1.0),
+    "dyt_alpha_0.3": dict(norm_name="dyt", alpha_init=0.3),
+    "dyt_alpha_0.5": dict(norm_name="dyt", alpha_init=0.5),
+    "dyt_alpha_1.0": dict(norm_name="dyt", alpha_init=1.0),
 }
 
 
@@ -62,6 +62,10 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Seed the global RNG *before* building the model so every ablation
+    # starts from a reproducible initialization; otherwise the weight-init
+    # stream advances across runs and the norm comparison is confounded.
+    torch.manual_seed(args.seed)
     model = build_gpt_124m(**cfg_kwargs)
     model.to(device)
     n_params = count_parameters(model)
@@ -104,7 +108,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
         "n_params": n_params,
         "n_spikes": loss_spike.n_spikes,
         "final_loss": losses[-1],
-        "mean_last_100_loss": sum(losses[-100:]) / 100,
+        "mean_last_100_loss": sum(losses[-100:]) / max(1, len(losses[-100:])),
         "max_abs_summary": stats.get("__summary__", {}).get("max_max_abs", 0.0),
         "mean_kurtosis": stats.get("__summary__", {}).get("mean_kurtosis", 0.0),
         "elapsed_s": time.time() - t0,

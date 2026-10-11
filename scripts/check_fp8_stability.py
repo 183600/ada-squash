@@ -36,6 +36,19 @@ from adasquash.model import build_gpt_124m
 # ---------------------------------------------------------------------------
 # FP8 simulation
 # ---------------------------------------------------------------------------
+def fp8_min_normal(exp_bits: int) -> float:
+    """Smallest *normal* (non-subnormal) magnitude representable in an FP
+    format with `exp_bits` exponent bits.
+
+    The exponent bias is ``2**(exp_bits-1) - 1`` and normal exponents start
+    at 1, so the smallest normal magnitude is ``2**(1 - bias)``:
+
+    E4M3 (exp_bits=4) -> 2**-6  = 0.015625
+    E5M2 (exp_bits=5) -> 2**-14 = 6.103515625e-05
+    """
+    return 2.0 ** (1 - (2 ** (exp_bits - 1) - 1))
+
+
 def to_fp8_e4m3(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
     """Simulate per-tensor FP8-E4M3 quantization. Range: ±448."""
     return simulate_fp8(x, max_val=448.0, exp_bits=4, mantissa_bits=3)
@@ -55,7 +68,7 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     x_clamped = x.clamp(-max_val, max_val)
     # Round to the nearest mantissa increment (very rough).
     # Smallest normal magnitude:
-    min_norm = 2.0 ** (-(2 ** (exp_bits - 1)) + 2)
+    min_norm = fp8_min_normal(exp_bits)
     # Subnormal regime: we treat anything below min_norm as flush-to-zero
     # (matching FP8 hardware behaviour on most training cards).
     flushed = torch.where(x_clamped.abs() < min_norm, torch.zeros_like(x_clamped), x_clamped)
@@ -76,30 +89,18 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
 
 
 def measure_fp8_divergence(model, x, norm_name: str):
-    """Return dict with divergence stats for the model in fp8 vs bf16."""
-    device = x.device
-    # Reference forward in fp32
-    with torch.no_grad():
-        ref_out, _ = model(x.to(torch.float32), return_stats=False) if model.cfg.dim else model(x)
-    ref_max = ref_out.abs().max().item()
+    """Return dict with FP8-E4M3 quantization-stability stats per norm.
 
-    # FP8-simulated forward: quantize every linear's input and every norm's
-    # input to FP8-E4M3.
+    Note `x` holds *token ids*, so it must stay an integer tensor - casting
+    it to float breaks the embedding lookup. The model itself already runs
+    in fp32, so a single hooked forward is enough.
+    """
+    # Measure the quantization error introduced by FP8-E4M3 on every
+    # normalization layer's output, which is where the low-precision
+    # activation traffic actually bites.
     handles = []
-    norm_inputs = []
-
-    def _hook(module, inp, out):
-        for i in inp:
-            if isinstance(i, torch.Tensor) and i.is_floating_point():
-                # We replace inputs *in place* via this hack: store the
-                # quantized version on a side-channel; we'll re-run the
-                # forward.
-                pass
-
-    # Simpler approach: just measure on the *intermediate* activations
-    # after the norm, since that's where the FP8 quantization actually
-    # bites. We use forward hooks to compute the quantization error.
     quant_errors = []
+    fp8_e4m3_min = fp8_min_normal(4)
 
     def make_q_hook():
         def hook(module, inp, out):
@@ -110,7 +111,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
                 "module": module.__class__.__name__,
                 "max_abs": out.abs().max().item(),
                 "overflow_rate": (out.abs() > 448).float().mean().item(),
-                "underflow_rate": (out.abs() < 2 ** -(2 ** 3 - 1) + 2).float().mean().item() if out.numel() else 0.0,
+                "underflow_rate": (out.abs() < fp8_e4m3_min).float().mean().item() if out.numel() else 0.0,
                 "rel_err": rel_err,
             })
         return hook
@@ -161,6 +162,10 @@ def main():
 
     results = []
     for norm in args.norms:
+        # Re-seed per norm: otherwise every norm gets a different random
+        # init and the overflow/underflow comparison is confounded by
+        # initialization noise.
+        torch.manual_seed(args.seed)
         model = build_gpt_124m(norm_name=norm).to(device)
         model.eval()
         x = torch.randint(0, model.cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)

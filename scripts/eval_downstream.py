@@ -92,6 +92,9 @@ def needle_in_haystack(
     A minimal needle-in-a-haystack test. We insert `needle` at a random
     position in a long stream of `haystack_prompt` repeats, then ask the
     model to recite the secret. Returns accuracy.
+
+    The expected answer is derived from `needle` itself (its final token /
+    number), so a custom secret passed via `--secret` is actually scored.
     """
     import random
     tok = tokenizer
@@ -99,7 +102,14 @@ def needle_in_haystack(
     prompt_ids = tok(haystack_prompt, add_special_tokens=False)["input_ids"]
     question_ids = tok("\n\nWhat is the magic number? The magic number is", add_special_tokens=False)["input_ids"]
 
+    # The secret to recite is the last whitespace-separated chunk of the
+    # needle with trailing punctuation stripped ("... is 12345." -> "12345").
+    secret = needle.strip().rstrip(".!?").split()
+    secret = secret[-1] if secret else ""
+    target_ids = tok(" " + secret, add_special_tokens=False)["input_ids"] if secret else []
+
     n_correct = 0
+    n_run = 0
     for _ in range(n_trials):
         body_len = context_len - len(needle_ids) - len(question_ids) - 2
         if body_len < len(prompt_ids):
@@ -112,12 +122,14 @@ def needle_in_haystack(
         x = torch.tensor(full, device=device).unsqueeze(0)
         with torch.no_grad():
             logits, _ = model(x)
-        # greedy decode next token, check if it's " 12345"
+        n_run += 1
+        # greedy decode next token, check if it starts the secret
         next_id = int(logits[0, -1].argmax(-1).item())
-        target_ids = tok(" 12345", add_special_tokens=False)["input_ids"]
         if target_ids and next_id == target_ids[0]:
             n_correct += 1
-    return n_correct / max(1, n_trials)
+    if n_run == 0:
+        return 0.0
+    return n_correct / n_run
 
 
 def main():

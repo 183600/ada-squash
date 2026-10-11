@@ -61,6 +61,43 @@ class GPTConfig:
 
 
 # ---------------------------------------------------------------------------
+# Norm-construction helpers
+# ---------------------------------------------------------------------------
+def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
+    """Collect the kwargs a given `norm_name` accepts from a GPTConfig.
+
+    The result is passed to `build_norm`, which forwards it to the class
+    constructor; norms that do not declare one of these kwargs (LN, RMSNorm,
+    plain DyT) simply ignore the extras only when they are not supplied, so
+    each family gets exactly the subset it supports.
+
+    Using one helper for the blocks *and* the final norm guarantees that a
+    configured hyper-parameter (alpha_init / alpha_0 / k_init / p_init) is
+    honoured everywhere, instead of silently reverting to the class default
+    on `norm_f`.
+    """
+    kwargs: dict = {}
+    if cfg.norm_name in ("dytd", "dytcd"):
+        kwargs = dict(
+            layer_idx=layer_idx,
+            num_layers=cfg.n_layers,
+            alpha_0=cfg.alpha_0,
+            k_init=cfg.k_init,
+            learnable_k=cfg.learnable_k,
+        )
+    if cfg.norm_name == "dytcd":
+        kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p)
+    if cfg.norm_name == "dytc":
+        kwargs.update(
+            p_init=cfg.p_init, learnable_p=cfg.learnable_p,
+            alpha_init=cfg.alpha_init,
+        )
+    if cfg.norm_name == "dyt":
+        kwargs.update(alpha_init=cfg.alpha_init)
+    return kwargs
+
+
+# ---------------------------------------------------------------------------
 # Block
 # ---------------------------------------------------------------------------
 class Block(nn.Module):
@@ -79,26 +116,7 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
         # Note: norm_kwargs only used by DyT-D / DyT-CD; other norms ignore
         # the extra kwargs silently.
-        norm_kwargs = {}
-        if cfg.norm_name in ("dytd", "dytcd"):
-            norm_kwargs = dict(
-                layer_idx=layer_idx,
-                num_layers=cfg.n_layers,
-                alpha_0=cfg.alpha_0,
-                k_init=cfg.k_init,
-                learnable_k=cfg.learnable_k,
-            )
-        if cfg.norm_name == "dytcd":
-            norm_kwargs.update(
-                p_init=cfg.p_init, learnable_p=cfg.learnable_p,
-            )
-        if cfg.norm_name == "dytc":
-            norm_kwargs.update(
-                p_init=cfg.p_init, learnable_p=cfg.learnable_p,
-                alpha_init=cfg.alpha_init,
-            )
-        if cfg.norm_name == "dyt":
-            norm_kwargs.update(dict(alpha_init=cfg.alpha_init))
+        norm_kwargs = build_norm_kwargs(cfg, layer_idx)
 
         self.norm1 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)
         self.attn = CausalSelfAttention(
@@ -184,7 +202,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [Block(cfg, i) for i in range(cfg.n_layers)]
         )
-        self.norm_f = build_norm(cfg.norm_name, cfg.dim)
+        self.norm_f = build_norm(cfg.norm_name, cfg.dim, **build_norm_kwargs(cfg, 0))
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
@@ -317,6 +335,7 @@ __all__ = [
     "Block",
     "MLP",
     "GPT",
+    "build_norm_kwargs",
     "build_gpt_124m",
     "build_gpt_350m",
     "build_llama_tiny_1b",

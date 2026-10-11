@@ -32,7 +32,7 @@ from torch.optim import AdamW
 
 from adasquash import build_norm
 from adasquash.attention import CausalSelfAttention
-from adasquash.model import GPTConfig
+from adasquash.model import GPTConfig, build_norm_kwargs
 from adasquash.utils import (
     ActivationStats, LossSpikeCounter, count_parameters,
 )
@@ -80,12 +80,13 @@ class MoELayer(nn.Module):
         route = torch.zeros_like(logits).scatter_(-1, indices, scores)
         # Expert computation (vectorized: all experts evaluated, gated by
         # routing matrix - this is correct but not optimized; for real
-        # benchmarks use Megablocks-style grouped GEMM)
-        x_e = x_flat.unsqueeze(1)  # [N, 1, C]
-        h1 = F.linear(x_e, self.experts_w1)  # [N, E, H]
-        h3 = F.linear(x_e, self.experts_w3)
+        # benchmarks use Megablocks-style grouped GEMM).
+        # `einsum` (not `F.linear`): the stacked expert weights are 3-D, so
+        # each token must be applied to every expert explicitly.
+        h1 = torch.einsum("nc,ech->neh", x_flat, self.experts_w1)  # [N, E, H]
+        h3 = torch.einsum("nc,ech->neh", x_flat, self.experts_w3)  # [N, E, H]
         h = F.silu(h1) * h3  # [N, E, H]
-        y_e = F.linear(h, self.experts_w2)  # [N, E, C]
+        y_e = torch.einsum("neh,ehc->nec", h, self.experts_w2)  # [N, E, C]
         # Apply routing weights
         y = (y_e * route.unsqueeze(-1)).sum(dim=1)  # [N, C]
         y = self.drop(y)
@@ -106,18 +107,7 @@ class MoEBlock(nn.Module):
     def __init__(self, cfg: GPTConfig, n_experts: int, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        norm_kwargs = {}
-        if cfg.norm_name in ("dytd", "dytcd"):
-            norm_kwargs = dict(layer_idx=layer_idx, num_layers=cfg.n_layers,
-                               alpha_0=cfg.alpha_0, k_init=cfg.k_init,
-                               learnable_k=cfg.learnable_k)
-        if cfg.norm_name == "dytcd":
-            norm_kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p)
-        if cfg.norm_name == "dytc":
-            norm_kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p,
-                               alpha_init=cfg.alpha_init)
-        if cfg.norm_name == "dyt":
-            norm_kwargs.update(alpha_init=cfg.alpha_init)
+        norm_kwargs = build_norm_kwargs(cfg, layer_idx)
 
         self.norm1 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)
         self.attn = CausalSelfAttention(cfg.dim, cfg.n_heads,
@@ -154,7 +144,7 @@ class MoEGPT(nn.Module):
         self.blocks = nn.ModuleList(
             [MoEBlock(cfg, n_experts, i) for i in range(cfg.n_layers)]
         )
-        self.norm_f = build_norm(cfg.norm_name, cfg.dim)
+        self.norm_f = build_norm(cfg.norm_name, cfg.dim, **build_norm_kwargs(cfg, 0))
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight

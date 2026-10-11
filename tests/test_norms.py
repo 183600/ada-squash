@@ -70,8 +70,10 @@ def test_norm_preserves_shape_and_dtype(name):
 @pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"])
 def test_norm_gradient_flows(name):
     norm = build_norm(name, 64)
-    x = torch.randn(2, 16, 64, requires_grad=True) * 3.0
-    y = norm(x)
+    # `x` must stay the *leaf* of the graph, otherwise `x.grad` is always
+    # None (the gradient would land on the pre-multiplication tensor).
+    x = torch.randn(2, 16, 64, requires_grad=True)
+    y = norm(x * 3.0)
     loss = y.pow(2).sum()
     loss.backward()
     assert x.grad is not None
@@ -125,16 +127,22 @@ def test_dytcd_alpha_per_channel_shape():
 # ---------------------------------------------------------------------------
 def test_qk_squash_keeps_logits_bounded():
     bs = 2
-    q = torch.randn(bs, 4, 16, 64) * 50
-    k = torch.randn(bs, 4, 16, 64) * 50
+    head_dim = 64
+    q = torch.randn(bs, 4, 16, head_dim) * 50
+    k = torch.randn(bs, 4, 16, head_dim) * 50
     squash = QKSquash()
     q2, k2 = squash(q, k)
-    # after squashing, max abs is 1
+    # tanh bounds every element of Q' / K' to [-1, 1]
     assert q2.abs().max().item() <= 1.0 + 1e-4
     assert k2.abs().max().item() <= 1.0 + 1e-4
-    logits = (q2 @ k2.transpose(-1, -2)) / math.sqrt(64)
-    # logits should be in [-1, 1]
-    assert logits.abs().max().item() <= 1.0 + 1e-4
+    # The pre-scale dot product is therefore bounded by head_dim, so the
+    # scaled logits are bounded by sqrt(head_dim) - independent of the
+    # (here 50x) input magnitude. This is the "logit explosion" guarantee.
+    logits = (q2 @ k2.transpose(-1, -2)) / math.sqrt(head_dim)
+    assert logits.abs().max().item() <= math.sqrt(head_dim) + 1e-4
+    # ... and strictly smaller than the unsquashed logits would be.
+    logits_raw = (q @ k.transpose(-1, -2)) / math.sqrt(head_dim)
+    assert logits.abs().max().item() < logits_raw.abs().max().item()
 
 
 # ---------------------------------------------------------------------------
