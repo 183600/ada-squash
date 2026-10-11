@@ -1,0 +1,27 @@
+# GPT-2 124M, RMSNorm baseline (LLaMA-style)
+model: gpt2-124m
+norm: rmsnorm
+qk_norm: null
+use_layerscale: false
+
+dataset: HuggingFaceFW/fineweb-edu
+dataset_config: sample-10BT
+tokenizer: gpt2
+seq_len: 1024
+batch_size: 32
+grad_accum: 4
+
+max_steps: 10000
+lr: 6.0e-4
+min_lr_ratio: 0.1
+warmup: 500
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+bf16: true
+
+output_dir: runs/gpt2-124m-rmsnorm
+log_every: 20
+stats_every: 500
+save_every: 2000

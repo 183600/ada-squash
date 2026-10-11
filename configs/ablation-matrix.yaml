@@ -1,0 +1,82 @@
+# Ablation matrix for DyT++ component study
+# Used by: python scripts/ablation.py
+model: gpt2-124m
+
+# Synthetic random-token data for cheap stability tests
+batch_size: 8
+seq_len: 512
+max_steps: 1000
+lr: 6.0e-4
+seed: 42
+
+log_every: 50
+stats_every: 200
+output_dir: runs/ablation
+
+# Each entry below is one ablation; the script iterates over these and
+# writes one summary.json per row.
+ablations:
+  # ---- Per-channel on/off ----
+  - name: dyt_no_perchannel
+    norm: dyt
+  - name: dytc_perchannel
+    norm: dytc
+    p_init: 2.0
+    learnable_p: false
+  - name: dytcd_full
+    norm: dytcd
+
+  # ---- Depth conditioning ----
+  - name: dyt_no_depth
+    norm: dyt
+  - name: dytd_k0_no_depth_schedule
+    norm: dytd
+    k_init: 0.0
+  - name: dytd_full
+    norm: dytd
+  - name: dytcd_full
+    norm: dytcd
+
+  # ---- LayerScale init ----
+  - name: dytcd_no_ls
+    norm: dytcd
+    use_layerscale: false
+  - name: dytcd_ls_1e5
+    norm: dytcd
+    layerscale_init: 1.0e-5
+  - name: dytcd_ls_1e3
+    norm: dytcd
+    layerscale_init: 1.0e-3
+
+  # ---- tanh vs softsign family ----
+  - name: dytc_p1_softsign
+    norm: dytc
+    p_init: 1.0
+    learnable_p: false
+  - name: dytc_p2_softsign
+    norm: dytc
+    p_init: 2.0
+    learnable_p: false
+  - name: dytc_p4_softsign
+    norm: dytc
+    p_init: 4.0
+    learnable_p: false
+  - name: dytc_plearnable
+    norm: dytc
+    p_init: 2.0
+    learnable_p: true
+  - name: dytc_tanh_eq_p64
+    norm: dytc
+    p_init: 64.0
+    learnable_p: false
+
+  # ---- alpha init ----
+  - name: dyt_alpha_0p3
+    norm: dyt
+    alpha_init: 0.3
+  - name: dyt_alpha_0p5
+    norm: dyt
+    alpha_init: 0.5
+  - name: dyt_alpha_1p0
+    norm: dyt
+    alpha_init: 1.0

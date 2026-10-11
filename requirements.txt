@@ -1,0 +1,21 @@
+# DyT++ / AdaSquash - Python dependencies
+# Tested with Python 3.10+
+
+# Core
+torch>=2.1.0
+numpy>=1.24
+
+# Data & tokenization
+datasets>=2.14
+transformers>=4.36
+tokenizers>=0.15
+
+# Logging
+tensorboard>=2.14
+wandb>=0.16
+
+# Optional: downstream eval
+# lm-eval>=0.4
+
+# Testing
+pytest>=7.0
