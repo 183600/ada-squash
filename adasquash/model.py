@@ -179,7 +179,9 @@ class MLP(nn.Module):
         # swiglu
         h1 = self.w1(x)
         h3 = self.w3(x)
-        return self.drop(self.w2(F.silu(h1) * h3))
+        h = F.silu(h1)
+        h.mul_(h3)
+        return self.drop(self.w2(h))
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +217,11 @@ class GPT(nn.Module):
         else:
             self.freqs_cis = None
 
+        # Pre-computed position ids for non-rotary mode
+        self.register_buffer(
+            "_pos_ids", torch.arange(cfg.max_seq_len), persistent=False
+        )
+
     def _init_weights(self, m: nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
@@ -243,7 +250,7 @@ class GPT(nn.Module):
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
-            pos = torch.arange(0, T, device=input_ids.device).unsqueeze(0)
+            pos = self._pos_ids[:T].unsqueeze(0)
             x.add_(self.pos_emb(pos))
         x = self.drop(x)
 

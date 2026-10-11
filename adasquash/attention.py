@@ -44,7 +44,6 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // n_heads
         self.dim = dim
         self.qk_norm = qk_norm
-        self._causal_mask: Optional[torch.Tensor] = None
         self._rope_cache: Optional[tuple] = None
 
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
@@ -104,14 +103,18 @@ class CausalSelfAttention(nn.Module):
             q, k = apply_rope(q, k, freqs_cis, cos, sin)
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        logits = torch.matmul(q, k.transpose(-1, -2))
-        logits.mul_(scale)
 
         # logit monitoring (useful for the QK-squash ablation). Monitoring
         # only; disabled by default.
         stats = {}
         if return_stats:
             with torch.no_grad():
+                logits = torch.matmul(q, k.transpose(-1, -2))
+                logits.mul_(scale)
+                causal_mask = torch.triu(
+                    torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+                )
+                logits = logits.masked_fill_(causal_mask, float("-inf"))
                 abs_logits = logits.abs()
                 logit_abs_mean = abs_logits.mean().item()
                 logit_abs_max = abs_logits.amax(dim=-1).mean().item()
@@ -122,22 +125,15 @@ class CausalSelfAttention(nn.Module):
                 "logit_std": logit_std,
             }
 
-        # causal mask
-        causal_mask = self._causal_mask
-        if (
-            causal_mask is None
-            or causal_mask.shape[0] != T
-            or causal_mask.device != x.device
-        ):
-            causal_mask = torch.triu(
-                torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
-            )
-            self._causal_mask = causal_mask
-        logits = logits.masked_fill_(causal_mask, float("-inf"))
-        probs = F.softmax(logits, dim=-1)
-        probs = self.attn_drop(probs)
-
-        out = torch.matmul(probs, v)  # [B, H, T, hd]
+        # Use SDPA for memory-efficient attention (FlashAttention / mem-efficient).
+        # is_causal=True is mathematically equivalent to the manual triu mask
+        # and lets SDPA pick the most efficient fused kernel.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            scale=scale,
+        )
         out = out.transpose(1, 2).reshape(B, T, C)
         out = self.proj_drop(self.proj(out))
         return out, stats
