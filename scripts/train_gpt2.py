@@ -77,8 +77,17 @@ def build_dataloader(
             self.buf: list = []
 
         def __iter__(self):
+            # Shard the document stream across DataLoader workers. With
+            # num_workers > 1 every worker otherwise re-iterates the *same*
+            # streaming dataset from the start, so each batch would be
+            # duplicated across workers (halving the unique tokens/step).
+            worker_info = torch.utils.data.get_worker_info()
+            worker_id = worker_info.id if worker_info is not None else 0
+            n_workers = worker_info.num_workers if worker_info is not None else 1
             buf = self.buf
-            for ex in self.ds:
+            for i, ex in enumerate(self.ds):
+                if i % n_workers != worker_id:
+                    continue
                 ids = self.tok(ex.get("text", ""), add_special_tokens=False)["input_ids"]
                 buf.extend(ids)
                 buf.append(self.tok.eos_token_id)

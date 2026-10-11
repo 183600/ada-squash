@@ -86,7 +86,9 @@ def compute_ce_sum(model, batch, target, device="cuda"):
 
     Returning the raw sum lets several probe batches be pooled into a
     single PPL estimate - averaging per-batch PPLs would weight every
-    batch equally regardless of its token count.
+    batch equally regardless of its token count. Padding targets are
+    masked exactly like training (ignore_index), so the padded final
+    position does not inflate the PPL, and only valid tokens are counted.
     """
     model.eval()
     batch = batch.to(device)
@@ -97,8 +99,10 @@ def compute_ce_sum(model, batch, target, device="cuda"):
         logits.view(-1, logits.size(-1)),
         target.view(-1),
         reduction="sum",
+        ignore_index=model.cfg.pad_token_id,
     )
-    return ce.item(), target.numel()
+    n = (target != model.cfg.pad_token_id).sum().item()
+    return ce.item(), n
 
 
 def compute_ppl(model, batch, target, device="cuda"):

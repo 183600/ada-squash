@@ -77,10 +77,12 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     # Compute exponent
     exp = torch.floor(torch.log2(abs_x.clamp(min=1e-30)))
     exp = exp.clamp(max=torch.log2(torch.tensor(max_val)).item())
-    # Round the mantissa
+    # Round the mantissa on the true IEEE grid: with `mantissa_bits`
+    # explicit bits there are 2^mantissa_bits uniformly spaced values in
+    # [1, 2), i.e. a step of 2^-mantissa_bits (E4M3: 1/8, E5M2: 1/4).
     mant = abs_x / (2.0 ** exp)  # in [1, 2)
     levels = 2 ** mantissa_bits
-    mant_q = torch.round((mant - 1.0) * (levels - 1)) / (levels - 1) + 1.0
+    mant_q = torch.round((mant - 1.0) * levels) / levels + 1.0
     quant = sign * mant_q * (2.0 ** exp)
     # Restore zero where flushed
     quant = torch.where(flushed == 0, torch.zeros_like(quant), quant)

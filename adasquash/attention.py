@@ -111,14 +111,21 @@ class CausalSelfAttention(nn.Module):
             with torch.no_grad():
                 logits = torch.matmul(q, k.transpose(-1, -2))
                 logits.mul_(scale)
+                # Keep only the causal-visible (finite) logits for the
+                # statistics; the -inf masked entries would otherwise make
+                # every aggregate (mean/max/std) inf/nan.
                 causal_mask = torch.triu(
                     torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
                 )
-                logits = logits.masked_fill_(causal_mask, float("-inf"))
-                abs_logits = logits.abs()
-                logit_abs_mean = abs_logits.mean().item()
-                logit_abs_max = abs_logits.amax(dim=-1).mean().item()
-                logit_std = logits.std(dim=-1).mean().item()
+                valid = logits.masked_fill(causal_mask, float("-inf"))
+                valid = valid[valid != float("-inf")]
+                if valid.numel():
+                    abs_logits = valid.abs()
+                    logit_abs_mean = abs_logits.mean().item()
+                    logit_abs_max = abs_logits.amax().item()
+                    logit_std = valid.std().item()
+                else:
+                    logit_abs_mean = logit_abs_max = logit_std = 0.0
             stats = {
                 "logit_abs_mean": logit_abs_mean,
                 "logit_abs_max": logit_abs_max,
