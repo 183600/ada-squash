@@ -233,7 +233,7 @@ All training scripts log:
 @misc{adasquash2026,
   title  = {DyT++: Adaptive Squashing without Statistics for Ultra-Deep and
             Low-Precision Transformers},
-  author = {AdaSquash Team},
+  author = {Zhong Wenjia},
   year   = {2026},
   url    = {https://gitee.com/qwe12345678/ada-squash}
 }
