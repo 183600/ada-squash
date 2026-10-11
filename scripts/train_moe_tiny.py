@@ -230,7 +230,9 @@ def main():
         y = torch.cat([x[:, 1:], torch.zeros(args.batch_size, 1, dtype=torch.long, device=device)], dim=1)
         if step % args.stats_every == 0:
             act_stats.attach()
-        _, loss, aux, tpe_list = model(x, y, return_aux=True)
+        logits, loss, aux, tpe_list = model(x, y, return_aux=True)
+        # Not needed by the CE backward; free it while grads compute.
+        del logits
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()

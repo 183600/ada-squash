@@ -49,6 +49,10 @@ class CausalSelfAttention(nn.Module):
         # Causal-mask cache (keyed by length); avoids re-allocating the
         # [T, T] mask on every layer / every step.
         self._causal_mask: Optional[torch.Tensor] = None
+        # RoPE cos/sin cache (keyed by length / device / dtype): the
+        # [T, hd//2] -> [1, 1, T, hd] expansion is identical for every
+        # layer, so build it once per module instead of once per step.
+        self._rope_cache: Optional[tuple] = None
 
         # Fused QKV projection (LLaMA-style fused QKV is even better, but
         # plain concatenation keeps the code obvious).
@@ -105,7 +109,8 @@ class CausalSelfAttention(nn.Module):
             q, k = self.q_squash(q, k)
 
         if freqs_cis is not None:
-            q, k = apply_rope(q, k, freqs_cis)
+            cos, sin = self._rope_tables(freqs_cis)
+            q, k = apply_rope(q, k, freqs_cis, cos, sin)
 
         scale = 1.0 / math.sqrt(self.head_dim)
         logits = torch.matmul(q, k.transpose(-1, -2))
@@ -150,6 +155,24 @@ class CausalSelfAttention(nn.Module):
         out = self.proj_drop(self.proj(out))
         return out, stats
 
+    def _rope_tables(self, freqs_cis: torch.Tensor):
+        """Return the expanded (cos, sin) rotary tables, cached per
+        (length, device, dtype). The tables never require grad, so the cache
+        is a plain attribute and does not show up in the state dict."""
+        key = (freqs_cis.shape[0], freqs_cis.device, freqs_cis.dtype)
+        cache = self._rope_cache
+        if cache is None or cache[0] != key:
+            # freqs_cis: [T, hd//2] complex (exp(i*theta)); take real/imag as
+            # the rotation factors and expand to [T, hd] to match the head
+            # dim, then broadcast-shape them to [1, 1, T, hd].
+            cos = torch.cat([freqs_cis.real, freqs_cis.real], dim=-1)
+            sin = torch.cat([freqs_cis.imag, freqs_cis.imag], dim=-1)
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+            cache = (key, cos, sin)
+            self._rope_cache = cache
+        return cache[1], cache[2]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -165,27 +188,49 @@ class RMSNormHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        # In-place scale by the per-channel weight: `x` is a fresh
-        # intermediate, so this avoids materializing another [.., C] tensor.
-        return x.mul_(self.weight)
+        # Out-of-place on purpose: the weight requires grad, so an in-place
+        # `mul_` would force autograd to snapshot (clone) the pre-mul tensor
+        # for the grad-weight term. The out-of-place form just references the
+        # existing intermediate instead of copying it.
+        return x * self.weight
 
 
-def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor):
-    """Apply rotary positional embeddings. q,k: [B,H,T,hd]."""
+def apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    cos: Optional[torch.Tensor] = None,
+    sin: Optional[torch.Tensor] = None,
+):
+    """Apply rotary positional embeddings. q,k: [B,H,T,hd].
+
+    `cos`/`sin` may be passed pre-expanded ([1,1,T,hd]); otherwise they are
+    derived from `freqs_cis` on the fly.
+    """
     def rotate_half(x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
     # freqs_cis: [T, hd//2] complex (exp(i*theta)); take real/imag as the
     # rotation factors and expand to [T, hd] to match the head dim.
-    cos = freqs_cis.real
-    sin = freqs_cis.imag
-    cos = torch.cat([cos, cos], dim=-1).unsqueeze(0).unsqueeze(0)
-    sin = torch.cat([sin, sin], dim=-1).unsqueeze(0).unsqueeze(0)
+    if cos is None or sin is None:
+        cos = freqs_cis.real
+        sin = freqs_cis.imag
+        cos = torch.cat([cos, cos], dim=-1).unsqueeze(0).unsqueeze(0)
+        sin = torch.cat([sin, sin], dim=-1).unsqueeze(0).unsqueeze(0)
     q_d = q.float()
     k_d = k.float()
-    q_out = (q_d * cos) + (rotate_half(q_d) * sin)
-    k_out = (k_d * cos) + (rotate_half(k_d) * sin)
+    # Accumulate into the freshly allocated `q_d * cos` buffer instead of
+    # materializing (q*cos), (rot*sin) and their sum separately: same
+    # elementwise order, ~half the temporary [B,H,T,hd] fp32 traffic.
+    q_out = q_d * cos
+    rot = rotate_half(q_d)
+    rot.mul_(sin)
+    q_out.add_(rot)
+    k_out = k_d * cos
+    rot = rotate_half(k_d)
+    rot.mul_(sin)
+    k_out.add_(rot)
     return q_out.to(q.dtype), k_out.to(k.dtype)
 
 

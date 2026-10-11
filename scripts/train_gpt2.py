@@ -274,7 +274,11 @@ def main():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             with ctx:
-                _, loss = model(x, y)
+                logits, loss = model(x, y)
+            # The [B, T, V] logits are not needed by the CE backward (only
+            # the saved log-probs are), so drop them before backprop to free
+            # a few GB of activation memory while grads are being computed.
+            del logits
             loss = loss / args.grad_accum
             loss.backward()
             # Accumulate the scalar on-device and sync once at the end of

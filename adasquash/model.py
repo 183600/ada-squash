@@ -125,22 +125,26 @@ class Block(nn.Module):
         freqs_cis: Optional[torch.Tensor] = None,
         return_stats: bool = False,
     ):
-        # Pre-norm style
+        # Pre-norm style. The residual sum is accumulated into the *fresh*
+        # branch tensor (x + ls*out == ls*out + x, bitwise identical for
+        # finite values), which avoids materializing another [B, T, C]
+        # buffer per residual; the incoming residual `x` is never touched
+        # in place (the pre-norm saved it for backward).
         h = self.norm1(x)
         attn_out, logit_stats = self.attn(
             h, freqs_cis=freqs_cis, return_stats=return_stats
         )
         if self.use_layerscale:
-            x = x + self.ls1 * attn_out
-        else:
-            x = x + attn_out
+            attn_out = self.ls1 * attn_out
+        attn_out.add_(x)
+        x = attn_out
 
         h = self.norm2(x)
         mlp_out = self.mlp(h)
         if self.use_layerscale:
-            x = x + self.ls2 * mlp_out
-        else:
-            x = x + mlp_out
+            mlp_out = self.ls2 * mlp_out
+        mlp_out.add_(x)
+        x = mlp_out
         return x, logit_stats
 
 
@@ -159,11 +163,12 @@ class MLP(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # swiglu: h1 and h3 are fresh intermediates, so the SiLU can be
-        # applied in-place (saves one [.., hidden] activation buffer).
+        # swiglu. h1/h3 are kept out-of-place: the SiLU needs its pre-image
+        # for the input grad, so `silu(..., inplace=True)` would make autograd
+        # clone that pre-image (same memory plus a full copy).
         h1 = self.w1(x)
         h3 = self.w3(x)
-        return self.drop(self.w2(F.silu(h1, inplace=True) * h3))
+        return self.drop(self.w2(F.silu(h1) * h3))
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +222,10 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
             pos = torch.arange(0, T, device=input_ids.device).unsqueeze(0)
-            x = x + self.pos_emb(pos)
+            # `x` is the fresh embedding output and the embedding backward
+            # does not need it, so the position add can run in place and
+            # skips a full [B, T, C] allocation.
+            x.add_(self.pos_emb(pos))
         x = self.drop(x)
 
         freqs = None

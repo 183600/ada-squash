@@ -87,9 +87,11 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        # In-place scale by the per-channel weight: `x` is a fresh
-        # intermediate, so this avoids materializing another [.., C] tensor.
-        return x.mul_(self.weight)
+        # Out-of-place on purpose: the weight requires grad, so an in-place
+        # `mul_` would force autograd to snapshot (clone) the pre-mul tensor
+        # for the grad-weight term. The out-of-place form just references the
+        # existing intermediate instead of copying it.
+        return x * self.weight
 
 
 # ---------------------------------------------------------------------------
@@ -168,13 +170,18 @@ class DyTC(nn.Module):
         # For p>=1 we can safely compute |x|^p; for very large |x| the
         # denominator -> |x|^p so the ratio is bounded by 1 in magnitude.
         abs_x = x.abs()
-        # `abs_x.pow(p)` keeps its own output for backward, so we only
-        # reuse the *last* temporary in-place.
-        denom = abs_x.pow(p) + 1.0
-        denom.pow_(1.0 / p)
+        # Both pow's stay out-of-place: `p` is learnable, so each pow needs
+        # its pre-image for the grad-p term. An in-place `pow_` would make
+        # autograd clone that pre-image (same memory plus a full copy), while
+        # the out-of-place chain reuses the live intermediates as-is.
+        denom = (abs_x.pow(p) + 1.0).pow(1.0 / p)
         x = x / denom
-        x.mul_(self.gamma)
+        # Out-of-place: `gamma` needs the pre-mul tensor for its own grad, so
+        # a `mul_` here would trigger another autograd snapshot/clone.
+        x = x * self.gamma
         if self.beta is not None:
+            # `add_` needs no saved copy of `x` (the beta grad is just the
+            # summed output grad), so the in-place add is a pure win.
             x.add_(self.beta)
         return x
 
@@ -326,14 +333,18 @@ class DyTCD(nn.Module):
         # `p` may be a learnable scalar tensor or a buffer; both broadcast.
         p = self.p
         abs_x = x.abs()
-        # `abs_x.pow(p)` keeps its own output for backward, so we only
-        # reuse the *last* temporary in-place.
-        denom = abs_x.pow(p) + 1.0
-        denom.pow_(1.0 / p)
+        # Both pow's stay out-of-place: with a learnable `p` each pow needs
+        # its pre-image for the grad-p term, and an in-place `pow_` makes
+        # autograd clone that pre-image (same footprint plus an extra copy).
+        denom = (abs_x.pow(p) + 1.0).pow(1.0 / p)
         x = x / denom
 
-        x.mul_(self.gamma)
+        # Out-of-place: `gamma` needs the pre-mul tensor for its own grad, so
+        # a `mul_` here would trigger another autograd snapshot/clone.
+        x = x * self.gamma
         if self.beta is not None:
+            # `add_` needs no saved copy of `x` (beta's grad is just the
+            # summed output grad), so the in-place add is a pure win.
             x.add_(self.beta)
         return x
 

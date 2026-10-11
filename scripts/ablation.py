@@ -83,8 +83,9 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
 
         if step % args.stats_every == 0:
             act_stats.attach()
-        out = model(x, y)
-        loss = out[1] if isinstance(out, tuple) else out[1]
+        logits, loss = model(x, y)
+        # Not needed by the CE backward; free it while grads compute.
+        del logits
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()

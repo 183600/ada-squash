@@ -39,8 +39,9 @@ class MaxAbsMeter:
         self.count = 0
 
     def update(self, x: torch.Tensor):
-        # detach + flatten to scalar max for speed
-        v = x.abs().max().item()
+        # max(|x|) == max(max(x), -min(x)): two tiny reductions plus one
+        # scalar combine instead of materializing a full |x| copy.
+        v = torch.maximum(x.max(), -x.min()).item()
         if v > self.value:
             self.value = v
         self.count += 1
