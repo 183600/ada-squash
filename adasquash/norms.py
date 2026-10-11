@@ -159,8 +159,9 @@ class DyTC(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.alpha * x
-        # Generalized softsign, numerically stable.
-        p = self.p if isinstance(self.p, torch.Tensor) else torch.tensor(self.p, device=x.device, dtype=x.dtype)
+        # Generalized softsign, numerically stable. `p` may be a learnable
+        # scalar tensor or a plain float; both broadcast against `x`.
+        p = self.p
         # For p>=1 we can safely compute |x|^p; for very large |x| the
         # denominator -> |x|^p so the ratio is bounded by 1 in magnitude.
         abs_x = x.abs()
@@ -315,9 +316,8 @@ class DyTCD(nn.Module):
         # Broadcast over [B, T, C]
         x = alpha_c * x
 
-        p = self.p if isinstance(self.p, torch.Tensor) else torch.tensor(
-            self.p, device=x.device, dtype=x.dtype
-        )
+        # `p` may be a learnable scalar tensor or a buffer; both broadcast.
+        p = self.p
         abs_x = x.abs()
         denom = (1.0 + abs_x.pow(p)).pow(1.0 / p)
         x = x / denom

@@ -119,10 +119,17 @@ class Block(nn.Module):
                 torch.full((cfg.dim,), cfg.layerscale_init)
             )
 
-    def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
+        return_stats: bool = False,
+    ):
         # Pre-norm style
         h = self.norm1(x)
-        attn_out, logit_stats = self.attn(h, freqs_cis=freqs_cis)
+        attn_out, logit_stats = self.attn(
+            h, freqs_cis=freqs_cis, return_stats=return_stats
+        )
         if self.use_layerscale:
             x = x + self.ls1 * attn_out
         else:
@@ -215,7 +222,7 @@ class GPT(nn.Module):
 
         all_logit_stats = []
         for block in self.blocks:
-            x, ls = block(x, freqs_cis=freqs)
+            x, ls = block(x, freqs_cis=freqs, return_stats=return_stats)
             if return_stats:
                 all_logit_stats.append(ls)
         x = self.norm_f(x)

@@ -46,6 +46,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // n_heads
         self.dim = dim
         self.qk_norm = qk_norm
+        # Causal-mask cache (keyed by length); avoids re-allocating the
+        # [T, T] mask on every layer / every step.
+        self._causal_mask: Optional[torch.Tensor] = None
 
         # Fused QKV projection (LLaMA-style fused QKV is even better, but
         # plain concatenation keeps the code obvious).
@@ -72,14 +75,20 @@ class CausalSelfAttention(nn.Module):
         else:
             raise ValueError(f"Unknown qk_norm='{qk_norm}'")
 
-    def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
+        return_stats: bool = False,
+    ):
         """
         Args
-            x:         [B, T, C]
-            freqs_cis: optional RoPE freqs [T, head_dim//2, 2]  (complex)
+            x:            [B, T, C]
+            freqs_cis:    optional RoPE freqs [T, head_dim//2, 2]  (complex)
+            return_stats: if True, compute logit statistics for monitoring
         Returns
             y:         [B, T, C]
-            logit_stats: dict of logit statistics for monitoring
+            logit_stats: dict of logit statistics (empty unless requested)
         """
         B, T, C = x.shape
         qkv = self.qkv(x)
@@ -101,29 +110,41 @@ class CausalSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         logits = torch.matmul(q, k.transpose(-1, -2)) * scale
 
-        # logit monitoring (useful for the QK-squash ablation)
-        with torch.no_grad():
-            logit_abs_mean = logits.abs().mean().item()
-            logit_abs_max = logits.abs().amax(dim=-1).mean().item()
-            logit_std = logits.std(dim=-1).mean().item()
+        # logit monitoring (useful for the QK-squash ablation). Skipped by
+        # default: it forces a device sync and materializes extra [B,H,T,T]
+        # buffers on every layer, but is monitoring-only.
+        stats = {}
+        if return_stats:
+            with torch.no_grad():
+                abs_logits = logits.abs()
+                logit_abs_mean = abs_logits.mean().item()
+                logit_abs_max = abs_logits.amax(dim=-1).mean().item()
+                logit_std = logits.std(dim=-1).mean().item()
+            stats = {
+                "logit_abs_mean": logit_abs_mean,
+                "logit_abs_max": logit_abs_max,
+                "logit_std": logit_std,
+            }
 
-        # causal mask
-        causal_mask = torch.tril(
-            torch.ones(T, T, device=x.device, dtype=torch.bool)
-        ).view(1, 1, T, T)
-        logits = logits.masked_fill(~causal_mask, float("-inf"))
+        # causal mask (cached per sequence length; in-place to avoid a
+        # full [B, H, T, T] copy).
+        causal_mask = self._causal_mask
+        if (
+            causal_mask is None
+            or causal_mask.shape[0] != T
+            or causal_mask.device != x.device
+        ):
+            causal_mask = torch.triu(
+                torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+            )
+            self._causal_mask = causal_mask
+        logits = logits.masked_fill_(causal_mask, float("-inf"))
         probs = F.softmax(logits, dim=-1)
         probs = self.attn_drop(probs)
 
         out = torch.matmul(probs, v)  # [B, H, T, hd]
         out = out.transpose(1, 2).reshape(B, T, C)
         out = self.proj_drop(self.proj(out))
-
-        stats = {
-            "logit_abs_mean": logit_abs_mean,
-            "logit_abs_max": logit_abs_max,
-            "logit_std": logit_std,
-        }
         return out, stats
 
 

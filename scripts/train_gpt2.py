@@ -92,7 +92,12 @@ def build_dataloader(
 
     ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True)
     stream = PackedStream(ds, tok, seq_len)
-    return DataLoader(stream, batch_size=batch_size, num_workers=2)
+    return DataLoader(
+        stream,
+        batch_size=batch_size,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+    )
 
 
 # ---------------------------------------------------------------------------
