@@ -9,9 +9,6 @@ Provides:
   * MaxAbsMeter           - online max |x| estimator
   * measure_activation_stats - one-shot hook-driven measurement pass
   * count_parameters     - param accounting helpers
-
-All metrics are designed to be cheap (one tensor reduce per forward step)
-so they can be logged at every iteration without measurable overhead.
 """
 
 from __future__ import annotations
@@ -39,9 +36,7 @@ class MaxAbsMeter:
         self.count = 0
 
     def update(self, x: torch.Tensor):
-        # max(|x|) == max(max(x), -min(x)): two tiny reductions plus one
-        # scalar combine instead of materializing a full |x| copy.
-        v = torch.maximum(x.max(), -x.min()).item()
+        v = x.abs().amax().item()
         if v > self.value:
             self.value = v
         self.count += 1
@@ -72,20 +67,19 @@ class KurtosisMeter:
         self._bulk_update(x)
 
     def _bulk_update(self, x: torch.Tensor):
-        """Batched Welford update. Faster than the per-element loop."""
+        """Batched Welford update."""
         # Use the formulas from:
         #  Pébay, "Formulas for Robust, One-Pass Parallel Computation of
         #  Covariances and Arbitrary-Order Statistical Moments", 2008.
         new_n = self.n + x.numel()
         if new_n == self.n:
             return
-        # Gather all four reduced scalars in one tensor so the forward pass
-        # only syncs the device once instead of once per statistic.
         x_mean_t = x.mean()
         x_var_t = x.var(unbiased=False)
         xc = x - x_mean_t
-        x_m3_t = (xc ** 3).sum()
-        x_m4_t = (xc ** 4).sum()
+        xc2 = xc * xc
+        x_m3_t = (xc * xc2).sum()
+        x_m4_t = (xc2 * xc2).sum()
         x_mean, x_var, x_m3, x_m4 = torch.stack(
             [x_mean_t, x_var_t, x_m3_t, x_m4_t]
         ).tolist()
@@ -135,22 +129,13 @@ class KurtosisMeter:
 
 class ActivationStats:
     """
-    Aggregator: register forward hooks on every normalization module and
-    collect per-layer max(|x|) and kurtosis.
-
-    Usage:
-        stats = ActivationStats(model)
-        stats.attach()
-        # ... training step ...
-        stats.detach()
-        stats.summary()  # -> dict
+    Aggregator: register forward hooks on normalization modules.
     """
 
     def __init__(self, model: nn.Module):
         self.model = model
         self.handles: list = []
         self.max_abs: Dict[str, MaxAbsMeter] = defaultdict(MaxAbsMeter)
-        self.kurtosis: Dict[str, KurtosisMeter] = defaultdict(KurtosisMeter)
 
     def _make_hook(self, name: str):
         def hook(module, inp, out):
@@ -158,16 +143,12 @@ class ActivationStats:
             if x is None or not torch.is_tensor(x):
                 return
             self.max_abs[name].update(x)
-            self.kurtosis[name].update(x)
         return hook
 
     def attach(self):
         self.handles = []
         self.max_abs = defaultdict(MaxAbsMeter)
-        self.kurtosis = defaultdict(KurtosisMeter)
         for name, m in self.model.named_modules():
-            # Hook on the *inputs* of all normalization layers (pre-norm
-            # activations). Detect by class name to be conservative.
             cls_name = m.__class__.__name__
             if cls_name in {
                 "LayerNorm", "RMSNorm", "DyT", "DyTC", "DyTD", "DyTCD",
@@ -184,16 +165,12 @@ class ActivationStats:
         for name in self.max_abs:
             out[name] = {
                 "max_abs": self.max_abs[name].value,
-                "kurtosis": self.kurtosis[name].result(),
             }
-        # Aggregate across all layers for a single headline number.
         if out:
             all_max = [v["max_abs"] for v in out.values() if v["max_abs"] != -float("inf")]
-            all_kurt = [v["kurtosis"] for v in out.values()]
             out["__summary__"] = {
                 "mean_max_abs": sum(all_max) / max(1, len(all_max)),
                 "max_max_abs": max(all_max) if all_max else 0.0,
-                "mean_kurtosis": sum(all_kurt) / max(1, len(all_kurt)),
             }
         return out
 
@@ -203,9 +180,6 @@ class ActivationStats:
 # ---------------------------------------------------------------------------
 class LossSpikeCounter:
     """
-    Detect "loss spikes" - iterations where the loss jumps relative to the
-    EMA. Mirrors the definition used in the xIELU / Spike-no-more literature:
-      spike  <=>  loss > ema * (1 + threshold)  AND  loss - ema > abs_threshold
     """
 
     def __init__(self, ema_beta: float = 0.99, rel_threshold: float = 0.20, abs_threshold: float = 0.05):
@@ -227,7 +201,6 @@ class LossSpikeCounter:
             )
             if is_spike:
                 self.n_spikes += 1
-        # update EMA (only on non-spike iterations to avoid poisoning)
         if self.ema is None:
             self.ema = loss_value
         else:
@@ -247,12 +220,10 @@ class LossSpikeCounter:
 @torch.no_grad()
 def measure_activation_stats(model: nn.Module, batch: torch.Tensor) -> dict:
     """
-    Run a single forward pass on `batch` and return aggregated max|x| /
-    kurtosis per layer. Useful for cheap sanity-checks during config sweeps.
+    Run a single forward pass on `batch`.
     """
     stats = ActivationStats(model)
     stats.attach()
-    # Forward (loss unused).
     out = model(batch)
     if isinstance(out, tuple):
         out = out[0]

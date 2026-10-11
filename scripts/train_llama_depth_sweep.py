@@ -35,9 +35,39 @@ def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
     return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
+# Per-depth (dim, n_heads) taken from the Phase-2 experiment card
+# (experiments/phase2_llama_1b_depth/README.md). The point of the sweep is
+# the *depth* axis, so `dim` has to shrink as depth grows or the 96-layer
+# run is simply a 4x larger model and "RMSNorm diverges at depth" is
+# unfalsifiable. head_dim is 128 for every row, so RoPE / attention shapes
+# stay identical across the sweep.
+DEPTH_SHAPE = {
+    12: (2560, 20),
+    24: (2048, 16),
+    48: (1536, 12),
+    96: (1280, 10),
+}
+_BASE_DEPTH = 24
+_BASE_SHAPE = (2048, 16)  # LLaMA-tiny 1b defaults
+
+
+def shape_for_depth(depth: int, base_dim: int, base_heads: int):
+    """(dim, n_heads) for a given depth, keeping the parameter count ~fixed.
+
+    Falls back to a 1/sqrt(depth) dim schedule (with head_dim held fixed)
+    for depths that are not in the documented table.
+    """
+    if depth in DEPTH_SHAPE:
+        return DEPTH_SHAPE[depth]
+    base_head_dim = max(1, base_dim // base_heads)
+    dim = int(round(base_dim * math.sqrt(_BASE_DEPTH / max(1, depth))))
+    heads = max(1, int(round(dim / base_head_dim)))
+    dim = heads * base_head_dim
+    return dim, heads
+
+
 def launch_one(args, depth: int, norm: str, output_dir: Path, additional: list | None = None):
-    """Launch a single training run via subprocess (so that we can use
-    separate CUDA contexts and avoid OOM fragmentation between configs)."""
+    """Launch a single training run via subprocess."""
     cmd = [
         sys.executable, str(Path(__file__).parent / "train_gpt2.py"),
         "--model", args.model,
@@ -71,11 +101,17 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, additional: list |
         cmd.append("--no-layerscale")
     if additional:
         cmd.extend(additional)
-    # depth override - we monkeypatch by setting an env var that the
-    # train_gpt2.py script picks up via GPT_DEPTH env-var.
+    # depth / width override - train_gpt2.py picks these up from the env.
     env = dict(os.environ)
     env["ADASQUASH_DEPTH_OVERRIDE"] = str(depth)
-    print(f"[sweep] launching depth={depth} norm={norm} -> {output_dir}")
+    shape = ""
+    if not args.no_dim_scaling:
+        base_dim, base_heads = _BASE_SHAPE if args.model == "llama-1b" else (768, 12)
+        dim, heads = shape_for_depth(depth, base_dim, base_heads)
+        env["ADASQUASH_DIM_OVERRIDE"] = str(dim)
+        env["ADASQUASH_HEADS_OVERRIDE"] = str(heads)
+        shape = f" (dim={dim}, heads={heads})"
+    print(f"[sweep] launching depth={depth} norm={norm} -> {output_dir}{shape}")
     return subprocess.Popen(cmd, env=env, stdout=open(output_dir / "stdout.log", "w"),
                             stderr=subprocess.STDOUT)
 
@@ -104,6 +140,12 @@ def main():
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
     p.add_argument("--no-layerscale", action="store_true")
+    p.add_argument(
+        "--no-dim-scaling",
+        action="store_true",
+        help="keep dim/n_heads fixed across depths (param count then grows "
+             "linearly with depth, which confounds the depth axis)",
+    )
     p.add_argument("--output-dir", default="runs/depth-sweep")
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--stats-every", type=int, default=500)

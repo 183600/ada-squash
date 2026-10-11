@@ -57,6 +57,29 @@ def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
+# Generalized softsign
+# ---------------------------------------------------------------------------
+def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
+    """
+    phi_p(x) = x / (1 + |x|^p)^{1/p}.
+
+    Split the two regimes and clamp the pow base into the branch where it
+    is guaranteed to stay <= 1:
+
+        |x| <= 1 :  phi = x * (1 + |x|^p)^(-1/p)          (|x|^p  <= 1)
+        |x| >  1 :  phi = sgn(x) * (1 + |x|^-p)^(-1/p)    (|x|^-p <= 1)
+
+    Both branches stay in [0, 1] before the final combine.
+    """
+    t = x.abs()
+    t_lo = t.clamp(max=1.0)
+    t_hi = t.clamp(min=1.0)
+    y_lo = x / (t_lo.pow(p) + 1.0).pow(1.0 / p)
+    y_hi = torch.sign(x) * (t_hi.pow(-p) + 1.0).pow(-1.0 / p)
+    return torch.where(t > 1.0, y_hi, y_lo)
+
+
+# ---------------------------------------------------------------------------
 # Baselines
 # ---------------------------------------------------------------------------
 @register_norm("ln")
@@ -85,12 +108,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = x.pow(2).mean(dim=-1, keepdim=True)
+        var = (x * x).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        # Out-of-place on purpose: the weight requires grad, so an in-place
-        # `mul_` would force autograd to snapshot (clone) the pre-mul tensor
-        # for the grad-weight term. The out-of-place form just references the
-        # existing intermediate instead of copying it.
         return x * self.weight
 
 
@@ -116,7 +135,6 @@ class DyT(nn.Module):
         x = torch.tanh(self.alpha * x)
         x = x * self.gamma
         if self.beta is not None:
-            # In-place on the freshly-created scaled tensor (no extra alloc).
             x.add_(self.beta)
         return x
 
@@ -164,24 +182,11 @@ class DyTC(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.alpha * x
-        # Generalized softsign, numerically stable. `p` may be a learnable
-        # scalar tensor or a plain float; both broadcast against `x`.
-        p = self.p
-        # For p>=1 we can safely compute |x|^p; for very large |x| the
-        # denominator -> |x|^p so the ratio is bounded by 1 in magnitude.
-        abs_x = x.abs()
-        # Both pow's stay out-of-place: `p` is learnable, so each pow needs
-        # its pre-image for the grad-p term. An in-place `pow_` would make
-        # autograd clone that pre-image (same memory plus a full copy), while
-        # the out-of-place chain reuses the live intermediates as-is.
-        denom = (abs_x.pow(p) + 1.0).pow(1.0 / p)
-        x = x / denom
-        # Out-of-place: `gamma` needs the pre-mul tensor for its own grad, so
-        # a `mul_` here would trigger another autograd snapshot/clone.
+        # `p` may be a learnable scalar tensor or a plain float; both
+        # broadcast against `x`.
+        x = generalized_softsign(x, self.p)
         x = x * self.gamma
         if self.beta is not None:
-            # `add_` needs no saved copy of `x` (the beta grad is just the
-            # summed output grad), so the in-place add is a pure win.
             x.add_(self.beta)
         return x
 
@@ -253,7 +258,6 @@ class DyTD(nn.Module):
         x = torch.tanh(a * x)
         x = x * self.gamma
         if self.beta is not None:
-            # In-place on the freshly-created scaled tensor (no extra alloc).
             x.add_(self.beta)
         return x
 
@@ -319,10 +323,8 @@ class DyTCD(nn.Module):
         """Effective per-channel alpha at this depth (for logging)."""
         depth_ratio = float(self.layer_idx) / float(self.num_layers)
         scale = self.alpha_0 * torch.exp(-self.k * depth_ratio)
-        # Softplus to keep the modulation strictly positive and bounded,
-        # but delta starts at 0 so 1 + softplus(0) ≈ 1 + 0.69 ≈ 1.69...
-        # we instead use 1 + delta directly (delta may go negative => the
-        # channel gets *less* compression than the global alpha).
+        # delta may be negative, in which case the channel gets *less*
+        # compression than the global alpha.
         return scale * (1.0 + self.delta)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -331,20 +333,9 @@ class DyTCD(nn.Module):
         x = alpha_c * x
 
         # `p` may be a learnable scalar tensor or a buffer; both broadcast.
-        p = self.p
-        abs_x = x.abs()
-        # Both pow's stay out-of-place: with a learnable `p` each pow needs
-        # its pre-image for the grad-p term, and an in-place `pow_` makes
-        # autograd clone that pre-image (same footprint plus an extra copy).
-        denom = (abs_x.pow(p) + 1.0).pow(1.0 / p)
-        x = x / denom
-
-        # Out-of-place: `gamma` needs the pre-mul tensor for its own grad, so
-        # a `mul_` here would trigger another autograd snapshot/clone.
+        x = generalized_softsign(x, self.p)
         x = x * self.gamma
         if self.beta is not None:
-            # `add_` needs no saved copy of `x` (beta's grad is just the
-            # summed output grad), so the in-place add is a pure win.
             x.add_(self.beta)
         return x
 
@@ -374,6 +365,7 @@ __all__ = [
     "NORM_REGISTRY",
     "register_norm",
     "build_norm",
+    "generalized_softsign",
     "LayerNorm",
     "RMSNorm",
     "DyT",

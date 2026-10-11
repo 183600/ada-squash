@@ -62,11 +62,10 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Seed the global RNG *before* building the model so every ablation
-    # starts from a reproducible initialization; otherwise the weight-init
-    # stream advances across runs and the norm comparison is confounded.
+    # Seed so every ablation starts from a reproducible initialization.
     torch.manual_seed(args.seed)
     model = build_gpt_124m(**cfg_kwargs)
+    model.reset_parameters(args.seed)
     model.to(device)
     n_params = count_parameters(model)
 
@@ -88,7 +87,6 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
         if step % args.stats_every == 0:
             act_stats.attach()
         logits, loss = model(x, y)
-        # Not needed by the CE backward; free it while grads compute.
         del logits
         loss.backward()
         if step % args.stats_every == 0:
@@ -99,18 +97,15 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
         loss_spike.update(loss.item())
         losses.append(loss.item())
         if step % args.log_every == 0:
-            print(f"  [step {step:4d}] loss={loss.item():.4f} spikes={loss_spike.n_spikes}", flush=True)
+            print(f"  [step {step:4d}] loss={loss.item():.4f}", flush=True)
 
     stats = act_stats.summary()
     summary = {
         "name": name,
         "cfg": cfg_kwargs,
         "n_params": n_params,
-        "n_spikes": loss_spike.n_spikes,
         "final_loss": losses[-1],
         "mean_last_100_loss": sum(losses[-100:]) / max(1, len(losses[-100:])),
-        "max_abs_summary": stats.get("__summary__", {}).get("max_max_abs", 0.0),
-        "mean_kurtosis": stats.get("__summary__", {}).get("mean_kurtosis", 0.0),
         "elapsed_s": time.time() - t0,
     }
     with open(output_dir / "summary.json", "w") as f:

@@ -9,8 +9,7 @@ We measure:
   - the standard "FP8 trainability" curve: at what layer do logits NaN?
 
 This script is a CPU/GPU pure-python simulation - it does NOT need real
-FP8 hardware (e.g. H100 FP8), and is useful for predicting which norm
-configurations will be FP8-trainable *before* paying for the kernel work.
+FP8 hardware (e.g. H100 FP8).
 
 Usage:
     python scripts/check_fp8_stability.py --norms ln rmsnorm dyt dytc dytd dytcd
@@ -96,8 +95,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
     in fp32, so a single hooked forward is enough.
     """
     # Measure the quantization error introduced by FP8-E4M3 on every
-    # normalization layer's output, which is where the low-precision
-    # activation traffic actually bites.
+    # normalization layer's output.
     handles = []
     quant_errors = []
     fp8_e4m3_min = fp8_min_normal(4)
@@ -158,15 +156,16 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
-    rng = torch.Generator(device=device).manual_seed(args.seed)
 
     results = []
     for norm in args.norms:
-        # Re-seed per norm: otherwise every norm gets a different random
-        # init and the overflow/underflow comparison is confounded by
-        # initialization noise.
+        # Re-seed *both* streams per norm: otherwise every norm gets a
+        # different random init AND a different probe batch, and the
+        # overflow/underflow comparison is confounded by both.
         torch.manual_seed(args.seed)
+        rng = torch.Generator(device=device).manual_seed(args.seed)
         model = build_gpt_124m(norm_name=norm).to(device)
+        model.reset_parameters(args.seed)
         model.eval()
         x = torch.randint(0, model.cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
         r = measure_fp8_divergence(model, x, norm)

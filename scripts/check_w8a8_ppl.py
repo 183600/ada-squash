@@ -1,14 +1,7 @@
 """
 Post-training W8A8 quantization PPL drop check.
 
-Naive round-to-nearest W8A8 quantization on LLaMA-class models usually
-produces a noticeable PPL drop because a small number of "outlier"
-feature dimensions (Dettmers et al. 2022) dominate the rounding error.
-
-The hypothesis we test here: a model trained with DyT-C / DyT-CD (per-
-channel adaptive squashing) should produce *milder* outliers in the
-hidden state and therefore suffer less W8A8 PPL drop than one trained
-with LayerNorm or RMSNorm.
+Naive round-to-nearest W8A8 quantization.
 
 We use a per-channel weight quantization (axis=1) and per-token
 activation quantization (axis=-1), which is the same scheme as
@@ -23,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -87,22 +81,29 @@ def wrap_model_w8a8(model: nn.Module):
 # PPL measurement
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def compute_ppl(model, batch, target, device="cuda"):
+def compute_ce_sum(model, batch, target, device="cuda"):
+    """Summed (not averaged) cross-entropy over `target` tokens.
+
+    Returning the raw sum lets several probe batches be pooled into a
+    single PPL estimate - averaging per-batch PPLs would weight every
+    batch equally regardless of its token count.
+    """
     model.eval()
     batch = batch.to(device)
     target = target.to(device)
     logits, _ = model(batch, target)
     # logits: [B, T, V]
-    # We use the same ignore_index as training (0) just for consistency;
-    # for non-pad data this is irrelevant.
     ce = torch.nn.functional.cross_entropy(
         logits.view(-1, logits.size(-1)),
         target.view(-1),
         reduction="sum",
     )
-    n = target.numel()
-    ppl = torch.exp(ce / n)
-    return ppl.item()
+    return ce.item(), target.numel()
+
+
+def compute_ppl(model, batch, target, device="cuda"):
+    ce, n = compute_ce_sum(model, batch, target, device=device)
+    return torch.exp(torch.tensor(ce / n)).item()
 
 
 def main():
@@ -117,20 +118,15 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
-    rng = torch.Generator(device=device).manual_seed(args.seed)
 
     results = []
     for ckpt_path in args.ckpts:
+        # Re-seed per checkpoint so every checkpoint is evaluated on the
+        # *same* probe batches; otherwise the cross-checkpoint ppl_drop
+        # comparison also carries the variance of a different eval sample.
+        rng = torch.Generator(device=device).manual_seed(args.seed)
         # Load fp32 model
         model, _ = load_ckpt(ckpt_path, device=device)
-        # Build random data (PPL on random data is a stable proxy for
-        # outlier-suppression effects under quantization; for real
-        # numbers, plug in a real eval dataset).
-        x = torch.randint(0, model.cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
-        y = torch.cat([x[:, 1:], torch.zeros(args.batch_size, 1, dtype=torch.long, device=device)], dim=1)
-
-        ppl_fp = compute_ppl(model, x, y, device=device)
-
         # Build a *copy* of the model for quantization so we can compare.
         # The cleanest way is a deepcopy, but state_dict round-trip is
         # safer for our custom modules.
@@ -138,7 +134,26 @@ def main():
         qmodel = copy.deepcopy(model)
         qmodel.to(device)
         wrap_model_w8a8(qmodel)
-        ppl_q = compute_ppl(qmodel, x, y, device=device)
+
+        ce_fp = ce_q = 0.0
+        n_tok = 0
+        for _ in range(max(1, args.n_batches)):
+            # Build random data.
+            x = torch.randint(
+                0, model.cfg.vocab_size, (args.batch_size, args.seq_len),
+                generator=rng, device=device,
+            )
+            y = torch.cat(
+                [x[:, 1:], torch.zeros(args.batch_size, 1, dtype=torch.long, device=device)],
+                dim=1,
+            )
+            a, n = compute_ce_sum(model, x, y, device=device)
+            b, _ = compute_ce_sum(qmodel, x, y, device=device)
+            ce_fp += a
+            ce_q += b
+            n_tok += n
+        ppl_fp = math.exp(ce_fp / n_tok)
+        ppl_q = math.exp(ce_q / n_tok)
 
         r = {
             "ckpt": ckpt_path,

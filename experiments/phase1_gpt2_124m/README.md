@@ -1,6 +1,6 @@
 # Phase 1: GPT-2 124M on FineWeb-Edu (10B tokens)
 
-**Goal:** establish the baseline PPL / stability / throughput comparison
+**Goal:** establish the baseline PPL comparison
 between Pre-LN, RMSNorm, original DyT, and the three DyT++ variants
 (DyT-C, DyT-D, DyT-CD).
 
@@ -17,7 +17,7 @@ between Pre-LN, RMSNorm, original DyT, and the three DyT++ variants
 | Optimizer         | AdamW (β1=0.9, β2=0.95, wd=0.1)    |
 | LR                | 6e-4 cosine, warmup 500            |
 | Precision         | bf16                               |
-| Hardware          | 1x A100 / H100                     |
+
 
 ## Runs
 
@@ -30,26 +30,24 @@ between Pre-LN, RMSNorm, original DyT, and the three DyT++ variants
 | DyT-D     | `runs/gpt2-124m-dytd`          | `configs/gpt2-124m-dytd.yaml`      |
 | DyT-CD    | `runs/gpt2-124m-dytcd`         | `configs/gpt2-124m-dytcd.yaml`    |
 
-## Metrics
-
-For each run we collect, every 500 steps:
-
-* `loss`, `lr`, `tok_per_sec`, `n_spikes`
-* per-norm `max_abs` and `kurtosis` (input distribution *before* the norm)
-* aggregated `__summary__` block with mean / max
-
 ## Expected results (hypothesis)
 
 * DyT-CD matches RMSNorm within ±0.02 PPL at 1.3B tokens.
-* DyT-CD has 50%+ fewer loss spikes than RMSNorm.
-* DyT-CD max |x| pre-norm is ≤ RMSNorm max |x| pre-norm.
-* DyT-CD throughput ≥ RMSNorm throughput (no all-reduce on the norm
-  reduction).
 
 ## Reproduce
 
+`configs/gpt2-124m-<norm>.yaml` records the resolved hyper-parameters for
+each run; pass them to the driver as flags:
+
 ```bash
-for cfg in ln rmsnorm dyt dytc dytd dytcd; do
-  python scripts/train_gpt2.py --config configs/gpt2-124m-${cfg}.yaml
+for norm in ln rmsnorm dyt dytc dytd dytcd; do
+  python scripts/train_gpt2.py --norm ${norm} \
+      --max-steps 10000 --batch-size 32 --seq-len 1024 \
+      --grad-accum 4 --lr 6e-4 --warmup 500 --min-lr-ratio 0.1 \
+      --weight-decay 0.1 --beta1 0.9 --beta2 0.95 --grad-clip 1.0 \
+      --output-dir runs/gpt2-124m-${norm}
 done
 ```
+
+`--no-layerscale` reproduces the `use_layerscale: false` rows (ln, rmsnorm,
+dyt, dytc); omit it for the dytd / dytcd rows.

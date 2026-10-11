@@ -15,8 +15,7 @@ Dynamic Tanh (DyT, Zhou et al. 2025) along three orthogonal axes:
 
 The core hypothesis: with **<0.1% additional parameters**, statistic-free
 element-wise adaptive squashing matches or exceeds RMSNorm on stability
-while saving the synchronization cost of `mean`/`var` reductions at
-inference.
+with element-wise adaptive squashing.
 
 ## Repository layout
 
@@ -89,7 +88,7 @@ python scripts/train_gpt2.py --norm dytcd \
 ```
 
 Logged outputs in `<output-dir>/`:
-- `train.jsonl`     - per-step loss / lr / throughput / spike count
+- `train.jsonl`     - per-step loss / lr
 - `tb/`             - TensorBoard scalars
 - `ckpt_NNNNNN.pt`  - resumable checkpoints
 - `stdout.log`      - raw stdout (for depth-sweep runs)
@@ -105,14 +104,22 @@ python scripts/train_llama_depth_sweep.py \
 ```
 
 Each `(depth, norm)` combination runs in its own subprocess under
-`runs/depth-sweep/d{depth}-{norm}/`. The depth override is signalled via
-the `ADASQUASH_DEPTH_OVERRIDE` env var, so the same training script can be
-invoked directly for a single config:
+`runs/depth-sweep/d{depth}-{norm}/`. Depth and width are signalled via the
+`ADASQUASH_DEPTH_OVERRIDE`, `ADASQUASH_DIM_OVERRIDE` and
+`ADASQUASH_HEADS_OVERRIDE` env vars (head_dim is held at 128 for every
+depth, and `dim` shrinks with depth so the parameter count stays ~constant
+— otherwise the "curse of depth" axis is confounded with model size). The
+same training script can also be invoked directly for a single config:
 
 ```bash
-ADASQUASH_DEPTH_OVERRIDE=48 python scripts/train_gpt2.py \
+ADASQUASH_DEPTH_OVERRIDE=48 \
+ADASQUASH_DIM_OVERRIDE=1536 ADASQUASH_HEADS_OVERRIDE=12 \
+    python scripts/train_gpt2.py \
     --model llama-1b --norm dytcd --max-steps 5000 ...
 ```
+
+Pass `--no-dim-scaling` to the sweep launcher to keep `dim` fixed across
+depths instead.
 
 ### Phase 3: special experiments
 
@@ -137,7 +144,7 @@ python scripts/run_needle.py --ckpt runs/gpt2-124m-dytcd/ckpt_final.pt \
 ### Ablations
 
 The ablation runner sweeps the variant matrix on synthetic data (1000
-steps, GPT-2 124M) - cheap enough to fit on one H100 in <2 hours.
+steps, GPT-2 124M).
 
 ```bash
 python scripts/ablation.py --output-dir runs/ablation
@@ -172,8 +179,7 @@ y    = γ · φ + β
 * All operations are strictly element-wise → no cross-token statistics
   and no collective ops. Kernel-friendly: trivially fuses with the
   surrounding matmul.
-* Parameter cost: one extra `[C]` vector per norm, typically <0.1% of
-  the model.
+* One extra `[C]` vector per norm, typically <0.1% of the model.
 
 ### DyT-D — Variant B: depth-conditioned
 
@@ -219,10 +225,7 @@ All training scripts log:
 | Metric              | What it captures                                   |
 |---------------------|---------------------------------------------------|
 | `loss`              | training cross-entropy                            |
-| `n_spikes`          | `LossSpikeCounter` (EMA-relative jump)             |
-| `max_abs_*`         | per-layer max abs pre-norm activation (outlier)    |
-| `kurtosis_*`        | per-layer excess kurtosis pre-norm (heavy-tail)   |
-| `tok_per_sec`       | throughput                                        |
+
 | `expert_cv`         | (MoE only) CoV of tokens-per-expert               |
 | `overflow_rate_e4m3`| (FP8 sim) fraction of activations above ±448      |
 | `underflow_rate_e4m3` | (FP8 sim) fraction of activations below min-normal |

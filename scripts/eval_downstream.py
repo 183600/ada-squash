@@ -50,11 +50,21 @@ def load_ckpt(path: str, device: str = "cuda"):
         model = build_gpt_350m(**model_cfg)
     else:
         model = build_llama_tiny_1b(**model_cfg)
-    # Apply depth override if any.
+    # Apply depth / width override if any. The depth sweep shrinks `dim` as
+    # depth grows so the parameter count stays ~constant, so the checkpoint
+    # has to be rebuilt with *all* of the recorded overrides - rebuilding
+    # with `n_layers` alone would produce a state_dict shape mismatch.
     depth = args.get("_depth_override")
-    if depth:
+    dim = args.get("_dim_override")
+    heads = args.get("_heads_override")
+    if depth or dim or heads:
         cfg_dict = {k: getattr(model.cfg, k) for k in vars(model.cfg)}
-        cfg_dict["n_layers"] = depth
+        if depth:
+            cfg_dict["n_layers"] = depth
+        if dim:
+            cfg_dict["dim"] = dim
+        if heads:
+            cfg_dict["n_heads"] = heads
         model = GPT(GPTConfig(**cfg_dict))
     model.load_state_dict(ckpt["model"])
     model.to(device)

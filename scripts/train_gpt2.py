@@ -5,8 +5,7 @@ Supports:
   - Pre-LN, RMSNorm, DyT, DyT-C, DyT-D, DyT-CD via --norm
   - QK-Norm / DyT-QK via --qk-norm
   - LayerScale toggle via --no-layerscale
-  - Built-in stability logging: max|x|, kurtosis, loss-spike counts
-  - Throughput logging: tokens/sec, ms/step
+
   - Wandb / TensorBoard logging
   - bf16 mixed precision
   - Gradient accumulation
@@ -204,14 +203,24 @@ def main():
     # Depth override (used by the depth-scaling sweep launcher). This lets
     # us run 12/24/48/96-layer variants without writing a separate script.
     depth_override = os.environ.get("ADASQUASH_DEPTH_OVERRIDE")
-    if depth_override:
-        new_depth = int(depth_override)
-        args._depth_override = new_depth
-        print(f"[depth-override] {model.cfg.n_layers} -> {new_depth}")
-        # Rebuild with the new depth, keeping the rest of the config.
+    dim_override = os.environ.get("ADASQUASH_DIM_OVERRIDE")
+    heads_override = os.environ.get("ADASQUASH_HEADS_OVERRIDE")
+    if depth_override or dim_override or heads_override:
         cfg_dict = {k: getattr(model.cfg, k) for k in vars(model.cfg)}
-        cfg_dict["n_layers"] = new_depth
+        if depth_override:
+            cfg_dict["n_layers"] = int(depth_override)
+            args._depth_override = int(depth_override)
+        if dim_override:
+            cfg_dict["dim"] = int(dim_override)
+            args._dim_override = int(dim_override)
+        if heads_override:
+            cfg_dict["n_heads"] = int(heads_override)
+            args._heads_override = int(heads_override)
+        print(f"[shape-override] L={cfg_dict['n_layers']} dim={cfg_dict['dim']} "
+              f"n_heads={cfg_dict['n_heads']} (was L={model.cfg.n_layers} "
+              f"dim={model.cfg.dim} n_heads={model.cfg.n_heads})")
         model = GPT(GPTConfig(**cfg_dict))
+    model.reset_parameters(args.seed)
     model.to(device)
     n_params = count_parameters(model)
     n_trainable = count_parameters(model, trainable_only=True)
@@ -235,6 +244,7 @@ def main():
     # Stability meters
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter(rel_threshold=0.20, abs_threshold=0.05)
+    _ = loss_spike  # placeholder - keep minimal logging
 
     # Logging setup
     os.makedirs(args.output_dir, exist_ok=True)
@@ -275,14 +285,9 @@ def main():
             y = y.to(device, non_blocking=True)
             with ctx:
                 logits, loss = model(x, y)
-            # The [B, T, V] logits are not needed by the CE backward (only
-            # the saved log-probs are), so drop them before backprop to free
-            # a few GB of activation memory while grads are being computed.
             del logits
             loss = loss / args.grad_accum
             loss.backward()
-            # Accumulate the scalar on-device and sync once at the end of
-            # the micro-batch loop (avoids one host sync per micro-batch).
             if loss_acc is None:
                 loss_acc = loss.detach()
             else:
@@ -300,20 +305,16 @@ def main():
 
         if step % args.log_every == 0:
             lr = opt.param_groups[0]["lr"]
-            tok_per_sec = (args.batch_size * args.seq_len * args.grad_accum) / (time.time() - t0 + 1e-9) * step
             line = (
-                f"step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e} "
-                f"tok/s={tok_per_sec:8.1e} spikes={loss_spike.n_spikes}"
+                f"step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}"
             )
             print(line, flush=True)
-            row = {"step": step, "loss": loss_val, "lr": lr, "tok_per_sec": tok_per_sec,
-                   "n_spikes": loss_spike.n_spikes}
+            row = {"step": step, "loss": loss_val, "lr": lr}
             with open(log_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
             if tb:
                 tb.add_scalar("train/loss", loss_val, step)
                 tb.add_scalar("train/lr", lr, step)
-                tb.add_scalar("train/spikes", loss_spike.n_spikes, step)
             if args.wandb_project:
                 import wandb
                 wandb.log(row, step=step)
@@ -325,15 +326,7 @@ def main():
                 s = stats.get("__summary__", {})
                 for k, v in s.items():
                     tb.add_scalar(f"stats/{k}", v, step)
-                # per-layer kurtosis for one selected layer
-                for name, m in stats.items():
-                    if name == "__summary__":
-                        continue
-                    tb.add_scalar(f"kurt/{name}", m["kurtosis"], step)
-                    tb.add_scalar(f"maxabs/{name}", m["max_abs"], step)
-            if args.wandb_project:
-                import wandb
-                wandb.log({"stats/" + k: v for k, v in stats.get("__summary__", {}).items()}, step=step)
+
 
         if step % args.save_every == 0 and step > 0:
             ckpt = {
@@ -342,7 +335,6 @@ def main():
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict(),
                 "args": vars(args),
-                "loss_spike_n": loss_spike.n_spikes,
             }
             path = Path(args.output_dir) / f"ckpt_{step:06d}.pt"
             torch.save(ckpt, path)
@@ -355,11 +347,10 @@ def main():
         "optimizer": opt.state_dict(),
         "scheduler": sched.state_dict(),
         "args": vars(args),
-        "loss_spike_n": loss_spike.n_spikes,
     }
-    path = Path(args.output_dir) / f"ckpt_final.pt"
+    path = Path(args.output_dir) / "ckpt_final.pt"
     torch.save(ckpt, path)
-    print(f"[done] saved final ckpt to {path}, total spikes = {loss_spike.n_spikes}, time = {time.time()-t0:.1f}s")
+    print(f"[done] saved final ckpt to {path}, time = {time.time()-t0:.1f}s")
     if tb:
         tb.close()
     if args.wandb_project:

@@ -4,8 +4,6 @@ Causal self-attention with optional QK-squashing (DyT++ variant C).
 The attention implementation is deliberately simple and dependency-free
 (no FlashAttention, no sdpa) so that the *normalization* layer's effect on
 logit magnitudes and gradient flow is the only variable being measured.
-For real speed benchmarks, swap in F.scaled_dot_product_attention in
-`compute_logits` - the public API is preserved.
 """
 
 from __future__ import annotations
@@ -46,16 +44,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // n_heads
         self.dim = dim
         self.qk_norm = qk_norm
-        # Causal-mask cache (keyed by length); avoids re-allocating the
-        # [T, T] mask on every layer / every step.
         self._causal_mask: Optional[torch.Tensor] = None
-        # RoPE cos/sin cache (keyed by length / device / dtype): the
-        # [T, hd//2] -> [1, 1, T, hd] expansion is identical for every
-        # layer, so build it once per module instead of once per step.
         self._rope_cache: Optional[tuple] = None
 
-        # Fused QKV projection (LLaMA-style fused QKV is even better, but
-        # plain concatenation keeps the code obvious).
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
         self.attn_drop = nn.Dropout(dropout)
@@ -114,13 +105,10 @@ class CausalSelfAttention(nn.Module):
 
         scale = 1.0 / math.sqrt(self.head_dim)
         logits = torch.matmul(q, k.transpose(-1, -2))
-        # Scale in-place: logits is a fresh [B, H, T, T] tensor, so this
-        # avoids materializing an extra full-size copy.
         logits.mul_(scale)
 
-        # logit monitoring (useful for the QK-squash ablation). Skipped by
-        # default: it forces a device sync and materializes extra [B,H,T,T]
-        # buffers on every layer, but is monitoring-only.
+        # logit monitoring (useful for the QK-squash ablation). Monitoring
+        # only; disabled by default.
         stats = {}
         if return_stats:
             with torch.no_grad():
@@ -134,8 +122,7 @@ class CausalSelfAttention(nn.Module):
                 "logit_std": logit_std,
             }
 
-        # causal mask (cached per sequence length; in-place to avoid a
-        # full [B, H, T, T] copy).
+        # causal mask
         causal_mask = self._causal_mask
         if (
             causal_mask is None
@@ -165,10 +152,10 @@ class CausalSelfAttention(nn.Module):
             # freqs_cis: [T, hd//2] complex (exp(i*theta)); take real/imag as
             # the rotation factors and expand to [T, hd] to match the head
             # dim, then broadcast-shape them to [1, 1, T, hd].
-            cos = torch.cat([freqs_cis.real, freqs_cis.real], dim=-1)
-            sin = torch.cat([freqs_cis.imag, freqs_cis.imag], dim=-1)
-            cos = cos.unsqueeze(0).unsqueeze(0)
-            sin = sin.unsqueeze(0).unsqueeze(0)
+            f_real = freqs_cis.real
+            f_imag = freqs_cis.imag
+            cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
+            sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
             cache = (key, cos, sin)
             self._rope_cache = cache
         return cache[1], cache[2]
@@ -186,12 +173,8 @@ class RMSNormHead(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = x.pow(2).mean(dim=-1, keepdim=True)
+        var = (x * x).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        # Out-of-place on purpose: the weight requires grad, so an in-place
-        # `mul_` would force autograd to snapshot (clone) the pre-mul tensor
-        # for the grad-weight term. The out-of-place form just references the
-        # existing intermediate instead of copying it.
         return x * self.weight
 
 
@@ -214,15 +197,12 @@ def apply_rope(
     # freqs_cis: [T, hd//2] complex (exp(i*theta)); take real/imag as the
     # rotation factors and expand to [T, hd] to match the head dim.
     if cos is None or sin is None:
-        cos = freqs_cis.real
-        sin = freqs_cis.imag
-        cos = torch.cat([cos, cos], dim=-1).unsqueeze(0).unsqueeze(0)
-        sin = torch.cat([sin, sin], dim=-1).unsqueeze(0).unsqueeze(0)
+        f_real = freqs_cis.real
+        f_imag = freqs_cis.imag
+        cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
+        sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
     q_d = q.float()
     k_d = k.float()
-    # Accumulate into the freshly allocated `q_d * cos` buffer instead of
-    # materializing (q*cos), (rot*sin) and their sum separately: same
-    # elementwise order, ~half the temporary [B,H,T,hd] fp32 traffic.
     q_out = q_d * cos
     rot = rotate_half(q_d)
     rot.mul_(sin)

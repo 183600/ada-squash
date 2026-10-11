@@ -6,7 +6,7 @@ depth-scaling advantage over RMSNorm and original DyT.
 ## Depth sweep
 
 We train each norm at four depths: 12, 24, 48, 96 layers, keeping the
-*parameter budget* approximately fixed by scaling `dim` to keep FLOPs
+parameter count approximately fixed by scaling `dim` to keep FLOPs
 roughly constant.
 
 | Depth | dim   | Heads | MLP ratio | ~Params |
@@ -18,7 +18,12 @@ roughly constant.
 
 The exact dim choices are tunable; the key constraint is keeping
 the embedding/head ratio consistent so RoPE / attention shapes don't
-break.
+break. `scripts/train_llama_depth_sweep.py` encodes this table
+(`DEPTH_SHAPE`) and exports it to the trainer as
+`ADASQUASH_DEPTH_OVERRIDE` / `ADASQUASH_DIM_OVERRIDE` /
+`ADASQUASH_HEADS_OVERRIDE`; head_dim is 128 at every depth so only depth
+varies. Pass `--no-dim-scaling` to opt out (that makes the 96-layer run a
+~4x larger model and the depth axis no longer isolated).
 
 ## Recipe
 
@@ -56,7 +61,13 @@ After each Phase 2 run, we evaluate:
 ```bash
 # depth sweep
 python scripts/train_llama_depth_sweep.py \
-    --config configs/llama-1b-depth-sweep.yaml
+    --model llama-1b \
+    --depths 12 24 48 96 \
+    --norms rmsnorm dyt dytcd \
+    --seq-len 2048 --batch-size 8 --grad-accum 8 \
+    --max-steps 5000 --lr 3e-4 --warmup 500 --weight-decay 0.1 \
+    --sequential \
+    --output-dir runs/depth-sweep
 
 # downstream eval per run
 for d in 12 24 48 96; do

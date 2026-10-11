@@ -15,7 +15,7 @@ breaks RMSNorm in MoE training should be much milder.
 * 8 experts, top-2 routing, aux-loss coefficient 1e-3
 * dim=512, n_layers=8, n_heads=8, seq_len=1024
 * 1000 synthetic-data steps (cheap proxy)
-* Track `expert_cv` (CoV of tokens-per-expert) + per-norm kurtosis
+* Track `expert_cv` (CoV of tokens-per-expert)
 
 **Reproduce:**
 
@@ -34,11 +34,7 @@ FP8-E4M3 overflow rate than RMSNorm activations at the same
 training step.
 
 We run a CPU/GPU simulation of FP8-E4M3 (no real FP8 hardware
-required) and report per-norm:
-
-* mean overflow rate (|x| > 448)
-* mean underflow rate (|x| < smallest normal)
-* mean relative quantization error
+required).
 
 **Reproduce:**
 
@@ -50,10 +46,8 @@ python scripts/check_fp8_stability.py \
 
 ## 3c. Post-training W8A8 PPL drop
 
-**Hypothesis:** because DyT-CD suppresses the "super-active" outlier
-channels via per-channel α_c, naive W8A8 round-to-nearest quantization
-should produce *less* PPL drop on DyT-CD checkpoints than on
-RMSNorm / LayerNorm ones.
+**Hypothesis:** naive W8A8 round-to-nearest quantization should produce
+*less* PPL drop on DyT-CD checkpoints than on RMSNorm / LayerNorm ones.
 
 **Reproduce:**
 

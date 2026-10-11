@@ -76,11 +76,13 @@ class MoELayer(nn.Module):
             scores, indices = logits.softmax(-1).max(dim=-1, keepdim=True)
         else:
             scores, indices = logits.softmax(-1).topk(self.top_k, dim=-1)
+        # Renormalise the selected gate values so they sum to 1 (Switch /
+        # Mixtral convention).
+        scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         # Build a [N, E] sparse one-hot routing tensor
         route = torch.zeros_like(logits).scatter_(-1, indices, scores)
         # Expert computation (vectorized: all experts evaluated, gated by
-        # routing matrix - this is correct but not optimized; for real
-        # benchmarks use Megablocks-style grouped GEMM).
+        # routing matrix).
         # `einsum` (not `F.linear`): the stacked expert weights are 3-D, so
         # each token must be applied to every expert explicitly.
         h1 = torch.einsum("nc,ech->neh", x_flat, self.experts_w1)  # [N, E, H]
@@ -221,7 +223,6 @@ def main():
         if step % args.stats_every == 0:
             act_stats.attach()
         logits, loss, aux, tpe_list = model(x, y, return_aux=True)
-        # Not needed by the CE backward; free it while grads compute.
         del logits
         loss.backward()
         if step % args.stats_every == 0:
@@ -233,11 +234,11 @@ def main():
         opt.step()
         opt.zero_grad(set_to_none=True)
         loss_spike.update(loss.item())
-        history.append({"step": step, "loss": loss.item(), "aux": float(aux),
-                        "expert_cv": exp_cv, "spikes": loss_spike.n_spikes})
+        history.append({"step": step, "loss": loss.item(), "aux": aux.detach().item(),
+                        "expert_cv": exp_cv})
         if step % args.log_every == 0:
-            print(f"  [moe] step={step:4d} loss={loss.item():.4f} aux={float(aux):.4f} "
-                  f"expert_cv={exp_cv:.3f} spikes={loss_spike.n_spikes}", flush=True)
+            print(f"  [moe] step={step:4d} loss={loss.item():.4f} aux={aux.detach().item():.4f} "
+                  f"expert_cv={exp_cv:.3f}", flush=True)
     with open(Path(args.output_dir) / "history.json", "w") as f:
         json.dump(history, f)
     s = act_stats.summary()

@@ -6,7 +6,7 @@ Submodules:
     adasquash.norms       - Normalization layers (LN, RMSNorm, DyT, DyT-C, DyT-D, DyT-CD)
     adasquash.attention   - Attention with optional QK-squashing (DyT-QK variant C)
     adasquash.model       - GPT-style transformer with configurable norm & depth schedule
-    adasquash.utils       - Stability metrics (max|x|, kurtosis, loss-spike counter, etc.)
+    adasquash.utils       - Utility functions
 """
 
 from .norms import (
@@ -17,6 +17,7 @@ from .norms import (
     DyTD,
     DyTCD,
     build_norm,
+    generalized_softsign,
     NORM_REGISTRY,
 )
 from .attention import CausalSelfAttention
@@ -39,6 +40,7 @@ __all__ = [
     "DyTD",
     "DyTCD",
     "build_norm",
+    "generalized_softsign",
     "NORM_REGISTRY",
     "CausalSelfAttention",
     "GPTConfig",

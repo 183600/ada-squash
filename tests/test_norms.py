@@ -27,13 +27,13 @@ import torch
 import torch.nn as nn
 
 from adasquash import (
-    build_norm, NORM_REGISTRY,
+    build_norm, NORM_REGISTRY, generalized_softsign,
     LayerNorm, RMSNorm, DyT, DyTC, DyTD, DyTCD,
     GPTConfig, GPT, build_gpt_124m,
     ActivationStats, LossSpikeCounter, KurtosisMeter, MaxAbsMeter,
     count_parameters, measure_activation_stats,
 )
-from adasquash.attention import CausalSelfAttention
+from adasquash.attention import CausalSelfAttention, apply_rope
 from adasquash.norms import QKSquash
 
 
@@ -70,8 +70,6 @@ def test_norm_preserves_shape_and_dtype(name):
 @pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"])
 def test_norm_gradient_flows(name):
     norm = build_norm(name, 64)
-    # `x` must stay the *leaf* of the graph, otherwise `x.grad` is always
-    # None (the gradient would land on the pre-multiplication tensor).
     x = torch.randn(2, 16, 64, requires_grad=True)
     y = norm(x * 3.0)
     loss = y.pow(2).sum()
@@ -98,6 +96,49 @@ def test_dytcd_output_bounded_by_one():
     assert y.abs().max().item() <= 1.0 + 1e-4
 
 
+def test_softsign_matches_closed_form_where_the_closed_form_is_safe():
+    """The split evaluation must agree with x / (1+|x|^p)^(1/p)."""
+    torch.manual_seed(0)
+    for p in (1.0, 2.0, 4.0):
+        x = torch.randn(4096, dtype=torch.float64) * 2.0
+        ref = x / (x.abs().pow(p) + 1.0).pow(1.0 / p)
+        got = generalized_softsign(x, p)
+        assert torch.allclose(got, ref, atol=1e-12), p
+
+
+@pytest.mark.parametrize("p", [16.0, 64.0, 256.0])
+def test_softsign_saturates_instead_of_overflowing(p):
+    """For large p the layer must saturate to +-1 rather than overflow."""
+    x = torch.tensor([[[-10.0, -4.5, 4.5, 10.0]]], requires_grad=True)
+    y = generalized_softsign(x, p)
+    y.sum().backward()
+    assert torch.isfinite(y).all()
+    assert torch.allclose(y, torch.tensor([[[-1.0, -1.0, 1.0, 1.0]]]), atol=1e-4)
+    assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.parametrize("cls", ["dytc", "dytcd"])
+def test_tanh_equivalent_ablation_produces_finite_loss(cls):
+    """The `p -> infinity == tanh` ablation (p = 64) must not NaN out."""
+    if cls == "dytc":
+        norm = DyTC(8, alpha_init=1.0, p_init=64.0, learnable_p=False)
+    else:
+        norm = DyTCD(8, layer_idx=3, num_layers=12, alpha_0=1.0, p_init=64.0,
+                     learnable_p=False)
+    x = (torch.randn(4, 8, 8) * 8.0).requires_grad_(True)
+    y = norm(x)
+    y.pow(2).sum().backward()
+    assert torch.isfinite(y).all()
+    assert torch.isfinite(x.grad).all()
+    assert y.abs().max().item() <= 1.0 + 1e-4
+
+
+def test_softsign_zero_maps_to_zero():
+    x = torch.zeros(3, 5)
+    assert generalized_softsign(x, 2.0).abs().max().item() == 0.0
+    assert generalized_softsign(x, 64.0).abs().max().item() == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Depth schedule
 # ---------------------------------------------------------------------------
@@ -120,6 +161,77 @@ def test_dytcd_alpha_per_channel_shape():
     a = norm.alpha_per_channel
     assert a.shape == (64,)
     assert (a > 0).all()
+
+
+# ---------------------------------------------------------------------------
+# Rotary embeddings
+# ---------------------------------------------------------------------------
+def _ref_rope(x, pos, inv_freq):
+    """Independent LLaMA-style RoPE for one position."""
+    h = x.shape[-1] // 2
+    th = pos.double() * inv_freq.double()
+    c, s = torch.cos(th), torch.sin(th)
+    xd = x.double()
+    return torch.cat(
+        [xd[..., :h] * c - xd[..., h:] * s, xd[..., h:] * c + xd[..., :h] * s],
+        dim=-1,
+    )
+
+
+def _ref_freqs(head_dim, max_seq_len, base=10000.0):
+    inv = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    t = torch.arange(max_seq_len).float()
+    return inv, t
+
+
+@pytest.mark.parametrize("head_dim,base", [(8, 10000.0), (64, 10000.0), (128, 500000.0)])
+def test_apply_rope_matches_llama_reference(head_dim, base):
+    torch.manual_seed(0)
+    T_ = 12
+    inv, t = _ref_freqs(head_dim, T_, base)
+    freqs = torch.outer(t, inv)
+    fc = torch.polar(torch.ones_like(freqs), freqs)
+    q = torch.randn(1, 2, T_, head_dim)
+    k = torch.randn(1, 2, T_, head_dim)
+    qo, ko = apply_rope(q, k, fc)
+    for i in range(T_):
+        assert torch.allclose(qo[0, 0, i].double(), _ref_rope(q[0, 0, i], t[i], inv), atol=1e-4)
+        assert torch.allclose(ko[0, 0, i].double(), _ref_rope(k[0, 0, i], t[i], inv), atol=1e-4)
+
+
+def test_rope_dimension_to_frequency_assignment():
+    """rotate_half pairs dim j with j + hd//2, so both need inv_freq[j]."""
+    head_dim, T_ = 8, 4
+    inv, t = _ref_freqs(head_dim, T_)
+    fc = torch.polar(torch.ones_like(torch.outer(t, inv)), torch.outer(t, inv))
+    cos = torch.cat([fc[1].real, fc[1].real]).double()
+    expected = torch.cat([torch.cos(inv), torch.cos(inv)]).double()
+    assert torch.allclose(cos, expected, atol=1e-6)
+
+
+def test_rope_is_relative():
+    """<R_pos_i q, R_pos_j k> must depend only on pos_i - pos_j."""
+    torch.manual_seed(0)
+    head_dim, T_ = 16, 16
+    inv, t = _ref_freqs(head_dim, T_)
+    freqs = torch.outer(t, inv)
+    fc = torch.polar(torch.ones_like(freqs), freqs)
+    # the *same* q / k vector placed at every position
+    q = torch.randn(1, 1, 1, head_dim)
+    k = torch.randn(1, 1, 1, head_dim)
+    q_at, k_at = [], []
+    for i in range(T_):
+        qi, ki = apply_rope(q, k, fc[i:i + 1])
+        q_at.append(qi)
+        k_at.append(ki)
+    q_at = torch.cat(q_at, dim=2)
+    k_at = torch.cat(k_at, dim=2)
+    dot = (q_at @ k_at.transpose(-1, -2))[0, 0]
+    for i in range(T_):
+        for j in range(T_):
+            d = t[j] - t[i]
+            ref = (q[0, 0, 0].double() * _ref_rope(k[0, 0, 0], d, inv)).sum()
+            assert torch.allclose(dot[i, j].double(), ref, atol=1e-4), (i, j)
 
 
 # ---------------------------------------------------------------------------
@@ -229,14 +341,17 @@ def test_activation_stats_hooks():
     s = stats.summary()
     stats.detach()
     assert "__summary__" in s
-    assert "mean_kurtosis" in s["__summary__"]
+    # ActivationStats reports per-norm max|x| of the *pre-norm* activations.
+    assert "mean_max_abs" in s["__summary__"]
+    assert "max_max_abs" in s["__summary__"]
+    assert s["__summary__"]["max_max_abs"] >= s["__summary__"]["mean_max_abs"]
 
 
 # ---------------------------------------------------------------------------
-# Throughput sanity
+# Smoke test
 # ---------------------------------------------------------------------------
-def test_throughput_smoke():
-    """Just check that a forward+backward pass doesn't crash on CPU."""
+def test_forward_smoke():
+    """Just check that a forward pass doesn't crash on CPU."""
     model = build_gpt_124m(norm_name="dytcd")
     model.eval()
     x = torch.randint(0, model.cfg.vocab_size, (1, 32))

@@ -143,11 +143,7 @@ class Block(nn.Module):
         freqs_cis: Optional[torch.Tensor] = None,
         return_stats: bool = False,
     ):
-        # Pre-norm style. The residual sum is accumulated into the *fresh*
-        # branch tensor (x + ls*out == ls*out + x, bitwise identical for
-        # finite values), which avoids materializing another [B, T, C]
-        # buffer per residual; the incoming residual `x` is never touched
-        # in place (the pre-norm saved it for backward).
+        # Pre-norm style.
         h = self.norm1(x)
         attn_out, logit_stats = self.attn(
             h, freqs_cis=freqs_cis, return_stats=return_stats
@@ -173,7 +169,6 @@ class MLP(nn.Module):
         super().__init__()
         # SwiGLU: w2(silu(w1 x) * w3 x)
         hidden = int(hidden * 2 / 3)
-        # round up to multiple of 8 for fp8 / TensorCore friendliness
         hidden = (hidden + 7) & ~7
         self.w1 = nn.Linear(dim, hidden, bias=False)
         self.w2 = nn.Linear(hidden, dim, bias=False)
@@ -181,9 +176,7 @@ class MLP(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # swiglu. h1/h3 are kept out-of-place: the SiLU needs its pre-image
-        # for the input grad, so `silu(..., inplace=True)` would make autograd
-        # clone that pre-image (same memory plus a full copy).
+        # swiglu
         h1 = self.w1(x)
         h3 = self.w3(x)
         return self.drop(self.w2(F.silu(h1) * h3))
@@ -230,6 +223,17 @@ class GPT(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
+    @torch.no_grad()
+    def reset_parameters(self, seed: Optional[int] = None):
+        """Re-run (re-)initialization of the shared Linear / Embedding
+        weights from a fixed seed. Norm-owned parameters (alpha, delta,
+        gamma, ...) are left untouched.
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+        self.apply(self._init_weights)
+        return self
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -240,9 +244,6 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
             pos = torch.arange(0, T, device=input_ids.device).unsqueeze(0)
-            # `x` is the fresh embedding output and the embedding backward
-            # does not need it, so the position add can run in place and
-            # skips a full [B, T, C] allocation.
             x.add_(self.pos_emb(pos))
         x = self.drop(x)
 
@@ -282,7 +283,7 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def norm_param_count(self) -> dict:
-        """Return per-norm parameter count, useful for the 'free-ness' story."""
+        """Return per-norm parameter count."""
         out = {}
         for name, m in self.named_modules():
             # Pick out the top-level normalization modules.
