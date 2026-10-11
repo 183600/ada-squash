@@ -78,11 +78,17 @@ class KurtosisMeter:
         new_n = self.n + x.numel()
         if new_n == self.n:
             return
-        x_mean = x.mean().item()
-        x_var = x.var(unbiased=False).item()
+        # Gather all four reduced scalars in one tensor so the forward pass
+        # only syncs the device once instead of once per statistic.
+        x_mean_t = x.mean()
+        x_var_t = x.var(unbiased=False)
+        xc = x - x_mean_t
+        x_m3_t = (xc ** 3).sum()
+        x_m4_t = (xc ** 4).sum()
+        x_mean, x_var, x_m3, x_m4 = torch.stack(
+            [x_mean_t, x_var_t, x_m3_t, x_m4_t]
+        ).tolist()
         x_m2 = x_var * x.numel()
-        x_m3 = ((x - x_mean) ** 3).sum().item()
-        x_m4 = ((x - x_mean) ** 4).sum().item()
         n_a, n_b = self.n, x.numel()
         n = n_a + n_b
         delta = x_mean - self.mean

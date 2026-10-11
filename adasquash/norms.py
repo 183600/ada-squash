@@ -87,7 +87,9 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        return x * self.weight
+        # In-place scale by the per-channel weight: `x` is a fresh
+        # intermediate, so this avoids materializing another [.., C] tensor.
+        return x.mul_(self.weight)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +114,8 @@ class DyT(nn.Module):
         x = torch.tanh(self.alpha * x)
         x = x * self.gamma
         if self.beta is not None:
-            x = x + self.beta
+            # In-place on the freshly-created scaled tensor (no extra alloc).
+            x.add_(self.beta)
         return x
 
 
@@ -165,11 +168,14 @@ class DyTC(nn.Module):
         # For p>=1 we can safely compute |x|^p; for very large |x| the
         # denominator -> |x|^p so the ratio is bounded by 1 in magnitude.
         abs_x = x.abs()
-        denom = (1.0 + abs_x.pow(p)).pow(1.0 / p)
+        # `abs_x.pow(p)` keeps its own output for backward, so we only
+        # reuse the *last* temporary in-place.
+        denom = abs_x.pow(p) + 1.0
+        denom.pow_(1.0 / p)
         x = x / denom
-        x = x * self.gamma
+        x.mul_(self.gamma)
         if self.beta is not None:
-            x = x + self.beta
+            x.add_(self.beta)
         return x
 
 
@@ -240,7 +246,8 @@ class DyTD(nn.Module):
         x = torch.tanh(a * x)
         x = x * self.gamma
         if self.beta is not None:
-            x = x + self.beta
+            # In-place on the freshly-created scaled tensor (no extra alloc).
+            x.add_(self.beta)
         return x
 
 
@@ -319,12 +326,15 @@ class DyTCD(nn.Module):
         # `p` may be a learnable scalar tensor or a buffer; both broadcast.
         p = self.p
         abs_x = x.abs()
-        denom = (1.0 + abs_x.pow(p)).pow(1.0 / p)
+        # `abs_x.pow(p)` keeps its own output for backward, so we only
+        # reuse the *last* temporary in-place.
+        denom = abs_x.pow(p) + 1.0
+        denom.pow_(1.0 / p)
         x = x / denom
 
-        x = x * self.gamma
+        x.mul_(self.gamma)
         if self.beta is not None:
-            x = x + self.beta
+            x.add_(self.beta)
         return x
 
 

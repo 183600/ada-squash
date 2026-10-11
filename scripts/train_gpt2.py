@@ -262,7 +262,7 @@ def main():
         attach_stats = (step % args.stats_every == 0)
         if attach_stats:
             act_stats.attach()
-        loss_acc = 0.0
+        loss_acc = None
         for _ in range(args.grad_accum):
             try:
                 batch = next(data_iter)
@@ -276,10 +276,15 @@ def main():
                 _, loss = model(x, y)
             loss = loss / args.grad_accum
             loss.backward()
-            loss_acc += loss.item()
+            # Accumulate the scalar on-device and sync once at the end of
+            # the micro-batch loop (avoids one host sync per micro-batch).
+            if loss_acc is None:
+                loss_acc = loss.detach()
+            else:
+                loss_acc = loss_acc + loss.detach()
         if attach_stats:
             act_stats.detach()
-        loss_val = loss_acc
+        loss_val = loss_acc.item()
 
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)

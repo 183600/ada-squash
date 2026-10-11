@@ -159,7 +159,11 @@ class MLP(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        # swiglu: h1 and h3 are fresh intermediates, so the SiLU can be
+        # applied in-place (saves one [.., hidden] activation buffer).
+        h1 = self.w1(x)
+        h3 = self.w3(x)
+        return self.drop(self.w2(F.silu(h1, inplace=True) * h3))
 
 
 # ---------------------------------------------------------------------------

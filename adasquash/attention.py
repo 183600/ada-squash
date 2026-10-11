@@ -108,7 +108,10 @@ class CausalSelfAttention(nn.Module):
             q, k = apply_rope(q, k, freqs_cis)
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        logits = torch.matmul(q, k.transpose(-1, -2)) * scale
+        logits = torch.matmul(q, k.transpose(-1, -2))
+        # Scale in-place: logits is a fresh [B, H, T, T] tensor, so this
+        # avoids materializing an extra full-size copy.
+        logits.mul_(scale)
 
         # logit monitoring (useful for the QK-squash ablation). Skipped by
         # default: it forces a device sync and materializes extra [B,H,T,T]
@@ -162,7 +165,9 @@ class RMSNormHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        return x * self.weight
+        # In-place scale by the per-channel weight: `x` is a fresh
+        # intermediate, so this avoids materializing another [.., C] tensor.
+        return x.mul_(self.weight)
 
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor):
