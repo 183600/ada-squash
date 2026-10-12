@@ -45,6 +45,7 @@ def load_ckpt(path: str, device: str = "cuda"):
         p_init=args.get("p_init", 2.0),
         learnable_p=not args.get("no_learnable_p", False),
         learnable_k=not args.get("no_learnable_k", False),
+        beta=args.get("beta", True),
     )
     if args.get("layerscale_init") is not None:
         model_cfg["layerscale_init"] = args["layerscale_init"]

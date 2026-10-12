@@ -349,8 +349,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
             "mean_rel_quant_err_e4m3": 0.0,
             "logit_rel_divergence": rel,
             "logit_nan_under_fp8": logit_nan,
-            "first_nonfinite_layer": first_bad[0] if first_bad else None,
-            "first_overflow_layer": first_over[0] if first_over else None,
+            "first_nonfinite_layer": first_bad_idx,
+            "first_overflow_layer": first_over_idx,
         }
 
     mean_overflow = sum(e["overflow_rate"] for e in quant_errors) / len(quant_errors)

@@ -184,7 +184,7 @@ class MoEGPT(nn.Module):
         )
         self.norm_f = build_norm(
             cfg.norm_name, cfg.dim,
-            **build_norm_kwargs(cfg, cfg.n_layers - 1),
+            **build_norm_kwargs(cfg, cfg.n_layers, is_final_norm=True),
         )
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:

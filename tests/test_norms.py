@@ -578,6 +578,56 @@ def test_dytcd_alpha_clamp_has_a_correct_gradient():
     assert m.delta.grad[0].abs().item() > 0.0
 
 
+def test_dytcd_trains_alpha0_and_k_when_x_and_delta_are_frozen():
+    """`alpha_0` / `k` must receive gradients on their own merit.
+
+    The backward used to compute the alpha chain only inside
+    `needs_input_grad[delta]`, and gated `need_softsign` on x/delta alone, so
+    a run that freezes the input and `delta` (e.g. probing the depth schedule
+    with the delta term ablated) silently got `None` gradients for `alpha_0`
+    and `k` - the depth schedule would never train, with no error to say why.
+    """
+    torch.manual_seed(0)
+    m = DyTCD(6, layer_idx=5, num_layers=12).double()
+    m.delta.requires_grad_(False)
+    x = torch.randn(3, 5, 6, dtype=torch.float64)  # no grad
+    m(x).sum().backward()
+    assert m.alpha_0.grad is not None and m.alpha_0.grad.abs().item() > 0.0
+    assert m.k.grad is not None and m.k.grad.abs().item() > 0.0
+    assert m.delta.grad is None
+    # gamma / beta still train; only the explicitly frozen inputs are None.
+    assert m.gamma.grad is not None
+
+
+def test_dytcd_partial_freeze_matches_the_reference_grads():
+    """With `delta` frozen but x live, the alpha chain must match a recomposition.
+
+    The alpha chain and the x path share `grad_x_scaled`, so gating the chain
+    on the wrong `needs_input_grad` entry corrupts whichever side survives.
+    Every live gradient is compared against a plain-autograd recomposition
+    that treats `delta` as a constant.
+    """
+    torch.manual_seed(1)
+    m = DyTCD(6, layer_idx=5, num_layers=12).double()
+    m.delta.requires_grad_(False)
+    x = torch.randn(3, 5, 6, dtype=torch.float64).requires_grad_(True)
+    m(x).sum().backward()
+
+    def ref(x_, a0_, k_):
+        scale = a0_ * torch.exp(-k_ * m._depth_ratio)
+        alpha_c = torch.addcmul(scale, scale, m.delta.detach()).clamp(min=1e-4)
+        phi = generalized_softsign(alpha_c * x_, m.p.detach())
+        return torch.addcmul(m.beta, phi, m.gamma)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    a0_ref = m.alpha_0.detach().clone().requires_grad_(True)
+    k_ref = m.k.detach().clone().requires_grad_(True)
+    ref(x_ref, a0_ref, k_ref).sum().backward()
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-10)
+    assert torch.allclose(m.alpha_0.grad, a0_ref.grad, atol=1e-10)
+    assert torch.allclose(m.k.grad, k_ref.grad, atol=1e-10)
+
+
 @pytest.mark.parametrize("p", [-2.0, -1e-4, 0.0, 1e-9])
 def test_softsign_exponent_floor_keeps_a_runaway_p_finite(p):
     """A learnable `p` that crosses zero must not NaN the model.
@@ -1876,6 +1926,76 @@ def test_needle_decode_overhead_matches_the_secret_length():
         assert needle_decode_overhead(tok, needle) == (
             len(needle_target_ids(tok, needle)) - 1
         )
+
+
+# ---------------------------------------------------------------------------
+# Config plumbing the model rebuild depends on
+# ---------------------------------------------------------------------------
+def test_beta_config_key_is_not_inverted(tmp_path):
+    """`beta: true` in a YAML config must enable beta, not disable it.
+
+    The alias table inverts the *positive-form* keys because their argparse
+    dests are negative (`use_layerscale` -> `--no-layerscale`). `--no-beta`
+    stores into the positive dest `beta`, so inverting `beta` made a config
+    that asked for beta train without it - and a `beta: false` config train
+    with it - in both the trainer and the depth-sweep launcher.
+    """
+    from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
+    from scripts.train_llama_depth_sweep import _SWEEP_CONFIG_ALIASES
+
+    for aliases in (_TRAIN_CONFIG_ALIASES, _SWEEP_CONFIG_ALIASES):
+        for yaml_value, expected in ((True, True), (False, False)):
+            cfg = tmp_path / "beta.yaml"
+            cfg.write_text(f"beta: {str(yaml_value).lower()}\n")
+            p = argparse.ArgumentParser()
+            p.add_argument("--no-beta", dest="beta", action="store_false",
+                           default=True)
+            apply_config_to_parser(p, str(cfg), aliases)
+            assert p.parse_args([]).beta is expected, (aliases, yaml_value)
+
+
+def test_load_ckpt_rebuilds_a_model_trained_without_beta(tmp_path):
+    """A `--no-beta` checkpoint must reload through `load_ckpt`.
+
+    `beta` is architectural - it decides whether the affine-bias parameter
+    exists at all - and `load_ckpt` rebuilds the module from the recorded
+    args, so omitting it rebuilt the model with `beta=True` and the
+    state_dict load died on the missing `*.beta` keys.
+    """
+    from scripts.eval_downstream import load_ckpt
+
+    cfg = GPTConfig(vocab_size=50304, dim=32, n_layers=1, n_heads=4,
+                    max_seq_len=1024, mlp_ratio=4.0,
+                    norm_name="dytcd", beta=False)
+    model = GPT(cfg)
+    assert model.blocks[0].norm1.beta is None
+    args = dict(norm="dytcd", model="gpt2-124m", no_layerscale=False,
+                alpha_0=0.9, k_init=1.0, alpha_init=0.5, p_init=2.0,
+                no_learnable_p=False, no_learnable_k=False, beta=False,
+                layerscale_init=None, tie_embeddings=None, qk_norm=None,
+                qk_alpha_init=1.0,
+                _depth_override=1, _dim_override=32, _heads_override=4)
+    path = tmp_path / "ckpt.pt"
+    torch.save({"model": model.state_dict(), "args": args, "step": 0}, path)
+    rebuilt, recorded = load_ckpt(str(path), device="cpu")
+    assert rebuilt.blocks[0].norm1.beta is None
+    assert recorded["beta"] is False
+
+
+def test_moe_final_norm_shares_the_dense_final_norm_depth_ratio():
+    """The MoE study's final norm must sit at depth_ratio = 1.0 like the dense GPT's.
+
+    It was built with `layer_idx = n_layers - 1` instead of
+    `is_final_norm=True`, so every depth-conditioned final norm in the MoE
+    comparison ran at depth_ratio = (L-1)/L while the dense baseline ran at
+    1.0 - the two studies would differ on a knob neither reports.
+    """
+    from scripts.train_moe_tiny import MoEGPT
+
+    cfg = GPTConfig(vocab_size=64, dim=32, n_layers=4, n_heads=4,
+                    max_seq_len=16, norm_name="dytcd")
+    assert GPT(cfg).norm_f._depth_ratio == pytest.approx(1.0)
+    assert MoEGPT(cfg, n_experts=2).norm_f._depth_ratio == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

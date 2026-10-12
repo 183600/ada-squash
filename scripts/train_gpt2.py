@@ -198,7 +198,7 @@ _TRAIN_CONFIG_ALIASES = {
     "learnable_k": ("no_learnable_k", True),
     "tie_word_embeddings": ("tie_embeddings", False),
     "bf16": ("no_bf16", True),
-    "beta": ("beta", True),
+    "beta": ("beta", False),
     "alpha_jitter": ("alpha_jitter", False),
 }
 

@@ -78,7 +78,7 @@ _SWEEP_CONFIG_ALIASES = {
     "learnable_k": ("no_learnable_k", True),
     "bf16": ("no_bf16", True),
     "tie_word_embeddings": ("tie_embeddings", False),
-    "beta": ("beta", True),
+    "beta": ("beta", False),
     "alpha_jitter": ("alpha_jitter", False),
 }
 

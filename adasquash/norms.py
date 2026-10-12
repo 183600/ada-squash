@@ -818,7 +818,10 @@ class _DyTCDForward(torch.autograd.Function):
         grad_softsign = grad_out * gamma
 
         need_softsign = (
-            ctx.needs_input_grad[0] or ctx.needs_input_grad[3]
+            ctx.needs_input_grad[0]
+            or ctx.needs_input_grad[1]
+            or ctx.needs_input_grad[2]
+            or ctx.needs_input_grad[3]
         )
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[4]
         phi = None
@@ -835,7 +838,12 @@ class _DyTCDForward(torch.autograd.Function):
 
             # Gradient w.r.t. alpha_c (and thus alpha_0, k, delta)
             # x_scaled = x * alpha_c
-            if ctx.needs_input_grad[3]:
+            need_alpha_chain = (
+                ctx.needs_input_grad[1]
+                or ctx.needs_input_grad[2]
+                or ctx.needs_input_grad[3]
+            )
+            if need_alpha_chain:
                 grad_alpha_c = (grad_x_scaled * x).sum(dim=tuple(range(x.ndim - 1)))
 
                 # alpha_c = clamp_min(scale * (1 + delta), _MIN_ALPHA), scale =
@@ -849,11 +857,12 @@ class _DyTCDForward(torch.autograd.Function):
                 grad_alpha_c = grad_alpha_c * live
 
                 grad_scale = grad_alpha_c * one_plus_delta
-                grad_delta = grad_alpha_c * scale
 
                 # scale = alpha_0 * exp(-k * depth_ratio)
                 # grad_alpha_0 = grad_scale * exp(-k * depth_ratio)
                 # grad_k = grad_scale * alpha_0 * exp(-k * r) * (-r) = -grad_scale * scale * r
+                if ctx.needs_input_grad[3]:
+                    grad_delta = grad_alpha_c * scale
                 if ctx.needs_input_grad[1]:
                     grad_alpha_0 = grad_scale * torch.exp(-k * depth_ratio)
                 if ctx.needs_input_grad[2]:
