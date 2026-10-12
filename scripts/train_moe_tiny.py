@@ -147,7 +147,10 @@ class MoEGPT(nn.Module):
         self.blocks = nn.ModuleList(
             [MoEBlock(cfg, n_experts, i) for i in range(cfg.n_layers)]
         )
-        self.norm_f = build_norm(cfg.norm_name, cfg.dim, **build_norm_kwargs(cfg, 0))
+        self.norm_f = build_norm(
+            cfg.norm_name, cfg.dim,
+            **build_norm_kwargs(cfg, cfg.n_layers - 1),
+        )
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight

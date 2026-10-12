@@ -378,8 +378,11 @@ class GPT(nn.Module):
         """Return per-norm parameter count."""
         out = {}
         for name, m in self.named_modules():
-            # Pick out the top-level normalization modules.
-            if name.endswith((".norm1", ".norm2", ".norm_f")):
+            # Pick out the top-level normalization modules. `norm_f` is a
+            # direct child of GPT, so its name carries no `blocks.<i>.` prefix
+            # - matching it with the leading-dot pattern below would drop the
+            # final norm from the accounting.
+            if name == "norm_f" or name.endswith((".norm1", ".norm2")):
                 cls = m.__class__.__name__
                 out.setdefault(cls, 0)
                 for p in m.parameters(recurse=False):

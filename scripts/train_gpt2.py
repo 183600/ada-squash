@@ -278,8 +278,13 @@ def main():
     t0 = time.time()
     while step < args.max_steps:
         opt.zero_grad(set_to_none=True)
-        # activation stats over one micro-batch per macro-step is enough
-        attach_stats = (step % args.stats_every == 0)
+        # Activation stats over one macro-step is enough. The window is keyed
+        # on the *post-increment* step so that the hooks are attached for
+        # exactly the step whose summary is reported below; keying on the
+        # pre-increment step would attach at step 0/500/1000 but report at
+        # 500/1000/1500, labelling every number with a step it was not
+        # measured on.
+        attach_stats = ((step + 1) % args.stats_every == 0)
         if attach_stats:
             act_stats.attach()
         loss_acc = None

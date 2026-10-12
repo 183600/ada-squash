@@ -76,10 +76,20 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     so only a single pow chain is materialized. This keeps phi in [-1, 1],
     avoids overflow for large p / large |x|, and stays finite for |x| = inf
     (where the naive closed form would divide inf by inf).
+
+    The reciprocal is taken on `w = max(|x|, 1)` rather than on `|x|`
+    directly. `torch.where` masks the *value* of the unused branch, but the
+    backward pass still runs `d/dt (1/t) = -1/t^2` on it, so an exact zero
+    (bf16 underflow of a small activation, a padded/zeroed element, ...) would
+    evaluate `0 * -inf = NaN` and poison every gradient that reaches this
+    layer. Clamping first keeps the unused branch finite; `clamp` itself
+    contributes no gradient below its threshold, so the selected branch is
+    still differentiated exactly and phi'(0) = 1 as the closed form requires.
     """
     t = x.abs()
+    w = t.clamp(min=1.0)
     mask = t > 1.0
-    u = torch.where(mask, t.reciprocal(), t)
+    u = torch.where(mask, w.reciprocal(), t)
     num = torch.where(mask, torch.sign(x), x)
     return num / (u.pow(p) + 1.0).pow(1.0 / p)
 
