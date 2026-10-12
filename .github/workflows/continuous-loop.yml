@@ -154,7 +154,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Run opencode for ~5 hours (3 phases per iteration)
+      - name: Run opencode for ~5 hours (4 phases per iteration)
         timeout-minutes: 300
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
@@ -165,15 +165,17 @@ jobs:
           OUT=/tmp/oc_out.log
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
 
-          # ================= 三阶段提示词 =================
+          # ================= 四阶段提示词 =================
           PROMPT_PERF='优化代码的性能和显存占用。优化只要不会明显降低性能就可以做。不要修改代码逻辑、不要影响实验结果。不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动。'
           PROMPT_BUG='仔细检查代码中是否存在影响实验结果的bug，如果有就修复所有的bug。不要重复修复之前已经修过的bug。不要输出或写入"修复了哪些bug"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动。'
-          PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释）。删除所有多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，绝对不能删除、修改或移动，也不属于“多余的内容”。'
+          PROMPT_APPLY='检查算力申请.md是否有错误，如果有就改好。不要删除或移动算力申请.md。'
+          PROMPT_CLEAN='不要删除、修改或移动算力申请.md——它是算力申请材料，其中的算力规模与预算估算属于申请所需信息，不属于“多余的内容”，也不属于“关于预算、花费的记录”。确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释，但算力申请.md除外）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，绝对不能删除、修改或移动，也不属于“多余的内容”。'
 
           # 每阶段单次调用的最大时长（秒）
           PERF_TIMEOUT=$((60*60))     # 1h
           BUG_TIMEOUT=$((60*60))      # 1h
           CLEAN_TIMEOUT=$((30*60))    # 30m
+          APPLY_TIMEOUT=$((30*60))    # 30m（算力申请.md 检查修复）
 
           # ================= opencode 自带免费模型池 =================
           # 全部来自 opencode 自带 OpenCode Zen provider 的 $0 免费模型，
@@ -293,6 +295,31 @@ jobs:
           fi
           ensure_license
 
+          # ================= 算力申请.md 防删自愈 =================
+          # clean 阶段可能把 算力申请.md 当作“多余内容”删除。
+          # 启动时保存工作区副本；每次提交前校验，一旦被删立即从 HEAD（其次启动副本）恢复，
+          # 保证文件不丢失（允许 apply 阶段的正常修改）。
+          APPLY_PATH="算力申请.md"
+          APPLY_PRISTINE=/tmp/apply_pristine.md
+
+          if [ -f "$APPLY_PATH" ]; then
+            cp "$APPLY_PATH" "$APPLY_PRISTINE"
+            echo "[guard] 算力申请.md 启动副本就绪（$(wc -l < "$APPLY_PRISTINE") 行）"
+          else
+            echo "[warn] 工作区未找到 算力申请.md，防删自愈不可用"
+          fi
+
+          ensure_apply() {
+            [ -f "$APPLY_PATH" ] && return 0
+            if git show "HEAD:${APPLY_PATH}" > /tmp/apply_restore.md 2>/dev/null && [ -s /tmp/apply_restore.md ]; then
+              mv /tmp/apply_restore.md "$APPLY_PATH"
+              echo "[guard] 检测到 算力申请.md 被删除，已从 HEAD 恢复"
+            elif [ -s "$APPLY_PRISTINE" ]; then
+              cp "$APPLY_PRISTINE" "$APPLY_PATH"
+              echo "[guard] 检测到 算力申请.md 被删除，已从启动副本恢复"
+            fi
+          }
+
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
@@ -302,6 +329,7 @@ jobs:
           commit_and_push() {
             ensure_workflow
             ensure_license
+            ensure_apply
             git add -A || true
             git commit -m "auto: iteration $1" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
@@ -312,6 +340,7 @@ jobs:
             echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
             ensure_workflow
             ensure_license
+            ensure_apply
             git add -A || true
             if ! git diff --cached --quiet; then
               git commit -m "auto: partial work saved on shutdown" || true
@@ -413,12 +442,13 @@ jobs:
               break
             fi
 
-            # ----- 三个阶段：perf -> bug -> clean -----
-            for phase in perf bug clean; do
+            # ----- 四个阶段：perf -> bug -> clean -> apply -----
+            for phase in perf bug clean apply; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
                 clean) P="$PROMPT_CLEAN"; T="$CLEAN_TIMEOUT" ;;
+                apply) P="$PROMPT_APPLY"; T="$APPLY_TIMEOUT" ;;
               esac
 
               # 收窄到剩余时间
@@ -474,6 +504,15 @@ jobs:
           if [ -s "$LIC_PRISTINE" ] && { [ ! -f "$LIC" ] || ! cmp -s "$LIC" "$LIC_PRISTINE"; }; then
             cp "$LIC_PRISTINE" "$LIC"
             echo "[guard] 收尾阶段发现 LICENSE 被删/改，已恢复"
+          fi
+          # 防删自愈：收尾提交前恢复被删的 算力申请.md
+          if [ ! -f "算力申请.md" ]; then
+            if git show "HEAD:算力申请.md" > /tmp/apply_restore.md 2>/dev/null && [ -s /tmp/apply_restore.md ]; then
+              mv /tmp/apply_restore.md "算力申请.md"
+            elif [ -s /tmp/apply_pristine.md ]; then
+              cp /tmp/apply_pristine.md "算力申请.md"
+            fi
+            [ -f "算力申请.md" ] && echo "[guard] 收尾阶段发现 算力申请.md 被删，已恢复"
           fi
           git add -A
           git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
