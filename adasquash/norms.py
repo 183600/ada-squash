@@ -383,14 +383,17 @@ class DyTC(_SquashedAffine):
         p_init: float = 2.0,
         learnable_p: bool = True,
         beta: bool = True,
+        alpha_jitter: float = 0.05,
     ):
         super().__init__()
         # Per-channel alpha. Initialized with a tiny random jitter so that
         # channels can diverge from day-1 if the optimizer wants them to.
         alpha = torch.full((dim,), float(alpha_init))
         # Small symmetric jitter, kept well below alpha_init so we start
-        # close to the original DyT operating point.
-        alpha = alpha + 0.05 * torch.randn(dim) * alpha_init
+        # close to the original DyT operating point. Set alpha_jitter=0 for
+        # fully deterministic initialization.
+        if alpha_jitter > 0:
+            alpha = alpha + alpha_jitter * torch.randn(dim) * alpha_init
         self.alpha = nn.Parameter(alpha)
 
         # Curvature exponent p. p=1 = classic softsign, p=2 = smooth

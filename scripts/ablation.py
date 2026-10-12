@@ -43,7 +43,7 @@ from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yam
 ABLATIONS = {
     # ---- Per-channel ----
     "dyt_no_perchannel": dict(norm_name="dyt"),
-    "dytc_perchannel": dict(norm_name="dytc", p_init=2.0, learnable_p=False),
+    "dytc_perchannel": dict(norm_name="dytc", p_init=2.0, learnable_p=False, alpha_jitter=0.0),
     "dytcd_full": dict(norm_name="dytcd"),
     # ---- Depth-cond ----
     # `learnable_k=False` is load-bearing: `k_init=0.0` alone only sets the
@@ -56,11 +56,11 @@ ABLATIONS = {
     "dytcd_ls1e5": dict(norm_name="dytcd", layerscale_init=1e-5),
     "dytcd_ls1e3": dict(norm_name="dytcd", layerscale_init=1e-3),
     # ---- softsign family vs its hard-tanh limit ----
-    "dytc_p1_softsign": dict(norm_name="dytc", p_init=1.0, learnable_p=False),
-    "dytc_p2_softsign": dict(norm_name="dytc", p_init=2.0, learnable_p=False),
-    "dytc_p4_softsign": dict(norm_name="dytc", p_init=4.0, learnable_p=False),
-    "dytc_plearnable": dict(norm_name="dytc", p_init=2.0, learnable_p=True),
-    "dytc_hardtanh_eq": dict(norm_name="dytc", p_init=64.0, learnable_p=False),  # p->inf == hard tanh
+    "dytc_p1_softsign": dict(norm_name="dytc", p_init=1.0, learnable_p=False, alpha_jitter=0.0),
+    "dytc_p2_softsign": dict(norm_name="dytc", p_init=2.0, learnable_p=False, alpha_jitter=0.0),
+    "dytc_p4_softsign": dict(norm_name="dytc", p_init=4.0, learnable_p=False, alpha_jitter=0.0),
+    "dytc_plearnable": dict(norm_name="dytc", p_init=2.0, learnable_p=True, alpha_jitter=0.0),
+    "dytc_hardtanh_eq": dict(norm_name="dytc", p_init=64.0, learnable_p=False, alpha_jitter=0.0),  # p->inf == hard tanh
     # ---- alpha init grid ----
     "dyt_alpha_0.3": dict(norm_name="dyt", alpha_init=0.3),
     "dyt_alpha_0.5": dict(norm_name="dyt", alpha_init=0.5),

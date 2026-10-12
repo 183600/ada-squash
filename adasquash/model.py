@@ -57,6 +57,8 @@ class GPTConfig:
     p_init: float = 2.0
     learnable_p: bool = True
     learnable_k: bool = True
+    beta: bool = True  # output affine bias for DyT-family norms
+    alpha_jitter: float = 0.05  # per-channel alpha init jitter for DyTC
     gradient_checkpointing: bool = False
     # Misc
     pad_token_id: int = 0
@@ -85,7 +87,7 @@ def _cross_entropy_chunk_rows(vocab_size: int) -> int:
     return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
 
 
-def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
+def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0, is_final_norm: bool = False) -> dict:
     """Collect the kwargs a given `norm_name` accepts from a GPTConfig.
 
     The result is passed to `build_norm`, which forwards it to the class
@@ -100,9 +102,22 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
     This deliberately reads `cfg` afresh on every call and keeps no
     module-level state, so that each model in a multi-model process gets
     its own correct configuration.
+
+    Args:
+        cfg: Model configuration
+        layer_idx: Layer index for depth-conditioned norms
+        is_final_norm: If True, this is the final norm (after all blocks).
+                       For depth-conditioned norms, uses depth_ratio=1.0.
     """
     kwargs: dict = {}
+    is_dyt_family = cfg.norm_name in ("dyt", "dytd", "dytc", "dytcd")
     if cfg.norm_name in ("dytd", "dytcd"):
+        if is_final_norm:
+            # Final norm sits after all layers; use depth_ratio = 1.0
+            depth_ratio = 1.0
+            layer_idx = cfg.n_layers  # for logging consistency
+        else:
+            depth_ratio = float(layer_idx) / float(cfg.n_layers)
         kwargs = dict(
             layer_idx=layer_idx,
             num_layers=cfg.n_layers,
@@ -116,9 +131,12 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
         kwargs.update(
             p_init=cfg.p_init, learnable_p=cfg.learnable_p,
             alpha_init=cfg.alpha_init,
+            alpha_jitter=cfg.alpha_jitter,
         )
     if cfg.norm_name == "dyt":
         kwargs.update(alpha_init=cfg.alpha_init)
+    if is_dyt_family and hasattr(cfg, 'beta') and cfg.beta is not None:
+        kwargs.update(beta=cfg.beta)
     return kwargs
 
 
@@ -393,7 +411,7 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
         # Note: norm_kwargs only used by DyT-D / DyT-CD; other norms ignore
         # the extra kwargs silently.
-        norm_kwargs = build_norm_kwargs(cfg, layer_idx)
+        norm_kwargs = build_norm_kwargs(cfg, layer_idx, is_final_norm=False)
 
         self.norm1 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)
         self.attn = CausalSelfAttention(
@@ -566,7 +584,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [Block(cfg, i) for i in range(cfg.n_layers)]
         )
-        self.norm_f = build_norm(cfg.norm_name, cfg.dim, **build_norm_kwargs(cfg, cfg.n_layers - 1))
+        self.norm_f = build_norm(cfg.norm_name, cfg.dim, **build_norm_kwargs(cfg, cfg.n_layers, is_final_norm=True))
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight

@@ -28,6 +28,7 @@ ablations:
     norm: dytc
     p_init: 2.0
     learnable_p: false
+    alpha_jitter: 0.0
   - name: dytcd_full
     norm: dytcd
 
@@ -70,22 +71,27 @@ ablations:
     norm: dytc
     p_init: 1.0
     learnable_p: false
+    alpha_jitter: 0.0
   - name: dytc_p2_softsign
     norm: dytc
     p_init: 2.0
     learnable_p: false
+    alpha_jitter: 0.0
   - name: dytc_p4_softsign
     norm: dytc
     p_init: 4.0
     learnable_p: false
+    alpha_jitter: 0.0
   - name: dytc_plearnable
     norm: dytc
     p_init: 2.0
     learnable_p: true
+    alpha_jitter: 0.0
   - name: dytc_hardtanh_eq
     norm: dytc
     p_init: 64.0
     learnable_p: false
+    alpha_jitter: 0.0
 
   # ---- alpha init ----
   - name: dyt_alpha_0.3

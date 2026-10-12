@@ -78,6 +78,8 @@ _SWEEP_CONFIG_ALIASES = {
     "learnable_k": ("no_learnable_k", True),
     "bf16": ("no_bf16", True),
     "tie_word_embeddings": ("tie_embeddings", False),
+    "beta": ("beta", True),
+    "alpha_jitter": ("alpha_jitter", False),
 }
 
 
@@ -147,6 +149,10 @@ def launch_one(args, depth: int, norm: str, output_dir: Path):
         cmd.append("--no-learnable-k")
     if args.no_layerscale:
         cmd.append("--no-layerscale")
+    if args.beta is False:
+        cmd.append("--no-beta")
+    if args.alpha_jitter != 0.05:
+        cmd += ["--alpha-jitter", str(args.alpha_jitter)]
     if args.gradient_checkpointing:
         cmd.append("--gradient-checkpointing")
     if args.compile:
@@ -219,6 +225,9 @@ def main():
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
     p.add_argument("--no-layerscale", action="store_true")
+    p.add_argument("--no-beta", dest="beta", action="store_false")
+    p.add_argument("--alpha-jitter", type=float, default=0.05,
+                   help="per-channel alpha init jitter for DyTC (0 for deterministic)")
     p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing")
     p.add_argument("--compile", action="store_true", help="enable torch.compile")
     p.add_argument("--compile-mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])

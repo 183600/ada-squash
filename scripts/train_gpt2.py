@@ -198,6 +198,8 @@ _TRAIN_CONFIG_ALIASES = {
     "learnable_k": ("no_learnable_k", True),
     "tie_word_embeddings": ("tie_embeddings", False),
     "bf16": ("no_bf16", True),
+    "beta": ("beta", True),
+    "alpha_jitter": ("alpha_jitter", False),
 }
 
 
@@ -316,6 +318,10 @@ def main():
     p.add_argument("--p-init", type=float, default=2.0)
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
+    p.add_argument("--no-beta", dest="beta", action="store_false",
+                   help="disable output affine bias in DyT-family norms")
+    p.add_argument("--alpha-jitter", type=float, default=0.05,
+                   help="per-channel alpha init jitter for DyTC (0 for deterministic)")
     p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing")
     # Embedding tying is per-model: GPT-2 ties, LLaMA does not. The builders
     # already encode the right default, so the flag is tri-state - `None`
@@ -390,6 +396,8 @@ def main():
         p_init=args.p_init,
         learnable_p=not args.no_learnable_p,
         learnable_k=not args.no_learnable_k,
+        beta=args.beta,
+        alpha_jitter=args.alpha_jitter,
         gradient_checkpointing=args.gradient_checkpointing,
     )
     if args.layerscale_init is not None:
