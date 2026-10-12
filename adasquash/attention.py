@@ -165,8 +165,8 @@ class CausalSelfAttention(nn.Module):
         if cache is None or cache[0] != key:
             f_real = freqs_cis.real
             f_imag = freqs_cis.imag
-            cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
-            sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
+            cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
+            sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
             self._rope_cache = (key, freqs_cis, cos, sin)
         return self._rope_cache[2], self._rope_cache[3]
 
