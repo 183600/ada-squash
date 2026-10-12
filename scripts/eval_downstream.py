@@ -157,6 +157,7 @@ def needle_in_haystack(
 
     n_correct = 0
     n_run = 0
+    last_logits = getattr(model, "last_position_logits", None)
     for _ in range(n_trials):
         body_len = context_len - len(needle_ids) - len(question_ids) - 2
         # Too short to hold even one haystack repeat: returning 0.0 here is
@@ -173,23 +174,32 @@ def needle_in_haystack(
         # Insert needle at a random position
         pos = rng.randint(0, max(1, len(body) - 1))
         full = body[:pos] + needle_ids + body[pos:] + question_ids
-        x = torch.tensor(full, device=device).unsqueeze(0)
         n_run += 1
         # Greedy-decode the whole secret; stop as soon as it diverges.
+        # The decode buffer is allocated once at its final length and written
+        # in place, so growing the context by one token is an O(1) store.
         generated: list[int] = []
         correct = True
-        ctx = x
+        buf = torch.empty(
+            (1, len(full) + len(target_ids)), dtype=torch.long, device=device
+        )
+        buf[0, : len(full)] = torch.tensor(full, dtype=torch.long, device=device)
+        n = len(full)
         with torch.no_grad():
             for want in target_ids:
-                logits, _ = model(ctx)
-                nxt = int(logits[0, -1].argmax(-1).item())
+                ctx = buf[:, :n]
+                if last_logits is not None:
+                    step_logits = last_logits(ctx)
+                else:
+                    step_logits, _ = model(ctx)
+                    step_logits = step_logits[:, -1]
+                nxt = int(step_logits[0].argmax(-1).item())
                 generated.append(nxt)
                 if nxt != want:
                     correct = False
                     break
-                ctx = torch.cat(
-                    [ctx, torch.tensor([[nxt]], device=device)], dim=1
-                )
+                buf[0, n] = nxt
+                n += 1
         n_correct += int(correct)
     if n_run == 0:
         raise ValueError("needle test produced no trials")

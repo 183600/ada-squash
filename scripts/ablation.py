@@ -157,10 +157,11 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        loss_spike.update(loss.item())
-        losses.append(loss.item())
+        loss_val = loss.item()
+        loss_spike.update(loss_val)
+        losses.append(loss_val)
         if step % args.log_every == 0:
-            print(f"  [step {step:4d}] loss={loss.item():.4f}", flush=True)
+            print(f"  [step {step:4d}] loss={loss_val:.4f}", flush=True)
 
     if not losses:
         raise ValueError(f"ablation '{name}' produced no steps")

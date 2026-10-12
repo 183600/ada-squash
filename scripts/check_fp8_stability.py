@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -69,6 +68,17 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     Emulate FP8 by clamping + rounding to the nearest representable value.
     This is a coarse approximation but reproduces the *overflow / underflow*
     behaviour that's the actual subject of the stability check.
+
+    Algebraically it is `sign(x) * round(|x| * L / 2**exp) * 2**exp / L`
+    with `L = 2**mantissa_bits` and `exp = floor(log2(|x|))`. `frexp`
+    supplies `|x| == m * 2**e` with `m` in [0.5, 1), so `2*|m|` is exactly
+    `|x| / 2**exp` and the whole evaluation reduces to integer-scaled
+    rounding plus one `ldexp` - which also folds the trailing `/ L` into the
+    exponent, because `L` is a power of two. The signed mantissa that `frexp`
+    returns carries the sign through for free.
+
+    Flush-to-zero is decided on the same exponent: a value is sub-normal
+    exactly when `floor(log2(|x|)) < 2 - 2**(exp_bits-1)`.
     """
     # Keep the caller's dtype: rebinding `x` to the fp32 copy would make the
     # return type always fp32, so under a bf16 autocast (the regime FP8
@@ -77,32 +87,21 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     # the caller believes it is.
     in_dtype = x.dtype
     x = x.float()
-    # Clamp to the representable range.
-    x_clamped = x.clamp(-max_val, max_val)
-    # Round to the nearest mantissa increment (very rough).
-    # Smallest normal magnitude:
-    min_norm = fp8_min_normal(exp_bits)
-    # Subnormal regime: we treat anything below min_norm as flush-to-zero
-    # (matching FP8 hardware behaviour on most training cards).
-    flushed = torch.where(x_clamped.abs() < min_norm, torch.zeros_like(x_clamped), x_clamped)
-    # Mantissa quantization: 2^mantissa_bits levels per binade.
-    sign = flushed.sign()
-    abs_x = flushed.abs()
-    # Compute exponent. `abs_x` is already clamped to `max_val`, so this
-    # upper clamp only matters for the rounding edge; keep it on an integer
-    # binade so `2**exp` stays a power of two.
-    exp = torch.floor(torch.log2(abs_x.clamp(min=1e-30)))
-    exp = exp.clamp(max=math.floor(math.log2(max_val)))
-    # Round the mantissa on the true IEEE grid: with `mantissa_bits`
-    # explicit bits there are 2^mantissa_bits uniformly spaced values in
-    # [1, 2), i.e. a step of 2^-mantissa_bits (E4M3: 1/8, E5M2: 1/4).
-    mant = abs_x / (2.0 ** exp)  # in [1, 2)
-    levels = 2 ** mantissa_bits
-    mant_q = torch.round((mant - 1.0) * levels) / levels + 1.0
-    quant = sign * mant_q * (2.0 ** exp)
-    # Restore zero where flushed
-    quant = torch.where(flushed == 0, torch.zeros_like(quant), quant)
-    return quant.to(in_dtype)
+    levels = float(2 ** mantissa_bits)
+    a = x.clamp(-max_val, max_val)
+    # Smallest normal magnitude, expressed directly as an exponent threshold
+    # on the shifted `exp` below (the shift is `1 + mantissa_bits`).
+    min_exp = (2 - (1 << (exp_bits - 1))) - mantissa_bits
+    mant, exp = torch.frexp(a)
+    exp.sub_(1 + mantissa_bits)
+    # Round `2 * m * L` onto the FP8 grid; `m * 2 * L` is exact in fp32 for
+    # every supported `mantissa_bits`.
+    mant.mul_(2.0 * levels)
+    mant.round_()
+    # Sub-normals are not representable; frexp maps them (and zero) below the
+    # threshold, so a single masked fill covers both.
+    mant.masked_fill_(exp < min_exp, 0.0)
+    return torch.ldexp(mant, exp).to(in_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -198,27 +197,34 @@ def measure_fp8_divergence(model, x, norm_name: str):
     ranges = []
     fp8_e4m3_min = fp8_min_normal(4)
 
-    def make_range_hook():
+    def make_stat_hook():
+        """One hook feeding both the range table and the quant-error table.
+
+        They used to be registered separately, which meant `out.abs()` (a
+        full-size temporary) and its reductions were evaluated twice per norm
+        for identical inputs.
+        """
         def hook(module, inp, out):
             x_in = inp[0] if isinstance(inp, tuple) and inp else None
+            cls_name = module.__class__.__name__
+            has_in = torch.is_tensor(x_in)
+            abs_out = out.abs()
+            max_abs_out = abs_out.max().item()
+            abs_in = x_in.abs() if has_in else None
             ranges.append({
-                "module": module.__class__.__name__,
-                "max_abs_in": x_in.abs().max().item() if torch.is_tensor(x_in) else 0.0,
-                "max_abs_out": out.abs().max().item(),
-                "kurtosis_in": _excess_kurtosis(x_in) if torch.is_tensor(x_in) else 0.0,
+                "module": cls_name,
+                "max_abs_in": abs_in.max().item() if has_in else 0.0,
+                "max_abs_out": max_abs_out,
+                "kurtosis_in": _excess_kurtosis(x_in) if has_in else 0.0,
             })
-        return hook
-
-    def make_q_hook():
-        def hook(module, inp, out):
             # out is the post-norm activation
             q = to_fp8_e4m3(out)
-            denom = out.abs().mean().item() + 1e-6
+            denom = abs_out.mean().item() + 1e-6
             quant_errors.append({
-                "module": module.__class__.__name__,
-                "max_abs": out.abs().max().item(),
-                "overflow_rate": (out.abs() > 448).float().mean().item(),
-                "underflow_rate": (out.abs() < fp8_e4m3_min).float().mean().item() if out.numel() else 0.0,
+                "module": cls_name,
+                "max_abs": max_abs_out,
+                "overflow_rate": (abs_out > FP8_E4M3_MAX).float().mean().item(),
+                "underflow_rate": (abs_out < fp8_e4m3_min).float().mean().item() if out.numel() else 0.0,
                 "rel_err": (q - out).abs().mean().item() / denom,
             })
         return hook
@@ -249,8 +255,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
 
     for name, m in model.named_modules():
         if m.__class__.__name__ in {"LayerNorm", "RMSNorm", "DyT", "DyTC", "DyTD", "DyTCD"}:
-            handles.append(m.register_forward_hook(make_range_hook()))
-            handles.append(m.register_forward_hook(make_q_hook()))
+            handles.append(m.register_forward_hook(make_stat_hook()))
 
     block_handles = [
         blk.register_forward_hook(make_block_hook(i))
@@ -327,15 +332,17 @@ def measure_fp8_divergence(model, x, norm_name: str):
 
 def _excess_kurtosis(x: torch.Tensor) -> float:
     """Excess kurtosis of a tensor, in fp64 for stability."""
-    x = x.detach().float().flatten()
-    if x.numel() < 4:
+    xd = x.detach().double().flatten()
+    if xd.numel() < 4:
         return 0.0
-    xd = x.double()
-    m = xd.mean()
-    v = (xd - m).pow(2).mean()
-    if v <= 0:
+    # `torch.var_mean` returns `(variance, mean)` in that order.
+    var, mean = torch.var_mean(xd, unbiased=False)
+    if var <= 0:
         return 0.0
-    return ((xd - m).pow(4).mean() / (v * v) - 3.0).item()
+    d2 = xd - mean
+    d2.mul_(d2)
+    d2.mul_(d2)
+    return (d2.mean() / (var * var) - 3.0).item()
 
 
 def main():

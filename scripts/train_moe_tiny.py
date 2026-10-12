@@ -86,17 +86,36 @@ class MoELayer(nn.Module):
         scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         # Build a [N, E] sparse one-hot routing tensor
         route = torch.zeros_like(logits).scatter_(-1, indices, scores)
-        # Expert computation (vectorized: all experts evaluated, gated by
-        # routing matrix).
-        # `einsum` (not `F.linear`): the stacked expert weights are 3-D, so
-        # each token must be applied to every expert explicitly.
-        h1 = torch.einsum("nc,ech->neh", x_flat, self.experts_w1)  # [N, E, H]
-        h3 = torch.einsum("nc,ech->neh", x_flat, self.experts_w3)  # [N, E, H]
-        h = F.silu(h1)
-        h.mul_(h3)  # [N, E, H] - in place, silu only needs its own input
-        y_e = torch.einsum("neh,ehc->nec", h, self.experts_w2)  # [N, E, C]
-        # Apply routing weights
-        y = (y_e * route.unsqueeze(-1)).sum(dim=1)  # [N, C]
+        # Expert computation. Tokens are grouped by the expert(s) they route
+        # to, so each expert runs its GEMMs on the [n_e, C] slice that
+        # actually selects it rather than on all N tokens. The three stacked
+        # expert weights stay as [E, ...]; `w1[e]` / `w3[e]` / `w2[e]` are
+        # the [C, H] / [C, H] / [H, C] matrices of expert `e`, matching the
+        # `...ech` / `...ehc` index order the einsum form used.
+        n_tokens = x_flat.shape[0]
+        n_experts = self.n_experts
+        k = self.top_k
+        flat_expert = indices.reshape(-1)              # [N * k]
+        flat_token = torch.arange(n_tokens, device=x.device).repeat_interleave(k)
+        flat_gate = scores.reshape(-1)                 # [N * k]
+        # Sort by expert id so each expert's (token, gate) rows are contiguous.
+        order = flat_expert.argsort()
+        token_of = flat_token[order]
+        gate_of = flat_gate[order]
+        ends = flat_expert.bincount(minlength=n_experts).cumsum(0).tolist()
+
+        y = x_flat.new_zeros(n_tokens, C)
+        start = 0
+        for e in range(n_experts):
+            end = ends[e]
+            n_e = end - start
+            if n_e:
+                tok = token_of[start:end]
+                gate = gate_of[start:end].unsqueeze(-1)  # [n_e, 1]
+                xe = x_flat.index_select(0, tok)         # [n_e, C]
+                h = F.silu(xe @ self.experts_w1[e]) * (xe @ self.experts_w3[e])
+                y.index_add_(0, tok, (h @ self.experts_w2[e]) * gate)
+            start = end
         y = self.drop(y)
         y = y.view(B, T, C)
 
@@ -108,7 +127,6 @@ class MoELayer(nn.Module):
         # exactly that fraction (the gate weights of the top-k experts sum
         # to one).
         tokens_per_expert = route.sum(0)  # [E]
-        n_tokens = x_flat.shape[0]
         f_i = tokens_per_expert / n_tokens
         p_i = logits.softmax(-1).mean(dim=0)
         aux = self.n_experts * (f_i * p_i).sum()

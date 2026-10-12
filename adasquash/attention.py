@@ -45,6 +45,7 @@ class CausalSelfAttention(nn.Module):
         self.dim = dim
         self.qk_norm = qk_norm
         self._rope_cache: Optional[tuple] = None
+        self._tril_cache: Optional[tuple] = None
 
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
@@ -111,11 +112,11 @@ class CausalSelfAttention(nn.Module):
             with torch.no_grad():
                 logits = torch.matmul(q, k.transpose(-1, -2))
                 logits.mul_(scale)
-                causal_mask = torch.triu(
-                    torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
-                )
-                valid = logits.masked_fill(causal_mask, float("-inf"))
-                valid = valid[valid != float("-inf")]
+                # Only the causal triangle is ever read, so the upper triangle
+                # is selected directly instead of being overwritten with -inf
+                # first (which cost a full-size masked copy of `logits`).
+                keep = self._tril_mask(T, x.device)
+                valid = logits[keep]
                 if valid.numel():
                     abs_logits = valid.abs()
                     logit_abs_mean = abs_logits.mean().item()
@@ -140,6 +141,15 @@ class CausalSelfAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, T, C)
         out = self.proj_drop(self.proj(out))
         return out, stats
+
+    def _tril_mask(self, T: int, device) -> torch.Tensor:
+        """Lower-triangular boolean mask `[T, T]`, cached per (T, device)."""
+        cache = self._tril_cache
+        if cache is None or cache[0] != (T, device):
+            mask = torch.ones(T, T, device=device, dtype=torch.bool).tril()
+            cache = ((T, device), mask)
+            self._tril_cache = cache
+        return cache[1]
 
     def _rope_tables(self, freqs_cis: torch.Tensor):
         """Return the expanded (cos, sin) rotary tables, cached per

@@ -389,6 +389,7 @@ class GPT(nn.Module):
         input_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         return_stats: bool = False,
+        last_position_only: bool = False,
     ):
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
@@ -404,6 +405,10 @@ class GPT(nn.Module):
             if return_stats:
                 all_logit_stats.append(ls)
         x = self.norm_f(x)
+        if last_position_only:
+            # The [B, T, V] logit block dwarfs every other activation in the
+            # model; decoding / scoring only the final position never needs it.
+            x = x[:, -1:]
         logits = self.lm_head(x)
 
         if targets is None:
@@ -411,13 +416,23 @@ class GPT(nn.Module):
         else:
             loss = cross_entropy_mean(
                 logits.view(-1, logits.size(-1)),
-                targets.view(-1),
+                (targets[:, -1:] if last_position_only else targets).view(-1),
                 ignore_index=self.cfg.ignore_index,
             )
 
         if not return_stats:
             return logits, loss
         return logits, loss, all_logit_stats
+
+    def last_position_logits(
+        self, input_ids: torch.Tensor, return_stats: bool = False
+    ) -> torch.Tensor:
+        """Logits for the final position only, shaped `[B, V]`."""
+        out = self.forward(
+            input_ids, targets=None, return_stats=return_stats,
+            last_position_only=True,
+        )
+        return out[0][:, -1]
 
     @torch.no_grad()
     def num_params(self, trainable_only: bool = False) -> int:

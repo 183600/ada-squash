@@ -155,20 +155,16 @@ def compute_ce_sum(model, batch, target, device="cuda"):
     model.eval()
     batch = batch.to(device)
     target = target.to(device)
-    # Ask the model for logits only; the loss it would compute internally is
-    # recomputed below so that the mask matches the shift convention exactly.
-    logits, _ = model(batch)
-    # logits: [B, T, V]
-    ce = torch.nn.functional.cross_entropy(
-        logits.view(-1, logits.size(-1)),
-        target.view(-1),
-        reduction="sum",
-        ignore_index=model.cfg.ignore_index,
-    )
     n = (target != model.cfg.ignore_index).sum().item()
     if n == 0:
         raise ValueError("probe batch contains no valid target tokens")
-    return ce.item(), n
+    # The model's own loss is already the mean over the non-ignored targets
+    # and evaluates the [N, V] logit block in row chunks (see
+    # `cross_entropy_mean`), so scaling it back up by `n` gives the same sum
+    # without ever allocating a full-length log-softmax buffer for the block.
+    logits, loss = model(batch, target)
+    del logits
+    return loss.item() * n, n
 
 
 def compute_ppl(model, batch, target, device="cuda"):

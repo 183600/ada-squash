@@ -39,7 +39,9 @@ class MaxAbsMeter:
 
     def update(self, x: torch.Tensor):
         with torch.no_grad():
-            v = x.abs().amax().item()
+            # `abs()` would materialise a full-size copy of the activation;
+            # the extremal magnitude is max(max(x), -min(x)) instead.
+            v = torch.maximum(x.max(), -x.min()).item()
         if v > self.value:
             self.value = v
         self.count += 1
@@ -74,11 +76,14 @@ class KurtosisMeter:
         # Use the formulas from:
         #  Pébay, "Formulas for Robust, One-Pass Parallel Computation of
         #  Covariances and Arbitrary-Order Statistical Moments", 2008.
-        new_n = self.n + x.numel()
+        n_b = x.numel()
+        new_n = self.n + n_b
         if new_n == self.n:
             return
-        x_mean_t = x.mean()
-        x_var_t = x.var(unbiased=False)
+        # A single fused pass for the first two moments instead of two
+        # independent reductions over `x`. `torch.var_mean` returns
+        # `(variance, mean)` in that order.
+        x_var_t, x_mean_t = torch.var_mean(x, unbiased=False)
         xc = x - x_mean_t
         xc2 = xc * xc
         x_m3_t = (xc * xc2).sum()
@@ -86,9 +91,9 @@ class KurtosisMeter:
         x_mean, x_var, x_m3, x_m4 = torch.stack(
             [x_mean_t, x_var_t, x_m3_t, x_m4_t]
         ).tolist()
-        x_m2 = x_var * x.numel()
-        n_a, n_b = self.n, x.numel()
-        n = n_a + n_b
+        x_m2 = x_var * n_b
+        n_a, n_b_ = self.n, n_b
+        n = n_a + n_b_
         delta = x_mean - self.mean
         if n_a == 0:
             self.mean = x_mean
@@ -100,21 +105,21 @@ class KurtosisMeter:
         delta_ab = delta * delta
         delta_ab2 = delta_ab * delta_ab
         # M2 update
-        new_M2 = self.M2 + x_m2 + delta_ab * n_a * n_b / n
+        new_M2 = self.M2 + x_m2 + delta_ab * n_a * n_b_ / n
         # M3 update
         new_M3 = (
             self._M3 + x_m3
-            + delta_ab * delta * (n_a * n_b * (n_a - n_b) / (n * n))
-            + 3.0 * delta * (n_a * x_m2 - n_b * self.M2) / n
+            + delta_ab * delta * (n_a * n_b_ * (n_a - n_b_) / (n * n))
+            + 3.0 * delta * (n_a * x_m2 - n_b_ * self.M2) / n
         )
         # M4 update
         new_M4 = (
             self.M4 + x_m4
-            + delta_ab2 * (n_a * n_b * (n_a * n_a - n_a * n_b + n_b * n_b) / (n ** 3))
-            + 6.0 * delta_ab * (n_a * n_a * x_m2 + n_b * n_b * self.M2) / (n * n)
-            + 4.0 * delta * (n_a * x_m3 - n_b * self._M3) / n
+            + delta_ab2 * (n_a * n_b_ * (n_a * n_a - n_a * n_b_ + n_b_ * n_b_) / (n ** 3))
+            + 6.0 * delta_ab * (n_a * n_a * x_m2 + n_b_ * n_b_ * self.M2) / (n * n)
+            + 4.0 * delta * (n_a * x_m3 - n_b_ * self._M3) / n
         )
-        self.mean = (self.mean * n_a + x_mean * n_b) / n
+        self.mean = (self.mean * n_a + x_mean * n_b_) / n
         self.M2 = new_M2
         self._M3 = new_M3
         self.M4 = new_M4
@@ -248,13 +253,18 @@ def markov_batch(
     Returns `(x, y)` with `y[:, -1] == ignore_index`: the final position has
     no successor and is masked out of the loss.
     """
-    cur = torch.randint(0, n_states, (batch_size, 1), generator=rng, device=device)
-    states = [cur]
-    for _ in range(1, seq_len):
-        jump = torch.randint(0, max_jump, (batch_size, 1), generator=rng, device=device)
-        states.append((cur + jump) % n_states)
-        cur = states[-1]
-    x = torch.cat(states, dim=1)
+    start = torch.randint(0, n_states, (batch_size, 1), generator=rng, device=device)
+    if seq_len > 1:
+        # The walk is cumulative: s_t = (s_0 + sum_{i<=t} j_i) mod n, and
+        # `(a + b) mod n == ((a mod n) + b) mod n`, so every intermediate
+        # reduction collapses into one cumsum over the jump draw.
+        jumps = torch.randint(
+            0, max_jump, (batch_size, seq_len - 1), generator=rng, device=device
+        )
+        walk = (start + jumps.cumsum(dim=1)).remainder_(n_states)
+        x = torch.cat([start, walk], dim=1)
+    else:
+        x = start
     y = torch.full(
         (batch_size, seq_len), ignore_index, dtype=torch.long, device=device
     )
