@@ -2,13 +2,8 @@ name: Continuous Loop
 
 on:
   workflow_dispatch:
-  # 每 5 分钟一次「心跳」+ 下面 concurrency 排队，保证「一个 job 结束后立刻触发下一个」：
-  # 任何时刻组内最多 1 个 running + 1 个 pending；当前 run 无论以何种方式结束
-  # （成功 / 失败 / 被取消 / runner 意外宕机），队列中的下一个 run 都会在几秒内开始。
-  # 即使收尾的 self-dispatch 步骤被 GitHub 跳过（runner 宕机时连 if: always()
-  # 步骤也不会执行），下一次心跳也能在 ≤5 分钟内补位续跑，链条永不断。
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '0 */6 * * *'
 
 concurrency:
   group: continuous-loop
@@ -548,36 +543,6 @@ jobs:
         run: |
           set +e
           BRANCH="${GITHUB_REF_NAME:-master}"
-
-          # 派发前最新 run 的 id，用来确认新 run 确实进入队列
-          BEFORE=$(gh run list --workflow=continuous-loop.yml --limit 1 \
-                    --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null || echo 0)
-          echo "[info] newest run before dispatch: #${BEFORE}"
-
-          # 重试 3 次：瞬时 API 故障不再打断链条
-          DISPATCHED=0
-          for attempt in 1 2 3; do
-            if gh workflow run continuous-loop.yml --ref "$BRANCH"; then
-              echo "[ok] dispatch accepted on ${BRANCH} (attempt ${attempt})"
-              DISPATCHED=1
-              break
-            fi
-            echo "[warn] dispatch attempt ${attempt} failed, retry in 15s"
-            sleep 15
-          done
-
-          if [ "$DISPATCHED" -eq 1 ]; then
-            # 最多等 60 秒，确认新 run 已出现在队列中
-            for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-              sleep 5
-              AFTER=$(gh run list --workflow=continuous-loop.yml --limit 1 \
-                        --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null || echo 0)
-              if [ "$AFTER" != "0" ] && [ "$AFTER" != "$BEFORE" ]; then
-                echo "[ok] next run #${AFTER} queued — loop continues"
-                exit 0
-              fi
-            done
-            echo "[warn] dispatch accepted but no new run visible yet"
-          fi
-
-          echo "[warn] self-dispatch failed; */5 cron heartbeat will start the next run"
+          gh workflow run continuous-loop.yml --ref "$BRANCH" \
+            && echo "next run dispatched on ${BRANCH}" \
+            || echo "[warn] dispatch failed, cron fallback will pick up"
