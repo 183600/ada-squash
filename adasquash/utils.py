@@ -1,5 +1,5 @@
 """
-Stability / efficiency metrics for the DyT++ study.
+Stability metrics for the DyT++ study.
 
 Provides:
    * ActivationStats       - aggregated max|x| and kurtosis over all

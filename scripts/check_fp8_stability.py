@@ -12,7 +12,7 @@ We measure:
     non-finite
 
 This script is a CPU/GPU pure-python simulation - it does NOT need real
-FP8 hardware (e.g. H100 FP8).
+FP8 hardware.
 
 Usage:
     python scripts/check_fp8_stability.py --norms ln rmsnorm dyt dytc dytd dytcd
