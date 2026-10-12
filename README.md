@@ -245,9 +245,15 @@ x_hat = α_c,l · x
 y    = γ · φ + β
 ```
 
-* δ_c is initialized to **zero**, so a trained DyT-D checkpoint can be
-  warm-started into DyT-CD with no accuracy hit - this is the "free
-  upgrade" path that makes ablations clean.
+* δ_c is initialized to **zero**, so the per-channel factor starts at
+  `α_c,l = α_l` (no per-channel deviation). That makes a trained DyT-D
+  checkpoint a usable *warm start* for the shared `α_0`, `k`, `γ`, `β`,
+  but the two layers are **not** functionally identical: DyT-D squashes
+  with `tanh`, while DyT-CD squashes with the generalized softsign and a
+  learnable `p`. The transfer is therefore not a lossless "free upgrade",
+  and the `dytd → dytcd` row of the ablation matrix bundles the
+  per-channel axis with the activation-family change (see
+  `configs/ablation-matrix.yaml`).
 
 ### DyT-QK — Variant C: attention logit squashing
 

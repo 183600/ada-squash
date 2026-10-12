@@ -467,10 +467,13 @@ class DyTCD(_SquashedAffine):
         else:
             self.register_buffer("k", torch.tensor(float(k_init)))
 
-        # Per-channel modulation, initialized to *zero* so the layer starts
-        # exactly as DyT-D would. This guarantees a smooth optimization
-        # trajectory when the channel branch is added on top of a trained
-        # DyT-D checkpoint, and makes ablation easy.
+        # Per-channel modulation, initialized to *zero* so the per-channel
+        # factor starts at alpha_c,l == alpha_l (no per-channel deviation).
+        # A trained DyT-D checkpoint can then seed the shared alpha_0 / k /
+        # gamma / beta, but the layers are *not* equivalent: DyT-D applies
+        # tanh while this layer applies the generalized softsign with a
+        # learnable p, so the transfer is a warm start, not a lossless
+        # upgrade.
         self.delta = nn.Parameter(torch.zeros(dim))
 
         if learnable_p:

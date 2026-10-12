@@ -41,13 +41,16 @@ ablations:
     learnable_k: false
   - name: dytd_full
     norm: dytd
-  # `dytcd_full` (above) is the combined reference for the depth axis:
-  # against `dytd_k0_no_depth_schedule` it isolates the depth schedule,
-  # because those two rows differ only in whether k is active.
+  # The depth schedule is isolated by `dytd_full` vs
+  # `dytd_k0_no_depth_schedule`: both rows are plain `dytd`, so they differ
+  # only in whether k is active (and its value).
   #
-  # It does NOT isolate the per-channel axis against `dytd_full`: `dytcd`
-  # also replaces the tanh activation with the generalized softsign and a
-  # learnable p, so that delta bundles per-channel alpha with the activation
+  # `dytcd_full` (above) is the combined A+B layer, not a drop-in for either
+  # single-axis reference. Against `dytd_full` it does NOT isolate the
+  # per-channel axis, and against `dytd_k0_no_depth_schedule` it does NOT
+  # isolate the depth schedule: `dytcd` also replaces the tanh activation
+  # with the generalized softsign and a learnable p, and adds the delta
+  # vector, so those contrasts bundle per-channel alpha with the activation
   # family. Use the `dytc_*` rows below to sweep the activation family on the
   # per-channel axis, and the `dyt*` rows above to isolate the alpha axis.
 

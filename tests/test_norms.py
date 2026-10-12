@@ -884,8 +884,7 @@ def test_ablation_matrix_depth_row_disables_the_schedule():
     )
 
 
-
-
+def test_yaml_config_overrides_parser_defaults():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
