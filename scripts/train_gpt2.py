@@ -215,8 +215,7 @@ def main():
     p.add_argument("--no-learnable-k", action="store_true")
     # Embedding tying is per-model: GPT-2 ties, LLaMA does not. The builders
     # already encode the right default, so the flag is tri-state - `None`
-    # means "leave the builder's default alone". The previous
-    # `store_true, default=True` could never turn anything off.
+    # means "leave the builder's default alone".
     p.add_argument("--tie-embeddings", dest="tie_embeddings",
                    action="store_true", default=None,
                    help="tie input/output embeddings (default: GPT-2 yes, LLaMA no)")
@@ -342,7 +341,6 @@ def main():
     # Stability meters
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter(rel_threshold=0.20, abs_threshold=0.05)
-    _ = loss_spike  # placeholder - keep minimal logging
 
     # Logging setup
     os.makedirs(args.output_dir, exist_ok=True)
@@ -369,10 +367,7 @@ def main():
         opt.zero_grad(set_to_none=True)
         # Activation stats over one macro-step is enough. The window is keyed
         # on the *post-increment* step so that the hooks are attached for
-        # exactly the step whose summary is reported below; keying on the
-        # pre-increment step would attach at step 0/500/1000 but report at
-        # 500/1000/1500, labelling every number with a step it was not
-        # measured on.
+        # exactly the step whose summary is reported below.
         attach_stats = ((step + 1) % args.stats_every == 0)
         if attach_stats:
             act_stats.attach()

@@ -105,9 +105,8 @@ class FP8LinearSim:
     This mirrors how FP8 training works on real hardware: the *inputs* and
     *outputs* of every GEMM are cast to FP8 (quantized-dequantized, since
     the simulation runs on fp32 tensors) while the accumulation itself stays
-    in higher precision. Measuring only the norms' outputs - which is all
-    the previous version of this script did - cannot observe how much error
-    actually accumulates through the network, and cannot answer the
+    in higher precision. Measuring only the norms' outputs cannot observe how
+    much error actually accumulates through the network, and cannot answer the
     "which layer first produces Inf/NaN" question at all.
     """
 
