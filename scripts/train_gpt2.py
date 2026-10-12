@@ -221,8 +221,8 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float, beta1: flo
         {"params": no_decay, "weight_decay": 0.0},
     ]
     # The fused multi-tensor step issues one kernel launch per device and
-    # needs no per-parameter temporary, so it is both faster and leaner than
-    # the default foreach path. It is CUDA-only and needs a single device.
+    # needs no per-parameter temporary. It is CUDA-only and needs a single
+    # device.
     devices = {p.device for p in decay + no_decay}
     fused = len(devices) == 1 and next(iter(devices)).type == "cuda"
     return AdamW(groups, lr=lr, betas=(beta1, beta2), fused=fused)
@@ -434,7 +434,7 @@ def main():
     model.reset_parameters(args.seed)
     model.to(device)
 
-    # torch.compile for faster training (requires PyTorch 2.0+)
+    # torch.compile (requires PyTorch 2.0+)
     if args.compile:
         print(f"[compile] enabling torch.compile with mode={args.compile_mode}")
         model = torch.compile(model, mode=args.compile_mode)

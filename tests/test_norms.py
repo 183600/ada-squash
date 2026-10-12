@@ -2,7 +2,6 @@
 Unit tests for the DyT++ / AdaSquash project.
 
 Run:
-    cd /home/z/my-project/ada-squash
     python -m pytest tests/ -v
 
 Tests cover:
@@ -523,16 +522,7 @@ def _compare_norm_to_reference(build, dim=6, seed=0):
 
 @pytest.mark.parametrize("name", ["dyt", "dytd", "dytc", "dytcd"])
 def test_fused_norm_kernels_match_autograd(name):
-    """Every hand-written backward must agree with autograd, per parameter.
-
-    The four fused kernels all used to keep the *post-affine* output and then
-    read it as if it were the squashed activation: `1 - out^2` where the tanh
-    derivative wanted `1 - tanh^2`, and `sum(grad_out * out)` where
-    `dL/dgamma` wants `sum(grad_out * phi)`. With `beta=0, gamma=1` those
-    coincide, which is why every existing test (which only asserted that the
-    gradients were finite) passed. The defaults are `beta=True` and a learned
-    `gamma`, so the trained models were taking genuinely wrong steps.
-    """
+    """Every hand-written backward must agree with autograd, per parameter."""
     build = lambda: build_norm(name, 6)
     _compare_norm_to_reference(build)
 
@@ -549,8 +539,8 @@ def test_dytd_kernels_match_autograd_with_frozen_schedule(learnable_p, learnable
     """A frozen `p` / `k` must not change the gradients that *are* trained.
 
     `learnable_p=False` makes `p` a plain Python float, which
-    `save_for_backward` rejects outright - the whole `dytc_p*_softsign` and
-    `dytc_hardtanh_eq` rows of the ablation matrix died in the forward pass.
+    `save_for_backward` rejects outright, so the forward carries the value on
+    the context instead of saving it as a tensor.
     """
     for cls_name, kw in (
         ("dytd", dict(layer_idx=3, num_layers=12, learnable_k=learnable_k)),
@@ -566,10 +556,9 @@ def test_dytd_kernels_match_autograd_with_frozen_schedule(learnable_p, learnable
 def test_dytcd_alpha_clamp_has_a_correct_gradient():
     """`alpha_c` is clamped away from zero, so the clamp must gate `delta`.
 
-    The backward used to recover `scale` by *dividing* the clamped
-    `alpha_c` back by `1 + delta`, which is only valid where the clamp is
-    inactive; on a clamped channel that recovers a negative `scale` and hands
-    the optimizer a gradient pointing the wrong way.
+    The backward cannot divide the clamped `alpha_c` back into `scale`: the
+    division is only valid where the clamp is inactive, so the raw product is
+    re-derived and the clamp's own zero-gradient is applied.
     """
     torch.manual_seed(0)
     m = DyTCD(6, layer_idx=5, num_layers=12).double()
@@ -612,10 +601,10 @@ def test_softsign_exponent_floor_keeps_a_runaway_p_finite(p):
 def test_attention_logit_stats_read_the_causal_triangle():
     """`return_stats=True` is the QK-squash ablation's monitor.
 
-    It used to slice `logits[tril_mask]` on a `[B, H, T, T]` tensor with a
-    `[T, T]` boolean mask, which boolean indexing applies to the *leading* two
-    dims - so every call raised `IndexError` and the ablation had no
-    diagnostic at all.
+    Only the causal triangle is ever read, so it is selected with
+    `masked_select` of a `[T, T]` mask against the `[B, H, T, T]` logits:
+    boolean *indexing* would apply the mask to the leading two dims instead
+    of the last two.
     """
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
@@ -668,11 +657,9 @@ def test_chunked_cross_entropy_leaves_the_callers_logits_intact():
     """`GPT.forward(..., return_logits=True)` hands the logit block to its
     caller, so the chunked loss node must not use it as a scratch buffer.
 
-    Reusing the block in place left the caller holding gradient values
-    stamped over its own logits after `loss.backward()`: anything computed
-    from the returned logits afterwards (accuracy, perplexity, a KL probe)
-    was then silently wrong. The reference graph is computed *after* the
-    backward here, so a scratch-buffered gradient shows up immediately.
+    The node writes its gradient into a private buffer instead. The
+    reference graph here is computed *after* the backward, so a
+    scratch-buffered gradient shows up immediately.
     """
     torch.manual_seed(0)
     V = 37
@@ -922,9 +909,9 @@ def test_fp8_wrapper_quantizes_weights_not_just_activations():
 
 def test_fp8_probe_corpus_is_structured_not_uniform():
     """`check_fp8_stability.py` reports activation *magnitudes* (overflow /
-    underflow rate, max|x|, kurtosis), and it drove the network with uniform
-    random token ids - embedding noise rather than anything a trained model
-    actually sees. The default probe must therefore be a real walk.
+    underflow rate, max|x|, kurtosis), so the probe has to be a corpus with
+    real next-token structure rather than embedding noise. The default probe
+    must therefore be a real walk.
     """
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1017,9 +1004,6 @@ def test_build_llama_tiny_accepts_tie_override():
 
 
 # ---------------------------------------------------------------------------
-# Config plumbing
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # MoE: the auxiliary loss and the reported `expert_cv`
 # ---------------------------------------------------------------------------
 def test_moe_tokens_per_expert_counts_tokens_not_gate_mass():
@@ -1076,9 +1060,8 @@ def test_moe_aux_loss_matches_the_switch_formula():
 
 
 def test_moe_qk_alpha_init_reaches_the_attention():
-    """`GPTConfig.qk_alpha_init` was dropped on the MoE path, so a config
-    asking for `qk_norm="dytqk"` with a given alpha silently built the
-    default alpha instead."""
+    """`GPTConfig.qk_alpha_init` must reach the QKSquash the MoE attention
+    builds, not fall back to the default alpha."""
     from adasquash.model import GPTConfig
     from scripts.train_moe_tiny import MoEBlock
 
@@ -1096,9 +1079,8 @@ def test_moe_qk_alpha_init_reaches_the_attention():
 # Ablation aggregate
 # ---------------------------------------------------------------------------
 def test_ablation_aggregate_keeps_rows_from_previous_runs():
-    """`all_summaries.json` used to be ordered by `args.names`, so a focused
-    re-run (`--names <one> --force`) rewrote the aggregate with just that row
-    and silently discarded every other completed ablation."""
+    """A focused re-run (`--names <one> --force`) must fold into the
+    aggregate instead of rewriting it and discarding the other rows."""
     from scripts.ablation import merge_summaries
 
     previous = [
@@ -1277,11 +1259,10 @@ def test_activation_stats_can_pool_across_sampling_windows():
 def test_activation_stats_reattach_does_not_leak_hooks():
     """`attach` must drop the hooks it registered last time.
 
-    It used to reset the handle list without removing the hooks, so a second
-    `attach` without an intervening `detach` left the first batch live: every
-    activation was then sampled once per live hook, and the abandoned hooks
-    survived the `detach` that followed - still writing into meters the
-    caller believes are closed.
+    Resetting the handle list without removing the hooks would leave the
+    first batch live: every activation sampled once per live hook, and the
+    abandoned hooks surviving the `detach` that followed - still writing into
+    meters the caller believes are closed.
     """
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
@@ -1387,14 +1368,10 @@ def _tiny_variant(cfg_kwargs):
 def test_every_ablation_row_builds_its_own_hyperparameters():
     """Two rows of the same norm family must not share hyper-parameters.
 
-    `build_norm_kwargs` used to memoize its result on
-    `(norm_name, layer_idx)`, so within one `ablation.py` process every row
-    after the first of its family inherited that first row's values: the
-    `dyt_alpha_*` grid, the whole `dytc_p*` softsign sweep and `dytd_full`
-    all came out configured like whichever row was built first, and the
-    matrix reported identical numbers where it was supposed to report a
-    contrast. The rows below are visited in matrix order, i.e. the order the
-    runner builds them in.
+    Each row has to be built with its own config: the `dyt_alpha_*` grid,
+    the whole `dytc_p*` softsign sweep and `dytd_full` must come out
+    configured exactly as the matrix spells them out. The rows below are
+    visited in matrix order, i.e. the order the runner builds them in.
     """
     from scripts.ablation import load_ablations_from_config
 
@@ -1493,9 +1470,9 @@ def test_depth_sweep_shape_honours_a_non_llama_base():
 def test_depth_sweep_base_shape_follows_the_selected_model():
     """Every `--model` arm must be rescaled from *its own* base width.
 
-    The launcher used to pick `llama-1b ? llama : gpt2-124m`, so a
-    `--model gpt2-350m` sweep was rescaled from (768, 12) and every arm was
-    built at 124M's width - a silently mislabelled experiment.
+    A single `llama-1b ? llama : gpt2-124m` fallback would send every
+    non-LLaMA arm to the 124M width, so a `--model gpt2-350m` sweep would be
+    rescaled from (768, 12) and built at 124M's shape.
     """
     from scripts.train_llama_depth_sweep import (
         _BASE_SHAPE, base_shape_for_model, shape_for_depth,
@@ -1842,9 +1819,8 @@ def test_needle_context_leaves_room_for_the_scoring_loop():
     past the prompt. The eval script's default context *is* `max_seq_len`,
     and a haystack prompt whose repeats divide the limit exactly fills it
     to `context_len - 2`, so a secret of three or more tokens pushes the
-    forward past the positional table: the run died inside the forward pass
-    with a shape error instead of reporting an accuracy. The context has to
-    be refused up front instead.
+    forward past the positional table. The context has to be refused up
+    front instead.
     """
     from scripts.eval_downstream import needle_in_haystack
 

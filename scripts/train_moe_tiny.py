@@ -218,9 +218,8 @@ class MoEGPT(nn.Module):
         loss = None
         if y is not None and not return_logits:
             # Fused with the output projection: the [B, T, V] logit block is
-            # the largest tensor this model would ever build (a few hundred MB
-            # at the shipped defaults) and nothing but the loss reads it, so
-            # the training path never materializes it.
+            # the largest tensor this model would ever build and nothing but
+            # the loss reads it, so the training path never materializes it.
             loss = fused_cross_entropy_mean(
                 z.reshape(-1, z.size(-1)), self.lm_head.weight, y.reshape(-1),
                 ignore_index=self.cfg.ignore_index,

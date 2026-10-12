@@ -56,7 +56,7 @@ def main():
 
     # Scoring the secret appends its tokens to the context, so a context
     # length equal to `max_seq_len` runs the last decode step past the
-    # model's positional table. Budget for it instead of crashing there.
+    # model's positional table. Reserve room for it instead of crashing there.
     overhead = needle_decode_overhead(tok, args.secret)
     results = []
     for L in args.ctx_lens:

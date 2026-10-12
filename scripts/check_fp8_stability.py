@@ -475,10 +475,8 @@ def main():
             # A random-init model cannot answer the question this script asks.
             # `layerscale_init=1e-5` pins every residual contribution to ~0, so
             # the pre-norm stream that the hooks measure is the embedding table
-            # itself and is bit-identical across norms (verified: `ln`,
-            # `rmsnorm`, `dyt`, `dytc`, `dytd` and `dytcd` all report the same
-            # `max_abs_pre_norm` to 7 digits). The rows below are then a
-            # comparison of six ways of rounding the same tensor, not a
+            # itself and is bit-identical across norms. The rows below are
+            # then a comparison of six ways of rounding the same tensor, not a
             # measurement of the layers. Say so instead of writing them out.
             print(
                 f"[fp8] WARNING: {norm} probed at a fresh random init. "
