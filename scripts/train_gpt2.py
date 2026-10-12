@@ -70,11 +70,17 @@ def build_dataloader(
         tok.pad_token_id = tok.eos_token_id
 
     class PackedStream(IterableDataset):
+        # Documents are tokenized a batch at a time: the fast tokenizer's
+        # Rust path parallelizes over a list of inputs, which a
+        # one-document-at-a-time call never gets to use.
+        tokenize_batch = 64
+
         def __init__(self, ds, tok, seq_len):
             self.ds = ds
             self.tok = tok
             self.seq_len = seq_len
             self.buf: list = []
+            self.pos = 0
 
         def __iter__(self):
             # Shard the document stream across DataLoader workers: worker i
@@ -83,20 +89,54 @@ def build_dataloader(
             worker_id = worker_info.id if worker_info is not None else 0
             n_workers = worker_info.num_workers if worker_info is not None else 1
             # Operate on `self.buf` *in place* so the unconsumed tail is
-            # carried over to the next call.
+            # carried over to the next call. `pos` walks the buffer instead
+            # of deleting its prefix after every chunk: with packed streams
+            # the tail is much longer than one chunk, so front-deleting it
+            # once per chunk re-shifts the whole tail and makes tokenizing a
+            # document quadratic in its length.
             buf = self.buf
-            for i, ex in enumerate(self.ds):
-                if i % n_workers != worker_id:
-                    continue
-                ids = self.tok(ex.get("text", ""), add_special_tokens=False)["input_ids"]
-                buf.extend(ids)
-                buf.append(self.tok.eos_token_id)
-                while len(buf) >= self.seq_len + 1:
-                    chunk = buf[: self.seq_len + 1]
-                    del buf[: self.seq_len]
-                    x = torch.tensor(chunk[:-1], dtype=torch.long)
-                    y = torch.tensor(chunk[1:], dtype=torch.long)
+            pos = self.pos
+            need = self.seq_len + 1
+            texts: list = []
+
+            def drain():
+                nonlocal pos
+                while len(buf) - pos >= need:
+                    x = torch.tensor(
+                        buf[pos:pos + self.seq_len], dtype=torch.long
+                    )
+                    y = torch.tensor(
+                        buf[pos + 1:pos + need], dtype=torch.long
+                    )
+                    pos += self.seq_len
                     yield x, y
+                # Safe to compact unconditionally: the loop above stops as
+                # soon as a partial chunk is left, so the tail is at most
+                # `need` tokens regardless of how long the last document was.
+                del buf[:pos]
+                pos = 0
+
+            def extend(batch):
+                for ids in self.tok(batch, add_special_tokens=False)["input_ids"]:
+                    buf.extend(ids)
+                    buf.append(self.tok.eos_token_id)
+
+            i = 0
+            for ex in self.ds:
+                if i % n_workers != worker_id:
+                    i += 1
+                    continue
+                i += 1
+                texts.append(ex.get("text", ""))
+                if len(texts) < self.tokenize_batch and len(buf) - pos < need:
+                    continue
+                extend(texts)
+                texts = []
+                yield from drain()
+            if texts:
+                extend(texts)
+                yield from drain()
+            self.pos = pos
 
     ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True)
     stream = PackedStream(ds, tok, seq_len)
@@ -178,7 +218,12 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float, beta1: flo
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return AdamW(groups, lr=lr, betas=(beta1, beta2))
+    # The fused multi-tensor step issues one kernel launch per device and
+    # needs no per-parameter temporary, so it is both faster and leaner than
+    # the default foreach path. It is CUDA-only and needs a single device.
+    devices = {p.device for p in decay + no_decay}
+    fused = len(devices) == 1 and next(iter(devices)).type == "cuda"
+    return AdamW(groups, lr=lr, betas=(beta1, beta2), fused=fused)
 
 
 def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float):
@@ -438,8 +483,10 @@ def main():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             with ctx:
-                logits, loss = model(x, y)
-            del logits
+                # The logit block is fused into the loss, so the projection's
+                # [B, T, V] output - the largest tensor in the model - is
+                # never materialized.
+                loss = model(x, y, return_logits=False)[1]
             loss = loss / args.grad_accum
             loss.backward()
             if loss_acc is None:

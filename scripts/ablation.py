@@ -147,8 +147,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
             # shipped config, is step 800 while `final_loss` is step 999).
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
-        logits, loss = model(x, y)
-        del logits
+        loss = model(x, y, return_logits=False)[1]
         loss.backward()
         if measure:
             act_stats.detach()

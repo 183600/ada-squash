@@ -58,6 +58,26 @@ def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
+# Shared output affine for the DyT family
+# ---------------------------------------------------------------------------
+class _SquashedAffine(nn.Module):
+    """
+    `y = gamma * phi + beta`, shared by every DyT-family layer.
+
+    Written as one `addcmul` rather than as a multiply followed by an
+    in-place add: the add would rewrite the squashed activation, which is
+    retained by the softsign node for its own backward pass, so it can only
+    run out of place - which costs a second full-size tensor. `addcmul`
+    evaluates `beta + phi * gamma` in a single pass over the activation.
+    """
+
+    def _affine(self, x: torch.Tensor) -> torch.Tensor:
+        if self.beta is None:
+            return x * self.gamma
+        return torch.addcmul(self.beta, x, self.gamma)
+
+
+# ---------------------------------------------------------------------------
 # Generalized softsign
 # ---------------------------------------------------------------------------
 class _GeneralizedSoftsign(torch.autograd.Function):
@@ -69,37 +89,46 @@ class _GeneralizedSoftsign(torch.autograd.Function):
     from the element-wise chain: the chain reuses every intermediate - the
     absolute value, the clamped reciprocal, both `where` outputs, the powered
     base and the denominator - which pins down eight full activations per
-    layer for the whole backward pass. The closed form only needs the split
-    input `u`, the denominator and the branch mask, plus the output itself
-    when `p` carries a gradient, so those are the only tensors retained.
+    layer for the whole backward pass.
 
-    With `u = |x|` for `|x| <= 1` and `1/|x|` otherwise, `num` the matching
-    numerator and `denom = (1 + u^p)^(1/p)`:
+    With `u = |x|` for `|x| <= 1` and `1/|x|` otherwise, and `s = (1 + u^p)^(-1/p)`:
 
-        phi = num / denom = num * s,        s = denom^-1
+        phi     = sign(x) * min(|x|, 1) * s
+        dphi/dx = (s * f)^(p+1),   f = 1 for |x| <= 1, u for |x| > 1
+                = s^(p+1)           for |x| <= 1
+                = (s*u)^(p+1)       for |x| >  1
+        dphi/dp = phi * [log1p(u^p)/p^2 - (1 - s^p) * log(u) / p]
 
-    the partial derivatives collapse to
-
-        dphi/dx   = s^(p+1)                for |x| <= 1
-                  = (s*u)^(p+1)            for |x| >  1
-        dphi/dp   = phi * [log1p(u^p)/p^2 - (1 - s^p) * log(u) / p]
+    `s * f` is the only combination the `x` derivative depends on, so that
+    single product is what the node retains - one activation per layer
+    instead of the input, the denominator and the branch mask. `u` and the
+    output are added on top only when `p` itself carries a gradient, which
+    is the one case that needs them.
     """
     @staticmethod
     def forward(ctx, x, p):
         t = x.abs()
-        w = t.clamp(min=1.0)
         mask = t > 1.0
-        u = torch.where(mask, w.reciprocal(), t)
-        num = torch.where(mask, torch.sign(x), x)
-        denom = (u.pow(p) + 1.0).pow(1.0 / p)
-        out = num / denom
+        # `lo` pins the output magnitude, `hi` keeps the reciprocal branch
+        # finite; both are needed to evaluate the two branches below.
+        lo = t.clamp(max=1.0)
+        hi = t.clamp(min=1.0)
+        hi.reciprocal_()
+        u = torch.where(mask, hi, t)
+        # s = (1 + u^p)^(-1/p), evaluated through log1p on a base <= 1.
+        s = u.pow(p).log1p_().mul_(-1.0 / p).exp_()
+        g = torch.where(mask, u, 1.0)
+        g.mul_(s)
+        # sign(x) is carried by the sign bit of x rather than by a separate
+        # `torch.sign` pass, so |x| = inf still yields +-1 instead of inf*0.
+        out = lo.mul_(s).copysign_(x)
 
         ctx.p_is_tensor = isinstance(p, torch.Tensor)
         ctx.need_p_grad = ctx.p_is_tensor and p.requires_grad
         saved = []
         if ctx.need_p_grad:
-            saved.append(out)
-        saved.extend((u, denom, mask))
+            saved.extend((out, u))
+        saved.append(g)
         if ctx.p_is_tensor:
             saved.append(p)
         else:
@@ -111,29 +140,31 @@ class _GeneralizedSoftsign(torch.autograd.Function):
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
         i = 0
-        out = None
+        out = u = None
         if ctx.need_p_grad:
-            out = saved[0]
-            i = 1
-        u, denom, mask = saved[i], saved[i + 1], saved[i + 2]
-        p = saved[i + 3] if ctx.p_is_tensor else ctx.p_value
+            out, u = saved[0], saved[1]
+            i = 2
+        g = saved[i]
+        p = saved[i + 1] if ctx.p_is_tensor else ctx.p_value
 
         grad_x = grad_p = None
         need_x = ctx.needs_input_grad[0]
         need_p = ctx.needs_input_grad[1] and ctx.need_p_grad
-        if need_x or need_p:
-            s = denom.reciprocal()
         if need_x:
-            # `u` on the |x| > 1 branch, 1 elsewhere: the |x| <= 1 branch
-            # reduces to s^(p+1) because d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1).
-            f = torch.where(mask, u, 1.0)
-            grad_x = grad_out * (s * f).pow(p + 1)
+            # The |x| <= 1 branch reduces to s^(p+1) because
+            # d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1).
+            grad_x = g.pow(p + 1).mul(grad_out)
         if need_p:
             a = u.pow(p)
-            inv = s.pow(p)  # = 1 / (1 + u^p)
+            inv = a.add(1.0).reciprocal()  # = 1 / (1 + u^p) = s^p
             logu = u.clamp(min=torch.finfo(u.dtype).tiny).log()
-            k = torch.log1p(a) / (p * p) - (1.0 - inv) * logu / p
-            grad_p = (grad_out * out * k).sum()
+            k = a.log1p() / (p * p) - (1.0 - inv) * logu / p
+            # Reduce the [N, C] products in fp32 under bf16 autocast: a bf16
+            # accumulator over a whole activation block cancels most of its
+            # own mantissa bits before the scalar survives.
+            acc = torch.float32 if u.dtype in (torch.bfloat16, torch.float16) else None
+            red = (grad_out * out * k).sum(dtype=acc)
+            grad_p = red.to(p.dtype) if ctx.p_is_tensor and red.dtype != p.dtype else red
         return grad_x, grad_p
 
 
@@ -149,15 +180,16 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     Both branches are then expressed through one shared pair of helpers,
 
         u   = |x| for |x| <= 1, 1/|x| for |x| > 1    (always <= 1)
-        num = x for |x| <= 1, sign(x) for |x| > 1
+        lo  = min(|x|, 1)                             (always <= 1)
 
-    so only a single pow chain is materialized. This keeps phi in [-1, 1],
-    avoids overflow for large p / large |x|, and stays finite for |x| = inf
-    (where the naive closed form would divide inf by inf).
+    so only a single pow chain is materialized: `s = (1 + u^p)^(-1/p)` and
+    `phi = sign(x) * lo * s`. This keeps phi in [-1, 1], avoids overflow for
+    large p / large |x|, and stays finite for |x| = inf (where the naive
+    closed form would divide inf by inf).
 
-    The reciprocal is taken on `w = max(|x|, 1)` rather than on `|x|`
-    directly. `torch.where` masks the *value* of the unused branch, but the
-    backward pass still runs `d/dt (1/t) = -1/t^2` on it, so an exact zero
+    The reciprocal is taken on `max(|x|, 1)` rather than on `|x|` directly.
+    `torch.where` masks the *value* of the unused branch, but the backward
+    pass still runs `d/dt (1/t) = -1/t^2` on it, so an exact zero
     (bf16 underflow of a small activation, a padded/zeroed element, ...) would
     evaluate `0 * -inf = NaN` and poison every gradient that reaches this
     layer. Clamping first keeps the unused branch finite; `clamp` itself
@@ -211,30 +243,46 @@ class _RMSNorm(torch.autograd.Function):
     solely so the weight gradient can reduce over it. The backward pass below
     rebuilds that product from the retained input and the per-row `rstd`
     instead, so only one full activation per layer is kept.
+
+    The forward reduction and the backward products are arranged so that no
+    full-size tensor is built twice: the sum of squares comes out of the
+    fused norm reduction, and `grad_out * rstd * weight` - the leading term
+    of `grad_x` and the pre-scaled operand behind `mean(t * x)` - is formed
+    once and used for both reductions.
     """
 
     @staticmethod
     def forward(ctx, x, weight, eps):
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        rstd = torch.rsqrt(var + eps)
+        # `vector_norm` reduces x*x without materializing the squares first.
+        nrm = torch.linalg.vector_norm(x, 2, dim=-1, keepdim=True)
+        rstd = torch.rsqrt(nrm.square_().div_(x.shape[-1]).add_(eps))
         ctx.save_for_backward(x, rstd, weight)
         return x * rstd * weight
 
     @staticmethod
     def backward(ctx, grad_out):
         x, rstd, weight = ctx.saved_tensors
-        t = grad_out * weight
+        # `gw = grad_out * rstd * weight` is both the leading term of d/dx
+        # and the pre-scaled operand behind mean(t * x), so the reduction is
+        # taken over `gw * x` rather than over a separately scaled copy.
+        gu = grad_out * rstd
+        gw = gu * weight
         grad_x = None
         if ctx.needs_input_grad[0]:
             # d/dx of `x * rstd`: the rsqrt term contributes
-            # -x * rstd^3 * mean(t * x).
-            mean_tx = (t * x).mean(dim=-1, keepdim=True)
-            grad_x = t * rstd - x * (mean_tx * rstd * rstd * rstd)
+            # -x * rstd^3 * mean(t * x); the rstd factor that `m` already
+            # carries leaves an rstd^2 to undo.
+            m = (gw * x).mean(dim=-1, keepdim=True)
+            grad_x = torch.addcmul(gw, x, m * rstd * rstd, value=-1)
         grad_weight = None
         if ctx.needs_input_grad[1]:
-            grad_weight = (grad_out * (x * rstd)).sum(
-                dim=tuple(range(x.ndim - 1))
-            )
+            grad_weight = (gu * x).sum(dim=tuple(range(x.ndim - 1)))
+        # The reduction promotes to the weight dtype (autocast keeps norms in
+        # fp32), so the gradients are handed back in their inputs' dtypes.
+        if grad_x is not None and grad_x.dtype != x.dtype:
+            grad_x = grad_x.to(x.dtype)
+        if grad_weight is not None and grad_weight.dtype != weight.dtype:
+            grad_weight = grad_weight.to(weight.dtype)
         return grad_x, grad_weight, None
 
 
@@ -242,7 +290,7 @@ class _RMSNorm(torch.autograd.Function):
 # Original DyT  (Zhu et al., 2025)
 # ---------------------------------------------------------------------------
 @register_norm("dyt")
-class DyT(nn.Module):
+class DyT(_SquashedAffine):
     """y = gamma * tanh(alpha * x) + beta. alpha is a global scalar."""
 
     def __init__(
@@ -258,17 +306,14 @@ class DyT(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.tanh(self.alpha * x)
-        x = x * self.gamma
-        if self.beta is not None:
-            x.add_(self.beta)
-        return x
+        return self._affine(x)
 
 
 # ---------------------------------------------------------------------------
 # Variant A: DyT-C  (per-channel alpha + generalized softsign)
 # ---------------------------------------------------------------------------
 @register_norm("dytc")
-class DyTC(nn.Module):
+class DyTC(_SquashedAffine):
     """
     Channel-adaptive Dynamic Squashing.
 
@@ -308,20 +353,14 @@ class DyTC(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x * self.alpha
-        x = generalized_softsign(x, self.p)
-        # Out-of-place: the softsign output is retained by its own backward
-        # node, so it must not be rewritten here.
-        x = x * self.gamma
-        if self.beta is not None:
-            x.add_(self.beta)
-        return x
+        return self._affine(generalized_softsign(x, self.p))
 
 
 # ---------------------------------------------------------------------------
 # Variant B: DyT-D  (depth-conditioned alpha + LayerScale)
 # ---------------------------------------------------------------------------
 @register_norm("dytd")
-class DyTD(nn.Module):
+class DyTD(_SquashedAffine):
     """
     Depth-conditioned DyT, addresses the "curse of depth" in Pre-LN
     Transformers.
@@ -382,18 +421,14 @@ class DyTD(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a = self.alpha_l
-        x = torch.tanh(a * x)
-        x = x * self.gamma
-        if self.beta is not None:
-            x.add_(self.beta)
-        return x
+        return self._affine(torch.tanh(a * x))
 
 
 # ---------------------------------------------------------------------------
 # Variant A+B combined: DyT-CD  (the main DyT++ proposal)
 # ---------------------------------------------------------------------------
 @register_norm("dytcd")
-class DyTCD(nn.Module):
+class DyTCD(_SquashedAffine):
     """
     DyT++ main layer: per-channel softsign with depth-conditioned scale.
 
@@ -450,7 +485,10 @@ class DyTCD(nn.Module):
     def alpha_per_channel(self) -> torch.Tensor:
         """Effective per-channel alpha at this depth (for logging)."""
         scale = self.alpha_0 * torch.exp(-self.k * self._depth_ratio)
-        return (scale * (1.0 + self.delta)).clamp(min=1e-4)
+        # `scale * (1 + delta)` as a single `addcmul`, then clamp the result
+        # in place: `addcmul` saves its two inputs, never its output, so the
+        # bound costs no extra tensor.
+        return torch.addcmul(scale, scale, self.delta).clamp_(min=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         alpha_c = self.alpha_per_channel  # [C]
@@ -458,13 +496,7 @@ class DyTCD(nn.Module):
         x = x * alpha_c
 
         # `p` may be a learnable scalar tensor or a buffer; both broadcast.
-        x = generalized_softsign(x, self.p)
-        # Out-of-place: the softsign output is retained by its own backward
-        # node, so it must not be rewritten here.
-        x = x * self.gamma
-        if self.beta is not None:
-            x.add_(self.beta)
-        return x
+        return self._affine(generalized_softsign(x, self.p))
 
 
 # ---------------------------------------------------------------------------

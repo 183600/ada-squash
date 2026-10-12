@@ -192,6 +192,145 @@ def cross_entropy_mean(
     )
 
 
+def _loss_acc_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Accumulation dtype for the loss / softmax: at least fp32."""
+    return torch.promote_types(dtype, torch.float32)
+
+
+def _autocast_dtype(device_type: str, *dtypes: torch.dtype) -> torch.dtype:
+    """The dtype a projection over these operands would actually run in."""
+    fallback = dtypes[0]
+    for dt in dtypes[1:]:
+        fallback = torch.promote_types(fallback, dt)
+    try:
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
+    except TypeError:
+        # torch < 2.4 only knows the CUDA spelling.
+        if device_type == "cuda" and torch.is_autocast_enabled():
+            return torch.get_autocast_gpu_dtype()
+    return fallback
+
+
+class _FusedLinearCrossEntropy(torch.autograd.Function):
+    """
+    Mean cross-entropy of `hidden @ weight.T` against `targets`, fused with
+    the projection that produces the logits.
+
+    Chunking `F.cross_entropy` alone still leaves the full [N, V] logit
+    block resident: it is the projection's output, so it is alive for the
+    whole forward pass *and* retained by the chunked-loss node for the
+    backward. With a 50k vocabulary it is by a wide margin the largest
+    tensor in the model - larger than every other activation put together -
+    and nothing else in the graph needs it.
+
+    Folding the projection into the loss node removes it entirely: the
+    forward builds one row chunk of logits at a time and throws it away,
+    and the backward re-derives each chunk from the `[N, C]` hidden states
+    that the rest of the graph already keeps. Peak memory then scales with
+    `chunk_rows` instead of `N`, at the cost of redoing one projection
+    GEMM. See `fused_cross_entropy_mean`.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden, weight, targets, ignore_index, chunk_rows):
+        # Cast once, up front: the projections then run on the tensors that
+        # are also the ones the backward replays, and the node retains the
+        # reduced-precision operands (what a bare `F.linear` would hand to
+        # its own backward) instead of the fp32 parameters.
+        dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
+        h = hidden.to(dt)
+        w = weight.to(dt)
+        total = None
+        for start in range(0, targets.numel(), chunk_rows):
+            end = min(start + chunk_rows, targets.numel())
+            # One [chunk, V] buffer at a time; it is released before the
+            # next chunk is projected, which is what bounds this node's peak.
+            logits = F.linear(h[start:end], w).to(_loss_acc_dtype(dt))
+            chunk = F.cross_entropy(
+                logits, targets[start:end],
+                ignore_index=ignore_index, reduction="sum",
+            )
+            total = chunk if total is None else total + chunk
+        count = targets.ne(ignore_index).sum()
+        ctx.save_for_backward(h, w, targets)
+        ctx.ignore_index = ignore_index
+        ctx.chunk_rows = chunk_rows
+        ctx.count = count
+        ctx.compute_dtype = dt
+        ctx.in_dtypes = (hidden.dtype, weight.dtype)
+        return total / count
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        h, w, targets = ctx.saved_tensors
+        # The backward runs outside autocast; the operands were already cast
+        # in the forward, so the chunk projection replays bit for bit.
+        dt = ctx.compute_dtype
+        need_h = ctx.needs_input_grad[0]
+        need_w = ctx.needs_input_grad[1]
+        grad_h = torch.zeros_like(h) if need_h else None
+        grad_w = torch.zeros_like(w) if need_w else None
+        grad_scale = (grad_out / ctx.count).to(dt)
+        chunk_rows = ctx.chunk_rows
+        for start in range(0, targets.numel(), chunk_rows):
+            end = min(start + chunk_rows, targets.numel())
+            hc = h[start:end]
+            tc = targets[start:end]
+            probs = torch.softmax(
+                F.linear(hc, w).to(_loss_acc_dtype(dt)), dim=-1
+            )
+            valid = tc.ne(ctx.ignore_index)
+            # subtract the one-hot at the gold column (ignored rows are
+            # remapped to column 0 first, then zeroed out below)
+            gold = tc.masked_fill(~valid, 0).unsqueeze(-1)
+            probs.scatter_add_(
+                -1, gold, torch.full_like(gold, -1.0, dtype=probs.dtype)
+            )
+            probs.mul_(grad_scale)
+            probs.masked_fill_(~valid.unsqueeze(-1), 0.0)
+            g = probs.to(dt)
+            if need_h:
+                grad_h[start:end].addmm_(g, w)
+            if need_w:
+                grad_w.addmm_(g.t(), hc)
+        hidden_dtype, weight_dtype = ctx.in_dtypes
+        if need_h and grad_h.dtype != hidden_dtype:
+            grad_h = grad_h.to(hidden_dtype)
+        if need_w and grad_w.dtype != weight_dtype:
+            grad_w = grad_w.to(weight_dtype)
+        return grad_h, grad_w, None, None, None
+
+
+def fused_cross_entropy_mean(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+    chunk_rows: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Mean cross-entropy of the `[N, V]` logits implied by `hidden @ weight.T`.
+
+    Equivalent to `cross_entropy_mean(F.linear(hidden, weight), targets)`,
+    including the gradient w.r.t. both `hidden` and `weight`, but without
+    ever holding the full logit block. `hidden` is `[..., C]`; `targets` is
+    the matching flat `[N]` block.
+    """
+    n = targets.numel()
+    if hidden.dim() != 2 or hidden.size(0) != n:
+        hidden = hidden.reshape(n, -1)
+    if chunk_rows is None:
+        chunk_rows = _cross_entropy_chunk_rows(weight.size(0))
+    if n <= chunk_rows:
+        return F.cross_entropy(
+            F.linear(hidden, weight), targets, ignore_index=ignore_index
+        )
+    return _FusedLinearCrossEntropy.apply(
+        hidden, weight, targets, int(ignore_index), int(chunk_rows)
+    )
+
+
 class Block(nn.Module):
     """
     Pre-norm Transformer block (norm-dependent residual).
@@ -268,6 +407,12 @@ class _SwiGLU(torch.autograd.Function):
     recomputes the gated product (one element-wise pass) and derives every
     gradient analytically, leaving the two branch activations and the input
     (which the weight gradients need anyway).
+
+    Under autocast the three projections run in a reduced dtype while the
+    parameters stay in fp32, and the backward is entered *outside* the
+    autocast region - so the node has to carry the dtype the projections
+    actually used over to the backward, and restore the parameter dtype on
+    the way out.
     """
 
     @staticmethod
@@ -278,11 +423,20 @@ class _SwiGLU(torch.autograd.Function):
         h.mul_(b)
         y = F.linear(h, w2)
         ctx.save_for_backward(x, a, b, w1, w2, w3)
+        ctx.compute_dtype = y.dtype
+        ctx.in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)
         return y
 
     @staticmethod
     def backward(ctx, grad_out):
         x, a, b, w1, w2, w3 = ctx.saved_tensors
+        dt = ctx.compute_dtype
+        # The weight gradients reduce against the activations, so those have
+        # to travel in the projection dtype too.
+        if w1.dtype != dt:
+            w1, w2, w3 = w1.to(dt), w2.to(dt), w3.to(dt)
+        if x.dtype != dt:
+            x = x.to(dt)
         grad_h = F.linear(grad_out, w2.t())
         sa = F.silu(a)
         grad_b = grad_h * sa
@@ -304,6 +458,15 @@ class _SwiGLU(torch.autograd.Function):
             grad_w3 = grad_b.reshape(-1, grad_b.shape[-1]).t() @ x.reshape(
                 -1, x.shape[-1]
             )
+        xd, w1d, w2d, w3d = ctx.in_dtypes
+        if grad_x is not None and grad_x.dtype != xd:
+            grad_x = grad_x.to(xd)
+        if grad_w1 is not None and grad_w1.dtype != w1d:
+            grad_w1 = grad_w1.to(w1d)
+        if grad_w2 is not None and grad_w2.dtype != w2d:
+            grad_w2 = grad_w2.to(w2d)
+        if grad_w3 is not None and grad_w3.dtype != w3d:
+            grad_w3 = grad_w3.to(w3d)
         return grad_x, grad_w1, grad_w2, grad_w3
 
 
@@ -389,7 +552,20 @@ class GPT(nn.Module):
         targets: Optional[torch.Tensor] = None,
         return_stats: bool = False,
         last_position_only: bool = False,
+        return_logits: bool = True,
     ):
+        """
+        Args:
+            input_ids:          [B, T]
+            targets:            [B, T] next-token ids; `None` skips the loss
+            return_stats:       collect per-layer attention logit statistics
+            last_position_only: score only the final position
+            return_logits:      materialize the [B, T, V] logit block. Set it
+                                to False on the training path: the loss is
+                                then fused with the output projection, so the
+                                block - the largest tensor in the model - is
+                                never built. The returned logits are `None`.
+        """
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
@@ -408,16 +584,28 @@ class GPT(nn.Module):
             # The [B, T, V] logit block dwarfs every other activation in the
             # model; decoding / scoring only the final position never needs it.
             x = x[:, -1:]
-        logits = self.lm_head(x)
 
+        logits = None
+        loss = None
         if targets is None:
-            loss = None
+            if return_logits:
+                logits = self.lm_head(x)
         else:
-            loss = cross_entropy_mean(
-                logits.view(-1, logits.size(-1)),
-                (targets[:, -1:] if last_position_only else targets).view(-1),
-                ignore_index=self.cfg.ignore_index,
-            )
+            flat = (targets[:, -1:] if last_position_only else targets).reshape(-1)
+            if return_logits:
+                logits = self.lm_head(x)
+                loss = cross_entropy_mean(
+                    logits.view(-1, logits.size(-1)),
+                    flat,
+                    ignore_index=self.cfg.ignore_index,
+                )
+            else:
+                loss = fused_cross_entropy_mean(
+                    x.reshape(-1, x.size(-1)),
+                    self.lm_head.weight,
+                    flat,
+                    ignore_index=self.cfg.ignore_index,
+                )
 
         if not return_stats:
             return logits, loss
@@ -504,6 +692,7 @@ __all__ = [
     "GPT",
     "build_norm_kwargs",
     "cross_entropy_mean",
+    "fused_cross_entropy_mean",
     "build_gpt_124m",
     "build_gpt_350m",
     "build_llama_tiny_1b",

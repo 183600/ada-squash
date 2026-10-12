@@ -161,8 +161,7 @@ def compute_ce_sum(model, batch, target, device="cuda"):
     # The model's own loss is already the mean over the non-ignored targets
     # (see `cross_entropy_mean`), so scaling it back up by `n` gives the sum
     # over those targets.
-    logits, loss = model(batch, target)
-    del logits
+    loss = model(batch, target, return_logits=False)[1]
     return loss.item() * n, n
 
 
