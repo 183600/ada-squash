@@ -4,7 +4,7 @@ Normalization layers for the DyT++ / AdaSquash study.
 Implements:
   * LayerNorm           - Pre-LN baseline (standard LayerNorm)
   * RMSNorm             - LLaMA-style RMSNorm baseline
-  * DyT                 - Original Dynamic Tanh (Zhou et al., 2025)
+  * DyT                 - Original Dynamic Tanh (Zhu et al., 2025)
   * DyTC                - Variant A: per-channel alpha + generalized softsign
   * DyTD                - Variant B: depth-conditioned alpha + LayerScale
   * DyTCD               - Variant A+B combined (the main DyT++ proposal)
@@ -18,9 +18,10 @@ Transformer block.
 
 The DyT-C softsign family
     phi_p(x) = x / (1 + |x|^p)^{1/p}
-converges to tanh as p -> infinity and to identity (with gentle clipping) as
-p -> 1. p=2 is a particularly attractive operating point: it is C^inf, has a
-bounded gradient, and avoids the saturation plateau of tanh in deep nets.
+converges to hard tanh (i.e. a clip to [-1, 1]) as p -> infinity and to the
+classic softsign x / (1 + |x|) at p = 1. p=2 is a particularly attractive
+operating point: it is C^inf, has a bounded gradient, and avoids the
+saturation plateau of tanh in deep nets.
 """
 
 from __future__ import annotations
@@ -238,7 +239,7 @@ class _RMSNorm(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
-# Original DyT  (Zhou et al., 2025)
+# Original DyT  (Zhu et al., 2025)
 # ---------------------------------------------------------------------------
 @register_norm("dyt")
 class DyT(nn.Module):
@@ -298,7 +299,8 @@ class DyTC(nn.Module):
         alpha = alpha + 0.05 * torch.randn(dim) * alpha_init
         self.alpha = nn.Parameter(alpha)
 
-        # Curvature exponent p. p=2 = softsign, p->inf = hard tanh.
+        # Curvature exponent p. p=1 = classic softsign, p=2 = smooth
+        # softsign, p->inf = hard tanh (clip to [-1, 1]).
         self.p = nn.Parameter(torch.tensor(float(p_init))) if learnable_p else float(p_init)
 
         self.gamma = nn.Parameter(torch.ones(dim))
@@ -332,9 +334,9 @@ class DyTD(nn.Module):
 
         x_out = x + lambda_l * Block(y)
 
-    this lets the shallow layers stay close to identity (preserving
-    gradient flow) while the deep layers apply progressively stronger
-    squashing.
+    because alpha_l decays with depth, shallow layers squash strongly
+    (bounding the pre-norm activations where they are largest) while deep
+    layers relax toward a near-linear, gradient-friendly response.
 
     The full LayerScale is applied in the model's Block.forward; this module
     only implements the depth-conditioned squashing and exposes
@@ -359,7 +361,8 @@ class DyTD(nn.Module):
         # Global "base" alpha (still a single scalar, like original DyT).
         self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
 
-        # Depth-decay rate. k>0 => deeper layers compress harder.
+        # Depth-decay rate. k>0 => alpha_l decays with depth, so deeper
+        # layers squash more gently (toward a near-linear response).
         # We expose a small positive init so the schedule is non-trivial
         # from the start.
         if learnable_k:

@@ -4,7 +4,7 @@
 
 This repository is the experimental codebase for the DyT++ proposal: a
 family of *statistic-free* normalization layers that generalize
-Dynamic Tanh (DyT, Zhou et al. 2025) along three orthogonal axes:
+Dynamic Tanh (DyT, Zhu et al. 2025) along three orthogonal axes:
 
 | Variant | Axis | What it adds | Targets |
 |--------|------|---------------|---------|
@@ -15,7 +15,7 @@ Dynamic Tanh (DyT, Zhou et al. 2025) along three orthogonal axes:
 
 The core hypothesis: with **<0.1% additional parameters**, statistic-free
 element-wise adaptive squashing matches or exceeds RMSNorm on stability
-with element-wise adaptive squashing.
+and throughput.
 
 ## Repository layout
 
@@ -171,7 +171,7 @@ pre-norm activation statistics. Ablations include:
 - Per-channel on/off
 - Depth-conditioning on/off
 - LayerScale init: 1e-5 / 1e-3 / off
-- Softsign family: p ∈ {1, 2, 4, learnable, →∞ (=tanh)}
+- Softsign family: p ∈ {1, 2, 4, learnable, →∞ (=hard tanh)}
 - DyT alpha init: 0.3 / 0.5 / 1.0
 
 ## Method reference
@@ -190,7 +190,8 @@ x_hat = α_c · x                                # α_c : [C]
 y    = γ · φ + β
 ```
 
-* p=1: classic softsign; p=2: smooth softsign (default); p→∞: tanh.
+* p=1: classic softsign; p=2: smooth softsign (default); p→∞: hard tanh
+  (i.e. a clip to [-1, 1] — note this is *not* tanh).
 * All operations are strictly element-wise → no cross-token statistics
   and no collective ops. Kernel-friendly: trivially fuses with the
   surrounding matmul.
@@ -204,9 +205,11 @@ y   = γ · tanh(α_l · x) + β
 x_out = x + λ_l · Block(y)        # LayerScale-style residual gate
 ```
 
-* Shallow layers keep α large → mild squashing → preserves gradient flow.
-* Deep layers compress aggressively → bounds the residual stream.
-* Directly addresses the "curse of depth" (Liu et al. 2020).
+* α_l decays with depth: shallow layers squash strongly (bounding the
+  largest pre-norm activations), while deep layers relax toward a
+  near-linear, gradient-friendly response.
+* Combined with the LayerScale residual gate, this targets the "curse of
+  depth" in Pre-LN Transformers (Liu et al. 2020).
 
 ### DyT-CD — main proposal (A + B combined)
 

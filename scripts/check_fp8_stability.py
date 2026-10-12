@@ -213,14 +213,16 @@ def measure_fp8_divergence(model, x, norm_name: str):
                 first_bad.append(i)
         return hook
 
+    # Reference logits in fp32 (no hooks: we only want to characterize the
+    # activations actually seen by the FP8 GEMMs in the pass below, and
+    # attaching here would double-count every norm).
+    with torch.no_grad():
+        logits_fp32, _ = model(x)
+
     for name, m in model.named_modules():
         if m.__class__.__name__ in {"LayerNorm", "RMSNorm", "DyT", "DyTC", "DyTD", "DyTCD"}:
             handles.append(m.register_forward_hook(make_range_hook()))
             handles.append(m.register_forward_hook(make_q_hook()))
-
-    # Reference logits in fp32, then logits with every GEMM on FP8.
-    with torch.no_grad():
-        logits_fp32, _ = model(x)
 
     block_handles = [
         blk.register_forward_hook(make_block_hook(i))

@@ -47,7 +47,9 @@ def load_ckpt(path: str, device: str = "cuda"):
     )
     if args.get("layerscale_init") is not None:
         model_cfg["layerscale_init"] = args["layerscale_init"]
-    if "tie_embeddings" in args:
+    # `tie_embeddings` defaults to None, meaning "use the builder default".
+    # Only override when the checkpoint actually recorded an explicit choice.
+    if args.get("tie_embeddings") is not None:
         model_cfg["tie_word_embeddings"] = args["tie_embeddings"]
     elif "no_tie_embeddings" in args:
         model_cfg["tie_word_embeddings"] = not args["no_tie_embeddings"]

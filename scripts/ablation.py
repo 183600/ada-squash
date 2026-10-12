@@ -44,12 +44,12 @@ ABLATIONS = {
     "dytcd_no_ls": dict(norm_name="dytcd", use_layerscale=False),
     "dytcd_ls1e5": dict(norm_name="dytcd", layerscale_init=1e-5),
     "dytcd_ls1e3": dict(norm_name="dytcd", layerscale_init=1e-3),
-    # ---- tanh vs softsign family ----
+    # ---- softsign family vs its hard-tanh limit ----
     "dytc_p1_softsign": dict(norm_name="dytc", p_init=1.0, learnable_p=False),
     "dytc_p2_softsign": dict(norm_name="dytc", p_init=2.0, learnable_p=False),
     "dytc_p4_softsign": dict(norm_name="dytc", p_init=4.0, learnable_p=False),
     "dytc_plearnable": dict(norm_name="dytc", p_init=2.0, learnable_p=True),
-    "dytc_tanh_eq": dict(norm_name="dytc", p_init=64.0, learnable_p=False),  # p->inf == tanh
+    "dytc_hardtanh_eq": dict(norm_name="dytc", p_init=64.0, learnable_p=False),  # p->inf == hard tanh
     # ---- alpha init grid ----
     "dyt_alpha_0.3": dict(norm_name="dyt", alpha_init=0.3),
     "dyt_alpha_0.5": dict(norm_name="dyt", alpha_init=0.5),

@@ -120,8 +120,8 @@ def test_softsign_saturates_instead_of_overflowing(p):
 
 
 @pytest.mark.parametrize("cls", ["dytc", "dytcd"])
-def test_tanh_equivalent_ablation_produces_finite_loss(cls):
-    """The `p -> infinity == tanh` ablation (p = 64) must not NaN out."""
+def test_hardtanh_limit_ablation_produces_finite_loss(cls):
+    """The `p -> infinity == hard tanh` ablation (p = 64) must not NaN out."""
     if cls == "dytc":
         norm = DyTC(8, alpha_init=1.0, p_init=64.0, learnable_p=False)
     else:

@@ -53,7 +53,7 @@ ablations:
     norm: dytcd
     layerscale_init: 1.0e-3
 
-  # ---- tanh vs softsign family ----
+  # ---- softsign family vs its hard-tanh limit ----
   - name: dytc_p1_softsign
     norm: dytc
     p_init: 1.0
@@ -70,7 +70,7 @@ ablations:
     norm: dytc
     p_init: 2.0
     learnable_p: true
-  - name: dytc_tanh_eq
+  - name: dytc_hardtanh_eq
     norm: dytc
     p_init: 64.0
     learnable_p: false

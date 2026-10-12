@@ -96,12 +96,14 @@ class MoELayer(nn.Module):
 
         # Load balancing auxiliary loss (Switch Transformer style):
         # aux = n_experts * sum_i(f_i * P_i) where f_i is the fraction of
-        # tokens *dispatched* to expert i and P_i is the mean router
-        # probability. `route` rows are renormalised to sum to `top_k`, so
-        # f_i is divided by `top_k` for the usual formulation to hold.
+        # routing mass assigned to expert i and P_i is the mean router
+        # probability. `route` rows are renormalised to sum to 1, so
+        # summing `route` over tokens and dividing by the token count gives
+        # exactly that fraction (the gate weights of the top-k experts sum
+        # to one).
         tokens_per_expert = route.sum(0)  # [E]
         n_tokens = x_flat.shape[0]
-        f_i = tokens_per_expert / (n_tokens * self.top_k)
+        f_i = tokens_per_expert / n_tokens
         p_i = logits.softmax(-1).mean(dim=0)
         aux = self.n_experts * (f_i * p_i).sum()
         return y, aux, tokens_per_expert.detach()
