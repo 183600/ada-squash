@@ -87,7 +87,8 @@ class MoELayer(nn.Module):
         # each token must be applied to every expert explicitly.
         h1 = torch.einsum("nc,ech->neh", x_flat, self.experts_w1)  # [N, E, H]
         h3 = torch.einsum("nc,ech->neh", x_flat, self.experts_w3)  # [N, E, H]
-        h = F.silu(h1) * h3  # [N, E, H]
+        h = F.silu(h1)
+        h.mul_(h3)  # [N, E, H] - in place, silu only needs its own input
         y_e = torch.einsum("neh,ehc->nec", h, self.experts_w2)  # [N, E, C]
         # Apply routing weights
         y = (y_e * route.unsqueeze(-1)).sum(dim=1)  # [N, C]

@@ -63,21 +63,29 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     """
     phi_p(x) = x / (1 + |x|^p)^{1/p}.
 
-    Split the two regimes and clamp the pow base into the branch where it
-    is guaranteed to stay <= 1:
+    The closed form is split so the exponentiated base stays <= 1:
 
-        |x| <= 1 :  phi = x * (1 + |x|^p)^(-1/p)          (|x|^p  <= 1)
-        |x| >  1 :  phi = sgn(x) * (1 + |x|^-p)^(-1/p)    (|x|^-p <= 1)
+        |x| <= 1 :  phi = sign(x)|x| * (1 + |x|^p)^(-1/p)      (|x|^p  <= 1)
+        |x| >  1 :  phi = sign(x)  *  (1 + |x|^-p)^(-1/p)      (|x|^-p <= 1)
 
-    Both branches stay in [0, 1] before the final combine.
+    Both branches are then expressed through one shared pair of helpers,
+
+        u   = |x| for |x| <= 1, 1/|x| for |x| > 1    (always <= 1)
+        num = x for |x| <= 1, sign(x) for |x| > 1
+
+    so only a single pow chain is materialized. This keeps phi in [-1, 1],
+    avoids overflow for large p / large |x|, and stays finite for |x| = inf
+    (where the naive closed form would divide inf by inf).
     """
     t = x.abs()
-    t_lo = t.clamp(max=1.0)
-    t_hi = t.clamp(min=1.0)
-    p_recip = 1.0 / p
-    y_lo = x / (t_lo.pow(p) + 1.0).pow(p_recip)
-    y_hi = torch.sign(x) * (t_hi.pow(-p) + 1.0).pow(-p_recip)
-    return torch.where(t > 1.0, y_hi, y_lo)
+    w = t.clamp(min=1.0)
+    mask = t > 1.0
+    # Pow base: |x| (<= 1) below the threshold, 1/|x| above it. w == 1 keeps
+    # the reciprocal well defined for the elements that do not need it.
+    u = torch.where(mask, w.reciprocal(), t)
+    # Numerator: |x| signed below the threshold, plain sign above it.
+    num = torch.where(mask, torch.sign(x), x)
+    return num / (u.pow(p) + 1.0).pow(1.0 / p)
 
 
 # ---------------------------------------------------------------------------
