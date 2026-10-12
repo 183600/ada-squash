@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -98,10 +97,8 @@ class MoELayer(nn.Module):
         # Load balancing auxiliary loss (Switch Transformer style):
         # aux = n_experts * sum_i(f_i * P_i) where f_i is the fraction of
         # tokens *dispatched* to expert i and P_i is the mean router
-        # probability. `route` rows are renormalised to sum to `top_k`, not
-        # 1, so f_i has to be divided by `top_k` for the usual formulation
-        # to hold - otherwise the loss is `top_k` times too large and its
-        # 1e-3 weight silently behaves like a different, unrecorded one.
+        # probability. `route` rows are renormalised to sum to `top_k`, so
+        # f_i is divided by `top_k` for the usual formulation to hold.
         tokens_per_expert = route.sum(0)  # [E]
         n_tokens = x_flat.shape[0]
         f_i = tokens_per_expert / (n_tokens * self.top_k)

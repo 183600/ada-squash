@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .norms import QKSquash, build_norm
+from .norms import QKSquash
 
 
 class CausalSelfAttention(nn.Module):
@@ -210,11 +210,9 @@ def apply_rope(
         cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
         sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
 
-    # Cast the embeddings, not the queries: upcasting q/k to the embedding
-    # dtype keeps the whole rotary (and the attention scores derived from it)
-    # in the wider type, which costs memory and throughput when the model runs
-    # in bf16/fp16. Embeddings are [1, 1, T, hd], so they are the cheaper
-    # side of the promotion.
+    # Cast the embeddings rather than the queries: q/k keep their own dtype,
+    # so the rotary and the attention scores derived from it are computed in
+    # that dtype. The embeddings are [1, 1, T, hd] and are cast once here.
     if cos.dtype != q.dtype:
         cos = cos.to(q.dtype)
         sin = sin.to(q.dtype)

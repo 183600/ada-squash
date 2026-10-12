@@ -15,12 +15,10 @@ Example depth sweep:
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -105,10 +103,8 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, additional: list |
         "--stats-every", str(args.stats_every),
         "--save-every", str(args.save_every),
     ]
-    # Forward the remaining knobs. Omitting any of these made every sweep
-    # arm silently fall back to the training script's defaults, so e.g. a
-    # sweep asking for `--qk-norm dytqk` or a non-unit `--grad-clip` would
-    # have run with neither.
+    # Forward the remaining knobs so each sweep arm runs with
+    # exactly the values requested on the launcher command line.
     if args.qk_norm:
         cmd += ["--qk-norm", args.qk_norm]
     if args.layerscale_init is not None:

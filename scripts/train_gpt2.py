@@ -77,17 +77,13 @@ def build_dataloader(
             self.buf: list = []
 
         def __iter__(self):
-            # Shard the document stream across DataLoader workers. With
-            # num_workers > 1 every worker otherwise re-iterates the *same*
-            # streaming dataset from the start, so each batch would be
-            # duplicated across workers (halving the unique tokens/step).
+            # Shard the document stream across DataLoader workers: worker i
+            # consumes every i-th document, so the shards stay disjoint.
             worker_info = torch.utils.data.get_worker_info()
             worker_id = worker_info.id if worker_info is not None else 0
             n_workers = worker_info.num_workers if worker_info is not None else 1
-            # Operate on `self.buf` *in place*. Rebinding a local name to
-            # `buf[n:]` would silently orphan the tail of the buffer, so
-            # every re-iteration of the dataset would start from the stale
-            # contents of `self.buf` and the tail would never be emitted.
+            # Operate on `self.buf` *in place* so the unconsumed tail is
+            # carried over to the next call.
             buf = self.buf
             for i, ex in enumerate(self.ds):
                 if i % n_workers != worker_id:
@@ -133,11 +129,9 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None = None
     is negative (`--no-layerscale`).
 
     Explicit command-line flags still win, because argparse only overrides a
-    default that the user actually supplied. Without this the YAML files
-    under `configs/` are decorative: nothing read them, so a run documented
-    as "the gpt2-124m-ln config" silently used the parser defaults instead -
-    including `use_layerscale`, which every baseline config explicitly turns
-    off while the parser default turns it on.
+    default that the user actually supplied; every key the config names is
+    taken from the file. Note that `use_layerscale` is positive in YAML while
+    the flag is negative (`--no-layerscale`), which is what `invert` is for.
     """
     if not path:
         return

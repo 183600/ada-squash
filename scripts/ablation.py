@@ -106,10 +106,8 @@ def install_outlier_channel(model, scale: float = 25.0) -> int:
 def load_ablations_from_config(path: str) -> dict:
     """Read the ablation table out of a YAML run config.
 
-    The in-script `ABLATIONS` dict and `configs/ablation-matrix.yaml` used to
-    list *different* rows under *different* names, so a run driven from the
-    YAML silently skipped names the script did not know about and vice versa.
-    Making the file authoritative removes that drift.
+    The config file is authoritative: it is the single place the
+    ablation table is listed, keyed by each row's `name`.
     """
     cfg = load_yaml_config(path)
     rows = cfg.get("ablations")
@@ -184,10 +182,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
         "final_loss": losses[-1],
         "mean_last_100_loss": sum(losses[-100:]) / max(1, len(losses[-100:])),
         "n_loss_spikes": loss_spike.n_spikes,
-        # The whole point of the ablation is stability, so the activation
-        # statistics have to reach the summary - previously they were
-        # measured and then thrown away, leaving only a loss curve that
-        # cannot separate the variants.
+        # Activation statistics belong in the summary alongside the loss curve.
         "act_stats": stats,
         "max_abs_pre_norm": stats.get("__summary__", {}).get("max_max_abs"),
         "mean_max_abs_pre_norm": stats.get("__summary__", {}).get("mean_max_abs"),

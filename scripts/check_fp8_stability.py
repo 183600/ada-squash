@@ -34,7 +34,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from adasquash import build_norm
 from adasquash.model import MLP, build_gpt_124m
 
 
@@ -129,9 +128,8 @@ class FP8SwiGLUSim:
     """FP8 simulation for the SwiGLU MLP.
 
     `MLP.forward` goes through `_SwiGLU.apply`, which calls `F.linear`
-    directly, so wrapping the child `nn.Linear` modules has no effect - the
-    MLP (the majority of the parameters, and the usual home of activation
-    outliers) would silently stay in fp32.
+    directly, so this wraps `F.linear` itself rather than the child
+    `nn.Linear` modules, and covers the MLP parameters too.
     """
 
     def __init__(self, mlp: MLP, quant):

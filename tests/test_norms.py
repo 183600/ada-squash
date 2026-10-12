@@ -31,10 +31,10 @@ from adasquash import (
     build_norm, NORM_REGISTRY, generalized_softsign,
     LayerNorm, RMSNorm, DyT, DyTC, DyTD, DyTCD,
     GPTConfig, GPT, build_gpt_124m, build_llama_tiny_1b,
-    ActivationStats, LossSpikeCounter, KurtosisMeter, MaxAbsMeter,
-    count_parameters, measure_activation_stats,
+    ActivationStats, LossSpikeCounter, KurtosisMeter,
+    count_parameters,
 )
-from adasquash.attention import CausalSelfAttention, apply_rope
+from adasquash.attention import apply_rope
 from adasquash.norms import QKSquash
 from adasquash.model import cross_entropy_mean
 
@@ -303,11 +303,7 @@ def test_checkpoint_roundtrip():
 # Loss masking
 # ---------------------------------------------------------------------------
 def test_ignore_index_does_not_collide_with_a_real_token():
-    """The mask must not swallow a legitimate target id.
-
-    `pad_token_id` is 0, which in the GPT-2 vocabulary is "!" - an ordinary
-    token. Masking on it silently dropped those targets from the loss.
-    """
+    """The mask id must lie outside the vocabulary id range."""
     cfg = GPTConfig()
     assert cfg.ignore_index == -100
     assert not (0 <= cfg.ignore_index < cfg.vocab_size)
@@ -420,8 +416,7 @@ def test_w8a8_wrapper_quantizes_swiglu_weights():
     """The W8A8 probe must quantize the MLP, not just attention/lm_head.
 
     `MLP.forward` calls `_SwiGLU.apply` with the raw `.weight` tensors, so
-    wrapping the child `nn.Linear` modules silently left the majority of the
-    parameters in fp32.
+    the wrapper attaches to those tensors.
     """
     import copy
     import sys as _sys
@@ -482,8 +477,7 @@ def test_fp8_quantizer_respects_format_range():
 
 
 def test_build_llama_tiny_accepts_tie_override():
-    """`tie_word_embeddings` used to be a hard-coded keyword, so passing it
-    through **over raised a duplicate-keyword TypeError."""
+    """`tie_word_embeddings` can be overridden through **over."""
     m = build_llama_tiny_1b(norm_name="dytcd", tie_word_embeddings=True)
     assert m.lm_head.weight is m.tok_emb.weight
     m2 = build_llama_tiny_1b(norm_name="dytcd")

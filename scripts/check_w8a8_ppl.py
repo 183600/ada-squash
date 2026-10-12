@@ -26,8 +26,8 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.nn as nn
 
-from adasquash import GPTConfig, GPT
-from adasquash.model import MLP, _SwiGLU, build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
+from adasquash import GPT
+from adasquash.model import MLP, _SwiGLU
 from scripts.eval_downstream import load_ckpt
 
 

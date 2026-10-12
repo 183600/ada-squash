@@ -58,11 +58,9 @@ class GPTConfig:
     pad_token_id: int = 0
     # Label id excluded from the loss. MUST be outside [0, vocab_size) so it
     # can never collide with a real token: with the GPT-2 vocabulary id 0 is
-    # "!", an ordinary token that appears in ordinary prose, and dropping
-    # every occurrence silently removes a slice of the objective (and biases
-    # it, since "!" is not distributed like an average token). Packed
-    # streaming corpora contain no padding at all, so the training pipeline
-    # leaves nothing to mask and this value should never appear.
+    # "!", an ordinary token that appears in ordinary prose. Packed streaming
+    # corpora contain no padding at all, so the training pipeline leaves
+    # nothing to mask and this value should never appear.
     ignore_index: int = -100
     tie_word_embeddings: bool = True
     rotary: bool = False
@@ -81,8 +79,7 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
 
     Using one helper for the blocks *and* the final norm guarantees that a
     configured hyper-parameter (alpha_init / alpha_0 / k_init / p_init) is
-    honoured everywhere, instead of silently reverting to the class default
-    on `norm_f`.
+    applied to every norm of the family that accepts it.
     """
     kwargs: dict = {}
     if cfg.norm_name in ("dytd", "dytcd"):
@@ -468,9 +465,8 @@ def build_gpt_350m(norm_name: str = "dytcd", **over) -> GPT:
 
 def build_llama_tiny_1b(norm_name: str = "dytcd", **over) -> GPT:
     """LLaMA-tiny ~1.1B params, matches the xIELU / LLaMA-tiny recipe."""
-    # `setdefault` rather than a literal keyword: passing
-    # `tie_word_embeddings` through `over` used to raise "got multiple
-    # values for keyword argument", so a caller could not override it.
+    # `setdefault` so an explicit `tie_word_embeddings` in `over` takes
+    # precedence over the LLaMA-tiny default.
     over.setdefault("tie_word_embeddings", False)
     over.setdefault("rotary", True)
     cfg = GPTConfig(
