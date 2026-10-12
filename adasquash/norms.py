@@ -124,7 +124,8 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        return x * torch.rsqrt(var + self.eps) * self.weight
+        x = x * torch.rsqrt(var + self.eps)
+        return x.mul_(self.weight)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +150,7 @@ class DyT(nn.Module):
         x = torch.tanh(self.alpha * x)
         x = x * self.gamma
         if self.beta is not None:
-            x = x + self.beta
+            x.add_(self.beta)
         return x
 
 
@@ -197,9 +198,9 @@ class DyTC(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x * self.alpha
         x = generalized_softsign(x, self.p)
-        x = x * self.gamma
+        x.mul_(self.gamma)
         if self.beta is not None:
-            x = x + self.beta
+            x.add_(self.beta)
         return x
 
 
@@ -270,7 +271,7 @@ class DyTD(nn.Module):
         x = torch.tanh(a * x)
         x = x * self.gamma
         if self.beta is not None:
-            x = x + self.beta
+            x.add_(self.beta)
         return x
 
 
@@ -344,9 +345,9 @@ class DyTCD(nn.Module):
 
         # `p` may be a learnable scalar tensor or a buffer; both broadcast.
         x = generalized_softsign(x, self.p)
-        x = x * self.gamma
+        x.mul_(self.gamma)
         if self.beta is not None:
-            x = x + self.beta
+            x.add_(self.beta)
         return x
 
 

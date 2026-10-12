@@ -143,25 +143,31 @@ class CausalSelfAttention(nn.Module):
 
     def _rope_tables(self, freqs_cis: torch.Tensor):
         """Return the expanded (cos, sin) rotary tables, cached per
-        (source tensor, length, device, dtype). The tables never require
+        (source storage, shape, device, dtype). The tables never require
         grad, so the cache is a plain attribute and does not show up in the
         state dict.
 
-        The cache is keyed on the identity of the source tensor as well as
-        its shape: two different frequency tables of the same length (e.g. a
-        re-scaled RoPE base, or a different model sharing the module) are
-        otherwise indistinguishable by shape alone and would silently reuse
-        the first table's values. The source tensor is kept alive by the
-        cache entry so that `is` stays a valid identity test.
+        The key uses the source tensor's storage pointer rather than its
+        Python identity: the caller passes `self.freqs_cis[:T]`, i.e. a fresh
+        view of the same buffer on every forward, so an identity test would
+        miss on every call. Two different frequency tables of the same length
+        (e.g. a re-scaled RoPE base, or a different model sharing the module)
+        still get distinct storage pointers. The source is kept alive by the
+        cache entry so its storage pointer stays valid.
         """
-        key = (freqs_cis.shape[0], freqs_cis.device, freqs_cis.dtype)
+        key = (
+            freqs_cis.data_ptr(),
+            freqs_cis.shape,
+            freqs_cis.device,
+            freqs_cis.dtype,
+        )
         cache = self._rope_cache
-        if cache is None or cache[0] is not freqs_cis or cache[1] != key:
+        if cache is None or cache[0] != key:
             f_real = freqs_cis.real
             f_imag = freqs_cis.imag
             cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
             sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
-            self._rope_cache = (freqs_cis, key, cos, sin)
+            self._rope_cache = (key, freqs_cis, cos, sin)
         return self._rope_cache[2], self._rope_cache[3]
 
 
@@ -178,7 +184,8 @@ class RMSNormHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        return x * torch.rsqrt(var + self.eps) * self.weight
+        x = x * torch.rsqrt(var + self.eps)
+        return x.mul_(self.weight)
 
 
 def apply_rope(
