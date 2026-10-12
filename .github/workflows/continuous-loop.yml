@@ -115,7 +115,11 @@ jobs:
               "edit": {
                 "*": "allow",
                 ".github/**": "deny",
-                "**/.github/**": "deny"
+                "**/.github/**": "deny",
+                "LICENSE": "deny",
+                "LICENSE.*": "deny",
+                "**/LICENSE": "deny",
+                "**/LICENSE.*": "deny"
               },
               "bash": {
                 "*": "allow",
@@ -123,12 +127,22 @@ jobs:
                 "rm -r .github*": "deny",
                 "rm .github*": "deny",
                 "mv .github*": "deny",
-                "git rm -r .github*": "deny"
+                "git rm -r .github*": "deny",
+                "rm *LICENSE*": "deny",
+                "mv *LICENSE*": "deny",
+                "cp *LICENSE*": "deny",
+                "git rm *LICENSE*": "deny",
+                "git mv *LICENSE*": "deny",
+                "shred *LICENSE*": "deny",
+                "truncate *LICENSE*": "deny",
+                "unlink *LICENSE*": "deny",
+                "dd *of=LICENSE*": "deny",
+                "find * -name *LICENSE*": "deny"
               }
             }
           }
           EOF
-          echo "[guard] opencode 权限已锁定：edit/bash 对 .github/** 禁止操作"
+          echo "[guard] opencode 权限已锁定：edit/bash 对 .github/** 与 LICENSE 禁止操作"
 
           echo "=== OpenCode Zen 可用模型目录 ==="
           opencode models opencode 2>/dev/null \
@@ -152,9 +166,9 @@ jobs:
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
 
           # ================= 三阶段提示词 =================
-          PROMPT_PERF='优化代码的性能和显存占用。优化只要不会明显降低性能就可以做。不要修改代码逻辑、不要影响实验结果。不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
-          PROMPT_BUG='仔细检查代码中是否存在影响实验结果的bug，如果有就修复所有的bug。不要重复修复之前已经修过的bug。不要输出或写入"修复了哪些bug"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
-          PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释）。删除所有多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”。'
+          PROMPT_PERF='优化代码的性能和显存占用。优化只要不会明显降低性能就可以做。不要修改代码逻辑、不要影响实验结果。不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动。'
+          PROMPT_BUG='仔细检查代码中是否存在影响实验结果的bug，如果有就修复所有的bug。不要重复修复之前已经修过的bug。不要输出或写入"修复了哪些bug"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动。'
+          PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释）。删除所有多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，绝对不能删除、修改或移动，也不属于“多余的内容”。'
 
           # 每阶段单次调用的最大时长（秒）
           PERF_TIMEOUT=$((60*60))     # 1h
@@ -244,6 +258,41 @@ jobs:
           fi
           ensure_workflow
 
+          # ================= LICENSE 防删自愈 =================
+          # opencode 的 clean 阶段可能把 LICENSE 当作“多余内容”删除或篡改。
+          # 启动时保存触发 commit 的 LICENSE 原始副本，
+          # 每次提交前校验，一旦被删/被改立即恢复，保证 LICENSE 永不丢失。
+          LICENSE_PATH="LICENSE"
+          LICENSE_PRISTINE=/tmp/license_pristine
+
+          fetch_license_pristine() {
+            # 优先：raw 直读触发 commit 的 LICENSE（公共仓库免鉴权）
+            if curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/LICENSE" -o "$LICENSE_PRISTINE" 2>/dev/null && [ -s "$LICENSE_PRISTINE" ]; then
+              return 0
+            fi
+            # 备选：仓库工作区副本（私有仓库 raw 不可达时）
+            if [ -f "$LICENSE_PATH" ]; then
+              cp "$LICENSE_PATH" "$LICENSE_PRISTINE"
+              return 0
+            fi
+            return 1
+          }
+
+          ensure_license() {
+            [ -s "$LICENSE_PRISTINE" ] || return 0
+            if [ ! -f "$LICENSE_PATH" ] || ! cmp -s "$LICENSE_PATH" "$LICENSE_PRISTINE"; then
+              cp "$LICENSE_PRISTINE" "$LICENSE_PATH"
+              echo "[guard] 检测到 LICENSE 被删除/篡改，已自动恢复"
+            fi
+          }
+
+          if fetch_license_pristine; then
+            echo "[guard] LICENSE 原始副本就绪（$(wc -c < "$LICENSE_PRISTINE") 字节）"
+          else
+            echo "[warn] 无法获取 LICENSE 原始副本，LICENSE 自愈保护不可用"
+          fi
+          ensure_license
+
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
@@ -252,6 +301,7 @@ jobs:
 
           commit_and_push() {
             ensure_workflow
+            ensure_license
             git add -A || true
             git commit -m "auto: iteration $1" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
@@ -261,6 +311,7 @@ jobs:
           on_shutdown() {
             echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
             ensure_workflow
+            ensure_license
             git add -A || true
             if ! git diff --cached --quiet; then
               git commit -m "auto: partial work saved on shutdown" || true
@@ -413,6 +464,16 @@ jobs:
             mkdir -p .github/workflows
             cp "$PRISTINE" "$WF"
             echo "[guard] 收尾阶段发现 workflow 被删/改，已恢复"
+          fi
+          # 防删自愈：收尾提交前恢复被删/改的 LICENSE
+          LIC="LICENSE"
+          LIC_PRISTINE=/tmp/license_pristine
+          if [ ! -s "$LIC_PRISTINE" ] && [ -n "${GITHUB_SHA:-}" ]; then
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/LICENSE" -o "$LIC_PRISTINE" 2>/dev/null || true
+          fi
+          if [ -s "$LIC_PRISTINE" ] && { [ ! -f "$LIC" ] || ! cmp -s "$LIC" "$LIC_PRISTINE"; }; then
+            cp "$LIC_PRISTINE" "$LIC"
+            echo "[guard] 收尾阶段发现 LICENSE 被删/改，已恢复"
           fi
           git add -A
           git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
