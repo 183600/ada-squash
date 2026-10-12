@@ -72,18 +72,26 @@ class GPTConfig:
 # ---------------------------------------------------------------------------
 # Norm-construction helpers
 # ---------------------------------------------------------------------------
-def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
-    """Collect the kwargs a given `norm_name` accepts from a GPTConfig.
+_CROSSENTROPY_CHUNK_BYTES = 1 << 26
+_CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
 
-    The result is passed to `build_norm`, which forwards it to the class
-    constructor; norms that do not declare one of these kwargs (LN, RMSNorm,
-    plain DyT) simply ignore the extras only when they are not supplied, so
-    each family gets exactly the subset it supports.
 
-    Using one helper for the blocks *and* the final norm guarantees that a
-    configured hyper-parameter (alpha_init / alpha_0 / k_init / p_init) is
-    applied to every norm of the family that accepts it.
-    """
+def _cross_entropy_chunk_rows(vocab_size: int) -> int:
+    """Rows of the [N, V] logit block handled per chunk."""
+    if vocab_size not in _CROSS_ENTROPY_CHUNK_ROWS_CACHE:
+        row_bytes = max(1, vocab_size) * 4
+        _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
+    return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
+
+
+_norm_kwargs_cache: dict[tuple, dict] = {}
+
+
+def _build_norm_kwargs_cache(cfg: "GPTConfig", layer_idx: int) -> dict:
+    """Cache norm kwargs per (norm_name, layer_idx) to avoid recomputation."""
+    cache_key = (cfg.norm_name, layer_idx)
+    if cache_key in _norm_kwargs_cache:
+        return _norm_kwargs_cache[cache_key]
     kwargs: dict = {}
     if cfg.norm_name in ("dytd", "dytcd"):
         kwargs = dict(
@@ -102,7 +110,23 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
         )
     if cfg.norm_name == "dyt":
         kwargs.update(alpha_init=cfg.alpha_init)
+    _norm_kwargs_cache[cache_key] = kwargs
     return kwargs
+
+
+def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
+    """Collect the kwargs a given `norm_name` accepts from a GPTConfig.
+
+    The result is passed to `build_norm`, which forwards it to the class
+    constructor; norms that do not declare one of these kwargs (LN, RMSNorm,
+    plain DyT) simply ignore the extras only when they are not supplied, so
+    each family gets exactly the subset it supports.
+
+    Using one helper for the blocks *and* the final norm guarantees that a
+    configured hyper-parameter (alpha_init / alpha_0 / k_init / p_init) is
+    applied to every norm of the family that accepts it.
+    """
+    return _build_norm_kwargs_cache(cfg, layer_idx)
 
 
 # ---------------------------------------------------------------------------
