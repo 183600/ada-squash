@@ -119,6 +119,10 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     dropped chunk by chunk and the gradient is rebuilt from a single
     softmax per chunk, so the step never holds more than one chunk's
     worth of extra logits at a time.
+
+    The backward pass overwrites the saved logit block in place with the
+    gradient (see `backward`), so the graph must not be traversed twice
+    with `retain_graph=True`.
     """
 
     @staticmethod
@@ -142,8 +146,13 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         logits, targets = ctx.saved_tensors
+        # The saved logit block doubles as the gradient buffer: each chunk
+        # is fully reduced into `probs` before its slice is overwritten, and
+        # no other node needs the original logit values (the producing
+        # matmul consumes only its inputs and this gradient vector). That
+        # keeps the step from ever holding a second [N, V] tensor.
+        grad_logits = logits
         grad_scale = (grad_out / ctx.count).to(logits.dtype)
-        grad_logits = torch.empty_like(logits)
         chunk_rows = ctx.chunk_rows
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
