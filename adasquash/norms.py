@@ -474,6 +474,14 @@ class QKSquash(nn.Module):
 
         Q' = tanh(alpha_q * Q);  K' = tanh(alpha_k * K)
         logits = (Q' @ K'.T) * scale
+
+    `tanh` bounds every element to [-1, 1], so the dot product over
+    `head_dim` terms is bounded by +-head_dim *before* the
+    `1/sqrt(head_dim)` scale, i.e. +-sqrt(head_dim) after it - a ceiling
+    that does not move with the activation magnitude. RMSNorm rescales
+    without saturating, so one dominant channel can still drive the logit;
+    `tanh` clips it. Only the incoming activations are touched, so the
+    module stays a pure element-wise function of Q/K.
     """
 
     def __init__(self, alpha_q_init: float = 1.0, alpha_k_init: float = 1.0):

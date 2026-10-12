@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import sys
 import json
+import random
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,7 +31,7 @@ from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 
 
 def load_ckpt(path: str, device: str = "cuda"):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     args = ckpt["args"]
     # Reconstruct model with the same config.
     model_cfg = dict(
@@ -44,6 +45,12 @@ def load_ckpt(path: str, device: str = "cuda"):
         learnable_p=not args.get("no_learnable_p", False),
         learnable_k=not args.get("no_learnable_k", False),
     )
+    if args.get("layerscale_init") is not None:
+        model_cfg["layerscale_init"] = args["layerscale_init"]
+    if "tie_embeddings" in args:
+        model_cfg["tie_word_embeddings"] = args["tie_embeddings"]
+    elif "no_tie_embeddings" in args:
+        model_cfg["tie_word_embeddings"] = not args["no_tie_embeddings"]
     if args["model"] == "gpt2-124m":
         model = build_gpt_124m(**model_cfg)
     elif args["model"] == "gpt2-350m":
@@ -97,6 +104,7 @@ def needle_in_haystack(
     model, tokenizer, needle: str = "The magic number is 12345.",
     haystack_prompt: str = "Many sentences follow. ",
     context_len: int = 4096, n_trials: int = 5, device: str = "cuda",
+    seed: int = 0,
 ):
     """
     A minimal needle-in-a-haystack test. We insert `needle` at a random
@@ -105,8 +113,12 @@ def needle_in_haystack(
 
     The expected answer is derived from `needle` itself (its final token /
     number), so a custom secret passed via `--secret` is actually scored.
+
+    `seed` pins the insertion positions so repeated evaluations of the same
+    checkpoint are comparable; the needle lands at a different depth every
+    trial, which is the point of the test.
     """
-    import random
+    rng = random.Random(seed)
     tok = tokenizer
     needle_ids = tok(needle, add_special_tokens=False)["input_ids"]
     prompt_ids = tok(haystack_prompt, add_special_tokens=False)["input_ids"]
@@ -127,7 +139,7 @@ def needle_in_haystack(
         n_repeats = body_len // len(prompt_ids)
         body = prompt_ids * n_repeats
         # Insert needle at a random position
-        pos = random.randint(0, max(1, len(body) - 1))
+        pos = rng.randint(0, max(1, len(body) - 1))
         full = body[:pos] + needle_ids + body[pos:] + question_ids
         x = torch.tensor(full, device=device).unsqueeze(0)
         with torch.no_grad():

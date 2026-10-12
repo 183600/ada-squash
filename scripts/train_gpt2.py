@@ -84,6 +84,10 @@ def build_dataloader(
             worker_info = torch.utils.data.get_worker_info()
             worker_id = worker_info.id if worker_info is not None else 0
             n_workers = worker_info.num_workers if worker_info is not None else 1
+            # Operate on `self.buf` *in place*. Rebinding a local name to
+            # `buf[n:]` would silently orphan the tail of the buffer, so
+            # every re-iteration of the dataset would start from the stale
+            # contents of `self.buf` and the tail would never be emitted.
             buf = self.buf
             for i, ex in enumerate(self.ds):
                 if i % n_workers != worker_id:
@@ -93,7 +97,7 @@ def build_dataloader(
                 buf.append(self.tok.eos_token_id)
                 while len(buf) >= self.seq_len + 1:
                     chunk = buf[: self.seq_len + 1]
-                    buf = buf[self.seq_len:]
+                    del buf[: self.seq_len]
                     x = torch.tensor(chunk[:-1], dtype=torch.long)
                     y = torch.tensor(chunk[1:], dtype=torch.long)
                     yield x, y
@@ -106,6 +110,61 @@ def build_dataloader(
         num_workers=2,
         pin_memory=torch.cuda.is_available(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Config plumbing
+# ---------------------------------------------------------------------------
+def load_yaml_config(path: str) -> dict:
+    """Read a YAML run config. Keys are returned as-is (snake_case)."""
+    import yaml
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"config '{path}' must be a mapping, got {type(data)}")
+    return data
+
+
+def apply_config_to_parser(parser, path: str | None, aliases: dict | None = None):
+    """Seed `parser` defaults from a YAML config.
+
+    `aliases` maps a config key onto `(argparse_dest, invert)`. `invert` is
+    for YAML keys that are positive (`use_layerscale: false`) while the flag
+    is negative (`--no-layerscale`).
+
+    Explicit command-line flags still win, because argparse only overrides a
+    default that the user actually supplied. Without this the YAML files
+    under `configs/` are decorative: nothing read them, so a run documented
+    as "the gpt2-124m-ln config" silently used the parser defaults instead -
+    including `use_layerscale`, which every baseline config explicitly turns
+    off while the parser default turns it on.
+    """
+    if not path:
+        return
+    cfg = load_yaml_config(path)
+    aliases = aliases or {}
+    known = {a.dest for a in parser._actions}
+    unknown = []
+    for key, value in cfg.items():
+        dest, invert = aliases.get(key, (key, False))
+        if dest not in known:
+            unknown.append(key)
+            continue
+        if invert and isinstance(value, bool):
+            value = not value
+        parser.set_defaults(**{dest: value})
+    if unknown:
+        print(f"[config] {path}: ignoring unknown keys {sorted(unknown)}")
+
+
+# YAML key -> (argparse dest, invert) for the negative-form flags.
+_TRAIN_CONFIG_ALIASES = {
+    "use_layerscale": ("no_layerscale", True),
+    "learnable_p": ("no_learnable_p", True),
+    "learnable_k": ("no_learnable_k", True),
+    "tie_word_embeddings": ("tie_embeddings", False),
+    "bf16": ("no_bf16", True),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -140,19 +199,35 @@ def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float)
 # Main train loop
 # ---------------------------------------------------------------------------
 def main():
+    # Pre-parse `--config` so the YAML can seed the parser defaults; the
+    # real parse below then lets explicit CLI flags override them.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    known, _ = pre.parse_known_args()
+
     p = argparse.ArgumentParser()
+    p.add_argument("--config", default=None, help="YAML run config; CLI flags override it")
     # Model
     p.add_argument("--model", choices=["gpt2-124m", "gpt2-350m", "llama-1b"], default="gpt2-124m")
     p.add_argument("--norm", default="dytcd", choices=list(["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"]))
     p.add_argument("--qk-norm", default=None, choices=[None, "qknorm", "dytqk"])
     p.add_argument("--no-layerscale", action="store_true")
+    p.add_argument("--layerscale-init", type=float, default=None)
     p.add_argument("--alpha-0", type=float, default=0.9)
     p.add_argument("--alpha-init", type=float, default=0.5)
     p.add_argument("--k-init", type=float, default=1.0)
     p.add_argument("--p-init", type=float, default=2.0)
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
-    p.add_argument("--tie-embeddings", action="store_true", default=True)
+    # Embedding tying is per-model: GPT-2 ties, LLaMA does not. The builders
+    # already encode the right default, so the flag is tri-state - `None`
+    # means "leave the builder's default alone". The previous
+    # `store_true, default=True` could never turn anything off.
+    p.add_argument("--tie-embeddings", dest="tie_embeddings",
+                   action="store_true", default=None,
+                   help="tie input/output embeddings (default: GPT-2 yes, LLaMA no)")
+    p.add_argument("--no-tie-embeddings", dest="tie_embeddings",
+                   action="store_false")
     # Data
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     p.add_argument("--dataset-config", default="sample-10BT")
@@ -169,7 +244,7 @@ def main():
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--bf16", action="store_true", default=True)
+    p.add_argument("--no-bf16", action="store_true", help="disable bf16 autocast")
     p.add_argument("--seed", type=int, default=42)
     # Logging / IO
     p.add_argument("--output-dir", default="runs/gpt2-124m-dytcd")
@@ -178,7 +253,10 @@ def main():
     p.add_argument("--save-every", type=int, default=2000)
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--run-name", default=None)
+    p.add_argument("--resume", default=None, help="checkpoint to resume from")
+    apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
+    args.bf16 = not args.no_bf16
 
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -202,6 +280,10 @@ def main():
         learnable_p=not args.no_learnable_p,
         learnable_k=not args.no_learnable_k,
     )
+    if args.layerscale_init is not None:
+        model_cfg["layerscale_init"] = args.layerscale_init
+    if args.tie_embeddings is not None:
+        model_cfg["tie_word_embeddings"] = args.tie_embeddings
     if args.model == "gpt2-124m":
         model = build_gpt_124m(**model_cfg)
     elif args.model == "gpt2-350m":
@@ -250,6 +332,19 @@ def main():
         lambda s: cosine_schedule(s, args.max_steps, args.warmup, args.min_lr_ratio),
     )
 
+    # Resume: restore model / optimizer / scheduler and the step counter so
+    # the LR schedule continues where it stopped instead of replaying warmup.
+    start_step = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            sched.load_state_dict(ckpt["scheduler"])
+        start_step = int(ckpt.get("step", 0))
+        print(f"[resume] {args.resume} -> step {start_step}")
+
     # Stability meters
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter(rel_threshold=0.20, abs_threshold=0.05)
@@ -274,7 +369,7 @@ def main():
         )
 
     # Training loop
-    step = 0
+    step = start_step
     t0 = time.time()
     while step < args.max_steps:
         opt.zero_grad(set_to_none=True)

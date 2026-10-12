@@ -1,12 +1,16 @@
 # Ablation matrix for DyT++ component study
-# Used by: python scripts/ablation.py
+# Used by: python scripts/ablation.py --config configs/ablation-matrix.yaml
 model: gpt2-124m
 
-# Synthetic random-token data for cheap stability tests
+# Synthetic Markov-chain corpus for cheap stability tests. The chain gives
+# the loss a learnable floor (log of the state count) so variants can
+# actually be ranked, and a sparse outlier channel gives the squashing
+# layers something to control.
 batch_size: 8
 seq_len: 512
 max_steps: 1000
 lr: 6.0e-4
+weight_decay: 0.1
 seed: 42
 
 log_every: 50
@@ -14,7 +18,8 @@ stats_every: 200
 output_dir: runs/ablation
 
 # Each entry below is one ablation; the script iterates over these and
-# writes one summary.json per row.
+# writes one summary.json per row. `norm` is the norm selector
+# (GPTConfig spells it `norm_name`).
 ablations:
   # ---- Per-channel on/off ----
   - name: dyt_no_perchannel
@@ -27,8 +32,8 @@ ablations:
     norm: dytcd
 
   # ---- Depth conditioning ----
-  - name: dyt_no_depth
-    norm: dyt
+  # `dytd_k0_no_depth_schedule` keeps the depth-axis plumbing but with a
+  # zero decay rate, so it isolates the schedule itself.
   - name: dytd_k0_no_depth_schedule
     norm: dytd
     k_init: 0.0
@@ -41,10 +46,10 @@ ablations:
   - name: dytcd_no_ls
     norm: dytcd
     use_layerscale: false
-  - name: dytcd_ls_1e5
+  - name: dytcd_ls1e5
     norm: dytcd
     layerscale_init: 1.0e-5
-  - name: dytcd_ls_1e3
+  - name: dytcd_ls1e3
     norm: dytcd
     layerscale_init: 1.0e-3
 
@@ -65,18 +70,18 @@ ablations:
     norm: dytc
     p_init: 2.0
     learnable_p: true
-  - name: dytc_tanh_eq_p64
+  - name: dytc_tanh_eq
     norm: dytc
     p_init: 64.0
     learnable_p: false
 
   # ---- alpha init ----
-  - name: dyt_alpha_0p3
+  - name: dyt_alpha_0.3
     norm: dyt
     alpha_init: 0.3
-  - name: dyt_alpha_0p5
+  - name: dyt_alpha_0.5
     norm: dyt
     alpha_init: 0.5
-  - name: dyt_alpha_1p0
+  - name: dyt_alpha_1.0
     norm: dyt
     alpha_init: 1.0

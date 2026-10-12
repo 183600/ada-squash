@@ -56,6 +56,14 @@ class GPTConfig:
     learnable_k: bool = True
     # Misc
     pad_token_id: int = 0
+    # Label id excluded from the loss. MUST be outside [0, vocab_size) so it
+    # can never collide with a real token: with the GPT-2 vocabulary id 0 is
+    # "!", an ordinary token that appears in ordinary prose, and dropping
+    # every occurrence silently removes a slice of the objective (and biases
+    # it, since "!" is not distributed like an average token). Packed
+    # streaming corpora contain no padding at all, so the training pipeline
+    # leaves nothing to mask and this value should never appear.
+    ignore_index: int = -100
     tie_word_embeddings: bool = True
     rotary: bool = False
 
@@ -402,7 +410,7 @@ class GPT(nn.Module):
             loss = cross_entropy_mean(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=self.cfg.pad_token_id,
+                ignore_index=self.cfg.ignore_index,
             )
 
         if not return_stats:
@@ -460,12 +468,15 @@ def build_gpt_350m(norm_name: str = "dytcd", **over) -> GPT:
 
 def build_llama_tiny_1b(norm_name: str = "dytcd", **over) -> GPT:
     """LLaMA-tiny ~1.1B params, matches the xIELU / LLaMA-tiny recipe."""
+    # `setdefault` rather than a literal keyword: passing
+    # `tie_word_embeddings` through `over` used to raise "got multiple
+    # values for keyword argument", so a caller could not override it.
+    over.setdefault("tie_word_embeddings", False)
+    over.setdefault("rotary", True)
     cfg = GPTConfig(
         vocab_size=32000, dim=2048, n_layers=24, n_heads=16,
         max_seq_len=2048, mlp_ratio=8.0 / 3.0,
-        norm_name=norm_name, rotary=True,
-        tie_word_embeddings=False,
-        **over,
+        norm_name=norm_name, **over,
     )
     return GPT(cfg)
 

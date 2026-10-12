@@ -97,10 +97,14 @@ class MoELayer(nn.Module):
 
         # Load balancing auxiliary loss (Switch Transformer style):
         # aux = n_experts * sum_i(f_i * P_i) where f_i is the fraction of
-        # tokens routed to expert i and P_i is the mean router probability.
+        # tokens *dispatched* to expert i and P_i is the mean router
+        # probability. `route` rows are renormalised to sum to `top_k`, not
+        # 1, so f_i has to be divided by `top_k` for the usual formulation
+        # to hold - otherwise the loss is `top_k` times too large and its
+        # 1e-3 weight silently behaves like a different, unrecorded one.
         tokens_per_expert = route.sum(0)  # [E]
         n_tokens = x_flat.shape[0]
-        f_i = tokens_per_expert / n_tokens
+        f_i = tokens_per_expert / (n_tokens * self.top_k)
         p_i = logits.softmax(-1).mean(dim=0)
         aux = self.n_experts * (f_i * p_i).sum()
         return y, aux, tokens_per_expert.detach()
@@ -182,7 +186,7 @@ class MoEGPT(nn.Module):
         loss = None
         if y is not None:
             ce = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                 y.view(-1), ignore_index=self.cfg.pad_token_id)
+                                 y.view(-1), ignore_index=self.cfg.ignore_index)
             loss = ce + 1e-3 * aux_total
         if return_aux:
             return logits, loss, aux_total, tpe_list
@@ -223,7 +227,14 @@ def main():
     history = []
     for step in range(args.max_steps):
         x = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
-        y = torch.cat([x[:, 1:], torch.zeros(args.batch_size, 1, dtype=torch.long, device=device)], dim=1)
+        # Shift-by-one targets. The final position has no successor, so it is
+        # padded with `cfg.ignore_index` (out-of-vocab) rather than token 0,
+        # which is a real GPT-2 token ("!") that would otherwise be trained on.
+        y = torch.full(
+            (args.batch_size, args.seq_len), cfg.ignore_index,
+            dtype=torch.long, device=device,
+        )
+        y[:, :-1] = x[:, 1:]
         if step % args.stats_every == 0:
             act_stats.attach()
         logits, loss, aux, tpe_list = model(x, y, return_aux=True)

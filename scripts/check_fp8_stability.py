@@ -3,10 +3,13 @@ FP8 stability check: simulate FP8 / bf16 training divergence on the
 same GPT-2 124M model with different norm layers.
 
 We measure:
-  - forward divergence: max|output_fp8 - output_bf16| / max|output_bf16|
-  - activation overflow rate under FP8-E4M3 / FP8-E5M2
-  - per-norm activation range, before / after the norm
-  - the standard "FP8 trainability" curve: at what layer do logits NaN?
+  - forward divergence: max|logits_fp8 - logits_fp32| / max|logits_fp32|,
+    where the FP8 pass quantize-dequantizes the input and output of every
+    GEMM (the SwiGLU MLP included)
+  - activation overflow rate under FP8-E4M3
+  - per-norm activation range and pre-norm excess kurtosis
+  - the "FP8 trainability" curve: the first block whose output goes
+    non-finite
 
 This script is a CPU/GPU pure-python simulation - it does NOT need real
 FP8 hardware (e.g. H100 FP8).
@@ -19,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,9 +32,10 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from adasquash import build_norm
-from adasquash.model import build_gpt_124m
+from adasquash.model import MLP, build_gpt_124m
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +55,11 @@ def fp8_min_normal(exp_bits: int) -> float:
 
 
 def to_fp8_e4m3(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
-    """Simulate per-tensor FP8-E4M3 quantization. Range: ±448."""
+    """Simulate per-tensor FP8-E4M3 quantization. Range: +-448."""
     return simulate_fp8(x, max_val=448.0, exp_bits=4, mantissa_bits=3)
 
 def to_fp8_e5m2(x: torch.Tensor) -> torch.Tensor:
-    """Simulate per-tensor FP8-E5M2 quantization. Range: ±57344."""
+    """Simulate per-tensor FP8-E5M2 quantization. Range: +-57344."""
     return simulate_fp8(x, max_val=57344.0, exp_bits=5, mantissa_bits=2)
 
 def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: int) -> torch.Tensor:
@@ -74,9 +80,11 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     # Mantissa quantization: 2^mantissa_bits levels per binade.
     sign = flushed.sign()
     abs_x = flushed.abs()
-    # Compute exponent
+    # Compute exponent. `abs_x` is already clamped to `max_val`, so this
+    # upper clamp only matters for the rounding edge; keep it on an integer
+    # binade so `2**exp` stays a power of two.
     exp = torch.floor(torch.log2(abs_x.clamp(min=1e-30)))
-    exp = exp.clamp(max=torch.log2(torch.tensor(max_val)).item())
+    exp = exp.clamp(max=math.floor(math.log2(max_val)))
     # Round the mantissa on the true IEEE grid: with `mantissa_bits`
     # explicit bits there are 2^mantissa_bits uniformly spaced values in
     # [1, 2), i.e. a step of 2^-mantissa_bits (E4M3: 1/8, E5M2: 1/4).
@@ -89,62 +97,198 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     return quant.to(x.dtype)
 
 
-def measure_fp8_divergence(model, x, norm_name: str):
-    """Return dict with FP8-E4M3 quantization-stability stats per norm.
+# ---------------------------------------------------------------------------
+# FP8 forward simulation (quantize -> dequantize, a.k.a. "fake quant")
+# ---------------------------------------------------------------------------
+class FP8LinearSim:
+    """Wrap a module so its matmuls run on FP8-quantized operands.
 
-    Note `x` holds *token ids*, so it must stay an integer tensor - casting
-    it to float breaks the embedding lookup. The model itself already runs
-    in fp32, so a single hooked forward is enough.
+    This mirrors how FP8 training works on real hardware: the *inputs* and
+    *outputs* of every GEMM are cast to FP8 (quantized-dequantized, since
+    the simulation runs on fp32 tensors) while the accumulation itself stays
+    in higher precision. Measuring only the norms' outputs - which is all
+    the previous version of this script did - cannot observe how much error
+    actually accumulates through the network, and cannot answer the
+    "which layer first produces Inf/NaN" question at all.
     """
-    # Measure the quantization error introduced by FP8-E4M3 on every
-    # normalization layer's output.
+
+    def __init__(self, module: nn.Module, quant):
+        self.module = module
+        self.quant = quant
+        self.orig_forward = module.forward
+
+        def fwd(*args, **kwargs):
+            a = tuple(self.quant(x) if torch.is_tensor(x) else x for x in args)
+            y = self.orig_forward(*a, **kwargs)
+            return self.quant(y)
+
+        module.forward = fwd
+
+
+class FP8SwiGLUSim:
+    """FP8 simulation for the SwiGLU MLP.
+
+    `MLP.forward` goes through `_SwiGLU.apply`, which calls `F.linear`
+    directly, so wrapping the child `nn.Linear` modules has no effect - the
+    MLP (the majority of the parameters, and the usual home of activation
+    outliers) would silently stay in fp32.
+    """
+
+    def __init__(self, mlp: MLP, quant):
+        self.mlp = mlp
+        self.quant = quant
+        self.orig_forward = mlp.forward
+
+        def fwd(x):
+            q = self.quant
+            a = q(F.linear(q(x), mlp.w1.weight))
+            b = q(F.linear(q(x), mlp.w3.weight))
+            h = q(F.silu(a) * b)
+            return mlp.drop(q(F.linear(h, mlp.w2.weight)))
+
+        mlp.forward = fwd
+
+    @property
+    def module(self):
+        return self.mlp
+
+
+@contextmanager
+def fp8_forward(model: nn.Module, quant):
+    """Run `model`'s forward with every GEMM on FP8-quantized operands."""
+    patched = []
+    try:
+        for m in model.modules():
+            if isinstance(m, MLP):
+                patched.append(FP8SwiGLUSim(m, quant))
+            elif isinstance(m, nn.Linear):
+                patched.append(FP8LinearSim(m, quant))
+        yield
+    finally:
+        for p in patched:
+            p.module.forward = p.orig_forward
+
+
+def measure_fp8_divergence(model, x, norm_name: str):
+    """FP8 forward-divergence and trainability stats for one model.
+
+    Returns the relative divergence of the FP8-simulated logits against the
+    fp32 logits, per-norm activation-range statistics before/after each
+    norm, and the depth at which the residual stream first goes non-finite.
+    """
     handles = []
     quant_errors = []
+    ranges = []
     fp8_e4m3_min = fp8_min_normal(4)
+
+    def make_range_hook():
+        def hook(module, inp, out):
+            x_in = inp[0] if isinstance(inp, tuple) and inp else None
+            ranges.append({
+                "module": module.__class__.__name__,
+                "max_abs_in": x_in.abs().max().item() if torch.is_tensor(x_in) else 0.0,
+                "max_abs_out": out.abs().max().item(),
+                "kurtosis_in": _excess_kurtosis(x_in) if torch.is_tensor(x_in) else 0.0,
+            })
+        return hook
 
     def make_q_hook():
         def hook(module, inp, out):
             # out is the post-norm activation
             q = to_fp8_e4m3(out)
-            rel_err = (q - out).abs().mean().item() / (out.abs().mean().item() + 1e-6)
+            denom = out.abs().mean().item() + 1e-6
             quant_errors.append({
                 "module": module.__class__.__name__,
                 "max_abs": out.abs().max().item(),
                 "overflow_rate": (out.abs() > 448).float().mean().item(),
                 "underflow_rate": (out.abs() < fp8_e4m3_min).float().mean().item() if out.numel() else 0.0,
-                "rel_err": rel_err,
+                "rel_err": (q - out).abs().mean().item() / denom,
             })
+        return hook
+
+    first_bad = []
+
+    def make_block_hook(i):
+        def hook(module, inp, out):
+            y = out[0] if isinstance(out, tuple) else out
+            if not torch.isfinite(y).all():
+                first_bad.append(i)
         return hook
 
     for name, m in model.named_modules():
         if m.__class__.__name__ in {"LayerNorm", "RMSNorm", "DyT", "DyTC", "DyTD", "DyTCD"}:
+            handles.append(m.register_forward_hook(make_range_hook()))
             handles.append(m.register_forward_hook(make_q_hook()))
 
+    # Reference logits in fp32, then logits with every GEMM on FP8.
     with torch.no_grad():
-        _ = model(x)
+        logits_fp32, _ = model(x)
+
+    block_handles = [
+        blk.register_forward_hook(make_block_hook(i))
+        for i, blk in enumerate(model.blocks)
+    ]
+    with fp8_forward(model, to_fp8_e4m3):
+        with torch.no_grad():
+            logits_fp8, _ = model(x)
+    for h in block_handles:
+        h.remove()
 
     for h in handles:
         h.remove()
 
-    # Aggregate
+    # Relative forward divergence of the logits.
+    finite = torch.isfinite(logits_fp8).all()
+    if finite:
+        rel = ((logits_fp8 - logits_fp32).abs().max()
+               / logits_fp32.abs().max().clamp(min=1e-12)).item()
+        logit_nan = False
+    else:
+        rel = float("inf")
+        logit_nan = True
+
     if not quant_errors:
-        return {"norm": norm_name, "n_layers": 0, "mean_overflow": 0.0, "max_overflow": 0.0}
+        return {
+            "norm": norm_name, "n_layers": 0,
+            "mean_overflow": 0.0, "max_overflow": 0.0,
+            "logit_rel_divergence": rel, "first_nonfinite_layer": None,
+        }
 
     mean_overflow = sum(e["overflow_rate"] for e in quant_errors) / len(quant_errors)
     max_overflow = max(e["overflow_rate"] for e in quant_errors)
     mean_underflow = sum(e["underflow_rate"] for e in quant_errors) / len(quant_errors)
     mean_rel_err = sum(e["rel_err"] for e in quant_errors) / len(quant_errors)
     max_max = max(e["max_abs"] for e in quant_errors)
+    max_in = max(r["max_abs_in"] for r in ranges) if ranges else 0.0
+    mean_kurt = (sum(r["kurtosis_in"] for r in ranges) / len(ranges)) if ranges else 0.0
 
     return {
         "norm": norm_name,
         "n_layers": len(quant_errors),
+        "max_abs_pre_norm": max_in,
         "max_abs_post_norm": max_max,
+        "mean_excess_kurtosis_pre_norm": mean_kurt,
         "mean_overflow_rate_e4m3": mean_overflow,
         "max_overflow_rate_e4m3": max_overflow,
         "mean_underflow_rate_e4m3": mean_underflow,
         "mean_rel_quant_err_e4m3": mean_rel_err,
+        "logit_rel_divergence": rel,
+        "logit_nan_under_fp8": logit_nan,
+        "first_nonfinite_layer": first_bad[0] if first_bad else None,
     }
+
+
+def _excess_kurtosis(x: torch.Tensor) -> float:
+    """Excess kurtosis of a tensor, in fp64 for stability."""
+    x = x.detach().float().flatten()
+    if x.numel() < 4:
+        return 0.0
+    xd = x.double()
+    m = xd.mean()
+    v = (xd - m).pow(2).mean()
+    if v <= 0:
+        return 0.0
+    return ((xd - m).pow(4).mean() / (v * v) - 3.0).item()
 
 
 def main():

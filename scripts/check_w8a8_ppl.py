@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 
 from adasquash import GPTConfig, GPT
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
+from adasquash.model import MLP, _SwiGLU, build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 from scripts.eval_downstream import load_ckpt
 
 
@@ -56,8 +56,6 @@ def quantize_activation_per_token(x: torch.Tensor, n_bits: int = 8):
 
 def wrap_linear_w8a8(linear: nn.Linear):
     """Replace a linear's forward with W8A8 quantized versions."""
-    original_forward = linear.forward
-
     def quantized_forward(x):
         # weight quantization happens lazily once.
         if not hasattr(linear, "_q_weight"):
@@ -70,9 +68,36 @@ def wrap_linear_w8a8(linear: nn.Linear):
     return linear
 
 
+def wrap_swiglu_w8a8(mlp):
+    """Quantize a SwiGLU `MLP`.
+
+    `MLP.forward` calls `_SwiGLU.apply` with the raw `nn.Linear.weight`
+    tensors, so wrapping the child `nn.Linear` modules (as
+    `wrap_linear_w8a8` does) never takes effect: every SwiGLU weight would
+    stay fp32 and the reported W8A8 PPL drop would be measured on a model
+    that is only partly quantized - the MLP holds the majority of the
+    parameters and is exactly where activation outliers live. The whole
+    module is therefore wrapped at once.
+    """
+    def quantized_forward(x):
+        weights = []
+        for lin in (mlp.w1, mlp.w2, mlp.w3):
+            if not hasattr(lin, "_q_weight"):
+                qw, _ = quantize_weight_per_channel(lin.weight.data)
+                lin._q_weight = qw
+            weights.append(lin._q_weight)
+        x_q = quantize_activation_per_token(x)
+        return mlp.drop(_SwiGLU.apply(x_q, weights[0], weights[1], weights[2]))
+
+    mlp.forward = quantized_forward
+    return mlp
+
+
 def wrap_model_w8a8(model: nn.Module):
     for m in model.modules():
-        if isinstance(m, nn.Linear):
+        if isinstance(m, MLP):
+            wrap_swiglu_w8a8(m)
+        elif isinstance(m, nn.Linear):
             wrap_linear_w8a8(m)
     return model
 
@@ -93,15 +118,19 @@ def compute_ce_sum(model, batch, target, device="cuda"):
     model.eval()
     batch = batch.to(device)
     target = target.to(device)
-    logits, _ = model(batch, target)
+    # Ask the model for logits only; the loss it would compute internally is
+    # recomputed below so that the mask matches the shift convention exactly.
+    logits, _ = model(batch)
     # logits: [B, T, V]
     ce = torch.nn.functional.cross_entropy(
         logits.view(-1, logits.size(-1)),
         target.view(-1),
         reduction="sum",
-        ignore_index=model.cfg.pad_token_id,
+        ignore_index=model.cfg.ignore_index,
     )
-    n = (target != model.cfg.pad_token_id).sum().item()
+    n = (target != model.cfg.ignore_index).sum().item()
+    if n == 0:
+        raise ValueError("probe batch contains no valid target tokens")
     return ce.item(), n
 
 
@@ -147,10 +176,15 @@ def main():
                 0, model.cfg.vocab_size, (args.batch_size, args.seq_len),
                 generator=rng, device=device,
             )
-            y = torch.cat(
-                [x[:, 1:], torch.zeros(args.batch_size, 1, dtype=torch.long, device=device)],
-                dim=1,
+            # Shift-by-one targets; the final position has no successor and is
+            # padded with `cfg.ignore_index` (out of vocabulary) rather than
+            # token 0, which is a real GPT-2 token ("!") and would otherwise
+            # be counted as a scored prediction.
+            y = torch.full(
+                (args.batch_size, args.seq_len), model.cfg.ignore_index,
+                dtype=torch.long, device=device,
             )
+            y[:, :-1] = x[:, 1:]
             a, n = compute_ce_sum(model, x, y, device=device)
             b, _ = compute_ce_sum(qmodel, x, y, device=device)
             ce_fp += a

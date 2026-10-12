@@ -5,6 +5,9 @@
 torch>=2.1.0
 numpy>=1.24
 
+# Run configs (configs/*.yaml are read via --config)
+PyYAML>=6.0
+
 # Data & tokenization
 datasets>=2.14
 transformers>=4.36

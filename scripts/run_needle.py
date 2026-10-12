@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 import sys
 from pathlib import Path
 
@@ -40,6 +39,7 @@ def main():
     p.add_argument("--tokenizer", default="gpt2")
     p.add_argument("--secret", default="The magic number is 98765.")
     p.add_argument("--output", default=None)
+    p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -47,7 +47,6 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
 
-    random.seed(0)
     results = []
     for L in args.ctx_lens:
         if L > model.cfg.max_seq_len:
@@ -56,7 +55,7 @@ def main():
             continue
         acc = needle_in_haystack(
             model, tok, needle=args.secret, context_len=L,
-            n_trials=args.trials, device=device,
+            n_trials=args.trials, device=device, seed=args.seed,
         )
         print(f"[needle] L={L:5d} acc={acc:.3f}")
         results.append({"ctx_len": L, "acc": acc})

@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import argparse
 import math
 import pytest
 import torch
@@ -29,12 +30,13 @@ import torch.nn as nn
 from adasquash import (
     build_norm, NORM_REGISTRY, generalized_softsign,
     LayerNorm, RMSNorm, DyT, DyTC, DyTD, DyTCD,
-    GPTConfig, GPT, build_gpt_124m,
+    GPTConfig, GPT, build_gpt_124m, build_llama_tiny_1b,
     ActivationStats, LossSpikeCounter, KurtosisMeter, MaxAbsMeter,
     count_parameters, measure_activation_stats,
 )
 from adasquash.attention import CausalSelfAttention, apply_rope
 from adasquash.norms import QKSquash
+from adasquash.model import cross_entropy_mean
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +297,244 @@ def test_checkpoint_roundtrip():
         out1, _ = model(x)
         out2, _ = model2(x)
     assert torch.allclose(out1, out2, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Loss masking
+# ---------------------------------------------------------------------------
+def test_ignore_index_does_not_collide_with_a_real_token():
+    """The mask must not swallow a legitimate target id.
+
+    `pad_token_id` is 0, which in the GPT-2 vocabulary is "!" - an ordinary
+    token. Masking on it silently dropped those targets from the loss.
+    """
+    cfg = GPTConfig()
+    assert cfg.ignore_index == -100
+    assert not (0 <= cfg.ignore_index < cfg.vocab_size)
+
+
+def test_token_zero_targets_are_scored():
+    """A batch of nothing but token-0 targets must produce a real loss."""
+    torch.manual_seed(0)
+    # Uniform (all-zero) logits give an exactly log(V) cross-entropy.
+    logits = torch.zeros(64, 16, requires_grad=True)
+    targets = torch.zeros(64, dtype=torch.long)
+    loss = cross_entropy_mean(logits, targets, ignore_index=GPTConfig().ignore_index)
+    # If id 0 were masked the valid count would be zero and the result NaN.
+    assert math.isfinite(loss.item())
+    assert abs(loss.item() - math.log(16)) < 1e-4
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad.abs().sum().item() > 0
+
+
+def test_padded_positions_are_masked_and_excluded_from_the_count():
+    torch.manual_seed(0)
+    logits = torch.randn(64, 8)
+    targets = torch.randint(0, 8, (64,))
+    targets[-1] = -100
+    masked = cross_entropy_mean(logits, targets, ignore_index=-100)
+    kept = cross_entropy_mean(logits[:-1], targets[:-1], ignore_index=-100)
+    assert abs(masked.item() - kept.item()) < 1e-5
+
+
+def test_gpt_forward_ignores_only_ignore_index():
+    """A masked target must contribute neither loss nor gradient."""
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
+                          max_seq_len=16))
+    model.eval()
+    x = torch.randint(0, 64, (1, 16))
+    y = torch.randint(0, 64, (1, 16))
+    y_masked = y.clone()
+    y_masked[:, -1] = model.cfg.ignore_index
+
+    with torch.no_grad():
+        logits, loss_masked = model(x, y_masked)
+        # Reference: the same loss over the unmasked prefix only. If the
+        # masked position leaked into the sum or the normalizer this drifts.
+        ref = torch.nn.functional.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.size(-1)),
+            y[:, :-1].reshape(-1),
+        )
+    assert abs(loss_masked.item() - ref.item()) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Gradient correctness of the fused autograd kernels
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("p", [1.0, 2.0, 4.0])
+def test_softsign_gradcheck_wrt_x_and_p(p):
+    """The hand-written backward must match autograd on the closed form."""
+    from adasquash.norms import _GeneralizedSoftsign
+
+    x = (torch.randn(4, 6, dtype=torch.float64) * 3).requires_grad_(True)
+    pt = torch.tensor(p, dtype=torch.float64, requires_grad=True)
+
+    def fn(a, b):
+        return _GeneralizedSoftsign.apply(a, b)
+
+    assert torch.autograd.gradcheck(fn, (x, pt), eps=1e-6, atol=1e-7)
+
+
+def test_swiglu_and_rmsnorm_gradcheck():
+    from adasquash.norms import _RMSNorm
+    from adasquash.model import _SwiGLU
+
+    x = torch.randn(2, 5, 7, dtype=torch.float64).requires_grad_(True)
+    w = torch.randn(7, dtype=torch.float64).requires_grad_(True)
+    assert torch.autograd.gradcheck(
+        lambda a, b: _RMSNorm.apply(a, b, 1e-6), (x, w), atol=1e-7
+    )
+
+    x = torch.randn(2, 5, 7, dtype=torch.float64).requires_grad_(True)
+    hidden = 9
+    ws = [torch.randn(hidden, 7, dtype=torch.float64).requires_grad_(True),
+          torch.randn(7, hidden, dtype=torch.float64).requires_grad_(True),
+          torch.randn(hidden, 7, dtype=torch.float64).requires_grad_(True)]
+    assert torch.autograd.gradcheck(
+        lambda *a: _SwiGLU.apply(*a), (x, *ws), atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("chunk_rows", [4, 8, 1000])
+def test_chunked_cross_entropy_matches_reference(chunk_rows):
+    torch.manual_seed(0)
+    V = 37
+    targets = torch.randint(0, V, (200,))
+    targets[:17] = -100
+    targets[50:60] = -100
+    logits = torch.randn(200, V, dtype=torch.float64).requires_grad_(True)
+    got = cross_entropy_mean(logits, targets, ignore_index=-100, chunk_rows=chunk_rows)
+    ref = torch.nn.functional.cross_entropy(logits, targets, ignore_index=-100)
+    assert torch.allclose(got, ref)
+    g1, = torch.autograd.grad(got, logits, retain_graph=True)
+    g2, = torch.autograd.grad(ref, logits, retain_graph=True)
+    assert torch.allclose(g1, g2, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Quantization harnesses
+# ---------------------------------------------------------------------------
+def test_w8a8_wrapper_quantizes_swiglu_weights():
+    """The W8A8 probe must quantize the MLP, not just attention/lm_head.
+
+    `MLP.forward` calls `_SwiGLU.apply` with the raw `.weight` tensors, so
+    wrapping the child `nn.Linear` modules silently left the majority of the
+    parameters in fp32.
+    """
+    import copy
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.check_w8a8_ppl import wrap_model_w8a8
+
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=256, dim=32, n_layers=1, n_heads=4, max_seq_len=32))
+    model.eval()
+    x = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        ref = model(x)[0]
+    q = wrap_model_w8a8(copy.deepcopy(model)).eval()
+    with torch.no_grad():
+        got = q(x)[0]
+    assert hasattr(q.blocks[0].mlp.w1, "_q_weight"), "SwiGLU w1 left in fp32"
+    assert hasattr(q.blocks[0].mlp.w2, "_q_weight"), "SwiGLU w2 left in fp32"
+    assert hasattr(q.blocks[0].mlp.w3, "_q_weight"), "SwiGLU w3 left in fp32"
+    # Quantization must actually perturb the output.
+    assert not torch.allclose(ref, got, atol=1e-8)
+
+
+def test_fp8_forward_simulation_perturbs_logits_and_restores():
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.check_fp8_stability import fp8_forward, to_fp8_e4m3
+
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=256, dim=32, n_layers=2, n_heads=4, max_seq_len=32))
+    model.eval()
+    x = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        ref = model(x)[0]
+    with fp8_forward(model, to_fp8_e4m3):
+        with torch.no_grad():
+            got = model(x)[0]
+    assert not torch.allclose(ref, got, atol=1e-8)
+    # The context manager must restore the original forwards.
+    with torch.no_grad():
+        again = model(x)[0]
+    assert torch.allclose(ref, again)
+
+
+def test_fp8_quantizer_respects_format_range():
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.check_fp8_stability import to_fp8_e4m3, to_fp8_e5m2, fp8_min_normal
+
+    x = torch.tensor([1e6, -1e6, 0.0, 1e-8, 1.0, -3.25])
+    q = to_fp8_e4m3(x)
+    assert q.abs().max().item() <= 448.0 + 1e-6
+    q5 = to_fp8_e5m2(x)
+    assert q5.abs().max().item() <= 57344.0 + 1e-3
+    # Below the smallest normal magnitude both formats flush to zero.
+    assert to_fp8_e4m3(torch.tensor([fp8_min_normal(4) * 0.5])).item() == 0.0
+    # Exact representable values round-trip.
+    assert to_fp8_e4m3(torch.tensor([1.0, 0.5, -2.0, 448.0])).tolist() == [1.0, 0.5, -2.0, 448.0]
+
+
+def test_build_llama_tiny_accepts_tie_override():
+    """`tie_word_embeddings` used to be a hard-coded keyword, so passing it
+    through **over raised a duplicate-keyword TypeError."""
+    m = build_llama_tiny_1b(norm_name="dytcd", tie_word_embeddings=True)
+    assert m.lm_head.weight is m.tok_emb.weight
+    m2 = build_llama_tiny_1b(norm_name="dytcd")
+    assert m2.lm_head.weight is not m2.tok_emb.weight
+
+
+# ---------------------------------------------------------------------------
+# Config plumbing
+# ---------------------------------------------------------------------------
+def test_yaml_config_overrides_parser_defaults():
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
+
+    root = Path(__file__).resolve().parent.parent
+    p = argparse.ArgumentParser()
+    p.add_argument("--norm", default="dytcd")
+    p.add_argument("--no-layerscale", action="store_true")
+    p.add_argument("--no-learnable-p", action="store_true")
+    p.add_argument("--no-learnable-k", action="store_true")
+    p.add_argument("--no-tie-embeddings", action="store_true")
+    p.add_argument("--no-bf16", action="store_true")
+    p.add_argument("--layerscale-init", type=float, default=None)
+    p.add_argument("--output-dir", default="x")
+    apply_config_to_parser(p, str(root / "configs" / "gpt2-124m-ln.yaml"),
+                           _TRAIN_CONFIG_ALIASES)
+    a = p.parse_args([])
+    assert a.norm == "ln"
+    # The baseline config turns LayerScale off, the parser default turns it on.
+    assert a.no_layerscale is True
+    assert a.output_dir == "runs/gpt2-124m-ln"
+
+
+def test_explicit_cli_flags_beat_the_config():
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
+
+    root = Path(__file__).resolve().parent.parent
+    p = argparse.ArgumentParser()
+    p.add_argument("--norm", default="dytcd")
+    p.add_argument("--no-layerscale", action="store_true")
+    p.add_argument("--no-learnable-p", action="store_true")
+    p.add_argument("--no-learnable-k", action="store_true")
+    p.add_argument("--no-tie-embeddings", action="store_true")
+    p.add_argument("--no-bf16", action="store_true")
+    p.add_argument("--layerscale-init", type=float, default=None)
+    apply_config_to_parser(p, str(root / "configs" / "gpt2-124m-dytcd.yaml"),
+                           _TRAIN_CONFIG_ALIASES)
+    assert p.parse_args([]).no_layerscale is False      # from the config
+    assert p.parse_args(["--no-layerscale"]).no_layerscale is True  # from the CLI
 
 
 # ---------------------------------------------------------------------------
