@@ -8,10 +8,14 @@ Run:
 Tests cover:
   - norm registry / build_norm
   - all normalization layers preserve shape and dtype
-  - DyT family gradients flow correctly
-  - the generalized softsign is bounded in [-1, 1]
+  - every fused autograd kernel (DyT / DyT-C / DyT-D / DyT-CD, RMSNorm,
+    SwiGLU, both cross-entropies, the generalized softsign) matches an
+    independent recomposition in plain autograd, per parameter, from a
+    *randomized* parameter set - not just "the gradients are finite"
+  - frozen `p` / `k`, `beta=False`, and the alpha / p clamps
+  - the generalized softsign is bounded in [-1, 1] and finite for runaway `p`
   - depth schedule of DyT-D / DyT-CD is monotone in alpha_0 / k
-  - QK-squash keeps logits bounded
+  - QK-squash keeps logits bounded; attention logit stats read the causal triangle
   - model forward / loss / checkpoint round-trip
   - metrics: KurtosisMeter matches torch.kurtosis on synthetic data
 """
@@ -391,6 +395,257 @@ def test_swiglu_and_rmsnorm_gradcheck():
     assert torch.autograd.gradcheck(
         lambda *a: _SwiGLU.apply(*a), (x, *ws), atol=1e-6
     )
+
+
+def test_layerscale_residual_gradcheck():
+    from adasquash.model import _LayerScaleResidual
+
+    x = torch.randn(2, 4, 6, dtype=torch.float64).requires_grad_(True)
+    r = torch.randn(2, 4, 6, dtype=torch.float64).requires_grad_(True)
+    s = torch.randn(6, dtype=torch.float64).requires_grad_(True)
+    assert torch.autograd.gradcheck(
+        lambda *a: _LayerScaleResidual.apply(*a), (x, r, s), atol=1e-9
+    )
+
+
+def test_fused_cross_entropy_matches_the_reference_value_and_gradients():
+    """The training path's loss node: `hidden @ weight.T` folded into the CE.
+
+    It is what every training step backpropagates through, and nothing else
+    in the graph reproduces it, so its gradients are checked against plain
+    `F.cross_entropy` on the materialized logits - including the
+    `ignore_index` rows, which must contribute neither loss nor gradient.
+    """
+    from adasquash.model import fused_cross_entropy_mean
+
+    torch.manual_seed(0)
+    N, C, V = 40, 5, 7
+    hidden = torch.randn(N, C, dtype=torch.float64).requires_grad_(True)
+    weight = torch.randn(V, C, dtype=torch.float64).requires_grad_(True)
+    targets = torch.randint(0, V, (N,), dtype=torch.long)
+    targets[:5] = -100
+    targets[20:23] = -100
+
+    fused = fused_cross_entropy_mean(
+        hidden, weight, targets, ignore_index=-100, chunk_rows=7
+    )
+    ref = torch.nn.functional.cross_entropy(
+        torch.nn.functional.linear(hidden, weight), targets, ignore_index=-100
+    )
+    assert fused == pytest.approx(ref.item(), rel=1e-12)
+    g_fused = torch.autograd.grad(fused, (hidden, weight))
+    g_ref = torch.autograd.grad(ref, (hidden, weight))
+    for a, b in zip(g_fused, g_ref):
+        assert torch.allclose(a, b, atol=1e-12)
+    # The masked rows must be exactly zero, not merely small.
+    assert torch.count_nonzero(g_fused[0][:5]) == 0
+    assert torch.count_nonzero(g_fused[0][20:23]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Gradient correctness of the fused DyT-family kernels
+# ---------------------------------------------------------------------------
+def _fused_norm_reference(m, x):
+    """Independent, plain-autograd recomposition of a norm layer.
+
+    Deliberately written out of the public pieces rather than reusing the
+    kernels under test, so it is an actual second opinion on both the value
+    and every gradient.
+    """
+    from adasquash.norms import generalized_softsign
+
+    if isinstance(m, DyT):
+        phi = torch.tanh(m.alpha * x)
+    elif isinstance(m, DyTD):
+        a = m.alpha_0 * torch.exp(-m.k * m._depth_ratio)
+        phi = torch.tanh(a * x)
+    elif isinstance(m, DyTC):
+        phi = generalized_softsign(m.alpha * x, m.p)
+    elif isinstance(m, DyTCD):
+        scale = m.alpha_0 * torch.exp(-m.k * m._depth_ratio)
+        alpha_c = torch.addcmul(scale, scale, m.delta).clamp(min=1e-4)
+        phi = generalized_softsign(alpha_c * x, m.p)
+    else:
+        raise AssertionError(type(m))
+    if m.beta is None:
+        return phi * m.gamma
+    return torch.addcmul(m.beta, phi, m.gamma)
+
+
+def _compare_norm_to_reference(build, dim=6, seed=0):
+    """Same batch, same weights, same loss -> same values and same grads."""
+    torch.manual_seed(seed)
+
+    def build_trained():
+        # The affine has to be *off* its initialization, or the comparison is
+        # vacuous: at `gamma == 1, beta == 0` the post-affine output equals the
+        # squashed activation exactly, which is precisely why reading one for
+        # the other stayed invisible until a real (trained) checkpoint. Every
+        # parameter is therefore randomized, which is the state a model is in
+        # one step into training.
+        m = build().double()
+        with torch.no_grad():
+            for _, p in m.named_parameters():
+                if p.ndim == 0:      # alpha / k / p scalars
+                    p.copy_(torch.randn((), dtype=torch.float64) * 0.3 + 0.7)
+                else:                # gamma / delta / beta / alpha_c
+                    p.copy_(torch.randn(p.shape, dtype=torch.float64) * 0.4)
+        return m
+
+    m = build_trained()
+    x = (torch.randn(3, 5, dim, dtype=torch.float64) * 2.0).requires_grad_(True)
+    y = m(x)
+    # A non-uniform cotangent, so a gradient that is merely proportional to
+    # the right tensor (rather than equal to it) still fails.
+    cot = torch.linspace(0.5, 1.3, y.numel(), dtype=torch.float64).view_as(y)
+    y.mul(cot).sum().backward()
+    grads = {n: (p.grad.clone() if p.grad is not None else None)
+             for n, p in m.named_parameters()}
+    x_grad = x.grad.clone()
+
+    ref = build_trained()
+    ref.load_state_dict(m.state_dict())
+    x2 = x.detach().clone().requires_grad_(True)
+    y2 = _fused_norm_reference(ref, x2)
+    y2.mul(cot).sum().backward()
+
+    assert torch.allclose(y.detach(), y2.detach(), atol=1e-10), "forward"
+    assert torch.allclose(x_grad, x2.grad, atol=1e-9), "d/dx"
+    for name, p in ref.named_parameters():
+        expected = grads[name]
+        if expected is None:
+            assert p.grad is None or torch.count_nonzero(p.grad) == 0, name
+        else:
+            assert p.grad is not None and torch.allclose(
+                expected, p.grad, atol=1e-9
+            ), f"d/d{name}"
+
+
+@pytest.mark.parametrize("name", ["dyt", "dytd", "dytc", "dytcd"])
+def test_fused_norm_kernels_match_autograd(name):
+    """Every hand-written backward must agree with autograd, per parameter.
+
+    The four fused kernels all used to keep the *post-affine* output and then
+    read it as if it were the squashed activation: `1 - out^2` where the tanh
+    derivative wanted `1 - tanh^2`, and `sum(grad_out * out)` where
+    `dL/dgamma` wants `sum(grad_out * phi)`. With `beta=0, gamma=1` those
+    coincide, which is why every existing test (which only asserted that the
+    gradients were finite) passed. The defaults are `beta=True` and a learned
+    `gamma`, so the trained models were taking genuinely wrong steps.
+    """
+    build = lambda: build_norm(name, 6)
+    _compare_norm_to_reference(build)
+
+
+@pytest.mark.parametrize("name", ["dyt", "dytd", "dytc", "dytcd"])
+def test_fused_norm_kernels_match_autograd_without_beta(name):
+    """Same check with the affine bias removed (`beta=False`)."""
+    _compare_norm_to_reference(lambda: build_norm(name, 6, beta=False))
+
+
+@pytest.mark.parametrize("learnable_p", [True, False])
+@pytest.mark.parametrize("learnable_k", [True, False])
+def test_dytd_kernels_match_autograd_with_frozen_schedule(learnable_p, learnable_k):
+    """A frozen `p` / `k` must not change the gradients that *are* trained.
+
+    `learnable_p=False` makes `p` a plain Python float, which
+    `save_for_backward` rejects outright - the whole `dytc_p*_softsign` and
+    `dytc_hardtanh_eq` rows of the ablation matrix died in the forward pass.
+    """
+    for cls_name, kw in (
+        ("dytd", dict(layer_idx=3, num_layers=12, learnable_k=learnable_k)),
+        ("dytc", dict(learnable_p=learnable_p)),
+        ("dytcd", dict(layer_idx=3, num_layers=12,
+                       learnable_p=learnable_p, learnable_k=learnable_k)),
+    ):
+        _compare_norm_to_reference(
+            lambda cls_name=cls_name, kw=kw: build_norm(cls_name, 6, **kw)
+        )
+
+
+def test_dytcd_alpha_clamp_has_a_correct_gradient():
+    """`alpha_c` is clamped away from zero, so the clamp must gate `delta`.
+
+    The backward used to recover `scale` by *dividing* the clamped
+    `alpha_c` back by `1 + delta`, which is only valid where the clamp is
+    inactive; on a clamped channel that recovers a negative `scale` and hands
+    the optimizer a gradient pointing the wrong way.
+    """
+    torch.manual_seed(0)
+    m = DyTCD(6, layer_idx=5, num_layers=12).double()
+    with torch.no_grad():
+        # scale * (1 + delta) < 0 for these, so alpha_c is pinned at the floor.
+        m.delta.fill_(-3.0)
+    x = (torch.randn(3, 5, 6, dtype=torch.float64) * 2.0).requires_grad_(True)
+    m(x).sum().backward()
+    assert torch.count_nonzero(m.delta.grad) == 0, (
+        "a channel held at the alpha floor still received a delta gradient"
+    )
+    # Unclamped channels must still be trained.
+    with torch.no_grad():
+        m.delta[0] = 0.0
+    x2 = (torch.randn(3, 5, 6, dtype=torch.float64) * 2.0).requires_grad_(True)
+    m(x2).sum().backward()
+    assert m.delta.grad[0].abs().item() > 0.0
+
+
+@pytest.mark.parametrize("p", [-2.0, -1e-4, 0.0, 1e-9])
+def test_softsign_exponent_floor_keeps_a_runaway_p_finite(p):
+    """A learnable `p` that crosses zero must not NaN the model.
+
+    `phi_p` is only a finite family member for `p > 0`: as `p -> 0+` it
+    collapses to 0 (a dead layer), and for `p < 0` the `|x|^p` term blows up
+    at `|x| = 0`, so the layer returns inf/NaN and poisons every gradient that
+    reaches it. `p` is a free parameter here and the ablation matrix sweeps it
+    upward, so it can walk into that region.
+    """
+    x = (torch.randn(2, 4, 8, dtype=torch.float64)).requires_grad_(True)
+    pt = torch.tensor(p, dtype=torch.float64, requires_grad=True)
+    y = generalized_softsign(x, pt)
+    assert torch.isfinite(y).all()
+    y.sum().backward()
+    assert torch.isfinite(x.grad).all()
+    # Below the floor the forward only ever saw `clamp(p)`, so p is frozen.
+    assert pt.grad.item() == 0.0
+
+
+def test_attention_logit_stats_read_the_causal_triangle():
+    """`return_stats=True` is the QK-squash ablation's monitor.
+
+    It used to slice `logits[tril_mask]` on a `[B, H, T, T]` tensor with a
+    `[T, T]` boolean mask, which boolean indexing applies to the *leading* two
+    dims - so every call raised `IndexError` and the ablation had no
+    diagnostic at all.
+    """
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
+                          max_seq_len=64, norm_name="dytcd")).eval()
+    x = torch.randint(0, 64, (2, 16))
+    with torch.no_grad():
+        _, _, stats = model(x, return_stats=True)
+    assert len(stats) == model.cfg.n_layers
+    for s in stats:
+        assert set(s) == {"logit_abs_mean", "logit_abs_max", "logit_std"}
+        assert s["logit_abs_max"] >= s["logit_abs_mean"] >= 0.0
+        assert math.isfinite(s["logit_std"])
+
+
+def test_attention_logit_stats_agree_with_a_manual_causal_measurement():
+    from adasquash.attention import CausalSelfAttention
+
+    torch.manual_seed(0)
+    attn = CausalSelfAttention(32, 4).eval()
+    x = torch.randn(2, 6, 32)
+    with torch.no_grad():
+        _, stats = attn(x, return_stats=True)
+        h = attn.qkv(x).view(2, 6, 3, 4, 8).permute(2, 0, 3, 1, 4)
+        q, k, _ = h[0], h[1], h[2]
+        logits = (q @ k.transpose(-1, -2)) / math.sqrt(8)
+        mask = torch.ones(6, 6, dtype=torch.bool).tril()
+        valid = logits.masked_select(mask)
+    assert stats["logit_abs_max"] == pytest.approx(valid.abs().max().item(), rel=1e-5)
+    assert stats["logit_abs_mean"] == pytest.approx(valid.abs().mean().item(), rel=1e-5)
+    assert stats["logit_std"] == pytest.approx(valid.std().item(), rel=1e-4)
 
 
 @pytest.mark.parametrize("chunk_rows", [4, 8, 1000])

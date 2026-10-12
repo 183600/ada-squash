@@ -115,14 +115,20 @@ def wrap_swiglu_w8a8(mlp):
     (`silu(w1 x) * (w3 x)`, the most outlier-prone tensor in the network)
     in fp32 while every other GEMM input is int8. The forward is therefore
     written out explicitly, quantizing each GEMM input in turn.
+
+    The weights are quantized once, here: they do not change afterwards, and
+    `quantize_weight_per_channel` is idempotent, so doing it per forward would
+    reproduce the same matrices at the cost of three full re-quantizations on
+    every call.
     """
+    weights = []
+    for lin in (mlp.w1, mlp.w2, mlp.w3):
+        qw, _ = quantize_weight_per_channel(lin.weight.data)
+        _install_quantized_weight(lin, qw)
+        weights.append(qw)
+    qa = quantize_activation_per_token
+
     def quantized_forward(x):
-        weights = []
-        for lin in (mlp.w1, mlp.w2, mlp.w3):
-            qw, _ = quantize_weight_per_channel(lin.weight.data)
-            _install_quantized_weight(lin, qw)
-            weights.append(qw)
-        qa = quantize_activation_per_token
         x_q = qa(x)
         a = qa(F.linear(x_q, weights[0]))
         b = qa(F.linear(x_q, weights[2]))

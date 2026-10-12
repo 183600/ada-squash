@@ -114,9 +114,13 @@ class CausalSelfAttention(nn.Module):
                 logits.mul_(scale)
                 # Only the causal triangle is ever read, so it is selected
                 # directly rather than masking the upper triangle with -inf.
+                # `masked_select` (not `logits[mask]`): the mask is [T, T]
+                # while the logits are [B, H, T, T], and boolean *indexing*
+                # would apply it to the leading two dims instead of the last
+                # two. `masked_select` broadcasts, which is what is meant here.
                 keep = self._tril_mask(T, x.device)
-                valid = logits[keep]
-                if valid.numel():
+                valid = logits.masked_select(keep)
+                if valid.numel() > 1:
                     abs_logits = valid.abs()
                     logit_abs_mean = abs_logits.mean().item()
                     logit_abs_max = abs_logits.amax().item()

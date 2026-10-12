@@ -59,9 +59,12 @@ pip install lm-eval
 python -m pytest tests/ -v
 ```
 
-These cover shape/dtype preservation, gradient flow, softsign boundedness,
-depth schedule monotonicity, QK-squashing logit bounds, checkpoint
-round-trip, and the metrics implementation.
+These cover shape/dtype preservation, softsign boundedness, depth schedule
+monotonicity, QK-squashing logit bounds, checkpoint round-trip, the metrics
+implementation, and — since every norm here is a hand-written autograd kernel
+— a per-parameter comparison of each kernel against an independent
+recomposition in plain autograd, run from a *randomized* parameter set so the
+check is not vacuous at the `gamma=1, beta=0` initialization.
 
 ### Phase 1: GPT-2 124M on FineWeb-Edu
 
@@ -102,7 +105,8 @@ Resume an interrupted run with `--resume <ckpt>.pt`; the model, optimizer,
 scheduler and step counter are all restored, so the LR schedule continues
 where it stopped instead of replaying warmup. The schedule-defining flags
 (`--max-steps`, `--warmup`, `--min-lr-ratio`, `--lr`, `--weight-decay`,
-`--betas`, `--grad-clip`) are read back from the checkpoint as well -
+`--beta1` / `--beta2`, `--grad-clip`) are read back from the checkpoint as
+well -
 without them the cosine curve would be silently reshaped mid-run, since
 only `last_epoch` survives `load_state_dict`. Any that the command line
 leaves at its default are replaced silently; one you typed explicitly is
