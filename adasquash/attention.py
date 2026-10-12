@@ -2,8 +2,8 @@
 Causal self-attention with optional QK-squashing (DyT++ variant C).
 
 The attention implementation is deliberately simple and dependency-free
-(no FlashAttention, no sdpa) so that the *normalization* layer's effect on
-logit magnitudes and gradient flow is the only variable being measured.
+so that the *normalization* layer's effect on logit magnitudes and
+gradient flow is the only variable being measured.
 """
 
 from __future__ import annotations
@@ -129,9 +129,8 @@ class CausalSelfAttention(nn.Module):
                 "logit_std": logit_std,
             }
 
-        # Use SDPA for memory-efficient attention (FlashAttention / mem-efficient).
-        # is_causal=True is mathematically equivalent to the manual triu mask
-        # and lets SDPA pick the most efficient fused kernel.
+        # is_causal=True is mathematically equivalent to the manual triu
+        # mask.
         out = F.scaled_dot_product_attention(
             q, k, v,
             is_causal=True,

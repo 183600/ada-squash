@@ -100,7 +100,7 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
 # ---------------------------------------------------------------------------
 # Block
 # ---------------------------------------------------------------------------
-_CROSSENTROPY_CHUNK_BYTES = 1 << 26  # ~64MB of fp32 logits per chunk
+_CROSSENTROPY_CHUNK_BYTES = 1 << 26
 _CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
 
 
@@ -117,11 +117,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     Mean cross-entropy over a [N, V] logit block, evaluated in row chunks.
 
     The per-row math is identical to `F.cross_entropy`; only the
-    reduction over rows is split. The [N, V] log-probabilities that the
-    fused kernel would otherwise have to keep alive for backward are
-    dropped chunk by chunk and the gradient is rebuilt from a single
-    softmax per chunk, so the step never holds more than one chunk's
-    worth of extra logits at a time.
+    reduction over rows is split.
 
     The backward pass overwrites the saved logit block in place with the
     gradient (see `backward`), so the graph must not be traversed twice
@@ -152,8 +148,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         # The saved logit block doubles as the gradient buffer: each chunk
         # is fully reduced into `probs` before its slice is overwritten, and
         # no other node needs the original logit values (the producing
-        # matmul consumes only its inputs and this gradient vector). That
-        # keeps the step from ever holding a second [N, V] tensor.
+        # matmul consumes only its inputs and this gradient vector).
         grad_logits = logits
         grad_scale = (grad_out / ctx.count).to(logits.dtype)
         chunk_rows = ctx.chunk_rows
@@ -179,7 +174,7 @@ def cross_entropy_mean(
     ignore_index: int = -100,
     chunk_rows: Optional[int] = None,
 ) -> torch.Tensor:
-    """Mean cross-entropy with a bounded log-probability footprint."""
+    """Mean cross-entropy over a [N, V] logit block, evaluated in row chunks."""
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(logits.size(-1))
     if logits.size(0) <= chunk_rows:
