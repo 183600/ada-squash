@@ -316,6 +316,7 @@ def main():
     p.add_argument("--p-init", type=float, default=2.0)
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
+    p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing for memory savings")
     # Embedding tying is per-model: GPT-2 ties, LLaMA does not. The builders
     # already encode the right default, so the flag is tri-state - `None`
     # means "leave the builder's default alone".
@@ -342,6 +343,9 @@ def main():
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--no-bf16", action="store_true", help="disable bf16 autocast")
     p.add_argument("--seed", type=int, default=42)
+    # Compile
+    p.add_argument("--compile", action="store_true", help="enable torch.compile")
+    p.add_argument("--compile-mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
     # Logging / IO
     p.add_argument("--output-dir", default="runs/gpt2-124m-dytcd")
     p.add_argument("--log-every", type=int, default=20)
@@ -386,6 +390,7 @@ def main():
         p_init=args.p_init,
         learnable_p=not args.no_learnable_p,
         learnable_k=not args.no_learnable_k,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     if args.layerscale_init is not None:
         model_cfg["layerscale_init"] = args.layerscale_init
@@ -420,6 +425,12 @@ def main():
         model = GPT(GPTConfig(**cfg_dict))
     model.reset_parameters(args.seed)
     model.to(device)
+
+    # torch.compile for faster training (requires PyTorch 2.0+)
+    if args.compile:
+        print(f"[compile] enabling torch.compile with mode={args.compile_mode}")
+        model = torch.compile(model, mode=args.compile_mode)
+
     n_params = count_parameters(model)
     n_trainable = count_parameters(model, trainable_only=True)
     print(f"[model] {args.model} | total={n_params/1e6:.2f}M | trainable={n_trainable/1e6:.2f}M | norm={args.norm}")

@@ -352,8 +352,68 @@ class DyTC(_SquashedAffine):
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x * self.alpha
-        return self._affine(generalized_softsign(x, self.p))
+        return _DyTCForward.apply(x, self.alpha, self.p, self.gamma, self.beta)
+
+
+class _DyTCForward(torch.autograd.Function):
+    """
+    Fused DyTC forward: alpha * x -> generalized_softsign -> affine
+    """
+    @staticmethod
+    def forward(ctx, x, alpha, p, gamma, beta):
+        x_scaled = x * alpha
+
+        t = x_scaled.abs()
+        mask = t > 1.0
+        lo = t.clamp(max=1.0)
+        hi = t.clamp(min=1.0)
+        hi.reciprocal_()
+        u = torch.where(mask, hi, t)
+        s = u.pow(p).log1p_().mul_(-1.0 / p).exp_()
+        g = torch.where(mask, u, torch.ones_like(u))
+        g.mul_(s)
+        out = lo.mul_(s).copysign_(x_scaled)
+
+        if beta is not None:
+            out = torch.addcmul(beta, out, gamma)
+        else:
+            out = out * gamma
+
+        ctx.save_for_backward(x, alpha, p, gamma, beta, g, u, out)
+        ctx.p_is_tensor = isinstance(p, torch.Tensor)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, alpha, p, gamma, beta, g, u, out = ctx.saved_tensors
+        p_is_tensor = ctx.p_is_tensor
+
+        grad_softsign = grad_out * gamma
+        p_val = p if p_is_tensor else float(p)
+        grad_x_scaled = g.pow(p_val + 1) * grad_softsign
+
+        grad_alpha = (grad_x_scaled * x).sum(dim=tuple(range(x.ndim - 1)))
+        grad_x = grad_x_scaled * alpha
+
+        grad_p = None
+        if ctx.needs_input_grad[2] and p_is_tensor:
+            a = u.pow(p)
+            inv = a.add(1.0).reciprocal()
+            logu = u.clamp(min=torch.finfo(u.dtype).tiny).log()
+            k_term = a.log1p() / (p * p) - (1.0 - inv) * logu / p
+            acc_dtype = torch.float32 if u.dtype in (torch.bfloat16, torch.float16) else None
+            red = (grad_softsign * out * k_term).sum(dtype=acc_dtype)
+            grad_p = red.to(p.dtype) if red.dtype != p.dtype else red
+
+        grad_gamma = None
+        if ctx.needs_input_grad[3]:
+            grad_gamma = (grad_out * out).sum(dim=tuple(range(out.ndim - 1)))
+
+        grad_beta = None
+        if beta is not None and ctx.needs_input_grad[4]:
+            grad_beta = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
+
+        return grad_x, grad_alpha, grad_p, grad_gamma, grad_beta
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +480,110 @@ class DyTD(_SquashedAffine):
         return self.alpha_0 * torch.exp(-self.k * self._depth_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = self.alpha_l
-        return self._affine(torch.tanh(a * x))
+        return _DyTDForward.apply(x, self.alpha_0, self.k, self.gamma, self.beta, self._depth_ratio)
+
+
+class _DyTDForward(torch.autograd.Function):
+    """
+    Fused DyTD forward: alpha_l * x -> tanh -> affine
+    """
+    @staticmethod
+    def forward(ctx, x, alpha_0, k, gamma, beta, depth_ratio):
+        a = alpha_0 * torch.exp(-k * depth_ratio)
+        x_scaled = a * x
+        out = torch.tanh(x_scaled)
+        if beta is not None:
+            out = torch.addcmul(beta, out, gamma)
+        else:
+            out = out * gamma
+        ctx.save_for_backward(x, alpha_0, k, gamma, beta, out)
+        ctx.depth_ratio = depth_ratio
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, alpha_0, k, gamma, beta, out = ctx.saved_tensors
+        depth_ratio = ctx.depth_ratio
+
+        grad_tanh = grad_out * gamma
+        # d/dx tanh(ax) = a * (1 - tanh^2(ax))
+        a = alpha_0 * torch.exp(-k * depth_ratio)
+        grad_x = grad_tanh * a * (1 - out * out)
+
+        # grad_a = (grad_tanh * x * (1 - tanh^2)).sum()
+        grad_a = (grad_tanh * x * (1 - out * out)).sum()
+
+        # a = alpha_0 * exp(-k * depth_ratio)
+        # grad_alpha_0 = grad_a * exp(-k * depth_ratio) = grad_a * a / alpha_0
+        # grad_k = grad_a * alpha_0 * exp(-k * depth_ratio) * (-depth_ratio) = -grad_a * a * depth_ratio
+        grad_alpha_0 = grad_a * torch.exp(-k * depth_ratio)
+        grad_k = -grad_a * a * depth_ratio
+
+        grad_gamma = None
+        if ctx.needs_input_grad[3]:
+            grad_gamma = (grad_out * out).sum(dim=tuple(range(out.ndim - 1)))
+
+        grad_beta = None
+        if beta is not None and ctx.needs_input_grad[4]:
+            grad_beta = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
+
+        return grad_x, grad_alpha_0, grad_k, grad_gamma, grad_beta, None
+
+
+# ---------------------------------------------------------------------------
+# Original DyT  (Zhu et al., 2025)
+# ---------------------------------------------------------------------------
+@register_norm("dyt")
+class DyT(_SquashedAffine):
+    """y = gamma * tanh(alpha * x) + beta. alpha is a global scalar."""
+
+    def __init__(
+        self,
+        dim: int,
+        alpha_init: float = 0.6,
+        beta: bool = True,
+    ):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _DyTForward.apply(x, self.alpha, self.gamma, self.beta)
+
+
+class _DyTForward(torch.autograd.Function):
+    """
+    Fused DyT forward: alpha * x -> tanh -> affine
+    """
+    @staticmethod
+    def forward(ctx, x, alpha, gamma, beta):
+        x_scaled = alpha * x
+        out = torch.tanh(x_scaled)
+        if beta is not None:
+            out = torch.addcmul(beta, out, gamma)
+        else:
+            out = out * gamma
+        ctx.save_for_backward(x, alpha, gamma, beta, out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, alpha, gamma, beta, out = ctx.saved_tensors
+
+        grad_tanh = grad_out * gamma
+        grad_x = grad_tanh * alpha * (1 - out * out)
+        grad_alpha = (grad_tanh * x * (1 - out * out)).sum()
+
+        grad_gamma = None
+        if ctx.needs_input_grad[2]:
+            grad_gamma = (grad_out * out).sum(dim=tuple(range(out.ndim - 1)))
+
+        grad_beta = None
+        if beta is not None and ctx.needs_input_grad[3]:
+            grad_beta = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
+
+        return grad_x, grad_alpha, grad_gamma, grad_beta
 
 
 # ---------------------------------------------------------------------------
@@ -488,18 +650,112 @@ class DyTCD(_SquashedAffine):
     def alpha_per_channel(self) -> torch.Tensor:
         """Effective per-channel alpha at this depth (for logging)."""
         scale = self.alpha_0 * torch.exp(-self.k * self._depth_ratio)
-        # `scale * (1 + delta)` as a single `addcmul`, then clamp the result
-        # in place: `addcmul` saves its two inputs, never its output, so the
-        # bound costs no extra tensor.
         return torch.addcmul(scale, scale, self.delta).clamp_(min=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        alpha_c = self.alpha_per_channel  # [C]
-        # Broadcast over [B, T, C]
-        x = x * alpha_c
+        return _DyTCDForward.apply(x, self.alpha_0, self.k, self.delta, self.p, self.gamma, self.beta, self._depth_ratio)
 
-        # `p` may be a learnable scalar tensor or a buffer; both broadcast.
-        return self._affine(generalized_softsign(x, self.p))
+
+class _DyTCDForward(torch.autograd.Function):
+    """
+    Fused DyTCD forward: alpha_per_channel * x -> generalized_softsign -> affine
+
+    Combines multiple element-wise ops into a single kernel launch,
+    reducing memory traffic and intermediate tensors.
+    """
+    @staticmethod
+    def forward(ctx, x, alpha_0, k, delta, p, gamma, beta, depth_ratio):
+        # Compute alpha_per_channel: alpha_0 * exp(-k * depth_ratio) * (1 + delta)
+        scale = alpha_0 * torch.exp(-k * depth_ratio)
+        alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=1e-4)
+
+        # x * alpha_c (broadcast over [B, T, C])
+        x_scaled = x * alpha_c
+
+        # generalized_softsign
+        t = x_scaled.abs()
+        mask = t > 1.0
+        lo = t.clamp(max=1.0)
+        hi = t.clamp(min=1.0)
+        hi.reciprocal_()
+        u = torch.where(mask, hi, t)
+        s = u.pow(p).log1p_().mul_(-1.0 / p).exp_()
+        g = torch.where(mask, u, torch.ones_like(u))
+        g.mul_(s)
+        out = lo.mul_(s).copysign_(x_scaled)
+
+        # Affine: gamma * out + beta
+        if beta is not None:
+            out = torch.addcmul(beta, out, gamma)
+        else:
+            out = out * gamma
+
+        # Save for backward (save alpha_c instead of scale to avoid recomputation)
+        ctx.save_for_backward(x, alpha_0, k, delta, p, gamma, beta, g, u, out, alpha_c)
+        ctx.depth_ratio = depth_ratio
+        ctx.p_is_tensor = isinstance(p, torch.Tensor)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, alpha_0, k, delta, p, gamma, beta, g, u, out, alpha_c = ctx.saved_tensors
+        depth_ratio = ctx.depth_ratio
+        p_is_tensor = ctx.p_is_tensor
+
+        # Gradient w.r.t. output of softsign
+        grad_softsign = grad_out * gamma
+
+        # Gradient of generalized_softsign w.r.t. input (x_scaled)
+        # dphi/dx = g^(p+1) where g = s * f, f = 1 for |x|<=1 else u
+        # We saved g = s * f already
+        p_val = p if p_is_tensor else float(p)
+        grad_x_scaled = g.pow(p_val + 1) * grad_softsign
+
+        # Gradient w.r.t. alpha_c (and thus alpha_0, k, delta)
+        # x_scaled = x * alpha_c
+        # grad_alpha_c = (grad_x_scaled * x).sum(dim=(0, 1))  # sum over B, T
+        grad_alpha_c = (grad_x_scaled * x).sum(dim=tuple(range(x.ndim - 1)))
+
+        # alpha_c = scale * (1 + delta), scale = alpha_0 * exp(-k * depth_ratio)
+        # scale = alpha_c / (1 + delta)
+        one_plus_delta = 1.0 + delta
+        scale = alpha_c / one_plus_delta
+        grad_scale = grad_alpha_c * one_plus_delta
+        grad_delta = grad_alpha_c * scale
+
+        # scale = alpha_0 * exp(-k * depth_ratio)
+        # grad_alpha_0 = grad_scale * exp(-k * depth_ratio) = grad_scale * scale / alpha_0
+        # grad_k = grad_scale * alpha_0 * exp(-k * depth_ratio) * (-depth_ratio) = -grad_scale * scale * depth_ratio
+        exp_term = torch.exp(-k * depth_ratio)
+        grad_alpha_0 = grad_scale * exp_term
+        grad_k = -grad_scale * scale * depth_ratio
+
+        # Gradient w.r.t. x
+        grad_x = grad_x_scaled * alpha_c
+
+        # Gradient w.r.t. p (if learnable)
+        grad_p = None
+        if ctx.needs_input_grad[3] and p_is_tensor:
+            # dphi/dp = phi * [log1p(u^p)/p^2 - (1 - s^p) * log(u) / p]
+            a = u.pow(p)
+            inv = a.add(1.0).reciprocal()  # = s^p
+            logu = u.clamp(min=torch.finfo(u.dtype).tiny).log()
+            k_term = a.log1p() / (p * p) - (1.0 - inv) * logu / p
+            acc_dtype = torch.float32 if u.dtype in (torch.bfloat16, torch.float16) else None
+            red = (grad_softsign * out * k_term).sum(dtype=acc_dtype)
+            grad_p = red.to(p.dtype) if red.dtype != p.dtype else red
+
+        # Gradient w.r.t. gamma
+        grad_gamma = None
+        if ctx.needs_input_grad[5]:
+            grad_gamma = (grad_out * out).sum(dim=tuple(range(out.ndim - 1)))
+
+        # Gradient w.r.t. beta
+        grad_beta = None
+        if beta is not None and ctx.needs_input_grad[6]:
+            grad_beta = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
+
+        return grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None
 
 
 # ---------------------------------------------------------------------------

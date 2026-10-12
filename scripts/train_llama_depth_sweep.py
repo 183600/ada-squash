@@ -147,6 +147,11 @@ def launch_one(args, depth: int, norm: str, output_dir: Path):
         cmd.append("--no-learnable-k")
     if args.no_layerscale:
         cmd.append("--no-layerscale")
+    if args.gradient_checkpointing:
+        cmd.append("--gradient-checkpointing")
+    if args.compile:
+        cmd.append("--compile")
+        cmd += ["--compile-mode", args.compile_mode]
     # depth / width override - train_gpt2.py picks these up from the env.
     env = dict(os.environ)
     env["ADASQUASH_DEPTH_OVERRIDE"] = str(depth)
@@ -214,6 +219,9 @@ def main():
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
     p.add_argument("--no-layerscale", action="store_true")
+    p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing for memory savings")
+    p.add_argument("--compile", action="store_true", help="enable torch.compile")
+    p.add_argument("--compile-mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument(
         "--no-dim-scaling",
         action="store_true",

@@ -57,6 +57,8 @@ class GPTConfig:
     p_init: float = 2.0
     learnable_p: bool = True
     learnable_k: bool = True
+    # Gradient checkpointing (activation recomputation) for memory savings
+    gradient_checkpointing: bool = False
     # Misc
     pad_token_id: int = 0
     # Label id excluded from the loss. MUST be outside [0, vocab_size) so it
@@ -345,6 +347,34 @@ def fused_cross_entropy_mean(
     )
 
 
+class _LayerScaleResidual(torch.autograd.Function):
+    """
+    Fused LayerScale + residual add: x + scale * residual
+
+    Saves memory by avoiding the intermediate scaled tensor.
+    """
+    @staticmethod
+    def forward(ctx, x, residual, scale):
+        # x: [B, T, C], residual: [B, T, C], scale: [C]
+        ctx.save_for_backward(residual, scale)
+        # In-place add after scaling: x + residual * scale
+        # We can't easily fuse the mul+add in-place without copying,
+        # but we can do it out-of-place with a single kernel launch
+        y = x + residual * scale
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        residual, scale = ctx.saved_tensors
+        # grad_x = grad_out
+        # grad_residual = grad_out * scale
+        # grad_scale = (grad_out * residual).sum(dim=(0, 1))
+        grad_x = grad_out
+        grad_residual = grad_out * scale
+        grad_scale = (grad_out * residual).sum(dim=(0, 1))
+        return grad_x, grad_residual, grad_scale
+
+
 class Block(nn.Module):
     """
     Pre-norm Transformer block (norm-dependent residual).
@@ -395,18 +425,16 @@ class Block(nn.Module):
             h, freqs_cis=freqs_cis, return_stats=return_stats
         )
         if self.use_layerscale:
-            # Out-of-place: an in-place scale would make autograd clone the
-            # attention output, which the residual add retains anyway.
-            attn_out = attn_out * self.ls1
-        attn_out.add_(x)
-        x = attn_out
+            x = _LayerScaleResidual.apply(x, attn_out, self.ls1)
+        else:
+            x = x + attn_out
 
         h = self.norm2(x)
         mlp_out = self.mlp(h)
         if self.use_layerscale:
-            mlp_out = mlp_out * self.ls2
-        mlp_out.add_(x)
-        x = mlp_out
+            x = _LayerScaleResidual.apply(x, mlp_out, self.ls2)
+        else:
+            x = x + mlp_out
         return x, logit_stats
 
 
@@ -414,19 +442,9 @@ class _SwiGLU(torch.autograd.Function):
     """
     w2(silu(w1 x) * (w3 x)) handled as a single autograd node.
 
-    Recorded op by op, this chain makes autograd retain both branch
-    activations, the silu input and the gated product - and the two in-place
-    steps force a defensive copy of each of them, so a block keeps four
-    hidden-sized activations alive for its backward. The backward below
-    recomputes the gated product (one element-wise pass) and derives every
-    gradient analytically, leaving the two branch activations and the input
-    (which the weight gradients need anyway).
-
-    Under autocast the three projections run in a reduced dtype while the
-    parameters stay in fp32, and the backward is entered *outside* the
-    autocast region - so the node has to carry the dtype the projections
-    actually used over to the backward, and restore the parameter dtype on
-    the way out.
+    Fused forward + backward avoids retaining 4 hidden-sized activations.
+    Only saves x, a, b, w1, w2, w3 (weights are shared).
+    The backward recomputes silu(a) and the gated product analytically.
     """
 
     @staticmethod
@@ -436,6 +454,7 @@ class _SwiGLU(torch.autograd.Function):
         h = F.silu(a)
         h.mul_(b)
         y = F.linear(h, w2)
+        # Save only what's needed: x, a, b for backward, weights for grad
         ctx.save_for_backward(x, a, b, w1, w2, w3)
         ctx.compute_dtype = y.dtype
         ctx.in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)
@@ -445,33 +464,35 @@ class _SwiGLU(torch.autograd.Function):
     def backward(ctx, grad_out):
         x, a, b, w1, w2, w3 = ctx.saved_tensors
         dt = ctx.compute_dtype
-        # The weight gradients reduce against the activations, so those have
-        # to travel in the projection dtype too.
         if w1.dtype != dt:
             w1, w2, w3 = w1.to(dt), w2.to(dt), w3.to(dt)
         if x.dtype != dt:
             x = x.to(dt)
+
+        # grad_h = grad_out @ w2^T  [B*T, H]
         grad_h = F.linear(grad_out, w2.t())
+
+        # Recompute silu(a) and gated product (memory vs compute tradeoff)
         sa = F.silu(a)
+        gated = sa * b  # This is h from forward
+
+        # grad_b = grad_h * silu(a)
         grad_b = grad_h * sa
+
+        # grad_a = grad_h * b * silu'(a) = grad_h * b * sigmoid(a) * (1 + a * (1 - sigmoid(a)))
+        # Using torch.ops.aten.silu_backward for efficiency
         grad_a = torch.ops.aten.silu_backward(grad_h * b, a)
 
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
         if ctx.needs_input_grad[0]:
             grad_x = F.linear(grad_a, w1.t()) + F.linear(grad_b, w3.t())
         if ctx.needs_input_grad[1]:
-            grad_w1 = grad_a.reshape(-1, grad_a.shape[-1]).t() @ x.reshape(
-                -1, x.shape[-1]
-            )
+            grad_w1 = grad_a.reshape(-1, grad_a.shape[-1]).t() @ x.reshape(-1, x.shape[-1])
         if ctx.needs_input_grad[2]:
-            h = sa * b
-            grad_w2 = grad_out.reshape(-1, grad_out.shape[-1]).t() @ h.reshape(
-                -1, h.shape[-1]
-            )
+            grad_w2 = grad_out.reshape(-1, grad_out.shape[-1]).t() @ gated.reshape(-1, gated.shape[-1])
         if ctx.needs_input_grad[3]:
-            grad_w3 = grad_b.reshape(-1, grad_b.shape[-1]).t() @ x.reshape(
-                -1, x.shape[-1]
-            )
+            grad_w3 = grad_b.reshape(-1, grad_b.shape[-1]).t() @ x.reshape(-1, x.shape[-1])
+
         xd, w1d, w2d, w3d = ctx.in_dtypes
         if grad_x is not None and grad_x.dtype != xd:
             grad_x = grad_x.to(xd)
@@ -589,10 +610,19 @@ class GPT(nn.Module):
         freqs = self.freqs_cis[:T] if self.freqs_cis is not None else None
 
         all_logit_stats = []
-        for block in self.blocks:
-            x, ls = block(x, freqs_cis=freqs, return_stats=return_stats)
-            if return_stats:
-                all_logit_stats.append(ls)
+        if self.cfg.gradient_checkpointing and self.training:
+            # Gradient checkpointing: recompute block activations during backward
+            for block in self.blocks:
+                x, ls = torch.utils.checkpoint.checkpoint(
+                    block, x, freqs, return_stats, use_reentrant=False
+                )
+                if return_stats:
+                    all_logit_stats.append(ls)
+        else:
+            for block in self.blocks:
+                x, ls = block(x, freqs_cis=freqs, return_stats=return_stats)
+                if return_stats:
+                    all_logit_stats.append(ls)
         x = self.norm_f(x)
         if last_position_only:
             # The [B, T, V] logit block dwarfs every other activation in the
