@@ -2,13 +2,15 @@
 Stability / efficiency metrics for the DyT++ study.
 
 Provides:
-  * ActivationStats       - aggregated max|x| and kurtosis over all
+   * ActivationStats       - aggregated max|x| and kurtosis over all
                              activations that pass through a norm layer
-  * LossSpikeCounter      - running count of loss spikes (relative jump)
-  * KurtosisMeter         - online kurtosis estimator (Welford-style)
-  * MaxAbsMeter           - online max |x| estimator
-  * measure_activation_stats - one-shot hook-driven measurement pass
-  * count_parameters     - param accounting helpers
+   * LossSpikeCounter      - running count of loss spikes (relative jump)
+   * KurtosisMeter         - online kurtosis estimator (Welford-style)
+   * MaxAbsMeter           - online max |x| estimator
+   * measure_activation_stats - one-shot hook-driven measurement pass
+   * markov_batch          - learnable synthetic corpus for the offline
+                             experiments (ablations / MoE / W8A8 probe)
+   * count_parameters     - param accounting helpers
 """
 
 from __future__ import annotations
@@ -137,6 +139,7 @@ class ActivationStats:
         self.model = model
         self.handles: list = []
         self.max_abs: Dict[str, MaxAbsMeter] = defaultdict(MaxAbsMeter)
+        self.kurtosis: Dict[str, KurtosisMeter] = defaultdict(KurtosisMeter)
 
     def _make_hook(self, name: str):
         def hook(module, inp, out):
@@ -144,11 +147,22 @@ class ActivationStats:
             if x is None or not torch.is_tensor(x):
                 return
             self.max_abs[name].update(x)
+            self.kurtosis[name].update(x)
         return hook
 
-    def attach(self):
+    def attach(self, reset: bool = True):
+        """Hook every norm module.
+
+        `reset=False` keeps the meters accumulated so far, so a caller that
+        re-attaches on a sampling window can pool statistics over the whole
+        run instead of reporting only the last window. `MaxAbsMeter` takes a
+        running maximum, so pooling is exact; `KurtosisMeter` merges moments,
+        so the pooled value is the kurtosis over all samples seen.
+        """
         self.handles = []
-        self.max_abs = defaultdict(MaxAbsMeter)
+        if reset:
+            self.max_abs = defaultdict(MaxAbsMeter)
+            self.kurtosis = defaultdict(KurtosisMeter)
         for name, m in self.model.named_modules():
             cls_name = m.__class__.__name__
             if cls_name in {
@@ -166,14 +180,89 @@ class ActivationStats:
         for name in self.max_abs:
             out[name] = {
                 "max_abs": self.max_abs[name].value,
+                "excess_kurtosis": self.kurtosis[name].result(),
             }
         if out:
             all_max = [v["max_abs"] for v in out.values() if v["max_abs"] != -float("inf")]
+            all_kurt = [
+                v["excess_kurtosis"] for v in out.values()
+                if math.isfinite(v["excess_kurtosis"])
+            ]
+            peak = max(all_max) if all_max else 0.0
             out["__summary__"] = {
                 "mean_max_abs": sum(all_max) / max(1, len(all_max)),
-                "max_max_abs": max(all_max) if all_max else 0.0,
+                "max_max_abs": peak,
+                # Explicit alias for the metric name used in the README table:
+                # the largest pre-norm activation magnitude seen by any norm.
+                "max_abs_pre_norm": peak,
+                "mean_excess_kurtosis_pre_norm": (
+                    sum(all_kurt) / len(all_kurt) if all_kurt else 0.0
+                ),
             }
         return out
+
+
+# ---------------------------------------------------------------------------
+# Synthetic corpus
+# ---------------------------------------------------------------------------
+def markov_batch(
+    rng: torch.Generator,
+    ignore_index: int,
+    batch_size: int,
+    seq_len: int,
+    device: str,
+    n_states: int = 64,
+    outlier_id: Optional[int] = None,
+    max_jump: int = 3,
+):
+    """Synthetic corpus with *learnable* structure.
+
+    Each row is an actual walk of a Markov chain over `n_states` hidden
+    states:
+
+        s_{t+1} = (s_t + j_{t+1}) % n_states,   j_t ~ U{0, ..., max_jump-1}
+
+    and the emitted token is the state itself, so the target at position `t`
+    is a deterministic function of the token at position `t-1` restricted to
+    `max_jump` successors.
+
+    Two failure modes this avoids:
+
+    * Uniformly random token ids carry *no* next-token signal, so the
+      optimal loss is `log(vocab_size)` no matter what the model does and
+      the loss column cannot rank anything.
+    * Drawing each position independently (`state_t ~ U`, no walk) is no
+      better: the sum of two independent draws is still independent of the
+      previous position, which silently reproduces the first failure while
+      looking like a chain. Here the attainable full-vocab floor is
+      `log(vocab_size) - (log(n_states) - log(max_jump))`, i.e. strictly
+      below the uniform baseline for any `vocab_size > n_states`.
+
+    `outlier_id` designates one token whose embedding row has been scaled
+    up (see `scripts.ablation.install_outlier_channel`). Positions are drawn
+    from it on a few percent of steps, which reproduces the "super-active
+    dimension" regime the per-channel axis is meant to handle: an i.i.d.
+    corpus never produces such a channel, so the ablations could not
+    exercise the component under test.
+
+    Returns `(x, y)` with `y[:, -1] == ignore_index`: the final position has
+    no successor and is masked out of the loss.
+    """
+    cur = torch.randint(0, n_states, (batch_size, 1), generator=rng, device=device)
+    states = [cur]
+    for _ in range(1, seq_len):
+        jump = torch.randint(0, max_jump, (batch_size, 1), generator=rng, device=device)
+        states.append((cur + jump) % n_states)
+        cur = states[-1]
+    x = torch.cat(states, dim=1)
+    y = torch.full(
+        (batch_size, seq_len), ignore_index, dtype=torch.long, device=device
+    )
+    y[:, :-1] = x[:, 1:]
+    if outlier_id is not None:
+        spike = torch.rand((batch_size, seq_len), generator=rng, device=device) < 0.03
+        x[spike] = outlier_id
+    return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -250,5 +339,6 @@ __all__ = [
     "KurtosisMeter",
     "MaxAbsMeter",
     "measure_activation_stats",
+    "markov_batch",
     "count_parameters",
 ]

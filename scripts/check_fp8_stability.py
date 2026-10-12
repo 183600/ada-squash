@@ -36,6 +36,9 @@ import torch.nn.functional as F
 
 from adasquash.model import MLP, build_gpt_124m
 
+# Largest finite magnitude of the FP8-E4M3 format used throughout this file.
+FP8_E4M3_MAX = 448.0
+
 
 # ---------------------------------------------------------------------------
 # FP8 simulation
@@ -67,6 +70,12 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     This is a coarse approximation but reproduces the *overflow / underflow*
     behaviour that's the actual subject of the stability check.
     """
+    # Keep the caller's dtype: rebinding `x` to the fp32 copy would make the
+    # return type always fp32, so under a bf16 autocast (the regime FP8
+    # training actually runs in) every simulated tensor would be silently
+    # promoted back to fp32 and the accumulation precision would not be what
+    # the caller believes it is.
+    in_dtype = x.dtype
     x = x.float()
     # Clamp to the representable range.
     x_clamped = x.clamp(-max_val, max_val)
@@ -93,7 +102,7 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     quant = sign * mant_q * (2.0 ** exp)
     # Restore zero where flushed
     quant = torch.where(flushed == 0, torch.zeros_like(quant), quant)
-    return quant.to(x.dtype)
+    return quant.to(in_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +117,12 @@ class FP8LinearSim:
     in higher precision. Measuring only the norms' outputs cannot observe how
     much error actually accumulates through the network, and cannot answer the
     "which layer first produces Inf/NaN" question at all.
+
+    Both GEMM operands are quantized: the activation argument *and* the
+    weight. `F.linear(x, W)` is an fp8 x fp8 product on real hardware, so
+    quantizing only `x` would leave this an A8-only simulation and would
+    systematically understate the error - especially for the weight term,
+    which is constant across the probe batch and therefore free to re-use.
     """
 
     def __init__(self, module: nn.Module, quant):
@@ -115,9 +130,11 @@ class FP8LinearSim:
         self.quant = quant
         self.orig_forward = module.forward
 
-        def fwd(*args, **kwargs):
-            a = tuple(self.quant(x) if torch.is_tensor(x) else x for x in args)
-            y = self.orig_forward(*a, **kwargs)
+        def fwd(x):
+            # `nn.Linear.forward` is exactly `F.linear(x, self.weight,
+            # self.bias)`, so the quantized weight is injected here: it is not
+            # reachable through the argument list, which takes only `input`.
+            y = F.linear(self.quant(x), self.quant(module.weight), module.bias)
             return self.quant(y)
 
         module.forward = fwd
@@ -128,7 +145,7 @@ class FP8SwiGLUSim:
 
     `MLP.forward` goes through `_SwiGLU.apply`, which calls `F.linear`
     directly, so this wraps `F.linear` itself rather than the child
-    `nn.Linear` modules, and covers the MLP parameters too.
+    `nn.Linear` modules, and covers the MLP weights too.
     """
 
     def __init__(self, mlp: MLP, quant):
@@ -138,10 +155,12 @@ class FP8SwiGLUSim:
 
         def fwd(x):
             q = self.quant
-            a = q(F.linear(q(x), mlp.w1.weight))
-            b = q(F.linear(q(x), mlp.w3.weight))
+            w1, w2, w3 = q(mlp.w1.weight), q(mlp.w2.weight), q(mlp.w3.weight)
+            x_q = q(x)
+            a = q(F.linear(x_q, w1))
+            b = q(F.linear(x_q, w3))
             h = q(F.silu(a) * b)
-            return mlp.drop(q(F.linear(h, mlp.w2.weight)))
+            return mlp.drop(q(F.linear(h, w2)))
 
         mlp.forward = fwd
 
@@ -171,7 +190,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
 
     Returns the relative divergence of the FP8-simulated logits against the
     fp32 logits, per-norm activation-range statistics before/after each
-    norm, and the depth at which the residual stream first goes non-finite.
+    norm, the first block whose residual stream leaves the FP8 range, and
+    the first block whose residual stream goes non-finite.
     """
     handles = []
     quant_errors = []
@@ -204,12 +224,21 @@ def measure_fp8_divergence(model, x, norm_name: str):
         return hook
 
     first_bad = []
+    first_over = []
 
     def make_block_hook(i):
         def hook(module, inp, out):
             y = out[0] if isinstance(out, tuple) else out
             if not torch.isfinite(y).all():
                 first_bad.append(i)
+                return
+            # `simulate_fp8` saturates anything above `max_val` back down to
+            # +-448, so an overflowing residual stream is finite by the time
+            # it leaves the wrapper and a finite-check can never see it. The
+            # magnitude itself is the thing FP8 cannot represent, so it is
+            # recorded here as its own failure mode.
+            if y.abs().amax().item() > FP8_E4M3_MAX:
+                first_over.append(i)
         return hook
 
     # Reference logits in fp32 (no hooks: we only want to characterize the
@@ -247,10 +276,24 @@ def measure_fp8_divergence(model, x, norm_name: str):
         logit_nan = True
 
     if not quant_errors:
+        # A model with no hookable norm modules: emit the same key set as the
+        # normal path so rows in results.json stay homogeneous and downstream
+        # `row[key]` lookups cannot KeyError halfway through a sweep.
         return {
-            "norm": norm_name, "n_layers": 0,
-            "mean_overflow": 0.0, "max_overflow": 0.0,
-            "logit_rel_divergence": rel, "first_nonfinite_layer": None,
+            "norm": norm_name,
+            "n_layers": int(getattr(model.cfg, "n_layers", 0)),
+            "n_norm_hooks": 0,
+            "max_abs_pre_norm": 0.0,
+            "max_abs_post_norm": 0.0,
+            "mean_excess_kurtosis_pre_norm": 0.0,
+            "mean_overflow_rate_e4m3": 0.0,
+            "max_overflow_rate_e4m3": 0.0,
+            "mean_underflow_rate_e4m3": 0.0,
+            "mean_rel_quant_err_e4m3": 0.0,
+            "logit_rel_divergence": rel,
+            "logit_nan_under_fp8": logit_nan,
+            "first_nonfinite_layer": first_bad[0] if first_bad else None,
+            "first_overflow_layer": first_over[0] if first_over else None,
         }
 
     mean_overflow = sum(e["overflow_rate"] for e in quant_errors) / len(quant_errors)
@@ -263,7 +306,11 @@ def measure_fp8_divergence(model, x, norm_name: str):
 
     return {
         "norm": norm_name,
-        "n_layers": len(quant_errors),
+        # The block count, not the number of norm hooks: there are two norms
+        # per block plus the final norm, so reporting the hook count here
+        # labelled it `n_layers` while printing (2L+1).
+        "n_layers": int(getattr(model.cfg, "n_layers", 0)),
+        "n_norm_hooks": len(quant_errors),
         "max_abs_pre_norm": max_in,
         "max_abs_post_norm": max_max,
         "mean_excess_kurtosis_pre_norm": mean_kurt,
@@ -274,6 +321,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
         "logit_rel_divergence": rel,
         "logit_nan_under_fp8": logit_nan,
         "first_nonfinite_layer": first_bad[0] if first_bad else None,
+        "first_overflow_layer": first_over[0] if first_over else None,
     }
 
 
@@ -293,27 +341,46 @@ def _excess_kurtosis(x: torch.Tensor) -> float:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--norms", nargs="+", default=["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"])
+    p.add_argument("--ckpt", nargs="+", default=None,
+                   help="one checkpoint per --norms entry; when given, the "
+                        "probe runs on the trained weights instead of a "
+                        "fresh random init")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", default="runs/fp8_check/results.json")
     args = p.parse_args()
 
+    if args.ckpt and len(args.ckpt) != len(args.norms):
+        p.error(f"--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
 
     results = []
-    for norm in args.norms:
+    for i, norm in enumerate(args.norms):
         # Re-seed *both* streams per norm: otherwise every norm gets a
         # different random init AND a different probe batch, and the
         # overflow/underflow comparison is confounded by both.
         torch.manual_seed(args.seed)
         rng = torch.Generator(device=device).manual_seed(args.seed)
-        model = build_gpt_124m(norm_name=norm).to(device)
-        model.reset_parameters(args.seed)
-        model.eval()
+        if args.ckpt:
+            from scripts.eval_downstream import load_ckpt
+            # A freshly initialised model has no trained outlier channels and
+            # `layerscale_init=1e-5` pins the residual stream to the embedding
+            # table, so every norm looks identical and the metric reads
+            # embedding noise. Probing a trained checkpoint is the only way
+            # this experiment can measure what it claims to measure.
+            model, _ = load_ckpt(args.ckpt[i], device=device)
+            model.eval()
+        else:
+            model = build_gpt_124m(norm_name=norm).to(device)
+            model.reset_parameters(args.seed)
+            model.eval()
         x = torch.randint(0, model.cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
         r = measure_fp8_divergence(model, x, norm)
+        if args.ckpt:
+            r["ckpt"] = args.ckpt[i]
         print(f"[fp8] {norm}: {r}")
         results.append(r)
 

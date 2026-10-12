@@ -63,7 +63,14 @@ These cover shape/dtype preservation, gradient flow, softsign boundedness,
 depth schedule monotonicity, QK-squashing logit bounds, checkpoint
 round-trip, and the metrics implementation.
 
-### Phase 1: GPT-2 124M on FineWeb-Edu (10B tokens)
+### Phase 1: GPT-2 124M on FineWeb-Edu
+
+> Note on scale: the shipped configs are `max_steps × batch_size ×
+> grad_accum × seq_len` = 10000 × 32 × 4 × 1024 ≈ **1.3 B tokens**, not the
+> full 10 B-token FineWeb-Edu sample. Raise `--max-steps` (to ≈ 76 000 for
+> 10 B tokens) when running the headline comparison, and raise it
+> identically for every variant - a shorter run makes the comparison
+> budget-dependent.
 
 Every run is described by a YAML file under `configs/`. `--config` seeds the
 CLI defaults, and an explicitly passed flag still wins over the file.
@@ -94,7 +101,12 @@ python scripts/train_gpt2.py \
 
 Resume an interrupted run with `--resume <ckpt>.pt`; the model, optimizer,
 scheduler and step counter are all restored, so the LR schedule continues
-where it stopped instead of replaying warmup.
+where it stopped instead of replaying warmup. The schedule-defining flags
+(`--max-steps`, `--warmup`, `--min-lr-ratio`, `--lr`, `--weight-decay`,
+`--betas`, `--grad-clip`) are read back from the checkpoint as well -
+without them the cosine curve would be silently reshaped mid-run, since
+only `last_epoch` survives `load_state_dict`. Any that are overridden are
+printed on startup.
 
 Logged outputs in `<output-dir>/`:
 - `train.jsonl`     - per-step loss / lr
@@ -116,7 +128,11 @@ Each `(depth, norm)` combination runs in its own subprocess under
 `ADASQUASH_HEADS_OVERRIDE` env vars (head_dim is held at 128 for every
 depth, and `dim` shrinks with depth so the parameter count stays ~constant
 — otherwise the "curse of depth" axis is confounded with model size). The
-same training script can also be invoked directly for a single config:
+`dim` schedule follows `dim ≈ base_dim · sqrt(base_depth / depth)`, giving
+≈ 1.16 / 1.07 / 0.98 / 1.01 B parameters at L = 12 / 24 / 48 / 96, a
+1.19× spread; the table is only used for the LLaMA-tiny base shape and any
+other base model is rescaled from its own width. The same training script
+can also be invoked directly for a single config:
 
 ```bash
 ADASQUASH_DEPTH_OVERRIDE=48 \
@@ -131,16 +147,22 @@ depths instead.
 ### Phase 3: special experiments
 
 ```bash
-# Phase 3a: tiny MoE (8x0.3B) — expert variance drift
+# Phase 3a: tiny MoE (8x0.3B) — expert load imbalance
 python scripts/train_moe_tiny.py --norm dytcd --n-experts 8
 
 # Phase 3b: FP8 stability (CPU/GPU simulation, no real FP8 hardware needed)
-# Runs the real forward pass with every GEMM on FP8-quantized operands and
-# reports the logit divergence, per-norm overflow/underflow and the first
-# block whose residual stream goes non-finite.
+# Runs the real forward pass with both operands of every GEMM (SwiGLU MLP
+# included) on FP8-quantized values and reports the logit divergence,
+# per-norm overflow/underflow, the first block whose residual stream leaves
+# the FP8 range and the first block that goes non-finite.
+# Add `--ckpt <one per --norms entry>` to probe trained weights instead of
+# a fresh random init.
 python scripts/check_fp8_stability.py --norms ln rmsnorm dyt dytc dytd dytcd
 
 # Phase 3c: post-training W8A8 PPL drop (quantizes the SwiGLU MLPs too)
+# The probe corpus matters: on uniform random tokens both models sit at
+# ppl ~= vocab_size and the drop is noise, so the default probe is the
+# learnable synthetic corpus (--probe dataset uses real text instead).
 python scripts/check_w8a8_ppl.py \
     --ckpts runs/gpt2-124m-ln/ckpt_final.pt \
             runs/gpt2-124m-rmsnorm/ckpt_final.pt \
@@ -154,19 +176,23 @@ python scripts/run_needle.py --ckpt runs/gpt2-124m-dytcd/ckpt_final.pt \
 ### Ablations
 
 The ablation runner sweeps the variant matrix (1000 steps, GPT-2 124M) over a
-synthetic Markov-chain corpus. The chain gives the loss a learnable floor of
-`log(n_states)` so variants can actually be ranked — uniformly random tokens
-have no next-token signal and pin every variant at `log(vocab_size)` — and a
-deliberately inflated embedding row supplies the activation-outlier channel
-the squashing layers are meant to control.
+synthetic Markov-chain corpus. The chain is an actual *walk*
+(`s_{t+1} = (s_t + j_{t+1}) mod n_states`), so the target is a function of
+the current state and the loss has a learnable floor well below
+`log(vocab_size)` — uniformly random tokens have no next-token signal and
+pin every variant at `log(vocab_size)`, which would make the loss column
+unable to rank anything. A deliberately inflated embedding row supplies the
+activation-outlier channel the squashing layers are meant to control.
 
 ```bash
 python scripts/ablation.py --config configs/ablation-matrix.yaml
 ```
 
 It writes a `summary.json` per ablation and an `all_summaries.json`
-aggregating them; each summary carries both the loss curve and the
-pre-norm activation statistics. Ablations include:
+aggregating them (merged with any previous run, so a partial re-run does
+not discard rows it skipped). Each summary carries the full loss curve,
+the loss-spike count, and the pre-norm activation statistics pooled over
+every sampled step of the run. Ablations include:
 
 - Per-channel on/off
 - Depth-conditioning on/off
@@ -252,12 +278,21 @@ All training scripts log:
 | `loss`              | training cross-entropy                            |
 | `n_loss_spikes`     | relative+absolute loss jumps over the run         |
 | `max_abs_pre_norm`  | max \|activation\| entering each normalization    |
-| `expert_cv`         | (MoE only) CoV of tokens-per-expert               |
+| `expert_cv`         | (MoE only) CoV of tokens-per-expert, per block    |
 | `logit_rel_divergence` | (FP8 sim) max abs logit error vs fp32         |
 | `overflow_rate_e4m3`| (FP8 sim) fraction of activations above ±448      |
 | `underflow_rate_e4m3` | (FP8 sim) fraction of activations below min-normal |
-| `first_nonfinite_layer` | (FP8 sim) depth at which the residual breaks    |
+| `first_overflow_layer` | (FP8 sim) first block whose residual leaves ±448 |
+| `first_nonfinite_layer` | (FP8 sim) depth at which the residual breaks  |
 | `ppl_drop_pct`      | (W8A8) PPL increase after post-training quantization |
+
+A note on interpreting these: an experiment is only as good as its probe
+corpus. Three failure modes are checked rather than assumed —
+`check_w8a8_ppl.py` rejects a probe whose tokens are (near-)all distinct,
+since nothing repeats and no model can beat chance on it; `check_fp8_stability.py`
+only measures outlier channels on trained weights, so pass `--ckpt`; and
+the ablation / MoE corpora are genuine Markov walks rather than uniform
+draws.
 
 ## Citation
 

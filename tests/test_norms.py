@@ -439,6 +439,123 @@ def test_w8a8_wrapper_quantizes_swiglu_weights():
     assert not torch.allclose(ref, got, atol=1e-8)
 
 
+def test_w8a8_quantizes_every_gemm_activation_including_the_hidden():
+    """The SwiGLU hidden (`silu(w1 x) * (w3 x)`) is fed to `w2` from inside
+    `_SwiGLU`, so leaving it fp32 makes the W8A8 measurement a partial one."""
+    import torch.nn.functional as F
+    from scripts.check_w8a8_ppl import (
+        quantize_activation_per_token, wrap_model_w8a8,
+    )
+
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=128, dim=32, n_layers=1, n_heads=4,
+                          max_seq_len=32, norm_name="rmsnorm"))
+    wrap_model_w8a8(model)
+    shapes = []
+    orig = F.linear
+
+    def spy(x, w, b=None):
+        shapes.append(tuple(x.shape))
+        # Already on the int8 grid iff re-quantizing is a no-op.
+        assert (quantize_activation_per_token(x) - x).abs().max().item() == 0.0
+        return orig(x, w, b)
+
+    F.linear = spy
+    try:
+        with torch.no_grad():
+            model(torch.randint(0, 128, (1, 16)))
+    finally:
+        F.linear = orig
+    hidden = model.blocks[0].mlp.w1.weight.shape[0]
+    assert any(s[-1] == hidden for s in shapes), "SwiGLU GEMM never observed"
+
+
+def test_w8a8_quantizes_tied_embeddings_consistently():
+    """GPT-2 ties lm_head to tok_emb; both sides must use the same copy."""
+    from scripts.check_w8a8_ppl import wrap_model_w8a8
+
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=128, dim=32, n_layers=1, n_heads=4,
+                          tie_word_embeddings=True))
+    assert model.lm_head.weight is model.tok_emb.weight
+    wrap_model_w8a8(model)
+    with torch.no_grad():
+        model(torch.randint(0, 128, (1, 8)))
+    assert hasattr(model.tok_emb, "_q_weight"), "token embedding left in fp32"
+    assert hasattr(model.lm_head, "_q_weight")
+
+
+def test_w8a8_probe_rejects_a_signal_free_corpus():
+    from adasquash import markov_batch
+    from scripts.check_w8a8_ppl import probe_token_coverage
+
+    V = 50304
+    rng = torch.Generator().manual_seed(0)
+    random_probe = [torch.randint(0, V, (4, 512), generator=rng) for _ in range(8)]
+    rng = torch.Generator().manual_seed(0)
+    markov_probe = [markov_batch(rng, -100, 4, 512, "cpu")[0] for _ in range(8)]
+    # Uniform tokens are (almost) all distinct: nothing repeats, so no model
+    # can beat chance and the reported PPL drop is noise.
+    assert probe_token_coverage(random_probe) > 0.5
+    assert probe_token_coverage(markov_probe) < 0.05
+
+
+def test_fp8_quantizer_preserves_input_dtype():
+    """Under a bf16 autocast the sim must not silently promote back to fp32."""
+    from scripts.check_fp8_stability import simulate_fp8, to_fp8_e4m3
+
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        assert to_fp8_e4m3(torch.tensor([1.0], dtype=dtype)).dtype == dtype
+    assert simulate_fp8(torch.tensor([1.0], dtype=torch.float64),
+                        448.0, 4, 3).dtype == torch.float64
+
+
+def test_fp8_wrapper_quantizes_weights_not_just_activations():
+    """An fp8 GEMM is fp8 x fp8; quantizing only the activation is A8-only."""
+    import torch.nn.functional as F
+    from scripts.check_fp8_stability import fp8_forward, to_fp8_e4m3
+
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=128, dim=32, n_layers=1, n_heads=4,
+                          max_seq_len=32, norm_name="rmsnorm"))
+    on_grid = lambda t: bool((to_fp8_e4m3(t) - t).abs().max().item() < 1e-6)
+    seen = []
+    orig = F.linear
+
+    def spy(x, w, b=None):
+        seen.append((on_grid(x), on_grid(w)))
+        return orig(x, w, b)
+
+    F.linear = spy
+    try:
+        with torch.no_grad():
+            with fp8_forward(model, to_fp8_e4m3):
+                model(torch.randint(0, 128, (1, 16)))
+    finally:
+        F.linear = orig
+    assert seen, "no GEMM observed"
+    assert all(a and w for a, w in seen), f"unquantized operands: {seen}"
+
+
+def test_fp8_reports_overflow_depth_separately_from_nonfinite():
+    """`simulate_fp8` saturates to +-448, so an overflowing residual stream
+    is finite and `first_nonfinite_layer` alone can never report it."""
+    from scripts.check_fp8_stability import measure_fp8_divergence
+
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=128, dim=32, n_layers=4, n_heads=4,
+                          norm_name="dytcd", layerscale_init=1.0))
+    with torch.no_grad():
+        model.tok_emb.weight.mul_(1e4)
+    model.eval()
+    r = measure_fp8_divergence(model, torch.randint(0, 128, (2, 32)), "dytcd")
+    assert r["first_overflow_layer"] is not None
+    assert r["first_overflow_layer"] < model.cfg.n_layers
+    # `n_layers` is the block count, not the norm-hook count (2L+1).
+    assert r["n_layers"] == model.cfg.n_layers
+    assert r["n_norm_hooks"] == 2 * model.cfg.n_layers + 1
+
+
 def test_fp8_forward_simulation_perturbs_logits_and_restores():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -579,6 +696,279 @@ def test_activation_stats_hooks():
     assert "mean_max_abs" in s["__summary__"]
     assert "max_max_abs" in s["__summary__"]
     assert s["__summary__"]["max_max_abs"] >= s["__summary__"]["mean_max_abs"]
+    # README metric-table name for the same quantity.
+    assert s["__summary__"]["max_abs_pre_norm"] == s["__summary__"]["max_max_abs"]
+    assert "mean_excess_kurtosis_pre_norm" in s["__summary__"]
+    # Kurtosis is documented on the class and must actually be emitted.
+    assert "excess_kurtosis" in s["blocks.0.norm1"]
+
+
+def test_activation_stats_can_pool_across_sampling_windows():
+    """`attach(reset=False)` must accumulate, so run-level stats are possible.
+
+    The ablation runner re-attaches on a sampling window; without this the
+    reported statistics describe only the last window while `final_loss`
+    describes the whole run.
+    """
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                          max_seq_len=16, norm_name="dytcd"))
+    stats = ActivationStats(model)
+    probe = torch.zeros(1, 4, dtype=torch.long)
+    with torch.no_grad():
+        # Window 1 carries the larger activation.
+        model.tok_emb.weight[0].fill_(100.0)
+        stats.attach(reset=True)
+        model(probe)
+        stats.detach()
+        first = stats.summary()["__summary__"]["max_max_abs"]
+        # Window 2 is much smaller; a pooled report must still show window 1's
+        # peak, while a resetting one drops back to the smaller value.
+        model.tok_emb.weight.zero_()
+        stats.attach(reset=False)
+        model(probe)
+        stats.detach()
+        pooled = stats.summary()["__summary__"]["max_max_abs"]
+    assert first > 100.0, "the first window should carry the outlier"
+    assert pooled > 100.0, "reset=False must not discard earlier meters"
+    # A fresh attach() does reset.
+    with torch.no_grad():
+        stats.attach(reset=True)
+        model(probe)
+        stats.detach()
+        assert stats.summary()["__summary__"]["max_max_abs"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Synthetic corpus: the ablations / MoE / W8A8 probe depend on it having
+# real next-token signal.
+# ---------------------------------------------------------------------------
+def _mutual_information(x, y, n_states):
+    pairs = torch.stack([x[:, :-1].reshape(-1), y[:, :-1].reshape(-1)], 1)
+    joint = torch.zeros(n_states, n_states, dtype=torch.double)
+    joint[pairs[:, 0].long(), pairs[:, 1].long()] += 1
+    p = joint / joint.sum()
+    px, py = p.sum(1, keepdim=True), p.sum(0, keepdim=True)
+    tiny = 1e-30
+    return (
+        p * ((p.clamp(min=tiny).log()) - px.clamp(min=tiny).log()
+             - py.clamp(min=tiny).log())
+    ).sum().item()
+
+
+def test_markov_corpus_has_learnable_next_token_signal():
+    from adasquash import markov_batch
+
+    rng = torch.Generator().manual_seed(0)
+    x, y = markov_batch(rng, -100, 256, 512, "cpu", n_states=64)
+    mi = _mutual_information(x, y, 64)
+    # A per-position independent draw has I == 0 and pins the loss at
+    # log(vocab_size) for every variant, making the ablation matrix
+    # unrankable. A real walk over 64 states with jumps in {0,1,2} carries
+    # log(64) - log(3) ~ 3.06 nats.
+    assert mi > 2.5, f"I(x;y) = {mi:.3f} nats, the corpus has no signal"
+    assert abs(mi - (math.log(64) - math.log(3))) < 0.2
+
+
+def test_markov_corpus_shapes_and_masking():
+    from adasquash import markov_batch
+
+    rng = torch.Generator().manual_seed(0)
+    x, y = markov_batch(rng, -100, 4, 16, "cpu", n_states=64)
+    assert x.shape == y.shape == (4, 16)
+    # Target is the shifted successor, final position masked out.
+    assert torch.equal(y[:, :-1], x[:, 1:])
+    assert (y[:, -1] == -100).all()
+    assert x.min() >= 0 and x.max() < 64
+
+
+def test_markov_outlier_channel_does_not_destroy_the_targets():
+    from adasquash import markov_batch
+
+    rng = torch.Generator().manual_seed(0)
+    x, y = markov_batch(rng, -100, 8, 512, "cpu", outlier_id=50303)
+    frac = (x == 50303).float().mean().item()
+    assert 0.01 < frac < 0.06, f"outlier channel fraction = {frac}"
+    # The spike perturbs the *input* only; the targets stay on the clean
+    # walk, so the corpus is still learnable.
+    assert 50303 not in y.unique().tolist()
+
+
+def test_depth_schedule_ablation_row_actually_disables_the_schedule():
+    """`k_init=0.0` alone leaves `k` learnable, so the schedule comes back."""
+    from scripts.ablation import load_ablations_from_config
+
+    root = Path(__file__).resolve().parent.parent
+    rows = load_ablations_from_config(
+        str(root / "configs" / "ablation-matrix.yaml")
+    )
+    row = rows["dytd_k0_no_depth_schedule"]
+    assert row["norm_name"] == "dytd"
+    assert row["k_init"] == 0.0
+    assert row.get("learnable_k") is False, (
+        "with learnable_k=True the optimizer learns k straight back off zero "
+        "and the row stops isolating the depth schedule"
+    )
+
+
+def test_depth_sweep_shape_holds_the_parameter_count_roughly_fixed():
+    """The depth axis must not be confounded with model size."""
+    from scripts.train_llama_depth_sweep import shape_for_depth
+
+    V = 32000
+
+    def params(depth, dim):
+        hidden = int(dim * (8 / 3.0))
+        hidden = int(hidden * 2 / 3)
+        hidden = (hidden + 7) & ~7
+        return depth * (4 * dim * dim + 3 * hidden * dim + 4 * dim) + 2 * V * dim
+
+    counts = []
+    for depth in (12, 24, 48, 96):
+        dim, heads = shape_for_depth(depth, 2048, 16)
+        assert dim % heads == 0
+        assert dim // heads == 128, "head_dim must be constant across the sweep"
+        counts.append(params(depth, dim))
+    spread = max(counts) / min(counts)
+    assert spread < 1.3, (
+        f"parameter count varies {spread:.2f}x across the depth axis; a deep "
+        f"run that is also a bigger model makes 'RMSNorm diverges at depth' "
+        f"unfalsifiable"
+    )
+
+
+def test_depth_sweep_shape_honours_a_non_llama_base():
+    from scripts.train_llama_depth_sweep import _BASE_SHAPE, shape_for_depth
+
+    # The documented table is only valid for the LLaMA-tiny base shape; a
+    # gpt2-124m sweep must not silently be built at LLaMA-tiny width.
+    # head_dim is still held at the gpt2 base's 64, but dim/heads follow the
+    # gpt2 base, not the table.
+    dim, heads = shape_for_depth(12, 768, 12)
+    assert dim // heads == 768 // 12
+    assert (dim, heads) not in [(2560, 20), (2048, 16), (1536, 12), (1280, 10)]
+    # The base depth is unchanged, so a gpt2 sweep still lands on the
+    # builder's own shape there.
+    assert shape_for_depth(24, 768, 12) == (768, 12)
+    assert shape_for_depth(24, *_BASE_SHAPE) == (2048, 16)
+
+
+# ---------------------------------------------------------------------------
+# Training-loop invariants
+# ---------------------------------------------------------------------------
+def test_lr_schedule_has_no_dead_first_step():
+    """`LambdaLR` evaluates step 0 at construction, so the first update
+    would otherwise run at lr == 0 and warmup end one step late."""
+    import argparse as _argparse
+    from scripts.train_gpt2 import build_lr_lambda
+    from torch.optim.lr_scheduler import LambdaLR
+
+    args = _argparse.Namespace(max_steps=100, warmup=10, min_lr_ratio=0.1)
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=6e-4)
+    sched = LambdaLR(opt, build_lr_lambda(args))
+    assert opt.param_groups[0]["lr"] > 0.0, "first update would be a no-op"
+    # The lambda is evaluated at `last_epoch`, which starts at 0, so
+    # `last_epoch = 9` is the last index whose `s + 1` lands on `warmup`.
+    for _ in range(9):
+        opt.step()
+        sched.step()
+    assert abs(opt.param_groups[0]["lr"] - 6e-4) < 1e-9, "peak not reached at end of warmup"
+    for _ in range(90):
+        opt.step()
+        sched.step()
+    assert abs(opt.param_groups[0]["lr"] - 6e-5) < 1e-9, "min_lr_ratio not reached"
+
+
+def test_resume_restores_the_schedule_defining_flags():
+    import argparse as _argparse
+    from scripts.train_gpt2 import restore_schedule_args
+
+    ckpt_args = dict(max_steps=10000, warmup=500, min_lr_ratio=0.1, lr=6e-4,
+                     weight_decay=0.1, beta1=0.9, beta2=0.95, grad_clip=1.0)
+    args = _argparse.Namespace(max_steps=30000, warmup=123, min_lr_ratio=0.1,
+                               lr=6e-4, weight_decay=0.1, beta1=0.9, beta2=0.95,
+                               grad_clip=1.0)
+    changed = restore_schedule_args(args, ckpt_args)
+    assert set(changed) == {"max_steps", "warmup"}
+    assert args.max_steps == 10000 and args.warmup == 500
+    # Identical flags are a no-op; a checkpoint without `args` keeps the CLI.
+    same = _argparse.Namespace(**ckpt_args)
+    assert restore_schedule_args(same, ckpt_args) == []
+    assert restore_schedule_args(same, {}) == []
+
+
+def test_qk_alpha_init_reaches_the_attention():
+    """The QKSquash init used to be a constructor argument nothing could set."""
+    cfg = GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                    norm_name="rmsnorm", qk_norm="dytqk", qk_alpha_init=0.25)
+    model = GPT(cfg)
+    sq = model.blocks[0].attn.q_squash
+    assert sq is not None and sq is model.blocks[0].attn.k_squash
+    assert sq.alpha_q.item() == pytest.approx(0.25)
+    assert sq.alpha_k.item() == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
+# Needle-in-a-haystack protocol
+# ---------------------------------------------------------------------------
+class _CharTokenizer:
+    """Char-level tokenizer, so a secret spans several tokens."""
+
+    def __call__(self, s, add_special_tokens=False):
+        return {"input_ids": [ord(c) % 60 + 1 for c in s]}
+
+
+class _ScriptedModel:
+    """Emits a scripted token sequence, one per call."""
+
+    def __init__(self, ids, cfg):
+        self.ids, self.cfg, self.base = ids, cfg, None
+
+    def __call__(self, x, y=None):
+        if self.base is None:
+            self.base = x.shape[1]
+        k = min(x.shape[1] - self.base, len(self.ids) - 1)
+        logits = torch.full((x.shape[0], x.shape[1], 64), -20.0)
+        logits[:, -1, self.ids[k]] = 20.0
+        return logits, None
+
+
+def test_needle_scores_the_whole_secret_not_just_its_first_token():
+    """GPT-2 splits " 12345" into several BPE tokens; matching only the
+    first one accepts a model that recites 3 of the 5 digits."""
+    from scripts.eval_downstream import needle_in_haystack
+
+    model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                          max_seq_len=256, norm_name="rmsnorm")).eval()
+    tok = _CharTokenizer()
+    needle = "The magic number is 12345."
+    target = tok(" 12345")["input_ids"]
+    assert len(target) > 1, "the secret must span several tokens for this test"
+
+    exact = needle_in_haystack(
+        _ScriptedModel(target, model.cfg), tok, needle=needle,
+        context_len=256, n_trials=2, device="cpu")
+    assert exact == 1.0
+
+    wrong_tail = target[:-1] + [(target[-1] % 60) + 1]
+    partial = needle_in_haystack(
+        _ScriptedModel(wrong_tail, model.cfg), tok, needle=needle,
+        context_len=256, n_trials=2, device="cpu")
+    assert partial == 0.0
+
+
+def test_needle_rejects_contexts_it_cannot_evaluate():
+    """A context past `max_seq_len` used to crash inside the forward pass,
+    and one too short to hold a single haystack repeat silently scored 0.0."""
+    from scripts.eval_downstream import needle_in_haystack
+
+    model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                          max_seq_len=256, norm_name="rmsnorm")).eval()
+    tok = _CharTokenizer()
+    with pytest.raises(ValueError, match="max_seq_len"):
+        needle_in_haystack(model, tok, context_len=4096, n_trials=1, device="cpu")
+    with pytest.raises(ValueError, match="too short"):
+        needle_in_haystack(model, tok, context_len=20, n_trials=1, device="cpu")
 
 
 # ---------------------------------------------------------------------------

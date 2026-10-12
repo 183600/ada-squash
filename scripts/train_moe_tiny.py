@@ -1,12 +1,18 @@
 """
 MoE-tiny: a tiny 8-expert top-2 MoE block layered on top of the GPT
-backbone. Used to study the "expert variance drift" hypothesis from the
+backbone. Used to study the expert-load-imbalance hypothesis from the
 DyT++ proposal: when each expert sees only ~1/N of the tokens, the
 activation statistics per expert can drift much more than in dense
 training, and a *per-token* normalization like RMSNorm/LN runs on a
 distribution that's a noisy mixture of expert distributions.
 
 DyT-CD, being purely element-wise, sidesteps this entirely.
+
+Note on the metric: what is actually measured is the coefficient of
+variation of tokens-per-expert (`expert_cv`), i.e. *routing load
+imbalance*, recorded per block. A per-expert activation statistic is not
+computed here - the second norm runs on the residual stream *before*
+routing, so there is no per-expert normalized tensor to measure.
 
 Usage:
     python scripts/train_moe_tiny.py --norm dytcd --n-experts 8 \
@@ -29,7 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 
-from adasquash import build_norm
+from adasquash import build_norm, markov_batch
 from adasquash.attention import CausalSelfAttention
 from adasquash.model import GPTConfig, build_norm_kwargs
 from adasquash.utils import (
@@ -207,6 +213,16 @@ def main():
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--stats-every", type=int, default=200)
     p.add_argument("--output-dir", default="runs/moe-tiny")
+    p.add_argument("--probe", default="markov",
+                   choices=["markov", "random"],
+                   help="corpus. 'random' is uniform token ids: it has no "
+                        "next-token signal, so the LM loss is pinned at "
+                        "log(vocab_size) and the run learns nothing")
+    p.add_argument("--dataset", default=None,
+                   help="optional HF dataset name; when given, replaces the "
+                        "synthetic corpus with packed real text")
+    p.add_argument("--dataset-config", default=None)
+    p.add_argument("--tokenizer", default="gpt2")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -223,17 +239,39 @@ def main():
     loss_spike = LossSpikeCounter()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     rng = torch.Generator(device=device).manual_seed(args.seed)
+
+    data_iter = None
+    if args.dataset:
+        from scripts.train_gpt2 import build_dataloader
+        loader = build_dataloader(
+            args.dataset, args.dataset_config, args.seq_len,
+            args.batch_size, tokenizer=args.tokenizer,
+        )
+        data_iter = iter(loader)
+
+    def next_batch():
+        if data_iter is None:
+            # Learnable corpus: uniform token ids would pin the loss at
+            # log(vocab_size), which carries no information about the norm
+            # under test and gives the router nothing to learn from either.
+            return markov_batch(
+                rng, cfg.ignore_index, args.batch_size, args.seq_len, device
+            )
+        try:
+            return next(data_iter)
+        except StopIteration:
+            return next(iter(loader))
+
     history = []
     for step in range(args.max_steps):
-        x = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
-        # Shift-by-one targets. The final position has no successor, so it is
-        # padded with `cfg.ignore_index` (out-of-vocab) rather than token 0,
-        # which is a real GPT-2 token ("!") that would otherwise be trained on.
-        y = torch.full(
-            (args.batch_size, args.seq_len), cfg.ignore_index,
-            dtype=torch.long, device=device,
-        )
-        y[:, :-1] = x[:, 1:]
+        x, y = next_batch()
+        # The shift is already done by both corpus builders; the final
+        # position has no successor and carries `cfg.ignore_index` (out of
+        # vocabulary) rather than token 0, which is a real GPT-2 token ("!")
+        # that would otherwise be trained on.
+        if y[:, -1].ne(cfg.ignore_index).any():
+            y = y.clone()
+            y[:, -1] = cfg.ignore_index
         if step % args.stats_every == 0:
             act_stats.attach()
         logits, loss, aux, tpe_list = model(x, y, return_aux=True)
@@ -241,15 +279,20 @@ def main():
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()
-        # Log expert variance drift
-        tpe = tpe_list[-1]
-        exp_cv = (tpe.std() / (tpe.mean() + 1e-6)).item() if isinstance(tpe, torch.Tensor) else 0.0
+        # Log expert load imbalance. Reported per block: the motivating
+        # hypothesis is a drift *with depth*, which a single last-block
+        # number cannot show.
+        expert_cv = [_expert_cv(tpe) for tpe in tpe_list]
+        exp_cv = expert_cv[-1]
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
         loss_spike.update(loss.item())
-        history.append({"step": step, "loss": loss.item(), "aux": aux.detach().item(),
-                        "expert_cv": exp_cv})
+        history.append({"step": step, "loss": loss.item(),
+                        "aux": aux.detach().item(),
+                        "expert_cv": exp_cv,
+                        "expert_cv_per_block": expert_cv,
+                        "n_loss_spikes": loss_spike.n_spikes})
         if step % args.log_every == 0:
             print(f"  [moe] step={step:4d} loss={loss.item():.4f} aux={aux.detach().item():.4f} "
                   f"expert_cv={exp_cv:.3f}", flush=True)
@@ -258,7 +301,14 @@ def main():
     s = act_stats.summary()
     with open(Path(args.output_dir) / "stats.json", "w") as f:
         json.dump(s, f, indent=2, default=str)
-    print(f"[done] saved to {args.output_dir}")
+    print(f"[done] saved to {args.output_dir} | n_loss_spikes={loss_spike.n_spikes}")
+
+
+def _expert_cv(tpe) -> float:
+    """Coefficient of variation of tokens-per-expert (load imbalance)."""
+    if not isinstance(tpe, torch.Tensor):
+        return 0.0
+    return (tpe.std() / (tpe.mean() + 1e-6)).item()
 
 
 if __name__ == "__main__":

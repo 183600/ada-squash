@@ -3,10 +3,16 @@ Post-training W8A8 quantization PPL drop check.
 
 Naive round-to-nearest W8A8 quantization.
 
-We use a per-channel weight quantization (axis=1) and per-token
+We use a per-channel weight quantization (axis=0) and per-token
 activation quantization (axis=-1), which is the same scheme as
 llm.int8() minus the mixed-precision detour - the detour exists
 precisely to handle the outliers we're trying to suppress.
+
+The probe corpus matters as much as the quantizer: on uniform random
+tokens there is no next-token signal, both models sit at
+ppl ~= vocab_size, and the reported drop is noise (it can even be
+negative). `--probe markov` (default) uses the synthetic learnable corpus
+so the metric has resolution; `--probe dataset` uses real text.
 
 Usage:
     python scripts/check_w8a8_ppl.py --ckpts runs/gpt2-124m-ln/ckpt_final.pt runs/gpt2-124m-rmsnorm/ckpt_final.pt runs/gpt2-124m-dytcd/ckpt_final.pt
@@ -25,9 +31,10 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from adasquash import GPT
-from adasquash.model import MLP, _SwiGLU
+from adasquash import GPT, markov_batch
+from adasquash.model import MLP
 from scripts.eval_downstream import load_ckpt
 
 
@@ -78,6 +85,12 @@ def wrap_swiglu_w8a8(mlp):
     that is only partly quantized - the MLP holds the majority of the
     parameters and is exactly where activation outliers live. The whole
     module is therefore wrapped at once.
+
+    `_SwiGLU.apply` also performs the `w2` GEMM internally, so routing the
+    forward through it would leave the SwiGLU *hidden* activation
+    (`silu(w1 x) * (w3 x)`, the most outlier-prone tensor in the network)
+    in fp32 while every other GEMM input is int8. The forward is therefore
+    written out explicitly, quantizing each GEMM input in turn.
     """
     def quantized_forward(x):
         weights = []
@@ -86,17 +99,41 @@ def wrap_swiglu_w8a8(mlp):
                 qw, _ = quantize_weight_per_channel(lin.weight.data)
                 lin._q_weight = qw
             weights.append(lin._q_weight)
-        x_q = quantize_activation_per_token(x)
-        return mlp.drop(_SwiGLU.apply(x_q, weights[0], weights[1], weights[2]))
+        qa = quantize_activation_per_token
+        x_q = qa(x)
+        a = qa(F.linear(x_q, weights[0]))
+        b = qa(F.linear(x_q, weights[2]))
+        h = qa(F.silu(a) * b)
+        return mlp.drop(F.linear(h, weights[1]))
 
     mlp.forward = quantized_forward
     return mlp
+
+
+def wrap_embedding_w8a8(emb: nn.Embedding):
+    """Quantize an embedding lookup.
+
+    GPT-2 ties `lm_head.weight` to `tok_emb.weight`. `wrap_model_w8a8`
+    reaches `lm_head` as an `nn.Linear` and gives it a quantized *copy*,
+    while `nn.Embedding` keeps reading the original fp32 tensor - so the
+    same weight would be consumed at two different precisions inside one
+    forward. Quantizing the lookup keeps the two sides consistent.
+    """
+    def quantized_forward(idx):
+        if not hasattr(emb, "_q_weight"):
+            emb._q_weight, _ = quantize_weight_per_channel(emb.weight.data)
+        return F.embedding(idx, emb._q_weight)
+
+    emb.forward = quantized_forward
+    return emb
 
 
 def wrap_model_w8a8(model: nn.Module):
     for m in model.modules():
         if isinstance(m, MLP):
             wrap_swiglu_w8a8(m)
+        elif isinstance(m, nn.Embedding):
+            wrap_embedding_w8a8(m)
         elif isinstance(m, nn.Linear):
             wrap_linear_w8a8(m)
     return model
@@ -136,12 +173,97 @@ def compute_ce_sum(model, batch, target, device="cuda"):
 
 def compute_ppl(model, batch, target, device="cuda"):
     ce, n = compute_ce_sum(model, batch, target, device=device)
-    return torch.exp(torch.tensor(ce / n)).item()
+    return math.exp(ce / n)
+
+
+def probe_token_coverage(batches) -> float:
+    """Fraction of probe positions holding a *distinct* token id.
+
+    A uniformly random probe over a large vocabulary is almost entirely
+    distinct (each id shows up about once), so no predictive model - bigram,
+    trigram or transformer - can beat chance on it and every PPL sits at the
+    vocab_size ceiling. A corpus with real next-token structure repeats
+    tokens, and the coverage falls by orders of magnitude (a 64-state Markov
+    chain is <= 0.03; natural text is typically <= 0.15).
+
+    This is a property of the probe alone, so it separates "the corpus is
+    degenerate" (a hard error here) from "the checkpoint is untrained"
+    (reported separately as a warning).
+
+    Measured exactly rather than estimated: an empirical bigram conditional
+    entropy would be badly biased downward at this sample size, where most
+    (prev, next) pairs are seen zero or one times.
+    """
+    n_pos = 0
+    ids: set = set()
+    for x in batches:
+        flat = x.reshape(-1)
+        ids.update(flat.tolist())
+        n_pos += flat.numel()
+    return len(ids) / max(1, n_pos)
+
+
+# ---------------------------------------------------------------------------
+# Probe batches
+# ---------------------------------------------------------------------------
+def _probe_random(rng, vocab_size, batch_size, seq_len, device):
+    """Uniform random tokens.
+
+    Kept selectable for parity with earlier runs, but note it carries no
+    next-token signal: every PPL comes out at ~vocab_size and the reported
+    `ppl_drop_pct` is noise (it can even come out negative).
+    """
+    return torch.randint(
+        0, vocab_size, (batch_size, seq_len), generator=rng, device=device
+    )
+
+
+def _probe_markov(rng, batch_size, seq_len, device, n_states=64):
+    """Learnable synthetic corpus (see `adasquash.utils.markov_batch`)."""
+    x, _ = markov_batch(rng, -100, batch_size, seq_len, device, n_states=n_states)
+    return x
+
+
+def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len):
+    """Real text, packed into fixed-length streams.
+
+    Returns a stateful zero-argument callable: the streaming dataset is
+    opened once and cycled, rather than re-instantiated (and re-sharded
+    from scratch) on every batch.
+    """
+    from scripts.train_gpt2 import build_dataloader
+    loader = build_dataloader(
+        dataset, dataset_config, seq_len, batch_size, tokenizer=tokenizer
+    )
+    it = iter(loader)
+
+    def _next():
+        nonlocal it
+        try:
+            return next(it)[0]
+        except StopIteration:
+            it = iter(loader)
+            return next(it)[0]
+
+    return _next
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpts", nargs="+", required=True)
+    p.add_argument("--probe", default="markov",
+                   choices=["markov", "dataset", "random"],
+                   help="probe corpus. 'random' is uniform tokens: it has no "
+                        "next-token signal, so ppl_fp ~= vocab_size and the "
+                        "PPL drop is unmeasurable (kept only for parity)")
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
+    p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--tokenizer", default="gpt2")
+    p.add_argument("--n-states", type=int, default=64,
+                   help="state count of the synthetic 'markov' probe")
+    p.add_argument("--max-probe-coverage", type=float, default=0.5,
+                   help="reject a probe whose tokens are more than this "
+                        "fraction distinct (uniform noise is ~1.0)")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--n-batches", type=int, default=20)
@@ -151,6 +273,21 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
+
+    dataset_probe = (
+        make_dataset_probe(args.dataset, args.dataset_config, args.tokenizer,
+                           args.batch_size, args.seq_len)
+        if args.probe == "dataset" else None
+    )
+
+    def make_probe(rng, cfg):
+        if args.probe == "random":
+            return _probe_random(rng, cfg.vocab_size, args.batch_size,
+                                 args.seq_len, device)
+        if args.probe == "markov":
+            return _probe_markov(rng, args.batch_size, args.seq_len, device,
+                                 n_states=args.n_states)
+        return dataset_probe()
 
     results = []
     for ckpt_path in args.ckpts:
@@ -170,12 +307,10 @@ def main():
 
         ce_fp = ce_q = 0.0
         n_tok = 0
+        batches = []
         for _ in range(max(1, args.n_batches)):
-            # Build random data.
-            x = torch.randint(
-                0, model.cfg.vocab_size, (args.batch_size, args.seq_len),
-                generator=rng, device=device,
-            )
+            x = make_probe(rng, model.cfg)
+            batches.append(x)
             # Shift-by-one targets; the final position has no successor and is
             # padded with `cfg.ignore_index` (out of vocabulary) rather than
             # token 0, which is a real GPT-2 token ("!") and would otherwise
@@ -193,13 +328,36 @@ def main():
         ppl_fp = math.exp(ce_fp / n_tok)
         ppl_q = math.exp(ce_q / n_tok)
 
+        # A probe with no next-token signal pins the CE near log(vocab_size)
+        # for *both* models, so the difference is pure noise. Measured on the
+        # probe itself, so an untrained checkpoint is not mistaken for a
+        # broken corpus.
+        coverage = probe_token_coverage(batches)
+        if coverage > args.max_probe_coverage:
+            raise ValueError(
+                f"probe='{args.probe}' carries no next-token signal: "
+                f"{coverage:.0%} of its tokens are distinct, so nothing "
+                f"repeats and no model can beat chance. Use "
+                f"--probe markov|dataset (--max-probe-coverage overrides)."
+            )
+
         r = {
             "ckpt": ckpt_path,
+            "probe": args.probe,
             "ppl_fp": ppl_fp,
             "ppl_w8a8": ppl_q,
             "ppl_drop": ppl_q - ppl_fp,
             "ppl_drop_pct": 100.0 * (ppl_q - ppl_fp) / ppl_fp,
+            "probe_token_coverage": coverage,
         }
+        # Distinct from the hard check above: a high PPL here means the
+        # *checkpoint* is untrained, which is the user's call, not an error.
+        if ppl_fp >= 0.5 * model.cfg.vocab_size:
+            print(f"[w8a8] WARNING: {ckpt_path} ppl_fp={ppl_fp:.1f} is at the "
+                  f"vocab_size={model.cfg.vocab_size} ceiling - the probe is "
+                  f"fine (coverage={coverage:.1%}) but this checkpoint appears "
+                  f"untrained, so ppl_drop_pct is not meaningful yet",
+                  file=sys.stderr)
         print(f"[w8a8] {ckpt_path}: {r}")
         results.append(r)
 

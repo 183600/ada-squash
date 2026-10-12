@@ -14,7 +14,7 @@ Supports:
 Example:
     python scripts/train_gpt2.py \
         --norm dytcd \
-        --dataset HuggingFWC/fineweb-edu \
+        --dataset HuggingFaceFW/fineweb-edu \
         --dataset-config sample-10BT \
         --max-steps 10000 \
         --batch-size 32 --seq-len 1024 \
@@ -189,6 +189,52 @@ def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float)
     return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def build_lr_lambda(args):
+    """LR multiplier as a function of `LambdaLR.last_epoch`.
+
+    The `+ 1` is load-bearing: `LambdaLR` evaluates the lambda for step 0 at
+    construction, so with a bare `step` the very first `opt.step()` runs at
+    lr == 0 (a wasted update) and the whole warmup is shifted one step late.
+    """
+    return lambda s: cosine_schedule(
+        s + 1, args.max_steps, args.warmup, args.min_lr_ratio
+    )
+
+
+# Hyper-parameters that define the LR trajectory. A resumed run has to keep
+# every one of them, otherwise the schedule silently changes shape mid-run
+# even though `LambdaLR.load_state_dict` restores `last_epoch` faithfully.
+_SCHEDULE_ARGS = (
+    "max_steps",
+    "warmup",
+    "min_lr_ratio",
+    "lr",
+    "weight_decay",
+    "beta1",
+    "beta2",
+    "grad_clip",
+)
+
+
+def restore_schedule_args(args, ckpt_args: dict) -> list:
+    """Adopt the original run's schedule / optimizer hyper-parameters.
+
+    Returns the names that were overridden. `max_steps` is included on
+    purpose: extending a finished run (resume with a larger `--max-steps`
+    to continue the cosine tail) changes the schedule by design, so the
+    override is recorded rather than rejected - silently, it would look like
+    an uninterrupted run.
+    """
+    changed = []
+    for name in _SCHEDULE_ARGS:
+        if name not in ckpt_args:
+            continue
+        if getattr(args, name, None) != ckpt_args[name]:
+            setattr(args, name, ckpt_args[name])
+            changed.append(name)
+    return changed
+
+
 # ---------------------------------------------------------------------------
 # Main train loop
 # ---------------------------------------------------------------------------
@@ -205,6 +251,8 @@ def main():
     p.add_argument("--model", choices=["gpt2-124m", "gpt2-350m", "llama-1b"], default="gpt2-124m")
     p.add_argument("--norm", default="dytcd", choices=list(["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"]))
     p.add_argument("--qk-norm", default=None, choices=[None, "qknorm", "dytqk"])
+    p.add_argument("--qk-alpha-init", type=float, default=1.0,
+                   help="initial alpha_q / alpha_k for --qk-norm dytqk")
     p.add_argument("--no-layerscale", action="store_true")
     p.add_argument("--layerscale-init", type=float, default=None)
     p.add_argument("--alpha-0", type=float, default=0.9)
@@ -265,6 +313,7 @@ def main():
     model_cfg = dict(
         norm_name=args.norm,
         qk_norm=args.qk_norm,
+        qk_alpha_init=args.qk_alpha_init,
         use_layerscale=not args.no_layerscale,
         alpha_0=args.alpha_0,
         k_init=args.k_init,
@@ -318,25 +367,32 @@ def main():
     )
     data_iter = iter(loader)
 
-    # Optimizer
-    opt = build_optimizer(model, args.lr, args.weight_decay, args.beta1, args.beta2)
-    sched = LambdaLR(
-        opt,
-        lambda s: cosine_schedule(s, args.max_steps, args.warmup, args.min_lr_ratio),
-    )
-
     # Resume: restore model / optimizer / scheduler and the step counter so
     # the LR schedule continues where it stopped instead of replaying warmup.
+    # The lambda closes over `max_steps` / `warmup` / `min_lr_ratio`, and
+    # `load_state_dict` only restores `last_epoch`, so those values have to
+    # come back from the checkpoint too - otherwise a resumed run silently
+    # follows a different curve than the run it claims to continue.
     start_step = 0
+    resume_ckpt = None
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        if "optimizer" in ckpt:
-            opt.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt:
-            sched.load_state_dict(ckpt["scheduler"])
-        start_step = int(ckpt.get("step", 0))
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        changed = restore_schedule_args(args, resume_ckpt.get("args") or {})
+        if changed:
+            print(f"[resume] schedule args restored from checkpoint: {changed}")
+        start_step = int(resume_ckpt.get("step", 0))
         print(f"[resume] {args.resume} -> step {start_step}")
+
+    # Optimizer
+    opt = build_optimizer(model, args.lr, args.weight_decay, args.beta1, args.beta2)
+    sched = LambdaLR(opt, build_lr_lambda(args))
+
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model"])
+        if "optimizer" in resume_ckpt:
+            opt.load_state_dict(resume_ckpt["optimizer"])
+        if "scheduler" in resume_ckpt:
+            sched.load_state_dict(resume_ckpt["scheduler"])
 
     # Stability meters
     act_stats = ActivationStats(model)
@@ -407,12 +463,21 @@ def main():
                 f"step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}"
             )
             print(line, flush=True)
-            row = {"step": step, "loss": loss_val, "lr": lr}
+            row = {
+                "step": step,
+                "loss": loss_val,
+                "lr": lr,
+                # Running counter over the whole (resumed) run; the README
+                # metric table lists it as a logged quantity, so it has to
+                # reach the jsonl / TB / wandb sinks, not just stay in RAM.
+                "n_loss_spikes": loss_spike.n_spikes,
+            }
             with open(log_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
             if tb:
                 tb.add_scalar("train/loss", loss_val, step)
                 tb.add_scalar("train/lr", lr, step)
+                tb.add_scalar("train/n_loss_spikes", loss_spike.n_spikes, step)
             if args.wandb_project:
                 import wandb
                 wandb.log(row, step=step)
@@ -445,6 +510,7 @@ def main():
         "optimizer": opt.state_dict(),
         "scheduler": sched.state_dict(),
         "args": vars(args),
+        "n_loss_spikes": loss_spike.n_spikes,
     }
     path = Path(args.output_dir) / "ckpt_final.pt"
     torch.save(ckpt, path)

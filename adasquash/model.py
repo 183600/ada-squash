@@ -45,6 +45,10 @@ class GPTConfig:
     # Norm & attention
     norm_name: str = "dytcd"
     qk_norm: Optional[str] = None
+    # Initial alpha_q / alpha_k for `qk_norm="dytqk"`. Threaded through here
+    # so the squashing strength of variant C is configurable; previously the
+    # constructor argument existed but nothing could ever set it.
+    qk_alpha_init: float = 1.0
     use_layerscale: bool = True
     layerscale_init: float = 1e-5
     # DyT-family specific
@@ -211,6 +215,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(
             cfg.dim, cfg.n_heads,
             qk_norm=cfg.qk_norm,
+            alpha_init=cfg.qk_alpha_init,
             dropout=cfg.dropout,
         )
         self.norm2 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)

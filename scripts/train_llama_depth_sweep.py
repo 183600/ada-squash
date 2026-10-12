@@ -33,20 +33,25 @@ def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
     return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-# Per-depth (dim, n_heads) taken from the Phase-2 experiment card
-# (experiments/phase2_llama_1b_depth/README.md). The point of the sweep is
-# the *depth* axis, so `dim` has to shrink as depth grows or the 96-layer
-# run is simply a 4x larger model and "RMSNorm diverges at depth" is
-# unfalsifiable. head_dim is 128 for every row, so RoPE / attention shapes
-# stay identical across the sweep.
-DEPTH_SHAPE = {
-    12: (2560, 20),
-    24: (2048, 16),
-    48: (1536, 12),
-    96: (1280, 10),
-}
+# Per-depth (dim, n_heads) for the LLaMA-tiny 1b base shape. The point of the
+# sweep is the *depth* axis, so `dim` has to shrink as depth grows or the
+# 96-layer run is simply a larger model and "RMSNorm diverges at depth" is
+# unfalsifiable. Parameter count is ~ L * dim^2, so a constant budget means
+# dim ~ base_dim * sqrt(base_depth / depth); the table below is exactly that
+# law with head_dim pinned at 128, which keeps RoPE and attention shapes
+# identical across the sweep (1.16 / 1.07 / 0.98 / 1.01 B, a 1.19x spread).
 _BASE_DEPTH = 24
-_BASE_SHAPE = (2048, 16)  # LLaMA-tiny 1b defaults
+_BASE_DIM = 2048
+_BASE_HEADS = 16          # head_dim = 128
+_BASE_SHAPE = (_BASE_DIM, _BASE_HEADS)  # LLaMA-tiny 1b defaults
+_BASE_HEAD_DIM = _BASE_DIM // _BASE_HEADS
+
+DEPTH_SHAPE = {
+    12: (2944, 23),
+    24: (2048, 16),
+    48: (1408, 11),
+    96: (1024, 8),
+}
 
 # YAML key -> (argparse dest, invert) for the negative-form flags.
 _SWEEP_CONFIG_ALIASES = {
@@ -61,10 +66,13 @@ _SWEEP_CONFIG_ALIASES = {
 def shape_for_depth(depth: int, base_dim: int, base_heads: int):
     """(dim, n_heads) for a given depth, keeping the parameter count ~fixed.
 
-    Falls back to a 1/sqrt(depth) dim schedule (with head_dim held fixed)
-    for depths that are not in the documented table.
+    The documented table is only valid for the LLaMA-tiny base shape; any
+    other base model falls back to the 1/sqrt(depth) law scaled from its own
+    `base_dim` / `base_heads`, with head_dim held fixed. Without that guard
+    the table would be returned for any base, so a `--model gpt2-124m` arm
+    would silently be built at LLaMA-tiny width.
     """
-    if depth in DEPTH_SHAPE:
+    if (base_dim, base_heads) == _BASE_SHAPE and depth in DEPTH_SHAPE:
         return DEPTH_SHAPE[depth]
     base_head_dim = max(1, base_dim // base_heads)
     dim = int(round(base_dim * math.sqrt(_BASE_DEPTH / max(1, depth))))
@@ -73,7 +81,7 @@ def shape_for_depth(depth: int, base_dim: int, base_heads: int):
     return dim, heads
 
 
-def launch_one(args, depth: int, norm: str, output_dir: Path, additional: list | None = None):
+def launch_one(args, depth: int, norm: str, output_dir: Path):
     """Launch a single training run via subprocess."""
     cmd = [
         sys.executable, str(Path(__file__).parent / "train_gpt2.py"),
@@ -98,6 +106,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, additional: list |
         "--alpha-init", str(args.alpha_init),
         "--k-init", str(args.k_init),
         "--p-init", str(args.p_init),
+        "--qk-alpha-init", str(args.qk_alpha_init),
         "--output-dir", str(output_dir),
         "--log-every", str(args.log_every),
         "--stats-every", str(args.stats_every),
@@ -120,8 +129,6 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, additional: list |
         cmd.append("--no-learnable-k")
     if args.no_layerscale:
         cmd.append("--no-layerscale")
-    if additional:
-        cmd.extend(additional)
     # depth / width override - train_gpt2.py picks these up from the env.
     env = dict(os.environ)
     env["ADASQUASH_DEPTH_OVERRIDE"] = str(depth)
@@ -135,11 +142,15 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, additional: list |
     print(f"[sweep] launching depth={depth} norm={norm} -> {output_dir}{shape}")
     log = open(output_dir / "stdout.log", "w")
     try:
-        return subprocess.Popen(cmd, env=env, stdout=log,
+        proc = subprocess.Popen(cmd, env=env, stdout=log,
                                 stderr=subprocess.STDOUT)
     except Exception:
         log.close()
         raise
+    # The child holds its own duplicate of the descriptor; ours is no longer
+    # needed, and keeping one open per (depth, norm) arm leaks up to a dozen.
+    log.close()
+    return proc
 
 
 def main():
@@ -180,6 +191,8 @@ def main():
     p.add_argument("--alpha-init", type=float, default=0.5)
     p.add_argument("--k-init", type=float, default=1.0)
     p.add_argument("--p-init", type=float, default=2.0)
+    p.add_argument("--qk-alpha-init", type=float, default=1.0,
+                   help="initial alpha_q / alpha_k for --qk-norm dytqk")
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
     p.add_argument("--no-layerscale", action="store_true")

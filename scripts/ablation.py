@@ -25,8 +25,9 @@ import torch
 
 from adasquash import (
     GPTConfig, GPT, build_gpt_124m, count_parameters,
-    ActivationStats, LossSpikeCounter,
+    ActivationStats, LossSpikeCounter, markov_batch,
 )
+from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
 
 
@@ -38,7 +39,10 @@ ABLATIONS = {
     "dytc_perchannel": dict(norm_name="dytc", p_init=2.0, learnable_p=False),
     "dytcd_full": dict(norm_name="dytcd"),
     # ---- Depth-cond ----
-    "dytd_k0_no_depth_schedule": dict(norm_name="dytd", k_init=0.0),
+    # `learnable_k=False` is load-bearing: `k_init=0.0` alone only sets the
+    # *initial* decay rate, the optimizer would immediately start learning k
+    # back off zero and the row would stop isolating the schedule.
+    "dytd_k0_no_depth_schedule": dict(norm_name="dytd", k_init=0.0, learnable_k=False),
     "dytd_full": dict(norm_name="dytd"),
     # ---- LayerScale ----
     "dytcd_no_ls": dict(norm_name="dytcd", use_layerscale=False),
@@ -56,39 +60,11 @@ ABLATIONS = {
     "dyt_alpha_1.0": dict(norm_name="dyt", alpha_init=1.0),
 }
 
-
-def make_batch(rng, ignore_index: int, batch_size: int, seq_len: int,
-               device: str, n_states: int = 64, outlier_id: int | None = None):
-    """Synthetic corpus with *learnable* structure.
-
-    Uniformly random token ids carry no next-token signal: the optimal loss
-    is log(vocab_size) no matter what the model does, so every ablation would
-    report the same flat number and the loss column could not rank anything.
-    Here the sequence is a Markov chain over a small hidden state set, which
-    caps the attainable loss at log(n_states) instead.
-
-    `outlier_id` designates one token whose embedding row has been scaled
-    up (see `install_outlier_channel`). Positions are drawn from it on a few
-    percent of steps, which reproduces the "super-active dimension" regime
-    the DyT-C axis is meant to handle: an i.i.d. corpus never produces such a
-    channel, so the ablations could not exercise the component under test.
-    """
-    n = batch_size * seq_len
-    states = torch.randint(0, n_states, (n,), generator=rng, device=device)
-    # Transition: the next state is the current one advanced by a small jump.
-    jump = torch.randint(0, 3, (n,), generator=rng, device=device)
-    nxt = (states + jump) % n_states
-    x = nxt.view(batch_size, seq_len).clone()
-    # Target is the shifted successor; the final position has no successor
-    # and carries `ignore_index` so it is masked out of the loss.
-    y = torch.full(
-        (batch_size, seq_len), ignore_index, dtype=torch.long, device=device
-    )
-    y[:, :-1] = nxt.view(batch_size, seq_len)[:, 1:]
-    if outlier_id is not None:
-        spike = torch.rand((batch_size, seq_len), generator=rng, device=device) < 0.03
-        x[spike] = outlier_id
-    return x, y
+_MODEL_BUILDERS = {
+    "gpt2-124m": build_gpt_124m,
+    "gpt2-350m": build_gpt_350m,
+    "llama-1b": build_llama_tiny_1b,
+}
 
 
 def install_outlier_channel(model, scale: float = 25.0) -> int:
@@ -121,6 +97,13 @@ def load_ablations_from_config(path: str) -> dict:
         # `norm_name`.
         if "norm" in row:
             row["norm_name"] = row.pop("norm")
+        if name in out:
+            # `out[name] = row` would silently keep the last definition, so a
+            # duplicated row would quietly drop a condition of the matrix.
+            raise ValueError(
+                f"{path}: duplicate ablation name '{name}' - each row must be "
+                "unique or an intended comparison is silently lost"
+            )
         out[name] = row
     return out
 
@@ -132,7 +115,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Seed so every ablation starts from a reproducible initialization.
     torch.manual_seed(args.seed)
-    model = build_gpt_124m(**cfg_kwargs)
+    model = _MODEL_BUILDERS[args.model](**cfg_kwargs)
     model.reset_parameters(args.seed)
     model.to(device)
     n_params = count_parameters(model)
@@ -148,16 +131,24 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
     loss_spike = LossSpikeCounter()
     outlier_id = install_outlier_channel(model)
 
+    # `markov_batch` is a genuine walk, so the corpus has next-token signal
+    # and the loss column can actually rank the variants (see its docstring).
     losses = []
+    stats_windowed = False
     t0 = time.time()
     for step in range(args.max_steps):
-        x, y = make_batch(
+        x, y = markov_batch(
             rng, model.cfg.ignore_index, args.batch_size, args.seq_len, device,
             outlier_id=outlier_id,
         )
         measure = (step % args.stats_every == 0)
         if measure:
-            act_stats.attach()
+            # `reset=False` after the first window so the reported activation
+            # statistics pool every sampled step of the run instead of
+            # describing only the last sampling window (which, with the
+            # shipped config, is step 800 while `final_loss` is step 999).
+            act_stats.attach(reset=not stats_windowed)
+            stats_windowed = True
         logits, loss = model(x, y)
         del logits
         loss.backward()
@@ -178,19 +169,27 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
     summary = {
         "name": name,
         "cfg": cfg_kwargs,
+        "model": args.model,
         "n_params": n_params,
         "final_loss": losses[-1],
         "mean_last_100_loss": sum(losses[-100:]) / max(1, len(losses[-100:])),
         "n_loss_spikes": loss_spike.n_spikes,
+        # The full curve, not just its endpoints: a flat-at-log(vocab) run and
+        # a run that halved its loss have the same `final_loss` scale story.
+        "loss_curve": losses,
         # Activation statistics belong in the summary alongside the loss curve.
         "act_stats": stats,
-        "max_abs_pre_norm": stats.get("__summary__", {}).get("max_max_abs"),
+        "max_abs_pre_norm": stats.get("__summary__", {}).get("max_abs_pre_norm"),
         "mean_max_abs_pre_norm": stats.get("__summary__", {}).get("mean_max_abs"),
+        "mean_excess_kurtosis_pre_norm": stats.get("__summary__", {}).get(
+            "mean_excess_kurtosis_pre_norm"
+        ),
         "elapsed_s": time.time() - t0,
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"  [done] {summary}")
+    print(f"  [done] {summary['final_loss']:.4f} "
+          f"max_abs_pre_norm={summary['max_abs_pre_norm']}")
     return summary
 
 
@@ -207,6 +206,7 @@ def main():
 
     p = argparse.ArgumentParser()
     p.add_argument("--config", default=None, help="YAML run config; CLI flags override it")
+    p.add_argument("--model", choices=sorted(_MODEL_BUILDERS), default="gpt2-124m")
     p.add_argument("--names", nargs="+", default=list(ablations.keys()))
     p.add_argument("--max-steps", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=8)
@@ -218,6 +218,8 @@ def main():
     p.add_argument("--stats-every", type=int, default=200)
     p.add_argument("--output-dir", default="runs/ablation")
     p.add_argument("--force", action="store_true")
+    # `ablations` is consumed by `load_ablations_from_config` above, not by
+    # the parser; everything else in the YAML maps straight onto a dest.
     apply_config_to_parser(p, known.config)
     args = p.parse_args()
 
@@ -236,9 +238,23 @@ def main():
         s = run_one(name, ablations[name], args, run_dir)
         all_summaries.append(s)
 
-    with open(base / "all_summaries.json", "w") as f:
-        json.dump(all_summaries, f, indent=2)
-    print(f"\n[done] {len(all_summaries)} ablations saved to {base}")
+    # Merge with whatever is already on disk: skipped rows still belong in the
+    # aggregate, and overwriting with only the freshly-run ones would drop
+    # every previously completed ablation on a partial re-run.
+    merged: dict[str, dict] = {}
+    agg_path = base / "all_summaries.json"
+    if agg_path.exists():
+        try:
+            for row in json.loads(agg_path.read_text()):
+                merged[row["name"]] = row
+        except (json.JSONDecodeError, KeyError, TypeError):
+            merged = {}
+    for row in all_summaries:
+        merged[row["name"]] = row
+    ordered = [merged[n] for n in args.names if n in merged]
+    with open(agg_path, "w") as f:
+        json.dump(ordered, f, indent=2)
+    print(f"\n[done] {len(ordered)} ablations saved to {base}")
 
 
 if __name__ == "__main__":

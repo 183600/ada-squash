@@ -37,6 +37,7 @@ def load_ckpt(path: str, device: str = "cuda"):
     model_cfg = dict(
         norm_name=args["norm"],
         qk_norm=args.get("qk_norm"),
+        qk_alpha_init=args.get("qk_alpha_init", 1.0),
         use_layerscale=not args.get("no_layerscale", False),
         alpha_0=args.get("alpha_0", 0.9),
         k_init=args.get("k_init", 1.0),
@@ -119,6 +120,11 @@ def needle_in_haystack(
     `seed` pins the insertion positions so repeated evaluations of the same
     checkpoint are comparable; the needle lands at a different depth every
     trial, which is the point of the test.
+
+    A trial counts as correct only when *every* token of the secret is
+    emitted in order. The secret is a multi-token string under any BPE
+    (" 12345" is `" 123"` + `"45"` for GPT-2), so scoring just the first
+    token would accept a model that recites 3 of the 5 digits.
     """
     rng = random.Random(seed)
     tok = tokenizer
@@ -132,27 +138,61 @@ def needle_in_haystack(
     secret = secret[-1] if secret else ""
     target_ids = tok(" " + secret, add_special_tokens=False)["input_ids"] if secret else []
 
+    # A learned positional table (or a RoPE table) is indexed by absolute
+    # position, so asking for more tokens than the model was built with
+    # raises deep inside the forward pass. `run_needle.py` guards this at the
+    # call site; the guard belongs here too, because this function is also
+    # the entry point behind `--needle-test`.
+    model_limit = getattr(getattr(model, "cfg", None), "max_seq_len", None)
+    if model_limit is not None and context_len > model_limit:
+        raise ValueError(
+            f"context_len={context_len} exceeds the model's max_seq_len="
+            f"{model_limit}; raise max_seq_len (and retrain) or lower the "
+            f"context length - there is no valid result at this length"
+        )
+    if not target_ids:
+        raise ValueError(f"could not derive a secret to score from needle={needle!r}")
+    if len(prompt_ids) == 0:
+        raise ValueError("haystack_prompt tokenizes to zero tokens")
+
     n_correct = 0
     n_run = 0
     for _ in range(n_trials):
         body_len = context_len - len(needle_ids) - len(question_ids) - 2
+        # Too short to hold even one haystack repeat: returning 0.0 here is
+        # indistinguishable from a genuine model failure in the results file,
+        # so refuse instead of reporting a fabricated number.
         if body_len < len(prompt_ids):
-            break
+            raise ValueError(
+                f"context_len={context_len} is too short to hold the needle "
+                f"({len(needle_ids)} tok) + question ({len(question_ids)} tok) "
+                f"+ one haystack repeat ({len(prompt_ids)} tok)"
+            )
         n_repeats = body_len // len(prompt_ids)
         body = prompt_ids * n_repeats
         # Insert needle at a random position
         pos = rng.randint(0, max(1, len(body) - 1))
         full = body[:pos] + needle_ids + body[pos:] + question_ids
         x = torch.tensor(full, device=device).unsqueeze(0)
-        with torch.no_grad():
-            logits, _ = model(x)
         n_run += 1
-        # greedy decode next token, check if it starts the secret
-        next_id = int(logits[0, -1].argmax(-1).item())
-        if target_ids and next_id == target_ids[0]:
-            n_correct += 1
+        # Greedy-decode the whole secret; stop as soon as it diverges.
+        generated: list[int] = []
+        correct = True
+        ctx = x
+        with torch.no_grad():
+            for want in target_ids:
+                logits, _ = model(ctx)
+                nxt = int(logits[0, -1].argmax(-1).item())
+                generated.append(nxt)
+                if nxt != want:
+                    correct = False
+                    break
+                ctx = torch.cat(
+                    [ctx, torch.tensor([[nxt]], device=device)], dim=1
+                )
+        n_correct += int(correct)
     if n_run == 0:
-        return 0.0
+        raise ValueError("needle test produced no trials")
     return n_correct / n_run
 
 
@@ -162,7 +202,10 @@ def main():
     p.add_argument("--tasks", nargs="+", default=["mmlu", "gsm8k", "hellaswag"])
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--needle-test", action="store_true", help="also run needle-in-haystack")
-    p.add_argument("--needle-context-len", type=int, default=4096)
+    p.add_argument("--needle-context-len", type=int, default=None,
+                   help="needle context length (default: the checkpoint's "
+                        "max_seq_len - the longest the model can be "
+                        "evaluated at; asking for more raises)")
     p.add_argument("--tokenizer", default="gpt2")
     p.add_argument("--output", default=None)
     args = p.parse_args()
@@ -184,11 +227,13 @@ def main():
     if args.needle_test:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.tokenizer)
+        ctx_len = args.needle_context_len or model.cfg.max_seq_len
         acc = needle_in_haystack(
-            model, tok, context_len=args.needle_context_len, device=device
+            model, tok, context_len=ctx_len, device=device
         )
         results["needle_acc"] = acc
-        print(f"[eval] needle-in-haystack accuracy @ {args.needle_context_len} = {acc:.3f}")
+        results["needle_ctx_len"] = ctx_len
+        print(f"[eval] needle-in-haystack accuracy @ {ctx_len} = {acc:.3f}")
 
     out = args.output or (Path(args.ckpt).parent / "eval_results.json")
     Path(out).write_text(json.dumps(results, indent=2))

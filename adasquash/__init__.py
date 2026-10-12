@@ -28,6 +28,7 @@ from .utils import (
     KurtosisMeter,
     MaxAbsMeter,
     measure_activation_stats,
+    markov_batch,
     count_parameters,
 )
 
@@ -54,5 +55,6 @@ __all__ = [
     "KurtosisMeter",
     "MaxAbsMeter",
     "measure_activation_stats",
+    "markov_batch",
     "count_parameters",
 ]
