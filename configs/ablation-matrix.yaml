@@ -41,9 +41,15 @@ ablations:
     learnable_k: false
   - name: dytd_full
     norm: dytd
-  # `dytcd_full` (above) is the depth+per-channel reference: it is compared
-  # against `dytd_full` to isolate the per-channel axis, and against
-  # `dytd_k0_no_depth_schedule` to isolate the depth schedule.
+  # `dytcd_full` (above) is the combined reference for the depth axis:
+  # against `dytd_k0_no_depth_schedule` it isolates the depth schedule,
+  # because those two rows differ only in whether k is active.
+  #
+  # It does NOT isolate the per-channel axis against `dytd_full`: `dytcd`
+  # also replaces the tanh activation with the generalized softsign and a
+  # learnable p, so that delta bundles per-channel alpha with the activation
+  # family. Use the `dytc_*` rows below to sweep the activation family on the
+  # per-channel axis, and the `dyt*` rows above to isolate the alpha axis.
 
   # ---- LayerScale init ----
   - name: dytcd_no_ls

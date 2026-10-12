@@ -11,6 +11,14 @@ We measure:
   - the "FP8 trainability" curve: the first block whose output goes
     non-finite
 
+The probe corpus is the same decision `check_w8a8_ppl.py` makes: the
+headline metrics here are activation *magnitudes* (overflow rate,
+underflow rate, max|x|, kurtosis), and uniform random token ids drive the
+network with embedding noise rather than with anything a trained model
+actually sees. `--probe markov` (default) walks a Markov chain, so the
+activation statistics are measured on a corpus with real next-token
+structure; `--probe random` reproduces the old behaviour.
+
 This script is a CPU/GPU pure-python simulation - it does NOT need real
 FP8 hardware.
 
@@ -34,6 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from adasquash.model import MLP, build_gpt_124m
+from adasquash.utils import markov_batch
 
 # Largest finite magnitude of the FP8-E4M3 format used throughout this file.
 FP8_E4M3_MAX = 448.0
@@ -343,10 +352,18 @@ def _excess_kurtosis(x: torch.Tensor) -> float:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--norms", nargs="+", default=["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"])
+    p.add_argument("--probe", default="markov",
+                   choices=["markov", "random"],
+                   help="probe corpus. 'random' is uniform token ids: it has "
+                        "no next-token structure, so the activation magnitudes "
+                        "below describe embedding noise rather than a trained "
+                        "model's activations (kept only for parity)")
     p.add_argument("--ckpt", nargs="+", default=None,
                    help="one checkpoint per --norms entry; when given, the "
                         "probe runs on the trained weights instead of a "
                         "fresh random init")
+    p.add_argument("--n-states", type=int, default=64,
+                   help="state count of the synthetic 'markov' probe")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
@@ -358,6 +375,20 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
+
+    def make_probe(rng, cfg):
+        if args.probe == "random":
+            return torch.randint(
+                0, cfg.vocab_size, (args.batch_size, args.seq_len),
+                generator=rng, device=device,
+            )
+        # A real walk, not independent draws: the activation statistics
+        # measured below have to be the ones a trained model sees.
+        x, _ = markov_batch(
+            rng, cfg.ignore_index, args.batch_size, args.seq_len, device,
+            n_states=args.n_states,
+        )
+        return x
 
     results = []
     for i, norm in enumerate(args.norms):
@@ -379,7 +410,7 @@ def main():
             model = build_gpt_124m(norm_name=norm).to(device)
             model.reset_parameters(args.seed)
             model.eval()
-        x = torch.randint(0, model.cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
+        x = make_probe(rng, model.cfg)
         r = measure_fp8_divergence(model, x, norm)
         if args.ckpt:
             r["ckpt"] = args.ckpt[i]

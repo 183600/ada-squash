@@ -191,6 +191,27 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
     return summary
 
 
+def merge_summaries(previous: list, fresh: list) -> list:
+    """Fold freshly-computed rows into the existing aggregate.
+
+    `previous` is what `all_summaries.json` held, `fresh` what this run
+    produced. Every row survives: a partial re-run (`--names <one> --force`)
+    must not reorder the aggregate into a single-row table, and rows written
+    by earlier runs that are not in `args.names` must not be dropped from it.
+    Order follows first appearance, so the aggregate is stable across re-runs;
+    a repeated name is overwritten by the newer row.
+    """
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for row in list(previous) + list(fresh):
+        if not isinstance(row, dict) or "name" not in row:
+            continue
+        if row["name"] not in merged:
+            order.append(row["name"])
+        merged[row["name"]] = row
+    return [merged[name] for name in order if name in merged]
+
+
 def main():
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", default=None)
@@ -239,17 +260,16 @@ def main():
     # Merge with whatever is already on disk: skipped rows still belong in the
     # aggregate, and overwriting with only the freshly-run ones would drop
     # every previously completed ablation on a partial re-run.
-    merged: dict[str, dict] = {}
     agg_path = base / "all_summaries.json"
+    previous: list = []
     if agg_path.exists():
         try:
-            for row in json.loads(agg_path.read_text()):
-                merged[row["name"]] = row
-        except (json.JSONDecodeError, KeyError, TypeError):
-            merged = {}
-    for row in all_summaries:
-        merged[row["name"]] = row
-    ordered = [merged[n] for n in args.names if n in merged]
+            previous = json.loads(agg_path.read_text())
+            if not isinstance(previous, list):
+                previous = []
+        except json.JSONDecodeError:
+            previous = []
+    ordered = merge_summaries(previous, all_summaries)
     with open(agg_path, "w") as f:
         json.dump(ordered, f, indent=2)
     print(f"\n[done] {len(ordered)} ablations saved to {base}")

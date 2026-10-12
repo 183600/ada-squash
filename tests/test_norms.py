@@ -409,6 +409,63 @@ def test_chunked_cross_entropy_matches_reference(chunk_rows):
     assert torch.allclose(g1, g2, atol=1e-12)
 
 
+def test_chunked_cross_entropy_leaves_the_callers_logits_intact():
+    """`GPT.forward(..., return_logits=True)` hands the logit block to its
+    caller, so the chunked loss node must not use it as a scratch buffer.
+
+    Reusing the block in place left the caller holding gradient values
+    stamped over its own logits after `loss.backward()`: anything computed
+    from the returned logits afterwards (accuracy, perplexity, a KL probe)
+    was then silently wrong. The reference graph is computed *after* the
+    backward here, so a scratch-buffered gradient shows up immediately.
+    """
+    torch.manual_seed(0)
+    V = 37
+    N = 200
+    targets = torch.randint(0, V, (N,))
+    targets[:17] = -100
+    targets[50:60] = -100
+    logits = torch.randn(N, V, dtype=torch.float64).requires_grad_(True)
+    pristine = logits.detach().clone()
+
+    got = cross_entropy_mean(logits, targets, ignore_index=-100, chunk_rows=8)
+    assert torch.allclose(
+        got, torch.nn.functional.cross_entropy(logits, targets, ignore_index=-100),
+        rtol=1e-12,
+    )
+    got.backward()
+
+    assert torch.equal(logits, pristine), (
+        "the chunked-loss node overwrote the caller's logit block in place"
+    )
+    # ... and the gradient it did hand back is still the correct one.
+    ref_logits = pristine.clone().requires_grad_(True)
+    ref = torch.nn.functional.cross_entropy(ref_logits, targets, ignore_index=-100)
+    ref.backward()
+    assert torch.allclose(logits.grad, ref_logits.grad, atol=1e-12)
+
+
+def test_gpt_forward_returned_logits_survive_backward():
+    """The same guarantee through the model's public forward signature."""
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=50304, dim=64, n_layers=1, n_heads=4,
+                          max_seq_len=128, norm_name="rmsnorm")).eval()
+    # 8*128 = 1024 rows > the fitted chunk size for a 50k vocab, so the
+    # chunked path (not the `F.cross_entropy` fast path) is what runs.
+    from adasquash.model import _cross_entropy_chunk_rows
+    x = torch.randint(0, 50304, (8, 128))
+    y = torch.randint(0, 50304, (8, 128))
+    y[:, -1] = model.cfg.ignore_index
+    assert x.numel() > _cross_entropy_chunk_rows(model.cfg.vocab_size)
+
+    logits, loss = model(x, y, return_logits=True)
+    pristine = logits.detach().clone()
+    loss.backward()
+    assert torch.equal(logits, pristine), (
+        "logits returned by GPT.forward were corrupted by backward()"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Quantization harnesses
 # ---------------------------------------------------------------------------
@@ -485,6 +542,77 @@ def test_w8a8_quantizes_tied_embeddings_consistently():
     assert hasattr(model.lm_head, "_q_weight")
 
 
+def test_w8a8_quantizes_the_head_on_the_fused_loss_path():
+    """The output projection is the largest GEMM in the model, and the
+    fused-loss path reaches its weight directly
+    (`fused_cross_entropy_mean` takes `lm_head.weight` as an argument and
+    never calls `lm_head.forward`), so a wrapper that only overrides
+    `forward` silently measures that GEMM unquantized.
+    """
+    import copy
+    from adasquash.model import fused_cross_entropy_mean
+    from scripts.check_w8a8_ppl import (
+        compute_ce_sum, quantize_weight_per_channel, wrap_model_w8a8,
+    )
+
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=128, dim=32, n_layers=1, n_heads=4,
+                          max_seq_len=16, norm_name="rmsnorm")).eval()
+    x = torch.randint(0, 128, (2, 16))
+    y = torch.randint(0, 128, (2, 16))
+    y[:, -1] = model.cfg.ignore_index
+
+    qmodel = wrap_model_w8a8(copy.deepcopy(model)).eval()
+    qw, _ = quantize_weight_per_channel(model.lm_head.weight.data)
+    # The wrapped model's own activations, captured from a real forward.
+    seen = {}
+    handle = qmodel.norm_f.register_forward_hook(
+        lambda m, i, o: seen.setdefault("h", o.detach())
+    )
+    with torch.no_grad():
+        fused = compute_ce_sum(qmodel, x, y, device="cpu")[0]
+    handle.remove()
+    n_valid = (y != model.cfg.ignore_index).sum().item()
+    fused = fused / n_valid
+    hidden = seen["h"].reshape(-1, model.cfg.dim)
+
+    with torch.no_grad():
+        ref = fused_cross_entropy_mean(
+            hidden, qw, y.reshape(-1), ignore_index=model.cfg.ignore_index
+        ).item()
+        fp = fused_cross_entropy_mean(
+            hidden, model.lm_head.weight, y.reshape(-1),
+            ignore_index=model.cfg.ignore_index,
+        ).item()
+
+    assert torch.allclose(qmodel.lm_head.weight, qw), (
+        "the wrapped model's head weight is still the fp32 matrix"
+    )
+    assert not torch.equal(qw, model.lm_head.weight), (
+        "the quantized head must actually differ from the fp32 one"
+    )
+    assert abs(fused - ref) < 1e-6, (
+        "the fused loss path is not using the W8A8-quantized output "
+        "projection (it still sees the fp32 weight)"
+    )
+    assert abs(fused - fp) > abs(fused - ref), (
+        "the fused loss path matches the fp32 projection better than the "
+        "quantized one"
+    )
+
+
+def test_w8a8_weight_quantization_is_idempotent():
+    """A tied matrix is quantized once per accessor (embedding lookup and
+    head GEMM), so the two copies must not drift apart."""
+    from scripts.check_w8a8_ppl import quantize_weight_per_channel
+
+    torch.manual_seed(0)
+    w = torch.randn(64, 32) * 3.0
+    once, _ = quantize_weight_per_channel(w)
+    assert torch.allclose(once, quantize_weight_per_channel(once)[0])
+    assert not torch.equal(once, w)
+
+
 def test_w8a8_probe_rejects_a_signal_free_corpus():
     from adasquash import markov_batch
     from scripts.check_w8a8_ppl import probe_token_coverage
@@ -535,6 +663,38 @@ def test_fp8_wrapper_quantizes_weights_not_just_activations():
         F.linear = orig
     assert seen, "no GEMM observed"
     assert all(a and w for a, w in seen), f"unquantized operands: {seen}"
+
+
+def test_fp8_probe_corpus_is_structured_not_uniform():
+    """`check_fp8_stability.py` reports activation *magnitudes* (overflow /
+    underflow rate, max|x|, kurtosis), and it drove the network with uniform
+    random token ids - embedding noise rather than anything a trained model
+    actually sees. The default probe must therefore be a real walk.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import scripts.check_fp8_stability as fp8
+    from adasquash.utils import markov_batch
+    from scripts.check_w8a8_ppl import probe_token_coverage
+
+    p = fp8.argparse.ArgumentParser()
+    p.add_argument("--norms", nargs="+", default=["ln"])
+    p.add_argument("--ckpt", nargs="+", default=None)
+    p.add_argument("--probe", default="markov", choices=["markov", "random"])
+    args = p.parse_args([])
+    assert args.probe == "markov", (
+        "the FP8 probe defaults to a signal-free uniform-token corpus"
+    )
+    # And the corpus it produces is the learnable walk, not independent draws.
+    rng = torch.Generator().manual_seed(0)
+    probe = [
+        markov_batch(rng, -100, 4, 512, "cpu", n_states=64)[0] for _ in range(8)
+    ]
+    # Uniform ids over a 50k vocab: coverage ~ 1. A 64-state walk: ~64 ids.
+    assert probe_token_coverage(probe) < 0.05, (
+        "the probe corpus is degenerate: nothing repeats, so the activation "
+        "statistics describe embedding noise"
+    )
 
 
 def test_fp8_reports_overflow_depth_separately_from_nonfinite():
@@ -604,7 +764,128 @@ def test_build_llama_tiny_accepts_tie_override():
 # ---------------------------------------------------------------------------
 # Config plumbing
 # ---------------------------------------------------------------------------
-def test_yaml_config_overrides_parser_defaults():
+# ---------------------------------------------------------------------------
+# MoE: the auxiliary loss and the reported `expert_cv`
+# ---------------------------------------------------------------------------
+def test_moe_tokens_per_expert_counts_tokens_not_gate_mass():
+    """`tokens_per_expert` / `expert_cv` must count the tokens routed to each
+    expert. Summing the renormalised gate weights instead reports routing
+    *mass*, which sums to 1 and is not the `f_i` of the Switch / Mixtral
+    load-balancing loss the module documents itself as implementing.
+    """
+    from scripts.train_moe_tiny import MoELayer
+
+    torch.manual_seed(0)
+    E, K = 8, 2
+    mo = MoELayer(32, 64, n_experts=E, top_k=K).eval()
+    x = torch.randn(4, 16, 32)
+    with torch.no_grad():
+        _, _, tpe = mo(x)
+        logits = mo.router(x.view(-1, 32))
+        _, indices = logits.softmax(-1).topk(K, dim=-1)
+
+    n_tokens = x.reshape(-1, 32).shape[0]
+    assert tpe.shape == (E,)
+    assert (tpe >= 0).all()
+    # Token counts: N tokens, each assigning its top-k slots, so the total is
+    # N*K and every count is an integer number of tokens.
+    assert tpe.sum().item() == pytest.approx(n_tokens * K)
+    assert torch.allclose(tpe, tpe.round()), "counts must be whole tokens"
+    true_counts = torch.zeros(E).scatter_add_(
+        0, indices.reshape(-1), torch.ones(indices.numel())
+    )
+    assert torch.equal(tpe, true_counts)
+
+
+def test_moe_aux_loss_matches_the_switch_formula():
+    """aux = n_experts * sum_i(f_i * P_i) with f_i the token fraction."""
+    from scripts.train_moe_tiny import MoELayer
+
+    torch.manual_seed(0)
+    E = 8
+    mo = MoELayer(32, 64, n_experts=E, top_k=2).eval()
+    x = torch.randn(4, 16, 32)
+    with torch.no_grad():
+        _, aux, tpe = mo(x)
+        logits = mo.router(x.view(-1, 32))
+        _, indices = logits.softmax(-1).topk(2, dim=-1)
+        n = logits.shape[0]
+        f_i = torch.zeros(E).scatter_add_(
+            0, indices.reshape(-1), torch.ones(indices.numel())
+        ) / n
+        p_i = logits.softmax(-1).mean(dim=0)
+        expected = E * (f_i * p_i).sum()
+    assert torch.allclose(aux, expected, atol=1e-6), (
+        "the auxiliary loss is not the Switch/Mixtral load-balancing loss"
+    )
+
+
+def test_moe_qk_alpha_init_reaches_the_attention():
+    """`GPTConfig.qk_alpha_init` was dropped on the MoE path, so a config
+    asking for `qk_norm="dytqk"` with a given alpha silently built the
+    default alpha instead."""
+    from adasquash.model import GPTConfig
+    from scripts.train_moe_tiny import MoEBlock
+
+    cfg = GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                    max_seq_len=16, norm_name="rmsnorm",
+                    qk_norm="dytqk", qk_alpha_init=0.25)
+    blk = MoEBlock(cfg, n_experts=4, layer_idx=0)
+    sq = blk.attn.q_squash
+    assert sq is not None
+    assert sq.alpha_q.item() == pytest.approx(0.25)
+    assert sq.alpha_k.item() == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
+# Ablation aggregate
+# ---------------------------------------------------------------------------
+def test_ablation_aggregate_keeps_rows_from_previous_runs():
+    """`all_summaries.json` used to be ordered by `args.names`, so a focused
+    re-run (`--names <one> --force`) rewrote the aggregate with just that row
+    and silently discarded every other completed ablation."""
+    from scripts.ablation import merge_summaries
+
+    previous = [
+        {"name": "dytcd_full", "final_loss": 1.0},
+        {"name": "dytcd_no_ls", "final_loss": 2.0},
+        {"name": "dytd_full", "final_loss": 3.0},
+    ]
+    fresh = [{"name": "dytcd_full", "final_loss": 9.0}]
+
+    merged = merge_summaries(previous, fresh)
+    names = [r["name"] for r in merged]
+    assert names == ["dytcd_full", "dytcd_no_ls", "dytd_full"], (
+        f"a focused re-run reshaped the aggregate: {names}"
+    )
+    # The re-run replaces the stale row rather than being ignored.
+    assert merged[0]["final_loss"] == 9.0
+    # Brand-new rows are appended, and an empty/absent aggregate still works.
+    assert merge_summaries([], fresh)[0]["name"] == "dytcd_full"
+    assert [r["name"] for r in merge_summaries(previous, [])] == names
+    assert merge_summaries([], []) == []
+    # Malformed rows are skipped, not crashed on.
+    assert merge_summaries([{"nope": 1}, "junk"], fresh) == fresh
+
+
+def test_ablation_matrix_depth_row_disables_the_schedule():
+    """`dytcd_full` vs `dytd_full` also changes the activation family, so it
+    cannot be presented as isolating the per-channel axis."""
+    root = Path(__file__).resolve().parent.parent
+    from scripts.ablation import load_ablations_from_config
+
+    rows = load_ablations_from_config(str(root / "configs" / "ablation-matrix.yaml"))
+    assert rows["dytd_full"]["norm_name"] == "dytd"
+    # dytd == tanh, dytcd == generalized softsign with learnable p.
+    assert rows["dytcd_full"]["norm_name"] == "dytcd"
+    assert rows["dytcd_full"].get("learnable_p") is not False, (
+        "the per-channel reference must use the softsign family, so the "
+        "dytd_full -> dytcd_full delta is not a pure per-channel contrast"
+    )
+
+
+
+
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES

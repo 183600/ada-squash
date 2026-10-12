@@ -127,9 +127,14 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     The per-row math is identical to `F.cross_entropy`; only the
     reduction over rows is split.
 
-    The backward pass overwrites the saved logit block in place with the
-    gradient (see `backward`), so the graph must not be traversed twice
-    with `retain_graph=True`.
+    The backward writes into a private gradient buffer rather than reusing
+    the saved logit block. Reusing it would be the cheaper option, but the
+    block is not the node's private property: `GPT.forward(..., 
+    return_logits=True)` hands the very same tensor back to its caller, so
+    overwriting it in place would leave that caller holding gradient values
+    stamped over its logits after `loss.backward()`. The training path never
+    materializes the block at all (`fused_cross_entropy_mean`), so the buffer
+    is only paid for on the path that explicitly asked for the logits.
     """
 
     @staticmethod
@@ -153,11 +158,9 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         logits, targets = ctx.saved_tensors
-        # The saved logit block doubles as the gradient buffer: each chunk
-        # is fully reduced into `probs` before its slice is overwritten, and
-        # no other node needs the original logit values (the producing
-        # matmul consumes only its inputs and this gradient vector).
-        grad_logits = logits
+        # A buffer of our own: `logits` belongs to whoever produced it and
+        # may still be reading it (see the class docstring).
+        grad_logits = torch.empty_like(logits)
         grad_scale = (grad_out / ctx.count).to(logits.dtype)
         chunk_rows = ctx.chunk_rows
         for start in range(0, targets.numel(), chunk_rows):

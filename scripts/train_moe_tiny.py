@@ -84,8 +84,6 @@ class MoELayer(nn.Module):
         # Renormalise the selected gate values so they sum to 1 (Switch /
         # Mixtral convention).
         scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        # Build a [N, E] sparse one-hot routing tensor
-        route = torch.zeros_like(logits).scatter_(-1, indices, scores)
         # Expert computation. Tokens are grouped by the expert(s) they route
         # to, so each expert runs its GEMMs on the [n_e, C] slice that
         # actually selects it rather than on all N tokens. The three stacked
@@ -121,16 +119,22 @@ class MoELayer(nn.Module):
 
         # Load balancing auxiliary loss (Switch Transformer style):
         # aux = n_experts * sum_i(f_i * P_i) where f_i is the fraction of
-        # routing mass assigned to expert i and P_i is the mean router
-        # probability. `route` rows are renormalised to sum to 1, so
-        # summing `route` over tokens and dividing by the token count gives
-        # exactly that fraction (the gate weights of the top-k experts sum
-        # to one).
-        tokens_per_expert = route.sum(0)  # [E]
+        # *tokens* routed to expert i and P_i is the mean router
+        # probability. f_i counts tokens, so it is built from the top-k
+        # selection and detached: its value is a routing decision, not a
+        # differentiable quantity, and letting gradients flow through it
+        # makes the loss push the gates as well as the probabilities.
+        # Summing the renormalised gate weights instead would silently
+        # report routing *mass* under the name `tokens_per_expert` (and
+        # `expert_cv` is defined on this quantity), so the two quantities
+        # are kept distinct here.
+        tokens_per_expert = torch.zeros_like(logits[0]).scatter_add_(
+            0, indices.reshape(-1), torch.ones_like(flat_gate)
+        ).detach()
         f_i = tokens_per_expert / n_tokens
         p_i = logits.softmax(-1).mean(dim=0)
         aux = self.n_experts * (f_i * p_i).sum()
-        return y, aux, tokens_per_expert.detach()
+        return y, aux, tokens_per_expert
 
 
 class MoEBlock(nn.Module):
@@ -142,6 +146,7 @@ class MoEBlock(nn.Module):
         self.norm1 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)
         self.attn = CausalSelfAttention(cfg.dim, cfg.n_heads,
                                         qk_norm=cfg.qk_norm,
+                                        alpha_init=cfg.qk_alpha_init,
                                         dropout=cfg.dropout)
         self.norm2 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)
         hidden = int(cfg.dim * cfg.mlp_ratio)

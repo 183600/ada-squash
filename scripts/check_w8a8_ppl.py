@@ -43,7 +43,15 @@ from scripts.eval_downstream import load_ckpt
 # ---------------------------------------------------------------------------
 def quantize_weight_per_channel(w: torch.Tensor, n_bits: int = 8):
     """Per-output-channel (axis=0) symmetric int quantization.
-    w: [out, in] -> [out, in]"""
+
+    w: [out, in] -> [out, in]
+
+    The operation is idempotent: a matrix already on the int8 grid has
+    ``max|w| / 127`` for a scale and integral ``w / scale``, so re-quantizing
+    reproduces it exactly. That is what lets a weight shared by several
+    accessors (a tied embedding / head) be quantized more than once without
+    the copies drifting apart.
+    """
     mx = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
     q_max = (2 ** (n_bits - 1)) - 1
     scale = mx / q_max
@@ -61,15 +69,31 @@ def quantize_activation_per_token(x: torch.Tensor, n_bits: int = 8):
     return q * scale
 
 
+def _install_quantized_weight(linear: nn.Module, qw: torch.Tensor):
+    """Make `qw` the weight every consumer of this module sees.
+
+    Two consumers exist. The wrapped forward reads `_q_weight`. Any caller
+    that reaches for the matrix directly reads `linear.weight` - and
+    `GPT.forward(return_logits=False)` does exactly that, because the fused
+    loss takes `lm_head.weight` as an argument and never calls
+    `lm_head.forward` (which is what the wrapper replaces). Syncing the live
+    weight as well is what keeps the output projection quantized on that
+    path: it is the largest GEMM in the model, so leaving it fp32 would
+    measure a partly-quantized network and report far too small a PPL drop.
+    """
+    with torch.no_grad():
+        linear.weight.copy_(qw)
+    linear._q_weight = qw
+
+
 def wrap_linear_w8a8(linear: nn.Linear):
     """Replace a linear's forward with W8A8 quantized versions."""
+    qw, _ = quantize_weight_per_channel(linear.weight.data)
+    _install_quantized_weight(linear, qw)
+
     def quantized_forward(x):
-        # weight quantization happens lazily once.
-        if not hasattr(linear, "_q_weight"):
-            qw, _ = quantize_weight_per_channel(linear.weight.data)
-            linear._q_weight = qw
         x_q = quantize_activation_per_token(x)
-        return torch.nn.functional.linear(x_q, linear._q_weight, linear.bias)
+        return torch.nn.functional.linear(x_q, qw, linear.bias)
 
     linear.forward = quantized_forward
     return linear
@@ -95,10 +119,9 @@ def wrap_swiglu_w8a8(mlp):
     def quantized_forward(x):
         weights = []
         for lin in (mlp.w1, mlp.w2, mlp.w3):
-            if not hasattr(lin, "_q_weight"):
-                qw, _ = quantize_weight_per_channel(lin.weight.data)
-                lin._q_weight = qw
-            weights.append(lin._q_weight)
+            qw, _ = quantize_weight_per_channel(lin.weight.data)
+            _install_quantized_weight(lin, qw)
+            weights.append(qw)
         qa = quantize_activation_per_token
         x_q = qa(x)
         a = qa(F.linear(x_q, weights[0]))
@@ -119,16 +142,27 @@ def wrap_embedding_w8a8(emb: nn.Embedding):
     same weight would be consumed at two different precisions inside one
     forward. Quantizing the lookup keeps the two sides consistent.
     """
-    def quantized_forward(idx):
-        if not hasattr(emb, "_q_weight"):
-            emb._q_weight, _ = quantize_weight_per_channel(emb.weight.data)
-        return F.embedding(idx, emb._q_weight)
+    qw, _ = quantize_weight_per_channel(emb.weight.data)
 
+    def quantized_forward(idx):
+        return F.embedding(idx, qw)
+
+    with torch.no_grad():
+        emb.weight.copy_(qw)
+    emb._q_weight = qw
     emb.forward = quantized_forward
     return emb
 
 
 def wrap_model_w8a8(model: nn.Module):
+    """Wrap `model` (in place) so every GEMM runs W8A8.
+
+    The weights are replaced, not just shadowed behind an overridden
+    `forward`: consumers that read a weight matrix directly - most
+    importantly `fused_cross_entropy_mean`, which takes `lm_head.weight` as
+    an argument - would otherwise keep using the fp32 copy. Wrap a copy
+    unless the fp32 weights are throwaway.
+    """
     for m in model.modules():
         if isinstance(m, MLP):
             wrap_swiglu_w8a8(m)
