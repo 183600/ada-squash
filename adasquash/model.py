@@ -57,7 +57,6 @@ class GPTConfig:
     p_init: float = 2.0
     learnable_p: bool = True
     learnable_k: bool = True
-    # Gradient checkpointing (activation recomputation) for memory savings
     gradient_checkpointing: bool = False
     # Misc
     pad_token_id: int = 0
@@ -99,15 +98,8 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
     applied to every norm of the family that accepts it.
 
     This deliberately reads `cfg` afresh on every call and keeps no
-    module-level state. It used to memoize the kwargs on
-    `(norm_name, layer_idx)`, which silently returned the *first* model's
-    values to every later model of the same family: the ablation matrix
-    builds one model per row in a single process, so `dyt_alpha_1.0`,
-    `dytc_p4_softsign` and `dytd_full` all came out configured exactly like
-    the row that happened to be built first, and those rows reported
-    identical numbers instead of the contrast they were meant to draw. The
-    dict is built once per norm at model-construction time, so caching it
-    buys nothing and costs that class of bug.
+    module-level state, so that each model in a multi-model process gets
+    its own correct configuration.
     """
     kwargs: dict = {}
     if cfg.norm_name in ("dytd", "dytcd"):
@@ -240,12 +232,10 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
     tensor in the model - larger than every other activation put together -
     and nothing else in the graph needs it.
 
-    Folding the projection into the loss node removes it entirely: the
-    forward builds one row chunk of logits at a time and throws it away,
-    and the backward re-derives each chunk from the `[N, C]` hidden states
-    that the rest of the graph already keeps. Peak memory then scales with
-    `chunk_rows` instead of `N`, at the cost of redoing one projection
-    GEMM. See `fused_cross_entropy_mean`.
+    The forward builds one row chunk of logits at a time and throws it
+    away, and the backward re-derives each chunk from the `[N, C]` hidden
+    states that the rest of the graph already keeps. See
+    `fused_cross_entropy_mean`.
     """
 
     @staticmethod
@@ -285,10 +275,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         dt = ctx.compute_dtype
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
-        # `empty_like`, not `zeros_like`: with a 50k vocabulary `grad_w` is by
-        # far the largest buffer this node touches, and the first chunk is
-        # written straight into it below, so zero-filling it first would be a
-        # full-size write pass over memory that is overwritten immediately.
+        # `empty_like`, not `zeros_like`: the first chunk is written straight
+        # into `grad_w` below, so zero-filling it first would be wasted work.
         # (`grad_h` is filled slice by slice, every slice overwritten, so it
         # needs no zero-fill either.)
         grad_h = torch.empty_like(h) if need_h else None
@@ -366,8 +354,6 @@ def fused_cross_entropy_mean(
 class _LayerScaleResidual(torch.autograd.Function):
     """
     Fused LayerScale + residual add: x + scale * residual
-
-    Saves memory by avoiding the intermediate scaled tensor.
     """
     @staticmethod
     def forward(ctx, x, residual, scale):
@@ -504,7 +490,7 @@ class _SwiGLU(torch.autograd.Function):
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
         grad_h = F.linear(grad_out, w2.t())
 
-        # Recompute silu(a) and gated product (memory vs compute tradeoff).
+        # Recompute silu(a) and gated product.
         # Ordering matters: every temporary below is a hidden-sized block, and
         # `grad_h` is only released once it has been consumed, so the terms are
         # taken in the order that lets each one die before the next is born.

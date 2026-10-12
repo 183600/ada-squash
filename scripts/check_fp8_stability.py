@@ -229,11 +229,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
             abs_in = x_in.abs() if has_in else None
             # out is the post-norm activation
             q = to_fp8_e4m3(out)
-            # Every scalar this hook reports is staged as a 0-dim tensor and
-            # read once. Reading them one at a time costs one blocking
-            # device-to-host copy each - six per norm, ~150 for a 124M model -
-            # and each one drains the queue of kernels the forward has already
-            # issued.
+        # Every scalar this hook reports is staged as a 0-dim tensor and
+        # read once.
             scalars = [
                 abs_out.max(),                                   # max_abs_out
                 abs_out.mean(),                               # rel_err denominator

@@ -105,8 +105,7 @@ class KurtosisMeter:
         x_var_t, x_mean_t = torch.var_mean(x, unbiased=False)
         xc = x - x_mean_t
         xc2 = xc * xc
-        # vecdot reduces without materializing the product, so the third and
-        # fourth moments cost one full-size temporary (`xc2`) instead of two.
+        # vecdot reduces without materializing the product.
         x_m3_t = torch.linalg.vecdot(xc, xc2)
         x_m4_t = torch.linalg.vecdot(xc2, xc2)
         x_mean, x_var, x_m3, x_m4 = torch.stack(

@@ -1840,7 +1840,7 @@ def test_needle_context_leaves_room_for_the_scoring_loop():
     Greedy scoring appends each secret token to the context before scoring
     the next one, so the last scored step runs `len(secret) - 1` positions
     past the prompt. The eval script's default context *is* `max_seq_len`,
-    and a haystack prompt whose repeats divide the budget exactly fills it
+    and a haystack prompt whose repeats divide the limit exactly fills it
     to `context_len - 2`, so a secret of three or more tokens pushes the
     forward past the positional table: the run died inside the forward pass
     with a shape error instead of reporting an accuracy. The context has to
@@ -1865,7 +1865,7 @@ def test_needle_context_leaves_room_for_the_scoring_loop():
         model, tok, needle=needle, context_len=256 - overhead,
         n_trials=2, device="cpu") == 1.0
 
-    # A haystack prompt whose token count divides the budget exactly, so the
+    # A haystack prompt whose token count divides the limit exactly, so the
     # body fills to `context_len - 2`: the longest prompt the function can
     # build for that context. The documented default - the full
     # `max_seq_len` - is then refused up front, rather than the decode
@@ -1886,7 +1886,7 @@ def test_needle_context_leaves_room_for_the_scoring_loop():
 
 
 def test_needle_decode_overhead_matches_the_secret_length():
-    """The contexts the call sites budget for the decode are derived from
+    """The contexts the call sites allow for the decode are derived from
     the same tokenization the scoring loop uses."""
     from scripts.eval_downstream import (
         needle_decode_overhead, needle_target_ids,

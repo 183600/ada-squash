@@ -382,10 +382,8 @@ def _expert_cv(tpe) -> float:
 def _expert_cv_per_block(tpe_list) -> list:
     """`_expert_cv` for every block, with a single device-to-host transfer.
 
-    Each block's CoV is a 0-dim tensor, so reading them one at a time costs
-    one blocking sync per block per step - enough to stall the launch queue
-    behind the next micro-batch. They are stacked and converted together
-    instead, which is one transfer for the whole model.
+    Each block's CoV is a 0-dim tensor. They are stacked and converted
+    together instead, which is one transfer for the whole model.
     """
     cvs = [
         tpe.std() / (tpe.mean() + 1e-6)

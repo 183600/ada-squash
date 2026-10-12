@@ -316,7 +316,7 @@ def main():
     p.add_argument("--p-init", type=float, default=2.0)
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
-    p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing for memory savings")
+    p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing")
     # Embedding tying is per-model: GPT-2 ties, LLaMA does not. The builders
     # already encode the right default, so the flag is tri-state - `None`
     # means "leave the builder's default alone".

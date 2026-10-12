@@ -70,10 +70,9 @@ def register_norm(name: str):
 # DyT-C and DyT-CD) all evaluate the same family, so the element-wise core
 # lives here rather than being open-coded three times.
 #
-# With `t = |x|` the closed form needs two branches, and the branch that is not
-# selected still costs a tensor of its own. Both branches collapse onto a
-# single pair of *reciprocal* helpers, which removes the boolean mask and the
-# `torch.where` entirely:
+# With `t = |x|` the closed form needs two branches. Both branches collapse
+# onto a single pair of *reciprocal* helpers, which removes the boolean mask
+# and the `torch.where` entirely:
 #
 #     lo = min(t, 1)          r = 1 / max(t, 1)
 #
@@ -145,9 +144,7 @@ class _SquashedAffine(nn.Module):
     `y = gamma * phi + beta`, shared by every DyT-family layer.
 
     The affine itself is evaluated inside each layer's fused autograd kernel
-    (as one `addcmul` rather than a multiply followed by an add: the add would
-    have to run out of place, because the squashed activation `phi` is retained
-    for the backward pass, and that costs a second full-size tensor).
+    (as one `addcmul` rather than a multiply followed by an add).
     """
 
 
@@ -765,9 +762,6 @@ class DyTCD(_SquashedAffine):
 class _DyTCDForward(torch.autograd.Function):
     """
     Fused DyTCD forward: alpha_per_channel * x -> generalized_softsign -> affine
-
-    Combines multiple element-wise ops into a single kernel launch,
-    reducing memory traffic and intermediate tensors.
     """
     @staticmethod
     def forward(ctx, x, alpha_0, k, delta, p, gamma, beta, depth_ratio):
@@ -792,8 +786,7 @@ class _DyTCDForward(torch.autograd.Function):
             out = phi.mul_(gamma)
 
         # `alpha_c` is kept instead of `scale` so the backward does not have to
-        # re-derive the clamped per-channel product; it is a [C] vector, so it
-        # costs nothing next to the activations.
+        # re-derive the clamped per-channel product.
         # `p` has by now been replaced by its clamped copy, which carries no
         # grad flag inside `forward`; the *raw* input is what says whether the
         # exponent is trainable, so the flag is read off that.

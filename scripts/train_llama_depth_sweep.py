@@ -219,7 +219,7 @@ def main():
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
     p.add_argument("--no-layerscale", action="store_true")
-    p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing for memory savings")
+    p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing")
     p.add_argument("--compile", action="store_true", help="enable torch.compile")
     p.add_argument("--compile-mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument(

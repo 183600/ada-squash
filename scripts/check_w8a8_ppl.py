@@ -117,9 +117,7 @@ def wrap_swiglu_w8a8(mlp):
     written out explicitly, quantizing each GEMM input in turn.
 
     The weights are quantized once, here: they do not change afterwards, and
-    `quantize_weight_per_channel` is idempotent, so doing it per forward would
-    reproduce the same matrices at the cost of three full re-quantizations on
-    every call.
+    `quantize_weight_per_channel` is idempotent.
     """
     weights = []
     for lin in (mlp.w1, mlp.w2, mlp.w3):
@@ -361,9 +359,9 @@ def main():
         # The cleanest way to compare the two precisions is to quantize a
         # copy, but `copy.deepcopy` holds both models resident for the whole
         # measurement while only one of them is ever executed. Measuring the
-        # fp32 model first and then wrapping *the same* model in place halves
-        # peak model memory and leaves the comparison bit-for-bit the same:
-        # `wrap_model_w8a8` is deterministic and the batches are already fixed.
+        # fp32 model first and then wrapping *the same* model in place keeps
+        # the comparison bit-for-bit the same: `wrap_model_w8a8` is
+        # deterministic and the batches are already fixed.
         ce_fp = 0.0
         n_tok = 0
         for x in batches:
