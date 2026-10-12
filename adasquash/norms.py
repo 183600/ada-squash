@@ -74,7 +74,7 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     t = x.abs()
     t_lo = t.clamp(max=1.0)
     t_hi = t.clamp(min=1.0)
-    p_recip = 1.0 / float(p)
+    p_recip = 1.0 / p
     y_lo = x / (t_lo.pow(p) + 1.0).pow(p_recip)
     y_hi = torch.sign(x) * (t_hi.pow(-p) + 1.0).pow(-p_recip)
     return torch.where(t > 1.0, y_hi, y_lo)
@@ -325,8 +325,8 @@ class DyTCD(nn.Module):
         depth_ratio = float(self.layer_idx) / float(self.num_layers)
         scale = self.alpha_0 * torch.exp(-self.k * depth_ratio)
         # delta may be negative, in which case the channel gets *less*
-        # compression than the global alpha.
-        return scale * (1.0 + self.delta)
+        # compression than the global alpha. Clamp to keep alpha > 0.
+        return (scale * (1.0 + self.delta)).clamp(min=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         alpha_c = self.alpha_per_channel  # [C]
