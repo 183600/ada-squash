@@ -111,9 +111,6 @@ class CausalSelfAttention(nn.Module):
             with torch.no_grad():
                 logits = torch.matmul(q, k.transpose(-1, -2))
                 logits.mul_(scale)
-                # Keep only the causal-visible (finite) logits for the
-                # statistics; the -inf masked entries would otherwise make
-                # every aggregate (mean/max/std) inf/nan.
                 causal_mask = torch.triu(
                     torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
                 )
@@ -152,16 +149,12 @@ class CausalSelfAttention(nn.Module):
         key = (freqs_cis.shape[0], freqs_cis.device, freqs_cis.dtype)
         cache = self._rope_cache
         if cache is None or cache[0] != key:
-            # freqs_cis: [T, hd//2] complex (exp(i*theta)); take real/imag as
-            # the rotation factors and expand to [T, hd] to match the head
-            # dim, then broadcast-shape them to [1, 1, T, hd].
             f_real = freqs_cis.real
             f_imag = freqs_cis.imag
             cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
             sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
-            cache = (key, cos, sin)
-            self._rope_cache = cache
-        return cache[1], cache[2]
+            self._rope_cache = (key, cos, sin)
+        return self._rope_cache[1], self._rope_cache[2]
 
 
 # ---------------------------------------------------------------------------
@@ -176,9 +169,8 @@ class RMSNormHead(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = (x * x).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return x * self.weight
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        return x * torch.rsqrt(var + self.eps) * self.weight
 
 
 def apply_rope(
@@ -197,24 +189,21 @@ def apply_rope(
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
-    # freqs_cis: [T, hd//2] complex (exp(i*theta)); take real/imag as the
-    # rotation factors and expand to [T, hd] to match the head dim.
     if cos is None or sin is None:
         f_real = freqs_cis.real
         f_imag = freqs_cis.imag
         cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
         sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
-    q_d = q.float()
-    k_d = k.float()
-    q_out = q_d * cos
-    rot = rotate_half(q_d)
-    rot.mul_(sin)
-    q_out.add_(rot)
-    k_out = k_d * cos
-    rot = rotate_half(k_d)
-    rot.mul_(sin)
-    k_out.add_(rot)
-    return q_out.to(q.dtype), k_out.to(k.dtype)
+
+    if q.dtype != cos.dtype:
+        q = q.to(cos.dtype)
+        k = k.to(cos.dtype)
+
+    q_out = q * cos
+    q_out.add_(rotate_half(q).mul_(sin))
+    k_out = k * cos
+    k_out.add_(rotate_half(k).mul_(sin))
+    return q_out, k_out
 
 
 __all__ = ["CausalSelfAttention", "RMSNormHead"]

@@ -78,12 +78,8 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     (where the naive closed form would divide inf by inf).
     """
     t = x.abs()
-    w = t.clamp(min=1.0)
     mask = t > 1.0
-    # Pow base: |x| (<= 1) below the threshold, 1/|x| above it. w == 1 keeps
-    # the reciprocal well defined for the elements that do not need it.
-    u = torch.where(mask, w.reciprocal(), t)
-    # Numerator: |x| signed below the threshold, plain sign above it.
+    u = torch.where(mask, t.reciprocal(), t)
     num = torch.where(mask, torch.sign(x), x)
     return num / (u.pow(p) + 1.0).pow(1.0 / p)
 
@@ -117,9 +113,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = (x * x).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return x * self.weight
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        return x * torch.rsqrt(var + self.eps) * self.weight
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +139,7 @@ class DyT(nn.Module):
         x = torch.tanh(self.alpha * x)
         x = x * self.gamma
         if self.beta is not None:
-            x.add_(self.beta)
+            x = x + self.beta
         return x
 
 
@@ -190,13 +185,11 @@ class DyTC(nn.Module):
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.alpha * x
-        # `p` may be a learnable scalar tensor or a plain float; both
-        # broadcast against `x`.
+        x = x * self.alpha
         x = generalized_softsign(x, self.p)
         x = x * self.gamma
         if self.beta is not None:
-            x.add_(self.beta)
+            x = x + self.beta
         return x
 
 
@@ -267,7 +260,7 @@ class DyTD(nn.Module):
         x = torch.tanh(a * x)
         x = x * self.gamma
         if self.beta is not None:
-            x.add_(self.beta)
+            x = x + self.beta
         return x
 
 
@@ -332,20 +325,18 @@ class DyTCD(nn.Module):
     def alpha_per_channel(self) -> torch.Tensor:
         """Effective per-channel alpha at this depth (for logging)."""
         scale = self.alpha_0 * torch.exp(-self.k * self._depth_ratio)
-        # delta may be negative, in which case the channel gets *less*
-        # compression than the global alpha. Clamp to keep alpha > 0.
         return (scale * (1.0 + self.delta)).clamp(min=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         alpha_c = self.alpha_per_channel  # [C]
         # Broadcast over [B, T, C]
-        x = alpha_c * x
+        x = x * alpha_c
 
         # `p` may be a learnable scalar tensor or a buffer; both broadcast.
         x = generalized_softsign(x, self.p)
         x = x * self.gamma
         if self.beta is not None:
-            x.add_(self.beta)
+            x = x + self.beta
         return x
 
 

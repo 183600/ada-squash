@@ -101,12 +101,15 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
 # Block
 # ---------------------------------------------------------------------------
 _CROSSENTROPY_CHUNK_BYTES = 1 << 26  # ~64MB of fp32 logits per chunk
+_CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
 
 
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
     """Rows of the [N, V] logit block handled per chunk."""
-    row_bytes = max(1, vocab_size) * 4
-    return max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
+    if vocab_size not in _CROSS_ENTROPY_CHUNK_ROWS_CACHE:
+        row_bytes = max(1, vocab_size) * 4
+        _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
+    return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
 
 
 class _ChunkedCrossEntropy(torch.autograd.Function):
@@ -265,9 +268,8 @@ class MLP(nn.Module):
         # swiglu
         h1 = self.w1(x)
         h3 = self.w3(x)
-        h = F.silu(h1)
-        h.mul_(h3)
-        return self.drop(self.w2(h))
+        F.silu(h1, inplace=True).mul_(h3)
+        return self.drop(self.w2(h1))
 
 
 # ---------------------------------------------------------------------------
@@ -336,13 +338,10 @@ class GPT(nn.Module):
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
-            pos = self._pos_ids[:T].unsqueeze(0)
-            x.add_(self.pos_emb(pos))
+            x.add_(self.pos_emb(self._pos_ids[:T].unsqueeze(0)))
         x = self.drop(x)
 
-        freqs = None
-        if self.freqs_cis is not None:
-            freqs = self.freqs_cis[:T]
+        freqs = self.freqs_cis[:T] if self.freqs_cis is not None else None
 
         all_logit_stats = []
         for block in self.blocks:
