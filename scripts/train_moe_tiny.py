@@ -33,7 +33,6 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import AdamW
 
 from adasquash import build_norm, markov_batch
 from adasquash.attention import CausalSelfAttention
@@ -257,7 +256,14 @@ def main():
     )
     model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
     print(f"[moe] total params = {count_parameters(model)/1e6:.2f}M")
-    opt = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    # Same parameter grouping as the Phase-1 driver and the ablation runner:
+    # weight decay on the matmul weights only. A single group would decay
+    # the norm gains (RMSNorm/LN `weight`, DyT `gamma`) and the LayerScale
+    # gates as well, so the norm comparison this study reports would not be
+    # comparable with the training runs it is meant to explain - and it would
+    # shrink the very residual gates the depth-conditioned axis depends on.
+    from scripts.train_gpt2 import build_optimizer
+    opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -286,6 +292,13 @@ def main():
             return next(iter(loader))
 
     history = []
+    # The reported activation statistics have to describe the same run the
+    # loss / aux / expert_cv curves describe. Re-attaching with a reset per
+    # window (the `ActivationStats.attach` default) would leave `stats.json`
+    # reporting only the last window - step 800 of a 1000-step run - so the
+    # first window resets the meters and the rest pool into it, the same
+    # contract `scripts/ablation.py`'s runner relies on.
+    stats_windowed = False
     for step in range(args.max_steps):
         x, y = next_batch()
         # The shift is already done by both corpus builders; the final
@@ -296,7 +309,8 @@ def main():
             y = y.clone()
             y[:, -1] = cfg.ignore_index
         if step % args.stats_every == 0:
-            act_stats.attach()
+            act_stats.attach(reset=not stats_windowed)
+            stats_windowed = True
         logits, loss, aux, tpe_list = model(x, y, return_aux=True)
         del logits
         loss.backward()

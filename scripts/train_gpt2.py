@@ -261,22 +261,32 @@ _SCHEDULE_ARGS = (
 )
 
 
-def restore_schedule_args(args, ckpt_args: dict) -> list:
+def restore_schedule_args(
+    args, ckpt_args: dict, explicit: frozenset = frozenset()
+) -> list:
     """Adopt the original run's schedule / optimizer hyper-parameters.
 
-    Returns the names that were overridden. `max_steps` is included on
-    purpose: extending a finished run (resume with a larger `--max-steps`
-    to continue the cosine tail) changes the schedule by design, so the
-    override is recorded rather than rejected - silently, it would look like
-    an uninterrupted run.
+    Returns the names where the command line and the checkpoint disagree.
+    `max_steps` is included on purpose: extending a finished run (resume with
+    a larger `--max-steps` to continue the cosine tail) changes the schedule
+    by design, so such a divergence is recorded rather than rejected -
+    silently, it would look like an uninterrupted run.
+
+    A name the caller flags as *explicit* (passed on the command line, so
+    not just a default that would otherwise be adopted) is left alone: the
+    point of the restore is to keep a resumed run from silently reshaping the
+    curve it claims to continue, not to make an explicit extension
+    impossible. The disagreement is still returned so the caller can log it.
     """
     changed = []
     for name in _SCHEDULE_ARGS:
         if name not in ckpt_args:
             continue
         if getattr(args, name, None) != ckpt_args[name]:
-            setattr(args, name, ckpt_args[name])
             changed.append(name)
+        if name in explicit:
+            continue
+        setattr(args, name, ckpt_args[name])
     return changed
 
 
@@ -342,6 +352,16 @@ def main():
     p.add_argument("--resume", default=None, help="checkpoint to resume from")
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
+    # Which schedule flags the operator actually typed, as opposed to the
+    # defaults left over after the config seeded them (`set_defaults` above
+    # already folded the config into `get_default`). Only an explicit flag is
+    # allowed to diverge from the checkpoint's schedule on a resume - that is
+    # how a run is extended; a default that merely happens to differ gets
+    # replaced, because it is what would silently reshape the curve.
+    explicit = frozenset(
+        name for name in _SCHEDULE_ARGS
+        if getattr(args, name, None) != p.get_default(name)
+    )
     args.bf16 = not args.no_bf16
 
     torch.manual_seed(args.seed)
@@ -422,9 +442,18 @@ def main():
     resume_ckpt = None
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        changed = restore_schedule_args(args, resume_ckpt.get("args") or {})
+        changed = restore_schedule_args(
+            args, resume_ckpt.get("args") or {}, explicit=explicit
+        )
         if changed:
-            print(f"[resume] schedule args restored from checkpoint: {changed}")
+            kept = [n for n in changed if n in explicit]
+            adopted = [n for n in changed if n not in explicit]
+            if adopted:
+                print(f"[resume] schedule args restored from checkpoint: {adopted}")
+            if kept:
+                print(f"[resume] keeping your explicit override(s) {kept} - the "
+                      f"resumed run therefore follows a different schedule "
+                      f"than the one it continues")
         start_step = int(resume_ckpt.get("step", 0))
         print(f"[resume] {args.resume} -> step {start_step}")
 
@@ -442,6 +471,21 @@ def main():
     # Stability meters
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter(rel_threshold=0.20, abs_threshold=0.05)
+    if resume_ckpt is not None:
+        # The counter is logged once per `log_every` steps as a running count
+        # over the run, so a resumed run has to continue from the saved count
+        # (and the saved EMA baseline) instead of starting a new series that
+        # then looks like the whole history.
+        if loss_spike.load_state_dict(resume_ckpt.get("loss_spike")):
+            print(f"[resume] restored loss-spike counter "
+                  f"(n_spikes={loss_spike.n_spikes})")
+        elif "n_loss_spikes" in resume_ckpt:
+            # Checkpoints written before the full state was saved carry the
+            # count only; the EMA still has to rebuild, which the next update
+            # does from the first resumed loss.
+            loss_spike.n_spikes = int(resume_ckpt["n_loss_spikes"] or 0)
+            print(f"[resume] restored loss-spike counter from n_loss_spikes "
+                  f"(n_spikes={loss_spike.n_spikes}, EMA warm restarted)")
 
     # Logging setup
     os.makedirs(args.output_dir, exist_ok=True)
@@ -514,9 +558,10 @@ def main():
                 "step": step,
                 "loss": loss_val,
                 "lr": lr,
-                # Running counter over the whole (resumed) run; the README
-                # metric table lists it as a logged quantity, so it has to
-                # reach the jsonl / TB / wandb sinks, not just stay in RAM.
+                # Running counter over this run: resumed runs continue from
+                # the checkpoint's saved count (see the `loss_spike` entry in
+                # every checkpoint), so it covers the whole run and not just
+                # the post-resume window.
                 "n_loss_spikes": loss_spike.n_spikes,
             }
             with open(log_path, "a") as f:
@@ -545,6 +590,10 @@ def main():
                 "optimizer": opt.state_dict(),
                 "scheduler": sched.state_dict(),
                 "args": vars(args),
+                # Kept in *every* checkpoint, not only the final one: a run
+                # that is resumed from a periodic checkpoint would otherwise
+                # drop the spike history written before it.
+                "loss_spike": loss_spike.state_dict(),
             }
             path = Path(args.output_dir) / f"ckpt_{step:06d}.pt"
             torch.save(ckpt, path)
@@ -558,6 +607,7 @@ def main():
         "scheduler": sched.state_dict(),
         "args": vars(args),
         "n_loss_spikes": loss_spike.n_spikes,
+        "loss_spike": loss_spike.state_dict(),
     }
     path = Path(args.output_dir) / "ckpt_final.pt"
     torch.save(ckpt, path)

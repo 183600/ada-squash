@@ -29,8 +29,17 @@ from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
 
 
-# Component ablations. `dyt` / `dytd` are the "axis removed" references, so
-# each row must differ from `dytcd_full` in exactly one component.
+# Component ablations. The `dyt*` rows are the single-axis references
+# (`dyt` = plain Dynamic Tanh, `dytc` = the per-channel axis,
+# `dytd` = the depth axis) and `dytcd_full` is the combined layer, so the
+# contrasts are *between references* rather than one-component diffs off
+# `dytcd_full`: the per-channel axis is isolated by `dytc_*` vs `dyt`, the
+# depth schedule by `dytd_full` vs `dytd_k0_no_depth_schedule`, and the
+# activation family by the `dytc_p*` sweep. `dytcd_full` against
+# `dytd_full` / `dytc_perchannel` does *not* isolate an axis, because the
+# combined layer also switches tanh for the generalized softsign and adds
+# the `delta` vector - `configs/ablation-matrix.yaml` spells this out row
+# by row and is the authoritative table.
 ABLATIONS = {
     # ---- Per-channel ----
     "dyt_no_perchannel": dict(norm_name="dyt"),

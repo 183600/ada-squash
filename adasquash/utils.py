@@ -312,6 +312,35 @@ class LossSpikeCounter:
         self.n_spikes = 0
         self.history = []
 
+    def state_dict(self) -> dict:
+        """The part of the counter a checkpoint must carry to survive a
+        `--resume`: `ema` is the baseline the next update compares against,
+        so dropping it makes the first post-resume steps blind to a jump
+        away from the pre-resume loss scale, and `n_spikes` is the running
+        count the training log reports. `history` stays out of it - it is a
+        local debugging list and would make the checkpoint grow without
+        bound.
+        """
+        return {"ema": self.ema, "n_spikes": self.n_spikes}
+
+    def load_state_dict(self, state: Optional[dict]) -> bool:
+        """Adopt a previously saved counter state.
+
+        Returns True when a usable state was actually restored, so the
+        caller can log it instead of silently starting a fresh count. A
+        mapping without a finite `ema` restores nothing: the spike test is
+        relative to that baseline, so adopting the count without it would
+        keep counting spikes against a freshly seeded EMA.
+        """
+        if not isinstance(state, dict):
+            return False
+        ema = state.get("ema")
+        if not (isinstance(ema, (int, float)) and math.isfinite(ema)):
+            return False
+        self.ema = float(ema)
+        self.n_spikes = int(state.get("n_spikes") or 0)
+        return True
+
 
 # ---------------------------------------------------------------------------
 # One-shot measurement

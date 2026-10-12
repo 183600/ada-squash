@@ -5,10 +5,15 @@ For each context length in --ctx-lens, we:
   - generate a haystack by repeating a fixed prompt,
   - insert the needle at a random position,
   - prompt the model to recite the secret,
-  - check if the model's greedy next-token matches the secret's first id.
+  - check that *every* token of the secret is emitted, in order.
+
+The scoring is the whole-secret match implemented by
+`scripts.eval_downstream.needle_in_haystack`: the secret is a multi-token
+string under any BPE (" 12345" is `" 123"` + `"45"` for GPT-2), so scoring
+only the first token would accept a model that recites 3 of the 5 digits.
 
 This is the bare-bones version that does not need external eval
-harnesses. For a proper needle-in-haystack plot use the
+harnesses. For a proper needle-in-a-haystack plot use the
 `needleeval` package against the HF-exported checkpoint.
 
 Usage:

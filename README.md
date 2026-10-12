@@ -104,8 +104,13 @@ where it stopped instead of replaying warmup. The schedule-defining flags
 (`--max-steps`, `--warmup`, `--min-lr-ratio`, `--lr`, `--weight-decay`,
 `--betas`, `--grad-clip`) are read back from the checkpoint as well -
 without them the cosine curve would be silently reshaped mid-run, since
-only `last_epoch` survives `load_state_dict`. Any that are overridden are
-printed on startup.
+only `last_epoch` survives `load_state_dict`. Any that the command line
+leaves at its default are replaced silently; one you typed explicitly is
+kept and reported, which is how a finished run is extended
+(`--resume <ckpt> --max-steps <larger>` continues the cosine tail instead
+of truncating it). The loss-spike counter and its EMA baseline are part of
+the checkpoint, so `n_loss_spikes` keeps counting across a resume rather
+than restarting.
 
 Logged outputs in `<output-dir>/`:
 - `train.jsonl`     - per-step loss / lr

@@ -1177,6 +1177,177 @@ def test_resume_restores_the_schedule_defining_flags():
     assert restore_schedule_args(same, {}) == []
 
 
+def test_resume_keeps_an_explicitly_typed_schedule_flag():
+    """`--resume <ckpt> --max-steps <larger>` is the documented way to extend a
+    run, so a flag typed on the command line must not be overwritten by the
+    checkpoint's value - otherwise the extension silently truncates at the
+    old step count. A flag left at its default is still restored, because
+    that one would otherwise silently reshape the cosine curve."""
+    import argparse as _argparse
+    from scripts.train_gpt2 import restore_schedule_args
+
+    ckpt_args = dict(max_steps=10000, warmup=500, min_lr_ratio=0.1, lr=6e-4,
+                     weight_decay=0.1, beta1=0.9, beta2=0.95, grad_clip=1.0)
+    args = _argparse.Namespace(max_steps=30000, warmup=500, min_lr_ratio=0.1,
+                               lr=6e-4, weight_decay=0.1, beta1=0.9, beta2=0.95,
+                               grad_clip=1.0)
+    changed = restore_schedule_args(args, ckpt_args, explicit=frozenset({"max_steps"}))
+    # The divergence is reported either way ...
+    assert changed == ["max_steps"]
+    # ... but the explicit flag survives, so the run can be extended.
+    assert args.max_steps == 30000
+    # A non-explicit flag with the same divergence is still restored.
+    args2 = _argparse.Namespace(**vars(args))
+    restore_schedule_args(args2, ckpt_args, explicit=frozenset())
+    assert args2.max_steps == 10000
+
+
+def test_config_seeded_flags_are_defaults_not_explicit_overrides(tmp_path):
+    """A value that came from `--config` must behave like a default.
+
+    `apply_config_to_parser` folds the YAML into the parser defaults, so
+    `parser.get_default` is the post-config default and a config-seeded flag
+    is *not* "typed on the command line". If it were counted as explicit it
+    would be allowed to silently reshape the curve of the run it resumes -
+    exactly what the restore exists to prevent."""
+    import argparse as _argparse
+    from scripts.train_gpt2 import (
+        apply_config_to_parser, restore_schedule_args, _SCHEDULE_ARGS,
+        _TRAIN_CONFIG_ALIASES,
+    )
+
+    cfg_path = tmp_path / "run.yaml"
+    cfg_path.write_text("max_steps: 7\nwarmup: 3\n")
+
+    def build():
+        p = _argparse.ArgumentParser()
+        for name in _SCHEDULE_ARGS:
+            p.add_argument("--" + name.replace("_", "-"), type=float, default=999.0)
+        apply_config_to_parser(p, str(cfg_path), _TRAIN_CONFIG_ALIASES)
+        return p
+
+    def parse_and_resume(cli, ck):
+        p = build()
+        argv, sys_argv = ["prog", *cli], sys.argv
+        try:
+            sys.argv = argv
+            args = p.parse_args()
+        finally:
+            sys.argv = sys_argv
+        explicit = frozenset(
+            name for name in _SCHEDULE_ARGS
+            if getattr(args, name, None) != p.get_default(name)
+        )
+        changed = restore_schedule_args(args, ck, explicit=explicit)
+        return args, sorted(explicit), changed
+
+    ck = {"max_steps": 100, "warmup": 50}
+    # Config only: both flags are adopted from the checkpoint.
+    args, explicit, changed = parse_and_resume([], ck)
+    assert explicit == []
+    assert (args.max_steps, args.warmup) == (100, 50)
+    assert changed == ["max_steps", "warmup"]
+    # The same run with `--max-steps` typed: only that flag survives.
+    args, explicit, changed = parse_and_resume(["--max-steps", "30"], ck)
+    assert explicit == ["max_steps"]
+    assert (args.max_steps, args.warmup) == (30, 50)
+    assert changed == ["max_steps", "warmup"]
+
+
+def test_loss_spike_counter_state_survives_a_resume():
+    """`n_loss_spikes` is logged as a running count over the run, so a resumed
+    run has to keep counting from the checkpoint's value - and from its EMA
+    baseline, which is what the spike test is relative to."""
+    from adasquash import LossSpikeCounter
+
+    c = LossSpikeCounter()
+    c.update(2.0)                       # seeds the EMA
+    c.update(2.01)                      # no jump
+    state = c.state_dict()
+    assert set(state) == {"ema", "n_spikes"}
+
+    resumed = LossSpikeCounter()
+    assert resumed.load_state_dict(state) is True
+    assert resumed.ema == pytest.approx(c.ema)
+    assert resumed.n_spikes == 0
+    # A spike is judged against the *restored* baseline, not a fresh one.
+    resumed.update(10.0)
+    c.update(10.0)
+    assert resumed.n_spikes == 1
+    assert resumed.ema == pytest.approx(c.ema)
+    # A unusable / absent state restores nothing rather than half-loading.
+    other = LossSpikeCounter()
+    assert other.load_state_dict(None) is False
+    assert other.load_state_dict({"n_spikes": 7}) is False
+    assert other.n_spikes == 0 and other.ema is None
+
+
+def _tiny_train_run(tmp_path, monkeypatch, steps, extra=()):
+    """Run `scripts/train_gpt2.py`'s main() on a tiny model + synthetic corpus.
+
+    The depth/width override env vars are the only knob the driver exposes for
+    shrinking a run, and the HF dataloader is replaced by the synthetic corpus
+    so the loop is exercised without `datasets` / `transformers`.
+    """
+    import scripts.train_gpt2 as tg
+    from adasquash import markov_batch
+
+    def fake_loader(dataset_name, dataset_config, seq_len, batch_size,
+                    tokenizer="gpt2"):
+        import torch.utils.data as tud
+        rng = torch.Generator().manual_seed(7)
+
+        class DS(tud.IterableDataset):
+            def __iter__(self):
+                while True:
+                    yield markov_batch(
+                        rng, -100, batch_size, seq_len, "cpu", n_states=64
+                    )
+
+        return tud.DataLoader(DS(), batch_size=None)
+
+    monkeypatch.setattr(tg, "build_dataloader", fake_loader)
+    monkeypatch.setenv("ADASQUASH_DEPTH_OVERRIDE", "2")
+    monkeypatch.setenv("ADASQUASH_DIM_OVERRIDE", "48")
+    monkeypatch.setenv("ADASQUASH_HEADS_OVERRIDE", "3")
+    argv = [
+        "train_gpt2.py", "--norm", "dytcd", "--no-bf16", "--batch-size", "2",
+        "--seq-len", "32", "--grad-accum", "1", "--log-every", "1",
+        "--stats-every", "100", "--warmup", "1",
+        "--output-dir", str(tmp_path),
+    ]
+    argv += ["--max-steps", str(steps), *extra]
+    monkeypatch.setattr(sys, "argv", argv)
+    tg.main()
+
+
+def test_resume_carries_the_loss_spike_counter_and_an_explicit_extension(tmp_path, monkeypatch, capsys):
+    """Two properties of `--resume` that only the full driver exercises:
+
+    * every checkpoint carries the loss-spike state, so `n_loss_spikes` is a
+      count over the whole run rather than only the post-resume window;
+    * a `--max-steps` typed on the command line survives the resume, which is
+      how a finished run is extended. Overwriting it with the checkpoint's
+      value makes the loop exit immediately and the extension silently no-op.
+    """
+    _tiny_train_run(tmp_path / "a", monkeypatch, 3, ["--save-every", "3"])
+    ckpt_path = tmp_path / "a" / "ckpt_000003.pt"
+    ckpt = torch.load(ckpt_path, weights_only=False)
+    assert set(ckpt["loss_spike"]) == {"ema", "n_spikes"}
+    assert isinstance(ckpt["loss_spike"]["ema"], float)
+
+    capsys.readouterr()
+    _tiny_train_run(tmp_path / "b", monkeypatch, 5,
+                    ["--save-every", "100", "--resume", str(ckpt_path)])
+    out = capsys.readouterr().out
+    assert "restored loss-spike counter" in out
+    assert "keeping your explicit override" in out
+    # The extension actually ran: step 5 was reached, not 3.
+    final = torch.load(tmp_path / "b" / "ckpt_final.pt", weights_only=False)
+    assert int(final["step"]) == 5
+    assert int(final["loss_spike"]["n_spikes"]) == 0
+
+
 def test_qk_alpha_init_reaches_the_attention():
     """`GPTConfig.qk_alpha_init` must reach the QKSquash the attention builds."""
     cfg = GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
