@@ -210,9 +210,14 @@ def apply_rope(
         cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
         sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
 
-    if q.dtype != cos.dtype:
-        q = q.to(cos.dtype)
-        k = k.to(cos.dtype)
+    # Cast the embeddings, not the queries: upcasting q/k to the embedding
+    # dtype keeps the whole rotary (and the attention scores derived from it)
+    # in the wider type, which costs memory and throughput when the model runs
+    # in bf16/fp16. Embeddings are [1, 1, T, hd], so they are the cheaper
+    # side of the promotion.
+    if cos.dtype != q.dtype:
+        cos = cos.to(q.dtype)
+        sin = sin.to(q.dtype)
 
     q_out = q * cos
     q_out.add_(rotate_half(q).mul_(sin))

@@ -59,6 +59,83 @@ def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
 # ---------------------------------------------------------------------------
 # Generalized softsign
 # ---------------------------------------------------------------------------
+class _GeneralizedSoftsign(torch.autograd.Function):
+    """
+    Autograd kernel behind `generalized_softsign`.
+
+    The forward pass is the split closed form (see the public wrapper below).
+    The backward pass is written out analytically instead of being recorded
+    from the element-wise chain: the chain reuses every intermediate - the
+    absolute value, the clamped reciprocal, both `where` outputs, the powered
+    base and the denominator - which pins down eight full activations per
+    layer for the whole backward pass. The closed form only needs the split
+    input `u`, the denominator and the branch mask, plus the output itself
+    when `p` carries a gradient, so those are the only tensors retained.
+
+    With `u = |x|` for `|x| <= 1` and `1/|x|` otherwise, `num` the matching
+    numerator and `denom = (1 + u^p)^(1/p)`:
+
+        phi = num / denom = num * s,        s = denom^-1
+
+    the partial derivatives collapse to
+
+        dphi/dx   = s^(p+1)                for |x| <= 1
+                  = (s*u)^(p+1)            for |x| >  1
+        dphi/dp   = phi * [log1p(u^p)/p^2 - (1 - s^p) * log(u) / p]
+    """
+    @staticmethod
+    def forward(ctx, x, p):
+        t = x.abs()
+        w = t.clamp(min=1.0)
+        mask = t > 1.0
+        u = torch.where(mask, w.reciprocal(), t)
+        num = torch.where(mask, torch.sign(x), x)
+        denom = (u.pow(p) + 1.0).pow(1.0 / p)
+        out = num / denom
+
+        ctx.p_is_tensor = isinstance(p, torch.Tensor)
+        ctx.need_p_grad = ctx.p_is_tensor and p.requires_grad
+        saved = []
+        if ctx.need_p_grad:
+            saved.append(out)
+        saved.extend((u, denom, mask))
+        if ctx.p_is_tensor:
+            saved.append(p)
+        else:
+            ctx.p_value = float(p)
+        ctx.save_for_backward(*saved)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        saved = ctx.saved_tensors
+        i = 0
+        out = None
+        if ctx.need_p_grad:
+            out = saved[0]
+            i = 1
+        u, denom, mask = saved[i], saved[i + 1], saved[i + 2]
+        p = saved[i + 3] if ctx.p_is_tensor else ctx.p_value
+
+        grad_x = grad_p = None
+        need_x = ctx.needs_input_grad[0]
+        need_p = ctx.needs_input_grad[1] and ctx.need_p_grad
+        if need_x or need_p:
+            s = denom.reciprocal()
+        if need_x:
+            # `u` on the |x| > 1 branch, 1 elsewhere: the |x| <= 1 branch
+            # reduces to s^(p+1) because d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1).
+            f = torch.where(mask, u, 1.0)
+            grad_x = grad_out * (s * f).pow(p + 1)
+        if need_p:
+            a = u.pow(p)
+            inv = s.pow(p)  # = 1 / (1 + u^p)
+            logu = u.clamp(min=torch.finfo(u.dtype).tiny).log()
+            k = torch.log1p(a) / (p * p) - (1.0 - inv) * logu / p
+            grad_p = (grad_out * out * k).sum()
+        return grad_x, grad_p
+
+
 def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     """
     phi_p(x) = x / (1 + |x|^p)^{1/p}.
@@ -85,13 +162,11 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     layer. Clamping first keeps the unused branch finite; `clamp` itself
     contributes no gradient below its threshold, so the selected branch is
     still differentiated exactly and phi'(0) = 1 as the closed form requires.
+
+    The layer runs as a custom autograd node (see `_GeneralizedSoftsign`) so
+    the backward pass can evaluate the closed-form derivatives directly.
     """
-    t = x.abs()
-    w = t.clamp(min=1.0)
-    mask = t > 1.0
-    u = torch.where(mask, w.reciprocal(), t)
-    num = torch.where(mask, torch.sign(x), x)
-    return num / (u.pow(p) + 1.0).pow(1.0 / p)
+    return _GeneralizedSoftsign.apply(x, p)
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +198,43 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _RMSNorm.apply(x, self.weight, self.eps)
+
+
+class _RMSNorm(torch.autograd.Function):
+    """
+    RMSNorm forward with the gradient written out analytically.
+
+    The obvious composition (`x.pow(2)`, `rsqrt`, two multiplies) makes
+    autograd retain both the input and the normalized activation - the latter
+    solely so the weight gradient can reduce over it. The backward pass below
+    rebuilds that product from the retained input and the per-row `rstd`
+    instead, so only one full activation per layer is kept.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, eps):
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return x.mul_(self.weight)
+        rstd = torch.rsqrt(var + eps)
+        ctx.save_for_backward(x, rstd, weight)
+        return x * rstd * weight
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, rstd, weight = ctx.saved_tensors
+        t = grad_out * weight
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            # d/dx of `x * rstd`: the rsqrt term contributes
+            # -x * rstd^3 * mean(t * x).
+            mean_tx = (t * x).mean(dim=-1, keepdim=True)
+            grad_x = t * rstd - x * (mean_tx * rstd * rstd * rstd)
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            grad_weight = (grad_out * (x * rstd)).sum(
+                dim=tuple(range(x.ndim - 1))
+            )
+        return grad_x, grad_weight, None
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +307,9 @@ class DyTC(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x * self.alpha
         x = generalized_softsign(x, self.p)
-        x.mul_(self.gamma)
+        # Out-of-place: the softsign output is retained by its own backward
+        # node, so it must not be rewritten here.
+        x = x * self.gamma
         if self.beta is not None:
             x.add_(self.beta)
         return x
@@ -345,7 +456,9 @@ class DyTCD(nn.Module):
 
         # `p` may be a learnable scalar tensor or a buffer; both broadcast.
         x = generalized_softsign(x, self.p)
-        x.mul_(self.gamma)
+        # Out-of-place: the softsign output is retained by its own backward
+        # node, so it must not be rewritten here.
+        x = x * self.gamma
         if self.beta is not None:
             x.add_(self.beta)
         return x

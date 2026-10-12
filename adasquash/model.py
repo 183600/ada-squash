@@ -233,17 +233,69 @@ class Block(nn.Module):
             h, freqs_cis=freqs_cis, return_stats=return_stats
         )
         if self.use_layerscale:
-            attn_out.mul_(self.ls1)
+            # Out-of-place: an in-place scale would make autograd clone the
+            # attention output, which the residual add retains anyway.
+            attn_out = attn_out * self.ls1
         attn_out.add_(x)
         x = attn_out
 
         h = self.norm2(x)
         mlp_out = self.mlp(h)
         if self.use_layerscale:
-            mlp_out.mul_(self.ls2)
+            mlp_out = mlp_out * self.ls2
         mlp_out.add_(x)
         x = mlp_out
         return x, logit_stats
+
+
+class _SwiGLU(torch.autograd.Function):
+    """
+    w2(silu(w1 x) * (w3 x)) handled as a single autograd node.
+
+    Recorded op by op, this chain makes autograd retain both branch
+    activations, the silu input and the gated product - and the two in-place
+    steps force a defensive copy of each of them, so a block keeps four
+    hidden-sized activations alive for its backward. The backward below
+    recomputes the gated product (one element-wise pass) and derives every
+    gradient analytically, leaving the two branch activations and the input
+    (which the weight gradients need anyway).
+    """
+
+    @staticmethod
+    def forward(ctx, x, w1, w2, w3):
+        a = F.linear(x, w1)
+        b = F.linear(x, w3)
+        h = F.silu(a)
+        h.mul_(b)
+        y = F.linear(h, w2)
+        ctx.save_for_backward(x, a, b, w1, w2, w3)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, a, b, w1, w2, w3 = ctx.saved_tensors
+        grad_h = F.linear(grad_out, w2.t())
+        sa = F.silu(a)
+        grad_b = grad_h * sa
+        grad_a = torch.ops.aten.silu_backward(grad_h * b, a)
+
+        grad_x = grad_w1 = grad_w2 = grad_w3 = None
+        if ctx.needs_input_grad[0]:
+            grad_x = F.linear(grad_a, w1.t()) + F.linear(grad_b, w3.t())
+        if ctx.needs_input_grad[1]:
+            grad_w1 = grad_a.reshape(-1, grad_a.shape[-1]).t() @ x.reshape(
+                -1, x.shape[-1]
+            )
+        if ctx.needs_input_grad[2]:
+            h = sa * b
+            grad_w2 = grad_out.reshape(-1, grad_out.shape[-1]).t() @ h.reshape(
+                -1, h.shape[-1]
+            )
+        if ctx.needs_input_grad[3]:
+            grad_w3 = grad_b.reshape(-1, grad_b.shape[-1]).t() @ x.reshape(
+                -1, x.shape[-1]
+            )
+        return grad_x, grad_w1, grad_w2, grad_w3
 
 
 class MLP(nn.Module):
@@ -260,11 +312,9 @@ class MLP(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # swiglu
-        h1 = self.w1(x)
-        h3 = self.w3(x)
-        F.silu(h1, inplace=True).mul_(h3)
-        return self.drop(self.w2(h1))
+        return self.drop(
+            _SwiGLU.apply(x, self.w1.weight, self.w2.weight, self.w3.weight)
+        )
 
 
 # ---------------------------------------------------------------------------
