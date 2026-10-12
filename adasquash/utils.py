@@ -162,8 +162,16 @@ class ActivationStats:
         run instead of reporting only the last window. `MaxAbsMeter` takes a
         running maximum, so pooling is exact; `KurtosisMeter` merges moments,
         so the pooled value is the kurtosis over all samples seen.
+
+        Any hook registered by a previous `attach` is removed first. Dropping
+        the handle list without removing the hooks leaves the old hooks
+        registered on the modules, so a re-attach silently doubles the
+        sampling rate (each activation is then counted once per live hook)
+        and, worse, a later `detach` only clears the newest batch: the
+        abandoned ones stay attached forever and keep writing into meters
+        that the caller believes are closed.
         """
-        self.handles = []
+        self.detach()
         if reset:
             self.max_abs = defaultdict(MaxAbsMeter)
             self.kurtosis = defaultdict(KurtosisMeter)

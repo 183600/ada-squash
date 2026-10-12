@@ -280,6 +280,17 @@ def main():
 
     def next_batch():
         if data_iter is None:
+            if args.probe == "random":
+                # Uniform token ids: no next-token signal, so the LM loss is
+                # pinned at log(vocab_size) and the run learns nothing. Kept
+                # only for parity with the fp8 / w8a8 probes.
+                x = torch.randint(
+                    0, cfg.vocab_size, (args.batch_size, args.seq_len),
+                    generator=rng, device=device,
+                )
+                y = torch.full_like(x, cfg.ignore_index)
+                y[:, :-1] = x[:, 1:]
+                return x, y
             # Learnable corpus: uniform token ids would pin the loss at
             # log(vocab_size), which carries no information about the norm
             # under test and gives the router nothing to learn from either.

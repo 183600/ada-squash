@@ -33,7 +33,9 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from scripts.eval_downstream import load_ckpt, needle_in_haystack
+from scripts.eval_downstream import (
+    load_ckpt, needle_decode_overhead, needle_in_haystack,
+)
 
 
 def main():
@@ -52,10 +54,15 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
 
+    # Scoring the secret appends its tokens to the context, so a context
+    # length equal to `max_seq_len` runs the last decode step past the
+    # model's positional table. Budget for it instead of crashing there.
+    overhead = needle_decode_overhead(tok, args.secret)
     results = []
     for L in args.ctx_lens:
-        if L > model.cfg.max_seq_len:
-            print(f"[skip] L={L} > max_seq_len={model.cfg.max_seq_len}, "
+        if L + overhead > model.cfg.max_seq_len:
+            print(f"[skip] L={L} (+{overhead} scoring positions for the secret)"
+                  f" > max_seq_len={model.cfg.max_seq_len}, "
                   "RoPE scaling needed - skipping for now.")
             continue
         acc = needle_in_haystack(

@@ -53,6 +53,24 @@ DEPTH_SHAPE = {
     96: (1024, 8),
 }
 
+# (dim, n_heads) of the *base* model of each builder, i.e. the shape the sweep
+# rescales away from. Keyed by the `--model` selector rather than by a single
+# `llama-1b ? llama : gpt2-124m` ternary: that ternary sent every non-LLaMA
+# arm to the 124M width, so a `--model gpt2-350m` sweep was silently rescaled
+# from (768, 12) and never actually ran at 350M's shape.
+_BASE_SHAPES = {
+    "llama-1b": (2048, 16),
+    "gpt2-124m": (768, 12),
+    "gpt2-350m": (1024, 16),
+}
+
+
+def base_shape_for_model(model: str) -> tuple:
+    """(dim, n_heads) of `model` at its own base depth; unknown models fall
+    back to the LLaMA-tiny base, which is what the documented table assumes."""
+    return _BASE_SHAPES.get(model, _BASE_SHAPE)
+
+
 # YAML key -> (argparse dest, invert) for the negative-form flags.
 _SWEEP_CONFIG_ALIASES = {
     "use_layerscale": ("no_layerscale", True),
@@ -134,7 +152,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path):
     env["ADASQUASH_DEPTH_OVERRIDE"] = str(depth)
     shape = ""
     if not args.no_dim_scaling:
-        base_dim, base_heads = _BASE_SHAPE if args.model == "llama-1b" else (768, 12)
+        base_dim, base_heads = base_shape_for_model(args.model)
         dim, heads = shape_for_depth(depth, base_dim, base_heads)
         env["ADASQUASH_DIM_OVERRIDE"] = str(dim)
         env["ADASQUASH_HEADS_OVERRIDE"] = str(heads)

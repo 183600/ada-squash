@@ -103,9 +103,48 @@ def evaluate_lm_harness(model, tasks: list[str], batch_size: int = 16, tokenizer
 # ---------------------------------------------------------------------------
 # Long-context needle-in-a-haystack
 # ---------------------------------------------------------------------------
+DEFAULT_NEEDLE = "The magic number is 12345."
+DEFAULT_QUESTION = "\n\nWhat is the magic number? The magic number is"
+DEFAULT_HAYSTACK = "Many sentences follow. "
+
+
+def needle_target_ids(tokenizer, needle: str = DEFAULT_NEEDLE) -> list:
+    """Token ids of the secret the model has to recite.
+
+    The secret is the last whitespace-separated chunk of `needle` with
+    trailing punctuation stripped ("... is 12345." -> "12345"), so a custom
+    secret is actually scored. Shared with the call sites that size a
+    context to fit the scoring loop.
+    """
+    secret = needle.strip().rstrip(".!?").split()
+    secret = secret[-1] if secret else ""
+    if not secret:
+        return []
+    return tokenizer(" " + secret, add_special_tokens=False)["input_ids"]
+
+
+def needle_decode_overhead(tokenizer, needle: str = DEFAULT_NEEDLE) -> int:
+    """Positions the scoring loop needs *on top of* `context_len`.
+
+    Scoring is a greedy decode of the secret: every emitted token is
+    appended to the context before the next one is predicted, so the longest
+    context the forward pass ever sees is
+
+        len(prompt + needle + question) + len(secret_ids) - 1.
+
+    That tail is not covered by the `max_seq_len` check the caller thinks it
+    is satisfying - a context sized at exactly `max_seq_len` runs the last
+    scored steps past the model's positional table and dies inside the
+    forward pass with a shape error instead of returning an accuracy.
+    Callers that pick a context length from `max_seq_len` have to subtract
+    this.
+    """
+    return max(0, len(needle_target_ids(tokenizer, needle)) - 1)
+
+
 def needle_in_haystack(
-    model, tokenizer, needle: str = "The magic number is 12345.",
-    haystack_prompt: str = "Many sentences follow. ",
+    model, tokenizer, needle: str = DEFAULT_NEEDLE,
+    haystack_prompt: str = DEFAULT_HAYSTACK,
     context_len: int = 4096, n_trials: int = 5, device: str = "cuda",
     seed: int = 0,
 ):
@@ -130,13 +169,8 @@ def needle_in_haystack(
     tok = tokenizer
     needle_ids = tok(needle, add_special_tokens=False)["input_ids"]
     prompt_ids = tok(haystack_prompt, add_special_tokens=False)["input_ids"]
-    question_ids = tok("\n\nWhat is the magic number? The magic number is", add_special_tokens=False)["input_ids"]
-
-    # The secret to recite is the last whitespace-separated chunk of the
-    # needle with trailing punctuation stripped ("... is 12345." -> "12345").
-    secret = needle.strip().rstrip(".!?").split()
-    secret = secret[-1] if secret else ""
-    target_ids = tok(" " + secret, add_special_tokens=False)["input_ids"] if secret else []
+    question_ids = tok(DEFAULT_QUESTION, add_special_tokens=False)["input_ids"]
+    target_ids = needle_target_ids(tok, needle)
 
     # A learned positional table (or a RoPE table) is indexed by absolute
     # position, so asking for more tokens than the model was built with
@@ -149,6 +183,17 @@ def needle_in_haystack(
             f"context_len={context_len} exceeds the model's max_seq_len="
             f"{model_limit}; raise max_seq_len (and retrain) or lower the "
             f"context length - there is no valid result at this length"
+        )
+    # ... and the decode itself needs the secret's tokens *appended*, so the
+    # context grows past `context_len` while a trial is being scored.
+    overhead = max(0, len(target_ids) - 1)
+    if model_limit is not None and context_len + overhead > model_limit:
+        raise ValueError(
+            f"context_len={context_len} + {overhead} scoring positions for "
+            f"the {len(target_ids)}-token secret exceeds the model's "
+            f"max_seq_len={model_limit}; scoring the last token would index "
+            f"past the positional table - lower the context length by at "
+            f"least {context_len + overhead - model_limit}"
         )
     if not target_ids:
         raise ValueError(f"could not derive a secret to score from needle={needle!r}")
@@ -213,8 +258,9 @@ def main():
     p.add_argument("--needle-test", action="store_true", help="also run needle-in-haystack")
     p.add_argument("--needle-context-len", type=int, default=None,
                    help="needle context length (default: the checkpoint's "
-                        "max_seq_len - the longest the model can be "
-                        "evaluated at; asking for more raises)")
+                        "max_seq_len minus the positions the secret's decode "
+                        "needs - the longest the model can actually be "
+                        "scored at; asking for more raises)")
     p.add_argument("--tokenizer", default="gpt2")
     p.add_argument("--output", default=None)
     args = p.parse_args()
@@ -236,7 +282,13 @@ def main():
     if args.needle_test:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.tokenizer)
-        ctx_len = args.needle_context_len or model.cfg.max_seq_len
+        # Default: the longest context the checkpoint can actually be scored
+        # at. Not simply `max_seq_len`: the greedy decode appends the secret
+        # to the context as it goes, so the last scored step needs a few
+        # positions past `context_len` (see `needle_decode_overhead`).
+        ctx_len = args.needle_context_len or max(
+            1, model.cfg.max_seq_len - needle_decode_overhead(tok)
+        )
         acc = needle_in_haystack(
             model, tok, context_len=ctx_len, device=device
         )

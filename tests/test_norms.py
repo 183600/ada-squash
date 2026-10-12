@@ -1019,6 +1019,38 @@ def test_activation_stats_can_pool_across_sampling_windows():
         assert stats.summary()["__summary__"]["max_max_abs"] <= 1.0
 
 
+def test_activation_stats_reattach_does_not_leak_hooks():
+    """`attach` must drop the hooks it registered last time.
+
+    It used to reset the handle list without removing the hooks, so a second
+    `attach` without an intervening `detach` left the first batch live: every
+    activation was then sampled once per live hook, and the abandoned hooks
+    survived the `detach` that followed - still writing into meters the
+    caller believes are closed.
+    """
+    torch.manual_seed(0)
+    model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
+                          max_seq_len=16, norm_name="dytcd"))
+    stats = ActivationStats(model)
+    n_norms = sum(
+        1 for m in model.modules()
+        if m.__class__.__name__ in {"DyTCD"}
+    )
+    assert n_norms == 2 * model.cfg.n_layers + 1
+
+    stats.attach()
+    stats.attach()  # no detach() in between
+    assert len(stats.handles) == n_norms, "the previous hooks were not removed"
+
+    stats.detach()
+    assert stats.handles == []
+    with torch.no_grad():
+        model(torch.zeros(1, 4, dtype=torch.long))
+    assert all(m.count == 0 for m in stats.max_abs.values()), (
+        "a detached hook is still writing into the meters"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Synthetic corpus: the ablations / MoE / W8A8 probe depend on it having
 # real next-token signal.
@@ -1091,6 +1123,76 @@ def test_depth_schedule_ablation_row_actually_disables_the_schedule():
     )
 
 
+def _tiny_variant(cfg_kwargs):
+    """Build one ablation row's norms at a size that fits in a unit test."""
+    return GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                         max_seq_len=16, **cfg_kwargs)).blocks[0].norm1
+
+
+def test_every_ablation_row_builds_its_own_hyperparameters():
+    """Two rows of the same norm family must not share hyper-parameters.
+
+    `build_norm_kwargs` used to memoize its result on
+    `(norm_name, layer_idx)`, so within one `ablation.py` process every row
+    after the first of its family inherited that first row's values: the
+    `dyt_alpha_*` grid, the whole `dytc_p*` softsign sweep and `dytd_full`
+    all came out configured like whichever row was built first, and the
+    matrix reported identical numbers where it was supposed to report a
+    contrast. The rows below are visited in matrix order, i.e. the order the
+    runner builds them in.
+    """
+    from scripts.ablation import load_ablations_from_config
+
+    root = Path(__file__).resolve().parent.parent
+    rows = load_ablations_from_config(str(root / "configs" / "ablation-matrix.yaml"))
+
+    for name in ("dyt_alpha_0.3", "dyt_alpha_0.5", "dyt_alpha_1.0"):
+        assert _tiny_variant(rows[name]).alpha.item() == pytest.approx(
+            float(rows[name]["alpha_init"])
+        ), name
+
+    for name in ("dytc_p1_softsign", "dytc_p2_softsign", "dytc_p4_softsign",
+                 "dytc_hardtanh_eq"):
+        assert _tiny_variant(rows[name]).p == pytest.approx(
+            float(rows[name]["p_init"])
+        ), name
+    # A learnable `p` is a Parameter, a frozen one is a plain float: the
+    # `p`-sweep rows are only a sweep if `dytc_plearnable` really differs.
+    assert isinstance(_tiny_variant(rows["dytc_plearnable"]).p, nn.Parameter)
+    assert not isinstance(_tiny_variant(rows["dytc_p2_softsign"]).p, nn.Parameter)
+
+    # The depth axis: `k` on (k=1, learnable) vs off (buffered k=0).
+    on = _tiny_variant(rows["dytd_full"])
+    off = _tiny_variant(rows["dytd_k0_no_depth_schedule"])
+    assert on.k.item() == pytest.approx(1.0)
+    assert isinstance(on.k, nn.Parameter)
+    assert off.k.item() == pytest.approx(0.0)
+    assert not isinstance(off.k, nn.Parameter)
+
+
+def test_norm_kwargs_follow_the_config_not_a_previously_built_model():
+    """The same guard for the axes the matrix does not currently sweep."""
+    from adasquash.model import build_norm_kwargs
+
+    def norm(**over):
+        cfg = GPTConfig(vocab_size=32, dim=32, n_heads=4, max_seq_len=8, **over)
+        return build_norm(cfg.norm_name, 32, **build_norm_kwargs(cfg, 0))
+
+    d = norm(norm_name="dytd", n_layers=2, k_init=0.0, learnable_k=False)
+    assert d.k.item() == 0.0 and not isinstance(d.k, nn.Parameter)
+    assert norm(norm_name="dytd", n_layers=2, k_init=1.0).k.item() == 1.0
+
+    c = norm(norm_name="dytc", n_layers=2, p_init=1.0, learnable_p=False)
+    assert c.p == 1.0
+    assert isinstance(norm(norm_name="dytc", n_layers=2, p_init=2.0).p,
+                      nn.Parameter)
+
+    # `num_layers` sets the depth ratio, so a deeper model must not reuse the
+    # shallow model's schedule even though `layer_idx` is identical.
+    assert norm(norm_name="dytd", n_layers=2).num_layers == 2
+    assert norm(norm_name="dytd", n_layers=8).num_layers == 8
+
+
 def test_depth_sweep_shape_holds_the_parameter_count_roughly_fixed():
     """The depth axis must not be confounded with model size."""
     from scripts.train_llama_depth_sweep import shape_for_depth
@@ -1131,6 +1233,27 @@ def test_depth_sweep_shape_honours_a_non_llama_base():
     # builder's own shape there.
     assert shape_for_depth(24, 768, 12) == (768, 12)
     assert shape_for_depth(24, *_BASE_SHAPE) == (2048, 16)
+
+
+def test_depth_sweep_base_shape_follows_the_selected_model():
+    """Every `--model` arm must be rescaled from *its own* base width.
+
+    The launcher used to pick `llama-1b ? llama : gpt2-124m`, so a
+    `--model gpt2-350m` sweep was rescaled from (768, 12) and every arm was
+    built at 124M's width - a silently mislabelled experiment.
+    """
+    from scripts.train_llama_depth_sweep import (
+        _BASE_SHAPE, base_shape_for_model, shape_for_depth,
+    )
+
+    assert base_shape_for_model("llama-1b") == _BASE_SHAPE == (2048, 16)
+    assert base_shape_for_model("gpt2-124m") == (768, 12)
+    assert base_shape_for_model("gpt2-350m") == (1024, 16)
+    # An unrecognised selector keeps the documented LLaMA-tiny base.
+    assert base_shape_for_model("something-else") == _BASE_SHAPE
+    # The 350M arm must not land on the 124M shape at the base depth.
+    assert shape_for_depth(24, *base_shape_for_model("gpt2-350m")) == (1024, 16)
+    assert shape_for_depth(24, *base_shape_for_model("gpt2-124m")) == (768, 12)
 
 
 # ---------------------------------------------------------------------------
@@ -1390,7 +1513,7 @@ def test_needle_scores_the_whole_secret_not_just_its_first_token():
     from scripts.eval_downstream import needle_in_haystack
 
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
-                          max_seq_len=256, norm_name="rmsnorm")).eval()
+                          max_seq_len=512, norm_name="rmsnorm")).eval()
     tok = _CharTokenizer()
     needle = "The magic number is 12345."
     target = tok(" 12345")["input_ids"]
@@ -1420,6 +1543,108 @@ def test_needle_rejects_contexts_it_cannot_evaluate():
         needle_in_haystack(model, tok, context_len=4096, n_trials=1, device="cpu")
     with pytest.raises(ValueError, match="too short"):
         needle_in_haystack(model, tok, context_len=20, n_trials=1, device="cpu")
+
+
+class _Reciter(GPT):
+    """A real GPT that recites the secret, so the scoring loop runs to the
+    end instead of bailing out on its first mismatching token.
+
+    The point is the *context* it forces: every emitted token is appended
+    before the next one is predicted, so the longest forward pass is
+    `context_len + len(secret) - 1` long - and the real `GPT.forward`
+    (reached through `last_position_logits`) is what enforces
+    `max_seq_len`.
+    """
+
+    def __init__(self, *a, secret=None, **kw):
+        super().__init__(*a, **kw)
+        self.secret = secret
+        self.i = 0
+        self.prev_n = None
+
+    def last_position_logits(self, input_ids, return_stats=False):
+        n = input_ids.shape[1]
+        if self.prev_n is None or n < self.prev_n:
+            # A shorter context than last time means a new trial: restart the
+            # secret instead of carrying the cursor across trials.
+            self.i = 0
+        self.prev_n = n
+        # Routed through the real forward pass so `max_seq_len` is actually
+        # enforced - that is the constraint the test is about.
+        out = super().last_position_logits(
+            input_ids, return_stats=return_stats
+        ).clone()
+        out[:, self.secret[min(self.i, len(self.secret) - 1)]] = 1e4
+        self.i += 1
+        return out
+
+
+def test_needle_context_leaves_room_for_the_scoring_loop():
+    """A context sized at exactly `max_seq_len` is still one decode too long.
+
+    Greedy scoring appends each secret token to the context before scoring
+    the next one, so the last scored step runs `len(secret) - 1` positions
+    past the prompt. The eval script's default context *is* `max_seq_len`,
+    and a haystack prompt whose repeats divide the budget exactly fills it
+    to `context_len - 2`, so a secret of three or more tokens pushes the
+    forward past the positional table: the run died inside the forward pass
+    with a shape error instead of reporting an accuracy. The context has to
+    be refused up front instead.
+    """
+    from scripts.eval_downstream import needle_in_haystack
+
+    tok = _CharTokenizer()
+    needle = "The magic number is 12345."
+    secret = tok(" 12345")["input_ids"]
+    assert len(secret) > 1, "the guard only bites for a multi-token secret"
+    overhead = len(secret) - 1
+
+    model = _Reciter(
+        GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                  max_seq_len=256, norm_name="rmsnorm"),
+        secret=secret,
+    ).eval()
+
+    # Fitting context: the whole secret is scored, no crash.
+    assert needle_in_haystack(
+        model, tok, needle=needle, context_len=256 - overhead,
+        n_trials=2, device="cpu") == 1.0
+
+    # A haystack prompt whose token count divides the budget exactly, so the
+    # body fills to `context_len - 2`: the longest prompt the function can
+    # build for that context. The documented default - the full
+    # `max_seq_len` - is then refused up front, rather than the decode
+    # running past the positional table inside the forward pass.
+    body_len = (256 - len(tok(needle)["input_ids"])
+                - len(tok("\n\nWhat is the magic number? The magic number is")["input_ids"])
+                - 2)
+    per_repeat = next(d for d in range(2, body_len + 1) if body_len % d == 0)
+    fresh = _Reciter(
+        GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                  max_seq_len=256, norm_name="rmsnorm"),
+        secret=secret,
+    ).eval()   # a fresh cursor: the previous run already recited the secret
+    with pytest.raises(ValueError, match="max_seq_len"):
+        needle_in_haystack(
+            fresh, tok, needle=needle, haystack_prompt="z" * (per_repeat - 1) + " ",
+            context_len=256, n_trials=1, device="cpu")
+
+
+def test_needle_decode_overhead_matches_the_secret_length():
+    """The contexts the call sites budget for the decode are derived from
+    the same tokenization the scoring loop uses."""
+    from scripts.eval_downstream import (
+        needle_decode_overhead, needle_target_ids,
+    )
+
+    tok = _CharTokenizer()
+    for needle in ("The magic number is 12345.", "secret: 42", "find 98765"):
+        assert needle_target_ids(tok, needle) == tok(
+            " " + needle.strip().rstrip(".!?").split()[-1]
+        )["input_ids"]
+        assert needle_decode_overhead(tok, needle) == (
+            len(needle_target_ids(tok, needle)) - 1
+        )
 
 
 # ---------------------------------------------------------------------------
