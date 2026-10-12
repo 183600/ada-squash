@@ -39,8 +39,7 @@ class MaxAbsMeter:
 
     def update(self, x: torch.Tensor):
         with torch.no_grad():
-            # `abs()` would materialise a full-size copy of the activation;
-            # the extremal magnitude is max(max(x), -min(x)) instead.
+            # max(|x|) = max(max(x), -min(x))
             v = torch.maximum(x.max(), -x.min()).item()
         if v > self.value:
             self.value = v
@@ -80,9 +79,7 @@ class KurtosisMeter:
         new_n = self.n + n_b
         if new_n == self.n:
             return
-        # A single fused pass for the first two moments instead of two
-        # independent reductions over `x`. `torch.var_mean` returns
-        # `(variance, mean)` in that order.
+        # `torch.var_mean` returns `(variance, mean)` in that order.
         x_var_t, x_mean_t = torch.var_mean(x, unbiased=False)
         xc = x - x_mean_t
         xc2 = xc * xc

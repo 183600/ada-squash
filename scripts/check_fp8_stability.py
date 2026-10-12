@@ -198,12 +198,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
     fp8_e4m3_min = fp8_min_normal(4)
 
     def make_stat_hook():
-        """One hook feeding both the range table and the quant-error table.
-
-        They used to be registered separately, which meant `out.abs()` (a
-        full-size temporary) and its reductions were evaluated twice per norm
-        for identical inputs.
-        """
+        """One hook feeding both the range table and the quant-error table."""
         def hook(module, inp, out):
             x_in = inp[0] if isinstance(inp, tuple) and inp else None
             cls_name = module.__class__.__name__

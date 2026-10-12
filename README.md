@@ -13,9 +13,9 @@ Dynamic Tanh (DyT, Zhu et al. 2025) along three orthogonal axes:
 | **DyT-CD** | both (the main proposal)  | DyT-C + DyT-D combined                     | ultra-deep, MoE, FP8 |
 | **DyT-QK** | attention logits (Variant C) | scalar squashing of Q/K before dot product | long-context logit explosion |
 
-The core hypothesis: with **<0.1% additional parameters**, statistic-free
-element-wise adaptive squashing matches or exceeds RMSNorm on stability
-and throughput.
+The core hypothesis: statistic-free element-wise adaptive squashing can
+stand in for statistic-based normalization while adding **<0.1% additional
+parameters**.
 
 ## Repository layout
 
@@ -68,9 +68,8 @@ round-trip, and the metrics implementation.
 > Note on scale: the shipped configs are `max_steps × batch_size ×
 > grad_accum × seq_len` = 10000 × 32 × 4 × 1024 ≈ **1.3 B tokens**, not the
 > full 10 B-token FineWeb-Edu sample. Raise `--max-steps` (to ≈ 76 000 for
-> 10 B tokens) when running the headline comparison, and raise it
-> identically for every variant - a shorter run makes the comparison
-> budget-dependent.
+> 10 B tokens) for the full sample, and raise it identically for every
+> variant so that each variant sees the same amount of data.
 
 Every run is described by a YAML file under `configs/`. `--config` seeds the
 CLI defaults, and an explicitly passed flag still wins over the file.

@@ -159,9 +159,8 @@ def compute_ce_sum(model, batch, target, device="cuda"):
     if n == 0:
         raise ValueError("probe batch contains no valid target tokens")
     # The model's own loss is already the mean over the non-ignored targets
-    # and evaluates the [N, V] logit block in row chunks (see
-    # `cross_entropy_mean`), so scaling it back up by `n` gives the same sum
-    # without ever allocating a full-length log-softmax buffer for the block.
+    # (see `cross_entropy_mean`), so scaling it back up by `n` gives the sum
+    # over those targets.
     logits, loss = model(batch, target)
     del logits
     return loss.item() * n, n
@@ -205,9 +204,8 @@ def probe_token_coverage(batches) -> float:
 def _probe_random(rng, vocab_size, batch_size, seq_len, device):
     """Uniform random tokens.
 
-    Kept selectable for parity with earlier runs, but note it carries no
-    next-token signal: every PPL comes out at ~vocab_size and the reported
-    `ppl_drop_pct` is noise (it can even come out negative).
+    They carry no next-token signal: every PPL comes out at ~vocab_size and
+    the reported `ppl_drop_pct` is noise (it can even come out negative).
     """
     return torch.randint(
         0, vocab_size, (batch_size, seq_len), generator=rng, device=device

@@ -112,9 +112,8 @@ class CausalSelfAttention(nn.Module):
             with torch.no_grad():
                 logits = torch.matmul(q, k.transpose(-1, -2))
                 logits.mul_(scale)
-                # Only the causal triangle is ever read, so the upper triangle
-                # is selected directly instead of being overwritten with -inf
-                # first (which cost a full-size masked copy of `logits`).
+                # Only the causal triangle is ever read, so it is selected
+                # directly rather than masking the upper triangle with -inf.
                 keep = self._tril_mask(T, x.device)
                 valid = logits[keep]
                 if valid.numel():

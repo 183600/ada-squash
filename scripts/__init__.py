@@ -5,9 +5,8 @@ Phase 3 utility scripts:
   - check_w8a8_ppl.py    : post-training W8A8 quantization PPL drop
   - run_needle.py        : long-context needle sweep
 
-These are intentionally minimal. Each is meant to be runnable on a single
-H100 within an afternoon so that the experiments can be referenced from
-the paper's Phase 3 section.
+These are intentionally minimal: each one is a standalone entry point for
+a single Phase 3 check.
 """
 
 from __future__ import annotations

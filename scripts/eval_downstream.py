@@ -176,8 +176,7 @@ def needle_in_haystack(
         full = body[:pos] + needle_ids + body[pos:] + question_ids
         n_run += 1
         # Greedy-decode the whole secret; stop as soon as it diverges.
-        # The decode buffer is allocated once at its final length and written
-        # in place, so growing the context by one token is an O(1) store.
+        # The decode buffer is allocated once and written in place.
         generated: list[int] = []
         correct = True
         buf = torch.empty(

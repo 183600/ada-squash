@@ -2,7 +2,7 @@
 # Used by: python scripts/ablation.py --config configs/ablation-matrix.yaml
 model: gpt2-124m
 
-# Synthetic Markov-chain corpus for cheap stability tests. The chain gives
+# Synthetic Markov-chain corpus for the stability tests. The chain gives
 # the loss a learnable floor (log of the state count) so variants can
 # actually be ranked, and a sparse outlier channel gives the squashing
 # layers something to control.

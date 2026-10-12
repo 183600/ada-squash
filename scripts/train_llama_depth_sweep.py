@@ -36,7 +36,7 @@ def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
 # Per-depth (dim, n_heads) for the LLaMA-tiny 1b base shape. The point of the
 # sweep is the *depth* axis, so `dim` has to shrink as depth grows or the
 # 96-layer run is simply a larger model and "RMSNorm diverges at depth" is
-# unfalsifiable. Parameter count is ~ L * dim^2, so a constant budget means
+# unfalsifiable. Parameter count is ~ L * dim^2, so holding it constant means
 # dim ~ base_dim * sqrt(base_depth / depth); the table below is exactly that
 # law with head_dim pinned at 128, which keeps RoPE and attention shapes
 # identical across the sweep (1.16 / 1.07 / 0.98 / 1.01 B, a 1.19x spread).
@@ -147,8 +147,8 @@ def launch_one(args, depth: int, norm: str, output_dir: Path):
     except Exception:
         log.close()
         raise
-    # The child holds its own duplicate of the descriptor; ours is no longer
-    # needed, and keeping one open per (depth, norm) arm leaks up to a dozen.
+    # The child holds its own duplicate of the descriptor, so ours can be
+    # closed once the child is running.
     log.close()
     return proc
 

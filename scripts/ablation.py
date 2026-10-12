@@ -5,8 +5,6 @@ softsign family, alpha initialization grid.
 Each ablation is a small training run (default: GPT-2 124M, 1000 steps)
 on a synthetic Markov corpus plus a stability measurement at the end. The
 results land in a JSON file under runs/ablation/<name>/summary.json.
-
-Designed to be runnable on a single H100 in <2 hours total.
 """
 
 from __future__ import annotations

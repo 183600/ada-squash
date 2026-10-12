@@ -46,8 +46,7 @@ class GPTConfig:
     norm_name: str = "dytcd"
     qk_norm: Optional[str] = None
     # Initial alpha_q / alpha_k for `qk_norm="dytqk"`. Threaded through here
-    # so the squashing strength of variant C is configurable; previously the
-    # constructor argument existed but nothing could ever set it.
+    # so the squashing strength of variant C is configurable.
     qk_alpha_init: float = 1.0
     use_layerscale: bool = True
     layerscale_init: float = 1e-5

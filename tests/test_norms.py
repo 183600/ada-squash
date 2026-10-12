@@ -898,7 +898,7 @@ def test_resume_restores_the_schedule_defining_flags():
 
 
 def test_qk_alpha_init_reaches_the_attention():
-    """The QKSquash init used to be a constructor argument nothing could set."""
+    """`GPTConfig.qk_alpha_init` must reach the QKSquash the attention builds."""
     cfg = GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
                     norm_name="rmsnorm", qk_norm="dytqk", qk_alpha_init=0.25)
     model = GPT(cfg)
@@ -958,8 +958,8 @@ def test_needle_scores_the_whole_secret_not_just_its_first_token():
 
 
 def test_needle_rejects_contexts_it_cannot_evaluate():
-    """A context past `max_seq_len` used to crash inside the forward pass,
-    and one too short to hold a single haystack repeat silently scored 0.0."""
+    """A context past `max_seq_len`, or one too short to hold a single
+    haystack repeat, must be rejected rather than evaluated."""
     from scripts.eval_downstream import needle_in_haystack
 
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
