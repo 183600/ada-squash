@@ -74,10 +74,7 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     t = x.abs()
     t_lo = t.clamp(max=1.0)
     t_hi = t.clamp(min=1.0)
-    if isinstance(p, torch.Tensor):
-        p_recip = 1.0 / p.item()
-    else:
-        p_recip = 1.0 / float(p)
+    p_recip = 1.0 / float(p)
     y_lo = x / (t_lo.pow(p) + 1.0).pow(p_recip)
     y_hi = torch.sign(x) * (t_hi.pow(-p) + 1.0).pow(-p_recip)
     return torch.where(t > 1.0, y_hi, y_lo)
