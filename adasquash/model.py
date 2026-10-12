@@ -100,6 +100,83 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0) -> dict:
 # ---------------------------------------------------------------------------
 # Block
 # ---------------------------------------------------------------------------
+_CROSSENTROPY_CHUNK_BYTES = 1 << 26  # ~64MB of fp32 logits per chunk
+
+
+def _cross_entropy_chunk_rows(vocab_size: int) -> int:
+    """Rows of the [N, V] logit block handled per chunk."""
+    row_bytes = max(1, vocab_size) * 4
+    return max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
+
+
+class _ChunkedCrossEntropy(torch.autograd.Function):
+    """
+    Mean cross-entropy over a [N, V] logit block, evaluated in row chunks.
+
+    The per-row math is identical to `F.cross_entropy`; only the
+    reduction over rows is split. The [N, V] log-probabilities that the
+    fused kernel would otherwise have to keep alive for backward are
+    dropped chunk by chunk and the gradient is rebuilt from a single
+    softmax per chunk, so the step never holds more than one chunk's
+    worth of extra logits at a time.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, targets, ignore_index, chunk_rows):
+        total = None
+        for start in range(0, targets.numel(), chunk_rows):
+            chunk_loss = F.cross_entropy(
+                logits[start:start + chunk_rows],
+                targets[start:start + chunk_rows],
+                ignore_index=ignore_index,
+                reduction="sum",
+            )
+            total = chunk_loss if total is None else total + chunk_loss
+        count = targets.ne(ignore_index).sum()
+        ctx.save_for_backward(logits, targets)
+        ctx.ignore_index = ignore_index
+        ctx.chunk_rows = chunk_rows
+        ctx.count = count
+        return total / count
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        logits, targets = ctx.saved_tensors
+        grad_scale = (grad_out / ctx.count).to(logits.dtype)
+        grad_logits = torch.empty_like(logits)
+        chunk_rows = ctx.chunk_rows
+        for start in range(0, targets.numel(), chunk_rows):
+            end = min(start + chunk_rows, targets.numel())
+            chunk_logits = logits[start:end]
+            chunk_targets = targets[start:end]
+            valid = chunk_targets.ne(ctx.ignore_index)
+            probs = torch.softmax(chunk_logits, dim=-1)
+            # subtract the one-hot at the gold column (ignored rows are
+            # remapped to column 0 first, then zeroed out below)
+            gold = chunk_targets.masked_fill(~valid, 0).unsqueeze(-1)
+            probs.scatter_add_(-1, gold, torch.full_like(gold, -1.0, dtype=probs.dtype))
+            probs.mul_(grad_scale)
+            probs.masked_fill_(~valid.unsqueeze(-1), 0.0)
+            grad_logits[start:end] = probs
+        return grad_logits, None, None, None
+
+
+def cross_entropy_mean(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+    chunk_rows: Optional[int] = None,
+) -> torch.Tensor:
+    """Mean cross-entropy with a bounded log-probability footprint."""
+    if chunk_rows is None:
+        chunk_rows = _cross_entropy_chunk_rows(logits.size(-1))
+    if logits.size(0) <= chunk_rows:
+        return F.cross_entropy(logits, targets, ignore_index=ignore_index)
+    return _ChunkedCrossEntropy.apply(
+        logits, targets, int(ignore_index), int(chunk_rows)
+    )
+
+
 class Block(nn.Module):
     """
     Pre-norm Transformer block (norm-dependent residual).
@@ -149,14 +226,14 @@ class Block(nn.Module):
             h, freqs_cis=freqs_cis, return_stats=return_stats
         )
         if self.use_layerscale:
-            attn_out = self.ls1 * attn_out
+            attn_out.mul_(self.ls1)
         attn_out.add_(x)
         x = attn_out
 
         h = self.norm2(x)
         mlp_out = self.mlp(h)
         if self.use_layerscale:
-            mlp_out = self.ls2 * mlp_out
+            mlp_out.mul_(self.ls2)
         mlp_out.add_(x)
         x = mlp_out
         return x, logit_stats
@@ -269,7 +346,7 @@ class GPT(nn.Module):
         if targets is None:
             loss = None
         else:
-            loss = F.cross_entropy(
+            loss = cross_entropy_mean(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
                 ignore_index=self.cfg.pad_token_id,
@@ -344,6 +421,7 @@ __all__ = [
     "MLP",
     "GPT",
     "build_norm_kwargs",
+    "cross_entropy_mean",
     "build_gpt_124m",
     "build_gpt_350m",
     "build_llama_tiny_1b",

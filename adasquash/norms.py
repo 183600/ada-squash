@@ -63,21 +63,33 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     """
     phi_p(x) = x / (1 + |x|^p)^{1/p}.
 
-    Split the two regimes and clamp the pow base into the branch where it
-    is guaranteed to stay <= 1:
+    |x|^p overflows for large |x| and large p, so the exponentiation is
+    always evaluated on a base that is guaranteed to stay in [0, 1]. The
+    identity
 
-        |x| <= 1 :  phi = x * (1 + |x|^p)^(-1/p)          (|x|^p  <= 1)
-        |x| >  1 :  phi = sgn(x) * (1 + |x|^-p)^(-1/p)    (|x|^-p <= 1)
+        (1 + |x|^-p)^(1/p) = (1 + |x|^p)^(1/p) / |x|      (|x| > 0)
 
-    Both branches stay in [0, 1] before the final combine.
+    lets the two regimes share a *single* pow pair by folding the extra
+    |x| factor into a max(|x|, 1) term:
+
+        s   = min(|x|, 1/|x|) = |x|  (|x| <= 1),  1/|x|  (|x| > 1)
+        phi = x / ( (1 + s^p)^(1/p) * max(|x|, 1) )
+
+    Both pow bases are therefore clamped into [tiny, 1], which keeps the
+    forward pass free of inf and stops inf from leaking into the gradient
+    of the reciprocal at x == 0.
     """
     t = x.abs()
-    t_lo = t.clamp(max=1.0)
-    t_hi = t.clamp(min=1.0)
+    # Clamp *before* the reciprocal so 1/t stays finite at t == 0; the
+    # clamp's zero gradient below `tiny` keeps that element out of the
+    # backward graph of the reciprocal.
+    inv = t.clamp(min=torch.finfo(t.dtype).tiny).reciprocal()
+    s = torch.where(t > 1.0, inv, t)
     p_recip = 1.0 / p
-    y_lo = x / (t_lo.pow(p) + 1.0).pow(p_recip)
-    y_hi = torch.sign(x) * (t_hi.pow(-p) + 1.0).pow(-p_recip)
-    return torch.where(t > 1.0, y_hi, y_lo)
+    # (1 + s^p)^(1/p): equal to (1 + |x|^p)^(1/p) for |x| <= 1 and to
+    # (1 + |x|^-p)^(1/p) for |x| > 1.
+    phi_scale = (s.pow(p) + 1.0).pow(p_recip)
+    return x / (phi_scale * t.clamp(min=1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +243,7 @@ class DyTD(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_layers = max(1, num_layers)
+        self._depth_ratio = float(layer_idx) / float(self.num_layers)
 
         # Global "base" alpha (still a single scalar, like original DyT).
         self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
@@ -251,8 +264,7 @@ class DyTD(nn.Module):
     @property
     def alpha_l(self) -> torch.Tensor:
         """The effective scalar alpha at this depth (for logging)."""
-        depth_ratio = float(self.layer_idx) / float(self.num_layers)
-        return self.alpha_0 * torch.exp(-self.k * depth_ratio)
+        return self.alpha_0 * torch.exp(-self.k * self._depth_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a = self.alpha_l
@@ -298,6 +310,7 @@ class DyTCD(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_layers = max(1, num_layers)
+        self._depth_ratio = float(layer_idx) / float(self.num_layers)
 
         self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
         if learnable_k:
@@ -322,8 +335,7 @@ class DyTCD(nn.Module):
     @property
     def alpha_per_channel(self) -> torch.Tensor:
         """Effective per-channel alpha at this depth (for logging)."""
-        depth_ratio = float(self.layer_idx) / float(self.num_layers)
-        scale = self.alpha_0 * torch.exp(-self.k * depth_ratio)
+        scale = self.alpha_0 * torch.exp(-self.k * self._depth_ratio)
         # delta may be negative, in which case the channel gets *less*
         # compression than the global alpha. Clamp to keep alpha > 0.
         return (scale * (1.0 + self.delta)).clamp(min=1e-4)
