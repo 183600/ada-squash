@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .norms import QKSquash
+from .norms import QKSquash, _RMSNorm
 
 
 class CausalSelfAttention(nn.Module):
@@ -196,9 +196,12 @@ class RMSNormHead(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return x.mul_(self.weight)
+        # The same fused kernel the backbone norms use, rather than the
+        # `pow(2).mean()` composition: that one leaves autograd holding the
+        # squared activation and the normalized output on top of the input,
+        # which for a [B, H, T, hd] tensor is the second-largest tensor in the
+        # attention block. The math is identical.
+        return _RMSNorm.apply(x, self.weight, self.eps)
 
 
 def apply_rope(

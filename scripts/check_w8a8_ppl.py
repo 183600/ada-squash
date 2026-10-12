@@ -168,13 +168,32 @@ def wrap_model_w8a8(model: nn.Module):
     importantly `fused_cross_entropy_mean`, which takes `lm_head.weight` as
     an argument - would otherwise keep using the fp32 copy. Wrap a copy
     unless the fp32 weights are throwaway.
+
+    `model.modules()` is recursive, so an `MLP` that `wrap_swiglu_w8a8` has
+    already taken over is *still* descended into afterwards and its three
+    `nn.Linear` children are quantized a second time. That is a full extra
+    quantization pass over the largest weight tensors in the network, per
+    block, and the resulting `quantized_forward` closures are never called
+    because `MLP.forward` has been replaced wholesale. The sub-modules of a
+    wrapped `MLP` are therefore skipped explicitly - continuing the loop does
+    not, because the generator recurses on its own.
+
+    A tied `lm_head` is *not* skipped: the embedding branch only puts the
+    shared matrix on the int8 grid, while the linear branch is what
+    quantizes that GEMM's activation.
     """
+    handled: set[int] = set()
     for m in model.modules():
         if isinstance(m, MLP):
             wrap_swiglu_w8a8(m)
-        elif isinstance(m, nn.Embedding):
+            handled.update(id(child) for child in (m.w1, m.w2, m.w3))
+            continue
+        if isinstance(m, nn.Embedding):
             wrap_embedding_w8a8(m)
-        elif isinstance(m, nn.Linear):
+            continue
+        if isinstance(m, nn.Linear):
+            if id(m) in handled:
+                continue
             wrap_linear_w8a8(m)
     return model
 
@@ -330,20 +349,24 @@ def main():
         rng = torch.Generator(device=device).manual_seed(args.seed)
         # Load fp32 model
         model, _ = load_ckpt(ckpt_path, device=device)
-        # Build a *copy* of the model for quantization so we can compare.
-        # The cleanest way is a deepcopy, but state_dict round-trip is
-        # safer for our custom modules.
-        import copy
-        qmodel = copy.deepcopy(model)
-        qmodel.to(device)
-        wrap_model_w8a8(qmodel)
 
-        ce_fp = ce_q = 0.0
-        n_tok = 0
+        # Build every probe batch up front, so the fp32 and the quantized
+        # measurement see exactly the same data without either model having
+        # to exist while the other runs.
         batches = []
         for _ in range(max(1, args.n_batches)):
             x = make_probe(rng, model.cfg)
             batches.append(x)
+
+        # The cleanest way to compare the two precisions is to quantize a
+        # copy, but `copy.deepcopy` holds both models resident for the whole
+        # measurement while only one of them is ever executed. Measuring the
+        # fp32 model first and then wrapping *the same* model in place halves
+        # peak model memory and leaves the comparison bit-for-bit the same:
+        # `wrap_model_w8a8` is deterministic and the batches are already fixed.
+        ce_fp = 0.0
+        n_tok = 0
+        for x in batches:
             # Shift-by-one targets; the final position has no successor and is
             # padded with `cfg.ignore_index` (out of vocabulary) rather than
             # token 0, which is a real GPT-2 token ("!") and would otherwise
@@ -354,10 +377,19 @@ def main():
             )
             y[:, :-1] = x[:, 1:]
             a, n = compute_ce_sum(model, x, y, device=device)
-            b, _ = compute_ce_sum(qmodel, x, y, device=device)
             ce_fp += a
-            ce_q += b
             n_tok += n
+
+        wrap_model_w8a8(model)
+        ce_q = 0.0
+        for x in batches:
+            y = torch.full(
+                (args.batch_size, args.seq_len), model.cfg.ignore_index,
+                dtype=torch.long, device=device,
+            )
+            y[:, :-1] = x[:, 1:]
+            b, _ = compute_ce_sum(model, x, y, device=device)
+            ce_q += b
         ppl_fp = math.exp(ce_fp / n_tok)
         ppl_q = math.exp(ce_q / n_tok)
 

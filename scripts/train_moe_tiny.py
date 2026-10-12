@@ -36,7 +36,7 @@ import torch.nn.functional as F
 
 from adasquash import build_norm, markov_batch
 from adasquash.attention import CausalSelfAttention
-from adasquash.model import GPTConfig, build_norm_kwargs
+from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean
 from adasquash.utils import (
     ActivationStats, LossSpikeCounter, count_parameters,
 )
@@ -75,11 +75,15 @@ class MoELayer(nn.Module):
         B, T, C = x.shape
         x_flat = x.view(B * T, C)  # [N, C]
         logits = self.router(x_flat)  # [N, E]
+        # The router distribution is needed twice - once for the top-k gate
+        # values and once for the mean probability in the aux loss - so it is
+        # computed once here instead of re-running the softmax for each.
+        probs = logits.softmax(-1)
         # Top-k routing
         if self.top_k == 1:
-            scores, indices = logits.softmax(-1).max(dim=-1, keepdim=True)
+            scores, indices = probs.max(dim=-1, keepdim=True)
         else:
-            scores, indices = logits.softmax(-1).topk(self.top_k, dim=-1)
+            scores, indices = probs.topk(self.top_k, dim=-1)
         # Renormalise the selected gate values so they sum to 1 (Switch /
         # Mixtral convention).
         scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
@@ -131,7 +135,7 @@ class MoELayer(nn.Module):
             0, indices.reshape(-1), torch.ones_like(flat_gate)
         ).detach()
         f_i = tokens_per_expert / n_tokens
-        p_i = logits.softmax(-1).mean(dim=0)
+        p_i = probs.mean(dim=0)
         aux = self.n_experts * (f_i * p_i).sum()
         return y, aux, tokens_per_expert
 
@@ -195,11 +199,13 @@ class MoEGPT(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
-    def forward(self, x, y=None, return_aux=False):
+    def forward(self, x, y=None, return_aux=False, return_logits=True):
         B, T = x.shape
         z = self.tok_emb(x)
         pos = torch.arange(0, T, device=x.device).unsqueeze(0)
-        z = z + self.pos_emb(pos)
+        # In-place, like `GPT.forward`: the embedding's own backward needs only
+        # the indices, so the row-sum never has to be preserved.
+        z.add_(self.pos_emb(pos))
         z = self.drop(z)
 
         aux_total = 0.0
@@ -209,12 +215,23 @@ class MoEGPT(nn.Module):
             aux_total = aux_total + aux
             tpe_list.append(tpe)
         z = self.norm_f(z)
-        logits = self.lm_head(z)
         loss = None
-        if y is not None:
-            ce = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                 y.view(-1), ignore_index=self.cfg.ignore_index)
-            loss = ce + 1e-3 * aux_total
+        if y is not None and not return_logits:
+            # Fused with the output projection: the [B, T, V] logit block is
+            # the largest tensor this model would ever build (a few hundred MB
+            # at the shipped defaults) and nothing but the loss reads it, so
+            # the training path never materializes it.
+            loss = fused_cross_entropy_mean(
+                z.reshape(-1, z.size(-1)), self.lm_head.weight, y.reshape(-1),
+                ignore_index=self.cfg.ignore_index,
+            ) + 1e-3 * aux_total
+            logits = None
+        else:
+            logits = self.lm_head(z)
+            if y is not None:
+                ce = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                     y.view(-1), ignore_index=self.cfg.ignore_index)
+                loss = ce + 1e-3 * aux_total
         if return_aux:
             return logits, loss, aux_total, tpe_list
         return logits, loss
@@ -322,27 +339,30 @@ def main():
         if step % args.stats_every == 0:
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
-        logits, loss, aux, tpe_list = model(x, y, return_aux=True)
+        logits, loss, aux, tpe_list = model(x, y, return_aux=True, return_logits=False)
         del logits
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()
         # Log expert load imbalance. Reported per block: the motivating
         # hypothesis is a drift *with depth*, which a single last-block
-        # number cannot show.
-        expert_cv = [_expert_cv(tpe) for tpe in tpe_list]
+        # number cannot show. The whole per-block vector is staged on-device
+        # and transferred once, rather than one blocking read per block.
+        expert_cv = _expert_cv_per_block(tpe_list)
         exp_cv = expert_cv[-1]
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        loss_spike.update(loss.item())
-        history.append({"step": step, "loss": loss.item(),
-                        "aux": aux.detach().item(),
+        loss_val = loss.detach().item()
+        aux_val = aux.detach().item()
+        loss_spike.update(loss_val)
+        history.append({"step": step, "loss": loss_val,
+                        "aux": aux_val,
                         "expert_cv": exp_cv,
                         "expert_cv_per_block": expert_cv,
                         "n_loss_spikes": loss_spike.n_spikes})
         if step % args.log_every == 0:
-            print(f"  [moe] step={step:4d} loss={loss.item():.4f} aux={aux.detach().item():.4f} "
+            print(f"  [moe] step={step:4d} loss={loss_val:.4f} aux={aux_val:.4f} "
                   f"expert_cv={exp_cv:.3f}", flush=True)
     with open(Path(args.output_dir) / "history.json", "w") as f:
         json.dump(history, f)
@@ -357,6 +377,25 @@ def _expert_cv(tpe) -> float:
     if not isinstance(tpe, torch.Tensor):
         return 0.0
     return (tpe.std() / (tpe.mean() + 1e-6)).item()
+
+
+def _expert_cv_per_block(tpe_list) -> list:
+    """`_expert_cv` for every block, with a single device-to-host transfer.
+
+    Each block's CoV is a 0-dim tensor, so reading them one at a time costs
+    one blocking sync per block per step - enough to stall the launch queue
+    behind the next micro-batch. They are stacked and converted together
+    instead, which is one transfer for the whole model.
+    """
+    cvs = [
+        tpe.std() / (tpe.mean() + 1e-6)
+        for tpe in tpe_list if isinstance(tpe, torch.Tensor)
+    ]
+    if not cvs:
+        return [0.0] * len(tpe_list)
+    if len(cvs) == 1:
+        return [float(cvs[0].item())]
+    return torch.stack([c.detach() for c in cvs]).tolist()
 
 
 if __name__ == "__main__":

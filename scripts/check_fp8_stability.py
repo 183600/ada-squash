@@ -42,7 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from adasquash.model import MLP, build_gpt_124m
-from adasquash.utils import markov_batch
+from adasquash.utils import KurtosisMeter, markov_batch
 
 # Largest finite magnitude of the FP8-E4M3 format used throughout this file.
 FP8_E4M3_MAX = 448.0
@@ -137,12 +137,17 @@ class FP8LinearSim:
         self.module = module
         self.quant = quant
         self.orig_forward = module.forward
+        # The weight is constant across the probe, so its fp8 form is built
+        # once here instead of on every forward: `simulate_fp8` is ~7 full
+        # passes over the weight, and it is the largest operand of its GEMM.
+        with torch.no_grad():
+            self.qw = quant(module.weight)
 
         def fwd(x):
             # `nn.Linear.forward` is exactly `F.linear(x, self.weight,
             # self.bias)`, so the quantized weight is injected here: it is not
             # reachable through the argument list, which takes only `input`.
-            y = F.linear(self.quant(x), self.quant(module.weight), module.bias)
+            y = F.linear(self.quant(x), self.qw, module.bias)
             return self.quant(y)
 
         module.forward = fwd
@@ -160,15 +165,20 @@ class FP8SwiGLUSim:
         self.mlp = mlp
         self.quant = quant
         self.orig_forward = mlp.forward
+        # Same reasoning as `FP8LinearSim`: the three expert projections are
+        # fixed for the whole pass, so their fp8 forms are built once.
+        with torch.no_grad():
+            self.qw1 = quant(mlp.w1.weight)
+            self.qw2 = quant(mlp.w2.weight)
+            self.qw3 = quant(mlp.w3.weight)
 
         def fwd(x):
             q = self.quant
-            w1, w2, w3 = q(mlp.w1.weight), q(mlp.w2.weight), q(mlp.w3.weight)
             x_q = q(x)
-            a = q(F.linear(x_q, w1))
-            b = q(F.linear(x_q, w3))
+            a = q(F.linear(x_q, self.qw1))
+            b = q(F.linear(x_q, self.qw3))
             h = q(F.silu(a) * b)
-            return mlp.drop(q(F.linear(h, w2)))
+            return mlp.drop(q(F.linear(h, self.qw2)))
 
         mlp.forward = fwd
 
@@ -206,6 +216,9 @@ def measure_fp8_divergence(model, x, norm_name: str):
     ranges = []
     fp8_e4m3_min = fp8_min_normal(4)
 
+    def _zero_like_scalar(ref: torch.Tensor) -> torch.Tensor:
+        return torch.zeros((), dtype=ref.dtype, device=ref.device)
+
     def make_stat_hook():
         """One hook feeding both the range table and the quant-error table."""
         def hook(module, inp, out):
@@ -213,23 +226,45 @@ def measure_fp8_divergence(model, x, norm_name: str):
             cls_name = module.__class__.__name__
             has_in = torch.is_tensor(x_in)
             abs_out = out.abs()
-            max_abs_out = abs_out.max().item()
             abs_in = x_in.abs() if has_in else None
-            ranges.append({
-                "module": cls_name,
-                "max_abs_in": abs_in.max().item() if has_in else 0.0,
-                "max_abs_out": max_abs_out,
-                "kurtosis_in": _excess_kurtosis(x_in) if has_in else 0.0,
-            })
             # out is the post-norm activation
             q = to_fp8_e4m3(out)
-            denom = abs_out.mean().item() + 1e-6
+            # Every scalar this hook reports is staged as a 0-dim tensor and
+            # read once. Reading them one at a time costs one blocking
+            # device-to-host copy each - six per norm, ~150 for a 124M model -
+            # and each one drains the queue of kernels the forward has already
+            # issued.
+            scalars = [
+                abs_out.max(),                                   # max_abs_out
+                abs_out.mean(),                               # rel_err denominator
+                (abs_out > FP8_E4M3_MAX).float().mean(),         # overflow
+                (abs_out < fp8_e4m3_min).float().mean() if out.numel() else
+                _zero_like_scalar(abs_out),                      # underflow
+                (q - out).abs().mean(),                          # quant err
+                abs_in.max() if has_in else _zero_like_scalar(abs_out),
+                _excess_kurtosis(x_in) if has_in else _zero_like_scalar(abs_out),
+            ]
+            (
+                max_abs_out, mean_abs_out, overflow, underflow, err,
+                max_abs_in, kurtosis_in,
+            ) = torch.stack(
+                [s.detach().reshape(()).double() for s in scalars]
+            ).tolist()
+            # Added after the widening: `tensor + 1e-6` would fold the
+            # epsilon into the tensor's own (fp32) precision.
+            denom = mean_abs_out + 1e-6
+            ranges.append({
+                "module": cls_name,
+                "max_abs_in": max_abs_in,
+                "max_abs_out": max_abs_out,
+                "kurtosis_in": kurtosis_in,
+            })
             quant_errors.append({
                 "module": cls_name,
                 "max_abs": max_abs_out,
-                "overflow_rate": (abs_out > FP8_E4M3_MAX).float().mean().item(),
-                "underflow_rate": (abs_out < fp8_e4m3_min).float().mean().item() if out.numel() else 0.0,
-                "rel_err": (q - out).abs().mean().item() / denom,
+                "overflow_rate": overflow,
+                "underflow_rate": underflow,
+                "rel_err": err / denom,
             })
         return hook
 
@@ -239,16 +274,18 @@ def measure_fp8_divergence(model, x, norm_name: str):
     def make_block_hook(i):
         def hook(module, inp, out):
             y = out[0] if isinstance(out, tuple) else out
-            if not torch.isfinite(y).all():
-                first_bad.append(i)
-                return
+            # Staged as tensors, not Python bools/floats: truth-testing a
+            # device tensor here would sync once per block per forward. The
+            # two conditions are mutually exclusive (a non-finite stream has
+            # already returned above) so they share one flag list.
+            all_finite = torch.isfinite(y).all()
+            first_bad.append((i, all_finite))
             # `simulate_fp8` saturates anything above `max_val` back down to
             # +-448, so an overflowing residual stream is finite by the time
             # it leaves the wrapper and a finite-check can never see it. The
             # magnitude itself is the thing FP8 cannot represent, so it is
             # recorded here as its own failure mode.
-            if y.abs().amax().item() > FP8_E4M3_MAX:
-                first_over.append(i)
+            first_over.append((i, y.abs().amax()))
         return hook
 
     # Reference logits in fp32 (no hooks: we only want to characterize the
@@ -274,11 +311,25 @@ def measure_fp8_divergence(model, x, norm_name: str):
     for h in handles:
         h.remove()
 
-    # Relative forward divergence of the logits.
+    # The block hooks only staged 0-dim tensors; resolve them now, in one
+    # transfer per list, instead of syncing inside the forward.
+    bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
+    over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
+    first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags)
+                          if not ok), None)
+    first_over_idx = next((i for i, v in zip([i for i, _ in first_over], over_vals)
+                           if v > FP8_E4M3_MAX), None)
+
+    # Relative forward divergence of the logits. Both maxima are taken before
+    # the difference is formed, and the difference is taken in place over the
+    # fp8 block, which is dead as soon as it is consumed - so this holds two
+    # [B, T, V] blocks at peak instead of the four a `a - b` plus a fresh
+    # `.abs()` plus a second `.abs().max()` would.
+    max_abs_fp32 = logits_fp32.abs().max()
     finite = torch.isfinite(logits_fp8).all()
     if finite:
-        rel = ((logits_fp8 - logits_fp32).abs().max()
-               / logits_fp32.abs().max().clamp(min=1e-12)).item()
+        rel = (logits_fp8.sub_(logits_fp32).abs_().max()
+               / max_abs_fp32.clamp(min=1e-12)).item()
         logit_nan = False
     else:
         rel = float("inf")
@@ -329,24 +380,38 @@ def measure_fp8_divergence(model, x, norm_name: str):
         "mean_rel_quant_err_e4m3": mean_rel_err,
         "logit_rel_divergence": rel,
         "logit_nan_under_fp8": logit_nan,
-        "first_nonfinite_layer": first_bad[0] if first_bad else None,
-        "first_overflow_layer": first_over[0] if first_over else None,
+        "first_nonfinite_layer": first_bad_idx,
+        "first_overflow_layer": first_over_idx,
     }
 
 
-def _excess_kurtosis(x: torch.Tensor) -> float:
-    """Excess kurtosis of a tensor, in fp64 for stability."""
-    xd = x.detach().double().flatten()
-    if xd.numel() < 4:
-        return 0.0
-    # `torch.var_mean` returns `(variance, mean)` in that order.
-    var, mean = torch.var_mean(xd, unbiased=False)
-    if var <= 0:
-        return 0.0
-    d2 = xd - mean
-    d2.mul_(d2)
-    d2.mul_(d2)
-    return (d2.mean() / (var * var) - 3.0).item()
+def _excess_kurtosis(x: torch.Tensor):
+    """Excess kurtosis of a tensor, in fp64 for stability.
+
+    Returned as a 0-dim tensor rather than a Python float so the caller can
+    batch it with its other reductions into a single device-to-host transfer.
+    The tensor is consumed in bounded slices: an fp64 copy of a whole
+    [B, T, C] activation, plus the centred-deviation buffer, would otherwise be
+    two full-size fp64 temporaries per norm hook. The recurrence and its merge
+    are the ones `KurtosisMeter` already implements; only the accumulation
+    width is widened, because this probe deliberately looks at activations
+    whose fourth moment overflows fp32.
+    """
+    with torch.no_grad():
+        flat = x.detach().flatten()
+        if flat.numel() < 4:
+            return flat.new_zeros((), dtype=torch.float64)
+        meter = _Float64KurtosisMeter()
+        step = _Float64KurtosisMeter._chunk
+        for start in range(0, flat.numel(), step):
+            meter.update(flat[start:start + step])
+        return flat.new_zeros((), dtype=torch.float64) + meter.result()
+
+
+class _Float64KurtosisMeter(KurtosisMeter):
+    """`KurtosisMeter` accumulating in fp64 instead of fp32."""
+
+    acc_dtype = torch.float64
 
 
 def main():

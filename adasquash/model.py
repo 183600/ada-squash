@@ -285,10 +285,17 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         dt = ctx.compute_dtype
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
-        grad_h = torch.zeros_like(h) if need_h else None
-        grad_w = torch.zeros_like(w) if need_w else None
+        # `empty_like`, not `zeros_like`: with a 50k vocabulary `grad_w` is by
+        # far the largest buffer this node touches, and the first chunk is
+        # written straight into it below, so zero-filling it first would be a
+        # full-size write pass over memory that is overwritten immediately.
+        # (`grad_h` is filled slice by slice, every slice overwritten, so it
+        # needs no zero-fill either.)
+        grad_h = torch.empty_like(h) if need_h else None
+        grad_w = torch.empty_like(w) if need_w else None
         grad_scale = (grad_out / ctx.count).to(dt)
         chunk_rows = ctx.chunk_rows
+        first = True
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
             hc = h[start:end]
@@ -307,9 +314,18 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             probs.masked_fill_(~valid.unsqueeze(-1), 0.0)
             g = probs.to(dt)
             if need_h:
-                grad_h[start:end].addmm_(g, w)
+                # Each slice is written, not accumulated: `grad_h` is filled
+                # one row block at a time and `grad_scale` is already folded
+                # into `g`, so there is nothing to add to.
+                torch.mm(g, w, out=grad_h[start:end])
             if need_w:
-                grad_w.addmm_(g.t(), hc)
+                # `grad_w` on the other hand is accumulated over every chunk,
+                # so only its first write has to skip the addition.
+                if first:
+                    torch.mm(g.t(), hc, out=grad_w)
+                else:
+                    grad_w.addmm_(g.t(), hc)
+            first = False
         hidden_dtype, weight_dtype = ctx.in_dtypes
         if need_h and grad_h.dtype != hidden_dtype:
             grad_h = grad_h.to(hidden_dtype)
@@ -357,11 +373,9 @@ class _LayerScaleResidual(torch.autograd.Function):
     def forward(ctx, x, residual, scale):
         # x: [B, T, C], residual: [B, T, C], scale: [C]
         ctx.save_for_backward(residual, scale)
-        # In-place add after scaling: x + residual * scale
-        # We can't easily fuse the mul+add in-place without copying,
-        # but we can do it out-of-place with a single kernel launch
-        y = x + residual * scale
-        return y
+        # `addcmul` forms the sum and the scaling in a single pass, so the
+        # scaled residual never becomes a full-size tensor of its own.
+        return torch.addcmul(x, residual, scale)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -369,10 +383,12 @@ class _LayerScaleResidual(torch.autograd.Function):
         # grad_x = grad_out
         # grad_residual = grad_out * scale
         # grad_scale = (grad_out * residual).sum(dim=(0, 1))
-        grad_x = grad_out
+        # The reduction is taken first so its temporary is released before the
+        # returned gradient block is materialized; `grad_x` needs no work.
+        red_dims = tuple(range(grad_out.ndim - 1))
+        grad_scale = (grad_out * residual).sum(dim=red_dims)
         grad_residual = grad_out * scale
-        grad_scale = (grad_out * residual).sum(dim=(0, 1))
-        return grad_x, grad_residual, grad_scale
+        return grad_out, grad_residual, grad_scale
 
 
 class Block(nn.Module):
@@ -445,20 +461,35 @@ class _SwiGLU(torch.autograd.Function):
     Fused forward + backward avoids retaining 4 hidden-sized activations.
     Only saves x, a, b, w1, w2, w3 (weights are shared).
     The backward recomputes silu(a) and the gated product analytically.
+
+    `a` and `b` are the irreducible part: `grad_a` needs `a` for the SiLU
+    derivative and `grad_b` needs `silu(a)`, so neither can be dropped. What
+    the backward can avoid is running a full activation block per algebraically
+    distinct term, so the gradient w.r.t. the hidden state accumulates in
+    place (`grad_h` is a private buffer the moment `F.linear` returns it, and
+    it *becomes* `grad_b` once the SiLU factor is folded into it).
     """
 
     @staticmethod
     def forward(ctx, x, w1, w2, w3):
-        a = F.linear(x, w1)
-        b = F.linear(x, w3)
+        # The projections run on a flattened [N, C] view of the activation, so
+        # every reduction below is a 2-D GEMM: that keeps the weight gradients
+        # free of reshaping and lets the two input-gradient projections
+        # accumulate in place. `reshape` is a view for the contiguous [B, T, C]
+        # the block always hands in.
+        lead = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1])
+        a = F.linear(x2, w1)
+        b = F.linear(x2, w3)
         h = F.silu(a)
         h.mul_(b)
         y = F.linear(h, w2)
         # Save only what's needed: x, a, b for backward, weights for grad
-        ctx.save_for_backward(x, a, b, w1, w2, w3)
+        ctx.save_for_backward(x2, a, b, w1, w2, w3)
         ctx.compute_dtype = y.dtype
         ctx.in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)
-        return y
+        ctx.lead = lead
+        return y.view(*lead, -1)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -469,33 +500,45 @@ class _SwiGLU(torch.autograd.Function):
         if x.dtype != dt:
             x = x.to(dt)
 
-        # grad_h = grad_out @ w2^T  [B*T, H]
+        # grad_h = grad_out @ w2^T  [N, H]
+        grad_out = grad_out.reshape(-1, grad_out.shape[-1])
         grad_h = F.linear(grad_out, w2.t())
 
-        # Recompute silu(a) and gated product (memory vs compute tradeoff)
+        # Recompute silu(a) and gated product (memory vs compute tradeoff).
+        # Ordering matters: every temporary below is a hidden-sized block, and
+        # `grad_h` is only released once it has been consumed, so the terms are
+        # taken in the order that lets each one die before the next is born.
         sa = F.silu(a)
-        gated = sa * b  # This is h from forward
-
-        # grad_b = grad_h * silu(a)
-        grad_b = grad_h * sa
-
-        # grad_a = grad_h * b * silu'(a) = grad_h * b * sigmoid(a) * (1 + a * (1 - sigmoid(a)))
-        # Using torch.ops.aten.silu_backward for efficiency
-        grad_a = torch.ops.aten.silu_backward(grad_h * b, a)
+        # grad_a = grad_h * b * silu'(a) = silu_backward(grad_h * b, a).
+        # `torch.ops.aten.silu_backward` for efficiency. Built before `grad_h`
+        # is reused so that the plain gradient is still available here.
+        prod = grad_h * b
+        grad_a = torch.ops.aten.silu_backward(prod, a)
+        del prod
+        # This is h from the forward; only grad_w2 reads it.
+        gated = sa * b
+        # grad_b = grad_h * silu(a), folded into the private `grad_h` buffer.
+        grad_b = grad_h.mul_(sa)
+        del sa
 
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
         if ctx.needs_input_grad[0]:
-            grad_x = F.linear(grad_a, w1.t()) + F.linear(grad_b, w3.t())
+            # Accumulated in place: the second projection writes straight into
+            # the first one's result instead of allocating a third block.
+            grad_x = F.linear(grad_a, w1.t())
+            grad_x.addmm_(grad_b, w3)
         if ctx.needs_input_grad[1]:
-            grad_w1 = grad_a.reshape(-1, grad_a.shape[-1]).t() @ x.reshape(-1, x.shape[-1])
+            grad_w1 = grad_a.t() @ x
         if ctx.needs_input_grad[2]:
-            grad_w2 = grad_out.reshape(-1, grad_out.shape[-1]).t() @ gated.reshape(-1, gated.shape[-1])
+            grad_w2 = grad_out.t() @ gated
         if ctx.needs_input_grad[3]:
-            grad_w3 = grad_b.reshape(-1, grad_b.shape[-1]).t() @ x.reshape(-1, x.shape[-1])
+            grad_w3 = grad_b.t() @ x
 
         xd, w1d, w2d, w3d = ctx.in_dtypes
-        if grad_x is not None and grad_x.dtype != xd:
-            grad_x = grad_x.to(xd)
+        if grad_x is not None:
+            if grad_x.dtype != xd:
+                grad_x = grad_x.to(xd)
+            grad_x = grad_x.view(*ctx.lead, -1)
         if grad_w1 is not None and grad_w1.dtype != w1d:
             grad_w1 = grad_w1.to(w1d)
         if grad_w2 is not None and grad_w2.dtype != w2d:

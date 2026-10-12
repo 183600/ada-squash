@@ -54,6 +54,22 @@ class KurtosisMeter:
     from a stable squashing layer.
     """
 
+    # Elements per bulk update. A [B, T, C] activation is tens of millions of
+    # elements, and the recurrence needs the widened copy plus two more
+    # same-sized temporaries; feeding it in slices caps the transient at
+    # `_KURTOSIS_CHUNK` regardless of the batch the run is configured for.
+    # The parallel-moment merge below is exact, so slicing changes nothing but
+    # the summation order.
+    _chunk = 1 << 22
+
+    # Datatype the moments are accumulated in. fp32 is ample for the bf16 /
+    # fp32 activations sampled during training - the kurtosis of a 25M-element
+    # block is a stable statistic, not a cancellation-prone one. It is *not*
+    # enough where the fourth moment can overflow (activations around 1e18
+    # square into inf at 1e36), which is why callers measuring activations
+    # that large can raise this to float64.
+    acc_dtype = torch.float32
+
     def __init__(self):
         self.reset()
 
@@ -65,10 +81,16 @@ class KurtosisMeter:
         self._M3 = 0.0
 
     def update(self, x: torch.Tensor):
-        # Detach + cast to f32 for numerically stable accumulation,
+        # Detach + widen for numerically stable accumulation,
         # then delegate to a vectorized Welford update (Pébay 2008).
-        x = x.detach().to(torch.float32).flatten()
-        self._bulk_update(x)
+        x = x.detach().flatten()
+        if x.numel() <= self._chunk:
+            self._bulk_update(x.to(self.acc_dtype))
+            return
+        # Slice first, widen per slice: converting the whole tensor at once
+        # is itself a full-size allocation.
+        for start in range(0, x.numel(), self._chunk):
+            self._bulk_update(x[start:start + self._chunk].to(self.acc_dtype))
 
     def _bulk_update(self, x: torch.Tensor):
         """Batched Welford update."""
