@@ -115,7 +115,7 @@ class CausalSelfAttention(nn.Module):
             q, k = apply_rope(q, k, freqs_cis, cos, sin)
             qk_fresh = True
 
-        if qk_fresh:
+        if qk_fresh and not v.is_contiguous():
             v = v.contiguous()
 
         scale = self.scale
