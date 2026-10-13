@@ -55,6 +55,24 @@ _MIN_ALPHA = 1e-4
 _MIN_P = 1e-3
 
 
+def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
+    """Sum away every dim except the trailing (parameter) axis.
+
+    The per-parameter gradients of the fused kernels below are
+    batch/sequence reductions of a full-size elementwise product: a `[C]`
+    parameter is fed by a `[B, T, C]` product, so only the leading dims go.
+    `t.sum(dim=())` would instead reduce *every* dim (an empty dim tuple
+    means "all dims" to torch), which is what
+    `sum(dim=tuple(range(ndim - 1)))` degenerates to for a 1-D input - a
+    single normalized vector, a shape LayerNorm accepts and the DyT family
+    / RMSNorm must accept too. That collapsed the parameter gradient to a
+    scalar and autograd rejected the whole backward pass with an invalid
+    gradient. With only the parameter axis left there is nothing to reduce,
+    so the elementwise product is returned unchanged.
+    """
+    return t if t.ndim <= 1 else t.sum(dim=tuple(range(t.ndim - 1)))
+
+
 def register_norm(name: str):
     def _decorator(cls):
         NORM_REGISTRY[name] = cls
@@ -393,7 +411,7 @@ class _RMSNorm(torch.autograd.Function):
             grad_x = torch.addcmul(gw, x, m * rstd * rstd, value=-1)
         grad_weight = None
         if ctx.needs_input_grad[1]:
-            grad_weight = (gu * x).sum(dim=tuple(range(x.ndim - 1)))
+            grad_weight = _sum_leading_dims(gu * x)
         # The reduction promotes to the weight dtype (autocast keeps norms in
         # fp32), so the gradients are handed back in their inputs' dtypes.
         if grad_x is not None and grad_x.dtype != x.dtype:
@@ -532,7 +550,7 @@ class _DyTCForward(torch.autograd.Function):
             grad_x_scaled = g.log_().mul_(p_val + 1).exp_()
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             if ctx.needs_input_grad[1]:
-                grad_alpha = (grad_x_scaled * x).sum(dim=tuple(range(x.ndim - 1)))
+                grad_alpha = _sum_leading_dims(grad_x_scaled * x)
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha)
 
@@ -544,13 +562,13 @@ class _DyTCForward(torch.autograd.Function):
             # full-size product.
             grad_phi = grad_out * phi
             if need_gamma_grad:
-                grad_gamma = grad_phi.sum(dim=tuple(range(phi.ndim - 1)))
+                grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
                 grad_p = _softsign_p_grad(grad_phi.mul_(gamma), u, p, p_raw)
 
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[4]:
-            grad_beta = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
+            grad_beta = _sum_leading_dims(grad_out)
 
         return grad_x, grad_alpha, grad_p, grad_gamma, grad_beta
 
@@ -671,11 +689,11 @@ class _DyTDForward(torch.autograd.Function):
 
         grad_gamma = None
         if ctx.needs_input_grad[3]:
-            grad_gamma = (grad_out * phi).sum(dim=tuple(range(phi.ndim - 1)))
+            grad_gamma = _sum_leading_dims(grad_out * phi)
 
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[4]:
-            grad_beta = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
+            grad_beta = _sum_leading_dims(grad_out)
 
         return grad_x, grad_alpha_0, grad_k, grad_gamma, grad_beta, None
 
@@ -739,11 +757,11 @@ class _DyTForward(torch.autograd.Function):
 
         grad_gamma = None
         if ctx.needs_input_grad[2]:
-            grad_gamma = (grad_out * phi).sum(dim=tuple(range(phi.ndim - 1)))
+            grad_gamma = _sum_leading_dims(grad_out * phi)
 
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[3]:
-            grad_beta = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
+            grad_beta = _sum_leading_dims(grad_out)
 
         return grad_x, grad_alpha, grad_gamma, grad_beta
 
@@ -918,8 +936,8 @@ class _DyTCDForward(torch.autograd.Function):
                 or ctx.needs_input_grad[3]
             )
             if need_alpha_chain:
-                grad_alpha_c = (grad_x_scaled * x_scaled).sum(
-                    dim=tuple(range(x_scaled.ndim - 1))
+                grad_alpha_c = _sum_leading_dims(
+                    grad_x_scaled * x_scaled
                 ).div_(alpha_c)
 
                 # alpha_c = clamp_min(scale * (1 + delta), _MIN_ALPHA), scale =
@@ -954,14 +972,14 @@ class _DyTCDForward(torch.autograd.Function):
         if need_phi:
             grad_phi = grad_out * phi
             if need_gamma_grad:
-                grad_gamma = grad_phi.sum(dim=tuple(range(phi.ndim - 1)))
+                grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
                 grad_p = _softsign_p_grad(grad_phi.mul_(gamma), u, p, p_raw)
 
         # Gradient w.r.t. beta
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[6]:
-            grad_beta = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
+            grad_beta = _sum_leading_dims(grad_out)
 
         return grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None
 

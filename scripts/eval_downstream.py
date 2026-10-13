@@ -272,11 +272,15 @@ def main():
     results = {"ckpt": args.ckpt, "norm": model_args["norm"], "tasks": {}}
 
     if args.tasks:
-        # Try lm-eval harness; if not available, gracefully skip.
+        # Try lm-eval harness; if not available, gracefully skip. A missing
+        # install surfaces as RuntimeError (the ImportError is re-raised as
+        # one) and an unimplemented wrapper as NotImplementedError - both are
+        # "this path is not available here", and neither may abort the run,
+        # because `--needle-test` and the results file below come after it.
         try:
             res = evaluate_lm_harness(model, args.tasks, args.batch_size)
             results["tasks"].update(res)
-        except NotImplementedError as e:
+        except (NotImplementedError, RuntimeError) as e:
             print(f"[eval] lm-eval path not available: {e}", file=sys.stderr)
 
     if args.needle_test:

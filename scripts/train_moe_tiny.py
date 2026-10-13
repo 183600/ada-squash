@@ -325,9 +325,13 @@ def main():
                 rng, cfg.ignore_index, args.batch_size, args.seq_len, device
             )
         try:
-            return next(data_iter)
+            x, y = next(data_iter)
         except StopIteration:
-            return next(iter(loader))
+            x, y = next(iter(loader))
+        # The HF loader yields CPU tensors; the model, the synthetic corpus
+        # and `rng` all live on `device`, so leaving the batch on the host
+        # dies on the first step with an embedding device mismatch.
+        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
     history = []
     # The reported activation statistics have to describe the same run the
