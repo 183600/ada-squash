@@ -1,5 +1,8 @@
 # DyT++ / AdaSquash
 
+**English** | [中文说明](README_zh.md)
+
+
 > Adaptive Squashing without Statistics for Ultra-Deep and Low-Precision Transformers
 
 This repository is the experimental codebase for the DyT++ proposal: a
