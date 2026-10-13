@@ -114,7 +114,11 @@ def _softsign_forward(xs: torch.Tensor, p):
 
 
 def _softsign_backward_pieces(
-    xs: torch.Tensor, s: torch.Tensor, need_u: bool, need_phi: bool = True
+    xs: torch.Tensor,
+    s: torch.Tensor,
+    need_u: bool,
+    need_phi: bool = True,
+    need_g: bool = True,
 ):
     """Rebuild the backward-only pieces of `phi_p` from the retained pair.
 
@@ -122,7 +126,8 @@ def _softsign_backward_pieces(
     `x`-derivative depends on (`dphi/dx = g^(p+1)`), `phi` is the pre-affine
     activation `dL/dgamma` and `dphi/dp` both reduce over, and `u` is only
     built when the exponent itself carries a gradient. `phi` is skipped the
-    same way when neither reduction reads it.
+    same way when neither reduction reads it, and `g` when only those
+    reductions are live.
     """
     t = xs.abs()
     # `lo` only feeds the reconstructed `phi`/`u`, so it is skipped whenever
@@ -130,14 +135,22 @@ def _softsign_backward_pieces(
     if need_phi or need_u:
         lo = t.clamp(max=1.0)
     r = t.clamp_(min=1.0).reciprocal_()
-    phi = lo.mul(s).copysign_(xs) if need_phi else None
+    if not need_phi:
+        phi = None
+    elif need_u:
+        # `lo` is still owed to `u` below, so `phi` takes its own buffer.
+        phi = lo.mul(s).copysign_(xs)
+    else:
+        # `lo` is dead after this point: fold the scale into it in place.
+        phi = lo.mul_(s).copysign_(xs)
     u = lo.mul_(r) if need_u else None
+    if not need_g:
+        return None, phi, u
     return r.mul_(s), phi, u
 
 
 def _softsign_p_grad(
-    grad_softsign: torch.Tensor,
-    phi: torch.Tensor,
+    grad_phi: torch.Tensor,
     u: torch.Tensor,
     p: torch.Tensor,
     p_raw: torch.Tensor,
@@ -153,6 +166,11 @@ def _softsign_p_grad(
     taken on `u` clamped off zero exactly as the `pow` form clamped it, so a
     zeroed / underflowed element stays finite; `phi` is zero there and zeroes
     the contribution either way.
+
+    `grad_phi` is the caller-owned `dL/dphi` product (`grad_out * phi`,
+    already carrying `gamma` where the layer has one). It is folded into the
+    reduction in place, so the kernel never allocates a second full-size
+    buffer for the product it reduces over.
     """
     log_u = u.clamp_(min=torch.finfo(u.dtype).tiny).log_()
     a = p * log_u
@@ -163,7 +181,7 @@ def _softsign_p_grad(
     # accumulator over a whole activation block cancels most of its own
     # mantissa bits before the scalar survives.
     acc = torch.float32 if u.dtype in (torch.bfloat16, torch.float16) else None
-    red = (grad_softsign * phi).mul_(k).sum(dtype=acc)
+    red = grad_phi.mul_(k).sum(dtype=acc)
     # The forward only saw `clamp(p)`, so below the floor `p` carries no
     # gradient at all.
     red = red * (p_raw > _MIN_P).to(red.dtype)
@@ -253,7 +271,7 @@ class _GeneralizedSoftsign(torch.autograd.Function):
         need_x = ctx.needs_input_grad[0]
         need_p = ctx.needs_input_grad[1] and ctx.need_p_grad
         if need_x or need_p:
-            g, phi, u = _softsign_backward_pieces(x, s, need_p, need_p)
+            g, phi, u = _softsign_backward_pieces(x, s, need_p, need_p, need_x)
         if need_x:
             # The |x| <= 1 branch reduces to s^(p+1) because
             # d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1). The power is taken
@@ -262,7 +280,7 @@ class _GeneralizedSoftsign(torch.autograd.Function):
             # the cost of `pow`.
             grad_x = g.log_().mul_(p + 1).exp_().mul_(grad_out)
         if need_p:
-            grad_p = _softsign_p_grad(grad_out, phi, u, p, p_raw)
+            grad_p = _softsign_p_grad(grad_out * phi, u, p, p_raw)
         return grad_x, grad_p
 
 
@@ -492,35 +510,43 @@ class _DyTCForward(torch.autograd.Function):
         # the *pre*-affine tensor is the one the backward needs. Both are
         # rebuilt from `s`; keeping the post-affine `out` instead would
         # silently differentiate the affine.
-        grad_softsign = grad_out * gamma
         need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
         need_gamma_grad = ctx.needs_input_grad[3]
+        need_phi = need_p_grad or need_gamma_grad
         phi = None
-        g = u = None
-        if need_softsign or need_p_grad or need_gamma_grad:
+        u = None
+        if need_softsign or need_phi:
             g, phi, u = _softsign_backward_pieces(
-                x * alpha, s, need_p_grad, need_p_grad or need_gamma_grad
+                x * alpha, s, need_p_grad, need_phi, need_softsign
             )
 
         p_val = p if p_is_tensor else float(p)
         grad_x = grad_alpha = None
         if need_softsign:
             # dphi/dx_scaled = g^(p+1), taken as exp((p+1) * log(g)) (see
-            # `_GeneralizedSoftsign.backward`).
-            grad_x_scaled = g.log_().mul_(p_val + 1).exp_().mul_(grad_softsign)
+            # `_GeneralizedSoftsign.backward`). The output affine is folded
+            # into the chain as two in-place scales rather than as one
+            # pre-multiplied `grad_out * gamma` tensor: the result is the
+            # same product, without the extra full-size buffer.
+            grad_x_scaled = g.log_().mul_(p_val + 1).exp_()
+            grad_x_scaled.mul_(grad_out).mul_(gamma)
             if ctx.needs_input_grad[1]:
                 grad_alpha = (grad_x_scaled * x).sum(dim=tuple(range(x.ndim - 1)))
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha)
 
-        grad_p = None
-        if need_p_grad:
-            grad_p = _softsign_p_grad(grad_softsign, phi, u, p, p_raw)
-
-        grad_gamma = None
-        if need_gamma_grad:
-            grad_gamma = (grad_out * phi).sum(dim=tuple(range(phi.ndim - 1)))
+        grad_p = grad_gamma = None
+        if need_phi:
+            # One `grad_out * phi` product feeds both reductions: dL/dgamma
+            # sums it as is, and the dphi/dp reduction folds `gamma` into it
+            # afterwards. Reading `gamma` twice would have cost a second
+            # full-size product.
+            grad_phi = grad_out * phi
+            if need_gamma_grad:
+                grad_gamma = grad_phi.sum(dim=tuple(range(phi.ndim - 1)))
+            if need_p_grad:
+                grad_p = _softsign_p_grad(grad_phi.mul_(gamma), u, p, p_raw)
 
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[4]:
@@ -855,8 +881,6 @@ class _DyTCDForward(torch.autograd.Function):
             p = ctx.p_value
 
         # Gradient w.r.t. output of softsign
-        grad_softsign = grad_out * gamma
-
         need_softsign = (
             ctx.needs_input_grad[0]
             or ctx.needs_input_grad[1]
@@ -865,11 +889,12 @@ class _DyTCDForward(torch.autograd.Function):
         )
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[4]
         need_gamma_grad = ctx.needs_input_grad[5]
+        need_phi = need_p_grad or need_gamma_grad
         phi = None
         u = None
-        if need_softsign or need_p_grad or need_gamma_grad:
+        if need_softsign or need_phi:
             g, phi, u = _softsign_backward_pieces(
-                x_scaled, s, need_p_grad, need_p_grad or need_gamma_grad
+                x_scaled, s, need_p_grad, need_phi, need_softsign
             )
 
         p_val = p if p_is_tensor else float(p)
@@ -877,8 +902,11 @@ class _DyTCDForward(torch.autograd.Function):
         if need_softsign:
             # Gradient of generalized_softsign w.r.t. input (x_scaled)
             # dphi/dx = g^(p+1) where g = s * f, taken as exp((p+1) * log(g))
-            # (see `_GeneralizedSoftsign.backward`).
-            grad_x_scaled = g.log_().mul_(p_val + 1).exp_().mul_(grad_softsign)
+            # (see `_GeneralizedSoftsign.backward`). The output affine is
+            # folded in as two in-place scales instead of a pre-multiplied
+            # `grad_out * gamma` buffer (see `_DyTCForward.backward`).
+            grad_x_scaled = g.log_().mul_(p_val + 1).exp_()
+            grad_x_scaled.mul_(grad_out).mul_(gamma)
 
             # Gradient w.r.t. alpha_c (and thus alpha_0, k, delta)
             # x_scaled = x * alpha_c, so d/dalpha_c = grad_x_scaled * x =
@@ -920,15 +948,15 @@ class _DyTCDForward(torch.autograd.Function):
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha_c)
 
-        # Gradient w.r.t. p (if learnable)
-        grad_p = None
-        if need_p_grad:
-            grad_p = _softsign_p_grad(grad_softsign, phi, u, p, p_raw)
-
-        # Gradient w.r.t. gamma
-        grad_gamma = None
-        if need_gamma_grad:
-            grad_gamma = (grad_out * phi).sum(dim=tuple(range(phi.ndim - 1)))
+        # Gradient w.r.t. p (if learnable) and w.r.t. gamma: one
+        # `grad_out * phi` product feeds both reductions.
+        grad_p = grad_gamma = None
+        if need_phi:
+            grad_phi = grad_out * phi
+            if need_gamma_grad:
+                grad_gamma = grad_phi.sum(dim=tuple(range(phi.ndim - 1)))
+            if need_p_grad:
+                grad_p = _softsign_p_grad(grad_phi.mul_(gamma), u, p, p_raw)
 
         # Gradient w.r.t. beta
         grad_beta = None

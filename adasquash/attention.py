@@ -94,15 +94,29 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
+        # Any QK transform reallocates Q and K. From that moment `v` is the
+        # only slice still aliasing the `[B, T, 3C]` projection buffer, and
+        # SDPA keeps `v` for its backward, so the whole 3C buffer would be
+        # pinned alive for the rest of the layer. Materialising `v` hands it
+        # a private C-sized storage instead and lets the projection buffer
+        # go. Without a transform Q, K and V all share one storage and the
+        # buffer is already minimal, so the copy is skipped there.
+        qk_fresh = False
         if self.q_rms is not None:
             q = self.q_rms(q)
             k = self.k_rms(k)
+            qk_fresh = True
         elif self.q_squash is not None:
             q, k = self.q_squash(q, k)
+            qk_fresh = True
 
         if freqs_cis is not None:
-            cos, sin = self._rope_tables(freqs_cis)
+            cos, sin = self._rope_tables(freqs_cis, q.dtype)
             q, k = apply_rope(q, k, freqs_cis, cos, sin)
+            qk_fresh = True
+
+        if qk_fresh:
+            v = v.contiguous()
 
         scale = self.scale
 
@@ -192,7 +206,7 @@ class CausalSelfAttention(nn.Module):
             "logit_std": math.sqrt(var) if var > 0.0 else 0.0,
         }
 
-    def _rope_tables(self, freqs_cis: torch.Tensor):
+    def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
         """Return the expanded (cos, sin) rotary tables, cached per
         (source storage, shape, device, dtype). The tables never require
         grad, so the cache is a plain attribute and does not show up in the
@@ -205,6 +219,11 @@ class CausalSelfAttention(nn.Module):
         (e.g. a re-scaled RoPE base, or a different model sharing the module)
         still get distinct storage pointers. The source is kept alive by the
         cache entry so its storage pointer stays valid.
+
+        The expanded tables live in the source's own dtype and the cast to
+        the activation dtype is memoised beside them, so a mixed-precision
+        model does not re-allocate and re-copy the tables on every layer of
+        every step.
         """
         key = (
             freqs_cis.data_ptr(),
@@ -218,8 +237,16 @@ class CausalSelfAttention(nn.Module):
             f_imag = freqs_cis.imag
             cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
             sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
-            self._rope_cache = (key, freqs_cis, cos, sin)
-        return self._rope_cache[2], self._rope_cache[3]
+            self._rope_cache = (key, freqs_cis, {}, cos, sin)
+        tables = self._rope_cache[2]
+        entry = tables.get(dtype)
+        if entry is None:
+            cos, sin = self._rope_cache[3], self._rope_cache[4]
+            if cos.dtype != dtype:
+                cos, sin = cos.to(dtype), sin.to(dtype)
+            entry = (cos, sin)
+            tables[dtype] = entry
+        return entry
 
 
 # ---------------------------------------------------------------------------

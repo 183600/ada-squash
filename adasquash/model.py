@@ -481,19 +481,25 @@ class _SwiGLU(torch.autograd.Function):
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
         grad_h = F.linear(grad_out, w2.t())
 
-        # Recompute silu(a) and gated product.
-        sa = F.silu(a)
+        # The three hidden-sized buffers this pass needs are kept to a
+        # minimum by the order below: `prod` is dropped before the last one
+        # is allocated, and `sa` is folded into both of its consumers so
+        # that `grad_a`, the gated product and one of {grad_b, sa} are the
+        # only hidden-sized tensors alive at any point.
+        #
         # grad_a = grad_h * b * silu'(a) = silu_backward(grad_h * b, a).
         # `torch.ops.aten.silu_backward` computes the SiLU derivative.
-        # Built before `grad_h` is reused so that the plain gradient is still
-        # available here.
         prod = grad_h * b
         grad_a = torch.ops.aten.silu_backward(prod, a)
         del prod
+
         # This is h from the forward; only grad_w2 reads it.
-        gated = sa * b
-        # grad_b = grad_h * silu(a).
+        sa = F.silu(a)
+        # grad_b = grad_h * silu(a); the product takes over grad_h's buffer.
         grad_b = grad_h.mul_(sa)
+        # grad_a needs `a` for the SiLU derivative and grad_b needs
+        # `silu(a)`, so neither of those two can be dropped.
+        gated = sa.mul_(b)
         del sa
 
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
