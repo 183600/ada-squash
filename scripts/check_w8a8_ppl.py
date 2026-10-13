@@ -203,6 +203,21 @@ def wrap_model_w8a8(model: nn.Module):
             if id(m) in handled:
                 continue
             wrap_linear_w8a8(m)
+    # The `lm_head` wrapper only covers `nn.Linear.forward`, but
+    # `fused_cross_entropy_mean` is handed `lm_head.weight` directly and never
+    # calls it (see `_install_quantized_weight`), so on the measurement path
+    # the output projection would otherwise receive an fp32 activation:
+    # A16xW8 for the largest GEMM in the model and a `ppl_drop` measured on a
+    # partly quantized network. `norm_f`'s output is that projection's input
+    # and nothing else consumes it, so the per-token quantizer is installed on
+    # it instead - a hook that returns a value replaces the module's output.
+    norm_f = getattr(model, "norm_f", None)
+    if isinstance(norm_f, nn.Module) and isinstance(
+        getattr(model, "lm_head", None), nn.Module
+    ):
+        norm_f.register_forward_hook(
+            lambda m, inp, out: quantize_activation_per_token(out)
+        )
     return model
 
 
@@ -317,7 +332,9 @@ def main():
                         "PPL drop is unmeasurable (kept only for parity)")
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     p.add_argument("--dataset-config", default="sample-10BT")
-    p.add_argument("--tokenizer", default="gpt2")
+    p.add_argument("--tokenizer", default="gpt2",
+                   help="tokenizer for --probe dataset; a checkpoint that "
+                        "recorded the one it was trained with wins")
     p.add_argument("--n-states", type=int, default=64,
                    help="state count of the synthetic 'markov' probe")
     p.add_argument("--max-probe-coverage", type=float, default=0.5,
@@ -333,13 +350,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
 
-    dataset_probe = (
-        make_dataset_probe(args.dataset, args.dataset_config, args.tokenizer,
-                           args.batch_size, args.seq_len)
-        if args.probe == "dataset" else None
-    )
-
-    def make_probe(rng, cfg):
+    def make_probe(rng, cfg, dataset_probe):
         if args.probe == "random":
             return _probe_random(rng, cfg.vocab_size, args.batch_size,
                                  args.seq_len, device)
@@ -355,14 +366,34 @@ def main():
         # comparison also carries the variance of a different eval sample.
         rng = torch.Generator(device=device).manual_seed(args.seed)
         # Load fp32 model
-        model, _ = load_ckpt(ckpt_path, device=device)
+        model, ckpt_args = load_ckpt(ckpt_path, device=device)
+        # The probe corpus is tokenized with the checkpoint's own tokenizer:
+        # `train_gpt2.py` records the one it was launched with, and feeding a
+        # 50k-class GPT-2 tokenizer to the depth sweep's 32k-vocabulary model
+        # is an index error out of the embedding (or, for the ids that happen
+        # to fit, a silently differently tokenized corpus).
+        #
+        # The dataset probe is (re)built per checkpoint for the same reason
+        # `rng` is re-seeded: `make_dataset_probe` is a *stateful* stream, so
+        # building it once above would let checkpoint #2 resume where #1
+        # stopped and the two checkpoints would be compared on two different
+        # eval samples. `markov` / `random` are pure functions of `rng` and
+        # are unaffected.
+        dataset_probe = (
+            make_dataset_probe(
+                args.dataset, args.dataset_config,
+                ckpt_args.get("tokenizer") or args.tokenizer,
+                args.batch_size, args.seq_len,
+            )
+            if args.probe == "dataset" else None
+        )
 
         # Build every probe batch up front, so the fp32 and the quantized
         # measurement see exactly the same data without either model having
         # to exist while the other runs.
         batches = []
         for _ in range(max(1, args.n_batches)):
-            x = make_probe(rng, model.cfg)
+            x = make_probe(rng, model.cfg, dataset_probe)
             batches.append(x)
 
         # The cleanest way to compare the two precisions is to quantize a

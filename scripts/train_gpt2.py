@@ -287,6 +287,44 @@ def restore_schedule_args(
     return changed
 
 
+def apply_explicit_optimizer_args(
+    opt, sched, args, explicit: frozenset = frozenset()
+) -> None:
+    """Re-apply the optimizer hyper-parameters the operator actually typed.
+
+    `AdamW.load_state_dict` restores every hyper-parameter of every param
+    group (`lr`, `weight_decay`, `betas`, ...) and `LambdaLR.load_state_dict`
+    restores `base_lrs` on top of that. So building the optimizer from the
+    command line and then loading the checkpoint's state *again* is not
+    enough: a `--lr` / `--weight-decay` / `--beta1` / `--beta2` that survives
+    `restore_schedule_args` as an explicit override would still be silently
+    overwritten one statement later, and the resumed run would keep training
+    on the checkpoint's values while the log claims the override was honoured.
+
+    `beta1` / `beta2` are applied from `args` and `weight_decay` straight into
+    every group (the driver builds exactly one decay and one no-decay group,
+    and the no-decay group is already at 0.0); `lr` has to move through the
+    scheduler, because `LambdaLR` recomputes `param_group["lr"]` from
+    `base_lrs` on every `sched.step()`.
+    """
+    if "lr" in explicit and sched.base_lrs:
+        base = float(args.lr)
+        ratio = base / sched.base_lrs[0]
+        if ratio != 1.0:
+            sched.base_lrs = [lr * ratio for lr in sched.base_lrs]
+            for group in opt.param_groups:
+                group["lr"] = group["lr"] * ratio
+    for group in opt.param_groups:
+        if "weight_decay" in explicit:
+            group["weight_decay"] = args.weight_decay
+        if "beta1" in explicit or "beta2" in explicit:
+            b0, b1 = group["betas"]
+            group["betas"] = (
+                args.beta1 if "beta1" in explicit else b0,
+                args.beta2 if "beta2" in explicit else b1,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Main train loop
 # ---------------------------------------------------------------------------
@@ -367,6 +405,38 @@ def main():
         name for name in _SCHEDULE_ARGS
         if getattr(args, name, None) != p.get_default(name)
     )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Resume: the checkpoint is read *before* the model is built, because its
+    # recorded `args` carry run-defining flags the rebuild has to match.
+    # `torch.compile` prefixes every state-dict key with `_orig_mod.` and a
+    # shape override changes the parameter shapes, so a run whose `--compile`
+    # or depth/width setting differs from the checkpoint's cannot be resumed
+    # at all: `load_state_dict` below fails with a missing-key or a size
+    # mismatch. The sweep launcher passes its shape override through the
+    # environment, which a bare `--resume` does not have, so it is taken from
+    # the checkpoint instead. The precision flag is adopted for the same
+    # reason: switching autocast on or off mid-run moves the whole curve.
+    resume_ckpt = None
+    run_args: dict = {}
+    if args.resume:
+        resume_ckpt = torch.load(
+            args.resume, map_location=device, weights_only=False
+        )
+        run_args = resume_ckpt.get("args") or {}
+        for name in ("compile", "compile_mode"):
+            if name in run_args:
+                setattr(args, name, run_args[name])
+        if "no_bf16" in run_args:
+            args.no_bf16 = bool(run_args["no_bf16"])
+        for env_name, arg_name in (
+            ("ADASQUASH_DEPTH_OVERRIDE", "_depth_override"),
+            ("ADASQUASH_DIM_OVERRIDE", "_dim_override"),
+            ("ADASQUASH_HEADS_OVERRIDE", "_heads_override"),
+        ):
+            if run_args.get(arg_name) is not None:
+                os.environ[env_name] = str(run_args[arg_name])
     args.bf16 = not args.no_bf16
 
     torch.manual_seed(args.seed)
@@ -446,19 +516,16 @@ def main():
     )
     data_iter = iter(loader)
 
-    # Resume: restore model / optimizer / scheduler and the step counter so
-    # the LR schedule continues where it stopped instead of replaying warmup.
-    # The lambda closes over `max_steps` / `warmup` / `min_lr_ratio`, and
-    # `load_state_dict` only restores `last_epoch`, so those values have to
-    # come back from the checkpoint too - otherwise a resumed run silently
-    # follows a different curve than the run it claims to continue.
+    # Resume: restore the step counter and the schedule / optimizer
+    # hyper-parameters the *checkpoint* has to win before the optimizer and
+    # the scheduler are built from the command line. The lambda closes over
+    # `max_steps` / `warmup` / `min_lr_ratio`, and `load_state_dict` only
+    # restores `last_epoch`, so those values have to come back from the
+    # checkpoint too - otherwise a resumed run silently follows a different
+    # curve than the run it claims to continue.
     start_step = 0
-    resume_ckpt = None
-    if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        changed = restore_schedule_args(
-            args, resume_ckpt.get("args") or {}, explicit=explicit
-        )
+    if resume_ckpt is not None:
+        changed = restore_schedule_args(args, run_args, explicit=explicit)
         if changed:
             kept = [n for n in changed if n in explicit]
             adopted = [n for n in changed if n not in explicit]
@@ -481,6 +548,12 @@ def main():
             opt.load_state_dict(resume_ckpt["optimizer"])
         if "scheduler" in resume_ckpt:
             sched.load_state_dict(resume_ckpt["scheduler"])
+        # Those `load_state_dict` calls also put the checkpoint's own
+        # hyper-parameters back on the optimizer / the scheduler's base LRs,
+        # so an explicitly typed override has to be re-applied *after* them:
+        # without this its only effect would be on the tensors that are
+        # loaded over a moment later, i.e. none.
+        apply_explicit_optimizer_args(opt, sched, args, explicit)
 
     # Stability meters
     act_stats = ActivationStats(model)
