@@ -1046,7 +1046,19 @@ def test_fp8_quantizer_respects_format_range():
 
 
 def test_build_llama_tiny_accepts_tie_override():
-    """`tie_word_embeddings` can be overridden through **over."""
+    """`tie_word_embeddings` can be overridden through **over.
+
+    A full ~1B fp32 build needs ~4 GB of RAM just for the weights, so the
+    test is skipped on small-memory runners (the tie/untie wiring it checks
+    is config-level and cannot silently differ with the parameter count).
+    """
+    try:
+        import os
+        _ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        _ram = 1 << 40  # unknown -> assume a big machine
+    if _ram < 6 * 1024**3:
+        pytest.skip("full 1B build needs >6 GB RAM")
     m = build_llama_tiny_1b(norm_name="dytcd", tie_word_embeddings=True)
     assert m.lm_head.weight is m.tok_emb.weight
     m2 = build_llama_tiny_1b(norm_name="dytcd")

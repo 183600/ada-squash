@@ -48,6 +48,23 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Setup Python and test dependencies (gate)
+        run: |
+          set +e
+          python3 --version
+          python3 -m pip install --quiet --upgrade pip 2>/dev/null || true
+          if python3 -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu; then
+            echo "[ok] CPU torch installed for the gate checks"
+          elif python3 -m pip install --quiet torch; then
+            echo "[ok] torch installed (default index)"
+          else
+            echo "[warn] torch install failed; gate degrades to syntax+pin checks only"
+          fi
+          python3 -m pip install --quiet numpy PyYAML pytest 2>/dev/null \
+            || echo "[warn] numpy/PyYAML/pytest install failed; gate degrades further"
+          python3 -c "import torch, numpy, yaml, pytest; print('deps OK')" 2>/dev/null \
+            || echo "[warn] gate dependencies incomplete"
+
       - name: Configure swap (safe version)
         run: |
           set -e
@@ -124,7 +141,12 @@ jobs:
                 "LICENSE": "deny",
                 "LICENSE.*": "deny",
                 "**/LICENSE": "deny",
-                "**/LICENSE.*": "deny"
+                "**/LICENSE.*": "deny",
+                "docs/design_notes.md": "deny",
+                "**/docs/design_notes.md": "deny",
+                "ci_gate.py": "deny",
+                "**/ci_gate.py": "deny",
+                "tests/**": "deny"
               },
               "bash": {
                 "*": "allow",
@@ -142,7 +164,24 @@ jobs:
                 "truncate *LICENSE*": "deny",
                 "unlink *LICENSE*": "deny",
                 "dd *of=LICENSE*": "deny",
-                "find * -name *LICENSE*": "deny"
+                "find * -name *LICENSE*": "deny",
+                "git push*": "deny",
+                "git checkout --orphan*": "deny",
+                "git switch --orphan*": "deny",
+                "git filter-branch*": "deny",
+                "git rebase*": "deny",
+                "git branch -D*": "deny",
+                "git update-ref*": "deny",
+                "git symbolic-ref*": "deny",
+                "git reflog*": "deny",
+                "git gc*": "deny",
+                "git remote add*": "deny",
+                "git remote remove*": "deny",
+                "git remote set-url*": "deny",
+                "rm *design_notes*": "deny",
+                "mv *design_notes*": "deny",
+                "rm *ci_gate*": "deny",
+                "mv *ci_gate*": "deny"
               }
             }
           }
@@ -171,10 +210,10 @@ jobs:
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
 
           # ================= 四阶段提示词 =================
-          PROMPT_PERF='优化代码的性能和显存占用。不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动；README.md 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_BUG='仔细检查代码中是否存在bug或者科研方法层面的问题，如果有就修改代码。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动；README.md 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_APPLY='检查算力申请.md是否有错误，如果有就改好。不要删除或移动算力申请.md，也不要删除或移动 README.md。'
-          PROMPT_CLEAN='不要删除、修改或移动算力申请.md——它是算力申请材料，其中的算力规模与预算估算属于申请所需信息，不属于“多余的内容”，也不属于“关于预算、花费的记录”。确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释，但算力申请.md除外）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，绝对不能删除、修改或移动，也不属于“多余的内容”；README.md 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
+          PROMPT_PERF='优化代码的性能和显存占用，但必须严格遵守 docs/design_notes.md 中标记【固定】的设计决策：注意力主路径必须保持 F.scaled_dot_product_attention 标准基线（它是本研究的对照设施不是研究变量）；不得改动 generalized_softsign 的数值稳定语义（_MIN_P=1e-3、_MIN_ALPHA=1e-4、对 max(|x|,1) 取倒数、copysign 符号处理）；不得删除或绕过任何手写 fused autograd kernel；QKSquash 必须保持 tanh 压缩。性能优化只能在固定设计的约束内进行（内存布局、分块、缓存、原地操作等）。每次改动后运行 python3 ci_gate.py 自检（含全量 pytest 对拍），不通过就自己修好。不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README.md、docs/design_notes.md、ci_gate.py、tests/、算力申请.md 同样绝对不能删除、修改或移动。'
+          PROMPT_BUG='仔细检查代码中是否存在bug或者科研方法层面的问题，如果有就修改代码。修复必须保持 docs/design_notes.md 中【固定】设计的实现方式与数值语义不变，不得借修复之名切换已固定的实现或做无意义的等价重写；不得削弱或删除 tests/ 中的对拍测试。每次修复后运行 python3 ci_gate.py 确认通过。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README.md、docs/design_notes.md、ci_gate.py、tests/、算力申请.md 同样绝对不能删除、修改或移动。'
+          PROMPT_APPLY='检查算力申请.md是否有错误，如果有就改好。不要删除或移动算力申请.md，也不要删除或移动 README.md、docs/design_notes.md、ci_gate.py 和 tests/。'
+          PROMPT_CLEAN='不要删除、修改或移动算力申请.md——它是算力申请材料，其中的算力规模与预算估算属于申请所需信息，不属于“多余的内容”，也不属于“关于预算、花费的记录”。确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释，但算力申请.md除外）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，绝对不能删除、修改或移动，也不属于“多余的内容”；README.md 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”；docs/design_notes.md 是固定的设计决策文档、ci_gate.py 是 CI 质量门禁脚本、tests/ 是对拍测试套件，三都必须原样保留，绝对不能删除、修改或移动。'
 
           # 每阶段单次调用的最大时长（秒）
           PERF_TIMEOUT=$((60*60))     # 1h
@@ -347,6 +386,64 @@ jobs:
           }
           ensure_readme
 
+          # ================= 质量门禁与固定文件防篡改 =================
+          # ci_gate.py：语法 + 设计固定项 + 全量 pytest 对拍；不通过则整段撤销。
+          # design_notes.md / ci_gate.py 以 design-pin 标签为基准恢复
+          # （AI 无 push 权限，动不了标签）。
+          GATE_PATH="ci_gate.py"
+
+          fetch_pinned() {
+            # $1 = repo path, $2 = dest
+            if curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/design-pin/$1" -o "$2" 2>/dev/null && [ -s "$2" ]; then
+              return 0
+            fi
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/$1" -o "$2" 2>/dev/null && [ -s "$2" ]
+          }
+
+          ensure_design_notes() {
+            if fetch_pinned "docs/design_notes.md" /tmp/dn_pinned.md 2>/dev/null; then
+              if [ ! -f docs/design_notes.md ] || ! cmp -s docs/design_notes.md /tmp/dn_pinned.md; then
+                mkdir -p docs
+                cp /tmp/dn_pinned.md docs/design_notes.md
+                echo "[guard] 检测到 design_notes.md 被删除/篡改，已从 design-pin 恢复"
+              fi
+            elif [ ! -f docs/design_notes.md ]; then
+              echo "[warn] design_notes.md 缺失且无法获取固定版本"
+            fi
+          }
+
+          ensure_gate() {
+            if fetch_pinned "ci_gate.py" /tmp/gate_pinned.py 2>/dev/null; then
+              if [ ! -f "$GATE_PATH" ] || ! cmp -s "$GATE_PATH" /tmp/gate_pinned.py; then
+                cp /tmp/gate_pinned.py "$GATE_PATH"
+                echo "[guard] 检测到 ci_gate.py 被删除/篡改，已从 design-pin 恢复"
+              fi
+            elif [ ! -f "$GATE_PATH" ]; then
+              echo "[warn] ci_gate.py 缺失且无法获取固定版本"
+            fi
+          }
+
+          gate_check() {
+            ensure_gate
+            echo "=========== GATE CHECK (syntax + design pins + pytest) ==========="
+            python3 "$GATE_PATH"
+            local EC=$?
+            if [ $EC -eq 0 ]; then
+              echo "[gate] PASS"
+            else
+              echo "[gate] FAIL (exit=$EC) —— 本阶段改动将被撤销"
+            fi
+            return $EC
+          }
+
+          reject_phase() {
+            echo "[gate] git reset --hard HEAD + git clean -fd —— 撤销本阶段全部改动"
+            git reset --hard HEAD
+            git clean -fd
+            ensure_design_notes
+            ensure_gate
+          }
+
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
@@ -358,6 +455,8 @@ jobs:
             ensure_license
             ensure_apply
             ensure_readme
+            ensure_design_notes
+            ensure_gate
             git add -A || true
             git commit -m "auto: iteration $1" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
@@ -370,6 +469,15 @@ jobs:
             ensure_license
             ensure_apply
             ensure_readme
+            ensure_design_notes
+            ensure_gate
+            # 语法快速检查：半成品代码不允许进入历史
+            if [ -f "$GATE_PATH" ] && ! python3 "$GATE_PATH" --syntax-only; then
+              echo "[trap] 语法检查未通过，丢弃未提交改动"
+              git reset --hard HEAD
+              git clean -fd
+              exit 0
+            fi
             git add -A || true
             if ! git diff --cached --quiet; then
               git commit -m "auto: partial work saved on shutdown" || true
@@ -491,8 +599,13 @@ jobs:
               echo ">>> iteration #$i | phase=$phase | budget=${T}s"
               run_phase "$phase" "$P" "$T"
 
-              # 无论成功失败，先把已完成的改动提交上去
-              commit_and_push "$i-$phase"
+              # ---- 质量门禁：通过才提交；不通过则整段撤销 ----
+              ensure_design_notes
+              if gate_check; then
+                commit_and_push "$i-$phase"
+              else
+                reject_phase
+              fi
 
               sleep 5
             done
@@ -554,6 +667,31 @@ jobs:
               fi
             fi
             [ -f README.md ] && echo "[guard] 收尾阶段发现 README.md 被删，已恢复"
+          fi
+          # 防删自愈：design_notes.md / ci_gate.py（design-pin 基准，标签不存在时退回触发提交）
+          fetch_pinned_final() {
+            if curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/design-pin/$1" -o "$2" 2>/dev/null && [ -s "$2" ]; then
+              return 0
+            fi
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/$1" -o "$2" 2>/dev/null && [ -s "$2" ]
+          }
+          if fetch_pinned_final "docs/design_notes.md" /tmp/dn_final.md; then
+            if [ ! -f docs/design_notes.md ] || ! cmp -s docs/design_notes.md /tmp/dn_final.md; then
+              mkdir -p docs && cp /tmp/dn_final.md docs/design_notes.md
+              echo "[guard] 收尾阶段发现 design_notes.md 被删/改，已恢复"
+            fi
+          fi
+          if fetch_pinned_final "ci_gate.py" /tmp/gate_final.py; then
+            if [ ! -f ci_gate.py ] || ! cmp -s ci_gate.py /tmp/gate_final.py; then
+              cp /tmp/gate_final.py ci_gate.py
+              echo "[guard] 收尾阶段发现 ci_gate.py 被删/改，已恢复"
+            fi
+          fi
+          # 质量门禁：收尾状态必须可运行，否则回退到最后一次已验证状态
+          if [ -f ci_gate.py ] && ! python3 ci_gate.py; then
+            echo "[gate] 收尾状态未通过，回退到 HEAD"
+            git reset --hard HEAD
+            git clean -fd
           fi
           git add -A
           git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
