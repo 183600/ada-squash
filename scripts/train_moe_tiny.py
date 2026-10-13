@@ -36,7 +36,9 @@ import torch.nn.functional as F
 
 from adasquash import build_norm, markov_batch
 from adasquash.attention import CausalSelfAttention
-from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean
+from adasquash.model import (
+    GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, _LayerScaleResidual,
+)
 from adasquash.utils import (
     ActivationStats, LossSpikeCounter, count_parameters,
 )
@@ -163,10 +165,18 @@ class MoEBlock(nn.Module):
     def forward(self, x, freqs_cis=None):
         h = self.norm1(x)
         a, _ = self.attn(h, freqs_cis=freqs_cis)
-        x = x + (self.ls1 * a if self.use_layerscale else a)
+        if self.use_layerscale:
+            # One fused pass, as in the dense `Block`: the scaled residual
+            # never becomes a full-size tensor of its own.
+            x = _LayerScaleResidual.apply(x, a, self.ls1)
+        else:
+            x = x + a
         h = self.norm2(x)
         m, aux, tpe = self.moe(h)
-        x = x + (self.ls2 * m if self.use_layerscale else m)
+        if self.use_layerscale:
+            x = _LayerScaleResidual.apply(x, m, self.ls2)
+        else:
+            x = x + m
         return x, aux, tpe
 
 

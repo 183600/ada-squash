@@ -39,8 +39,10 @@ class MaxAbsMeter:
 
     def update(self, x: torch.Tensor):
         with torch.no_grad():
-            # max(|x|) = max(max(x), -min(x))
-            v = torch.maximum(x.max(), -x.min()).item()
+            # max(|x|) = max(max(x), -min(x)), with both extrema taken in a
+            # single fused reduction rather than two passes over the block.
+            mn, mx = torch.aminmax(x)
+            v = torch.maximum(mx, -mn).item()
         if v > self.value:
             self.value = v
         self.count += 1
