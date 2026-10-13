@@ -101,8 +101,12 @@ def _softsign_forward(xs: torch.Tensor, p):
     hi = t.clamp_(min=1.0).reciprocal_()
     # u = lo * hi.
     u = hi.mul_(lo)
-    # s = (1 + u^p)^(-1/p), evaluated through log1p on a base <= 1.
-    s = u.pow_(p).log1p_().mul_(-1.0 / p).exp_()
+    # s = (1 + u^p)^(-1/p), evaluated through log1p on a base <= 1. The
+    # power is taken as `exp(p * log(u))`: `u <= 1` keeps `p * log(u) <= 0`,
+    # so the exponential lands in (0, 1] exactly where `pow` put it (including
+    # the `u == 0` limit, where `log(0) * p = -inf -> exp(-inf) = 0 = 0^p`),
+    # while an exp/log pair costs roughly half of a `pow`.
+    s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     # The sign rides on the sign bit of `xs` rather than on a separate
     # `torch.sign` pass, so `|x| = inf` still yields +-1 instead of inf * 0.
     phi = lo.mul_(s).copysign_(xs)
@@ -252,8 +256,11 @@ class _GeneralizedSoftsign(torch.autograd.Function):
             g, phi, u = _softsign_backward_pieces(x, s, need_p, need_p)
         if need_x:
             # The |x| <= 1 branch reduces to s^(p+1) because
-            # d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1).
-            grad_x = g.pow_(p + 1).mul_(grad_out)
+            # d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1). The power is taken
+            # as `exp((p+1) * log(g))`: `g > 0` keeps the log finite (and
+            # `g == 0` still lands on 0), and the exp/log pair is about half
+            # the cost of `pow`.
+            grad_x = g.log_().mul_(p + 1).exp_().mul_(grad_out)
         if need_p:
             grad_p = _softsign_p_grad(grad_out, phi, u, p, p_raw)
         return grad_x, grad_p
@@ -499,8 +506,9 @@ class _DyTCForward(torch.autograd.Function):
         p_val = p if p_is_tensor else float(p)
         grad_x = grad_alpha = None
         if need_softsign:
-            # dphi/dx_scaled = g^(p+1).
-            grad_x_scaled = g.pow_(p_val + 1).mul_(grad_softsign)
+            # dphi/dx_scaled = g^(p+1), taken as exp((p+1) * log(g)) (see
+            # `_GeneralizedSoftsign.backward`).
+            grad_x_scaled = g.log_().mul_(p_val + 1).exp_().mul_(grad_softsign)
             if ctx.needs_input_grad[1]:
                 grad_alpha = (grad_x_scaled * x).sum(dim=tuple(range(x.ndim - 1)))
             if ctx.needs_input_grad[0]:
@@ -598,7 +606,10 @@ class _DyTDForward(torch.autograd.Function):
         # `phi` (pre-affine) is the retained activation: the tanh derivative
         # reads `1 - phi^2` and `dL/dgamma` reads `phi`, so saving the
         # post-affine `out` would differentiate `gamma * tanh(.) + beta`.
-        phi = torch.tanh(a * x)
+        # The product already allocated its buffer, so the squash runs in
+        # place on it instead of adding a second [.., C] allocation.
+        phi = a.mul(x)
+        phi.tanh_()
         if beta is not None:
             out = torch.addcmul(beta, phi, gamma)
         else:
@@ -675,7 +686,10 @@ class _DyTForward(torch.autograd.Function):
         # tanh derivative is `1 - phi^2` and `dL/dgamma` is `sum(grad_out *
         # phi)`. Retaining the post-affine output instead would make both read
         # the affine as if it were the activation.
-        phi = torch.tanh(alpha * x)
+        # The product already allocated its buffer, so the squash runs in
+        # place on it instead of adding a second [.., C] allocation.
+        phi = alpha.mul(x)
+        phi.tanh_()
         if beta is not None:
             out = torch.addcmul(beta, phi, gamma)
         else:
@@ -862,8 +876,9 @@ class _DyTCDForward(torch.autograd.Function):
         grad_x = grad_alpha_0 = grad_k = grad_delta = None
         if need_softsign:
             # Gradient of generalized_softsign w.r.t. input (x_scaled)
-            # dphi/dx = g^(p+1) where g = s * f.
-            grad_x_scaled = g.pow_(p_val + 1).mul_(grad_softsign)
+            # dphi/dx = g^(p+1) where g = s * f, taken as exp((p+1) * log(g))
+            # (see `_GeneralizedSoftsign.backward`).
+            grad_x_scaled = g.log_().mul_(p_val + 1).exp_().mul_(grad_softsign)
 
             # Gradient w.r.t. alpha_c (and thus alpha_0, k, delta)
             # x_scaled = x * alpha_c, so d/dalpha_c = grad_x_scaled * x =

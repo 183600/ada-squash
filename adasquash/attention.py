@@ -165,12 +165,15 @@ class CausalSelfAttention(nn.Module):
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
         peak = torch.zeros((), dtype=q.dtype, device=device)
+        # Complement of the causal triangle, built once rather than re-derived
+        # for every block below.
+        drop = ~keep
         k_t = k.transpose(-1, -2)
         for start in range(0, T, rows):
             end = min(start + rows, T)
             block = torch.matmul(q[:, :, start:end], k_t)
             block.mul_(scale)
-            block.masked_fill_(~keep[start:end], 0.0)
+            block.masked_fill_(drop[start:end], 0.0)
             # Signed sum first: the variance needs `sum(x)`, and the absolute
             # pass below would have thrown the signs away.
             acc_x = acc_x + block.sum(dtype=torch.float64)
