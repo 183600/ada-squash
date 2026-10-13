@@ -198,8 +198,7 @@ def _softsign_p_grad(
 
     `grad_phi` is the caller-owned `dL/dphi` product (`grad_out * phi`,
     already carrying `gamma` where the layer has one). It is folded into the
-    reduction in place, so the kernel never allocates a second full-size
-    buffer for the product it reduces over.
+    reduction in place.
     """
     log_u = log_u.clamp_(min=math.log(torch.finfo(log_u.dtype).tiny))
     a = p * log_u
@@ -671,7 +670,7 @@ class _DyTDForward(torch.autograd.Function):
         # reads `1 - phi^2` and `dL/dgamma` reads `phi`, so saving the
         # post-affine `out` would differentiate `gamma * tanh(.) + beta`.
         # The product already allocated its buffer, so the squash runs in
-        # place on it instead of adding a second [.., C] allocation.
+        # place on it.
         phi = a.mul(x)
         phi.tanh_()
         if beta is not None:
@@ -751,7 +750,7 @@ class _DyTForward(torch.autograd.Function):
         # phi)`. Retaining the post-affine output instead would make both read
         # the affine as if it were the activation.
         # The product already allocated its buffer, so the squash runs in
-        # place on it instead of adding a second [.., C] allocation.
+        # place on it.
         phi = alpha.mul(x)
         phi.tanh_()
         if beta is not None:
@@ -892,8 +891,7 @@ class _DyTCDForward(torch.autograd.Function):
         # is exact here because `alpha_c` is the *clamped* value the product
         # was taken with and the floor keeps the divisor away from zero.
         # `s` is deliberately *not* kept: it is re-derived from `x_scaled`
-        # and `p` in the backward, which is one `exp` cheaper in memory than
-        # a full `[.., C]` block per norm held for the whole forward pass.
+        # and `p` in the backward.
         # `p` has by now been replaced by its clamped copy, which carries no
         # grad flag inside `forward`; the *raw* input is what says whether the
         # exponent is trainable, so the flag is read off that.

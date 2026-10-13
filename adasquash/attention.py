@@ -94,13 +94,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Any QK transform reallocates Q and K. From that moment `v` is the
-        # only slice still aliasing the `[B, T, 3C]` projection buffer, and
-        # SDPA keeps `v` for its backward, so the whole 3C buffer would be
-        # pinned alive for the rest of the layer. Materialising `v` hands it
-        # a private C-sized storage instead and lets the projection buffer
-        # go. Without a transform Q, K and V all share one storage and the
-        # buffer is already minimal, so the copy is skipped there.
+        # A QK transform reallocates Q and K into fresh storages; `v` keeps
+        # aliasing the `[B, T, 3C]` projection buffer it was split from, and
+        # SDPA holds `v` through its backward, so it is materialized here.
+        # Without a transform Q, K and V all still share one storage, so the
+        # copy is skipped.
         qk_fresh = False
         if self.q_rms is not None:
             q = self.q_rms(q)

@@ -266,8 +266,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             end = min(start + chunk_rows, targets.numel())
             # The chunk's logits are this node's own GEMM output - the cast
             # allocates a private copy whenever it changes the dtype - so the
-            # log-softmax runs in place on them instead of adding a second
-            # `[chunk, V]` block to the peak.
+            # log-softmax runs in place on them.
             chunk_logits = F.linear(h[start:end], w).to(acc)
             torch.log_softmax(chunk_logits, -1, out=chunk_logits)
             # `log_softmax` + `nll_loss` is what `F.cross_entropy` runs; the
@@ -505,11 +504,9 @@ class _SwiGLU(torch.autograd.Function):
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
         grad_h = F.linear(grad_out, w2.t())
 
-        # The three hidden-sized buffers this pass needs are kept to a
-        # minimum by the order below: `prod` is dropped before the last one
-        # is allocated, and `sa` is folded into both of its consumers so
-        # that `grad_a`, the gated product and one of {grad_b, sa} are the
-        # only hidden-sized tensors alive at any point.
+        # The temporaries are taken in a fixed order so each one is dead
+        # before the next is born: `prod` is dropped once `grad_a` has been
+        # derived from it, and `sa` is folded into both of its consumers.
         #
         # grad_a = grad_h * b * silu'(a) = silu_backward(grad_h * b, a).
         # `torch.ops.aten.silu_backward` computes the SiLU derivative.
