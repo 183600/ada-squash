@@ -223,8 +223,15 @@ class _GeneralizedSoftsign(torch.autograd.Function):
         if need_p:
             a = u.pow(p)
             inv = a.add(1.0).reciprocal()  # = 1 / (1 + u^p) = s^p
-            logu = u.clamp(min=torch.finfo(u.dtype).tiny).log()
-            k = a.log1p() / (p * p) - (1.0 - inv) * logu / p
+            # Compute the (1 - inv) * log(u) / p term safely to avoid 0 * inf at u=0.
+            # (1 - inv) = u^p / (1 + u^p) = a / (1 + a), so the term is
+            # a * log(u) / (p * (1 + a)). At u=0, a=0 and the limit is 0.
+            log_term = torch.where(
+                u > 0,
+                a * u.clamp(min=torch.finfo(u.dtype).tiny).log() / (p * (1.0 + a)),
+                torch.zeros_like(u),
+            )
+            k = a.log1p() / (p * p) - log_term
             # Reduce the [N, C] products in fp32 under bf16 autocast: a bf16
             # accumulator over a whole activation block cancels most of its
             # own mantissa bits before the scalar survives.
@@ -486,8 +493,15 @@ class _DyTCForward(torch.autograd.Function):
         if need_p_grad:
             a = u.pow(p)
             inv = a.add(1.0).reciprocal()
-            logu = u.clamp(min=torch.finfo(u.dtype).tiny).log()
-            k_term = a.log1p() / (p * p) - (1.0 - inv) * logu / p
+            # Compute the (1 - inv) * log(u) / p term safely to avoid 0 * inf at u=0.
+            # (1 - inv) = u^p / (1 + u^p) = a / (1 + a), so the term is
+            # a * log(u) / (p * (1 + a)). At u=0, a=0 and the limit is 0.
+            log_term = torch.where(
+                u > 0,
+                a * u.clamp(min=torch.finfo(u.dtype).tiny).log() / (p * (1.0 + a)),
+                torch.zeros_like(u),
+            )
+            k_term = a.log1p() / (p * p) - log_term
             acc_dtype = torch.float32 if u.dtype in (torch.bfloat16, torch.float16) else None
             red = (grad_softsign * phi * k_term).sum(dtype=acc_dtype)
             # The forward only saw `clamp(p)`, so below the floor `p` carries
@@ -878,8 +892,15 @@ class _DyTCDForward(torch.autograd.Function):
             # dphi/dp = phi * [log1p(u^p)/p^2 - (1 - s^p) * log(u) / p]
             a = u.pow(p)
             inv = a.add(1.0).reciprocal()  # = s^p
-            logu = u.clamp(min=torch.finfo(u.dtype).tiny).log()
-            k_term = a.log1p() / (p * p) - (1.0 - inv) * logu / p
+            # Compute the (1 - inv) * log(u) / p term safely to avoid 0 * inf at u=0.
+            # (1 - inv) = u^p / (1 + u^p) = a / (1 + a), so the term is
+            # a * log(u) / (p * (1 + a)). At u=0, a=0 and the limit is 0.
+            log_term = torch.where(
+                u > 0,
+                a * u.clamp(min=torch.finfo(u.dtype).tiny).log() / (p * (1.0 + a)),
+                torch.zeros_like(u),
+            )
+            k_term = a.log1p() / (p * p) - log_term
             acc_dtype = torch.float32 if u.dtype in (torch.bfloat16, torch.float16) else None
             red = (grad_softsign * phi * k_term).sum(dtype=acc_dtype)
             # The forward only saw `clamp(p)`, so below the floor `p` carries
