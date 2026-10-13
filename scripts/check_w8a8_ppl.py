@@ -52,21 +52,29 @@ def quantize_weight_per_channel(w: torch.Tensor, n_bits: int = 8):
     accessors (a tied embedding / head) be quantized more than once without
     the copies drifting apart.
     """
-    mx = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+    mx = w.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-6)
     q_max = (2 ** (n_bits - 1)) - 1
     scale = mx / q_max
-    q = torch.round(w / scale).clamp(-q_max - 1, q_max)
-    return q * scale, scale
+    # `w / scale` is already a buffer of its own, so the grid rounding, the
+    # saturation clamp and the dequantizing scale all run on it.
+    q = w / scale
+    q.round_()
+    q.clamp_(-q_max - 1, q_max)
+    q.mul_(scale)
+    return q, scale
 
 
 def quantize_activation_per_token(x: torch.Tensor, n_bits: int = 8):
     """Per-token (last-dim) symmetric int quantization.
     x: [..., C] -> [..., C]"""
-    mx = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+    mx = x.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-6)
     q_max = (2 ** (n_bits - 1)) - 1
     scale = mx / q_max
-    q = torch.round(x / scale).clamp(-q_max - 1, q_max)
-    return q * scale
+    q = x / scale
+    q.round_()
+    q.clamp_(-q_max - 1, q_max)
+    q.mul_(scale)
+    return q
 
 
 def _install_quantized_weight(linear: nn.Module, qw: torch.Tensor):
@@ -130,8 +138,11 @@ def wrap_swiglu_w8a8(mlp):
         x_q = qa(x)
         a = qa(F.linear(x_q, weights[0]))
         b = qa(F.linear(x_q, weights[2]))
-        h = qa(F.silu(a) * b)
-        return mlp.drop(F.linear(h, weights[1]))
+        # The gated product folds into the silu buffer, so the SwiGLU hidden
+        # activation never leaves a second full-size tensor behind.
+        h = F.silu(a)
+        h.mul_(b)
+        return mlp.drop(F.linear(qa(h), weights[1]))
 
     mlp.forward = quantized_forward
     return mlp

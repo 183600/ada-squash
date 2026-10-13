@@ -116,8 +116,12 @@ class MoELayer(nn.Module):
                 tok = token_of[start:end]
                 gate = gate_of[start:end].unsqueeze(-1)  # [n_e, 1]
                 xe = x_flat.index_select(0, tok)         # [n_e, C]
-                h = F.silu(xe @ self.experts_w1[e]) * (xe @ self.experts_w3[e])
-                y.index_add_(0, tok, (h @ self.experts_w2[e]) * gate)
+                # `h` is the silu activation's own buffer: the gate product
+                # folds into it rather than leaving a second [n_e, H] behind,
+                # and the expert output is scaled on its own buffer too.
+                h = F.silu(xe @ self.experts_w1[e])
+                h.mul_(xe @ self.experts_w3[e])
+                y.index_add_(0, tok, (h @ self.experts_w2[e]).mul_(gate))
             start = end
         y = self.drop(y)
         y = y.view(B, T, C)

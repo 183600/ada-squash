@@ -176,8 +176,11 @@ class FP8SwiGLUSim:
             x_q = q(x)
             a = q(F.linear(x_q, self.qw1))
             b = q(F.linear(x_q, self.qw3))
-            h = q(F.silu(a) * b)
-            return mlp.drop(q(F.linear(h, self.qw2)))
+            # The gated product folds into the silu buffer, so the SwiGLU
+            # hidden activation never leaves a second full-size tensor behind.
+            h = F.silu(a)
+            h.mul_(b)
+            return mlp.drop(q(F.linear(q(h), self.qw2)))
 
         mlp.forward = fwd
 
@@ -236,7 +239,9 @@ def measure_fp8_divergence(model, x, norm_name: str):
                 (abs_out > FP8_E4M3_MAX).float().mean(),         # overflow
                 (abs_out < fp8_e4m3_min).float().mean() if out.numel() else
                 _zero_like_scalar(abs_out),                      # underflow
-                (q - out).abs().mean(),                          # quant err
+                # `q` is this pass's own dequantized-copy buffer and is dead
+                # after it, so the deviation is formed on it.
+                q.sub_(out).abs_().mean(),                       # quant err
                 abs_in.max() if has_in else _zero_like_scalar(abs_out),
                 _excess_kurtosis(x_in) if has_in else _zero_like_scalar(abs_out),
             ]

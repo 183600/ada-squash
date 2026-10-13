@@ -984,6 +984,10 @@ class QKSquash(nn.Module):
     without saturating, so one dominant channel can still drive the logit;
     `tanh` clips it. Only the incoming activations are touched, so the
     module stays a pure element-wise function of Q/K.
+
+    The compression is `torch.tanh` on the scaled Q/K. The scale owns a
+    fresh buffer of its own, so the squash runs as the in-place form of
+    `tanh` on it instead of leaving a second full-size copy behind.
     """
 
     def __init__(self, alpha_q_init: float = 1.0, alpha_k_init: float = 1.0):
@@ -992,7 +996,13 @@ class QKSquash(nn.Module):
         self.alpha_k = nn.Parameter(torch.tensor(float(alpha_k_init)))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
-        return torch.tanh(self.alpha_q * q), torch.tanh(self.alpha_k * k)
+        q = q * self.alpha_q
+        k = k * self.alpha_k
+        # The scale above already owns a [B, H, T, hd] buffer, so the
+        # compression is taken on it rather than on a second copy out of it.
+        q.tanh_()
+        k.tanh_()
+        return q, k
 
 
 __all__ = [
