@@ -39,8 +39,7 @@ class MaxAbsMeter:
 
     def update(self, x: torch.Tensor):
         with torch.no_grad():
-            # max(|x|) = max(max(x), -min(x)), with both extrema taken in a
-            # single fused reduction rather than two passes over the block.
+            # max(|x|) = max(max(x), -min(x)).
             mn, mx = torch.aminmax(x)
             v = torch.maximum(mx, -mn).item()
         if v > self.value:
@@ -57,11 +56,9 @@ class KurtosisMeter:
     """
 
     # Elements per bulk update. A [B, T, C] activation is tens of millions of
-    # elements, and the recurrence needs the widened copy plus two more
-    # same-sized temporaries; feeding it in slices caps the transient at
-    # `_KURTOSIS_CHUNK` regardless of the batch the run is configured for.
-    # The parallel-moment merge below is exact, so slicing changes nothing but
-    # the summation order.
+    # elements, so the recurrence is fed in slices regardless of the batch the
+    # run is configured for. The parallel-moment merge below is exact, so
+    # slicing changes nothing but the summation order.
     _chunk = 1 << 22
 
     # Datatype the moments are accumulated in. fp32 is ample for the bf16 /
@@ -89,8 +86,7 @@ class KurtosisMeter:
         if x.numel() <= self._chunk:
             self._bulk_update(x.to(self.acc_dtype))
             return
-        # Slice first, widen per slice: converting the whole tensor at once
-        # is itself a full-size allocation.
+        # Slice first, widen per slice.
         for start in range(0, x.numel(), self._chunk):
             self._bulk_update(x[start:start + self._chunk].to(self.acc_dtype))
 
@@ -107,7 +103,6 @@ class KurtosisMeter:
         x_var_t, x_mean_t = torch.var_mean(x, unbiased=False)
         xc = x - x_mean_t
         xc2 = xc * xc
-        # vecdot reduces without materializing the product.
         x_m3_t = torch.linalg.vecdot(xc, xc2)
         x_m4_t = torch.linalg.vecdot(xc2, xc2)
         x_mean, x_var, x_m3, x_m4 = torch.stack(
@@ -349,8 +344,7 @@ class LossSpikeCounter:
         so dropping it makes the first post-resume steps blind to a jump
         away from the pre-resume loss scale, and `n_spikes` is the running
         count the training log reports. `history` stays out of it - it is a
-        local debugging list and would make the checkpoint grow without
-        bound.
+        local debugging list.
         """
         return {"ema": self.ema, "n_spikes": self.n_spikes}
 

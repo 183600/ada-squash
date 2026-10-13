@@ -152,8 +152,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
         if measure:
             # `reset=False` after the first window so the reported activation
             # statistics pool every sampled step of the run instead of
-            # describing only the last sampling window (which, with the
-            # shipped config, is step 800 while `final_loss` is step 999).
+            # describing only the last sampling window.
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
         loss = model(x, y, return_logits=False)[1]

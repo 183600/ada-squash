@@ -151,13 +151,10 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     reduction over rows is split.
 
     The backward writes into a private gradient buffer rather than reusing
-    the saved logit block. Reusing it would be the cheaper option, but the
-    block is not the node's private property: `GPT.forward(..., 
-    return_logits=True)` hands the very same tensor back to its caller, so
-    overwriting it in place would leave that caller holding gradient values
-    stamped over its logits after `loss.backward()`. The training path never
-    materializes the block at all (`fused_cross_entropy_mean`), so the buffer
-    is only paid for on the path that explicitly asked for the logits.
+    the saved logit block: `GPT.forward(..., return_logits=True)` hands the
+    very same tensor back to its caller, so overwriting it in place would
+    leave that caller holding gradient values stamped over its logits after
+    `loss.backward()`.
     """
 
     @staticmethod
@@ -243,33 +240,21 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
     Mean cross-entropy of `hidden @ weight.T` against `targets`, fused with
     the projection that produces the logits.
 
-    Chunking `F.cross_entropy` alone still leaves the full [N, V] logit
-    block resident: it is the projection's output, so it is alive for the
-    whole forward pass *and* retained by the chunked-loss node for the
-    backward. With a 50k vocabulary it is by a wide margin the largest
-    tensor in the model - larger than every other activation put together -
-    and nothing else in the graph needs it.
-
-    The forward builds one row chunk of logits at a time and throws it
-    away, and the backward re-derives each chunk from the `[N, C]` hidden
-    states that the rest of the graph already keeps. See
-    `fused_cross_entropy_mean`.
+    The forward builds one row chunk of logits at a time, and the backward
+    re-derives each chunk from the `[N, C]` hidden states that the rest of
+    the graph already keeps. See `fused_cross_entropy_mean`.
     """
 
     @staticmethod
     def forward(ctx, hidden, weight, targets, ignore_index, chunk_rows):
         # Cast once, up front: the projections then run on the tensors that
-        # are also the ones the backward replays, and the node retains the
-        # reduced-precision operands (what a bare `F.linear` would hand to
-        # its own backward) instead of the fp32 parameters.
+        # are also the ones the backward replays.
         dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
         h = hidden.to(dt)
         w = weight.to(dt)
         total = None
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
-            # One [chunk, V] buffer at a time; it is released before the
-            # next chunk is projected, which is what bounds this node's peak.
             logits = F.linear(h[start:end], w).to(_loss_acc_dtype(dt))
             chunk = F.cross_entropy(
                 logits, targets[start:end],
@@ -293,10 +278,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         dt = ctx.compute_dtype
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
-        # `empty_like`, not `zeros_like`: the first chunk is written straight
-        # into `grad_w` below, so zero-filling it first would be wasted work.
-        # (`grad_h` is filled slice by slice, every slice overwritten, so it
-        # needs no zero-fill either.)
+        # `empty_like`, not `zeros_like`: every slice of `grad_h` and the
+        # first chunk of `grad_w` are written directly.
         grad_h = torch.empty_like(h) if need_h else None
         grad_w = torch.empty_like(w) if need_w else None
         grad_scale = (grad_out / ctx.count).to(dt)
@@ -377,8 +360,6 @@ class _LayerScaleResidual(torch.autograd.Function):
     def forward(ctx, x, residual, scale):
         # x: [B, T, C], residual: [B, T, C], scale: [C]
         ctx.save_for_backward(residual, scale)
-        # `addcmul` forms the sum and the scaling in a single pass, so the
-        # scaled residual never becomes a full-size tensor of its own.
         return torch.addcmul(x, residual, scale)
 
     @staticmethod
@@ -387,8 +368,6 @@ class _LayerScaleResidual(torch.autograd.Function):
         # grad_x = grad_out
         # grad_residual = grad_out * scale
         # grad_scale = (grad_out * residual).sum(dim=(0, 1))
-        # The reduction is taken first so its temporary is released before the
-        # returned gradient block is materialized; `grad_x` needs no work.
         red_dims = tuple(range(grad_out.ndim - 1))
         grad_scale = (grad_out * residual).sum(dim=red_dims)
         grad_residual = grad_out * scale
@@ -462,25 +441,19 @@ class _SwiGLU(torch.autograd.Function):
     """
     w2(silu(w1 x) * (w3 x)) handled as a single autograd node.
 
-    Fused forward + backward avoids retaining 4 hidden-sized activations.
-    Only saves x, a, b, w1, w2, w3 (weights are shared).
-    The backward recomputes silu(a) and the gated product analytically.
+    Fused forward + backward. Only saves x, a, b, w1, w2, w3 (weights are
+    shared). The backward recomputes silu(a) and the gated product
+    analytically.
 
     `a` and `b` are the irreducible part: `grad_a` needs `a` for the SiLU
-    derivative and `grad_b` needs `silu(a)`, so neither can be dropped. What
-    the backward can avoid is running a full activation block per algebraically
-    distinct term, so the gradient w.r.t. the hidden state accumulates in
-    place (`grad_h` is a private buffer the moment `F.linear` returns it, and
-    it *becomes* `grad_b` once the SiLU factor is folded into it).
+    derivative and `grad_b` needs `silu(a)`, so neither can be dropped.
     """
 
     @staticmethod
     def forward(ctx, x, w1, w2, w3):
         # The projections run on a flattened [N, C] view of the activation, so
-        # every reduction below is a 2-D GEMM: that keeps the weight gradients
-        # free of reshaping and lets the two input-gradient projections
-        # accumulate in place. `reshape` is a view for the contiguous [B, T, C]
-        # the block always hands in.
+        # every reduction below is a 2-D GEMM. `reshape` is a view for the
+        # contiguous [B, T, C] the block always hands in.
         lead = x.shape[:-1]
         x2 = x.reshape(-1, x.shape[-1])
         a = F.linear(x2, w1)
@@ -509,26 +482,22 @@ class _SwiGLU(torch.autograd.Function):
         grad_h = F.linear(grad_out, w2.t())
 
         # Recompute silu(a) and gated product.
-        # Ordering matters: every temporary below is a hidden-sized block, and
-        # `grad_h` is only released once it has been consumed, so the terms are
-        # taken in the order that lets each one die before the next is born.
         sa = F.silu(a)
         # grad_a = grad_h * b * silu'(a) = silu_backward(grad_h * b, a).
-        # `torch.ops.aten.silu_backward` for efficiency. Built before `grad_h`
-        # is reused so that the plain gradient is still available here.
+        # `torch.ops.aten.silu_backward` computes the SiLU derivative.
+        # Built before `grad_h` is reused so that the plain gradient is still
+        # available here.
         prod = grad_h * b
         grad_a = torch.ops.aten.silu_backward(prod, a)
         del prod
         # This is h from the forward; only grad_w2 reads it.
         gated = sa * b
-        # grad_b = grad_h * silu(a), folded into the private `grad_h` buffer.
+        # grad_b = grad_h * silu(a).
         grad_b = grad_h.mul_(sa)
         del sa
 
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
         if ctx.needs_input_grad[0]:
-            # Accumulated in place: the second projection writes straight into
-            # the first one's result instead of allocating a third block.
             grad_x = F.linear(grad_a, w1.t())
             grad_x.addmm_(grad_b, w3)
         if ctx.needs_input_grad[1]:
@@ -645,11 +614,10 @@ class GPT(nn.Module):
             targets:            [B, T] next-token ids; `None` skips the loss
             return_stats:       collect per-layer attention logit statistics
             last_position_only: score only the final position
-            return_logits:      materialize the [B, T, V] logit block. Set it
+            return_logits:      return the [B, T, V] logit block. Set it
                                 to False on the training path: the loss is
-                                then fused with the output projection, so the
-                                block - the largest tensor in the model - is
-                                never built. The returned logits are `None`.
+                                then fused with the output projection and the
+                                returned logits are `None`.
         """
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
@@ -675,8 +643,8 @@ class GPT(nn.Module):
                     all_logit_stats.append(ls)
         x = self.norm_f(x)
         if last_position_only:
-            # The [B, T, V] logit block dwarfs every other activation in the
-            # model; decoding / scoring only the final position never needs it.
+            # Decoding / scoring only the final position never needs the full
+            # [B, T, V] logit block.
             x = x[:, -1:]
 
         logits = None

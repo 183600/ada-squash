@@ -78,8 +78,8 @@ def _install_quantized_weight(linear: nn.Module, qw: torch.Tensor):
     loss takes `lm_head.weight` as an argument and never calls
     `lm_head.forward` (which is what the wrapper replaces). Syncing the live
     weight as well is what keeps the output projection quantized on that
-    path: it is the largest GEMM in the model, so leaving it fp32 would
-    measure a partly-quantized network and report far too small a PPL drop.
+    path; otherwise that branch would still read the fp32 matrix and the run
+    would measure a partly-quantized network.
     """
     with torch.no_grad():
         linear.weight.copy_(qw)
@@ -169,12 +169,11 @@ def wrap_model_w8a8(model: nn.Module):
 
     `model.modules()` is recursive, so an `MLP` that `wrap_swiglu_w8a8` has
     already taken over is *still* descended into afterwards and its three
-    `nn.Linear` children are quantized a second time. That is a full extra
-    quantization pass over the largest weight tensors in the network, per
-    block, and the resulting `quantized_forward` closures are never called
-    because `MLP.forward` has been replaced wholesale. The sub-modules of a
-    wrapped `MLP` are therefore skipped explicitly - continuing the loop does
-    not, because the generator recurses on its own.
+    `nn.Linear` children are quantized a second time, and the resulting
+    `quantized_forward` closures are never called because `MLP.forward` has
+    been replaced wholesale. The sub-modules of a wrapped `MLP` are therefore
+    skipped explicitly - continuing the loop does not, because the generator
+    recurses on its own.
 
     A tied `lm_head` is *not* skipped: the embedding branch only puts the
     shared matrix on the int8 grid, while the linear branch is what
@@ -278,8 +277,7 @@ def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len):
     """Real text, packed into fixed-length streams.
 
     Returns a stateful zero-argument callable: the streaming dataset is
-    opened once and cycled, rather than re-instantiated (and re-sharded
-    from scratch) on every batch.
+    opened once and cycled.
     """
     from scripts.train_gpt2 import build_dataloader
     loader = build_dataloader(
@@ -357,11 +355,10 @@ def main():
             batches.append(x)
 
         # The cleanest way to compare the two precisions is to quantize a
-        # copy, but `copy.deepcopy` holds both models resident for the whole
-        # measurement while only one of them is ever executed. Measuring the
-        # fp32 model first and then wrapping *the same* model in place keeps
-        # the comparison bit-for-bit the same: `wrap_model_w8a8` is
-        # deterministic and the batches are already fixed.
+        # copy, but measuring the fp32 model first and then wrapping *the
+        # same* model in place keeps the comparison bit-for-bit the same:
+        # `wrap_model_w8a8` is deterministic and the batches are already
+        # fixed.
         ce_fp = 0.0
         n_tok = 0
         for x in batches:

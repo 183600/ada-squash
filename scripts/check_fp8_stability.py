@@ -138,8 +138,7 @@ class FP8LinearSim:
         self.quant = quant
         self.orig_forward = module.forward
         # The weight is constant across the probe, so its fp8 form is built
-        # once here instead of on every forward: `simulate_fp8` is ~7 full
-        # passes over the weight, and it is the largest operand of its GEMM.
+        # once here.
         with torch.no_grad():
             self.qw = quant(module.weight)
 
@@ -309,7 +308,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
         h.remove()
 
     # The block hooks only staged 0-dim tensors; resolve them now, in one
-    # transfer per list, instead of syncing inside the forward.
+    # transfer per list.
     bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags)
@@ -318,10 +317,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
                            if v > FP8_E4M3_MAX), None)
 
     # Relative forward divergence of the logits. Both maxima are taken before
-    # the difference is formed, and the difference is taken in place over the
-    # fp8 block, which is dead as soon as it is consumed - so this holds two
-    # [B, T, V] blocks at peak instead of the four a `a - b` plus a fresh
-    # `.abs()` plus a second `.abs().max()` would.
+    # the difference is formed.
     max_abs_fp32 = logits_fp32.abs().max()
     finite = torch.isfinite(logits_fp8).all()
     if finite:
@@ -387,9 +383,7 @@ def _excess_kurtosis(x: torch.Tensor):
 
     Returned as a 0-dim tensor rather than a Python float so the caller can
     batch it with its other reductions into a single device-to-host transfer.
-    The tensor is consumed in bounded slices: an fp64 copy of a whole
-    [B, T, C] activation, plus the centred-deviation buffer, would otherwise be
-    two full-size fp64 temporaries per norm hook. The recurrence and its merge
+    The tensor is consumed in bounded slices. The recurrence and its merge
     are the ones `KurtosisMeter` already implements; only the accumulation
     width is widened, because this probe deliberately looks at activations
     whose fourth moment overflows fp32.

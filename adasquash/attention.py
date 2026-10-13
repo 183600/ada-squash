@@ -134,24 +134,19 @@ class CausalSelfAttention(nn.Module):
             self._tril_cache = cache
         return cache[1]
 
-    # Peak size of one query-row block of the score matrix the logit monitor
-    # builds. The full [B, H, T, T] block is quadratic in the sequence length
-    # and dwarfs every other activation in the model, so the monitor never
-    # holds more than this many bytes of it at a time.
     _LOGITS_CHUNK_BYTES = 1 << 26
 
     def _logit_stats(
         self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device
     ) -> dict:
-        """Causal-logit monitor, evaluated over a bounded query-row block.
+        """Causal-logit monitor, evaluated over query-row blocks.
 
-        Each `[B, H, R, T]` block is reduced to a few scalars and dropped
-        before the next one is allocated, so the peak is the chunk budget
-        instead of the whole quadratic block. The reductions run in float64
-        on the device (accumulated as 0-dim tensors, so no per-chunk host
-        sync) and are only read back once at the end.
+        Each `[B, H, R, T]` block is reduced to a few scalars before the
+        next one is computed. The reductions run in float64 on the device
+        (accumulated as 0-dim tensors) and are only read back once at the
+        end.
 
-        The upper triangle is zeroed in place rather than gathered with
+        The upper triangle is zeroed rather than gathered with
         `masked_select`: a zero adds nothing to any of the sums and cannot
         raise the absolute maximum, so the reductions see exactly the causal
         entries the gather would have handed over.
@@ -237,10 +232,7 @@ class RMSNormHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # The same fused kernel the backbone norms use, rather than the
-        # `pow(2).mean()` composition: that one leaves autograd holding the
-        # squared activation and the normalized output on top of the input,
-        # which for a [B, H, T, hd] tensor is the second-largest tensor in the
-        # attention block. The math is identical.
+        # `pow(2).mean()` composition. The math is identical.
         return _RMSNorm.apply(x, self.weight, self.eps)
 
 
@@ -249,9 +241,7 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
     The textbook pairing (`rotate_half(x) = cat([-x2, x1])`, then
     `x * cos + rotate_half(x) * sin`) is written as two in-place `addcmul`s
-    over the two half-views of the output. Both rotated halves, the `cat`
-    buffer and the `neg` of `x2` are therefore never materialized: the only
-    full-size tensor this allocates is `out` itself.
+    over the two half-views of the output.
     """
     half = x.shape[-1] // 2
     x_lo = x[..., :half]

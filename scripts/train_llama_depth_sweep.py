@@ -55,9 +55,7 @@ DEPTH_SHAPE = {
 
 # (dim, n_heads) of the *base* model of each builder, i.e. the shape the sweep
 # rescales away from. Keyed by the `--model` selector rather than by a single
-# `llama-1b ? llama : gpt2-124m` ternary: that ternary sent every non-LLaMA
-# arm to the 124M width, so a `--model gpt2-350m` sweep was silently rescaled
-# from (768, 12) and never actually ran at 350M's shape.
+# `llama-1b ? llama : gpt2-124m` ternary, so every arm uses its own base width.
 _BASE_SHAPES = {
     "llama-1b": (2048, 16),
     "gpt2-124m": (768, 12),

@@ -90,10 +90,7 @@ def build_dataloader(
             n_workers = worker_info.num_workers if worker_info is not None else 1
             # Operate on `self.buf` *in place* so the unconsumed tail is
             # carried over to the next call. `pos` walks the buffer instead
-            # of deleting its prefix after every chunk: with packed streams
-            # the tail is much longer than one chunk, so front-deleting it
-            # once per chunk re-shifts the whole tail and makes tokenizing a
-            # document quadratic in its length.
+            # of deleting its prefix after every chunk.
             buf = self.buf
             pos = self.pos
             need = self.seq_len + 1
@@ -220,9 +217,7 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float, beta1: flo
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    # The fused multi-tensor step issues one kernel launch per device and
-    # needs no per-parameter temporary. It is CUDA-only and needs a single
-    # device.
+    # `fused=True` is CUDA-only and needs a single device.
     devices = {p.device for p in decay + no_decay}
     fused = len(devices) == 1 and next(iter(devices)).type == "cuda"
     return AdamW(groups, lr=lr, betas=(beta1, beta2), fused=fused)
@@ -546,9 +541,7 @@ def main():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             with ctx:
-                # The logit block is fused into the loss, so the projection's
-                # [B, T, V] output - the largest tensor in the model - is
-                # never materialized.
+                # The logit block is fused into the loss.
                 loss = model(x, y, return_logits=False)[1]
             loss = loss / args.grad_accum
             loss.backward()

@@ -79,7 +79,7 @@ class MoELayer(nn.Module):
         logits = self.router(x_flat)  # [N, E]
         # The router distribution is needed twice - once for the top-k gate
         # values and once for the mean probability in the aux loss - so it is
-        # computed once here instead of re-running the softmax for each.
+        # computed once here and reused.
         probs = logits.softmax(-1)
         # Top-k routing
         if self.top_k == 1:
@@ -166,8 +166,7 @@ class MoEBlock(nn.Module):
         h = self.norm1(x)
         a, _ = self.attn(h, freqs_cis=freqs_cis)
         if self.use_layerscale:
-            # One fused pass, as in the dense `Block`: the scaled residual
-            # never becomes a full-size tensor of its own.
+            # One fused pass, as in the dense `Block`.
             x = _LayerScaleResidual.apply(x, a, self.ls1)
         else:
             x = x + a
@@ -227,9 +226,7 @@ class MoEGPT(nn.Module):
         z = self.norm_f(z)
         loss = None
         if y is not None and not return_logits:
-            # Fused with the output projection: the [B, T, V] logit block is
-            # the largest tensor this model would ever build and nothing but
-            # the loss reads it, so the training path never materializes it.
+            # Fused with the output projection.
             loss = fused_cross_entropy_mean(
                 z.reshape(-1, z.size(-1)), self.lm_head.weight, y.reshape(-1),
                 ignore_index=self.cfg.ignore_index,
@@ -355,8 +352,7 @@ def main():
             act_stats.detach()
         # Log expert load imbalance. Reported per block: the motivating
         # hypothesis is a drift *with depth*, which a single last-block
-        # number cannot show. The whole per-block vector is staged on-device
-        # and transferred once, rather than one blocking read per block.
+        # number cannot show.
         expert_cv = _expert_cv_per_block(tpe_list)
         exp_cv = expert_cv[-1]
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
