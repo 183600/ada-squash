@@ -605,9 +605,12 @@ class GPT(nn.Module):
             self.freqs_cis = None
 
         # Pre-computed position ids for non-rotary mode
-        self.register_buffer(
-            "_pos_ids", torch.arange(cfg.max_seq_len), persistent=False
-        )
+        if not cfg.rotary:
+            self.register_buffer(
+                "_pos_ids", torch.arange(cfg.max_seq_len), persistent=False
+            )
+        else:
+            self._pos_ids = None
 
     def _init_weights(self, m: nn.Module):
         if isinstance(m, nn.Linear):

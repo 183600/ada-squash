@@ -431,7 +431,7 @@ def test_fused_cross_entropy_matches_the_reference_value_and_gradients():
     ref = torch.nn.functional.cross_entropy(
         torch.nn.functional.linear(hidden, weight), targets, ignore_index=-100
     )
-    assert fused == pytest.approx(ref.item(), rel=1e-12)
+    assert torch.allclose(fused, ref, atol=1e-12)
     g_fused = torch.autograd.grad(fused, (hidden, weight))
     g_ref = torch.autograd.grad(ref, (hidden, weight))
     for a, b in zip(g_fused, g_ref):
