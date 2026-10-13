@@ -102,9 +102,13 @@ def _softsign_forward(xs: torch.Tensor, p):
     t = xs.abs()
     lo = t.clamp(max=1.0)
     hi = t.clamp_(min=1.0).reciprocal_()
-    u = lo.mul(hi)
-    # s = (1 + u^p)^(-1/p), evaluated through log1p on a base <= 1.
-    s = u.pow(p).log1p_().mul_(-1.0 / p).exp_()
+    # `hi` is the last reader of the reciprocal buffer, so `u = lo * hi` is
+    # formed in it rather than in a fresh block.
+    u = hi.mul_(lo)
+    # s = (1 + u^p)^(-1/p), evaluated through log1p on a base <= 1. `u` is the
+    # last reader of `lo`, so the power chain runs in its buffer rather than
+    # pinning a second `u`-sized activation.
+    s = u.pow_(p).log1p_().mul_(-1.0 / p).exp_()
     # The sign rides on the sign bit of `xs` rather than on a separate
     # `torch.sign` pass, so `|x| = inf` still yields +-1 instead of inf * 0.
     phi = lo.mul_(s).copysign_(xs)
@@ -124,7 +128,10 @@ def _softsign_backward_pieces(
     as in the forward.
     """
     t = xs.abs()
-    lo = t.clamp(max=1.0)
+    # `lo` only feeds the reconstructed `phi`/`u`, so it is skipped whenever
+    # neither is asked for (e.g. a backward that only needs d/dx).
+    if need_phi or need_u:
+        lo = t.clamp(max=1.0)
     r = t.clamp_(min=1.0).reciprocal_()
     phi = lo.mul(s).copysign_(xs) if need_phi else None
     u = lo.mul_(r) if need_u else None
@@ -152,10 +159,14 @@ def _softsign_p_grad(
     underflowed element stays finite; `phi` is zero there and zeroes the
     contribution either way.
     """
-    log_u = u.clamp(min=torch.finfo(u.dtype).tiny).log()
+    # `u` is the last thing the backward needs, so the clamp and log run in
+    # its buffer; `a` is likewise dead once `softplus` has read it, so the
+    # sigmoid is taken in place on it instead of allocating a third block.
+    log_u = u.clamp_(min=torch.finfo(u.dtype).tiny).log_()
     a = p * log_u
     k = F.softplus(a).div_(p * p)
-    k.addcmul_(log_u, torch.sigmoid(a), value=-(1.0 / p))
+    a.sigmoid_()
+    k.addcmul_(log_u, a, value=-(1.0 / p))
     # Reduce the [N, C] products in fp32 under bf16 autocast: a bf16
     # accumulator over a whole activation block cancels most of its own
     # mantissa bits before the scalar survives.
@@ -357,7 +368,15 @@ class _RMSNorm(torch.autograd.Function):
         nrm = torch.linalg.vector_norm(x, 2, dim=-1, keepdim=True)
         rstd = torch.rsqrt(nrm.square_().div_(x.shape[-1]).add_(eps))
         ctx.save_for_backward(x, rstd, weight)
-        return x * rstd * weight
+        # `x * rstd` is a private buffer, so the weight can be folded into it
+        # in place. The dtype guard keeps the mixed-precision promotion
+        # (`bf16 * fp32 -> fp32`) that the plain product would have performed.
+        out = x * rstd
+        if out.dtype == weight.dtype:
+            out.mul_(weight)
+        else:
+            out = out * weight
+        return out
 
     @staticmethod
     def backward(ctx, grad_out):

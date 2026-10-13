@@ -149,7 +149,7 @@ class CausalSelfAttention(nn.Module):
         """Lower-triangular boolean mask `[T, T]`, cached per (T, device)."""
         cache = self._tril_cache
         if cache is None or cache[0] != (T, device):
-            mask = torch.ones(T, T, device=device, dtype=torch.bool).tril()
+            mask = torch.ones(T, T, device=device, dtype=torch.bool).tril_()
             cache = ((T, device), mask)
             self._tril_cache = cache
         return cache[1]
@@ -204,6 +204,26 @@ class RMSNormHead(nn.Module):
         return _RMSNorm.apply(x, self.weight, self.eps)
 
 
+def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate one `[B, H, T, hd]` embedding with pre-expanded tables.
+
+    The textbook pairing (`rotate_half(x) = cat([-x2, x1])`, then
+    `x * cos + rotate_half(x) * sin`) is written as two in-place `addcmul`s
+    over the two half-views of the output. Both rotated halves, the `cat`
+    buffer and the `neg` of `x2` are therefore never materialized: the only
+    full-size tensor this allocates is `out` itself.
+    """
+    half = x.shape[-1] // 2
+    x_lo = x[..., :half]
+    x_hi = x[..., half:]
+    # out[..., :half] = x_lo * cos_lo - x_hi * sin_lo
+    # out[..., half:] = x_hi * cos_hi + x_lo * sin_hi
+    out = x * cos
+    out[..., :half].addcmul_(x_hi, sin[..., :half], value=-1.0)
+    out[..., half:].addcmul_(x_lo, sin[..., half:], value=1.0)
+    return out
+
+
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -216,10 +236,6 @@ def apply_rope(
     `cos`/`sin` may be passed pre-expanded ([1,1,T,hd]); otherwise they are
     derived from `freqs_cis` on the fly.
     """
-    def rotate_half(x):
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat([-x2, x1], dim=-1)
-
     if cos is None or sin is None:
         f_real = freqs_cis.real
         f_imag = freqs_cis.imag
@@ -233,11 +249,7 @@ def apply_rope(
         cos = cos.to(q.dtype)
         sin = sin.to(q.dtype)
 
-    q_out = q * cos
-    q_out.add_(rotate_half(q).mul_(sin))
-    k_out = k * cos
-    k_out.add_(rotate_half(k).mul_(sin))
-    return q_out, k_out
+    return _rope_half(q, cos, sin), _rope_half(k, cos, sin)
 
 
 __all__ = ["CausalSelfAttention", "RMSNormHead"]
