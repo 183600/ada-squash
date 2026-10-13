@@ -686,7 +686,8 @@ class _DyTDForward(torch.autograd.Function):
         x, alpha_0, k, gamma, beta, phi = ctx.saved_tensors
         depth_ratio = ctx.depth_ratio
 
-        a = alpha_0 * torch.exp(-k * depth_ratio)
+        exp_kdr = torch.exp(-k * depth_ratio)
+        a = alpha_0 * exp_kdr
         grad_tanh = grad_out * gamma
         # d/d(a*x) of tanh, i.e. `1 - phi^2`, taken once and reused by both
         # the input gradient and the scalar `a` gradient. Evaluated as
@@ -703,7 +704,7 @@ class _DyTDForward(torch.autograd.Function):
         # a = alpha_0 * exp(-k * depth_ratio)
         # grad_alpha_0 = grad_a * exp(-k * depth_ratio)
         # grad_k       = grad_a * alpha_0 * exp(-k * r) * (-r) = -grad_a * a * r
-        grad_alpha_0 = grad_a * torch.exp(-k * depth_ratio)
+        grad_alpha_0 = grad_a * exp_kdr
         grad_k = -grad_a * a * depth_ratio
 
         grad_gamma = None
@@ -966,7 +967,8 @@ class _DyTCDForward(torch.autograd.Function):
                 # value, so it cannot be divided back into `scale` on the
                 # channels the clamp is holding: the raw product is re-derived
                 # instead, and the clamp's own zero-gradient is applied.
-                scale = alpha_0 * torch.exp(-k * depth_ratio)
+                exp_kdr = torch.exp(-k * depth_ratio)
+                scale = alpha_0 * exp_kdr
                 one_plus_delta = 1.0 + delta
                 live = (scale * one_plus_delta >= _MIN_ALPHA).to(grad_alpha_c.dtype)
                 grad_alpha_c = grad_alpha_c * live
@@ -979,7 +981,7 @@ class _DyTCDForward(torch.autograd.Function):
                 if ctx.needs_input_grad[3]:
                     grad_delta = grad_alpha_c * scale
                 if ctx.needs_input_grad[1]:
-                    grad_alpha_0 = grad_scale * torch.exp(-k * depth_ratio)
+                    grad_alpha_0 = grad_scale * exp_kdr
                 if ctx.needs_input_grad[2]:
                     grad_k = -grad_scale * scale * depth_ratio
 
