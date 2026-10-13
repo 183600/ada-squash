@@ -154,7 +154,8 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     the saved logit block: `GPT.forward(..., return_logits=True)` hands the
     very same tensor back to its caller, so overwriting it in place would
     leave that caller holding gradient values stamped over its logits after
-    `loss.backward()`.
+    `loss.backward()`. Within that buffer the probabilities are built
+    directly, so no second `[chunk, V]` block is ever live.
     """
 
     @staticmethod
@@ -185,17 +186,24 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         chunk_rows = ctx.chunk_rows
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
-            chunk_logits = logits[start:end]
             chunk_targets = targets[start:end]
+            # The softmax lands straight in the gradient slice it belongs in:
+            # a separate probability buffer plus a copy into `grad_logits`
+            # would be two extra passes over the largest block in the model.
+            probs = grad_logits[start:end]
+            torch.softmax(logits[start:end], dim=-1, out=probs)
             valid = chunk_targets.ne(ctx.ignore_index)
-            probs = torch.softmax(chunk_logits, dim=-1)
             # subtract the one-hot at the gold column (ignored rows are
-            # remapped to column 0 first, then zeroed out below)
+            # remapped to column 0 first, then scaled to zero below)
             gold = chunk_targets.masked_fill(~valid, 0).unsqueeze(-1)
-            probs.scatter_add_(-1, gold, torch.full_like(gold, -1.0, dtype=probs.dtype))
-            probs.mul_(grad_scale)
-            probs.masked_fill_(~valid.unsqueeze(-1), 0.0)
-            grad_logits[start:end] = probs
+            keep = valid.unsqueeze(-1).to(probs.dtype)
+            # Per-row scatter source and per-row scale: a masked row adds 0
+            # instead of -1 and is then multiplied by 0, which zeroes it
+            # without a second full-size `masked_fill_` pass. The scale is
+            # applied *after* the subtraction so the row reads
+            # (softmax - onehot) * grad_out / count, as autograd does.
+            probs.scatter_add_(-1, gold, keep.neg())
+            probs.mul_(keep.mul_(grad_scale))
         return grad_logits, None, None, None
 
 
@@ -252,12 +260,20 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
         h = hidden.to(dt)
         w = weight.to(dt)
+        acc = _loss_acc_dtype(dt)
         total = None
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
-            logits = F.linear(h[start:end], w).to(_loss_acc_dtype(dt))
-            chunk = F.cross_entropy(
-                logits, targets[start:end],
+            # The chunk's logits are this node's own GEMM output - the cast
+            # allocates a private copy whenever it changes the dtype - so the
+            # log-softmax runs in place on them instead of adding a second
+            # `[chunk, V]` block to the peak.
+            chunk_logits = F.linear(h[start:end], w).to(acc)
+            torch.log_softmax(chunk_logits, -1, out=chunk_logits)
+            # `log_softmax` + `nll_loss` is what `F.cross_entropy` runs; the
+            # pair is spelled out only so the first half can write in place.
+            chunk = F.nll_loss(
+                chunk_logits, targets[start:end],
                 ignore_index=ignore_index, reduction="sum",
             )
             total = chunk if total is None else total + chunk
@@ -276,6 +292,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         # The backward runs outside autocast; the operands were already cast
         # in the forward, so the chunk projection replays bit for bit.
         dt = ctx.compute_dtype
+        acc = _loss_acc_dtype(dt)
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
         # `empty_like`, not `zeros_like`: every slice of `grad_h` and the
@@ -289,18 +306,23 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             end = min(start + chunk_rows, targets.numel())
             hc = h[start:end]
             tc = targets[start:end]
-            probs = torch.softmax(
-                F.linear(hc, w).to(_loss_acc_dtype(dt)), dim=-1
-            )
+            # Same in-place log-softmax as the forward: the recomputed chunk
+            # is the only owner of its logits, and folding the softmax into
+            # that buffer halves the block this loop keeps live.
+            probs = F.linear(hc, w).to(acc)
+            torch.softmax(probs, -1, out=probs)
             valid = tc.ne(ctx.ignore_index)
             # subtract the one-hot at the gold column (ignored rows are
-            # remapped to column 0 first, then zeroed out below)
+            # remapped to column 0 first, then scaled to zero below)
             gold = tc.masked_fill(~valid, 0).unsqueeze(-1)
-            probs.scatter_add_(
-                -1, gold, torch.full_like(gold, -1.0, dtype=probs.dtype)
-            )
-            probs.mul_(grad_scale)
-            probs.masked_fill_(~valid.unsqueeze(-1), 0.0)
+            keep = valid.unsqueeze(-1).to(probs.dtype)
+            # Per-row scatter source and per-row scale: a masked row adds 0
+            # instead of -1 and is then multiplied by 0, which zeroes it
+            # without a second full-size `masked_fill_` pass. The scale is
+            # applied *after* the subtraction, so a scored row reads
+            # (softmax - onehot) * grad_out / count, as autograd does.
+            probs.scatter_add_(-1, gold, keep.neg())
+            probs.mul_(keep.mul_(grad_scale))
             g = probs.to(dt)
             if need_h:
                 # Each slice is written, not accumulated: `grad_h` is filled
