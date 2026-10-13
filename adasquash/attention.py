@@ -51,6 +51,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=False)
         self.attn_drop = nn.Dropout(dropout)
         self.proj_drop = nn.Dropout(dropout)
+        self.scale = 1.0 / math.sqrt(self.head_dim)
 
         if qk_norm is None:
             self.q_squash = None
@@ -103,7 +104,7 @@ class CausalSelfAttention(nn.Module):
             cos, sin = self._rope_tables(freqs_cis)
             q, k = apply_rope(q, k, freqs_cis, cos, sin)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
+        scale = self.scale
 
         # logit monitoring (useful for the QK-squash ablation). Monitoring
         # only; disabled by default.
