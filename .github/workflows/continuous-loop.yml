@@ -171,10 +171,10 @@ jobs:
           DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
 
           # ================= 四阶段提示词 =================
-          PROMPT_PERF='优化代码的性能和显存占用。不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动。'
-          PROMPT_BUG='仔细检查代码中是否存在bug或者科研方法层面的问题，如果有就修改代码。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动。'
-          PROMPT_APPLY='检查算力申请.md是否有错误，如果有就改好。不要删除或移动算力申请.md。'
-          PROMPT_CLEAN='不要删除、修改或移动算力申请.md——它是算力申请材料，其中的算力规模与预算估算属于申请所需信息，不属于“多余的内容”，也不属于“关于预算、花费的记录”。确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释，但算力申请.md除外）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，绝对不能删除、修改或移动，也不属于“多余的内容”。'
+          PROMPT_PERF='优化代码的性能和显存占用。不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动；README.md 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_BUG='仔细检查代码中是否存在bug或者科研方法层面的问题，如果有就修改代码。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE 是开源许可证文件，同样绝对不能删除、修改或移动；README.md 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_APPLY='检查算力申请.md是否有错误，如果有就改好。不要删除或移动算力申请.md，也不要删除或移动 README.md。'
+          PROMPT_CLEAN='不要删除、修改或移动算力申请.md——它是算力申请材料，其中的算力规模与预算估算属于申请所需信息，不属于“多余的内容”，也不属于“关于预算、花费的记录”。确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释，但算力申请.md除外）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，绝对不能删除、修改或移动，也不属于“多余的内容”；README.md 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
 
           # 每阶段单次调用的最大时长（秒）
           PERF_TIMEOUT=$((60*60))     # 1h
@@ -325,6 +325,28 @@ jobs:
             fi
           }
 
+
+          # ================= README.md 防删自愈 =================
+          # clean 阶段可能把 README.md 当作“多余内容”删除。
+          # 每次提交前校验：一旦被删，立即从 HEAD（其次最近一个包含它的历史版本）恢复；
+          # 只防删除，允许正常的内容修改。
+          ensure_readme() {
+            [ -f README.md ] && return 0
+            if git show HEAD:README.md > /tmp/readme_restore.md 2>/dev/null && [ -s /tmp/readme_restore.md ]; then
+              mv /tmp/readme_restore.md README.md
+              echo "[guard] 检测到 README.md 被删除，已从 HEAD 恢复"
+              return 0
+            fi
+            README_SHA=$(git log --format=%H --diff-filter=AM -- README.md 2>/dev/null | head -1)
+            if [ -n "$README_SHA" ] && git show "${README_SHA}:README.md" > /tmp/readme_restore2.md 2>/dev/null && [ -s /tmp/readme_restore2.md ]; then
+              mv /tmp/readme_restore2.md README.md
+              echo "[guard] 检测到 README.md 被删除，已从历史版本 ${README_SHA:0:7} 恢复"
+              return 0
+            fi
+            echo "[warn] README.md 缺失且找不到可恢复的历史版本"
+          }
+          ensure_readme
+
           i=0
           FAIL_COUNT=0
           RATE_COUNT=0
@@ -335,6 +357,7 @@ jobs:
             ensure_workflow
             ensure_license
             ensure_apply
+            ensure_readme
             git add -A || true
             git commit -m "auto: iteration $1" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
@@ -346,6 +369,7 @@ jobs:
             ensure_workflow
             ensure_license
             ensure_apply
+            ensure_readme
             git add -A || true
             if ! git diff --cached --quiet; then
               git commit -m "auto: partial work saved on shutdown" || true
@@ -518,6 +542,18 @@ jobs:
               cp /tmp/apply_pristine.md "算力申请.md"
             fi
             [ -f "算力申请.md" ] && echo "[guard] 收尾阶段发现 算力申请.md 被删，已恢复"
+          fi
+          # 防删自愈：收尾提交前恢复被删的 README.md
+          if [ ! -f "README.md" ]; then
+            if git show HEAD:README.md > /tmp/readme_restore.md 2>/dev/null && [ -s /tmp/readme_restore.md ]; then
+              mv /tmp/readme_restore.md README.md
+            else
+              README_SHA=$(git log --format=%H --diff-filter=AM -- README.md 2>/dev/null | head -1)
+              if [ -n "$README_SHA" ] && git show "${README_SHA}:README.md" > /tmp/readme_restore2.md 2>/dev/null && [ -s /tmp/readme_restore2.md ]; then
+                mv /tmp/readme_restore2.md README.md
+              fi
+            fi
+            [ -f README.md ] && echo "[guard] 收尾阶段发现 README.md 被删，已恢复"
           fi
           git add -A
           git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
