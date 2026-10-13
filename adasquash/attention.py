@@ -110,28 +110,7 @@ class CausalSelfAttention(nn.Module):
         stats = {}
         if return_stats:
             with torch.no_grad():
-                logits = torch.matmul(q, k.transpose(-1, -2))
-                logits.mul_(scale)
-                # Only the causal triangle is ever read, so it is selected
-                # directly rather than masking the upper triangle with -inf.
-                # `masked_select` (not `logits[mask]`): the mask is [T, T]
-                # while the logits are [B, H, T, T], and boolean *indexing*
-                # would apply it to the leading two dims instead of the last
-                # two. `masked_select` broadcasts, which is what is meant here.
-                keep = self._tril_mask(T, x.device)
-                valid = logits.masked_select(keep)
-                if valid.numel() > 1:
-                    abs_logits = valid.abs()
-                    logit_abs_mean = abs_logits.mean().item()
-                    logit_abs_max = abs_logits.amax().item()
-                    logit_std = valid.std().item()
-                else:
-                    logit_abs_mean = logit_abs_max = logit_std = 0.0
-            stats = {
-                "logit_abs_mean": logit_abs_mean,
-                "logit_abs_max": logit_abs_max,
-                "logit_std": logit_std,
-            }
+                stats = self._logit_stats(q, k, scale, T, x.device)
 
         # is_causal=True is mathematically equivalent to the manual triu
         # mask.
@@ -153,6 +132,66 @@ class CausalSelfAttention(nn.Module):
             cache = ((T, device), mask)
             self._tril_cache = cache
         return cache[1]
+
+    # Peak size of one query-row block of the score matrix the logit monitor
+    # builds. The full [B, H, T, T] block is quadratic in the sequence length
+    # and dwarfs every other activation in the model, so the monitor never
+    # holds more than this many bytes of it at a time.
+    _LOGITS_CHUNK_BYTES = 1 << 26
+
+    def _logit_stats(
+        self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device
+    ) -> dict:
+        """Causal-logit monitor, evaluated over a bounded query-row block.
+
+        Each `[B, H, R, T]` block is reduced to a few scalars and dropped
+        before the next one is allocated, so the peak is the chunk budget
+        instead of the whole quadratic block. The reductions run in float64
+        on the device (accumulated as 0-dim tensors, so no per-chunk host
+        sync) and are only read back once at the end.
+
+        The upper triangle is zeroed in place rather than gathered with
+        `masked_select`: a zero adds nothing to any of the sums and cannot
+        raise the absolute maximum, so the reductions see exactly the causal
+        entries the gather would have handed over.
+        """
+        B, H = q.shape[0], q.shape[1]
+        keep = self._tril_mask(T, device)
+        rows = max(
+            1, self._LOGITS_CHUNK_BYTES // max(1, B * H * T * q.element_size())
+        )
+        # `keep` is the full lower triangle, so its population is T(T+1)/2.
+        n_valid = B * H * (T * (T + 1) // 2)
+        if n_valid <= 1:
+            return {"logit_abs_mean": 0.0, "logit_abs_max": 0.0, "logit_std": 0.0}
+
+        acc_abs = torch.zeros((), dtype=torch.float64, device=device)
+        acc_x = torch.zeros((), dtype=torch.float64, device=device)
+        acc_sq = torch.zeros((), dtype=torch.float64, device=device)
+        peak = torch.zeros((), dtype=q.dtype, device=device)
+        k_t = k.transpose(-1, -2)
+        for start in range(0, T, rows):
+            end = min(start + rows, T)
+            block = torch.matmul(q[:, :, start:end], k_t)
+            block.mul_(scale)
+            block.masked_fill_(~keep[start:end], 0.0)
+            # Signed sum first: the variance needs `sum(x)`, and the absolute
+            # pass below would have thrown the signs away.
+            acc_x = acc_x + block.sum(dtype=torch.float64)
+            block.abs_()
+            peak = torch.maximum(peak, block.amax())
+            acc_abs = acc_abs + block.sum(dtype=torch.float64)
+            block.square_()
+            acc_sq = acc_sq + block.sum(dtype=torch.float64)
+        total = float(acc_abs)
+        signed = float(acc_x)
+        mean_abs = total / n_valid
+        var = (float(acc_sq) - signed * signed / n_valid) / (n_valid - 1)
+        return {
+            "logit_abs_mean": mean_abs,
+            "logit_abs_max": float(peak),
+            "logit_std": math.sqrt(var) if var > 0.0 else 0.0,
+        }
 
     def _rope_tables(self, freqs_cis: torch.Tensor):
         """Return the expanded (cos, sin) rotary tables, cached per
