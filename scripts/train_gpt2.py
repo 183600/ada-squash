@@ -5,7 +5,6 @@ Supports:
   - Pre-LN, RMSNorm, DyT, DyT-C, DyT-D, DyT-CD via --norm
   - QK-Norm / DyT-QK via --qk-norm
   - LayerScale toggle via --no-layerscale
-
   - Wandb / TensorBoard logging
   - bf16 mixed precision
   - Gradient accumulation
@@ -88,8 +87,9 @@ def build_dataloader(
             worker_info = torch.utils.data.get_worker_info()
             worker_id = worker_info.id if worker_info is not None else 0
             n_workers = worker_info.num_workers if worker_info is not None else 1
-            # Operate on `self.buf` *in place* so the unconsumed tail is
-            # of deleting its prefix after every chunk.
+            # Operate on `self.buf` *in place* with a read cursor, so the
+            # unconsumed tail survives instead of being deleted along with the
+            # consumed prefix.
             buf = self.buf
             pos = self.pos
             need = self.seq_len + 1
@@ -265,12 +265,11 @@ def restore_schedule_args(
     Returns the names where the command line and the checkpoint disagree.
     `max_steps` is included on purpose: extending a finished run (resume with
     a larger `--max-steps` to continue the cosine tail) changes the schedule
-    silently, it would look like an uninterrupted run.
-
-    not just a default that would otherwise be adopted) is left alone: the
-    point of the restore is to keep a resumed run from silently reshaping the
-    curve it claims to continue, not to make an explicit extension
-    impossible. The disagreement is still returned so the caller can log it.
+    deliberately, and a value the operator typed is left alone - not just a
+    default that would otherwise be adopted. The point of the restore is to
+    keep a resumed run from silently reshaping the curve it claims to
+    continue, not to make an explicit extension impossible. The disagreement
+    is still returned so the caller can log it.
     """
     changed = []
     for name in _SCHEDULE_ARGS:
@@ -411,9 +410,9 @@ def main():
     # shape override changes the parameter shapes, so a run whose `--compile`
     # or depth/width setting differs from the checkpoint's cannot be resumed
     # at all: `load_state_dict` below fails with a missing-key or a size
-    # environment, which a bare `--resume` does not have, so it is taken from
-    # the checkpoint instead. The precision flag is adopted for the same
-    # reason: switching autocast on or off mid-run moves the whole curve.
+    # mismatch. The precision flag is taken from the checkpoint as well,
+    # because a bare `--resume` carries no environment, and switching autocast
+    # on or off mid-run moves the whole curve.
     resume_ckpt = None
     run_args: dict = {}
     if args.resume:
@@ -547,8 +546,7 @@ def main():
         # Those `load_state_dict` calls also put the checkpoint's own
         # hyper-parameters back on the optimizer / the scheduler's base LRs,
         # so an explicitly typed override has to be re-applied *after* them:
-        # without this its only effect would be on the tensors that are
-        # loaded over a moment later, i.e. none.
+        # without this it would be undone before the first `opt.step()`.
         apply_explicit_optimizer_args(opt, sched, args, explicit)
 
     # Stability meters

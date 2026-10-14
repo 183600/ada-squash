@@ -4,10 +4,10 @@ same GPT-2 124M model with different norm layers.
 
 We measure:
   - forward divergence: max|logits_fp8 - logits_fp32| / max|logits_fp32|,
-    GEMM (the SwiGLU MLP included)
+    over every GEMM (the SwiGLU MLP included)
   - activation overflow rate under FP8-E4M3
   - per-norm activation range and pre-norm excess kurtosis
-    non-finite
+  - the first block whose stream goes non-finite under FP8
 
 The probe corpus is the same decision `check_w8a8_ppl.py` makes: the
 headline metrics here are activation *magnitudes* (overflow rate,
@@ -162,7 +162,8 @@ class FP8SwiGLUSim:
         self.mlp = mlp
         self.quant = quant
         self.orig_forward = mlp.forward
-        # Same reasoning as `FP8LinearSim`: the three expert projections are
+        # Same reasoning as `FP8LinearSim`: the three MLP projections are
+        # quantized once, here, and fixed for the whole pass.
         with torch.no_grad():
             self.qw1 = quant(mlp.w1.weight)
             self.qw2 = quant(mlp.w2.weight)
@@ -205,6 +206,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
 
     Returns the relative divergence of the FP8-simulated logits against the
     fp32 logits, per-norm activation-range statistics before/after each
+    norm, and the first block that goes non-finite under FP8.
     """
     handles = []
     quant_errors = []
@@ -224,15 +226,16 @@ def measure_fp8_divergence(model, x, norm_name: str):
             abs_in = x_in.abs() if has_in else None
             # out is the post-norm activation
             q = to_fp8_e4m3(out)
-        # Every scalar this hook reports is staged as a 0-dim tensor and
-        # read once.
+            # Every scalar this hook reports is staged as a 0-dim tensor and
+            # read once.
             scalars = [
                 abs_out.max(),                                   # max_abs_out
                 abs_out.mean(),                               # rel_err denominator
                 (abs_out > FP8_E4M3_MAX).float().mean(),         # overflow
                 (abs_out < fp8_e4m3_min).float().mean() if out.numel() else
                 _zero_like_scalar(abs_out),                      # underflow
-                # after it, so the deviation is formed on it.
+                # `q` is a fresh tensor from the quantizer, so the deviation
+                # is formed on it rather than on `out`.
                 q.sub_(out).abs_().mean(),                       # quant err
                 abs_in.max() if has_in else _zero_like_scalar(abs_out),
                 _excess_kurtosis(x_in) if has_in else _zero_like_scalar(abs_out),
@@ -243,8 +246,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
             ) = torch.stack(
                 [s.detach().reshape(()).double() for s in scalars]
             ).tolist()
-            # Added after the widening: `tensor + 1e-6` would fold the
-            # epsilon into the tensor's own (fp32) precision.
+            # Added after the widening: `mean + 1e-6` on the fp32 tensor
+            # would fold the epsilon into its own precision.
             denom = mean_abs_out + 1e-6
             ranges.append({
                 "module": cls_name,
@@ -268,8 +271,9 @@ def measure_fp8_divergence(model, x, norm_name: str):
         def hook(module, inp, out):
             y = out[0] if isinstance(out, tuple) else out
             # Staged as tensors, not Python bools/floats: truth-testing a
-            # two conditions are mutually exclusive (a non-finite stream has
-            # already returned above) so they share one flag list.
+            # device tensor syncs. The two conditions are mutually exclusive
+            # (a non-finite stream has already returned above) so they share
+            # one flag list.
             all_finite = torch.isfinite(y).all()
             first_bad.append((i, all_finite))
             # `simulate_fp8` saturates anything above `max_val` back down to
@@ -280,8 +284,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
             first_over.append((i, y.abs().amax()))
         return hook
 
-    # Reference logits in fp32 (no hooks: we only want to characterize the
-    # attaching here would double-count every norm).
+    # Reference logits in fp32 (no hooks: attaching them here would
+    # double-count every norm).
     with torch.no_grad():
         logits_fp32, _ = model(x)
 
@@ -302,7 +306,6 @@ def measure_fp8_divergence(model, x, norm_name: str):
     for h in handles:
         h.remove()
 
-    # transfer per list.
     bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags)
@@ -353,7 +356,6 @@ def measure_fp8_divergence(model, x, norm_name: str):
 
     return {
         "norm": norm_name,
-        # labelled it `n_layers` while printing (2L+1).
         "n_layers": int(getattr(model.cfg, "n_layers", 0)),
         "n_norm_hooks": len(quant_errors),
         "max_abs_pre_norm": max_in,

@@ -90,10 +90,12 @@ def _cross_entropy_chunk_rows(vocab_size: int) -> int:
 def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0, is_final_norm: bool = False) -> dict:
     """Collect the kwargs a given `norm_name` accepts from a GPTConfig.
 
+    The result is passed to `build_norm`, which forwards it to the class
     constructor; norms that do not declare one of these kwargs (LN, RMSNorm,
     plain DyT) simply ignore the extras only when they are not supplied, so
     each family gets exactly the subset it supports.
 
+    Using one helper for the blocks *and* the final norm guarantees that a
     configured hyper-parameter (alpha_init / alpha_0 / k_init / p_init) is
     applied to every norm of the family that accepts it.
 
@@ -104,6 +106,7 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0, is_final_norm: bool 
     Args:
         cfg: Model configuration
         layer_idx: Layer index for depth-conditioned norms
+        is_final_norm: If True, this is the final norm (after all blocks).
                        For depth-conditioned norms, uses depth_ratio=1.0.
     """
     kwargs: dict = {}
@@ -138,16 +141,20 @@ def build_norm_kwargs(cfg: "GPTConfig", layer_idx: int = 0, is_final_norm: bool 
 
 
 # ---------------------------------------------------------------------------
+# Block
 # ---------------------------------------------------------------------------
 class _ChunkedCrossEntropy(torch.autograd.Function):
     """
+    Mean cross-entropy over a [N, V] logit block, evaluated in row chunks.
 
     The per-row math is identical to `F.cross_entropy`; only the
     reduction over rows is split.
 
+    The backward writes into a private gradient buffer rather than reusing
+    the saved logit block: `GPT.forward(..., return_logits=True)` hands the
     very same tensor back to its caller, so overwriting it in place would
     leave that caller holding gradient values stamped over its logits after
-    `loss.backward()`. Each chunk's probabilities are built directly inside
+    `loss.backward()`.
     """
 
     @staticmethod
@@ -171,7 +178,8 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         logits, targets = ctx.saved_tensors
-        # may still be reading it (see the class docstring).
+        # A gradient buffer of our own: the saved logits may still be read by
+        # the caller (see the class docstring).
         grad_logits = torch.empty_like(logits)
         grad_scale = (grad_out / ctx.count).to(logits.dtype)
         chunk_rows = ctx.chunk_rows
@@ -189,8 +197,8 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             gold = chunk_targets.masked_fill(~valid, 0).unsqueeze(-1)
             keep = valid.unsqueeze(-1).to(probs.dtype)
             # Per-row scatter source and per-row scale: a masked row adds 0
-            # instead of -1 and is then multiplied by 0, which zeroes it
-            # applied *after* the subtraction so the row reads
+            # instead of -1 and is then multiplied by 0, which zeroes it. The
+            # scale is applied *after* the subtraction so the row reads
             # (softmax - onehot) * grad_out / count, as autograd does.
             probs.scatter_add_(-1, gold, keep.neg())
             probs.mul_(keep.mul_(grad_scale))
@@ -296,7 +304,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             hc = h[start:end]
             tc = targets[start:end]
             # Same in-place log-softmax as the forward: the recomputed chunk
-            # is the only owner of its logits, so the softmax folds into
+            # is the only owner of its logits, so the softmax folds into that
+            # tensor.
             probs = F.linear(hc, w).to(acc)
             torch.softmax(probs, -1, out=probs)
             valid = tc.ne(ctx.ignore_index)
@@ -305,15 +314,15 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             gold = tc.masked_fill(~valid, 0).unsqueeze(-1)
             keep = valid.unsqueeze(-1).to(probs.dtype)
             # Per-row scatter source and per-row scale: a masked row adds 0
-            # instead of -1 and is then multiplied by 0, which zeroes it
-            # applied *after* the subtraction, so a scored row reads
+            # instead of -1 and is then multiplied by 0, which zeroes it. The
+            # scale is applied *after* the subtraction, so a scored row reads
             # (softmax - onehot) * grad_out / count, as autograd does.
             probs.scatter_add_(-1, gold, keep.neg())
             probs.mul_(keep.mul_(grad_scale))
             g = probs.to(dt)
             if need_h:
                 # Each slice is written, not accumulated: `grad_h` is filled
-                # into `g`, so there is nothing to add to.
+                # from `g`, so there is nothing to add to.
                 torch.mm(g, w, out=grad_h[start:end])
             if need_w:
                 # `grad_w` on the other hand is accumulated over every chunk,
@@ -342,7 +351,8 @@ def fused_cross_entropy_mean(
     Mean cross-entropy of the `[N, V]` logits implied by `hidden @ weight.T`.
 
     Equivalent to `cross_entropy_mean(F.linear(hidden, weight), targets)`,
-    including the gradient w.r.t. both `hidden` and `weight`, but without
+    including the gradient w.r.t. both `hidden` and `weight`, but the logits
+    are never materialized for the whole block at once.
     """
     n = targets.numel()
     if hidden.dim() != 2 or hidden.size(0) != n:
@@ -384,6 +394,7 @@ class _LayerScaleResidual(torch.autograd.Function):
 
 class Block(nn.Module):
     """
+    Pre-norm Transformer block (norm-dependent residual).
 
     For DyT-D / DyT-CD the residual path uses a LayerScale-style gate
         x = x + lambda_l * attn_residual
@@ -460,6 +471,7 @@ class _SwiGLU(torch.autograd.Function):
     def forward(ctx, x, w1, w2, w3):
         # The projections run on a flattened [N, C] view of the activation, so
         # every reduction below is a 2-D GEMM. `reshape` is a view for the
+        # contiguous tensors the projections produce.
         lead = x.shape[:-1]
         x2 = x.reshape(-1, x.shape[-1])
         a = F.linear(x2, w1)
@@ -487,9 +499,6 @@ class _SwiGLU(torch.autograd.Function):
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
         grad_h = F.linear(grad_out, w2.t())
 
-        # before the next is born: `prod` is dropped once `grad_a` has been
-        # derived from it, and `sa` is folded into both of its consumers.
-        #
         # grad_a = grad_h * b * silu'(a) = silu_backward(grad_h * b, a).
         # `torch.ops.aten.silu_backward` computes the SiLU derivative.
         prod = grad_h * b
@@ -499,8 +508,6 @@ class _SwiGLU(torch.autograd.Function):
         # This is h from the forward; only grad_w2 reads it.
         sa = F.silu(a)
         grad_b = grad_h.mul_(sa)
-        # grad_a needs `a` for the SiLU derivative and grad_b needs
-        # `silu(a)`, so neither of those two can be dropped.
         gated = sa.mul_(b)
         del sa
 
@@ -600,7 +607,8 @@ class GPT(nn.Module):
     @torch.no_grad()
     def reset_parameters(self, seed: Optional[int] = None):
         """Re-run (re-)initialization of the shared Linear / Embedding
-        gamma, ...) are left untouched.
+        parameters. `apply` reaches the norm parameters too, but they fall
+        through the branches below untouched.
         """
         if seed is not None:
             torch.manual_seed(seed)
@@ -621,9 +629,9 @@ class GPT(nn.Module):
             targets:            [B, T] next-token ids; `None` skips the loss
             return_stats:       collect per-layer attention logit statistics
             last_position_only: score only the final position
-                                to False on the training path: the loss is
-                                then fused with the output projection and the
-                                returned logits are `None`.
+            return_logits:     keep the logits; set to False on the training
+                                path: the loss is then fused with the output
+                                projection and the returned logits are `None`.
         """
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
@@ -704,7 +712,8 @@ class GPT(nn.Module):
         out = {}
         for name, m in self.named_modules():
             # Pick out the top-level normalization modules. `norm_f` is a
-            # - matching it with the leading-dot pattern below would drop the
+            # plain attribute, not a submodule under a dotted name, so
+            # matching it with the leading-dot pattern below would drop the
             # final norm from the accounting.
             if name == "norm_f" or name.endswith((".norm1", ".norm2")):
                 cls = m.__class__.__name__

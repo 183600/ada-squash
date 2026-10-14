@@ -53,17 +53,15 @@ class KurtosisMeter:
     from a stable squashing layer.
     """
 
-    # Elements per bulk update. A [B, T, C] activation is tens of millions of
-    # elements, so the recurrence is fed in slices regardless of the batch the
-    # run is configured for. The parallel-moment merge below is exact, so
-    # slicing changes nothing but the summation order.
+    # Elements per bulk update: the recurrence is fed in slices regardless of
+    # the batch the run is configured for. The parallel-moment merge below is
+    # exact, so slicing changes nothing but the summation order.
     _chunk = 1 << 22
 
-    # Datatype the moments are accumulated in. fp32 is ample for the bf16 /
-    # fp32 activations sampled during training - the kurtosis of a 25M-element
-    # enough where the fourth moment can overflow (activations around 1e18
-    # square into inf at 1e36), which is why callers measuring activations
-    # that large can raise this to float64.
+    # Datatype the moments are accumulated in; fp32 is ample for the bf16 /
+    # fp32 activations sampled during training. Callers measuring activations
+    # large enough for the fourth moment to overflow can raise this to
+    # float64.
     acc_dtype = torch.float32
 
     def __init__(self):
@@ -177,12 +175,9 @@ class ActivationStats:
         running maximum, so pooling is exact; `KurtosisMeter` merges moments,
         so the pooled value is the kurtosis over all samples seen.
 
-        Any hook registered by a previous `attach` is removed first. Dropping
-        the handle list without removing the hooks leaves the old hooks
-        registered on the modules, so a re-attach silently doubles the
-        and, worse, a later `detach` only clears the newest batch: the
-        abandoned ones stay attached forever and keep writing into meters
-        that the caller believes are closed.
+        Any hook registered by a previous `attach` is removed first, and
+        `detach` clears the whole handle list, so a re-attach neither doubles
+        the meters nor leaves the abandoned hooks writing into them.
         """
         self.detach()
         if reset:
@@ -275,13 +270,11 @@ def markov_batch(
     """
     start = torch.randint(0, n_states, (batch_size, 1), generator=rng, device=device)
     if seq_len > 1:
-        # The walk is cumulative: s_t = (s_0 + sum_{i<=t} j_i) mod n, and
-        # reduction collapses into one cumsum over the jump draw.
+        # The walk is cumulative: s_t = (s_0 + sum_{i<=t} j_i) mod n, and the
+        # whole reduction collapses into one cumsum over the jump draw.
         jumps = torch.randint(
             0, max_jump, (batch_size, seq_len - 1), generator=rng, device=device
         )
-        # Single [B, T] allocation: the cumsum lands directly in the tail
-        # view instead of a throwaway [B, T-1] sum plus a cat copy.
         x = torch.empty((batch_size, seq_len), dtype=start.dtype, device=device)
         x[:, :1] = start
         torch.cumsum(jumps, dim=1, out=x[:, 1:])
@@ -304,6 +297,8 @@ def markov_batch(
 # ---------------------------------------------------------------------------
 class LossSpikeCounter:
     """
+    Counts loss spikes: jumps away from an EMA of the loss that are large
+    both in absolute and in relative terms.
     """
 
     def __init__(self, ema_beta: float = 0.99, rel_threshold: float = 0.20, abs_threshold: float = 0.05):
@@ -341,7 +336,7 @@ class LossSpikeCounter:
         """The part of the counter a checkpoint must carry to survive a
         `--resume`: `ema` is the baseline the next update compares against,
         so dropping it makes the first post-resume steps blind to a jump
-        away from the pre-resume loss scale, and `n_spikes` is the running
+        away from the pre-resume loss scale, and `n_spikes` is the running total.
         """
         return {"ema": self.ema, "n_spikes": self.n_spikes}
 
@@ -369,8 +364,7 @@ class LossSpikeCounter:
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def measure_activation_stats(model: nn.Module, batch: torch.Tensor) -> dict:
-    """
-    """
+    """One hook-driven measurement pass over `batch`, summarised as a dict."""
     stats = ActivationStats(model)
     stats.attach()
     out = model(batch)

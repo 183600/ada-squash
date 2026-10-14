@@ -12,4 +12,4 @@ Entry-point scripts (each is a standalone, directly invocable driver):
 
 from __future__ import annotations
 
-# kept separate so that each can be invoked directly.
+# Nothing is imported here: each driver is a standalone entry point.

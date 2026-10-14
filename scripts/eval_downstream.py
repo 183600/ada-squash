@@ -129,14 +129,15 @@ def needle_decode_overhead(tokenizer, needle: str = DEFAULT_NEEDLE) -> int:
 
     Scoring is a greedy decode of the secret: every emitted token is
     appended to the context before the next one is predicted, so the longest
+    run needs
 
         len(prompt + needle + question) + len(secret_ids) - 1.
 
     That tail is not covered by the `max_seq_len` check the caller thinks it
     is satisfying - a context sized at exactly `max_seq_len` runs the last
     scored steps past the model's positional table and dies inside the
-    Callers that pick a context length from `max_seq_len` have to subtract
-    this.
+    positional table itself. Callers that pick a context length from
+    `max_seq_len` have to subtract this.
     """
     return max(0, len(needle_target_ids(tokenizer, needle)) - 1)
 
@@ -153,6 +154,7 @@ def needle_in_haystack(
     model to recite the secret. Returns accuracy.
 
     The expected answer is derived from `needle` itself (its final token /
+    whitespace-separated chunk), so a custom needle is actually scored.
 
     `seed` pins the insertion positions so repeated evaluations of the same
     checkpoint are comparable; the needle lands at a different depth every
@@ -172,8 +174,9 @@ def needle_in_haystack(
 
     # A learned positional table (or a RoPE table) is indexed by absolute
     # position, so asking for more tokens than the model was built with
-    # call site; the guard belongs here too, because this function is also
-    # the entry point behind `--needle-test`.
+    # indexes past it. The `--needle-context-len` call site only subtracts
+    # the decode overhead, so the guard belongs here too, because this
+    # function is also the entry point behind `--needle-test`.
     model_limit = getattr(getattr(model, "cfg", None), "max_seq_len", None)
     if model_limit is not None and context_len > model_limit:
         raise ValueError(

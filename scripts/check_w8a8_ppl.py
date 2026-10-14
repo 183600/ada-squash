@@ -83,9 +83,10 @@ def _install_quantized_weight(linear: nn.Module, qw: torch.Tensor):
     that reaches for the matrix directly reads `linear.weight` - and
     `GPT.forward(return_logits=False)` does exactly that, because the fused
     loss takes `lm_head.weight` as an argument and never calls
-    weight as well is what keeps the output projection quantized on that
-    path; otherwise that branch would still read the fp32 matrix and the run
-    would measure a partly-quantized network.
+    `lm_head.forward`. Replacing the parameter in place as well is what keeps
+    the output projection quantized on that path; otherwise that branch would
+    still read the fp32 matrix and the run would measure a partly-quantized
+    network.
     """
     with torch.no_grad():
         linear.weight.copy_(qw)
@@ -113,12 +114,10 @@ def wrap_swiglu_w8a8(mlp):
     `wrap_linear_w8a8` does) never takes effect: every SwiGLU weight would
     stay fp32 and the reported W8A8 PPL drop would be measured on a model
     that is only partly quantized - the MLP holds the majority of the
-    module is therefore wrapped at once.
-
-    forward through it would leave the SwiGLU *hidden* activation
-    (`silu(w1 x) * (w3 x)`, the most outlier-prone tensor in the network)
-    in fp32 while every other GEMM input is int8. The forward is therefore
-    written out explicitly, quantizing each GEMM input in turn.
+    arithmetic. Wrapping the child forwards would then also leave the SwiGLU
+    *hidden* activation (`silu(w1 x) * (w3 x)`, the most outlier-prone
+    tensor in the network) in fp32 while every other GEMM input is int8. The
+    module is therefore wrapped at once, quantizing each GEMM input in turn.
 
     The weights are quantized once, here: they do not change afterwards, and
     `quantize_weight_per_channel` is idempotent.
@@ -393,6 +392,7 @@ def main():
         # copy, but measuring the fp32 model first and then wrapping *the
         # same* model in place keeps the comparison bit-for-bit the same:
         # `wrap_model_w8a8` is deterministic and the batches are already
+        # materialized.
         ce_fp = 0.0
         n_tok = 0
         for x in batches:

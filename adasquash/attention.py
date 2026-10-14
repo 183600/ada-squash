@@ -143,8 +143,6 @@ class CausalSelfAttention(nn.Module):
         cache = self._tril_cache
         if cache is None or cache[0] != (T, device):
             mask = torch.ones(T, T, device=device, dtype=torch.bool).tril_()
-            # The complement is derived once beside the triangle so the
-            # stats path does not re-allocate it on every call.
             cache = ((T, device), mask, ~mask)
             self._tril_cache = cache
         return cache[1]
@@ -167,9 +165,8 @@ class CausalSelfAttention(nn.Module):
     ) -> dict:
         """Causal-logit monitor, evaluated over query-row blocks.
 
-        next one is computed. The reductions run in float64 on the device
-        (accumulated as 0-dim tensors) and are only read back once at the
-        end.
+        The reductions run in float64 on the device (accumulated as 0-dim
+        tensors) and are only read back once at the end.
 
         The upper triangle is zeroed rather than gathered with
         `masked_select`: a zero adds nothing to any of the sums and cannot
@@ -190,7 +187,8 @@ class CausalSelfAttention(nn.Module):
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
         peak = torch.zeros((), dtype=q.dtype, device=device)
-        # Complement of the causal triangle, built once rather than re-derived
+        # The complement of the causal triangle sits beside the triangle in
+        # the cache entry.
         _pair = self._tril_cache
         drop = _pair[2] if len(_pair) >= 3 else ~keep
         k_t = k.transpose(-1, -2)
@@ -199,7 +197,8 @@ class CausalSelfAttention(nn.Module):
             block = torch.matmul(q[:, :, start:end], k_t)
             block.mul_(scale)
             block.masked_fill_(drop[start:end], 0.0)
-            # Signed sum first: the variance needs `sum(x)`, and the absolute
+            # Signed sum first: the variance needs `sum(x)`, and the
+            # absolute pass would have thrown the signs away.
             acc_x.add_(block.sum(dtype=torch.float64))
             block.abs_()
             torch.maximum(peak, block.amax(), out=peak)
@@ -223,11 +222,15 @@ class CausalSelfAttention(nn.Module):
         state dict.
 
         The key uses the source tensor's storage pointer rather than its
+        Python identity: the caller passes `self.freqs_cis[:T]`, i.e. a fresh
+        view of the same buffer on every forward, so an identity test would
         miss on every call. Two different frequency tables of the same length
         (e.g. a re-scaled RoPE base, or a different model sharing the module)
+        still get distinct storage pointers. The source is kept alive by the
         cache entry so its storage pointer stays valid.
 
-        the activation dtype is memoised beside them, so a mixed-precision
+        The expanded tables live in the source's own dtype and the cast to
+        the activation dtype is memoised beside them.
         """
         key = (
             freqs_cis.data_ptr(),
@@ -265,7 +268,8 @@ class RMSNormHead(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # `pow(2).mean()` composition. The math is identical.
+        # The same fused kernel the backbone norms use. The math is
+        # identical to the `pow(2).mean()` composition.
         return _RMSNorm.apply(x, self.weight, self.eps)
 
 
@@ -281,8 +285,8 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     x_hi = x[..., half:]
     # out[..., :half] = x_lo * cos_lo - x_hi * sin_lo
     # out[..., half:] = x_hi * cos_hi + x_lo * sin_hi
-    # A contiguous (not stride-preserving) output: same number of elements as
-    # `empty_like`, but laid out for the SDPA GEMMs that consume q/k next.
+    # A contiguous (not stride-preserving) output, laid out for the SDPA
+    # GEMMs that consume q/k next.
     out = torch.empty_like(x)
     out[..., :half].copy_(x_lo)
     out[..., :half].mul_(cos[..., :half])
@@ -302,6 +306,7 @@ def apply_rope(
 ):
     """Apply rotary positional embeddings. q,k: [B,H,T,hd].
 
+    `cos`/`sin` may be passed pre-expanded ([1,1,T,hd]); otherwise they are
     derived from `freqs_cis` on the fly.
     """
     if cos is None or sin is None:

@@ -3,7 +3,7 @@ Ablation runner: per-channel, depth-conditioned, LayerScale, tanh vs
 softsign family, alpha initialization grid.
 
 Each ablation is a small training run (default: GPT-2 124M, 1000 steps)
-on a synthetic Markov corpus plus a stability measurement at the end. The
+on a synthetic Markov corpus plus a stability measurement at the end.
 """
 
 from __future__ import annotations
@@ -76,7 +76,8 @@ _MODEL_BUILDERS = {
 def install_outlier_channel(model, scale: float = 25.0) -> int:
     """Scale up one embedding row to act as an activation-outlier channel.
 
-    Returns the token id of the outlier row. Run *after* `reset_parameters`
+    Returns the token id of the outlier row. Run *after* `reset_parameters`,
+    which would otherwise re-initialize the scaled row.
     """
     with torch.no_grad():
         oid = model.cfg.vocab_size - 1

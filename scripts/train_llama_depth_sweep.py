@@ -86,8 +86,9 @@ def shape_for_depth(depth: int, base_dim: int, base_heads: int):
 
     The documented table is only valid for the LLaMA-tiny base shape; any
     other base model falls back to the 1/sqrt(depth) law scaled from its own
-    the table would be returned for any base, so a `--model gpt2-124m` arm
-    would silently be built at LLaMA-tiny width.
+    base shape; without that fallback the table would be returned for any
+    base, so a `--model gpt2-124m` arm would silently be built at LLaMA-tiny
+    width.
     """
     if (base_dim, base_heads) == _BASE_SHAPE and depth in DEPTH_SHAPE:
         return DEPTH_SHAPE[depth]
@@ -248,8 +249,8 @@ def main():
         for norm in args.norms:
             out_dir = base / f"d{depth}-{norm}"
             out_dir.mkdir(parents=True, exist_ok=True)
-            # Save the depth-override scriptlet in the run dir so the
-            # a documentation artifact.
+            # Save the depth override in the run dir so the arm records
+            # its own depth next to the weights.
             (out_dir / "depth.txt").write_text(str(depth))
             proc = launch_one(args, depth, norm, out_dir)
             if args.sequential:

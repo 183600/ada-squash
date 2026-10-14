@@ -1,15 +1,18 @@
 """
+MoE-tiny: a tiny 8-expert top-2 MoE block layered on top of the GPT
 backbone. Used to study the expert-load-imbalance hypothesis from the
 DyT++ proposal: when each expert sees only ~1/N of the tokens, the
 activation statistics per expert can drift much more than in dense
 training, and a *per-token* normalization like RMSNorm/LN runs on a
 distribution that's a noisy mixture of expert distributions.
 
-DyT-CD, being purely element-wise, sidesteps this entirely.
+DyT-CD, being purely element-wise, sidesteps this entirely: the second
+norm runs on the residual stream *before* routing, so there is no
+per-expert normalized tensor to measure.
 
 Note on the metric: what is actually measured is the coefficient of
 variation of tokens-per-expert (`expert_cv`), i.e. *routing load
-routing, so there is no per-expert normalized tensor to measure.
+imbalance*, not activation imbalance.
 
 Usage:
     python scripts/train_moe_tiny.py --norm dytcd --n-experts 8 \
@@ -42,6 +45,7 @@ from adasquash.utils import (
 
 
 # ---------------------------------------------------------------------------
+# MoE block
 # ---------------------------------------------------------------------------
 class MoELayer(nn.Module):
     """
@@ -75,6 +79,7 @@ class MoELayer(nn.Module):
         logits = self.router(x_flat)  # [N, E]
         # The router distribution is needed twice - once for the top-k gate
         # values and once for the mean probability in the aux loss - so it is
+        # computed once here.
         probs = logits.softmax(-1)
         # Top-k routing
         if self.top_k == 1:
@@ -111,7 +116,8 @@ class MoELayer(nn.Module):
                 tok = token_of[start:end]
                 gate = gate_of[start:end].unsqueeze(-1)  # [n_e, 1]
                 xe = x_flat.index_select(0, tok)         # [n_e, C]
-                # folds into it with `mul_`, and the expert output is scaled
+                # The gated product folds into the silu buffer, and the
+                # expert output is scaled on its own buffer.
                 h = F.silu(xe @ self.experts_w1[e])
                 h.mul_(xe @ self.experts_w3[e])
                 y.index_add_(0, tok, (h @ self.experts_w2[e]).mul_(gate))
@@ -321,6 +327,7 @@ def main():
         except StopIteration:
             x, y = next(iter(loader))
         # The HF loader yields CPU tensors; the model, the synthetic corpus
+        # and the router all live on `device`, so leaving the batch on the host
         # dies on the first step with an embedding device mismatch.
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
@@ -349,7 +356,8 @@ def main():
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()
-        # number cannot show.
+        # Per-block CoV: the hypothesis is a drift *with depth*, which a single
+        # last-block number cannot show.
         expert_cv = _expert_cv_per_block(tpe_list)
         exp_cv = expert_cv[-1]
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -384,7 +392,8 @@ def _expert_cv(tpe) -> float:
 def _expert_cv_per_block(tpe_list) -> list:
     """`_expert_cv` for every block, with a single device-to-host transfer.
 
-    together instead, which is one transfer for the whole model.
+    Each block's CoV is a 0-dim tensor. They are stacked and converted
+    together, which is one transfer for the whole model.
     """
     cvs = [
         tpe.std() / (tpe.mean() + 1e-6)
