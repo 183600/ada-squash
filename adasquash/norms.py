@@ -17,6 +17,9 @@ _REDUCE_CHUNK_ELEMS = 1 << 20
 def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim <= 1:
         return a * b
+    if a.ndim == 2 and a.is_contiguous() and b.is_contiguous():
+        acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
+        return (a * b).sum(dim=0, dtype=acc).to(a.dtype)
     rows = a.numel() // a.shape[-1]
     step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
     if rows <= step or not (a.is_contiguous() and b.is_contiguous()):
@@ -53,10 +56,10 @@ def register_norm(name: str):
 def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     t = xs.abs()
     lo = t.clamp(max=1.0)
-    hi = t.clamp_(min=1.0).reciprocal_()
-    u = hi.mul_(lo)
-    s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
-    return lo.mul_(s).copysign_(xs)
+    hi = t.clamp(min=1.0).reciprocal()
+    u = lo * hi
+    s = u.log().mul(p).exp().log1p().mul(-1.0 / p).exp()
+    return lo * s * xs.sign()
 
 def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True):
     t = xs.abs()

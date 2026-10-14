@@ -252,9 +252,9 @@ class _SwiGLU(torch.autograd.Function):
         a = F.linear(x2, w1)
         b = F.linear(x2, w3)
         h = F.silu(a)
-        h.mul_(b)
-        y = F.linear(h, w2)
-        ctx.save_for_backward(x2, a, b, w1, w2, w3)
+        gated = h * b
+        y = F.linear(gated, w2)
+        ctx.save_for_backward(x2, a, b, h, w1, w2, w3)
         ctx.compute_dtype = y.dtype
         ctx.in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)
         ctx.lead = lead
@@ -262,7 +262,7 @@ class _SwiGLU(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, a, b, w1, w2, w3 = ctx.saved_tensors
+        x, a, b, h, w1, w2, w3 = ctx.saved_tensors
         dt = ctx.compute_dtype
         if w1.dtype != dt:
             w1, w2, w3 = (w1.to(dt), w2.to(dt), w3.to(dt))
@@ -273,10 +273,8 @@ class _SwiGLU(torch.autograd.Function):
         prod = grad_h * b
         grad_a = torch.ops.aten.silu_backward(prod, a)
         del prod
-        sa = F.silu(a)
-        grad_b = grad_h.mul_(sa)
-        gated = sa.mul_(b)
-        del sa
+        grad_b = grad_h * h
+        gated = h * b
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
         if ctx.needs_input_grad[0]:
             grad_x = F.linear(grad_a, w1.t())
