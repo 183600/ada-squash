@@ -396,14 +396,16 @@ def _expert_cv_per_block(tpe_list) -> list:
     together, which is one transfer for the whole model.
     """
     cvs = [
-        tpe.std() / (tpe.mean() + 1e-6)
-        for tpe in tpe_list if isinstance(tpe, torch.Tensor)
+        (tpe.std() / (tpe.mean() + 1e-6)) if isinstance(tpe, torch.Tensor)
+        else None
+        for tpe in tpe_list
     ]
-    if not cvs:
+    if not any(isinstance(c, torch.Tensor) for c in cvs):
         return [0.0] * len(tpe_list)
-    if len(cvs) == 1:
-        return [float(cvs[0].item())]
-    return torch.stack([c.detach() for c in cvs]).tolist()
+    vals = []
+    for c in cvs:
+        vals.append(float(c.item()) if isinstance(c, torch.Tensor) else 0.0)
+    return vals
 
 
 if __name__ == "__main__":
