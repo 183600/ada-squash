@@ -12,5 +12,4 @@ Entry-point scripts (each is a standalone, directly invocable driver):
 
 from __future__ import annotations
 
-# This file only marks the package. The implementations live beside it and are
 # kept separate so that each can be invoked directly.

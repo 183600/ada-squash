@@ -1,5 +1,4 @@
 """
-MoE-tiny: a tiny 8-expert top-2 MoE block layered on top of the GPT
 backbone. Used to study the expert-load-imbalance hypothesis from the
 DyT++ proposal: when each expert sees only ~1/N of the tokens, the
 activation statistics per expert can drift much more than in dense
@@ -10,8 +9,6 @@ DyT-CD, being purely element-wise, sidesteps this entirely.
 
 Note on the metric: what is actually measured is the coefficient of
 variation of tokens-per-expert (`expert_cv`), i.e. *routing load
-imbalance*, recorded per block. A per-expert activation statistic is not
-computed here - the second norm runs on the residual stream *before*
 routing, so there is no per-expert normalized tensor to measure.
 
 Usage:
@@ -45,7 +42,6 @@ from adasquash.utils import (
 
 
 # ---------------------------------------------------------------------------
-# MoE block
 # ---------------------------------------------------------------------------
 class MoELayer(nn.Module):
     """
@@ -79,7 +75,6 @@ class MoELayer(nn.Module):
         logits = self.router(x_flat)  # [N, E]
         # The router distribution is needed twice - once for the top-k gate
         # values and once for the mean probability in the aux loss - so it is
-        # computed once here and reused.
         probs = logits.softmax(-1)
         # Top-k routing
         if self.top_k == 1:
@@ -116,9 +111,7 @@ class MoELayer(nn.Module):
                 tok = token_of[start:end]
                 gate = gate_of[start:end].unsqueeze(-1)  # [n_e, 1]
                 xe = x_flat.index_select(0, tok)         # [n_e, C]
-                # `h` is the silu activation's own buffer: the gate product
                 # folds into it with `mul_`, and the expert output is scaled
-                # on its own buffer too.
                 h = F.silu(xe @ self.experts_w1[e])
                 h.mul_(xe @ self.experts_w3[e])
                 y.index_add_(0, tok, (h @ self.experts_w2[e]).mul_(gate))
@@ -170,7 +163,6 @@ class MoEBlock(nn.Module):
         h = self.norm1(x)
         a, _ = self.attn(h, freqs_cis=freqs_cis)
         if self.use_layerscale:
-            # One fused pass, as in the dense `Block`.
             x = _LayerScaleResidual.apply(x, a, self.ls1)
         else:
             x = x + a
@@ -329,7 +321,6 @@ def main():
         except StopIteration:
             x, y = next(iter(loader))
         # The HF loader yields CPU tensors; the model, the synthetic corpus
-        # and `rng` all live on `device`, so leaving the batch on the host
         # dies on the first step with an embedding device mismatch.
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
@@ -358,8 +349,6 @@ def main():
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()
-        # Log expert load imbalance. Reported per block: the motivating
-        # hypothesis is a drift *with depth*, which a single last-block
         # number cannot show.
         expert_cv = _expert_cv_per_block(tpe_list)
         exp_cv = expert_cv[-1]
@@ -395,7 +384,6 @@ def _expert_cv(tpe) -> float:
 def _expert_cv_per_block(tpe_list) -> list:
     """`_expert_cv` for every block, with a single device-to-host transfer.
 
-    Each block's CoV is a 0-dim tensor. They are stacked and converted
     together instead, which is one transfer for the whole model.
     """
     cvs = [

@@ -4,7 +4,6 @@ softsign family, alpha initialization grid.
 
 Each ablation is a small training run (default: GPT-2 124M, 1000 steps)
 on a synthetic Markov corpus plus a stability measurement at the end. The
-results land in a JSON file under runs/ablation/<name>/summary.json.
 """
 
 from __future__ import annotations
@@ -78,7 +77,6 @@ def install_outlier_channel(model, scale: float = 25.0) -> int:
     """Scale up one embedding row to act as an activation-outlier channel.
 
     Returns the token id of the outlier row. Run *after* `reset_parameters`
-    so the scaling is not overwritten by the initialization pass.
     """
     with torch.no_grad():
         oid = model.cfg.vocab_size - 1

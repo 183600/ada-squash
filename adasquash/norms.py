@@ -14,7 +14,6 @@ Design notes
 All DyT-family layers are *element-wise* (no cross-token statistics, no
 synchronization across the batch / sequence dimension). They can therefore
 serve as drop-in replacements for LayerNorm / RMSNorm inside any
-Transformer block.
 
 The DyT-C softsign family
     phi_p(x) = x / (1 + |x|^p)^{1/p}
@@ -57,15 +56,12 @@ _MIN_P = 1e-3
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     """Sum away every dim except the trailing (parameter) axis.
 
-    The per-parameter gradients of the fused kernels below are
-    batch/sequence reductions of a full-size elementwise product: a `[C]`
     parameter is fed by a `[B, T, C]` product, so only the leading dims go.
     `t.sum(dim=())` would instead reduce *every* dim (an empty dim tuple
     means "all dims" to torch), which is what
     `sum(dim=tuple(range(ndim - 1)))` degenerates to for a 1-D input - a
     single normalized vector, a shape LayerNorm accepts and the DyT family
     / RMSNorm must accept too. That collapsed the parameter gradient to a
-    scalar and autograd rejected the whole backward pass with an invalid
     gradient. With only the parameter axis left there is nothing to reduce,
     so the elementwise product is returned unchanged.
     """
@@ -75,11 +71,9 @@ def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
 def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """dot(a, b) over *every* element, without materialising `a * b`.
 
-    The DyT-family scalar reductions contract a full-size element-wise
     product down to one number. Both operands are the same shape and, in
     every caller, contiguous, so the contraction runs as a single flat
     `dot` over two views: the same value the product would have produced,
-    without the extra `[.., C]` block that building it in between would require.
     """
     if a.is_contiguous() and b.is_contiguous():
         return torch.dot(a.reshape(-1), b.reshape(-1))
@@ -98,9 +92,7 @@ def register_norm(name: str):
 # ---------------------------------------------------------------------------
 # Shared generalized-softsign core
 # ---------------------------------------------------------------------------
-# The three hand-written kernels below (the standalone `generalized_softsign`,
 # DyT-C and DyT-CD) all evaluate the same family, so the element-wise core
-# lives here rather than being open-coded three times.
 #
 # With `t = |x|` the closed form needs two branches. Both branches collapse
 # onto a single pair of *reciprocal* helpers, which removes the boolean mask
@@ -111,7 +103,6 @@ def register_norm(name: str):
 #     u = lo * r      = t      for t <= 1,  1/t  for t >  1   (always <= 1)
 #     f = r          = 1      for t <= 1,  1/t  for t >  1
 #
-# `r` doubles as the derivative's branch factor, so the kernel that would
 # otherwise have been `torch.where(t > 1, u, 1)` is a free alias.
 #
 # The reciprocal is taken on `max(t, 1)`, never on `t` itself: an exact zero
@@ -124,13 +115,10 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
 
     Returns `phi = sign(xs) * lo * s` with `s = (1 + u^p)^(-1/p)`.
 
-    `s` is *not* returned: no caller reads it. Each of the three kernels that
     run this core wants only the squashed activation, and they all rebuild `s`
     from their saved input in the backward (`_softsign_backward_pieces`), so
-    handing it back would keep a second `[.., C]` block alive across the call
     boundary for nothing. The frame drops `s` on return instead.
     """
-    # `lo` and `hi` are both derived from a single `abs()` buffer.
     t = xs.abs()
     lo = t.clamp(max=1.0)
     hi = t.clamp_(min=1.0).reciprocal_()
@@ -142,7 +130,6 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     # the `u == 0` limit, where `log(0) * p = -inf -> exp(-inf) = 0 = 0^p`).
     s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     # The sign rides on the sign bit of `xs` rather than on a separate
-    # `torch.sign` pass, so `|x| = inf` still yields +-1 instead of inf * 0.
     return lo.mul_(s).copysign_(xs)
 
 
@@ -160,19 +147,15 @@ def _softsign_backward_pieces(
     activation `dL/dgamma` and `dphi/dp` both reduce over, and `a = p *
     log(u)` is only returned when the exponent itself carries a gradient.
     `phi` is skipped the same way when neither reduction reads it, and `g`
-    when only those reductions are live.
 
     `s` is re-derived here, from `xs` and `p`, with exactly the sequence
     `_softsign_forward` ran - so it is bit-for-bit the value the forward used,
-    and no layer has to carry a `[.., C]` copy of it from its forward pass all
     the way to its own backward. The logarithm of `u` falls out of the same
-    chain, so the exponent gradient does not have to take a second one.
     """
     t = xs.abs()
     lo = t.clamp(max=1.0)
     r = t.clamp_(min=1.0).reciprocal_()
     # u = lo * r. `lo` is still owed to `phi` below, so `u` only gets its own
-    # buffer when phi is being rebuilt; otherwise the product takes it over.
     a = None
     if need_u:
         # `log(u)` is the head of `s`'s own chain, so the chain is grown out
@@ -180,15 +163,12 @@ def _softsign_backward_pieces(
         log_u = lo.mul(r).log_() if need_phi else lo.mul_(r).log_()
         # `A = p * log(u)` is the exponent the softsign's `1 + u^p` actually
         # evaluates, so `s = exp(-softplus(A) / p)` is grown straight out of
-        # it. The scale is taken in place, which leaves `A` on a buffer of its
         # own for the exponent gradient below and keeps the two chains from
         # having to agree on a shared temporary.
         log_u.mul_(p)
         s = log_u.exp().log1p_().mul_(-1.0 / p).exp_()
         # `s` is done reading `A` by now, and the exponent gradient only ever
         # consumes `A` (see `_softsign_p_grad`), so the floor is applied to
-        # that same buffer instead of allocating a second full-size tensor
-        # for it - and it rides on `A` instead of on `log(u)`, so it costs one
         # step rather than a clamp *and* a rescale.
         # The `-inf` a zeroed / underflowed `u` produces in its logarithm is
         # floored here - exactly where the pow form floored the base at
@@ -231,7 +211,6 @@ def _softsign_p_grad(
 
     so the whole reduction is evaluated from `A` alone - which
     `_softsign_backward_pieces` forms in place out of `log(u)` - plus one
-    scratch buffer. `A <= 0` because `u <= 1` and `p >= _MIN_P`, so
     `sigmoid(A) <= 1/2` and
     `softplus(A) = -log1p(-sigmoid(A))` loses nothing to cancellation there.
     The `-inf` a zeroed / underflowed `u` produces in its logarithm was
@@ -242,22 +221,16 @@ def _softsign_p_grad(
     already carrying `gamma` where the layer has one). It is folded into the
     reduction in place. So is the `1/p^2`, in the sense that it is applied to
     the *reduced scalar* rather than to the `[N, C]` bracket: the two are the
-    same value, but the bracket is the only full-size operand in the pair, and
-    `p^2` is constant across the whole activation block.
     """
     sig = a.sigmoid()
-    # `A * sigmoid(A)` first: `a` is this kernel's own scratch (its `A` value
     # is not read again), so the product lands on it and frees the sigmoid
-    # buffer to become `softplus(A) = -log1p(-sigmoid(A))` in place.
     a_sig = a.mul_(sig)
     sig.neg_().log1p_().neg_()
     k = sig.sub_(a_sig)
     # Reduce the [N, C] products in fp32 under bf16 autocast: a bf16
-    # accumulator over a whole activation block cancels most of its own
     # mantissa bits before the scalar survives.
     acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
     red = grad_phi.mul_(k).sum(dtype=acc)
-    # 0-dim from here on, so this costs a single scalar division.
     red = red.div_(p * p)
     # The forward only saw `clamp(p)`, so below the floor `p` carries no
     # gradient at all.
@@ -281,7 +254,6 @@ class _SquashedAffine(nn.Module):
     """
     `y = gamma * phi + beta`, shared by every DyT-family layer.
 
-    The affine itself is evaluated inside each layer's fused autograd kernel
     (as one `addcmul` rather than a multiply followed by an add).
     """
 
@@ -291,10 +263,7 @@ class _SquashedAffine(nn.Module):
 # ---------------------------------------------------------------------------
 class _GeneralizedSoftsign(torch.autograd.Function):
     """
-    Autograd kernel behind `generalized_softsign`.
 
-    The forward pass is the split closed form (see the public wrapper below).
-    The backward pass is written out analytically instead of being recorded
     from the element-wise chain.
 
     With `u = |x|` for `|x| <= 1` and `1/|x|` otherwise, and `s = (1 + u^p)^(-1/p)`:
@@ -308,13 +277,11 @@ class _GeneralizedSoftsign(torch.autograd.Function):
     `s * f` is the only combination the `x` derivative depends on, and `s` is
     also the factor every other output is built from - so `s` is all the
     backward needs, and it is re-derived from `x` and `p` there rather than
-    carried across the forward pass (see `_softsign_backward_pieces`).
     """
     @staticmethod
     def forward(ctx, x, p):
         p_is_tensor = isinstance(p, torch.Tensor)
         if p_is_tensor:
-            # Keep the raw `p` for the backward pass (the clamp's own zero
             # gradient is applied there) and floor the exponent the forward
             # math actually sees.
             p_raw = p
@@ -354,7 +321,6 @@ class _GeneralizedSoftsign(torch.autograd.Function):
             # `g == 0` still lands on 0).
             grad_x = g.log_().mul_(p + 1).exp_().mul_(grad_out)
         if need_p:
-            # `phi` is this kernel's own buffer and nothing else reads it, so
             # the `dL/dphi` product lands on it rather than beside it.
             grad_p = _softsign_p_grad(phi.mul_(grad_out), a, p, p_raw)
         return grad_x, grad_p
@@ -380,7 +346,6 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
 
     The reciprocal is taken on `max(|x|, 1)` rather than on `|x|` directly.
     `torch.where` masks the *value* of the unused branch, but the backward
-    pass still runs `d/dt (1/t) = -1/t^2` on it, so an exact zero
     (bf16 underflow of a small activation, a padded/zeroed element, ...) would
     evaluate `0 * -inf = NaN` and poison every gradient that reaches this
     layer. Clamping first keeps the unused branch finite; `clamp` itself
@@ -388,7 +353,6 @@ def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
     still differentiated exactly and phi'(0) = 1 as the closed form requires.
 
     The layer runs as a custom autograd node (see `_GeneralizedSoftsign`) so
-    the backward pass can evaluate the closed-form derivatives directly.
     """
     return _GeneralizedSoftsign.apply(x, p)
 
@@ -429,16 +393,11 @@ class _RMSNorm(torch.autograd.Function):
     """
     RMSNorm forward with the gradient written out analytically.
 
-    The backward pass below rebuilds the normalized activation from the
     retained input and the per-row `rstd`.
 
-    Both reductions of the backward run off *two* full-size products built
-    from a single buffer: `t = grad_out * rstd * x` is reduced as it stands
     for `dL/dweight` and, with the per-channel `weight` folded in (which
     commutes with the sum over the channel axis), carries the `mean(t * x)`
     that `d/dx` needs; the correction is then taken in place on
-    `grad_out * rstd * weight`, so the buffer the input gradient is returned
-    in never has a second copy beside it.
     """
 
     @staticmethod
@@ -448,7 +407,6 @@ class _RMSNorm(torch.autograd.Function):
         ctx.save_for_backward(x, rstd, weight)
         out = x * rstd
         # The dtype guard keeps the mixed-precision promotion
-        # (`bf16 * fp32 -> fp32`) that the plain product would have performed.
         if out.dtype == weight.dtype:
             out.mul_(weight)
         else:
@@ -463,15 +421,12 @@ class _RMSNorm(torch.autograd.Function):
         grad_x = None
         grad_weight = None
         if need_x:
-            # `u = grad_out * rstd` is a private buffer of ours (grad_out
             # belongs to the caller) and is the leading term of d/dx, which is
             # handed back *in it* at the end.
             u = grad_out * rstd
-            # `t = u * x` carries the second reduction. `dL/dweight` is its
             # sum over the leading dims, and d/dx needs `mean(t * weight)` -
             # the same product with a per-channel `weight` on it, which
             # commutes with the sum over the channel axis. So the two share one
-            # buffer: the weight is folded in only after `dL/dweight` has
             # consumed it, and in place, since nothing reads `t` again.
             t = u.mul(x)
             if need_w:
@@ -484,7 +439,6 @@ class _RMSNorm(torch.autograd.Function):
             # d/dx of `x * rstd`: the rsqrt term contributes
             # -x * rstd^3 * mean(t * x); the rstd factor that `m` already
             # carries leaves an rstd^2 to undo. The `weight` lands on the
-            # buffer `t` just released.
             if u.dtype == weight.dtype:
                 u.mul_(weight)
             else:
@@ -565,9 +519,6 @@ class _DyTCForward(torch.autograd.Function):
     Only the *scaled* activation crosses into the backward next to the
     per-channel parameters: the pre-affine activation, the branch value and
     the pow base are all re-derived from it and `p`. `alpha * x` is the one
-    full-size product the forward cannot avoid, so keeping it rather than
-    `x` is what leaves the backward without having to form it a second time
-    (`_DyTCDForward` keeps the same buffer for the same reason).
     """
     @staticmethod
     def forward(ctx, x, alpha, p, gamma, beta):
@@ -633,15 +584,12 @@ class _DyTCForward(torch.autograd.Function):
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
         if need_phi:
-            # `phi` is this kernel's own buffer: the `dL/dphi` product lands
             # on it rather than beside it, and the `gamma` fold for the
-            # exponent reduction reuses it again below.
             grad_phi = phi.mul_(grad_out)
             if need_gamma_grad:
                 grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
                 grad_p = _softsign_p_grad(grad_phi.mul_(gamma), a, p, p_raw)
-            # Both buffers are dead from here on.
             del phi, a, grad_phi
 
         grad_x = grad_alpha = None
@@ -655,8 +603,6 @@ class _DyTCForward(torch.autograd.Function):
             if ctx.needs_input_grad[1]:
                 # x_scaled = x * alpha, so d/dalpha = grad_x_scaled * x =
                 # grad_x_scaled * x_scaled / alpha - the division is taken on
-                # the `[C]` reduction, so it costs one scalar pass and not a
-                # full-size one.
                 grad_alpha = _sum_leading_dims(
                     grad_x_scaled * x_scaled
                 ).div_(alpha)
@@ -685,13 +631,11 @@ class DyTD(_SquashedAffine):
     where l is the layer index and L is the total depth. Combined with a
     LayerScale-style residual gate
 
-        x_out = x + lambda_l * Block(y)
 
     because alpha_l decays with depth, shallow layers squash strongly
     (bounding the pre-norm activations where they are largest) while deep
     layers relax toward a near-linear, gradient-friendly response.
 
-    The full LayerScale is applied in the model's Block.forward; this module
     only implements the depth-conditioned squashing and exposes
     `alpha_l` so the trainer can log the learned schedule.
     """
@@ -745,9 +689,7 @@ class _DyTDForward(torch.autograd.Function):
     def forward(ctx, x, alpha_0, k, gamma, beta, depth_ratio):
         a = alpha_0 * torch.exp(-k * depth_ratio)
         # `phi` (pre-affine) is the retained activation: the tanh derivative
-        # reads `1 - phi^2` and `dL/dgamma` reads `phi`, so saving the
         # post-affine `out` would differentiate `gamma * tanh(.) + beta`.
-        # The product already allocated its buffer, so the squash runs in
         # place on it.
         phi = a.mul(x)
         phi.tanh_()
@@ -766,7 +708,6 @@ class _DyTDForward(torch.autograd.Function):
 
         exp_kdr = torch.exp(-k * depth_ratio)
         a = alpha_0 * exp_kdr
-        # One buffer carries everything: `w` starts as the `grad_out * phi`
         # that `dL/dgamma` reduces and is then walked to the input gradient,
         # which it *is* on the way out.
         w = phi * grad_out
@@ -777,16 +718,13 @@ class _DyTDForward(torch.autograd.Function):
         # Taken as `gamma * (grad_out - grad_out * phi^2)` - the same product,
         # factored - rather than as `grad_out * gamma - (grad_out * gamma) *
         # phi^2`, so the cotangent (which belongs to the caller) never has to
-        # be copied into a second full-size buffer just to be scaled first.
         # The factored form also cancels nothing: near saturation
         # `1 - phi^2` is computed directly instead of as the difference of two
-        # nearly equal full-size terms.
         w.mul_(phi)
         torch.sub(grad_out, w, out=w)
         w.mul_(gamma)
         # grad_a = sum(dL/d(a*x) * x)
         # A single flat contraction over both operands rather than a
-        # full-size `w * x` block reduced afterwards.
         grad_a = _dot_all(w, x)
         # d/dx tanh(ax) = a * (1 - tanh^2(ax))
         w.mul_(a)
@@ -837,7 +775,6 @@ class _DyTForward(torch.autograd.Function):
         # tanh derivative is `1 - phi^2` and `dL/dgamma` is `sum(grad_out *
         # phi)`. Retaining the post-affine output instead would make both read
         # the affine as if it were the activation.
-        # The product already allocated its buffer, so the squash runs in
         # place on it.
         phi = alpha.mul(x)
         phi.tanh_()
@@ -854,7 +791,6 @@ class _DyTForward(torch.autograd.Function):
 
         # `w = grad_out * phi` is the `dL/dgamma` reduction and, walked on
         # through the tanh derivative, the input gradient too - so the two
-        # share one buffer (see `_DyTDForward.backward`).
         w = phi * grad_out
         grad_gamma = None
         if ctx.needs_input_grad[2]:
@@ -862,7 +798,6 @@ class _DyTForward(torch.autograd.Function):
         # `w = dL/d(alpha * x)`, shared by the input and the scalar alpha
         # gradient so the (1 - phi^2) factor is evaluated once. Factored as
         # `gamma * (grad_out - grad_out * phi^2)` so the caller's cotangent
-        # never has to be duplicated into a second full-size buffer just to
         # be scaled by `gamma` first.
         w.mul_(phi)
         torch.sub(grad_out, w, out=w)
@@ -1036,7 +971,6 @@ class _DyTCDForward(torch.autograd.Function):
         if need_phi:
             # Gradient w.r.t. p (if learnable) and w.r.t. gamma: one
             # `grad_out * phi` product feeds both reductions.
-            # `phi` is this kernel's own buffer, so the `dL/dphi` product
             # lands on it rather than beside it (see `_DyTCForward.backward`).
             grad_phi = phi.mul_(grad_out)
             if need_gamma_grad:
@@ -1051,7 +985,6 @@ class _DyTCDForward(torch.autograd.Function):
             # dphi/dx = g^(p+1) where g = s * f, taken as exp((p+1) * log(g))
             # (see `_GeneralizedSoftsign.backward`). The output affine is
             # folded in as two in-place scales instead of a pre-multiplied
-            # `grad_out * gamma` buffer (see `_DyTCForward.backward`).
             grad_x_scaled = g.log_().mul_(p_val + 1).exp_()
             grad_x_scaled.mul_(grad_out).mul_(gamma)
 
@@ -1071,9 +1004,6 @@ class _DyTCDForward(torch.autograd.Function):
 
                 # alpha_c = clamp_min(scale * (1 + delta), _MIN_ALPHA), scale =
                 # alpha_0 * exp(-k * depth_ratio). `alpha_c` is the *clamped*
-                # value, so the live (unclamped) mask is simply alpha_c > _MIN_ALPHA.
-                # It is folded in on the `[C]` reduction, which is this kernel's
-                # own buffer, rather than into a second copy of it.
                 grad_alpha_c.mul_((alpha_c > _MIN_ALPHA).to(grad_alpha_c.dtype))
 
                 # scale = alpha_0 * exp(-k * depth_ratio)
@@ -1085,7 +1015,6 @@ class _DyTCDForward(torch.autograd.Function):
                 # only feeds the two *scalar* schedules, so a layer that
                 # trains `delta` alone does not build it, and the shared
                 # `exp(-k * r)` is taken once for whichever of the three are
-                # live rather than for all three unconditionally.
                 need_delta = ctx.needs_input_grad[3]
                 if need_delta or ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
                     exp_kdr = torch.exp(-k * depth_ratio)
@@ -1112,7 +1041,6 @@ class _DyTCDForward(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
-# QK-squashing (Variant C) - lives inside the Attention module, but we
 # expose a small helper here so the attention code can pick it up cleanly.
 # ---------------------------------------------------------------------------
 class QKSquash(nn.Module):
@@ -1131,8 +1059,6 @@ class QKSquash(nn.Module):
     module stays a pure element-wise function of Q/K.
 
     The compression is `torch.tanh` on the scaled Q/K. The scale owns a
-    fresh buffer of its own, so the squash runs as the in-place form of
-    `tanh` on it instead of leaving a second full-size copy behind.
     """
 
     def __init__(self, alpha_q_init: float = 1.0, alpha_k_init: float = 1.0):
@@ -1143,7 +1069,6 @@ class QKSquash(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor):
         q = q * self.alpha_q
         k = k * self.alpha_k
-        # The scale above already owns a [B, H, T, hd] buffer, so the
         # compression is taken on it in place.
         q.tanh_()
         k.tanh_()

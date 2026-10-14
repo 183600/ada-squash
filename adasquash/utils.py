@@ -3,11 +3,9 @@ Stability metrics for the DyT++ study.
 
 Provides:
    * ActivationStats       - aggregated max|x| and kurtosis over all
-                             activations that pass through a norm layer
    * LossSpikeCounter      - running count of loss spikes (relative jump)
    * KurtosisMeter         - online kurtosis estimator (Welford-style)
    * MaxAbsMeter           - online max |x| estimator
-   * measure_activation_stats - one-shot hook-driven measurement pass
    * markov_batch          - learnable synthetic corpus for the offline
                              experiments (ablations / MoE / W8A8 probe)
    * count_parameters     - param accounting helpers
@@ -63,7 +61,6 @@ class KurtosisMeter:
 
     # Datatype the moments are accumulated in. fp32 is ample for the bf16 /
     # fp32 activations sampled during training - the kurtosis of a 25M-element
-    # block is a stable statistic, not a cancellation-prone one. It is *not*
     # enough where the fourth moment can overflow (activations around 1e18
     # square into inf at 1e36), which is why callers measuring activations
     # that large can raise this to float64.
@@ -93,7 +90,6 @@ class KurtosisMeter:
     def _bulk_update(self, x: torch.Tensor):
         """Batched Welford update."""
         # Use the formulas from:
-        #  Pébay, "Formulas for Robust, One-Pass Parallel Computation of
         #  Covariances and Arbitrary-Order Statistical Moments", 2008.
         n_b = x.numel()
         new_n = self.n + n_b
@@ -184,7 +180,6 @@ class ActivationStats:
         Any hook registered by a previous `attach` is removed first. Dropping
         the handle list without removing the hooks leaves the old hooks
         registered on the modules, so a re-attach silently doubles the
-        sampling rate (each activation is then counted once per live hook)
         and, worse, a later `detach` only clears the newest batch: the
         abandoned ones stay attached forever and keep writing into meters
         that the caller believes are closed.
@@ -281,7 +276,6 @@ def markov_batch(
     start = torch.randint(0, n_states, (batch_size, 1), generator=rng, device=device)
     if seq_len > 1:
         # The walk is cumulative: s_t = (s_0 + sum_{i<=t} j_i) mod n, and
-        # `(a + b) mod n == ((a mod n) + b) mod n`, so every intermediate
         # reduction collapses into one cumsum over the jump draw.
         jumps = torch.randint(
             0, max_jump, (batch_size, seq_len - 1), generator=rng, device=device
@@ -343,8 +337,6 @@ class LossSpikeCounter:
         `--resume`: `ema` is the baseline the next update compares against,
         so dropping it makes the first post-resume steps blind to a jump
         away from the pre-resume loss scale, and `n_spikes` is the running
-        count the training log reports. `history` stays out of it - it is a
-        local debugging list.
         """
         return {"ema": self.ema, "n_spikes": self.n_spikes}
 
@@ -373,7 +365,6 @@ class LossSpikeCounter:
 @torch.no_grad()
 def measure_activation_stats(model: nn.Module, batch: torch.Tensor) -> dict:
     """
-    Run a single forward pass on `batch`.
     """
     stats = ActivationStats(model)
     stats.attach()

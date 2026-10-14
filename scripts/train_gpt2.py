@@ -89,7 +89,6 @@ def build_dataloader(
             worker_id = worker_info.id if worker_info is not None else 0
             n_workers = worker_info.num_workers if worker_info is not None else 1
             # Operate on `self.buf` *in place* so the unconsumed tail is
-            # carried over to the next call. `pos` walks the buffer instead
             # of deleting its prefix after every chunk.
             buf = self.buf
             pos = self.pos
@@ -266,10 +265,8 @@ def restore_schedule_args(
     Returns the names where the command line and the checkpoint disagree.
     `max_steps` is included on purpose: extending a finished run (resume with
     a larger `--max-steps` to continue the cosine tail) changes the schedule
-    by design, so such a divergence is recorded rather than rejected -
     silently, it would look like an uninterrupted run.
 
-    A name the caller flags as *explicit* (passed on the command line, so
     not just a default that would otherwise be adopted) is left alone: the
     point of the restore is to keep a resumed run from silently reshaping the
     curve it claims to continue, not to make an explicit extension
@@ -414,7 +411,6 @@ def main():
     # shape override changes the parameter shapes, so a run whose `--compile`
     # or depth/width setting differs from the checkpoint's cannot be resumed
     # at all: `load_state_dict` below fails with a missing-key or a size
-    # mismatch. The sweep launcher passes its shape override through the
     # environment, which a bare `--resume` does not have, so it is taken from
     # the checkpoint instead. The precision flag is adopted for the same
     # reason: switching autocast on or off mid-run moves the whole curve.
@@ -614,7 +610,6 @@ def main():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             with ctx:
-                # The logit block is fused into the loss.
                 loss = model(x, y, return_logits=False)[1]
             loss = loss / args.grad_accum
             loss.backward()

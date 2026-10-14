@@ -82,11 +82,10 @@ _SWEEP_CONFIG_ALIASES = {
 
 
 def shape_for_depth(depth: int, base_dim: int, base_heads: int):
-    """(dim, n_heads) for a given depth, keeping the parameter count ~fixed.
+    """(dim, n_heads) for a given depth.
 
     The documented table is only valid for the LLaMA-tiny base shape; any
     other base model falls back to the 1/sqrt(depth) law scaled from its own
-    `base_dim` / `base_heads`, with head_dim held fixed. Without that guard
     the table would be returned for any base, so a `--model gpt2-124m` arm
     would silently be built at LLaMA-tiny width.
     """
@@ -232,8 +231,7 @@ def main():
     p.add_argument(
         "--no-dim-scaling",
         action="store_true",
-        help="keep dim/n_heads fixed across depths (param count then grows "
-             "linearly with depth, which confounds the depth axis)",
+        help="keep dim/n_heads fixed across depths",
     )
     p.add_argument("--output-dir", default="runs/depth-sweep")
     p.add_argument("--log-every", type=int, default=20)
@@ -251,7 +249,6 @@ def main():
             out_dir = base / f"d{depth}-{norm}"
             out_dir.mkdir(parents=True, exist_ok=True)
             # Save the depth-override scriptlet in the run dir so the
-            # subprocess can read it. We pass via env var, so this is purely
             # a documentation artifact.
             (out_dir / "depth.txt").write_text(str(depth))
             proc = launch_one(args, depth, norm, out_dir)

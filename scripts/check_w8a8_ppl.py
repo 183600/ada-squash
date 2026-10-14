@@ -55,7 +55,6 @@ def quantize_weight_per_channel(w: torch.Tensor, n_bits: int = 8):
     mx = w.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-6)
     q_max = (2 ** (n_bits - 1)) - 1
     scale = mx / q_max
-    # `w / scale` is already a buffer of its own, so the grid rounding, the
     # saturation clamp and the dequantizing scale all run on it.
     q = w / scale
     q.round_()
@@ -84,7 +83,6 @@ def _install_quantized_weight(linear: nn.Module, qw: torch.Tensor):
     that reaches for the matrix directly reads `linear.weight` - and
     `GPT.forward(return_logits=False)` does exactly that, because the fused
     loss takes `lm_head.weight` as an argument and never calls
-    `lm_head.forward` (which is what the wrapper replaces). Syncing the live
     weight as well is what keeps the output projection quantized on that
     path; otherwise that branch would still read the fp32 matrix and the run
     would measure a partly-quantized network.
@@ -115,10 +113,8 @@ def wrap_swiglu_w8a8(mlp):
     `wrap_linear_w8a8` does) never takes effect: every SwiGLU weight would
     stay fp32 and the reported W8A8 PPL drop would be measured on a model
     that is only partly quantized - the MLP holds the majority of the
-    parameters and is exactly where activation outliers live. The whole
     module is therefore wrapped at once.
 
-    `_SwiGLU.apply` also performs the `w2` GEMM internally, so routing the
     forward through it would leave the SwiGLU *hidden* activation
     (`silu(w1 x) * (w3 x)`, the most outlier-prone tensor in the network)
     in fp32 while every other GEMM input is int8. The forward is therefore
@@ -138,8 +134,6 @@ def wrap_swiglu_w8a8(mlp):
         x_q = qa(x)
         a = qa(F.linear(x_q, weights[0]))
         b = qa(F.linear(x_q, weights[2]))
-        # The gated product folds into the silu buffer: `mul_` writes the
-        # product into `h` rather than allocating a new one.
         h = F.silu(a)
         h.mul_(b)
         return mlp.drop(F.linear(qa(h), weights[1]))
@@ -180,7 +174,6 @@ def wrap_model_w8a8(model: nn.Module):
 
     `model.modules()` is recursive, so an `MLP` that `wrap_swiglu_w8a8` has
     already taken over is *still* descended into afterwards and its three
-    `nn.Linear` children are quantized a second time, and the resulting
     `quantized_forward` closures are never called because `MLP.forward` has
     been replaced wholesale. The sub-modules of a wrapped `MLP` are therefore
     skipped explicitly - continuing the loop does not, because the generator
@@ -400,7 +393,6 @@ def main():
         # copy, but measuring the fp32 model first and then wrapping *the
         # same* model in place keeps the comparison bit-for-bit the same:
         # `wrap_model_w8a8` is deterministic and the batches are already
-        # fixed.
         ce_fp = 0.0
         n_tok = 0
         for x in batches:

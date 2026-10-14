@@ -2,7 +2,6 @@
 Long-context needle-in-a-haystack sweep across context lengths.
 
 For each context length in --ctx-lens, we:
-  - generate a haystack by repeating a fixed prompt,
   - insert the needle at a random position,
   - prompt the model to recite the secret,
   - check that *every* token of the secret is emitted, in order.
