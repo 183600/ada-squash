@@ -274,8 +274,8 @@ class _SwiGLU(torch.autograd.Function):
         prod = grad_h * b
         grad_a = torch.ops.aten.silu_backward(prod, a)
         del prod
-        grad_b = grad_h * h
-        gated = h * b
+        grad_b = grad_h.mul_(h)
+        gated = h.mul(b)
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
         if ctx.needs_input_grad[0]:
             grad_x = grad_a @ w1

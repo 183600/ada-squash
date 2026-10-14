@@ -20,20 +20,22 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim == 2 and a.is_contiguous() and b.is_contiguous():
         acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
         return (a * b).sum(dim=0, dtype=acc).to(a.dtype)
-    rows = a.numel() // a.shape[-1]
-    step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
-    if rows <= step or not (a.is_contiguous() and b.is_contiguous()):
-        return _sum_leading_dims(a * b)
-    acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
-    a2 = a.reshape(rows, -1)
-    b2 = b.reshape(rows, -1)
-    total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a.device)
-    for start in range(0, rows, step):
-        part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc_dtype)
-        total.add_(part)
-    if total.dtype != a.dtype:
-        total = total.to(a.dtype)
-    return total
+    if a.is_contiguous() and b.is_contiguous():
+        rows = a.numel() // a.shape[-1]
+        step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
+        if rows <= step:
+            return _sum_leading_dims(a * b)
+        acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
+        a2 = a.view(rows, -1)
+        b2 = b.view(rows, -1)
+        total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a.device)
+        for start in range(0, rows, step):
+            part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc_dtype)
+            total.add_(part)
+        if total.dtype != a.dtype:
+            total = total.to(a.dtype)
+        return total
+    return _sum_leading_dims(a * b)
 
 def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.is_contiguous() and b.is_contiguous():
@@ -51,7 +53,7 @@ def register_norm(name: str):
 def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     t = xs.abs()
     lo = t.clamp(max=1.0)
-    hi = t.clamp_(min=1.0).reciprocal_()
+    hi = t.clamp(min=1.0).reciprocal_()
     u = hi.mul_(lo)
     s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     return lo.mul_(s).copysign_(xs)
@@ -62,13 +64,14 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
     r = t.clamp_(min=1.0).reciprocal_()
     a = None
     if need_u:
-        log_u = lo.mul(r).log_() if need_phi else lo.mul_(r).log_()
+        u = lo.mul(r)
+        log_u = u.log_()
         log_u.mul_(p)
         s = log_u.exp().log1p_().mul_(-1.0 / p).exp_()
         a = log_u.clamp_(min=p * math.log(torch.finfo(log_u.dtype).tiny))
     else:
-        s = lo.mul(r) if need_phi else lo.mul_(r)
-        s = s.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
+        s = lo.mul(r)
+        s.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     phi = lo.mul_(s).copysign_(xs) if need_phi else None
     if not need_g:
         return (None, phi, a)
@@ -181,7 +184,7 @@ class _RMSNorm(torch.autograd.Function):
         grad_x = None
         grad_weight = None
         if need_x:
-            u = grad_out * rstd
+            u = grad_out.mul(rstd)
             t = u.mul(x)
             if need_w:
                 grad_weight = _sum_leading_dims(t)
@@ -205,7 +208,7 @@ class _RMSNorm(torch.autograd.Function):
                 u = torch.addcmul(u, x, corr, value=-1)
             grad_x = u
         elif need_w:
-            grad_weight = _sum_leading_dims((grad_out * rstd).mul(x))
+            grad_weight = _sum_leading_dims(grad_out.mul(rstd).mul(x))
         if grad_x is not None and grad_x.dtype != x.dtype:
             grad_x = grad_x.to(x.dtype)
         if grad_weight is not None and grad_weight.dtype != weight.dtype:
@@ -236,12 +239,12 @@ class _DyTCForward(torch.autograd.Function):
         if p_is_tensor:
             p_raw = p
             p = p.clamp(min=_MIN_P)
-        x_scaled = x * alpha
+        x_scaled = x.mul(alpha)
         phi = _softsign_forward(x_scaled, p)
         if beta is not None:
             out = torch.addcmul(beta, phi, gamma)
         else:
-            out = phi.mul_(gamma)
+            out = phi.mul(gamma)
         ctx.p_is_tensor = p_is_tensor
         ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
         saved = [x_scaled, alpha, gamma, beta]
@@ -273,11 +276,11 @@ class _DyTCForward(torch.autograd.Function):
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
         if need_phi:
-            grad_phi = phi.mul_(grad_out)
+            grad_phi = phi.mul(grad_out)
             if need_gamma_grad:
                 grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
-                grad_p = _softsign_p_grad(grad_phi.mul_(gamma), a, p, p_raw)
+                grad_p = _softsign_p_grad(grad_phi.mul(gamma), a, p, p_raw)
             del phi, a, grad_phi
         grad_x = grad_alpha = None
         if need_softsign:
@@ -286,7 +289,7 @@ class _DyTCForward(torch.autograd.Function):
             if ctx.needs_input_grad[1]:
                 grad_alpha = _reduce_products(grad_x_scaled, x_scaled).div_(alpha)
             if ctx.needs_input_grad[0]:
-                grad_x = grad_x_scaled.mul_(alpha)
+                grad_x = grad_x_scaled.mul(alpha)
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[4]:
             grad_beta = _sum_leading_dims(grad_out)
@@ -321,12 +324,11 @@ class _DyTDForward(torch.autograd.Function):
     def forward(ctx, x, alpha_0, k, gamma, beta, depth_ratio):
         exp_kdr = torch.exp(-k * depth_ratio)
         a = alpha_0 * exp_kdr
-        phi = a.mul(x)
-        phi.tanh_()
+        phi = x.mul(a).tanh_()
         if beta is not None:
             out = torch.addcmul(beta, phi, gamma)
         else:
-            out = phi * gamma
+            out = phi.mul(gamma)
         ctx.save_for_backward(x, alpha_0, k, gamma, beta, exp_kdr.detach())
         ctx.depth_ratio = depth_ratio
         return out
@@ -336,8 +338,7 @@ class _DyTDForward(torch.autograd.Function):
         x, alpha_0, k, gamma, beta, exp_kdr = ctx.saved_tensors
         depth_ratio = ctx.depth_ratio
         a = alpha_0 * exp_kdr
-        phi = a.mul(x)
-        phi.tanh_()
+        phi = x.mul(a).tanh_()
         w = phi * grad_out
         grad_gamma = None
         if ctx.needs_input_grad[3]:
@@ -372,20 +373,18 @@ class _DyTForward(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, alpha, gamma, beta):
-        phi = alpha.mul(x)
-        phi.tanh_()
+        phi = x.mul(alpha).tanh_()
         if beta is not None:
             out = torch.addcmul(beta, phi, gamma)
         else:
-            out = phi * gamma
+            out = phi.mul(gamma)
         ctx.save_for_backward(x, alpha, gamma, beta)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         x, alpha, gamma, beta = ctx.saved_tensors
-        phi = alpha.mul(x)
-        phi.tanh_()
+        phi = x.mul(alpha).tanh_()
         w = phi * grad_out
         grad_gamma = None
         if ctx.needs_input_grad[2]:
@@ -442,12 +441,12 @@ class _DyTCDForward(torch.autograd.Function):
         exp_kdr = torch.exp(-k * depth_ratio)
         scale = alpha_0 * exp_kdr
         alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=_MIN_ALPHA)
-        x_scaled = x * alpha_c
+        x_scaled = x.mul(alpha_c)
         phi = _softsign_forward(x_scaled, p)
         if beta is not None:
             out = torch.addcmul(beta, phi, gamma)
         else:
-            out = phi.mul_(gamma)
+            out = phi.mul(gamma)
         ctx.p_is_tensor = p_is_tensor
         ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
         saved = [x_scaled, alpha_0, k, delta, gamma, beta, alpha_c, exp_kdr.detach()]
@@ -482,11 +481,11 @@ class _DyTCDForward(torch.autograd.Function):
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
         if need_phi:
-            grad_phi = phi.mul_(grad_out)
+            grad_phi = phi.mul(grad_out)
             if need_gamma_grad:
                 grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
-                grad_p = _softsign_p_grad(grad_phi.mul_(gamma), a, p, p_raw)
+                grad_p = _softsign_p_grad(grad_phi.mul(gamma), a, p, p_raw)
             del phi, a, grad_phi
         grad_x = grad_alpha_0 = grad_k = grad_delta = None
         if need_softsign:
@@ -508,7 +507,7 @@ class _DyTCDForward(torch.autograd.Function):
                         if ctx.needs_input_grad[2]:
                             grad_k = -grad_scale * scale * depth_ratio
             if ctx.needs_input_grad[0]:
-                grad_x = grad_x_scaled.mul_(alpha_c)
+                grad_x = grad_x_scaled.mul(alpha_c)
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[6]:
             grad_beta = _sum_leading_dims(grad_out)
@@ -522,8 +521,8 @@ class QKSquash(nn.Module):
         self.alpha_k = nn.Parameter(torch.tensor(float(alpha_k_init)))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
-        q = q * self.alpha_q
-        k = k * self.alpha_k
+        q = q.mul(self.alpha_q)
+        k = k.mul(self.alpha_k)
         q = torch.tanh(q)
         k = torch.tanh(k)
         return (q, k)

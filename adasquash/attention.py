@@ -100,8 +100,7 @@ class CausalSelfAttention(nn.Module):
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
         peak = torch.zeros((), dtype=q.dtype, device=device)
-        _pair = self._tril_cache
-        drop = _pair[2] if len(_pair) >= 3 else ~keep
+        drop = self._tril_pair(T, device)[1]
         k_t = k.transpose(-1, -2)
         for start in range(0, T, rows):
             end = min(start + rows, T)
@@ -154,10 +153,8 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     x_lo = x[..., :half]
     x_hi = x[..., half:]
     out = torch.empty_like(x)
-    out[..., :half] = x_lo * cos[..., :half]
-    out[..., :half].addcmul_(x_hi, sin[..., :half], value=-1.0)
-    out[..., half:] = x_hi * cos[..., half:]
-    out[..., half:].addcmul_(x_lo, sin[..., half:], value=1.0)
+    out[..., :half] = x_lo * cos[..., :half] - x_hi * sin[..., :half]
+    out[..., half:] = x_hi * cos[..., half:] + x_lo * sin[..., half:]
     return out
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
