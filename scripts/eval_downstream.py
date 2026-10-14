@@ -10,6 +10,20 @@ import torch
 from adasquash import GPTConfig, GPT
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 
+def _strip_compile_prefix(state):
+    """Normalise a `torch.compile` state_dict down to the plain module's keys.
+
+    `train_gpt2.py --compile` wraps the model, so the saved `state_dict()`
+    carries the `_orig_mod.` prefix that the wrapper introduces. Every
+    consumer here rebuilds the *unwrapped* module, so without this the
+    `load_state_dict` dies on the prefix and a compiled run's checkpoint
+    cannot be evaluated at all.
+    """
+    prefix = '_orig_mod.'
+    if not any(k.startswith(prefix) for k in state):
+        return state
+    return {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state.items()}
+
 def load_ckpt(path: str, device: str='cuda'):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     args = ckpt['args']
@@ -38,7 +52,7 @@ def load_ckpt(path: str, device: str='cuda'):
         if heads:
             cfg_dict['n_heads'] = heads
         model = GPT(GPTConfig(**cfg_dict))
-    model.load_state_dict(ckpt['model'])
+    model.load_state_dict(_strip_compile_prefix(ckpt['model']))
     model.to(device)
     model.eval()
     return (model, args)
