@@ -1,4 +1,4 @@
-# GPT-2 124M, RMSNorm baseline (LLaMA-style)
+
 model: gpt2-124m
 norm: rmsnorm
 qk_norm: null

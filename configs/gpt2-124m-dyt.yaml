@@ -1,4 +1,4 @@
-# GPT-2 124M, original Dynamic Tanh (Zhu et al. 2025)
+
 model: gpt2-124m
 norm: dyt
 alpha_init: 0.6

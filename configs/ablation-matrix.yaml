@@ -1,11 +1,11 @@
-# Ablation matrix for DyT++ component study
-# Used by: python scripts/ablation.py --config configs/ablation-matrix.yaml
+
+
 model: gpt2-124m
 
-# Synthetic Markov-chain corpus for the stability tests. The chain gives
-# the loss a learnable floor (log of the state count) so variants can
-# actually be ranked, and a sparse outlier channel gives the squashing
-# layers something to control.
+
+
+
+
 batch_size: 8
 seq_len: 512
 max_steps: 1000
@@ -17,11 +17,11 @@ log_every: 50
 stats_every: 200
 output_dir: runs/ablation
 
-# Each entry below is one ablation; the script iterates over these and
-# writes one summary.json per row. `norm` is the norm selector
-# (GPTConfig spells it `norm_name`).
+
+
+
 ablations:
-  # ---- Per-channel on/off ----
+
   - name: dyt_no_perchannel
     norm: dyt
   - name: dytc_perchannel
@@ -32,30 +32,30 @@ ablations:
   - name: dytcd_full
     norm: dytcd
 
-  # ---- Depth conditioning ----
-  # `learnable_k: false` is what actually switches the schedule off; `k_init`
-  # alone would only set its initial value and the optimizer would immediately
-  # learn k back off zero.
+
+
+
+
   - name: dytd_k0_no_depth_schedule
     norm: dytd
     k_init: 0.0
     learnable_k: false
   - name: dytd_full
     norm: dytd
-  # The depth schedule is isolated by `dytd_full` vs
-  # `dytd_k0_no_depth_schedule`: both rows are plain `dytd`, so they differ
-  # only in whether k is active (and its value).
-  #
-  # `dytcd_full` (above) is the combined A+B layer, not a drop-in for either
-  # single-axis reference. Against `dytd_full` it does NOT isolate the
-  # per-channel axis, and against `dytd_k0_no_depth_schedule` it does NOT
-  # isolate the depth schedule: `dytcd` also replaces the tanh activation
-  # with the generalized softsign and a learnable p, and adds the delta
-  # vector, so those contrasts bundle per-channel alpha with the activation
-  # family. Use the `dytc_*` rows below to sweep the activation family on the
-  # per-channel axis, and the `dyt*` rows above to isolate the alpha axis.
 
-  # ---- LayerScale init ----
+
+
+
+
+
+
+
+
+
+
+
+
+
   - name: dytcd_no_ls
     norm: dytcd
     use_layerscale: false
@@ -66,7 +66,7 @@ ablations:
     norm: dytcd
     layerscale_init: 1.0e-3
 
-  # ---- softsign family vs its hard-tanh limit ----
+
   - name: dytc_p1_softsign
     norm: dytc
     p_init: 1.0
@@ -93,7 +93,7 @@ ablations:
     learnable_p: false
     alpha_jitter: 0.0
 
-  # ---- alpha init ----
+
   - name: dyt_alpha_0.3
     norm: dyt
     alpha_init: 0.3

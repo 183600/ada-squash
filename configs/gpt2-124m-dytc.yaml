@@ -1,4 +1,4 @@
-# GPT-2 124M, DyT-C (Variant A: per-channel softsign)
+
 model: gpt2-124m
 norm: dytc
 alpha_init: 0.5

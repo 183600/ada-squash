@@ -1,5 +1,5 @@
-# GPT-2 124M, DyT-CD — the main DyT++ proposal
-# Combines per-channel adaptive softsign (A) with depth-conditioned alpha (B)
+
+
 model: gpt2-124m
 norm: dytcd
 alpha_0: 0.9

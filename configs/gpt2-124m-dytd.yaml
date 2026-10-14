@@ -1,4 +1,4 @@
-# GPT-2 124M, DyT-D (Variant B: depth-conditioned alpha + LayerScale)
+
 model: gpt2-124m
 norm: dytd
 alpha_0: 0.9
