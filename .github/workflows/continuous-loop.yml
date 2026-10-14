@@ -221,52 +221,30 @@ jobs:
           CLEAN_TIMEOUT=$((30*60))    # 30m
           APPLY_TIMEOUT=$((30*60))    # 30m（算力申请.md 检查修复）
 
-          # ================= opencode 自带免费模型池 =================
-          # 全部来自 opencode 自带 OpenCode Zen provider 的 $0 免费模型，
-          # 无需任何 API key；可自行增删。启动时会用 `opencode models` 校验，
-          # 自动剔除当前版本已下线的模型。
-          FREE_MODELS=(
-            "opencode/big-pickle"
-            "opencode/nemotron-3-ultra-free"
-            "opencode/nemotron-3.5-lightning-free"
-            "opencode/longcat-2.5-preview-free"
-            "opencode/mimo-v2.6-flash-free"
-            "opencode/mimo-v2.5-free"
-            "opencode/ling-3.1-flash-free"
-            "opencode/ling-3.0-flash-fin-free"
-            "opencode/step-5-preview-free"
-            "opencode/space-bunny-free"
-            "opencode/exo-free"
-            # 备用：已标记 deprecated 但通常仍可用的经典免费模型，按需取消注释
-            # "opencode/grok-code"
-            # "opencode/kimi-k2.5-free"
-            # "opencode/glm-5-free"
-            # "opencode/minimax-m3-free"
-            # "opencode/qwen3.6-plus-free"
-            # "opencode/deepseek-v4-flash-free"
-          )
-
-          # ---------- 校验模型可用性，剔除当前版本已下线的 ----------
-          AVAIL="$(opencode models opencode 2>/dev/null || opencode models 2>/dev/null || true)"
-          if [ -n "$AVAIL" ]; then
-            VALID=()
-            for m in "${FREE_MODELS[@]}"; do
-              if echo "$AVAIL" | grep -Fq "$m"; then
-                VALID+=("$m")
-              else
-                echo "[warn] 模型 $m 不在可用列表中，剔除"
-              fi
-            done
-            if [ ${#VALID[@]} -gt 0 ]; then
-              FREE_MODELS=("${VALID[@]}")
-            else
-              echo "[warn] 校验后模型池为空，回退为默认单模型"
-              FREE_MODELS=("opencode/big-pickle")
-            fi
-          else
-            echo "[warn] 无法获取模型目录，跳过校验，直接使用原始模型池"
+          # ================= 动态模型池（不写死，实时读取线上目录） =================
+          # 池直接来自 `opencode models opencode` 的实时输出：模型上新自动入池、
+          # 下线自动出池，无需再改本文件。目录暂时不可达时池置空，
+          # pick_model 会在每个阶段开始时惰性重建重试。
+          build_model_pool() {
+            local out ids m
+            out="$(opencode models opencode 2>/dev/null || opencode models 2>/dev/null || true)"
+            [ -z "$out" ] && return 1
+            # 提取 opencode provider 的全部模型 ID（形如 opencode/<model-id>）
+            ids="$(printf '%s\n' "$out" | grep -oE 'opencode/[A-Za-z0-9][A-Za-z0-9._-]*' | sort -u)"
+            [ -z "$ids" ] && return 1
+            local pool=()
+            while IFS= read -r m; do
+              [ -n "$m" ] && pool+=("$m")
+            done <<< "$ids"
+            [ ${#pool[@]} -eq 0 ] && return 1
+            FREE_MODELS=("${pool[@]}")
+            echo "[info] 动态模型池（${#FREE_MODELS[@]} 个）: ${FREE_MODELS[*]}"
+            return 0
+          }
+          if ! build_model_pool; then
+            echo "[warn] 启动时读取模型目录失败，模型池暂空；将随阶段重试自动重建"
+            FREE_MODELS=()
           fi
-          echo "[info] 免费模型池（${#FREE_MODELS[@]} 个）: ${FREE_MODELS[*]}"
 
           # ================= workflow 防删自愈 =================
           # opencode 的 clean 阶段可能把 .github 当作“多余内容”删除。
@@ -495,9 +473,18 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 随机选一个免费模型（尽量避免和上次相同） ----------
+          # ---------- 随机选一个模型（尽量避免和上次相同） ----------
+          # 池为空时先惰性重建（目录 API 瞬时故障的自愈）；
+          # 重建后仍为空则返回 1，由调用方计入失败并稍后重试。
           pick_model() {
+            if [ ${#FREE_MODELS[@]} -eq 0 ]; then
+              build_model_pool || true
+            fi
             local n=${#FREE_MODELS[@]}
+            if [ "$n" -eq 0 ]; then
+              CURRENT_MODEL=""
+              return 1
+            fi
             local m
             for _ in 1 2 3; do
               m="${FREE_MODELS[$((RANDOM % n))]}"
@@ -505,6 +492,7 @@ jobs:
             done
             PREVIOUS_MODEL="$m"
             CURRENT_MODEL="$m"
+            return 0
           }
 
           # ---------- 单阶段执行（带重试 + 随机换模型） ----------
@@ -524,7 +512,16 @@ jobs:
                 return 1
               fi
 
-              pick_model
+              if ! pick_model; then
+                FAIL_COUNT=$((FAIL_COUNT+1))
+                echo "[warn] phase=$phase 模型池为空（目录不可达），连续 $FAIL_COUNT 次，120s 后重试"
+                if [ $FAIL_COUNT -ge 3 ]; then
+                  echo "[warn] 连续 3 次拿不到模型目录，放弃该阶段"
+                  return 1
+                fi
+                sleep 120
+                continue
+              fi
               echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$CURRENT_MODEL ==========="
 
               timeout --kill-after=180 "$budget" opencode run -m "$CURRENT_MODEL" "$prompt" 2>&1 | tee "$OUT"
