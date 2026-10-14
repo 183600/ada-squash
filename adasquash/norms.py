@@ -10,7 +10,7 @@ _MIN_P = 1e-3
 
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     if t.ndim <= 1:
-        return t.clone()
+        return t
     return t.sum(dim=tuple(range(t.ndim - 1)))
 _REDUCE_CHUNK_ELEMS = 1 << 20
 
@@ -24,18 +24,13 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
     if rows <= step or not (a.is_contiguous() and b.is_contiguous()):
         return _sum_leading_dims(a * b)
-    acc = None
-    if a.dtype in (torch.bfloat16, torch.float16):
-        acc = torch.promote_types(a.dtype, torch.float32)
+    acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
     a2 = a.reshape(rows, -1)
     b2 = b.reshape(rows, -1)
-    total = None
+    total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a.device)
     for start in range(0, rows, step):
-        part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc)
-        if total is None:
-            total = part
-        else:
-            total.add_(part)
+        part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc_dtype)
+        total.add_(part)
     if total.dtype != a.dtype:
         total = total.to(a.dtype)
     return total

@@ -166,7 +166,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             end = min(start + chunk_rows, targets.numel())
             hc = h[start:end]
             tc = targets[start:end]
-            probs = F.linear(hc, w).to(acc)
+            probs = hc @ w.t()
+            probs = probs.to(acc)
             torch.softmax(probs, -1, out=probs)
             valid = tc.ne(ctx.ignore_index)
             gold = tc.masked_fill(~valid, 0).unsqueeze(-1)
@@ -269,7 +270,7 @@ class _SwiGLU(torch.autograd.Function):
         if x.dtype != dt:
             x = x.to(dt)
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
-        grad_h = F.linear(grad_out, w2.t())
+        grad_h = grad_out @ w2
         prod = grad_h * b
         grad_a = torch.ops.aten.silu_backward(prod, a)
         del prod
@@ -277,7 +278,7 @@ class _SwiGLU(torch.autograd.Function):
         gated = h * b
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
         if ctx.needs_input_grad[0]:
-            grad_x = F.linear(grad_a, w1.t())
+            grad_x = grad_a @ w1
             grad_x.addmm_(grad_b, w3)
         if ctx.needs_input_grad[1]:
             grad_w1 = grad_a.t() @ x

@@ -153,8 +153,10 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
     x_hi = x[..., half:]
-    out = x * cos
+    out = torch.empty_like(x)
+    out[..., :half] = x_lo * cos[..., :half]
     out[..., :half].addcmul_(x_hi, sin[..., :half], value=-1.0)
+    out[..., half:] = x_hi * cos[..., half:]
     out[..., half:].addcmul_(x_lo, sin[..., half:], value=1.0)
     return out
 
@@ -165,7 +167,7 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: O
         cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
         sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
     if cos.dtype != q.dtype:
-        cos = cos.to(q.dtype).contiguous()
-        sin = sin.to(q.dtype).contiguous()
+        cos = cos.to(dtype=q.dtype)
+        sin = sin.to(dtype=q.dtype)
     return (_rope_half(q, cos, sin), _rope_half(k, cos, sin))
 __all__ = ['CausalSelfAttention', 'RMSNormHead']
