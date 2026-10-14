@@ -964,15 +964,13 @@ class _DyTCDForward(torch.autograd.Function):
 
                 # alpha_c = clamp_min(scale * (1 + delta), _MIN_ALPHA), scale =
                 # alpha_0 * exp(-k * depth_ratio). `alpha_c` is the *clamped*
-                # value, so it cannot be divided back into `scale` on the
-                # channels the clamp is holding: the raw product is re-derived
-                # instead, and the clamp's own zero-gradient is applied.
+                # value, so the live (unclamped) mask is simply alpha_c > _MIN_ALPHA.
+                live = (alpha_c > _MIN_ALPHA).to(grad_alpha_c.dtype)
+                grad_alpha_c = grad_alpha_c * live
+
                 exp_kdr = torch.exp(-k * depth_ratio)
                 scale = alpha_0 * exp_kdr
                 one_plus_delta = 1.0 + delta
-                live = (scale * one_plus_delta >= _MIN_ALPHA).to(grad_alpha_c.dtype)
-                grad_alpha_c = grad_alpha_c * live
-
                 grad_scale = grad_alpha_c * one_plus_delta
 
                 # scale = alpha_0 * exp(-k * depth_ratio)
