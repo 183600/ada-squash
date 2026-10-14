@@ -562,9 +562,10 @@ class MLP(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(
-            _SwiGLU.apply(x, self.w1.weight, self.w2.weight, self.w3.weight)
-        )
+        y = _SwiGLU.apply(x, self.w1.weight, self.w2.weight, self.w3.weight)
+        if self.drop.p > 0.0:
+            y = self.drop(y)
+        return y
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +651,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
             x.add_(self.pos_emb(self._pos_ids[:T].unsqueeze(0)))
-        x = self.drop(x)
+        if self.drop.p > 0.0:
+            x = self.drop(x)
 
         freqs = self.freqs_cis[:T] if self.freqs_cis is not None else None
 

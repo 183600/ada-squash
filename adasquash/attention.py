@@ -134,7 +134,10 @@ class CausalSelfAttention(nn.Module):
             scale=scale,
         )
         out = out.transpose(1, 2).reshape(B, T, C)
-        out = self.proj_drop(self.proj(out))
+        if self.proj_drop.p > 0.0:
+            out = self.proj_drop(self.proj(out))
+        else:
+            out = self.proj(out)
         return out, stats
 
     def _tril_mask(self, T: int, device) -> torch.Tensor:
@@ -276,7 +279,9 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     x_hi = x[..., half:]
     # out[..., :half] = x_lo * cos_lo - x_hi * sin_lo
     # out[..., half:] = x_hi * cos_hi + x_lo * sin_hi
-    out = torch.empty_like(x)
+    # A contiguous (not stride-preserving) output: same number of elements as
+    # `empty_like`, but laid out for the SDPA GEMMs that consume q/k next.
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     out[..., :half].copy_(x_lo)
     out[..., :half].mul_(cos[..., :half])
     out[..., :half].addcmul_(x_hi, sin[..., :half], value=-1.0)
