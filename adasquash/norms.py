@@ -79,7 +79,7 @@ def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     product down to one number. Both operands are the same shape and, in
     every caller, contiguous, so the contraction runs as a single flat
     `dot` over two views: the same value the product would have produced,
-    without the extra `[.., C]` block it costs to build it in between.
+    without the extra `[.., C]` block that building it in between would require.
     """
     if a.is_contiguous() and b.is_contiguous():
         return torch.dot(a.reshape(-1), b.reshape(-1))
@@ -129,7 +129,7 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     from their saved input in the backward (`_softsign_backward_pieces`), so
     handing it back would only keep a second `[.., C]` block alive across the
     call boundary - through the output affine, which is exactly where the
-    block budget is tightest. Letting the frame drop `s` on return frees it
+    block pressure is highest. Letting the frame drop `s` on return frees it
     while the caller is still short one live buffer.
     """
     # `lo` and `hi` are both derived from a single `abs()` buffer.
@@ -142,7 +142,7 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     # power is taken as `exp(p * log(u))`: `u <= 1` keeps `p * log(u) <= 0`,
     # so the exponential lands in (0, 1] exactly where `pow` put it (including
     # the `u == 0` limit, where `log(0) * p = -inf -> exp(-inf) = 0 = 0^p`),
-    # while an exp/log pair costs roughly half of a `pow`.
+    # while an exp/log pair takes roughly half the arithmetic of a `pow`.
     s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     # The sign rides on the sign bit of `xs` rather than on a separate
     # `torch.sign` pass, so `|x| = inf` still yields +-1 instead of inf * 0.
@@ -336,7 +336,7 @@ class _GeneralizedSoftsign(torch.autograd.Function):
             # d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1). The power is taken
             # as `exp((p+1) * log(g))`: `g > 0` keeps the log finite (and
             # `g == 0` still lands on 0), and the exp/log pair is about half
-            # the cost of `pow`.
+            # the arithmetic of `pow`.
             grad_x = g.log_().mul_(p + 1).exp_().mul_(grad_out)
         if need_p:
             # `phi` is this kernel's own buffer and nothing else reads it, so
