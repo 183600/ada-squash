@@ -160,7 +160,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
                 ignore_index=ignore_index,
                 reduction="sum",
             )
-            total = chunk_loss if total is None else total + chunk_loss
+            total = chunk_loss if total is None else total.add_(chunk_loss)
         count = targets.ne(ignore_index).sum()
         ctx.save_for_backward(logits, targets)
         ctx.ignore_index = ignore_index
@@ -265,7 +265,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                 chunk_logits, targets[start:end],
                 ignore_index=ignore_index, reduction="sum",
             )
-            total = chunk if total is None else total + chunk
+            total = chunk if total is None else total.add_(chunk)
         count = targets.ne(ignore_index).sum()
         ctx.save_for_backward(h, w, targets)
         ctx.ignore_index = ignore_index

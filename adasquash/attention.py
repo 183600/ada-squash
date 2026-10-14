@@ -143,9 +143,22 @@ class CausalSelfAttention(nn.Module):
         cache = self._tril_cache
         if cache is None or cache[0] != (T, device):
             mask = torch.ones(T, T, device=device, dtype=torch.bool).tril_()
-            cache = ((T, device), mask)
+            # The complement is derived once beside the triangle so the
+            # stats path does not re-allocate it on every call.
+            cache = ((T, device), mask, ~mask)
             self._tril_cache = cache
         return cache[1]
+
+    def _tril_pair(self, T: int, device):
+        """(keep, drop) triangle pair, sharing the (T, device) cache entry."""
+        cache = self._tril_cache
+        if cache is None or cache[0] != (T, device):
+            self._tril_mask(T, device)
+            cache = self._tril_cache
+        if len(cache) >= 3:
+            return cache[1], cache[2]
+        keep = cache[1]
+        return keep, ~keep
 
     _LOGITS_CHUNK_BYTES = 1 << 26
 
@@ -178,7 +191,8 @@ class CausalSelfAttention(nn.Module):
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
         peak = torch.zeros((), dtype=q.dtype, device=device)
         # Complement of the causal triangle, built once rather than re-derived
-        drop = ~keep
+        _pair = self._tril_cache
+        drop = _pair[2] if len(_pair) >= 3 else ~keep
         k_t = k.transpose(-1, -2)
         for start in range(0, T, rows):
             end = min(start + rows, T)
@@ -186,12 +200,12 @@ class CausalSelfAttention(nn.Module):
             block.mul_(scale)
             block.masked_fill_(drop[start:end], 0.0)
             # Signed sum first: the variance needs `sum(x)`, and the absolute
-            acc_x = acc_x + block.sum(dtype=torch.float64)
+            acc_x.add_(block.sum(dtype=torch.float64))
             block.abs_()
-            peak = torch.maximum(peak, block.amax())
-            acc_abs = acc_abs + block.sum(dtype=torch.float64)
+            torch.maximum(peak, block.amax(), out=peak)
+            acc_abs.add_(block.sum(dtype=torch.float64))
             block.square_()
-            acc_sq = acc_sq + block.sum(dtype=torch.float64)
+            acc_sq.add_(block.sum(dtype=torch.float64))
         total = float(acc_abs)
         signed = float(acc_x)
         mean_abs = total / n_valid
@@ -269,7 +283,7 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     # out[..., half:] = x_hi * cos_hi + x_lo * sin_hi
     # A contiguous (not stride-preserving) output: same number of elements as
     # `empty_like`, but laid out for the SDPA GEMMs that consume q/k next.
-    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
     out[..., :half].copy_(x_lo)
     out[..., :half].mul_(cos[..., :half])
     out[..., :half].addcmul_(x_hi, sin[..., :half], value=-1.0)

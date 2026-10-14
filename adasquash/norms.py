@@ -443,7 +443,12 @@ class _RMSNorm(torch.autograd.Function):
                 u.mul_(weight)
             else:
                 u = u * weight
-            corr = m * rstd * rstd
+            # `m` is freshly owned here, so the rstd^2 fold reuses it
+            # instead of materialising a second [B, T, 1] temporary.
+            if m.dtype == rstd.dtype:
+                corr = m.mul_(rstd).mul_(rstd)
+            else:
+                corr = m * rstd * rstd
             out_dtype = torch.promote_types(
                 u.dtype, torch.promote_types(x.dtype, corr.dtype)
             )
@@ -687,7 +692,8 @@ class _DyTDForward(torch.autograd.Function):
     """
     @staticmethod
     def forward(ctx, x, alpha_0, k, gamma, beta, depth_ratio):
-        a = alpha_0 * torch.exp(-k * depth_ratio)
+        exp_kdr = torch.exp(-k * depth_ratio)
+        a = alpha_0 * exp_kdr
         # `phi` (pre-affine) is the retained activation: the tanh derivative
         # post-affine `out` would differentiate `gamma * tanh(.) + beta`.
         # place on it.
@@ -697,16 +703,15 @@ class _DyTDForward(torch.autograd.Function):
             out = torch.addcmul(beta, phi, gamma)
         else:
             out = phi * gamma
-        ctx.save_for_backward(x, alpha_0, k, gamma, beta, phi)
+        ctx.save_for_backward(x, alpha_0, k, gamma, beta, phi, exp_kdr.detach())
         ctx.depth_ratio = depth_ratio
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, alpha_0, k, gamma, beta, phi = ctx.saved_tensors
+        x, alpha_0, k, gamma, beta, phi, exp_kdr = ctx.saved_tensors
         depth_ratio = ctx.depth_ratio
 
-        exp_kdr = torch.exp(-k * depth_ratio)
         a = alpha_0 * exp_kdr
         # that `dL/dgamma` reduces and is then walked to the input gradient,
         # which it *is* on the way out.
@@ -900,7 +905,8 @@ class _DyTCDForward(torch.autograd.Function):
             p_raw = p
             p = p.clamp(min=_MIN_P)
         # Compute alpha_per_channel: alpha_0 * exp(-k * depth_ratio) * (1 + delta)
-        scale = alpha_0 * torch.exp(-k * depth_ratio)
+        exp_kdr = torch.exp(-k * depth_ratio)
+        scale = alpha_0 * exp_kdr
         alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=_MIN_ALPHA)
 
         # generalized_softsign on `x * alpha_c` (broadcast over [B, T, C])
@@ -925,7 +931,7 @@ class _DyTCDForward(torch.autograd.Function):
         # exponent is trainable, so the flag is read off that.
         ctx.p_is_tensor = p_is_tensor
         ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
-        saved = [x_scaled, alpha_0, k, delta, gamma, beta, alpha_c]
+        saved = [x_scaled, alpha_0, k, delta, gamma, beta, alpha_c, exp_kdr.detach()]
         if p_is_tensor:
             saved.append(p_raw)
         else:
@@ -939,9 +945,10 @@ class _DyTCDForward(torch.autograd.Function):
         # `ctx.saved_tensors` may only be unpacked once per backward.
         saved = ctx.saved_tensors
         x_scaled, alpha_0, k, delta, gamma, beta, alpha_c = saved[:7]
+        exp_kdr = saved[7]
         depth_ratio = ctx.depth_ratio
         p_is_tensor = ctx.p_is_tensor
-        p_raw = saved[7] if p_is_tensor else None
+        p_raw = saved[8] if p_is_tensor else None
         if p_is_tensor:
             p = p_raw.clamp(min=_MIN_P)
         else:
@@ -1017,7 +1024,6 @@ class _DyTCDForward(torch.autograd.Function):
                 # `exp(-k * r)` is taken once for whichever of the three are
                 need_delta = ctx.needs_input_grad[3]
                 if need_delta or ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
-                    exp_kdr = torch.exp(-k * depth_ratio)
                     scale = alpha_0 * exp_kdr
                     if need_delta:
                         grad_delta = grad_alpha_c * scale

@@ -280,8 +280,13 @@ def markov_batch(
         jumps = torch.randint(
             0, max_jump, (batch_size, seq_len - 1), generator=rng, device=device
         )
-        walk = (start + jumps.cumsum(dim=1)).remainder_(n_states)
-        x = torch.cat([start, walk], dim=1)
+        # Single [B, T] allocation: the cumsum lands directly in the tail
+        # view instead of a throwaway [B, T-1] sum plus a cat copy.
+        x = torch.empty((batch_size, seq_len), dtype=start.dtype, device=device)
+        x[:, :1] = start
+        torch.cumsum(jumps, dim=1, out=x[:, 1:])
+        del jumps
+        x[:, 1:].add_(start).remainder_(n_states)
     else:
         x = start
     y = torch.full(
