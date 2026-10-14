@@ -154,8 +154,8 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     the saved logit block: `GPT.forward(..., return_logits=True)` hands the
     very same tensor back to its caller, so overwriting it in place would
     leave that caller holding gradient values stamped over its logits after
-    `loss.backward()`. Within that buffer the probabilities are built
-    directly, so no second `[chunk, V]` block is ever live.
+    `loss.backward()`. Each chunk's probabilities are built directly inside
+    that buffer, one row block at a time.
     """
 
     @staticmethod
@@ -187,9 +187,9 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
             chunk_targets = targets[start:end]
-            # The softmax lands straight in the gradient slice it belongs in:
-            # a separate probability buffer plus a copy into `grad_logits`
-            # would be two extra passes over the largest block in the model.
+            # The softmax lands straight in the gradient slice it belongs in,
+            # so the chunk's probabilities are written where the gradient is
+            # due.
             probs = grad_logits[start:end]
             torch.softmax(logits[start:end], dim=-1, out=probs)
             valid = chunk_targets.ne(ctx.ignore_index)
@@ -264,9 +264,9 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         total = None
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
-            # The chunk's logits are this node's own GEMM output - the cast
-            # allocates a private copy whenever it changes the dtype - so the
-            # log-softmax runs in place on them.
+            # The chunk's logits are this node's own GEMM output, and the
+            # cast to `acc` hands back a tensor this node owns, so the
+            # log-softmax can run in place on them.
             chunk_logits = F.linear(h[start:end], w).to(acc)
             torch.log_softmax(chunk_logits, -1, out=chunk_logits)
             # `log_softmax` + `nll_loss` is what `F.cross_entropy` runs; the
@@ -306,8 +306,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             hc = h[start:end]
             tc = targets[start:end]
             # Same in-place log-softmax as the forward: the recomputed chunk
-            # is the only owner of its logits, and folding the softmax into
-            # that buffer halves the block this loop keeps live.
+            # is the only owner of its logits, so the softmax folds into
+            # that buffer.
             probs = F.linear(hc, w).to(acc)
             torch.softmax(probs, -1, out=probs)
             valid = tc.ne(ctx.ignore_index)
@@ -672,8 +672,8 @@ class GPT(nn.Module):
                     all_logit_stats.append(ls)
         x = self.norm_f(x)
         if last_position_only:
-            # Decoding / scoring only the final position never needs the full
-            # [B, T, V] logit block.
+            # Decoding / scoring only the final position: project just that
+            # position's hidden state.
             x = x[:, -1:]
 
         logits = None

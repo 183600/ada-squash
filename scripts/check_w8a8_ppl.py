@@ -138,8 +138,8 @@ def wrap_swiglu_w8a8(mlp):
         x_q = qa(x)
         a = qa(F.linear(x_q, weights[0]))
         b = qa(F.linear(x_q, weights[2]))
-        # The gated product folds into the silu buffer, so the SwiGLU hidden
-        # activation never leaves a second full-size tensor behind.
+        # The gated product folds into the silu buffer: `mul_` writes the
+        # product into `h` rather than allocating a new one.
         h = F.silu(a)
         h.mul_(b)
         return mlp.drop(F.linear(qa(h), weights[1]))

@@ -223,8 +223,7 @@ class CausalSelfAttention(nn.Module):
 
         The expanded tables live in the source's own dtype and the cast to
         the activation dtype is memoised beside them, so a mixed-precision
-        model does not re-allocate and re-copy the tables on every layer of
-        every step.
+        model reuses one set of tables across layers and steps.
         """
         key = (
             freqs_cis.data_ptr(),

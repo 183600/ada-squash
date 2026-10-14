@@ -127,10 +127,8 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     `s` is *not* returned: no caller reads it. Each of the three kernels that
     run this core wants only the squashed activation, and they all rebuild `s`
     from their saved input in the backward (`_softsign_backward_pieces`), so
-    handing it back would only keep a second `[.., C]` block alive across the
-    call boundary - through the output affine, which is exactly where the
-    block pressure is highest. Letting the frame drop `s` on return frees it
-    while the caller is still short one live buffer.
+    handing it back would keep a second `[.., C]` block alive across the call
+    boundary for nothing. The frame drops `s` on return instead.
     """
     # `lo` and `hi` are both derived from a single `abs()` buffer.
     t = xs.abs()
@@ -141,8 +139,7 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     # s = (1 + u^p)^(-1/p), evaluated through log1p on a base <= 1. The
     # power is taken as `exp(p * log(u))`: `u <= 1` keeps `p * log(u) <= 0`,
     # so the exponential lands in (0, 1] exactly where `pow` put it (including
-    # the `u == 0` limit, where `log(0) * p = -inf -> exp(-inf) = 0 = 0^p`),
-    # while an exp/log pair takes roughly half the arithmetic of a `pow`.
+    # the `u == 0` limit, where `log(0) * p = -inf -> exp(-inf) = 0 = 0^p`).
     s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     # The sign rides on the sign bit of `xs` rather than on a separate
     # `torch.sign` pass, so `|x| = inf` still yields +-1 instead of inf * 0.
@@ -166,18 +163,16 @@ def _softsign_backward_pieces(
     when only those reductions are live.
 
     `s` is re-derived here, from `xs` and `p`, with exactly the sequence
-    `_softsign_forward` ran - so it is bit-for-bit the value the forward used
-    without any layer having to keep a `[.., C]` copy of it alive from the
-    forward pass all the way to its own backward. The logarithm of `u` falls
-    out of the same chain, so the exponent gradient does not have to take a
-    second one.
+    `_softsign_forward` ran - so it is bit-for-bit the value the forward used,
+    and no layer has to carry a `[.., C]` copy of it from its forward pass all
+    the way to its own backward. The logarithm of `u` falls out of the same
+    chain, so the exponent gradient does not have to take a second one.
     """
     t = xs.abs()
     lo = t.clamp(max=1.0)
     r = t.clamp_(min=1.0).reciprocal_()
     # u = lo * r. `lo` is still owed to `phi` below, so `u` only gets its own
-    # buffer when phi is being rebuilt; otherwise the product takes it over
-    # and one fewer `[.., C]` block is live while `s` is built.
+    # buffer when phi is being rebuilt; otherwise the product takes it over.
     a = None
     if need_u:
         # `log(u)` is the head of `s`'s own chain, so the chain is grown out
@@ -186,8 +181,8 @@ def _softsign_backward_pieces(
         s = log_u.mul(p).exp_().log1p_().mul_(-1.0 / p).exp_()
         # `s` is done reading `log(u)` by now, and the exponent gradient only
         # ever consumes `p * log(u)` (see `_softsign_p_grad`), so the scale is
-        # folded straight back into the same buffer instead of letting a
-        # second full-size tensor stay alive for the rest of the backward.
+        # folded straight back into the same buffer instead of allocating a
+        # second full-size tensor for it.
         # The `-inf` a zeroed / underflowed `u` produces in its logarithm is
         # floored at `log(tiny)` here - exactly where the pow form floored
         # the base at `tiny` - so the element stays finite; `phi` is zero
@@ -220,10 +215,10 @@ def _softsign_p_grad(
 
         dphi/dp = phi * [softplus(A) - A * sigmoid(A)] / p^2
 
-    so the reduction never has to hold `log(u)` beside `A`: `A` (which
-    `_softsign_backward_pieces` formed in place out of `log(u)`) plus one
-    scratch buffer is the whole working set. `A <= 0` because `u <= 1` and
-    `p >= _MIN_P`, so `sigmoid(A) <= 1/2` and
+    so the whole reduction is evaluated from `A` alone - which
+    `_softsign_backward_pieces` forms in place out of `log(u)` - plus one
+    scratch buffer. `A <= 0` because `u <= 1` and `p >= _MIN_P`, so
+    `sigmoid(A) <= 1/2` and
     `softplus(A) = -log1p(-sigmoid(A))` loses nothing to cancellation there.
     The `-inf` a zeroed / underflowed `u` produces in its logarithm was
     already floored at `log(tiny)` where `A` was formed, so the element stays
@@ -335,13 +330,11 @@ class _GeneralizedSoftsign(torch.autograd.Function):
             # The |x| <= 1 branch reduces to s^(p+1) because
             # d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1). The power is taken
             # as `exp((p+1) * log(g))`: `g > 0` keeps the log finite (and
-            # `g == 0` still lands on 0), and the exp/log pair is about half
-            # the arithmetic of `pow`.
+            # `g == 0` still lands on 0).
             grad_x = g.log_().mul_(p + 1).exp_().mul_(grad_out)
         if need_p:
             # `phi` is this kernel's own buffer and nothing else reads it, so
-            # the `dL/dphi` product lands on it instead of allocating a second
-            # `[.., C]` block next to it.
+            # the `dL/dphi` product lands on it rather than beside it.
             grad_p = _softsign_p_grad(phi.mul_(grad_out), a, p, p_raw)
         return grad_x, grad_p
 
@@ -470,8 +463,7 @@ class _RMSNorm(torch.autograd.Function):
             # d/dx of `x * rstd`: the rsqrt term contributes
             # -x * rstd^3 * mean(t * x); the rstd factor that `m` already
             # carries leaves an rstd^2 to undo. The `weight` lands on the
-            # buffer `t` just released, so the whole backward never holds more
-            # than these two full-size blocks at once.
+            # buffer `t` just released.
             if u.dtype == weight.dtype:
                 u.mul_(weight)
             else:
@@ -602,9 +594,7 @@ class _DyTCForward(torch.autograd.Function):
         # sum(grad_out * phi), and `dphi/dp` is proportional to phi as well, so
         # the *pre*-affine tensor is the one the backward needs. Both are
         # rebuilt from the same pieces, so they are settled together and
-        # *before* the input-gradient chain: `phi` and the exponent's `a` are
-        # full-size buffers of their own, and draining them here means the
-        # `grad_x` chain below runs with only one of them still to allocate.
+        # *before* the input-gradient chain that consumes `g`.
         need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
         need_gamma_grad = ctx.needs_input_grad[3]
@@ -635,8 +625,7 @@ class _DyTCForward(torch.autograd.Function):
             # dphi/dx_scaled = g^(p+1), taken as exp((p+1) * log(g)) (see
             # `_GeneralizedSoftsign.backward`). The output affine is folded
             # into the chain as two in-place scales rather than as one
-            # pre-multiplied `grad_out * gamma` tensor: the result is the
-            # same product, without the extra full-size buffer.
+            # pre-multiplied `grad_out * gamma` tensor.
             grad_x_scaled = g.log_().mul_(p_val + 1).exp_()
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             if ctx.needs_input_grad[1]:
@@ -1005,9 +994,8 @@ class _DyTCDForward(torch.autograd.Function):
             )
 
         p_val = p if p_is_tensor else float(p)
-        # `phi` and the exponent's `a` are full-size buffers the rebuilt
-        # pieces own; draining them before the input-gradient chain keeps the
-        # `grad_alpha_c` reduction from having to be allocated alongside them.
+        # `phi` and the exponent's `a` belong to the rebuilt pieces; they are
+        # drained before the input-gradient chain below.
         grad_p = grad_gamma = None
         if need_phi:
             # Gradient w.r.t. p (if learnable) and w.r.t. gamma: one
@@ -1111,7 +1099,7 @@ class QKSquash(nn.Module):
         q = q * self.alpha_q
         k = k * self.alpha_k
         # The scale above already owns a [B, H, T, hd] buffer, so the
-        # compression is taken on it rather than on a second copy out of it.
+        # compression is taken on it in place.
         q.tanh_()
         k.tanh_()
         return q, k

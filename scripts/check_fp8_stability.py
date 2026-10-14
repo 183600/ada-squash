@@ -176,8 +176,8 @@ class FP8SwiGLUSim:
             x_q = q(x)
             a = q(F.linear(x_q, self.qw1))
             b = q(F.linear(x_q, self.qw3))
-            # The gated product folds into the silu buffer, so the SwiGLU
-            # hidden activation never leaves a second full-size tensor behind.
+            # The gated product folds into the silu buffer: `mul_` writes the
+            # product into `h` rather than allocating a new one.
             h = F.silu(a)
             h.mul_(b)
             return mlp.drop(q(F.linear(q(h), self.qw2)))

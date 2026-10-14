@@ -93,8 +93,8 @@ def evaluate_lm_harness(model, tasks: list[str], batch_size: int = 16, tokenizer
             "lm-eval not installed. `pip install lm-eval`."
         ) from e
     # The simplest integration: wrap our model in an HFLM-like adapter.
-    # For real evaluations use the project's HF model converter (see
-    # adasquash.hf_compat) once a checkpoint is exported.
+    # That adapter, and the HF-compatible checkpoint export it needs, are not
+    # implemented yet, so this path reports itself as unavailable.
     raise NotImplementedError(
         "Use the HF-compat exporter + `lm_eval --model hf` for this step. "
         "See README for the exact recipe."
