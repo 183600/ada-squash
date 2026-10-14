@@ -44,9 +44,9 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.split(C, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
         if self.q_rms is not None:
             q = self.q_rms(q)
             k = self.k_rms(k)
@@ -133,7 +133,7 @@ class CausalSelfAttention(nn.Module):
         if entry is None:
             cos, sin = (self._rope_cache[3], self._rope_cache[4])
             if cos.dtype != dtype:
-                cos, sin = (cos.to(dtype), sin.to(dtype))
+                cos, sin = (cos.to(dtype).contiguous(), sin.to(dtype).contiguous())
             entry = (cos, sin)
             tables[dtype] = entry
         return entry
@@ -161,10 +161,10 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: O
     if cos is None or sin is None:
         f_real = freqs_cis.real
         f_imag = freqs_cis.imag
-        cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0)
-        sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0)
+        cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
+        sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
     if cos.dtype != q.dtype:
-        cos = cos.to(q.dtype)
-        sin = sin.to(q.dtype)
+        cos = cos.to(q.dtype).contiguous()
+        sin = sin.to(q.dtype).contiguous()
     return (_rope_half(q, cos, sin), _rope_half(k, cos, sin))
 __all__ = ['CausalSelfAttention', 'RMSNormHead']
