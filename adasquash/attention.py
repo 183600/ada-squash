@@ -47,6 +47,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
+        del qkv
         if self.q_rms is not None:
             q = self.q_rms(q)
             k = self.k_rms(k)

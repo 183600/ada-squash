@@ -329,15 +329,17 @@ class _DyTDForward(torch.autograd.Function):
             out = torch.addcmul(beta, phi, gamma)
         else:
             out = phi * gamma
-        ctx.save_for_backward(x, alpha_0, k, gamma, beta, phi, exp_kdr.detach())
+        ctx.save_for_backward(x, alpha_0, k, gamma, beta, exp_kdr.detach())
         ctx.depth_ratio = depth_ratio
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, alpha_0, k, gamma, beta, phi, exp_kdr = ctx.saved_tensors
+        x, alpha_0, k, gamma, beta, exp_kdr = ctx.saved_tensors
         depth_ratio = ctx.depth_ratio
         a = alpha_0 * exp_kdr
+        phi = a.mul(x)
+        phi.tanh_()
         w = phi * grad_out
         grad_gamma = None
         if ctx.needs_input_grad[3]:
@@ -347,6 +349,7 @@ class _DyTDForward(torch.autograd.Function):
         w.mul_(gamma)
         grad_a = _dot_all(w, x)
         w.mul_(a)
+        del phi
         grad_x = w
         grad_alpha_0 = grad_a * exp_kdr
         grad_k = -grad_a * a * depth_ratio
@@ -377,12 +380,14 @@ class _DyTForward(torch.autograd.Function):
             out = torch.addcmul(beta, phi, gamma)
         else:
             out = phi * gamma
-        ctx.save_for_backward(x, alpha, gamma, beta, phi)
+        ctx.save_for_backward(x, alpha, gamma, beta)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, alpha, gamma, beta, phi = ctx.saved_tensors
+        x, alpha, gamma, beta = ctx.saved_tensors
+        phi = alpha.mul(x)
+        phi.tanh_()
         w = phi * grad_out
         grad_gamma = None
         if ctx.needs_input_grad[2]:
@@ -392,6 +397,7 @@ class _DyTForward(torch.autograd.Function):
         w.mul_(gamma)
         grad_alpha = _dot_all(w, x)
         w.mul_(alpha)
+        del phi
         grad_x = w
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[3]:
