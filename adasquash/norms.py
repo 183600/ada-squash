@@ -32,7 +32,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -71,6 +70,20 @@ def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     so the elementwise product is returned unchanged.
     """
     return t if t.ndim <= 1 else t.sum(dim=tuple(range(t.ndim - 1)))
+
+
+def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """dot(a, b) over *every* element, without materialising `a * b`.
+
+    The DyT-family scalar reductions contract a full-size element-wise
+    product down to one number. Both operands are the same shape and, in
+    every caller, contiguous, so the contraction runs as a single flat
+    `dot` over two views: the same value the product would have produced,
+    without the extra `[.., C]` block it costs to build it in between.
+    """
+    if a.is_contiguous() and b.is_contiguous():
+        return torch.dot(a.reshape(-1), b.reshape(-1))
+    return (a * b).sum()
 
 
 def register_norm(name: str):
@@ -143,12 +156,12 @@ def _softsign_backward_pieces(
 ):
     """Rebuild the backward-only pieces of `phi_p` from the signed input.
 
-    Returns `(g, phi, log_u)`, where `g = s * f` is the single combination the
+    Returns `(g, phi, a)`, where `g = s * f` is the single combination the
     `x`-derivative depends on (`dphi/dx = g^(p+1)`), `phi` is the pre-affine
-    activation `dL/dgamma` and `dphi/dp` both reduce over, and `log(u)` is
-    only returned when the exponent itself carries a gradient. `phi` is
-    skipped the same way when neither reduction reads it, and `g` when only
-    those reductions are live.
+    activation `dL/dgamma` and `dphi/dp` both reduce over, and `a = p *
+    log(u)` is only returned when the exponent itself carries a gradient.
+    `phi` is skipped the same way when neither reduction reads it, and `g`
+    when only those reductions are live.
 
     `s` is re-derived here, from `xs` and `p`, with exactly the sequence
     `_softsign_forward` ran - so it is bit-for-bit the value the forward used
@@ -162,24 +175,33 @@ def _softsign_backward_pieces(
     r = t.clamp_(min=1.0).reciprocal_()
     # u = lo * r. `lo` is still owed to `phi` below, so `u` only gets its own
     # buffer when phi is being rebuilt; otherwise the product takes it over.
+    a = None
     if need_u:
         # `log(u)` is the head of `s`'s own chain, so the chain is grown out
         # of it rather than restarted from `u`.
         log_u = lo.mul(r).log_()
         s = log_u.mul(p).exp_().log1p_().mul_(-1.0 / p).exp_()
+        # `s` is done reading `log(u)` by now, and the exponent gradient only
+        # ever consumes `p * log(u)` (see `_softsign_p_grad`), so the scale is
+        # folded straight back into the same buffer instead of letting a
+        # second full-size tensor stay alive for the rest of the backward.
+        # The `-inf` a zeroed / underflowed `u` produces in its logarithm is
+        # floored at `log(tiny)` here - exactly where the pow form floored
+        # the base at `tiny` - so the element stays finite; `phi` is zero
+        # there and zeroes the contribution either way.
+        a = log_u.clamp_(min=math.log(torch.finfo(log_u.dtype).tiny)).mul_(p)
     else:
-        log_u = None
         s = lo.mul(r) if need_phi else lo.mul_(r)
         s = s.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     phi = lo.mul_(s).copysign_(xs) if need_phi else None
     if not need_g:
-        return None, phi, log_u
-    return r.mul_(s), phi, log_u
+        return None, phi, a
+    return r.mul_(s), phi, a
 
 
 def _softsign_p_grad(
     grad_phi: torch.Tensor,
-    log_u: torch.Tensor,
+    a: torch.Tensor,
     p: torch.Tensor,
     p_raw: torch.Tensor,
 ) -> torch.Tensor:
@@ -190,25 +212,33 @@ def _softsign_p_grad(
         log1p(u^p) = softplus(A),   u^p / (1 + u^p) = sigmoid(A)
 
     let `dphi/dp = phi * [softplus(A)/p^2 - sigmoid(A) * log(u) / p]` be
-    evaluated from `A` alone, without the `u > 0` branch mask. The `-inf`
-    that a zeroed / underflowed `u` produces in its logarithm is floored at
-    `log(tiny)` exactly as the `pow` form floored the base at `tiny`
-    (`log(u) >= log(tiny)` is `u >= tiny`), so the element stays finite;
-    `phi` is zero there and zeroes the contribution either way.
+    evaluated from `A` alone, without the `u > 0` branch mask. Since
+    `log(u) = A / p`, both terms carry the same `1/p^2`,
+
+        dphi/dp = phi * [softplus(A) - A * sigmoid(A)] / p^2
+
+    so the reduction never has to hold `log(u)` beside `A`: `A` (which
+    `_softsign_backward_pieces` formed in place out of `log(u)`) plus one
+    scratch buffer is the whole working set. `A <= 0` because `u <= 1` and
+    `p >= _MIN_P`, so `sigmoid(A) <= 1/2` and
+    `softplus(A) = -log1p(-sigmoid(A))` loses nothing to cancellation there.
+    The `-inf` a zeroed / underflowed `u` produces in its logarithm was
+    already floored at `log(tiny)` where `A` was formed, so the element stays
+    finite; `phi` is zero there and zeroes the contribution either way.
 
     `grad_phi` is the caller-owned `dL/dphi` product (`grad_out * phi`,
     already carrying `gamma` where the layer has one). It is folded into the
     reduction in place.
     """
-    log_u = log_u.clamp_(min=math.log(torch.finfo(log_u.dtype).tiny))
-    a = p * log_u
-    k = F.softplus(a).div_(p * p)
-    a.sigmoid_()
-    k.addcmul_(log_u, a, value=-(1.0 / p))
+    sig = a.sigmoid()
+    a.mul_(sig)
+    # softplus(a) = -log1p(-sigmoid(a)), taken in place on the sigmoid buffer.
+    sig.neg_().log1p_().neg_()
+    k = sig.sub_(a).div_(p * p)
     # Reduce the [N, C] products in fp32 under bf16 autocast: a bf16
     # accumulator over a whole activation block cancels most of its own
     # mantissa bits before the scalar survives.
-    acc = torch.float32 if log_u.dtype in (torch.bfloat16, torch.float16) else None
+    acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
     red = grad_phi.mul_(k).sum(dtype=acc)
     # The forward only saw `clamp(p)`, so below the floor `p` carries no
     # gradient at all.
@@ -299,7 +329,7 @@ class _GeneralizedSoftsign(torch.autograd.Function):
         need_x = ctx.needs_input_grad[0]
         need_p = ctx.needs_input_grad[1] and ctx.need_p_grad
         if need_x or need_p:
-            g, phi, log_u = _softsign_backward_pieces(x, p, need_p, need_p, need_x)
+            g, phi, a = _softsign_backward_pieces(x, p, need_p, need_p, need_x)
         if need_x:
             # The |x| <= 1 branch reduces to s^(p+1) because
             # d/dx (1+x^p)^(-1/p-1) = (1+x^p)^(-1/p-1). The power is taken
@@ -308,7 +338,10 @@ class _GeneralizedSoftsign(torch.autograd.Function):
             # the cost of `pow`.
             grad_x = g.log_().mul_(p + 1).exp_().mul_(grad_out)
         if need_p:
-            grad_p = _softsign_p_grad(grad_out * phi, log_u, p, p_raw)
+            # `phi` is this kernel's own buffer and nothing else reads it, so
+            # the `dL/dphi` product lands on it instead of allocating a second
+            # `[.., C]` block next to it.
+            grad_p = _softsign_p_grad(phi.mul_(grad_out), a, p, p_raw)
         return grad_x, grad_p
 
 
@@ -552,9 +585,9 @@ class _DyTCForward(torch.autograd.Function):
         need_gamma_grad = ctx.needs_input_grad[3]
         need_phi = need_p_grad or need_gamma_grad
         phi = None
-        log_u = None
+        a = None
         if need_softsign or need_phi:
-            g, phi, log_u = _softsign_backward_pieces(
+            g, phi, a = _softsign_backward_pieces(
                 x * alpha, p, need_p_grad, need_phi, need_softsign
             )
 
@@ -575,15 +608,14 @@ class _DyTCForward(torch.autograd.Function):
 
         grad_p = grad_gamma = None
         if need_phi:
-            # One `grad_out * phi` product feeds both reductions: dL/dgamma
-            # sums it as is, and the dphi/dp reduction folds `gamma` into it
-            # afterwards. Reading `gamma` twice would have cost a second
-            # full-size product.
-            grad_phi = grad_out * phi
+            # `phi` is this kernel's own buffer: the `dL/dphi` product lands
+            # on it rather than beside it, and the `gamma` fold for the
+            # exponent reduction reuses it again below.
+            grad_phi = phi.mul_(grad_out)
             if need_gamma_grad:
                 grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
-                grad_p = _softsign_p_grad(grad_phi.mul_(gamma), log_u, p, p_raw)
+                grad_p = _softsign_p_grad(grad_phi.mul_(gamma), a, p, p_raw)
 
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[4]:
@@ -696,7 +728,9 @@ class _DyTDForward(torch.autograd.Function):
         w.mul_(grad_tanh)
         torch.sub(grad_tanh, w, out=w)
         # grad_a = sum(dL/d(a*x) * x)
-        grad_a = (w * x).sum()
+        # A single flat contraction over both operands rather than a
+        # full-size `w * x` block reduced afterwards.
+        grad_a = _dot_all(w, x)
         # d/dx tanh(ax) = a * (1 - tanh^2(ax))
         w.mul_(a)
         grad_x = w
@@ -771,7 +805,7 @@ class _DyTForward(torch.autograd.Function):
         w = phi * phi
         w.mul_(grad_tanh)
         torch.sub(grad_tanh, w, out=w)
-        grad_alpha = (w * x).sum()
+        grad_alpha = _dot_all(w, x)
         w.mul_(alpha)
         grad_x = w
 
@@ -931,9 +965,9 @@ class _DyTCDForward(torch.autograd.Function):
         need_gamma_grad = ctx.needs_input_grad[5]
         need_phi = need_p_grad or need_gamma_grad
         phi = None
-        log_u = None
+        a = None
         if need_softsign or need_phi:
-            g, phi, log_u = _softsign_backward_pieces(
+            g, phi, a = _softsign_backward_pieces(
                 x_scaled, p, need_p_grad, need_phi, need_softsign
             )
 
@@ -991,11 +1025,13 @@ class _DyTCDForward(torch.autograd.Function):
         # `grad_out * phi` product feeds both reductions.
         grad_p = grad_gamma = None
         if need_phi:
-            grad_phi = grad_out * phi
+            # `phi` is this kernel's own buffer, so the `dL/dphi` product
+            # lands on it rather than beside it (see `_DyTCForward.backward`).
+            grad_phi = phi.mul_(grad_out)
             if need_gamma_grad:
                 grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
-                grad_p = _softsign_p_grad(grad_phi.mul_(gamma), log_u, p, p_raw)
+                grad_p = _softsign_p_grad(grad_phi.mul_(gamma), a, p, p_raw)
 
         # Gradient w.r.t. beta
         grad_beta = None
