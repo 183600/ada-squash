@@ -56,10 +56,10 @@ def register_norm(name: str):
 def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     t = xs.abs()
     lo = t.clamp(max=1.0)
-    hi = t.clamp(min=1.0).reciprocal()
-    u = lo * hi
-    s = u.log().mul(p).exp().log1p().mul(-1.0 / p).exp()
-    return lo * s * xs.sign()
+    hi = t.clamp_(min=1.0).reciprocal_()
+    u = hi.mul_(lo)
+    s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
+    return lo.mul_(s).copysign_(xs)
 
 def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True):
     t = xs.abs()
