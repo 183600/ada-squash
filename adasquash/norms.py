@@ -494,13 +494,6 @@ class _RMSNorm(torch.autograd.Function):
         if grad_weight is not None and grad_weight.dtype != weight.dtype:
             grad_weight = grad_weight.to(weight.dtype)
         return grad_x, grad_weight, None
-        # The reduction promotes to the weight dtype (autocast keeps norms in
-        # fp32), so the gradients are handed back in their inputs' dtypes.
-        if grad_x is not None and grad_x.dtype != x.dtype:
-            grad_x = grad_x.to(x.dtype)
-        if grad_weight is not None and grad_weight.dtype != weight.dtype:
-            grad_weight = grad_weight.to(weight.dtype)
-        return grad_x, grad_weight, None
 
 
 # ---------------------------------------------------------------------------
@@ -781,10 +774,6 @@ class _DyTDForward(torch.autograd.Function):
         # grad_k       = grad_a * alpha_0 * exp(-k * r) * (-r) = -grad_a * a * r
         grad_alpha_0 = grad_a * exp_kdr
         grad_k = -grad_a * a * depth_ratio
-
-        grad_gamma = None
-        if ctx.needs_input_grad[3]:
-            grad_gamma = _sum_leading_dims(grad_out * phi)
 
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[4]:

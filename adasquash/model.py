@@ -393,7 +393,7 @@ class _LayerScaleResidual(torch.autograd.Function):
         # 1-D residual the empty dim tuple would reduce the `[C]` gradient
         # to a scalar and autograd would reject it (see the helper).
         grad_scale = _sum_leading_dims(grad_out * residual)
-        grad_residual = grad_out * scale
+        grad_residual = grad_out.mul(scale)
         return grad_out, grad_residual, grad_scale
 
 

@@ -276,8 +276,12 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     x_hi = x[..., half:]
     # out[..., :half] = x_lo * cos_lo - x_hi * sin_lo
     # out[..., half:] = x_hi * cos_hi + x_lo * sin_hi
-    out = x * cos
+    out = torch.empty_like(x)
+    out[..., :half].copy_(x_lo)
+    out[..., :half].mul_(cos[..., :half])
     out[..., :half].addcmul_(x_hi, sin[..., :half], value=-1.0)
+    out[..., half:].copy_(x_hi)
+    out[..., half:].mul_(cos[..., half:])
     out[..., half:].addcmul_(x_lo, sin[..., half:], value=1.0)
     return out
 
