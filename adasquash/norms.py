@@ -9,7 +9,9 @@ _MIN_ALPHA = 1e-4
 _MIN_P = 1e-3
 
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
-    return t if t.ndim <= 1 else t.sum(dim=tuple(range(t.ndim - 1)))
+    if t.ndim <= 1:
+        return t.clone()
+    return t.sum(dim=tuple(range(t.ndim - 1)))
 _REDUCE_CHUNK_ELEMS = 1 << 20
 
 def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
