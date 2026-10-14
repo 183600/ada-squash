@@ -68,6 +68,61 @@ def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     return t if t.ndim <= 1 else t.sum(dim=tuple(range(t.ndim - 1)))
 
 
+# Elements of the `[rows, C]` product reduced per chunk. A one-shot
+# `sum(a * b)` materializes the whole product block before reducing it, which
+# at a 124M-scale `[B, T, C]` activation is a hundred-odd MB of pure
+# intermediate alive for one `[C]` answer. Reducing a slice at a time keeps
+# the peak at the chunk instead, and the slices are cheaper to bring back
+# into cache than one pass over the whole block.
+_REDUCE_CHUNK_ELEMS = 1 << 20
+
+
+def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Sum `a * b` over every leading dim, chunked along those dims.
+
+    The reduction is the one `_sum_leading_dims(a * b)` performs, but the
+    product is taken on a slice of the flattened leading axis rather than on
+    the full block, so the only temporary it ever owns is one chunk. This is
+    what the per-channel gradient of the squashing layers
+    (`grad_alpha_c: [C]`) and the LayerScale gate (`grad_scale: [C]`) need:
+    both are `[C]` answers read out of a `[B, T, C]` elementwise product.
+
+    The operands are contiguous in every caller, so the flattening to
+    `[rows, C]` is a view; a non-contiguous operand falls back to the plain
+    product, which costs one allocation instead of a copy of the whole block.
+
+    Splitting the reduction changes the summation order, and with it the last
+    bits of the answer. The low-precision dtypes keep their fp32 accumulation
+    across chunk boundaries - the same accumulator a single-pass `sum` would
+    have reduced into - and are cast back once at the end.
+    """
+    if a.ndim <= 1:
+        # Nothing to reduce: the product is the answer, and it is `[C]`.
+        return a * b
+    rows = a.numel() // a.shape[-1]
+    step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
+    if rows <= step or not (a.is_contiguous() and b.is_contiguous()):
+        return _sum_leading_dims(a * b)
+    # The accumulator dtype a one-shot `.sum(dim=0)` would have used.
+    acc = None
+    if a.dtype in (torch.bfloat16, torch.float16):
+        acc = torch.promote_types(a.dtype, torch.float32)
+    a2 = a.reshape(rows, -1)
+    b2 = b.reshape(rows, -1)
+    total = None
+    for start in range(0, rows, step):
+        part = (a2[start:start + step] * b2[start:start + step]).sum(
+            dim=0, dtype=acc
+        )
+        if total is None:
+            total = part
+        else:
+            total.add_(part)
+    if total.dtype != a.dtype:
+        total = total.to(a.dtype)
+    return total
+
+
 def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """dot(a, b) over *every* element.
 
@@ -608,9 +663,7 @@ class _DyTCForward(torch.autograd.Function):
                 # x_scaled = x * alpha, so d/dalpha = grad_x_scaled * x =
                 # grad_x_scaled * x_scaled / alpha - the division is taken on
                 # the [C] reduction.
-                grad_alpha = _sum_leading_dims(
-                    grad_x_scaled * x_scaled
-                ).div_(alpha)
+                grad_alpha = _reduce_products(grad_x_scaled, x_scaled).div_(alpha)
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha)
 
@@ -1003,9 +1056,7 @@ class _DyTCDForward(torch.autograd.Function):
                 or ctx.needs_input_grad[3]
             )
             if need_alpha_chain:
-                grad_alpha_c = _sum_leading_dims(
-                    grad_x_scaled * x_scaled
-                ).div_(alpha_c)
+                grad_alpha_c = _reduce_products(grad_x_scaled, x_scaled).div_(alpha_c)
 
                 # alpha_c = clamp_min(scale * (1 + delta), _MIN_ALPHA), scale =
                 # alpha_0 * exp(-k * depth_ratio).

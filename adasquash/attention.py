@@ -276,19 +276,21 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
     x_hi = x[..., half:]
+    # The rotated tensor is allocated by the broadcast product itself, so the
+    # half-table write costs a copy (`copy_(x_lo)` then `mul_(cos)` in the
+    # textbook form is the same single product re-spelled).
+    #
+    # The two corrections land on slices taken *after* the product: a view of a
+    # tensor that does not yet carry a `grad_fn` is a stale leaf, and the first
+    # in-place write below attaches one to the base, so a pre-sliced partner
+    # is rejected outright by autograd. Taken fresh from the already-tracked
+    # tensor, each write is an ordinary in-place update.
+    #
     # out[..., :half] = x_lo * cos_lo - x_hi * sin_lo
     # out[..., half:] = x_hi * cos_hi + x_lo * sin_hi
-    # A contiguous (not stride-preserving) output, laid out for the SDPA
-    # GEMMs that consume q/k next.
-    out = torch.empty_like(x)
-    out_lo = out[..., :half]
-    out_hi = out[..., half:]
-    out_lo.copy_(x_lo)
-    out_lo.mul_(cos[..., :half])
-    out_lo.addcmul_(x_hi, sin[..., :half], value=-1.0)
-    out_hi.copy_(x_hi)
-    out_hi.mul_(cos[..., half:])
-    out_hi.addcmul_(x_lo, sin[..., half:], value=1.0)
+    out = x * cos
+    out[..., :half].addcmul_(x_hi, sin[..., :half], value=-1.0)
+    out[..., half:].addcmul_(x_lo, sin[..., half:], value=1.0)
     return out
 
 

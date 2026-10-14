@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .norms import build_norm, NORM_REGISTRY, _sum_leading_dims
+from .norms import build_norm, NORM_REGISTRY, _reduce_products, _sum_leading_dims
 from .attention import CausalSelfAttention
 
 
@@ -384,10 +384,14 @@ class _LayerScaleResidual(torch.autograd.Function):
         # grad_x = grad_out
         # grad_residual = grad_out * scale
         # grad_scale = (grad_out * residual).sum(dim=(0, 1))
+        # `_reduce_products` rather than `_sum_leading_dims(grad_out *
+        # residual)`: the gate gradient is a `[C]` answer read out of a
+        # `[B, T, C]` elementwise product, and the chunked reduction never
+        # materializes the whole product block.
         # `_sum_leading_dims` rather than a bare `sum(dim=red_dims)`: for a
         # 1-D residual the empty dim tuple would reduce the `[C]` gradient
         # to a scalar and autograd would reject it (see the helper).
-        grad_scale = _sum_leading_dims(grad_out * residual)
+        grad_scale = _reduce_products(grad_out, residual)
         grad_residual = grad_out.mul(scale)
         return grad_out, grad_residual, grad_scale
 
