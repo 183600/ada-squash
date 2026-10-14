@@ -134,7 +134,8 @@ class CausalSelfAttention(nn.Module):
         """Lower-triangular boolean mask `[T, T]`, cached per (T, device)."""
         cache = self._tril_cache
         if cache is None or cache[0] != (T, device):
-            mask = torch.ones(T, T, device=device, dtype=torch.bool).tril_()
+            ij = torch.arange(T, device=device)
+            mask = (ij[:, None] >= ij[None, :])
             cache = ((T, device), mask, ~mask)
             self._tril_cache = cache
         return cache[1]
@@ -280,12 +281,14 @@ def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     # A contiguous (not stride-preserving) output, laid out for the SDPA
     # GEMMs that consume q/k next.
     out = torch.empty_like(x)
-    out[..., :half].copy_(x_lo)
-    out[..., :half].mul_(cos[..., :half])
-    out[..., :half].addcmul_(x_hi, sin[..., :half], value=-1.0)
-    out[..., half:].copy_(x_hi)
-    out[..., half:].mul_(cos[..., half:])
-    out[..., half:].addcmul_(x_lo, sin[..., half:], value=1.0)
+    out_lo = out[..., :half]
+    out_hi = out[..., half:]
+    out_lo.copy_(x_lo)
+    out_lo.mul_(cos[..., :half])
+    out_lo.addcmul_(x_hi, sin[..., :half], value=-1.0)
+    out_hi.copy_(x_hi)
+    out_hi.mul_(cos[..., half:])
+    out_hi.addcmul_(x_lo, sin[..., half:], value=1.0)
     return out
 
 

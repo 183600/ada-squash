@@ -236,9 +236,12 @@ def _softsign_p_grad(
     red = grad_phi.mul_(k).sum(dtype=acc)
     red = red.div_(p * p)
     # The forward only saw `clamp(p)`, so below the floor `p` carries no
-    # gradient at all.
-    red = red * (p_raw > _MIN_P).to(red.dtype)
-    return red.to(p.dtype) if red.dtype != p.dtype else red
+    # gradient at all. Boolean mask mul avoids dtype conversion.
+    red.mul_(p_raw > _MIN_P)
+    # Avoid dtype conversion if red and p already match.
+    if red.dtype != p.dtype:
+        red = red.to(p.dtype)
+    return red
 
 
 def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
@@ -1006,7 +1009,8 @@ class _DyTCDForward(torch.autograd.Function):
 
                 # alpha_c = clamp_min(scale * (1 + delta), _MIN_ALPHA), scale =
                 # alpha_0 * exp(-k * depth_ratio).
-                grad_alpha_c.mul_((alpha_c > _MIN_ALPHA).to(grad_alpha_c.dtype))
+                # Boolean mask mul avoids dtype conversion.
+                grad_alpha_c.mul_(alpha_c > _MIN_ALPHA)
 
                 # scale = alpha_0 * exp(-k * depth_ratio)
                 # grad_delta      = grad_alpha_c * scale
