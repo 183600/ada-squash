@@ -95,24 +95,16 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
         # SDPA holds `v` through its backward, so it is materialized here.
-        # Without a transform Q, K and V all still share one storage, so the
-        # copy is skipped.
-        qk_fresh = False
+        # QK-Norm or RoPE may transform Q,K; V is materialized through SDPA.
         if self.q_rms is not None:
             q = self.q_rms(q)
             k = self.k_rms(k)
-            qk_fresh = True
         elif self.q_squash is not None:
             q, k = self.q_squash(q, k)
-            qk_fresh = True
 
         if freqs_cis is not None:
             cos, sin = self._rope_tables(freqs_cis, q.dtype)
             q, k = apply_rope(q, k, freqs_cis, cos, sin)
-            qk_fresh = True
-
-        if qk_fresh and not v.is_contiguous():
-            v = v.contiguous()
 
         scale = self.scale
 
