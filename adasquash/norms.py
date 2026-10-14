@@ -10,7 +10,7 @@ _MIN_P = 1e-3
 
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     if t.ndim <= 1:
-        return t
+        return t.clone()
     return t.sum(dim=tuple(range(t.ndim - 1)))
 _REDUCE_CHUNK_ELEMS = 1 << 20
 
