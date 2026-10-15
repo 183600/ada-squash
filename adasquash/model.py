@@ -272,11 +272,11 @@ class _SwiGLU(torch.autograd.Function):
         if x.dtype != dt:
             x = x.to(dt)
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
-        h = F.silu(a)
         grad_h = grad_out @ w2
-        prod = grad_h * b
+        prod = grad_h.mul(b)
         grad_a = torch.ops.aten.silu_backward(prod, a)
         del prod
+        h = F.silu(a)
         grad_b = grad_h.mul_(h)
         gated = h.mul_(b)
         grad_x = grad_w1 = grad_w2 = grad_w3 = None

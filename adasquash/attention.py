@@ -88,7 +88,6 @@ class CausalSelfAttention(nn.Module):
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
         B, H = (q.shape[0], q.shape[1])
-        keep = self._tril_mask(T, device)
         rows = max(1, self._LOGITS_CHUNK_BYTES // max(1, B * H * T * q.element_size()))
         n_valid = B * H * (T * (T + 1) // 2)
         if n_valid <= 1:
@@ -96,7 +95,7 @@ class CausalSelfAttention(nn.Module):
         acc_abs = torch.zeros((), dtype=torch.float64, device=device)
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
-        peak = torch.zeros((), dtype=q.dtype, device=device)
+        peak_sq = torch.zeros((), dtype=q.dtype, device=device)
         drop = self._tril_pair(T, device)[1]
         k_t = k.transpose(-1, -2)
         for start in range(0, T, rows):
@@ -106,24 +105,22 @@ class CausalSelfAttention(nn.Module):
             block.masked_fill_(drop[start:end], 0.0)
             acc_x.add_(block.sum(dtype=torch.float64))
             block.abs_()
-            torch.maximum(peak, block.amax(), out=peak)
             acc_abs.add_(block.sum(dtype=torch.float64))
             block.square_()
             acc_sq.add_(block.sum(dtype=torch.float64))
+            torch.maximum(peak_sq, block.amax(), out=peak_sq)
         total = float(acc_abs)
         signed = float(acc_x)
         mean_abs = total / n_valid
         var = (float(acc_sq) - signed * signed / n_valid) / (n_valid - 1)
-        return {'logit_abs_mean': mean_abs, 'logit_abs_max': float(peak), 'logit_std': math.sqrt(var) if var > 0.0 else 0.0}
+        return {'logit_abs_mean': mean_abs, 'logit_abs_max': math.sqrt(float(peak_sq)), 'logit_std': math.sqrt(var) if var > 0.0 else 0.0}
 
     def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
         cache = self._rope_cache
         if cache is None or cache[0] != key:
-            f_real = freqs_cis.real
-            f_imag = freqs_cis.imag
-            cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
-            sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
+            cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
+            sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
             self._rope_cache = (key, None, {}, cos, sin)
         tables = self._rope_cache[2]
         entry = tables.get(dtype)
@@ -145,23 +142,38 @@ class RMSNormHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _RMSNorm.apply(x, self.weight, self.eps)
 
-def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, record: bool) -> torch.Tensor:
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
     x_hi = x[..., half:]
+    if cos.shape[-1] == half:
+        lo_c = hi_c = cos
+        lo_s = hi_s = sin
+    else:
+        lo_c, hi_c = cos[..., :half], cos[..., half:]
+        lo_s, hi_s = sin[..., :half], sin[..., half:]
+    if record:
+        lo = x_lo.mul(lo_c)
+        lo.addcmul_(x_hi, lo_s, value=-1)
+        hi = x_hi.mul(hi_c)
+        hi.addcmul_(x_lo, hi_s, value=1)
+        return torch.cat((lo, hi), dim=-1)
     out = torch.empty_like(x)
-    out[..., :half] = x_lo * cos[..., :half] - x_hi * sin[..., :half]
-    out[..., half:] = x_hi * cos[..., half:] + x_lo * sin[..., half:]
+    out_lo = out[..., :half]
+    out_hi = out[..., half:]
+    torch.mul(x_lo, lo_c, out=out_lo)
+    torch.addcmul(out_lo, x_hi, lo_s, value=-1, out=out_lo)
+    torch.mul(x_hi, hi_c, out=out_hi)
+    torch.addcmul(out_hi, x_lo, hi_s, value=1, out=out_hi)
     return out
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
     if cos is None or sin is None:
-        f_real = freqs_cis.real
-        f_imag = freqs_cis.imag
-        cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
-        sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
+        cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
+        sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
     if cos.dtype != q.dtype:
         cos = cos.to(dtype=q.dtype)
         sin = sin.to(dtype=q.dtype)
-    return (_rope_half(q, cos, sin), _rope_half(k, cos, sin))
+    record = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad)
+    return (_rope_half(q, cos, sin, record), _rope_half(k, cos, sin, record))
 __all__ = ['CausalSelfAttention', 'RMSNormHead']
