@@ -525,15 +525,12 @@ class _DyTCDForward(torch.autograd.Function):
         return (grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None)
 
 class _QKSquashTanh(torch.autograd.Function):
-    """tanh(alpha * Q) / tanh(alpha * K), fused and recomputed rather than kept.
+    """tanh(alpha * Q) and tanh(alpha * K) as one autograd node.
 
-    Same closed form as ``torch.tanh(q * alpha_q)`` (D4); the squashed product
-    overwrites its own scaled input instead of leaving it behind, and the
-    backward rebuilds the squashed output from the (already resident) raw Q/K
-    instead of pinning it. That keeps a full Q-sized and a full K-sized tensor
-    per layer out of the backward graph, which is the same trade the norm
-    kernels make with ``x_scaled`` -- recompute a cheap elementwise closed form,
-    never store what the derivative can rebuild.
+    Same closed form as ``torch.tanh(q * alpha_q)`` (D4): the backward
+    re-derives the squashed output from the raw Q/K, so the node returns both
+    the per-tensor values and the alpha_q / alpha_k gradients while keeping
+    the public tanh semantics.
     """
 
     @staticmethod

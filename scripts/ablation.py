@@ -22,7 +22,7 @@ def effective_config_key(model_name: str, cfg_kwargs: dict) -> str:
     ``layerscale_init: 1.0e-5`` or ``alpha_init: 0.5``); two rows with equal
     keys build the exact same GPTConfig and, under the same seed, produce
     bit-identical runs. The runner trains the first and reuses its summary
-    for the rest instead of silently counting one configuration twice.
+    for the rest.
     """
     with torch.device('meta'):
         cfg = _MODEL_BUILDERS[model_name](**cfg_kwargs).cfg

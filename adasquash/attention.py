@@ -150,15 +150,14 @@ def _rope_halves(cos: torch.Tensor, sin: torch.Tensor, half: int):
     return (cos[..., :half], cos[..., half:], sin[..., :half], sin[..., half:])
 
 def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: torch.Tensor, hi_s: torch.Tensor, transpose: bool=False, out: Optional[torch.Tensor]=None):
-    """(x_lo*lo_c - x_hi*lo_s, x_hi*hi_c + x_lo*hi_s) written into one buffer.
+    """(x_lo*lo_c - x_hi*lo_s, x_hi*hi_c + x_lo*hi_s) written into ``out``.
 
-    ``out`` lets the caller own the single allocation. The step order is the
-    same op sequence as the plain-autograd composition, so the values are
-    bit-identical. ``transpose`` applies the transposed (inverse) rotation
-    ``[[lo_c, hi_s], [-lo_s, hi_c]]``, which is what a cotangent of this
-    orthogonal map has to be rotated by: the ``lo`` row picks up ``hi_s``
-    and the ``hi`` row picks up ``-lo_s`` (a no-op on the half-width split,
-    where both sin halves are the same tensor).
+    The step order is the same op sequence as the plain-autograd composition,
+    so the values are bit-identical. ``transpose`` applies the transposed
+    (inverse) rotation ``[[lo_c, hi_s], [-lo_s, hi_c]]``, which is what a
+    cotangent of this orthogonal map has to be rotated by: the ``lo`` row
+    picks up ``hi_s`` and the ``hi`` row picks up ``-lo_s`` (a no-op on the
+    half-width split, where both sin halves are the same tensor).
     """
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
@@ -177,13 +176,12 @@ def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: to
     return out
 
 class _ApplyRoPE(torch.autograd.Function):
-    """Rotary embedding for Q and K as one fused, closed-form-recompute kernel.
+    """Rotary embedding for Q and K as one autograd node.
 
     The rotation is orthogonal, so a cotangent is rotated by the transpose
     (R^T = R(-theta)) and depends on nothing but itself and the (cached)
-    cos/sin tables: the un-rotated Q/K are not pinned by the backward, which
-    is what lets the half/whole split be folded into a single buffer instead of
-    three tensors per operand.
+    cos/sin tables; the backward applies that transposed rotation to each
+    incoming cotangent with the same half/whole split as the forward.
     """
 
     @staticmethod
