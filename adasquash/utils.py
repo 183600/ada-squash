@@ -19,14 +19,16 @@ class MaxAbsMeter:
     def update(self, x: torch.Tensor):
         with torch.no_grad():
             xd = x.detach().reshape(-1)
-            if xd.numel() <= self._chunk:
-                v = xd.abs().max().item() if xd.numel() else -float('inf')
-            else:
+            n = xd.numel()
+            if n == 0:
                 v = -float('inf')
-                for start in range(0, xd.numel(), self._chunk):
-                    c = xd[start:start + self._chunk].abs().max().item()
-                    if c > v:
-                        v = c
+            elif n <= self._chunk:
+                v = xd.abs().max().item()
+            else:
+                peak = xd[:self._chunk].abs().amax()
+                for start in range(self._chunk, n, self._chunk):
+                    torch.fmax(peak, xd[start:start + self._chunk].abs().amax(), out=peak)
+                v = peak.item()
         if v > self.value:
             self.value = v
         self.count += 1
@@ -50,23 +52,31 @@ class KurtosisMeter:
         if xd.dtype != self.acc_dtype:
             xd = xd.to(self.acc_dtype)
         xd = xd.reshape(-1)
-        if xd.numel() <= self._chunk:
-            self._bulk_update(xd)
+        if xd.numel() == 0:
             return
-        for start in range(0, xd.numel(), self._chunk):
-            self._bulk_update(xd[start:start + self._chunk])
+        chunks = [xd[start:start + self._chunk] for start in range(0, xd.numel(), self._chunk)]
+        parts = []
+        for chunk in chunks:
+            x_var_t, x_mean_t = torch.var_mean(chunk, unbiased=False)
+            xc = chunk - x_mean_t
+            xc2 = xc * xc
+            parts.append(torch.stack([x_mean_t, x_var_t, torch.linalg.vecdot(xc, xc2), torch.linalg.vecdot(xc2, xc2)]))
+        for stats, chunk in zip(torch.stack(parts).tolist(), chunks):
+            self._merge(*stats, chunk.numel())
 
     def _bulk_update(self, x: torch.Tensor):
-        n_b = x.numel()
-        new_n = self.n + n_b
-        if new_n == self.n:
-            return
         x_var_t, x_mean_t = torch.var_mean(x, unbiased=False)
         xc = x - x_mean_t
         xc2 = xc * xc
         x_m3_t = torch.linalg.vecdot(xc, xc2)
         x_m4_t = torch.linalg.vecdot(xc2, xc2)
         x_mean, x_var, x_m3, x_m4 = torch.stack([x_mean_t, x_var_t, x_m3_t, x_m4_t]).tolist()
+        self._merge(x_mean, x_var, x_m3, x_m4, x.numel())
+
+    def _merge(self, x_mean: float, x_var: float, x_m3: float, x_m4: float, n_b: int):
+        new_n = self.n + n_b
+        if new_n == self.n:
+            return
         x_m2 = x_var * n_b
         n_a, n_b_ = (self.n, n_b)
         n = n_a + n_b_

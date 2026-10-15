@@ -115,15 +115,15 @@ def _loss_acc_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.promote_types(dtype, torch.float32)
 
 def _autocast_dtype(device_type: str, *dtypes: torch.dtype) -> torch.dtype:
-    fallback = dtypes[0]
-    for dt in dtypes[1:]:
-        fallback = torch.promote_types(fallback, dt)
     try:
         if torch.is_autocast_enabled(device_type):
             return torch.get_autocast_dtype(device_type)
     except TypeError:
         if device_type == 'cuda' and torch.is_autocast_enabled():
             return torch.get_autocast_gpu_dtype()
+    fallback = dtypes[0]
+    for dt in dtypes[1:]:
+        fallback = torch.promote_types(fallback, dt)
     return fallback
 
 class _FusedLinearCrossEntropy(torch.autograd.Function):

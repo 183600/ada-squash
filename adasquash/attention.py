@@ -92,6 +92,7 @@ class CausalSelfAttention(nn.Module):
         n_valid = B * H * (T * (T + 1) // 2)
         if n_valid <= 1:
             return {'logit_abs_mean': 0.0, 'logit_abs_max': 0.0, 'logit_std': 0.0}
+        reduce_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
         acc_abs = torch.zeros((), dtype=torch.float64, device=device)
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
@@ -104,11 +105,11 @@ class CausalSelfAttention(nn.Module):
             block = torch.matmul(q[:, :, start:end], k_t)
             block.mul_(scale)
             block.masked_fill_(drop[start:end], 0.0)
-            acc_x.add_(block.sum(dtype=torch.float64))
+            acc_x.add_(block.sum(dtype=reduce_dtype))
             block.abs_()
-            acc_abs.add_(block.sum(dtype=torch.float64))
+            acc_abs.add_(block.sum(dtype=reduce_dtype))
             block.square_()
-            acc_sq.add_(block.sum(dtype=torch.float64))
+            acc_sq.add_(block.sum(dtype=reduce_dtype))
             torch.maximum(peak_sq, block.amax(), out=peak_sq)
         del k_t, block
         total = float(acc_abs)

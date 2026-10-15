@@ -244,11 +244,10 @@ def _expert_cv(tpe) -> float:
 
 def _expert_cv_per_block(tpe_list) -> list:
     cvs = [tpe.std() / (tpe.mean() + 1e-06) if isinstance(tpe, torch.Tensor) else None for tpe in tpe_list]
-    if not any((isinstance(c, torch.Tensor) for c in cvs)):
+    tensors = [c.detach().reshape(()) for c in cvs if c is not None]
+    if not tensors:
         return [0.0] * len(tpe_list)
-    vals = []
-    for c in cvs:
-        vals.append(float(c.item()) if isinstance(c, torch.Tensor) else 0.0)
-    return vals
+    vals = iter(torch.stack(tensors).tolist())
+    return [next(vals) if c is not None else 0.0 for c in cvs]
 if __name__ == '__main__':
     main()
