@@ -225,25 +225,65 @@ jobs:
           # 池直接来自 `opencode models opencode` 的实时输出：模型上新自动入池、
           # 下线自动出池，无需再改本文件。目录暂时不可达时池置空，
           # pick_model 会在每个阶段开始时惰性重建重试。
+          # 现在同时通过 --verbose 读取每个模型支持的 variant（思考强度档位）。
+          declare -A MODEL_VARIANTS=()
+          # ================= 优先模型：deepseek-v4.1-flash-free =================
+          # 池中存在时始终优先选用；不存在时保持随机选择。
+          # 同一阶段内若优先模型刚失败/限流，则暂时回退随机，下个阶段开始时自动恢复优先。
+          PREFERRED_MODEL="opencode/deepseek-v4.1-flash-free"
+          PREFERRED_BROKEN=0
+          # ---- 解析脚本：从 --verbose 输出提取模型 ID + 支持的 variant 列表 ----
+          # `opencode models --verbose` 在每个模型行后输出一段 JSON 元数据，其中
+          # variants 字段列出该模型支持的思考强度档位（如 deepseek-v4.1-flash-free
+          # 有 low/high/max）。输出两列（\t 分隔）：opencode/<model-id>  逗号分隔 variant。
+          cat > /tmp/parse_model_variants.py <<'PYEOF'
+          import sys, json, re
+          text = sys.stdin.read()
+          parts = re.split(r'(?m)^opencode/([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$', text)
+          for i in range(1, len(parts) - 1, 2):
+              mid, blob = parts[i], parts[i + 1]
+              try:
+                  meta = json.loads(blob)
+              except Exception:
+                  try:
+                      meta = json.loads(blob[:blob.rindex('}') + 1])
+                  except Exception:
+                      continue
+              variants = sorted((meta.get('variants') or {}).keys())
+              print('opencode/%s\t%s' % (mid, ','.join(variants)))
+          PYEOF
           build_model_pool() {
-            local out ids m
-            out="$(opencode models opencode 2>/dev/null || opencode models 2>/dev/null || true)"
-            [ -z "$out" ] && return 1
-            # 提取 opencode provider 的全部模型 ID（形如 opencode/<model-id>）
-            ids="$(printf '%s\n' "$out" | grep -oE 'opencode/[A-Za-z0-9][A-Za-z0-9._-]*' | sort -u)"
-            [ -z "$ids" ] && return 1
+            local out tsv m v
             local pool=()
-            while IFS= read -r m; do
-              [ -n "$m" ] && pool+=("$m")
-            done <<< "$ids"
+            # --refresh 强制拉取线上最新目录（避免 runner 本地缓存过期、错过新上的模型）；
+            # refresh 失败时自动回退缓存目录，仍失败则返回空，由 pick_model 惰性重建重试。
+            out="$(opencode models opencode --verbose --refresh 2>/dev/null \
+              || opencode models opencode --verbose 2>/dev/null \
+              || opencode models --verbose 2>/dev/null \
+              || true)"
+            [ -z "$out" ] && return 1
+            tsv="$(printf '%s\n' "$out" | python3 /tmp/parse_model_variants.py 2>/dev/null)" || true
+            [ -z "$tsv" ] && return 1
+            MODEL_VARIANTS=()
+            while IFS=$'\t' read -r m v; do
+              [ -n "$m" ] || continue
+              pool+=("$m")
+              MODEL_VARIANTS["$m"]="$v"
+            done <<< "$tsv"
             [ ${#pool[@]} -eq 0 ] && return 1
             FREE_MODELS=("${pool[@]}")
             echo "[info] 动态模型池（${#FREE_MODELS[@]} 个）: ${FREE_MODELS[*]}"
+            if printf '%s\n' "${FREE_MODELS[@]}" | grep -qx -- "$PREFERRED_MODEL"; then
+              echo "[info] 优先模型在池中: $PREFERRED_MODEL (variant: ${MODEL_VARIANTS[$PREFERRED_MODEL]:-无})"
+            else
+              echo "[warn] 优先模型 $PREFERRED_MODEL 不在池中，本阶段改用随机模型"
+            fi
             return 0
           }
           if ! build_model_pool; then
             echo "[warn] 启动时读取模型目录失败，模型池暂空；将随阶段重试自动重建"
             FREE_MODELS=()
+            MODEL_VARIANTS=()
           fi
 
           # ================= workflow 防删自愈 =================
@@ -473,7 +513,9 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 随机选一个模型（尽量避免和上次相同） ----------
+          # ---------- 选模型：优先 deepseek-v4.1-flash-free，没有则随机 ----------
+          # 1) 优先模型在池中、且本阶段内未刚失败/限流时，始终优先选用；
+          # 2) 否则保持随机选择，并尽量避免和上次相同。
           # 池为空时先惰性重建（目录 API 瞬时故障的自愈）；
           # 重建后仍为空则返回 1，由调用方计入失败并稍后重试。
           pick_model() {
@@ -485,14 +527,33 @@ jobs:
               CURRENT_MODEL=""
               return 1
             fi
-            local m
-            for _ in 1 2 3; do
-              m="${FREE_MODELS[$((RANDOM % n))]}"
-              if [ "$n" -le 1 ] || [ "$m" != "$PREVIOUS_MODEL" ]; then break; fi
-            done
+            local m="" x
+            if [ -n "$PREFERRED_MODEL" ] && [ "$PREFERRED_BROKEN" -ne 1 ]; then
+              for x in "${FREE_MODELS[@]}"; do
+                if [ "$x" = "$PREFERRED_MODEL" ]; then m="$x"; break; fi
+              done
+            fi
+            if [ -z "$m" ]; then
+              for _ in 1 2 3; do
+                m="${FREE_MODELS[$((RANDOM % n))]}"
+                if [ "$n" -le 1 ] || [ "$m" != "$PREVIOUS_MODEL" ]; then break; fi
+              done
+            fi
             PREVIOUS_MODEL="$m"
             CURRENT_MODEL="$m"
             return 0
+          }
+
+          # ---------- 确定模型思考强度：优先 max，无 max 用 high，都不支持则不设置 ----------
+          # 从模型官方元数据公布的 variant 列表中选取；都不支持时按默认方式启动
+          # （不传 --variant），避免传无效值导致启动失败。
+          variant_for() {
+            local v="${MODEL_VARIANTS[$1]:-}"
+            case ",$v," in
+              *,max,*)  echo "max" ;;
+              *,high,*) echo "high" ;;
+              *)        echo "" ;;
+            esac
           }
 
           # ---------- 单阶段执行（带重试 + 随机换模型） ----------
@@ -503,6 +564,8 @@ jobs:
             local attempt=0
             FAIL_COUNT=0
             RATE_COUNT=0
+            # 每个阶段开始时恢复优先模型（每阶段总是优先尝试 deepseek-v4.1-flash-free）
+            PREFERRED_BROKEN=0
 
             while [ $attempt -lt 3 ]; do
               attempt=$((attempt+1))
@@ -522,9 +585,18 @@ jobs:
                 sleep 120
                 continue
               fi
-              echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$CURRENT_MODEL ==========="
+              # 思考强度：模型支持则尽量调 max（无 max 用 high），都不支持则不设置
+              local EFFORT="" VARFLAG=()
+              EFFORT="$(variant_for "$CURRENT_MODEL")"
+              if [ -n "$EFFORT" ]; then
+                VARFLAG=(--variant "$EFFORT")
+                echo "[info] model=$CURRENT_MODEL 思考强度=$EFFORT"
+              else
+                echo "[info] model=$CURRENT_MODEL 不支持调节思考强度，按默认档位启动"
+              fi
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$CURRENT_MODEL effort=${EFFORT:-none} ==========="
 
-              timeout --kill-after=180 "$budget" opencode run -m "$CURRENT_MODEL" "$prompt" 2>&1 | tee "$OUT"
+              timeout --kill-after=180 "$budget" opencode run -m "$CURRENT_MODEL" ${VARFLAG[@]+"${VARFLAG[@]}"} "$prompt" 2>&1 | tee "$OUT"
               local EC=$?
 
               # 成功
@@ -542,6 +614,10 @@ jobs:
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
                 RATE_COUNT=$((RATE_COUNT+1))
                 echo "[warn] phase=$phase 命中限流(429) (连续: $RATE_COUNT)，90s 后换模型重试"
+                if [ "$CURRENT_MODEL" = "$PREFERRED_MODEL" ]; then
+                  PREFERRED_BROKEN=1
+                  echo "[info] 优先模型命中限流，本阶段内改用随机模型"
+                fi
                 if [ $RATE_COUNT -ge 8 ]; then
                   echo "[warn] 连续 8 次限流，放弃该阶段"
                   return 1
@@ -558,6 +634,10 @@ jobs:
               # 其它非零退出：随机换一个免费模型重试
               FAIL_COUNT=$((FAIL_COUNT+1))
               echo "[warn] phase=$phase 模型 $CURRENT_MODEL 失败 (连续: $FAIL_COUNT)，换模型重试"
+              if [ "$CURRENT_MODEL" = "$PREFERRED_MODEL" ]; then
+                PREFERRED_BROKEN=1
+                echo "[info] 优先模型失败，本阶段内改用随机模型"
+              fi
               if [ $FAIL_COUNT -ge 3 ]; then
                 echo "[warn] 连续 3 次失败，放弃该阶段"
                 return 1
