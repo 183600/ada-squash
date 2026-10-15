@@ -1,13 +1,3 @@
-import torch as _torch
-try:
-    _torch.backends.cuda.matmul.allow_tf32 = True
-    _torch.backends.cudnn.allow_tf32 = True
-except Exception:
-    pass
-try:
-    _torch.set_float32_matmul_precision('high')
-except Exception:
-    pass
 from .norms import LayerNorm, RMSNorm, DyT, DyTC, DyTD, DyTCD, build_norm, generalized_softsign, NORM_REGISTRY
 from .attention import CausalSelfAttention
 from .model import GPTConfig, GPT, LayerConfig, build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
