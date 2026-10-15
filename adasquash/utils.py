@@ -58,18 +58,21 @@ class KurtosisMeter:
             chunk = xd[start:start + self._chunk]
             if chunk.dtype != self.acc_dtype:
                 chunk = chunk.to(self.acc_dtype)
-            x_var_t, x_mean_t = torch.var_mean(chunk, unbiased=False)
+            count = chunk.numel()
+            x_mean_t = chunk.sum() / count
             xc = chunk - x_mean_t
             xc2 = xc * xc
+            x_var_t = torch.linalg.vecdot(xc, xc) / count
             parts.append(torch.stack([x_mean_t, x_var_t, torch.linalg.vecdot(xc, xc2), torch.linalg.vecdot(xc2, xc2)]))
-            counts.append(chunk.numel())
+            counts.append(count)
         for stats, count in zip(torch.stack(parts).tolist(), counts):
             self._merge(*stats, count)
 
     def _bulk_update(self, x: torch.Tensor):
-        x_var_t, x_mean_t = torch.var_mean(x, unbiased=False)
+        x_mean_t = x.sum() / x.numel()
         xc = x - x_mean_t
         xc2 = xc * xc
+        x_var_t = torch.linalg.vecdot(xc, xc) / x.numel()
         x_m3_t = torch.linalg.vecdot(xc, xc2)
         x_m4_t = torch.linalg.vecdot(xc2, xc2)
         x_mean, x_var, x_m3, x_m4 = torch.stack([x_mean_t, x_var_t, x_m3_t, x_m4_t]).tolist()

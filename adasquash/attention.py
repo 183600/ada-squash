@@ -70,20 +70,9 @@ class CausalSelfAttention(nn.Module):
         cache = self._tril_cache
         if cache is None or cache[0] != (T, device):
             ij = torch.arange(T, device=device)
-            mask = ij[:, None] >= ij[None, :]
-            cache = ((T, device), mask, ~mask)
+            cache = ((T, device), ij[:, None] < ij[None, :])
             self._tril_cache = cache
         return cache[1]
-
-    def _tril_pair(self, T: int, device):
-        cache = self._tril_cache
-        if cache is None or cache[0] != (T, device):
-            self._tril_mask(T, device)
-            cache = self._tril_cache
-        if len(cache) >= 3:
-            return (cache[1], cache[2])
-        keep = cache[1]
-        return (keep, ~keep)
     _LOGITS_CHUNK_BYTES = 1 << 27
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
@@ -97,7 +86,7 @@ class CausalSelfAttention(nn.Module):
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
         peak_sq = torch.zeros((), dtype=q.dtype, device=device)
-        drop = self._tril_pair(T, device)[1]
+        drop = self._tril_mask(T, device)
         k_t = k.transpose(-1, -2)
         block = None
         for start in range(0, T, rows):
