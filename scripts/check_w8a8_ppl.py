@@ -174,6 +174,14 @@ def main():
         for _ in range(max(1, args.n_batches)):
             x = make_probe(rng, model.cfg, dataset_probe)
             batches.append(x)
+        # Reject a signal-free probe *before* measuring it. The coverage only
+        # depends on the corpus, so running the fp32 and the W8A8 pass first
+        # and rejecting afterwards threw away the whole measurement (and every
+        # other checkpoint's, since the aggregate is written at the end) after
+        # paying for all of it.
+        coverage = probe_token_coverage(batches)
+        if coverage > args.max_probe_coverage:
+            raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
         ce_fp = 0.0
         n_tok = 0
         for x in batches:
@@ -191,9 +199,6 @@ def main():
             ce_q += b
         ppl_fp = math.exp(ce_fp / n_tok)
         ppl_q = math.exp(ce_q / n_tok)
-        coverage = probe_token_coverage(batches)
-        if coverage > args.max_probe_coverage:
-            raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
         r = {'ckpt': ckpt_path, 'probe': args.probe, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage}
         if ppl_fp >= 0.5 * model.cfg.vocab_size:
             print(f'[w8a8] WARNING: {ckpt_path} ppl_fp={ppl_fp:.1f} is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={coverage:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet', file=sys.stderr)

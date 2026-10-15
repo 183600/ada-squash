@@ -143,7 +143,7 @@ def main():
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model, model_args = load_ckpt(args.ckpt, device=device)
-    print(f'[eval] loaded {args.ckpt} | norm={model_args['norm']} | n_layers={model.cfg.n_layers}')
+    print(f"[eval] loaded {args.ckpt} | norm={model_args['norm']} | n_layers={model.cfg.n_layers}")
     results = {'ckpt': args.ckpt, 'norm': model_args['norm'], 'tasks': {}}
     if args.tasks:
         try:

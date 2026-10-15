@@ -77,7 +77,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
     summary = {'name': name, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'elapsed_s': time.time() - t0}
     with open(output_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
-    print(f'  [done] {summary['final_loss']:.4f} max_abs_pre_norm={summary['max_abs_pre_norm']}')
+    print(f"  [done] {summary['final_loss']:.4f} max_abs_pre_norm={summary['max_abs_pre_norm']}")
     return summary
 
 def merge_summaries(previous: list, fresh: list) -> list:

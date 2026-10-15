@@ -129,6 +129,15 @@ def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float)
 def build_lr_lambda(args):
     return lambda s: cosine_schedule(s + 1, args.max_steps, args.warmup, args.min_lr_ratio)
 _SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip')
+# Flags that decide *what model is built and in what numeric format*. They are
+# as much a part of the run as the schedule is: resuming must rebuild the same
+# architecture (or fail loudly on the recorded one), not silently construct
+# whatever the CLI defaults happen to be. `_SCHEDULE_ARGS` is handled by
+# `restore_schedule_args`; these are restored alongside it, under the same
+# "the checkpoint wins unless the flag was typed on this command line" rule.
+_ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'beta', 'alpha_0', 'k_init', 'alpha_init', 'p_init', 'alpha_jitter')
+_NUMERIC_ARGS = ('compile', 'compile_mode', 'no_bf16')
+_RESUME_RUN_ARGS = _ARCH_ARGS + _NUMERIC_ARGS
 
 def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
     changed = []
@@ -207,18 +216,31 @@ def main():
     p.add_argument('--resume', default=None, help='checkpoint to resume from')
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
-    explicit = frozenset((name for name in _SCHEDULE_ARGS if getattr(args, name, None) != p.get_default(name)))
+    explicit = frozenset((name for name in _SCHEDULE_ARGS + _RESUME_RUN_ARGS if getattr(args, name, None) != p.get_default(name)))
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     resume_ckpt = None
     run_args: dict = {}
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         run_args = resume_ckpt.get('args') or {}
-        for name in ('compile', 'compile_mode'):
-            if name in run_args:
-                setattr(args, name, run_args[name])
-        if 'no_bf16' in run_args:
-            args.no_bf16 = bool(run_args['no_bf16'])
+        # Architecture / numeric-format flags follow the same policy as the
+        # schedule flags below: the checkpoint's value is adopted unless this
+        # command line set the flag explicitly, in which case the run follows
+        # a different architecture / precision than the one it continues and
+        # says so. (Unconditional restore would make a typed `--no-bf16` or
+        # `--compile` a no-op without a word, which is exactly the silent
+        # reshape the schedule path reports.)
+        resume_kept = []
+        for name in _RESUME_RUN_ARGS:
+            if name not in run_args:
+                continue
+            if name in explicit:
+                if getattr(args, name, None) != run_args[name]:
+                    resume_kept.append(name)
+                continue
+            setattr(args, name, run_args[name])
+        if resume_kept:
+            print(f'[resume] keeping your explicit override(s) {sorted(resume_kept)} for the architecture / numeric-format flags as well - the resumed run therefore differs from the one it continues')
         for env_name, arg_name in (('ADASQUASH_DEPTH_OVERRIDE', '_depth_override'), ('ADASQUASH_DIM_OVERRIDE', '_dim_override'), ('ADASQUASH_HEADS_OVERRIDE', '_heads_override')):
             if run_args.get(arg_name) is not None:
                 os.environ[env_name] = str(run_args[arg_name])
@@ -254,7 +276,7 @@ def main():
         if heads_override:
             cfg_dict['n_heads'] = int(heads_override)
             args._heads_override = int(heads_override)
-        print(f'[shape-override] L={cfg_dict['n_layers']} dim={cfg_dict['dim']} n_heads={cfg_dict['n_heads']} (was L={model.cfg.n_layers} dim={model.cfg.dim} n_heads={model.cfg.n_heads})')
+        print(f"[shape-override] L={cfg_dict['n_layers']} dim={cfg_dict['dim']} n_heads={cfg_dict['n_heads']} (was L={model.cfg.n_layers} dim={model.cfg.dim} n_heads={model.cfg.n_heads})")
         model = GPT(GPTConfig(**cfg_dict))
     model.reset_parameters(args.seed)
     model.to(device)
@@ -310,11 +332,19 @@ def main():
         wandb.init(project=args.wandb_project, name=args.run_name or args.norm, config=vars(args))
     step = start_step
     t0 = time.time()
+    # `max_abs_pre_norm` / `mean_excess_kurtosis_pre_norm` are outlier-driven
+    # maxima over the sampled activations, so a window that resets on every
+    # report describes the single micro-batch of the single step that landed
+    # on the window - not the run. Pool across windows (as `ablation.py` and
+    # `train_moe_tiny.py` already do) so the reported statistic covers every
+    # sampled step of the run it is reported alongside.
+    stats_windowed = False
     while step < args.max_steps:
         opt.zero_grad(set_to_none=True)
         attach_stats = (step + 1) % args.stats_every == 0
         if attach_stats:
-            act_stats.attach()
+            act_stats.attach(reset=not stats_windowed)
+            stats_windowed = True
         loss_acc = None
         for _ in range(args.grad_accum):
             try:
@@ -358,7 +388,7 @@ def main():
                 wandb.log(row, step=step)
         if step % args.stats_every == 0 and step > 0:
             stats = act_stats.summary()
-            print(f'[stats] {stats.get('__summary__', {})}')
+            print(f"[stats] {stats.get('__summary__', {})}")
             if tb:
                 s = stats.get('__summary__', {})
                 for k, v in s.items():
