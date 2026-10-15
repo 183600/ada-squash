@@ -252,7 +252,10 @@ class _SwiGLU(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1, w2, w3):
         lead = x.shape[:-1]
+        dt = _autocast_dtype(x.device.type, x.dtype, w1.dtype, w2.dtype, w3.dtype)
         x2 = x.reshape(-1, x.shape[-1])
+        if x2.dtype != dt:
+            x2 = x2.to(dt)
         a = F.linear(x2, w1)
         b = F.linear(x2, w3)
         h = F.silu(a)
@@ -274,21 +277,31 @@ class _SwiGLU(torch.autograd.Function):
             x = x.to(dt)
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
         grad_h = grad_out @ w2
-        prod = grad_h.mul(b)
-        grad_a = torch.ops.aten.silu_backward(prod, a)
-        del prod
-        h = F.silu(a)
-        grad_b = grad_h.mul_(h)
-        gated = h.mul_(b)
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
-        if ctx.needs_input_grad[0]:
+        do_x = ctx.needs_input_grad[0]
+        do_w1 = ctx.needs_input_grad[1]
+        do_w2 = ctx.needs_input_grad[2]
+        do_w3 = ctx.needs_input_grad[3]
+        need_a = do_x or do_w1
+        need_b = do_x or do_w3
+        grad_a = grad_b = None
+        if need_a:
+            prod = grad_h.mul(b)
+            grad_a = torch.ops.aten.silu_backward(prod, a)
+            del prod
+        h = None
+        if need_b or do_w2:
+            h = F.silu(a)
+        if need_b:
+            grad_b = grad_h.mul_(h)
+        if do_x:
             grad_x = grad_a @ w1
             grad_x.addmm_(grad_b, w3)
-        if ctx.needs_input_grad[1]:
+        if do_w1:
             grad_w1 = grad_a.t() @ x
-        if ctx.needs_input_grad[2]:
-            grad_w2 = grad_out.t() @ gated
-        if ctx.needs_input_grad[3]:
+        if do_w2:
+            grad_w2 = grad_out.t() @ h.mul_(b)
+        if do_w3:
             grad_w3 = grad_b.t() @ x
         xd, w1d, w2d, w3d = ctx.in_dtypes
         if grad_x is not None:
