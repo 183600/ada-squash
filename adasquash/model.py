@@ -255,7 +255,7 @@ class _SwiGLU(torch.autograd.Function):
         h = F.silu(a)
         gated = h * b
         y = F.linear(gated, w2)
-        ctx.save_for_backward(x2, a, b, h, w1, w2, w3)
+        ctx.save_for_backward(x2, a, b, w1, w2, w3)
         ctx.compute_dtype = y.dtype
         ctx.in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)
         ctx.lead = lead
@@ -263,19 +263,20 @@ class _SwiGLU(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, a, b, h, w1, w2, w3 = ctx.saved_tensors
+        x, a, b, w1, w2, w3 = ctx.saved_tensors
         dt = ctx.compute_dtype
         if w1.dtype != dt:
             w1, w2, w3 = (w1.to(dt), w2.to(dt), w3.to(dt))
         if x.dtype != dt:
             x = x.to(dt)
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
+        h = F.silu(a)
         grad_h = grad_out @ w2
         prod = grad_h * b
         grad_a = torch.ops.aten.silu_backward(prod, a)
         del prod
         grad_b = grad_h.mul_(h)
-        gated = h.mul(b)
+        gated = h.mul_(b)
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
         if ctx.needs_input_grad[0]:
             grad_x = grad_a @ w1
@@ -378,9 +379,9 @@ class GPT(nn.Module):
                 x, ls = block(x, freqs_cis=freqs, return_stats=return_stats)
                 if return_stats:
                     all_logit_stats.append(ls)
-        x = self.norm_f(x)
         if last_position_only:
             x = x[:, -1:]
+        x = self.norm_f(x)
         logits = None
         loss = None
         if targets is None:

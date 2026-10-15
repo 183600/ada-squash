@@ -53,8 +53,7 @@ def register_norm(name: str):
 def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     t = xs.abs()
     lo = t.clamp(max=1.0)
-    hi = t.clamp(min=1.0).reciprocal_()
-    u = hi.mul_(lo)
+    u = t.clamp_(min=1.0).reciprocal_().mul_(lo)
     s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     return lo.mul_(s).copysign_(xs)
 
@@ -167,7 +166,7 @@ class _RMSNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps):
         nrm = torch.linalg.vector_norm(x, 2, dim=-1, keepdim=True)
-        rstd = torch.rsqrt(nrm.square_().div_(x.shape[-1]).add_(eps))
+        rstd = nrm.square_().div_(x.shape[-1]).add_(eps).rsqrt_()
         ctx.save_for_backward(x, rstd, weight)
         out = x * rstd
         if out.dtype == weight.dtype:
@@ -242,9 +241,9 @@ class _DyTCForward(torch.autograd.Function):
         x_scaled = x.mul(alpha)
         phi = _softsign_forward(x_scaled, p)
         if beta is not None:
-            out = torch.addcmul(beta, phi, gamma)
+            out = phi.mul_(gamma).add_(beta)
         else:
-            out = phi.mul(gamma)
+            out = phi.mul_(gamma)
         ctx.p_is_tensor = p_is_tensor
         ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
         saved = [x_scaled, alpha, gamma, beta]
@@ -326,9 +325,9 @@ class _DyTDForward(torch.autograd.Function):
         a = alpha_0 * exp_kdr
         phi = x.mul(a).tanh_()
         if beta is not None:
-            out = torch.addcmul(beta, phi, gamma)
+            out = phi.mul_(gamma).add_(beta)
         else:
-            out = phi.mul(gamma)
+            out = phi.mul_(gamma)
         ctx.save_for_backward(x, alpha_0, k, gamma, beta, exp_kdr.detach())
         ctx.depth_ratio = depth_ratio
         return out
@@ -375,9 +374,9 @@ class _DyTForward(torch.autograd.Function):
     def forward(ctx, x, alpha, gamma, beta):
         phi = x.mul(alpha).tanh_()
         if beta is not None:
-            out = torch.addcmul(beta, phi, gamma)
+            out = phi.mul_(gamma).add_(beta)
         else:
-            out = phi.mul(gamma)
+            out = phi.mul_(gamma)
         ctx.save_for_backward(x, alpha, gamma, beta)
         return out
 
@@ -444,9 +443,9 @@ class _DyTCDForward(torch.autograd.Function):
         x_scaled = x.mul(alpha_c)
         phi = _softsign_forward(x_scaled, p)
         if beta is not None:
-            out = torch.addcmul(beta, phi, gamma)
+            out = phi.mul_(gamma).add_(beta)
         else:
-            out = phi.mul(gamma)
+            out = phi.mul_(gamma)
         ctx.p_is_tensor = p_is_tensor
         ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
         saved = [x_scaled, alpha_0, k, delta, gamma, beta, alpha_c, exp_kdr.detach()]
