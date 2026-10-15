@@ -145,6 +145,13 @@ def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()
         setattr(args, name, ckpt_args[name])
     return changed
 
+def load_model_state_dict(model, state_dict) -> None:
+    target = getattr(model, '_orig_mod', model)
+    prefix = '_orig_mod.'
+    if any(k.startswith(prefix) for k in state_dict):
+        state_dict = {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state_dict.items()}
+    target.load_state_dict(state_dict)
+
 def _is_no_decay_group(group) -> bool:
     # build_optimizer routes every parameter with ndim < 2 (norm gains, biases,
     # LayerScale and the scalar squashing parameters) to the no-decay group and
@@ -300,7 +307,7 @@ def main():
     opt = build_optimizer(model, args.lr, args.weight_decay, args.beta1, args.beta2)
     sched = LambdaLR(opt, build_lr_lambda(args))
     if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt['model'])
+        load_model_state_dict(model, resume_ckpt['model'])
         if 'optimizer' in resume_ckpt:
             opt.load_state_dict(resume_ckpt['optimizer'])
         if 'scheduler' in resume_ckpt:
