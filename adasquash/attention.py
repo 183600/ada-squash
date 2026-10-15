@@ -42,11 +42,8 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor]=None, return_stats: bool=False):
         B, T, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(C, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
+        qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
         del qkv
         if self.q_rms is not None:
             q = self.q_rms(q)
