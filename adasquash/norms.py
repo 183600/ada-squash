@@ -53,7 +53,8 @@ def register_norm(name: str):
 def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     t = xs.abs()
     lo = t.clamp(max=1.0)
-    u = t.clamp_(min=1.0).reciprocal_().mul_(lo)
+    u = t.clamp_(min=1.0).reciprocal_()
+    u.mul_(lo)
     if isinstance(p, torch.Tensor):
         s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
     else:

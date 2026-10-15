@@ -135,7 +135,8 @@ class MoEGPT(nn.Module):
     def forward(self, x, y=None, return_aux=False, return_logits=True):
         B, T = x.shape
         z = self.tok_emb(x)
-        z.add_(self.pos_emb(self._pos_ids[:T].unsqueeze(0)))
+        pe = self.pos_emb.weight[:T]
+        z.add_(pe if pe.dtype == z.dtype else pe.to(z.dtype))
         z = self.drop(z)
         aux_total = 0.0
         tpe_list = []

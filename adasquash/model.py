@@ -136,11 +136,24 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         acc = _loss_acc_dtype(dt)
         w_t = w.t()
         total = None
-        for start in range(0, targets.numel(), chunk_rows):
-            end = min(start + chunk_rows, targets.numel())
-            chunk_logits = (h[start:end] @ w_t).to(acc)
-            torch.log_softmax(chunk_logits, -1, out=chunk_logits)
-            chunk = F.nll_loss(chunk_logits, targets[start:end], ignore_index=ignore_index, reduction='sum')
+        n = targets.numel()
+        logits = None
+        cast_buf = None
+        for start in range(0, n, chunk_rows):
+            end = min(start + chunk_rows, n)
+            rows = end - start
+            if logits is None or logits.size(0) < rows:
+                logits = torch.empty(chunk_rows, w.shape[0], dtype=acc, device=h.device)
+                cast_buf = None if acc == dt else torch.empty(chunk_rows, w.shape[0], dtype=dt, device=h.device)
+            buf = logits[:rows]
+            if cast_buf is None:
+                torch.mm(h[start:end], w_t, out=buf)
+            else:
+                cast = cast_buf[:rows]
+                torch.mm(h[start:end], w_t, out=cast)
+                buf.copy_(cast)
+            torch.log_softmax(buf, -1, out=buf)
+            chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk if total is None else total.add_(chunk)
         count = targets.ne(ignore_index).sum()
         ctx.save_for_backward(h, w, targets)
@@ -164,20 +177,32 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         chunk_rows = ctx.chunk_rows
         w_t = w.t()
         first = True
-        for start in range(0, targets.numel(), chunk_rows):
-            end = min(start + chunk_rows, targets.numel())
+        n = targets.numel()
+        probs = None
+        cast_buf = None
+        for start in range(0, n, chunk_rows):
+            end = min(start + chunk_rows, n)
+            rows = end - start
             hc = h[start:end]
             tc = targets[start:end]
-            probs = hc @ w_t
-            probs = probs.to(acc)
-            torch.softmax(probs, -1, out=probs)
+            if probs is None or probs.size(0) < rows:
+                probs = torch.empty(chunk_rows, w.shape[0], dtype=acc, device=h.device)
+                cast_buf = None if acc == dt else torch.empty(chunk_rows, w.shape[0], dtype=dt, device=h.device)
+            buf = probs[:rows]
+            if cast_buf is None:
+                torch.mm(hc, w_t, out=buf)
+            else:
+                cast = cast_buf[:rows]
+                torch.mm(hc, w_t, out=cast)
+                buf.copy_(cast)
+            torch.softmax(buf, -1, out=buf)
             valid = tc.ne(ctx.ignore_index)
             gold = tc.masked_fill(~valid, 0).unsqueeze(-1)
-            keep = valid.unsqueeze(-1).to(probs.dtype)
-            probs.scatter_add_(-1, gold, keep.neg())
-            probs.mul_(keep.mul_(grad_scale))
-            g = probs.to(dt)
-            del probs, gold, keep, valid
+            keep = valid.unsqueeze(-1).to(buf.dtype)
+            buf.scatter_add_(-1, gold, keep.neg())
+            buf.mul_(keep.mul_(grad_scale))
+            g = buf if acc == dt else buf.to(dt)
+            del gold, keep, valid
             if need_h:
                 torch.mm(g, w, out=grad_h[start:end])
             if need_w:
@@ -380,7 +405,8 @@ class GPT(nn.Module):
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
-            x.add_(self.pos_emb(self._pos_ids[:T].unsqueeze(0)))
+            pe = self.pos_emb.weight[:T]
+            x.add_(pe if pe.dtype == x.dtype else pe.to(x.dtype))
         if self.drop.p > 0.0:
             x = self.drop(x)
         freqs = self.freqs_cis[:T] if self.freqs_cis is not None else None
