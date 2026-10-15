@@ -1,4 +1,3 @@
-
 model: gpt2-124m
 norm: dytc
 alpha_init: 0.5

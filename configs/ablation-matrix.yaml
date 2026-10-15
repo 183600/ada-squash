@@ -1,10 +1,4 @@
-
-
 model: gpt2-124m
-
-
-
-
 
 batch_size: 8
 seq_len: 512
@@ -16,9 +10,6 @@ seed: 42
 log_every: 50
 stats_every: 200
 output_dir: runs/ablation
-
-
-
 
 ablations:
 
@@ -32,29 +23,12 @@ ablations:
   - name: dytcd_full
     norm: dytcd
 
-
-
-
-
   - name: dytd_k0_no_depth_schedule
     norm: dytd
     k_init: 0.0
     learnable_k: false
   - name: dytd_full
     norm: dytd
-
-
-
-
-
-
-
-
-
-
-
-
-
 
   - name: dytcd_no_ls
     norm: dytcd
@@ -65,7 +39,6 @@ ablations:
   - name: dytcd_ls1e3
     norm: dytcd
     layerscale_init: 1.0e-3
-
 
   - name: dytc_p1_softsign
     norm: dytc
@@ -92,7 +65,6 @@ ablations:
     p_init: 64.0
     learnable_p: false
     alpha_jitter: 0.0
-
 
   - name: dyt_alpha_0.3
     norm: dyt
