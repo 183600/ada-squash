@@ -190,6 +190,7 @@ def main():
         data_iter = iter(loader)
 
     def next_batch():
+        nonlocal data_iter
         if data_iter is None:
             if args.probe == 'random':
                 x = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
@@ -200,7 +201,8 @@ def main():
         try:
             x, y = next(data_iter)
         except StopIteration:
-            x, y = next(iter(loader))
+            data_iter = iter(loader)
+            x, y = next(data_iter)
         return (x.to(device, non_blocking=True), y.to(device, non_blocking=True))
     history = []
     stats_windowed = False

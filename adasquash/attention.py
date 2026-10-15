@@ -154,8 +154,11 @@ def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: to
 
     ``out`` lets the caller own the single allocation. The step order is the
     same op sequence as the plain-autograd composition, so the values are
-    bit-identical. ``transpose`` applies the transposed (inverse) rotation,
-    which is what a cotangent of this orthogonal map has to be rotated by.
+    bit-identical. ``transpose`` applies the transposed (inverse) rotation
+    ``[[lo_c, hi_s], [-lo_s, hi_c]]``, which is what a cotangent of this
+    orthogonal map has to be rotated by: the ``lo`` row picks up ``hi_s``
+    and the ``hi`` row picks up ``-lo_s`` (a no-op on the half-width split,
+    where both sin halves are the same tensor).
     """
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
@@ -167,6 +170,8 @@ def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: to
     torch.mul(x_lo, lo_c, out=out_lo)
     torch.mul(x_hi, hi_c, out=out_hi)
     lo_sign, hi_sign = (1.0, -1.0) if transpose else (-1.0, 1.0)
+    if transpose:
+        lo_s, hi_s = hi_s, lo_s
     torch.addcmul(out_lo, x_hi, lo_s, value=lo_sign, out=out_lo)
     torch.addcmul(out_hi, x_lo, hi_s, value=hi_sign, out=out_hi)
     return out
