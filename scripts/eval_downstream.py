@@ -11,13 +11,6 @@ from adasquash import GPTConfig, GPT
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 
 def _strip_compile_prefix(state):
-    """Normalise a `torch.compile` state_dict down to the plain module's keys.
-
-    `train_gpt2.py --compile` wraps the model, so the saved `state_dict()`
-    carries the `_orig_mod.` prefix that the wrapper introduces. The
-    consumers here rebuild the *unwrapped* module, so the prefix is
-    stripped back off before loading.
-    """
     prefix = '_orig_mod.'
     if not any(k.startswith(prefix) for k in state):
         return state

@@ -174,11 +174,6 @@ def main():
         for _ in range(max(1, args.n_batches)):
             x = make_probe(rng, model.cfg, dataset_probe)
             batches.append(x)
-        # Reject a signal-free probe *before* measuring it. The coverage only
-        # depends on the corpus, so running the fp32 and the W8A8 pass first
-        # and rejecting afterwards threw away the whole measurement (and every
-        # other checkpoint's, since the aggregate is written at the end) after
-        # paying for all of it.
         coverage = probe_token_coverage(batches)
         if coverage > args.max_probe_coverage:
             raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")

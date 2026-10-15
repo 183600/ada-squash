@@ -129,12 +129,6 @@ def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float)
 def build_lr_lambda(args):
     return lambda s: cosine_schedule(s + 1, args.max_steps, args.warmup, args.min_lr_ratio)
 _SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip')
-# Flags that decide *what model is built and in what numeric format*. They are
-# as much a part of the run as the schedule is: resuming must rebuild the same
-# architecture (or fail loudly on the recorded one), not silently construct
-# whatever the CLI defaults happen to be. `_SCHEDULE_ARGS` is handled by
-# `restore_schedule_args`; these are restored alongside it, under the same
-# "the checkpoint wins unless the flag was typed on this command line" rule.
 _ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'beta', 'alpha_0', 'k_init', 'alpha_init', 'p_init', 'alpha_jitter')
 _NUMERIC_ARGS = ('compile', 'compile_mode', 'no_bf16')
 _RESUME_RUN_ARGS = _ARCH_ARGS + _NUMERIC_ARGS
@@ -223,13 +217,6 @@ def main():
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         run_args = resume_ckpt.get('args') or {}
-        # Architecture / numeric-format flags follow the same policy as the
-        # schedule flags below: the checkpoint's value is adopted unless this
-        # command line set the flag explicitly, in which case the run follows
-        # a different architecture / precision than the one it continues and
-        # says so. (Unconditional restore would make a typed `--no-bf16` or
-        # `--compile` a no-op without a word, which is exactly the silent
-        # reshape the schedule path reports.)
         resume_kept = []
         for name in _RESUME_RUN_ARGS:
             if name not in run_args:
@@ -332,12 +319,6 @@ def main():
         wandb.init(project=args.wandb_project, name=args.run_name or args.norm, config=vars(args))
     step = start_step
     t0 = time.time()
-    # `max_abs_pre_norm` / `mean_excess_kurtosis_pre_norm` are outlier-driven
-    # maxima over the sampled activations, so a window that resets on every
-    # report describes the single micro-batch of the single step that landed
-    # on the window - not the run. Pool across windows (as `ablation.py` and
-    # `train_moe_tiny.py` already do) so the reported statistic covers every
-    # sampled step of the run it is reported alongside.
     stats_windowed = False
     while step < args.max_steps:
         opt.zero_grad(set_to_none=True)
