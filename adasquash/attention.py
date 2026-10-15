@@ -98,6 +98,7 @@ class CausalSelfAttention(nn.Module):
         peak_sq = torch.zeros((), dtype=q.dtype, device=device)
         drop = self._tril_pair(T, device)[1]
         k_t = k.transpose(-1, -2)
+        block = None
         for start in range(0, T, rows):
             end = min(start + rows, T)
             block = torch.matmul(q[:, :, start:end], k_t)
@@ -109,6 +110,7 @@ class CausalSelfAttention(nn.Module):
             block.square_()
             acc_sq.add_(block.sum(dtype=torch.float64))
             torch.maximum(peak_sq, block.amax(), out=peak_sq)
+        del k_t, block
         total = float(acc_abs)
         signed = float(acc_x)
         mean_abs = total / n_valid

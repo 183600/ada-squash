@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 class MaxAbsMeter:
+    _chunk = 1 << 22
 
     def __init__(self):
         self.reset()
@@ -17,7 +18,15 @@ class MaxAbsMeter:
 
     def update(self, x: torch.Tensor):
         with torch.no_grad():
-            v = x.abs().max().item()
+            xd = x.detach().reshape(-1)
+            if xd.numel() <= self._chunk:
+                v = xd.abs().max().item() if xd.numel() else -float('inf')
+            else:
+                v = -float('inf')
+                for start in range(0, xd.numel(), self._chunk):
+                    c = xd[start:start + self._chunk].abs().max().item()
+                    if c > v:
+                        v = c
         if v > self.value:
             self.value = v
         self.count += 1
@@ -37,12 +46,15 @@ class KurtosisMeter:
         self._M3 = 0.0
 
     def update(self, x: torch.Tensor):
-        x = x.detach().flatten()
-        if x.numel() <= self._chunk:
-            self._bulk_update(x.to(self.acc_dtype))
+        xd = x.detach()
+        if xd.dtype != self.acc_dtype:
+            xd = xd.to(self.acc_dtype)
+        xd = xd.reshape(-1)
+        if xd.numel() <= self._chunk:
+            self._bulk_update(xd)
             return
-        for start in range(0, x.numel(), self._chunk):
-            self._bulk_update(x[start:start + self._chunk].to(self.acc_dtype))
+        for start in range(0, xd.numel(), self._chunk):
+            self._bulk_update(xd[start:start + self._chunk])
 
     def _bulk_update(self, x: torch.Tensor):
         n_b = x.numel()

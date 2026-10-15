@@ -177,6 +177,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             probs.scatter_add_(-1, gold, keep.neg())
             probs.mul_(keep.mul_(grad_scale))
             g = probs.to(dt)
+            del probs, gold, keep, valid
             if need_h:
                 torch.mm(g, w, out=grad_h[start:end])
             if need_w:
