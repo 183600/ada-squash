@@ -127,7 +127,7 @@ class CausalSelfAttention(nn.Module):
             f_imag = freqs_cis.imag
             cos = torch.cat([f_real, f_real], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
             sin = torch.cat([f_imag, f_imag], dim=-1).unsqueeze(0).unsqueeze(0).contiguous()
-            self._rope_cache = (key, freqs_cis, {}, cos, sin)
+            self._rope_cache = (key, None, {}, cos, sin)
         tables = self._rope_cache[2]
         entry = tables.get(dtype)
         if entry is None:
