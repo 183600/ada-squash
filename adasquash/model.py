@@ -42,7 +42,7 @@ class GPTConfig:
     ignore_index: int = -100
     tie_word_embeddings: bool = True
     rotary: bool = False
-_CROSSENTROPY_CHUNK_BYTES = 1 << 26
+_CROSSENTROPY_CHUNK_BYTES = 1 << 27
 _CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
 
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
@@ -134,10 +134,11 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         h = hidden.to(dt)
         w = weight.to(dt)
         acc = _loss_acc_dtype(dt)
+        w_t = w.t()
         total = None
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
-            chunk_logits = F.linear(h[start:end], w).to(acc)
+            chunk_logits = (h[start:end] @ w_t).to(acc)
             torch.log_softmax(chunk_logits, -1, out=chunk_logits)
             chunk = F.nll_loss(chunk_logits, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk if total is None else total.add_(chunk)
@@ -161,12 +162,13 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         grad_w = torch.empty_like(w) if need_w else None
         grad_scale = (grad_out / ctx.count).to(dt)
         chunk_rows = ctx.chunk_rows
+        w_t = w.t()
         first = True
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
             hc = h[start:end]
             tc = targets[start:end]
-            probs = hc @ w.t()
+            probs = hc @ w_t
             probs = probs.to(acc)
             torch.softmax(probs, -1, out=probs)
             valid = tc.ne(ctx.ignore_index)
@@ -253,8 +255,8 @@ class _SwiGLU(torch.autograd.Function):
         a = F.linear(x2, w1)
         b = F.linear(x2, w3)
         h = F.silu(a)
-        gated = h * b
-        y = F.linear(gated, w2)
+        h.mul_(b)
+        y = F.linear(h, w2)
         ctx.save_for_backward(x2, a, b, w1, w2, w3)
         ctx.compute_dtype = y.dtype
         ctx.in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)

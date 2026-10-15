@@ -12,7 +12,7 @@ def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     if t.ndim <= 1:
         return t.clone()
     return t.sum(dim=tuple(range(t.ndim - 1)))
-_REDUCE_CHUNK_ELEMS = 1 << 20
+_REDUCE_CHUNK_ELEMS = 1 << 22
 
 def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim <= 1:
@@ -275,7 +275,7 @@ class _DyTCForward(torch.autograd.Function):
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
         if need_phi:
-            grad_phi = phi.mul(grad_out)
+            grad_phi = phi.mul_(grad_out)
             if need_gamma_grad:
                 grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
@@ -288,7 +288,7 @@ class _DyTCForward(torch.autograd.Function):
             if ctx.needs_input_grad[1]:
                 grad_alpha = _reduce_products(grad_x_scaled, x_scaled).div_(alpha)
             if ctx.needs_input_grad[0]:
-                grad_x = grad_x_scaled.mul(alpha)
+                grad_x = grad_x_scaled.mul_(alpha)
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[4]:
             grad_beta = _sum_leading_dims(grad_out)
@@ -480,7 +480,7 @@ class _DyTCDForward(torch.autograd.Function):
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
         if need_phi:
-            grad_phi = phi.mul(grad_out)
+            grad_phi = phi.mul_(grad_out)
             if need_gamma_grad:
                 grad_gamma = _sum_leading_dims(grad_phi)
             if need_p_grad:
@@ -506,7 +506,7 @@ class _DyTCDForward(torch.autograd.Function):
                         if ctx.needs_input_grad[2]:
                             grad_k = -grad_scale * scale * depth_ratio
             if ctx.needs_input_grad[0]:
-                grad_x = grad_x_scaled.mul(alpha_c)
+                grad_x = grad_x_scaled.mul_(alpha_c)
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[6]:
             grad_beta = _sum_leading_dims(grad_out)

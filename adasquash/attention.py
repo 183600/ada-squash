@@ -87,7 +87,7 @@ class CausalSelfAttention(nn.Module):
             return (cache[1], cache[2])
         keep = cache[1]
         return (keep, ~keep)
-    _LOGITS_CHUNK_BYTES = 1 << 26
+    _LOGITS_CHUNK_BYTES = 1 << 27
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
         B, H = (q.shape[0], q.shape[1])
