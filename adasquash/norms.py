@@ -35,6 +35,18 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if total.dtype != a.dtype:
             total = total.to(a.dtype)
         return total
+    if a.numel() > _REDUCE_CHUNK_ELEMS:
+        row_elems = max(1, a.numel() // a.shape[0])
+        step = max(1, _REDUCE_CHUNK_ELEMS // row_elems)
+        acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
+        lead = tuple(range(a.ndim - 1))
+        total = None
+        for start in range(0, a.shape[0], step):
+            part = (a[start:start + step] * b[start:start + step]).sum(dim=lead, dtype=acc_dtype)
+            total = part if total is None else total.add_(part)
+        if total.dtype != a.dtype:
+            total = total.to(a.dtype)
+        return total
     return _sum_leading_dims(a * b)
 
 def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

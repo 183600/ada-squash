@@ -161,11 +161,11 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             buf = logits[:rows]
             if cast_buf is None:
                 torch.mm(h[start:end], w_t, out=buf)
+                torch.log_softmax(buf, -1, out=buf)
             else:
                 cast = cast_buf[:rows]
                 torch.mm(h[start:end], w_t, out=cast)
-                buf.copy_(cast)
-            torch.log_softmax(buf, -1, out=buf)
+                torch.log_softmax(cast, -1, dtype=acc, out=buf)
             chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk if total is None else total.add_(chunk)
         count = targets.ne(ignore_index).sum()
@@ -204,11 +204,11 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             buf = probs[:rows]
             if cast_buf is None:
                 torch.mm(hc, w_t, out=buf)
+                torch.softmax(buf, -1, out=buf)
             else:
                 cast = cast_buf[:rows]
                 torch.mm(hc, w_t, out=cast)
-                buf.copy_(cast)
-            torch.softmax(buf, -1, out=buf)
+                torch.softmax(cast, -1, dtype=acc, out=buf)
             valid = tc.ne(ctx.ignore_index)
             gold = tc.masked_fill(~valid, 0).unsqueeze(-1)
             keep = valid.unsqueeze(-1).to(buf.dtype)
