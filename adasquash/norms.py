@@ -524,6 +524,49 @@ class _DyTCDForward(torch.autograd.Function):
             grad_beta = _sum_leading_dims(grad_out)
         return (grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None)
 
+class _QKSquashTanh(torch.autograd.Function):
+    """tanh(alpha * Q) / tanh(alpha * K), fused and recomputed rather than kept.
+
+    Same closed form as ``torch.tanh(q * alpha_q)`` (D4); the squashed product
+    overwrites its own scaled input instead of leaving it behind, and the
+    backward rebuilds the squashed output from the (already resident) raw Q/K
+    instead of pinning it. That keeps a full Q-sized and a full K-sized tensor
+    per layer out of the backward graph, which is the same trade the norm
+    kernels make with ``x_scaled`` -- recompute a cheap elementwise closed form,
+    never store what the derivative can rebuild.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, alpha_q, alpha_k):
+        qo = q.mul(alpha_q)
+        qo.tanh_()
+        ko = k.mul(alpha_k)
+        ko.tanh_()
+        ctx.save_for_backward(q, k, alpha_q, alpha_k)
+        return (qo, ko)
+
+    @staticmethod
+    def _side(g, x, alpha, need_x, need_alpha):
+        xo = x.mul(alpha)
+        xo.tanh_()
+        gx = torch.ops.aten.tanh_backward(g, xo)
+        grad_alpha = _reduce_products(gx, x) if need_alpha else None
+        return (gx.mul_(alpha) if need_x else None), grad_alpha
+
+    @staticmethod
+    def backward(ctx, grad_qo, grad_ko):
+        q, k, alpha_q, alpha_k = ctx.saved_tensors
+        need_q, need_k = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+        need_aq, need_ak = ctx.needs_input_grad[2], ctx.needs_input_grad[3]
+        grad_q = grad_k = grad_alpha_q = grad_alpha_k = None
+        if need_q or need_aq:
+            grad_q, grad_alpha_q = _QKSquashTanh._side(
+                grad_qo, q, alpha_q, need_q, need_aq)
+        if need_k or need_ak:
+            grad_k, grad_alpha_k = _QKSquashTanh._side(
+                grad_ko, k, alpha_k, need_k, need_ak)
+        return (grad_q, grad_k, grad_alpha_q, grad_alpha_k)
+
 class QKSquash(nn.Module):
 
     def __init__(self, alpha_q_init: float=1.0, alpha_k_init: float=1.0):
@@ -532,9 +575,5 @@ class QKSquash(nn.Module):
         self.alpha_k = nn.Parameter(torch.tensor(float(alpha_k_init)))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
-        q = q.mul(self.alpha_q)
-        k = k.mul(self.alpha_k)
-        q = torch.tanh(q)
-        k = torch.tanh(k)
-        return (q, k)
+        return _QKSquashTanh.apply(q, k, self.alpha_q, self.alpha_k)
 __all__ = ['NORM_REGISTRY', 'register_norm', 'build_norm', 'generalized_softsign', 'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'QKSquash']

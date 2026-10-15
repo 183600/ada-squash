@@ -142,30 +142,65 @@ class RMSNormHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _RMSNorm.apply(x, self.weight, self.eps)
 
-def _rope_half(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, record: bool) -> torch.Tensor:
+def _rope_halves(cos: torch.Tensor, sin: torch.Tensor, half: int):
+    if cos.shape[-1] == half:
+        return (cos, cos, sin, sin)
+    return (cos[..., :half], cos[..., half:], sin[..., :half], sin[..., half:])
+
+def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: torch.Tensor, hi_s: torch.Tensor, transpose: bool=False, out: Optional[torch.Tensor]=None):
+    """(x_lo*lo_c - x_hi*lo_s, x_hi*hi_c + x_lo*hi_s) written into one buffer.
+
+    ``out`` lets the caller own the single allocation. The step order is the
+    same op sequence as the plain-autograd composition, so the values are
+    bit-identical. ``transpose`` applies the transposed (inverse) rotation,
+    which is what a cotangent of this orthogonal map has to be rotated by.
+    """
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
     x_hi = x[..., half:]
-    if cos.shape[-1] == half:
-        lo_c = hi_c = cos
-        lo_s = hi_s = sin
-    else:
-        lo_c, hi_c = cos[..., :half], cos[..., half:]
-        lo_s, hi_s = sin[..., :half], sin[..., half:]
-    if record:
-        lo = x_lo.mul(lo_c)
-        lo.addcmul_(x_hi, lo_s, value=-1)
-        hi = x_hi.mul(hi_c)
-        hi.addcmul_(x_lo, hi_s, value=1)
-        return torch.cat((lo, hi), dim=-1)
-    out = torch.empty_like(x)
+    if out is None:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     out_lo = out[..., :half]
     out_hi = out[..., half:]
     torch.mul(x_lo, lo_c, out=out_lo)
-    torch.addcmul(out_lo, x_hi, lo_s, value=-1, out=out_lo)
     torch.mul(x_hi, hi_c, out=out_hi)
-    torch.addcmul(out_hi, x_lo, hi_s, value=1, out=out_hi)
+    lo_sign, hi_sign = (1.0, -1.0) if transpose else (-1.0, 1.0)
+    torch.addcmul(out_lo, x_hi, lo_s, value=lo_sign, out=out_lo)
+    torch.addcmul(out_hi, x_lo, hi_s, value=hi_sign, out=out_hi)
     return out
+
+class _ApplyRoPE(torch.autograd.Function):
+    """Rotary embedding for Q and K as one fused, closed-form-recompute kernel.
+
+    The rotation is orthogonal, so a cotangent is rotated by the transpose
+    (R^T = R(-theta)) and depends on nothing but itself and the (cached)
+    cos/sin tables: the un-rotated Q/K are not pinned by the backward, which
+    is what lets the half/whole split be folded into a single buffer instead of
+    three tensors per operand.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, cos, sin):
+        half = q.shape[-1] // 2
+        lo_c, hi_c, lo_s, hi_s = _rope_halves(cos, sin, half)
+        ctx.save_for_backward(cos, sin)
+        qo = _rope_into(q, lo_c, hi_c, lo_s, hi_s)
+        ko = _rope_into(k, lo_c, hi_c, lo_s, hi_s)
+        return (qo, ko)
+
+    @staticmethod
+    def backward(ctx, grad_qo, grad_ko):
+        cos, sin = ctx.saved_tensors
+        grad_q = grad_k = None
+        if ctx.needs_input_grad[0]:
+            half = grad_qo.shape[-1] // 2
+            lo_c, hi_c, lo_s, hi_s = _rope_halves(cos, sin, half)
+            grad_q = _rope_into(grad_qo, lo_c, hi_c, lo_s, hi_s, transpose=True)
+        if ctx.needs_input_grad[1]:
+            half = grad_ko.shape[-1] // 2
+            lo_c, hi_c, lo_s, hi_s = _rope_halves(cos, sin, half)
+            grad_k = _rope_into(grad_ko, lo_c, hi_c, lo_s, hi_s, transpose=True)
+        return (grad_q, grad_k, None, None)
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
     if cos is None or sin is None:
@@ -174,6 +209,5 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: O
     if cos.dtype != q.dtype:
         cos = cos.to(dtype=q.dtype)
         sin = sin.to(dtype=q.dtype)
-    record = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad)
-    return (_rope_half(q, cos, sin, record), _rope_half(k, cos, sin, record))
+    return _ApplyRoPE.apply(q, k, cos, sin)
 __all__ = ['CausalSelfAttention', 'RMSNormHead']
