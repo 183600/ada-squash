@@ -258,7 +258,7 @@ class _DyTCForward(torch.autograd.Function):
             out = phi.mul_(gamma)
         ctx.p_is_tensor = p_is_tensor
         ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
-        saved = [x_scaled, alpha, gamma, beta]
+        saved = [x, alpha, gamma, beta]
         if p_is_tensor:
             saved.append(p_raw)
         else:
@@ -269,7 +269,7 @@ class _DyTCForward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
-        x_scaled, alpha, gamma, beta = saved[:4]
+        x, alpha, gamma, beta = saved[:4]
         p_is_tensor = ctx.p_is_tensor
         p_raw = saved[4] if p_is_tensor else None
         if p_is_tensor:
@@ -280,9 +280,11 @@ class _DyTCForward(torch.autograd.Function):
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
         need_gamma_grad = ctx.needs_input_grad[3]
         need_phi = need_p_grad or need_gamma_grad
+        x_scaled = None
         phi = None
         a = None
         if need_softsign or need_phi:
+            x_scaled = x.mul(alpha)
             g, phi, a = _softsign_backward_pieces(x_scaled, p, need_p_grad, need_phi, need_softsign)
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
@@ -460,7 +462,7 @@ class _DyTCDForward(torch.autograd.Function):
             out = phi.mul_(gamma)
         ctx.p_is_tensor = p_is_tensor
         ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
-        saved = [x_scaled, alpha_0, k, delta, gamma, beta, alpha_c, exp_kdr.detach()]
+        saved = [x, alpha_0, k, delta, gamma, beta, alpha_c, exp_kdr.detach()]
         if p_is_tensor:
             saved.append(p_raw)
         else:
@@ -472,7 +474,7 @@ class _DyTCDForward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
-        x_scaled, alpha_0, k, delta, gamma, beta, alpha_c = saved[:7]
+        x, alpha_0, k, delta, gamma, beta, alpha_c = saved[:7]
         exp_kdr = saved[7]
         depth_ratio = ctx.depth_ratio
         p_is_tensor = ctx.p_is_tensor
@@ -485,9 +487,11 @@ class _DyTCDForward(torch.autograd.Function):
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[4]
         need_gamma_grad = ctx.needs_input_grad[5]
         need_phi = need_p_grad or need_gamma_grad
+        x_scaled = None
         phi = None
         a = None
         if need_softsign or need_phi:
+            x_scaled = x.mul(alpha_c)
             g, phi, a = _softsign_backward_pieces(x_scaled, p, need_p_grad, need_phi, need_softsign)
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None

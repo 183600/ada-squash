@@ -26,6 +26,7 @@ class MoELayer(nn.Module):
         self.experts_w1 = nn.Parameter(torch.empty(n_experts, dim, hidden))
         self.experts_w2 = nn.Parameter(torch.empty(n_experts, hidden, dim))
         self.experts_w3 = nn.Parameter(torch.empty(n_experts, dim, hidden))
+        self._flat_token_cache: dict = {}
         self.drop = nn.Dropout(dropout)
         for p in (self.experts_w1, self.experts_w2, self.experts_w3):
             nn.init.normal_(p, std=0.02)
@@ -45,7 +46,11 @@ class MoELayer(nn.Module):
         n_experts = self.n_experts
         k = self.top_k
         flat_expert = indices.reshape(-1)
-        flat_token = torch.arange(n_tokens, device=x.device).repeat_interleave(k)
+        key = (n_tokens, x.device)
+        flat_token = self._flat_token_cache.get(key)
+        if flat_token is None:
+            flat_token = torch.arange(n_tokens, device=x.device).repeat_interleave(k)
+            self._flat_token_cache[key] = flat_token
         flat_gate = scores.reshape(-1)
         order = flat_expert.argsort()
         token_of = flat_token[order]
@@ -116,6 +121,7 @@ class MoEGPT(nn.Module):
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
+        self.register_buffer('_pos_ids', torch.arange(cfg.max_seq_len), persistent=False)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -129,8 +135,7 @@ class MoEGPT(nn.Module):
     def forward(self, x, y=None, return_aux=False, return_logits=True):
         B, T = x.shape
         z = self.tok_emb(x)
-        pos = torch.arange(0, T, device=x.device).unsqueeze(0)
-        z.add_(self.pos_emb(pos))
+        z.add_(self.pos_emb(self._pos_ids[:T].unsqueeze(0)))
         z = self.drop(z)
         aux_total = 0.0
         tpe_list = []
