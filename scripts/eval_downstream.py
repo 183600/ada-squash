@@ -14,10 +14,9 @@ def _strip_compile_prefix(state):
     """Normalise a `torch.compile` state_dict down to the plain module's keys.
 
     `train_gpt2.py --compile` wraps the model, so the saved `state_dict()`
-    carries the `_orig_mod.` prefix that the wrapper introduces. Every
-    consumer here rebuilds the *unwrapped* module, so without this the
-    `load_state_dict` dies on the prefix and a compiled run's checkpoint
-    cannot be evaluated at all.
+    carries the `_orig_mod.` prefix that the wrapper introduces. The
+    consumers here rebuild the *unwrapped* module, so the prefix is
+    stripped back off before loading.
     """
     prefix = '_orig_mod.'
     if not any(k.startswith(prefix) for k in state):
