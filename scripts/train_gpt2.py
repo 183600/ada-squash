@@ -145,6 +145,15 @@ def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()
         setattr(args, name, ckpt_args[name])
     return changed
 
+def _is_no_decay_group(group) -> bool:
+    # build_optimizer routes every parameter with ndim < 2 (norm gains, biases,
+    # LayerScale and the scalar squashing parameters) to the no-decay group and
+    # only nondescript >= 2-D weights to the decay group. Re-deriving the split
+    # from the parameters themselves keeps it available after load_state_dict,
+    # which replaces each group's dict - weight_decay included - with the
+    # checkpoint's copy, so the groups can no longer be told apart by value.
+    return all(p.ndim < 2 for p in group['params'])
+
 def apply_explicit_optimizer_args(opt, sched, args, explicit: frozenset=frozenset()) -> None:
     if 'lr' in explicit and sched.base_lrs:
         base = float(args.lr)
@@ -155,7 +164,7 @@ def apply_explicit_optimizer_args(opt, sched, args, explicit: frozenset=frozense
                 group['lr'] = group['lr'] * ratio
     for group in opt.param_groups:
         if 'weight_decay' in explicit:
-            group['weight_decay'] = args.weight_decay
+            group['weight_decay'] = 0.0 if _is_no_decay_group(group) else args.weight_decay
         if 'beta1' in explicit or 'beta2' in explicit:
             b0, b1 = group['betas']
             group['betas'] = (args.beta1 if 'beta1' in explicit else b0, args.beta2 if 'beta2' in explicit else b1)
