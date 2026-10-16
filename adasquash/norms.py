@@ -64,8 +64,11 @@ def register_norm(name: str):
         return cls
     return _decorator
 
-def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
-    t = xs.abs()
+def _softsign_forward(xs: torch.Tensor, p, scale=None) -> torch.Tensor:
+    if scale is None:
+        t = xs.abs()
+    else:
+        t = xs.mul(scale).abs_()
     lo = t.clamp(max=1.0)
     u = t.clamp_(min=1.0).reciprocal_()
     u.mul_(lo)
@@ -74,10 +77,16 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
         s = u.log2_().mul_(p).exp2_().log1p_().mul_(-log2e_p).exp2_()
     else:
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
-    return lo.mul_(s).copysign_(xs)
+    out = lo.mul_(s).copysign_(xs)
+    if scale is not None:
+        out.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
+    return out
 
-def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True):
-    t = xs.abs()
+def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True, scale=None):
+    if scale is None:
+        t = xs.abs()
+    else:
+        t = xs.mul(scale).abs_()
     lo = t.clamp(max=1.0)
     r = t.clamp_(min=1.0).reciprocal_()
     a = None
@@ -98,7 +107,11 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
             s.log2_().mul_(p).exp2_().log1p_().mul_(-log2e_p).exp2_()
         else:
             s.pow_(p).add_(1.0).pow_(-1.0 / p)
-    phi = lo.mul_(s).copysign_(xs) if need_phi else None
+    phi = None
+    if need_phi:
+        phi = lo.mul_(s).copysign_(xs)
+        if scale is not None:
+            phi.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     if not need_g:
         return (None, phi, a)
     return (r.mul_(s), phi, a)
@@ -267,8 +280,7 @@ class _DyTCForward(torch.autograd.Function):
         if p_is_tensor:
             p_raw = p
             p = p.clamp(min=_MIN_P)
-        x_scaled = x.mul(alpha)
-        phi = _softsign_forward(x_scaled, p)
+        phi = _softsign_forward(x, p, alpha)
         if beta is not None:
             out = phi.mul_(gamma).add_(beta)
         else:
@@ -297,12 +309,10 @@ class _DyTCForward(torch.autograd.Function):
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
         need_gamma_grad = ctx.needs_input_grad[3]
         need_phi = need_p_grad or need_gamma_grad
-        x_scaled = None
         phi = None
         a = None
         if need_softsign or need_phi:
-            x_scaled = x.mul(alpha)
-            g, phi, a = _softsign_backward_pieces(x_scaled, p, need_p_grad, need_phi, need_softsign)
+            g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha)
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
         if need_phi:
@@ -471,8 +481,7 @@ class _DyTCDForward(torch.autograd.Function):
         exp_kdr = torch.exp(-k * depth_ratio)
         scale = alpha_0 * exp_kdr
         alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=_MIN_ALPHA)
-        x_scaled = x.mul(alpha_c)
-        phi = _softsign_forward(x_scaled, p)
+        phi = _softsign_forward(x, p, alpha_c)
         if beta is not None:
             out = phi.mul_(gamma).add_(beta)
         else:
@@ -504,12 +513,10 @@ class _DyTCDForward(torch.autograd.Function):
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[4]
         need_gamma_grad = ctx.needs_input_grad[5]
         need_phi = need_p_grad or need_gamma_grad
-        x_scaled = None
         phi = None
         a = None
         if need_softsign or need_phi:
-            x_scaled = x.mul(alpha_c)
-            g, phi, a = _softsign_backward_pieces(x_scaled, p, need_p_grad, need_phi, need_softsign)
+            g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha_c)
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
         if need_phi:
@@ -525,7 +532,7 @@ class _DyTCDForward(torch.autograd.Function):
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             need_alpha_chain = ctx.needs_input_grad[1] or ctx.needs_input_grad[2] or ctx.needs_input_grad[3]
             if need_alpha_chain:
-                grad_alpha_c = _reduce_products(grad_x_scaled, x_scaled).div_(alpha_c)
+                grad_alpha_c = _reduce_products(grad_x_scaled, x)
                 grad_alpha_c.mul_(alpha_c > _MIN_ALPHA)
                 need_delta = ctx.needs_input_grad[3]
                 if need_delta or ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
