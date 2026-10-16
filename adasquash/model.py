@@ -78,12 +78,13 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         total = None
         n = targets.numel()
         acc = _loss_acc_dtype(logits.dtype)
+        buf_rows = min(chunk_rows, n)
         if acc == logits.dtype:
             buf = None
             for start in range(0, n, chunk_rows):
                 end = min(start + chunk_rows, n)
                 if buf is None:
-                    buf = torch.empty(chunk_rows, logits.size(-1), dtype=acc, device=logits.device)
+                    buf = torch.empty(buf_rows, logits.size(-1), dtype=acc, device=logits.device)
                 log_probs = buf[:end - start]
                 torch.log_softmax(logits[start:end], dim=-1, out=log_probs)
                 chunk_loss = F.nll_loss(log_probs, targets[start:end], ignore_index=ignore_index, reduction='sum')
@@ -120,7 +121,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
 def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int=-100, chunk_rows: Optional[int]=None) -> torch.Tensor:
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(logits.size(-1))
-    if logits.size(0) <= chunk_rows:
+    if logits.size(0) == 0:
         return F.cross_entropy(logits, targets, ignore_index=ignore_index)
     return _ChunkedCrossEntropy.apply(logits, targets, int(ignore_index), int(chunk_rows))
 
@@ -150,14 +151,15 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         w_t = w.t()
         total = None
         n = targets.numel()
+        buf_rows = min(chunk_rows, n)
         logits = None
         cast_buf = None
         for start in range(0, n, chunk_rows):
             end = min(start + chunk_rows, n)
             rows = end - start
             if logits is None or logits.size(0) < rows:
-                logits = torch.empty(chunk_rows, w.shape[0], dtype=acc, device=h.device)
-                cast_buf = None if acc == dt else torch.empty(chunk_rows, w.shape[0], dtype=dt, device=h.device)
+                logits = torch.empty(buf_rows, w.shape[0], dtype=acc, device=h.device)
+                cast_buf = None if acc == dt else torch.empty(buf_rows, w.shape[0], dtype=dt, device=h.device)
             buf = logits[:rows]
             if cast_buf is None:
                 torch.mm(h[start:end], w_t, out=buf)
@@ -191,6 +193,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         w_t = w.t()
         first = True
         n = targets.numel()
+        buf_rows = min(chunk_rows, n)
         probs = None
         cast_buf = None
         for start in range(0, n, chunk_rows):
@@ -199,8 +202,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             hc = h[start:end]
             tc = targets[start:end]
             if probs is None or probs.size(0) < rows:
-                probs = torch.empty(chunk_rows, w.shape[0], dtype=acc, device=h.device)
-                cast_buf = None if acc == dt else torch.empty(chunk_rows, w.shape[0], dtype=dt, device=h.device)
+                probs = torch.empty(buf_rows, w.shape[0], dtype=acc, device=h.device)
+                cast_buf = None if acc == dt else torch.empty(buf_rows, w.shape[0], dtype=dt, device=h.device)
             buf = probs[:rows]
             if cast_buf is None:
                 torch.mm(hc, w_t, out=buf)
@@ -296,8 +299,9 @@ class _SwiGLU(torch.autograd.Function):
             x2 = x2.to(dt)
         a = F.linear(x2, w1)
         b = F.linear(x2, w3)
-        h = F.silu(a)
+        h = F.silu(a, inplace=True)
         h.mul_(b)
+        del b
         y = F.linear(h, w2)
         ctx.save_for_backward(x2, w1, w2, w3)
         ctx.compute_dtype = y.dtype
@@ -334,7 +338,7 @@ class _SwiGLU(torch.autograd.Function):
             del prod
         h = None
         if need_b or do_w2:
-            h = F.silu(a)
+            h = F.silu(a, inplace=True)
         if need_b:
             grad_b = grad_h.mul_(h)
         if do_x:
