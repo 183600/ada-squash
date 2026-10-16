@@ -59,20 +59,21 @@ class KurtosisMeter:
             if chunk.dtype != self.acc_dtype:
                 chunk = chunk.to(self.acc_dtype)
             count = chunk.numel()
-            x_mean_t = chunk.sum() / count
+            # `torch.linalg.vecdot` is on the autocast list: under the bf16
+            # training autocast it silently rounds the variance to bf16, so
+            # it must not be used for M2. `torch.var_mean` keeps fp32.
+            x_var_t, x_mean_t = torch.var_mean(chunk, unbiased=False)
             xc = chunk - x_mean_t
             xc2 = xc * xc
-            x_var_t = torch.linalg.vecdot(xc, xc) / count
             parts.append(torch.stack([x_mean_t, x_var_t, torch.linalg.vecdot(xc, xc2), torch.linalg.vecdot(xc2, xc2)]))
             counts.append(count)
         for stats, count in zip(torch.stack(parts).tolist(), counts):
             self._merge(*stats, count)
 
     def _bulk_update(self, x: torch.Tensor):
-        x_mean_t = x.sum() / x.numel()
+        x_var_t, x_mean_t = torch.var_mean(x, unbiased=False)
         xc = x - x_mean_t
         xc2 = xc * xc
-        x_var_t = torch.linalg.vecdot(xc, xc) / x.numel()
         x_m3_t = torch.linalg.vecdot(xc, xc2)
         x_m4_t = torch.linalg.vecdot(xc2, xc2)
         x_mean, x_var, x_m3, x_m4 = torch.stack([x_mean_t, x_var_t, x_m3_t, x_m4_t]).tolist()
