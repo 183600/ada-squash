@@ -193,6 +193,21 @@ def document_hash(text: str) -> bytes:
     return hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).digest()
 
 
+def _dedup_shard_owner(example, n_workers: int) -> int:
+    """Which worker owns a document when dedup has to be global.
+
+    Worker-local `seen` sets cannot see duplicates that the round-robin
+    document shard handed to another worker, so with several loader workers
+    identical documents are routed by their cleaned-text hash instead: every
+    copy lands in the same worker and the per-worker set then drops all but
+    the first occurrence, matching the single-process cleaner the audit uses.
+    """
+    raw = example.get("text") if isinstance(example, dict) else None
+    if not isinstance(raw, str):
+        return 0
+    return int.from_bytes(document_hash(raw.strip()), "little") % n_workers
+
+
 def load_hash_file(path) -> set:
     """Read a document-hash ledger written by `audit_data.py`.
 
@@ -354,9 +369,13 @@ class PackedStream(IterableDataset):
                 buf.extend(ids)
                 buf.append(self.tok.eos_token_id)
 
+        shard_by_hash = self.cleaner.dedup and n_workers > 1
         i = 0
         for ex in self.ds:
-            if i % n_workers != worker_id:
+            if shard_by_hash:
+                if _dedup_shard_owner(ex, n_workers) != worker_id:
+                    continue
+            elif i % n_workers != worker_id:
                 i += 1
                 continue
             i += 1
