@@ -161,10 +161,9 @@ def load_model_state_dict(model, state_dict) -> None:
 def _is_no_decay_group(group) -> bool:
     # build_optimizer routes every parameter with ndim < 2 (norm gains, biases,
     # LayerScale and the scalar squashing parameters) to the no-decay group and
-    # only nondescript >= 2-D weights to the decay group. Re-deriving the split
-    # from the parameters themselves keeps it available after load_state_dict,
-    # which replaces each group's dict - weight_decay included - with the
-    # checkpoint's copy, so the groups can no longer be told apart by value.
+    # every >= 2-D weight to the decay group. Re-deriving the split from the
+    # parameters keeps it correct after load_state_dict replaces each group's
+    # dict (weight_decay included) with the checkpoint's copy.
     return all(p.ndim < 2 for p in group['params'])
 
 def apply_explicit_optimizer_args(opt, sched, args, explicit: frozenset=frozenset()) -> None:

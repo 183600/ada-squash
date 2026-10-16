@@ -59,9 +59,9 @@ class KurtosisMeter:
             if chunk.dtype != self.acc_dtype:
                 chunk = chunk.to(self.acc_dtype)
             count = chunk.numel()
-            # `torch.linalg.vecdot` is on the autocast list: under the bf16
-            # training autocast it silently rounds the variance to bf16, so
-            # it must not be used for M2. `torch.var_mean` keeps fp32.
+            # `torch.var_mean` accumulates the variance in fp32; the autocast
+            # list casts `torch.linalg.vecdot` to the active low-precision
+            # dtype.
             x_var_t, x_mean_t = torch.var_mean(chunk, unbiased=False)
             xc = chunk - x_mean_t
             xc2 = xc * xc

@@ -46,7 +46,7 @@ DEFAULT_DATA_OPTIONS = {
     "test_frac": 0.005,          # sealed until the one-shot final evaluation
     "num_documents": None,       # override when the dataset reports no size
     "dedup": True,               # drop exact duplicate documents per split
-    "dedup_max": 1_000_000,      # bounded memory for the duplicate hash set
+    "dedup_max": 1_000_000,      # cap on the duplicate hash set size
     "min_doc_chars": 0,          # drop degenerate (shorter than this) docs
     "max_doc_chars": 0,          # length-outlier cap, 0 = no cap
     "shuffle_buffer": 0,         # train-split batch shuffle window, 0 = off
@@ -259,9 +259,9 @@ class PackedStream(IterableDataset):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         n_workers = worker_info.num_workers if worker_info is not None else 1
-        # Duplicate removal is per epoch: a document repeated inside one pass
-        # is dropped, while a legitimate second epoch over the same corpus is
-        # not silently emptied by the first pass's hash set.
+        # Duplicate removal is per epoch: documents repeated inside one pass
+        # are dropped, while a later epoch over the same corpus still sees its
+        # own documents.
         self.cleaner.seen = set()
         return self._shuffle(self._pack(worker_id, n_workers), worker_id)
 
