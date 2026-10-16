@@ -3,6 +3,12 @@
 # without one. The two *_baseline rows are the simple statistic-based
 # references every DyT-family row is scored against (see the
 # `baseline_comparison` block the runner writes next to all_summaries.json).
+#
+# Every row runs under the identical optimizer/schedule/data recipe above;
+# rows may only set architectural / initialization knobs and the loader
+# rejects any row that tries to change lr, weight_decay, batch_size, ...
+# Each row is replicated over `seeds` (>= 3) and reported as mean +/- std
+# across seeds, so a claim is not built on a single lucky run.
 model: gpt2-124m
 
 batch_size: 8
@@ -10,7 +16,7 @@ seq_len: 512
 max_steps: 1000
 lr: 6.0e-4
 weight_decay: 0.1
-seed: 42
+seeds: [42, 43, 44]
 
 log_every: 50
 stats_every: 200
@@ -54,6 +60,16 @@ ablations:
       variants: the two mechanisms interact positively.
 
   # --- Axis isolation: depth conditioning ---
+  - name: dytcd_k0_no_depth_schedule
+    norm: dytcd
+    k_init: 0.0
+    learnable_k: false
+    hypothesis: >
+      Leave-one-out for the main proposal's depth axis: removing the depth
+      schedule from DyT-CD (k pinned at 0 and frozen; per-channel axis,
+      softsign and LayerScale kept) erases its advantage over the
+      single-axis and baseline rows, which would attribute the full model's
+      gain to depth decay.
   - name: dytd_k0_no_depth_schedule
     norm: dytd
     k_init: 0.0

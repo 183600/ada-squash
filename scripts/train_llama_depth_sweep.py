@@ -1,5 +1,15 @@
 from __future__ import annotations
+"""Compute-matched depth sweep with per-cell seed replication.
+
+Every (depth, norm) cell runs the *identical* recipe (same data slices, same
+optimizer/schedule, same token budget); depth-only comparisons must not mix in
+different training recipes. Each cell is replicated over `--seeds` (>= 3
+recommended) and the launcher aggregates `results.best_val_loss` into
+`Mean +/- Std` across those independent runs, because a single run cannot
+separate a depth/norm effect from run-to-run noise.
+"""
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -7,6 +17,7 @@ import sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from adasquash.metrics import mean_std_stderr
 from adasquash.repro import collect_run_metadata, save_run_manifest
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
@@ -36,8 +47,39 @@ def shape_for_depth(depth: int, base_dim: int, base_heads: int):
     dim = heads * base_head_dim
     return (dim, heads)
 
-def launch_one(args, depth: int, norm: str, output_dir: Path):
-    cmd = [sys.executable, str(Path(__file__).parent / 'train_gpt2.py'), '--model', args.model, '--norm', norm, '--dataset', args.dataset, '--dataset-config', args.dataset_config, '--tokenizer', args.tokenizer, '--seq-len', str(args.seq_len), '--batch-size', str(args.batch_size), '--grad-accum', str(args.grad_accum), '--max-steps', str(args.max_steps), '--lr', str(args.lr), '--min-lr-ratio', str(args.min_lr_ratio), '--warmup', str(args.warmup), '--weight-decay', str(args.weight_decay), '--beta1', str(args.beta1), '--beta2', str(args.beta2), '--grad-clip', str(args.grad_clip), '--seed', str(args.seed), '--alpha-0', str(args.alpha_0), '--alpha-init', str(args.alpha_init), '--k-init', str(args.k_init), '--p-init', str(args.p_init), '--qk-alpha-init', str(args.qk_alpha_init), '--output-dir', str(output_dir), '--log-every', str(args.log_every), '--stats-every', str(args.stats_every), '--save-every', str(args.save_every)]
+def seed_dir(cell_dir: Path, seed: int, multi: bool) -> Path:
+    """Per-seed run directory: `seed{N}/` once replicated, the cell dir itself
+    for the legacy single-seed layout."""
+    return cell_dir / f'seed{seed}' if multi else cell_dir
+
+def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
+    """Pool each seed's `results.best_val_loss` into a Mean +/- Std record."""
+    per_seed = []
+    for seed in seeds:
+        path = seed_dir(cell_dir, seed, multi) / 'run_manifest.json'
+        best = None
+        try:
+            manifest = json.loads(path.read_text())
+            if isinstance(manifest, dict):
+                best = (manifest.get('results') or {}).get('best_val_loss')
+        except (OSError, json.JSONDecodeError):
+            pass
+        per_seed.append({'seed': int(seed), 'best_val_loss': best})
+    vals = [p['best_val_loss'] for p in per_seed if isinstance(p['best_val_loss'], (int, float))]
+    stats = mean_std_stderr(vals)
+    return {
+        'cell': cell_dir.name,
+        'seeds': [int(s) for s in seeds],
+        'per_seed': per_seed,
+        'n_seeds': len(vals),
+        'best_val_loss': None if stats is None else stats['mean'],
+        'best_val_loss_std': None if stats is None or len(vals) < 2 else stats['std'],
+        'best_val_loss_std_basis': 'seeds' if len(vals) >= 2 else 'single_run',
+        'aggregation': 'Mean +/- Std across seeds; each seed is an independent run of the identical recipe',
+    }
+
+def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int):
+    cmd = [sys.executable, str(Path(__file__).parent / 'train_gpt2.py'), '--model', args.model, '--norm', norm, '--dataset', args.dataset, '--dataset-config', args.dataset_config, '--tokenizer', args.tokenizer, '--seq-len', str(args.seq_len), '--batch-size', str(args.batch_size), '--grad-accum', str(args.grad_accum), '--max-steps', str(args.max_steps), '--lr', str(args.lr), '--min-lr-ratio', str(args.min_lr_ratio), '--warmup', str(args.warmup), '--weight-decay', str(args.weight_decay), '--beta1', str(args.beta1), '--beta2', str(args.beta2), '--grad-clip', str(args.grad_clip), '--seed', str(seed), '--alpha-0', str(args.alpha_0), '--alpha-init', str(args.alpha_init), '--k-init', str(args.k_init), '--p-init', str(args.p_init), '--qk-alpha-init', str(args.qk_alpha_init), '--output-dir', str(output_dir), '--log-every', str(args.log_every), '--stats-every', str(args.stats_every), '--save-every', str(args.save_every)]
     if args.qk_norm:
         cmd += ['--qk-norm', args.qk_norm]
     if args.layerscale_init is not None:
@@ -129,7 +171,8 @@ def main():
     p.add_argument('--beta1', type=float, default=0.9)
     p.add_argument('--beta2', type=float, default=0.95)
     p.add_argument('--grad-clip', type=float, default=1.0)
-    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given')
+    p.add_argument('--seeds', nargs='+', type=int, default=[42], help='each (depth, norm) cell is replicated over these seeds and reported as Mean +/- Std (>= 3 recommended)')
     p.add_argument('--qk-norm', default=None, choices=[None, 'qknorm', 'dytqk'])
     p.add_argument('--layerscale-init', type=float, default=None)
     p.add_argument('--no-bf16', action='store_true')
@@ -157,31 +200,56 @@ def main():
     p.add_argument('--sequential', action='store_true', help='run configs sequentially')
     apply_config_to_parser(p, known.config, _SWEEP_CONFIG_ALIASES)
     args = p.parse_args()
+    seeds = [args.seed] if args.seed is not None else list(args.seeds or [42])
+    if len(seeds) < 3:
+        print(f'[sweep][warn] {len(seeds)} seed(s): a single depth/norm cell cannot be '
+              f'separated from run-to-run noise; use >= 3 seeds before interpreting deltas')
+    multi = len(seeds) > 1
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
-    sweep_manifest = collect_run_metadata(seed=args.seed)
+    sweep_manifest = collect_run_metadata(seed=seeds[0])
     sweep_manifest['hyperparameters'] = vars(args)
+    sweep_manifest['seeds'] = seeds
     sweep_manifest['grid'] = {
         'depths': list(args.depths),
         'norms': list(args.norms),
-        'runs': [f'd{depth}-{norm}' for depth in args.depths for norm in args.norms],
+        'seeds': seeds,
+        'runs': [f'd{depth}-{norm}-s{seed}'
+                 for depth in args.depths for norm in args.norms for seed in seeds],
     }
     save_run_manifest(base / 'run_manifest.json', sweep_manifest)
     procs = []
+    cells = []
     for depth in args.depths:
         for norm in args.norms:
-            out_dir = base / f'd{depth}-{norm}'
-            out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / 'depth.txt').write_text(str(depth))
-            proc = launch_one(args, depth, norm, out_dir)
-            if args.sequential:
-                rc = proc.wait()
-                print(f'[sweep] finished d{depth}-{norm} rc={rc}')
-            else:
-                procs.append(proc)
+            cell_dir = base / f'd{depth}-{norm}'
+            cell_dir.mkdir(parents=True, exist_ok=True)
+            for seed in seeds:
+                out_dir = seed_dir(cell_dir, seed, multi)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / 'depth.txt').write_text(str(depth))
+                proc = launch_one(args, depth, norm, out_dir, seed)
+                if args.sequential:
+                    rc = proc.wait()
+                    print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
+                else:
+                    procs.append(proc)
+            cells.append((depth, norm, cell_dir))
     if not args.sequential:
         for proc in procs:
             proc.wait()
+    for depth, norm, cell_dir in cells:
+        agg = aggregate_sweep_cell(cell_dir, seeds, multi)
+        with open(cell_dir / 'aggregate.json', 'w') as f:
+            json.dump(agg, f, indent=2)
+        mean = agg['best_val_loss']
+        std = agg.get('best_val_loss_std')
+        if mean is not None:
+            std_str = '' if std is None else f' +/- {std:.4f}'
+            print(f"[sweep] d{depth}-{norm}: best_val_loss={mean:.4f}{std_str} "
+                  f"over {agg['n_seeds']} seed(s)")
+        else:
+            print(f"[sweep] d{depth}-{norm}: no usable best_val_loss in the run manifests")
     print('[sweep] done')
 if __name__ == '__main__':
     main()

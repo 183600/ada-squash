@@ -1,4 +1,24 @@
 from __future__ import annotations
+"""Controlled ablation matrix for the DyT++ / AdaSquash proposal.
+
+Comparison protocol (what the runner guarantees, and checks)
+------------------------------------------------------------
+* **Controlled variables.** Every row runs under one optimizer (AdamW,
+  betas 0.9/0.95), one constant learning rate, one step count, one synthetic
+  data protocol and one seed set. Rows may only set architectural /
+  initialization knobs; a row that tries to set `lr`, `weight_decay`,
+  `batch_size`, `max_steps`, `dropout`, ... is rejected by the loader, because
+  a gain obtained by switching the optimizer is not a gain of the module.
+* **Complete ablation coverage.** `validate_matrix` checks the leave-one-out
+  set for the main proposal (`LOO_SPEC`): Full, Full-minus-per-channel,
+  Full-minus-depth-decay and Full-minus-LayerScale must all be present and
+  differ from Full in exactly the declared knob(s). A mechanism that is never
+  isolated cannot be claimed to help.
+* **Statistical reliability.** Every row is replicated over >= 3 seeds by
+  default and reported as mean +/- std across seeds; the row-vs-baseline
+  significance test runs on the paired per-seed means when both rows share
+  >= 2 seeds (falling back to the shared held-out batches otherwise).
+"""
 import argparse
 import dataclasses
 import json
@@ -14,7 +34,7 @@ from adasquash.metrics import mean_std_stderr, paired_z_one_sided, welch_z_one_s
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
-ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0)}
+ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0)}
 # Every row must state *why* it is run (the scientific hypothesis it tests),
 # not just what it configures. `load_ablations_from_config` enforces this for
 # YAML rows; these are the hypotheses of the built-in fallback rows.
@@ -24,6 +44,7 @@ ABLATION_HYPOTHESES = {
     'dyt_no_perchannel': 'Original DyT (one scalar alpha, tanh) matches or beats the LayerNorm/RMSNorm references at this scale, reproducing the paper claim under our protocol.',
     'dytc_perchannel': 'Adding the per-channel axis (p fixed at 2, jitter off, so only the axis changes) improves held-out loss over scalar DyT.',
     'dytcd_full': 'Combining the per-channel and depth axes beats both single-axis variants: the two mechanisms interact positively.',
+    'dytcd_k0_no_depth_schedule': 'Leave-one-out for the depth axis of the main proposal: with k pinned to 0 and frozen, DyT-CD keeps its per-channel factor, softsign and LayerScale, so any loss of the full model advantage is attributable to depth decay.',
     'dytd_k0_no_depth_schedule': 'Depth decay is the source of DyT-D gain: with k pinned to 0 and frozen, dytd_full advantage should vanish.',
     'dytd_full': 'Depth-conditioned alpha (+ LayerScale) beats scalar DyT here: shallow strong squashing + deep relaxed response helps this depth.',
     'dytcd_no_ls': 'The LayerScale residual gate contributes to DyT-CD; removing it (use_layerscale off) hurts held-out loss.',
@@ -41,6 +62,47 @@ ABLATION_HYPOTHESES = {
 _MODEL_BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
 _ABLATION_METADATA_KEYS = ('hypothesis',)
 
+# Knobs that the matrix runner holds fixed by construction: every row gets the
+# same optimizer (AdamW, fixed betas), learning rate, weight decay, step count,
+# batch size, sequence length, data generator and seed set. A row that sets one
+# of these is not an ablation of the proposed module - it is a different
+# optimization protocol whose gain cannot be attributed to the module - so the
+# loader rejects it instead of silently running it.
+_FORBIDDEN_ROW_KEYS = frozenset({
+    'lr', 'learning_rate', 'weight_decay', 'beta1', 'beta2', 'betas',
+    'optimizer', 'scheduler', 'schedule', 'warmup', 'min_lr_ratio',
+    'max_steps', 'epochs', 'batch_size', 'grad_accum', 'seq_len',
+    'grad_clip', 'dropout', 'bf16', 'seed', 'seeds', 'dataset',
+    'dataset_config', 'tokenizer', 'augmentation',
+})
+
+# Default number of random seeds for the matrix. One seed cannot separate a
+# method effect from run-to-run noise, so the key experiment is replicated
+# over >= 3 seeds and reported as mean +/- std across seeds (see
+# `aggregate_seed_summaries` and `baseline_comparison`).
+DEFAULT_SEEDS = (42, 43, 44)
+
+# Leave-one-out (LOO) coverage of the main proposal DyT-CD. Each entry names
+# one claimed mechanism and the matrix row that removes exactly it. The claim
+# "mechanism X helps" is supportable only when the Full model and its X-free
+# reference ran on the identical protocol; `validate_matrix` refuses to run
+# the matrix when a mechanism is never isolated.
+LOO_SPEC = {
+    'dytcd_full': {
+        'per_channel_softsign': {'row': 'dytd_full', 'diff': ('norm_name',)},
+        'depth_decay': {'row': 'dytcd_k0_no_depth_schedule',
+                        'diff': ('k_init', 'learnable_k')},
+        'layerscale_residual': {'row': 'dytcd_no_ls',
+                                'diff': ('use_layerscale',)},
+    },
+}
+
+def _effective_cfg(model_name: str, cfg_kwargs: dict) -> dict:
+    """The full GPTConfig a matrix row builds, as a plain dict."""
+    with torch.device('meta'):
+        cfg = _MODEL_BUILDERS[model_name](**cfg_kwargs).cfg
+    return dataclasses.asdict(cfg)
+
 def effective_config_key(model_name: str, cfg_kwargs: dict) -> str:
     """Canonical identity of the model a matrix row trains.
 
@@ -50,9 +112,69 @@ def effective_config_key(model_name: str, cfg_kwargs: dict) -> str:
     bit-identical runs. The runner trains the first and reuses its summary
     for the rest.
     """
-    with torch.device('meta'):
-        cfg = _MODEL_BUILDERS[model_name](**cfg_kwargs).cfg
-    return json.dumps(dataclasses.asdict(cfg), sort_keys=True)
+    return json.dumps(_effective_cfg(model_name, cfg_kwargs), sort_keys=True)
+
+def _check_row_keys(name: str, cfg: dict, source: str) -> None:
+    bad = sorted(set(cfg) & _FORBIDDEN_ROW_KEYS)
+    if bad:
+        raise ValueError(
+            f"{source}: ablation row '{name}' sets optimizer/schedule/data "
+            f"knob(s) {bad}; those are held fixed for every row so a "
+            f"comparison isolates the module under test instead of a "
+            f"different training recipe"
+        )
+
+def check_leave_one_out(rows: dict, model_name: str, spec: dict | None=None) -> dict:
+    """Verify every claimed mechanism is isolated by a Full-minus-X row.
+
+    For each `(full, mechanism) -> {row, diff}` entry the reference row must
+    exist and its *effective* model config must differ from the Full config in
+    exactly the declared fields - no more (a second change would confound the
+    contrast) and no fewer (a no-op row proves nothing). Raises ValueError
+    listing every violation so one broken claim cannot hide behind another.
+    """
+    spec = LOO_SPEC if spec is None else spec
+    problems: list[str] = []
+    report: dict = {}
+    for full_name, removals in spec.items():
+        if full_name not in rows:
+            problems.append(f"leave-one-out full row '{full_name}' is missing")
+            continue
+        full_cfg = _effective_cfg(model_name, rows[full_name])
+        report[full_name] = {}
+        for mechanism, info in removals.items():
+            ref_name = info['row']
+            declared = set(info['diff'])
+            if ref_name not in rows:
+                problems.append(
+                    f"'{mechanism}' has no Full-minus-X reference: row "
+                    f"'{ref_name}' is missing")
+                continue
+            ref_cfg = _effective_cfg(model_name, rows[ref_name])
+            actual = {k for k in full_cfg if full_cfg[k] != ref_cfg[k]}
+            actual |= {k for k in ref_cfg if k not in full_cfg}
+            if actual != declared:
+                problems.append(
+                    f"'{mechanism}': {ref_name} vs {full_name} differ in "
+                    f"{sorted(actual)}, expected exactly {sorted(declared)}")
+                continue
+            report[full_name][mechanism] = ref_name
+    if problems:
+        raise ValueError('leave-one-out coverage is incomplete: ' + '; '.join(problems))
+    return report
+
+def validate_matrix(rows: dict, hypotheses: dict, model_name: str) -> dict:
+    """Every static check the matrix must pass before any training starts."""
+    missing = []
+    for name, cfg in rows.items():
+        _check_row_keys(name, cfg, 'matrix')
+        if not str(hypotheses.get(name) or '').strip():
+            missing.append(name)
+    if missing:
+        raise ValueError(
+            f"ablation rows without a stated scientific hypothesis: {sorted(missing)}")
+    return {'rows': sorted(rows),
+            'leave_one_out': check_leave_one_out(rows, model_name)}
 
 def install_outlier_channel(model, scale: float=25.0) -> int:
     with torch.no_grad():
@@ -82,6 +204,7 @@ def load_ablations_from_config(path: str, include_metadata: bool = False) -> dic
         metadata = {key: row.pop(key) for key in _ABLATION_METADATA_KEYS if key in row}
         if 'norm' in row:
             row['norm_name'] = row.pop('norm')
+        _check_row_keys(name, row, path)
         if name in out:
             raise ValueError(f"{path}: duplicate ablation name '{name}' - each row must be unique or an intended comparison is silently lost")
         if include_metadata:
@@ -98,18 +221,23 @@ def load_ablations_from_config(path: str, include_metadata: bool = False) -> dic
         )
     return out
 
-def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: dict | None=None, hypothesis: str | None=None):
-    print(f'\n[abl] {name}: {cfg_kwargs}')
+def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: dict | None=None, hypothesis: str | None=None, seed: int | None=None):
+    if seed is None:
+        seed = getattr(args, 'seed', None)
+    if seed is None:
+        seed = (getattr(args, 'seeds', None) or DEFAULT_SEEDS)[0]
+    seed = int(seed)
+    print(f'\n[abl] {name} (seed={seed}): {cfg_kwargs}')
     print(f'  [hypothesis] {hypothesis or "(none stated - this row cannot be interpreted as a test)"}')
     output_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    set_all_seeds(args.seed)
+    set_all_seeds(seed)
     model = _MODEL_BUILDERS[args.model](**cfg_kwargs)
-    model.reset_parameters(args.seed)
+    model.reset_parameters(seed)
     model.to(device)
     n_params = count_parameters(model)
     opt = build_optimizer(model, args.lr, args.weight_decay, 0.9, 0.95)
-    rng = torch.Generator(device=device).manual_seed(args.seed)
+    rng = torch.Generator(device=device).manual_seed(seed)
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter()
     outlier_id = install_outlier_channel(model)
@@ -140,7 +268,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     # optimizer has never seen (seed + 1), evaluated with no gradients. Model
     # comparisons must use this - the training loss above is fitted data.
     n_val_batches = max(1, getattr(args, 'val_batches', 20))
-    val_rng = torch.Generator(device=device).manual_seed(args.seed + 1)
+    val_rng = torch.Generator(device=device).manual_seed(seed + 1)
     model.eval()
     val_losses = []
     with torch.no_grad():
@@ -151,19 +279,109 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     # `val_loss` is a sample mean over held-out batches; keep the per-batch
     # losses (and their standard error) so comparisons can be *paired* across
     # rows (every row evaluates the identical batches, generated from the
-    # fixed `args.seed + 1` generator) and report significance instead of a
+    # fixed `seed + 1` generator) and report significance instead of a
     # bare point estimate.
     val_stats = mean_std_stderr(val_losses)
     val_loss = val_stats['mean']
     stats = act_stats.summary()
-    summary = {'name': name, 'hypothesis': hypothesis, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'val_losses': val_losses, 'val_loss_std': val_stats['std'], 'val_loss_stderr': val_stats['stderr'], 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'elapsed_s': time.time() - t0}
+    # The knobs every matrix row shares. Recorded per summary so a reported
+    # comparison can be audited for controlled variables after the fact.
+    controls = {
+        'optimizer': {'name': 'AdamW', 'betas': [0.9, 0.95], 'lr': args.lr,
+                      'weight_decay': args.weight_decay,
+                      'grad_clip': 1.0},
+        'schedule': {'type': 'constant', 'lr': args.lr},
+        'data': {'generator': 'markov_batch', 'batch_size': args.batch_size,
+                 'seq_len': args.seq_len, 'outlier_id': outlier_id,
+                 'val_seed_offset': 1},
+        'train_steps': args.max_steps,
+        'seed': seed,
+    }
+    summary = {'name': name, 'hypothesis': hypothesis, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'seed': seed, 'seeds': [seed], 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'val_losses': val_losses, 'val_loss_std': val_stats['std'], 'val_loss_stderr': val_stats['stderr'], 'val_loss_std_basis': 'val_batches', 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'controls': controls, 'elapsed_s': time.time() - t0}
     if run_metadata is None:
-        run_metadata = collect_run_metadata(seed=args.seed)
+        run_metadata = collect_run_metadata(seed=seed)
     summary['run_metadata'] = run_metadata
     with open(output_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} max_abs_pre_norm={summary['max_abs_pre_norm']}")
     return summary
+
+def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None=None, hypothesis: str | None=None) -> dict:
+    """Pool per-seed runs into one Mean +/- Std summary.
+
+    The seed is the unit of replication: two runs with different seeds are
+    independent samples of the same protocol, while the held-out batches
+    inside one run are not (they all come from one generator). The pooled
+    `val_loss` is therefore the mean of the per-seed means, `val_loss_std` is
+    the sample std across seeds whenever there is more than one seed (with
+    `val_loss_std_basis` recording which variability it describes), and the
+    per-batch losses are kept tagged by seed so the comparison can pair rows
+    seed by seed.
+    """
+    per_seed = []
+    for s in summaries:
+        seed = s.get('seed')
+        if seed is None and isinstance(s.get('seeds'), list) and s['seeds']:
+            seed = s['seeds'][0]
+        per_seed.append({
+            'seed': seed,
+            'val_loss': s.get('val_loss'),
+            'val_losses': s.get('val_losses'),
+            'final_loss': s.get('final_loss'),
+            'mean_last_100_loss': s.get('mean_last_100_loss'),
+            'n_loss_spikes': s.get('n_loss_spikes'),
+            'elapsed_s': s.get('elapsed_s'),
+        })
+    seed_losses = [p['val_loss'] for p in per_seed if isinstance(p['val_loss'], (int, float))]
+    stats = mean_std_stderr(seed_losses) or {'mean': None, 'std': None, 'stderr': None, 'n': 0}
+    multi = len(seed_losses) >= 2
+
+    def _mean_of(key):
+        vals = [p[key] for p in per_seed if isinstance(p.get(key), (int, float))]
+        return sum(vals) / len(vals) if vals else None
+
+    agg = dict(summaries[0]) if summaries else {}
+    pooled: list = []
+    by_seed: dict = {}
+    for p in per_seed:
+        if isinstance(p.get('val_losses'), list):
+            pooled.extend(p['val_losses'])
+            by_seed[str(p['seed'])] = p['val_losses']
+    agg.update({
+        'name': name,
+        'cfg': cfg_kwargs if cfg_kwargs is not None else agg.get('cfg'),
+        'hypothesis': hypothesis if hypothesis is not None else agg.get('hypothesis'),
+        'seeds': [p['seed'] for p in per_seed],
+        'n_seeds': len(seed_losses),
+        'per_seed': per_seed,
+        'val_loss': stats['mean'],
+        'val_loss_seed_std': stats['std'] if multi else None,
+        'val_loss_seed_stderr': stats['stderr'] if multi else None,
+        'val_loss_std': stats['std'] if multi else agg.get('val_loss_std'),
+        'val_loss_stderr': stats['stderr'] if multi else agg.get('val_loss_stderr'),
+        'val_loss_std_basis': 'seeds' if multi else 'val_batches',
+        'val_losses': pooled,
+        'val_losses_by_seed': by_seed,
+        'final_loss': _mean_of('final_loss'),
+        'mean_last_100_loss': _mean_of('mean_last_100_loss'),
+        'n_loss_spikes': sum(p['n_loss_spikes'] or 0 for p in per_seed
+                             if isinstance(p.get('n_loss_spikes'), (int, float))),
+        'elapsed_s': sum(p['elapsed_s'] or 0.0 for p in per_seed
+                         if isinstance(p.get('elapsed_s'), (int, float))),
+    })
+    return agg
+
+def _load_summary(path: Path):
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+def _write_summary(path: Path, summary: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(summary, f, indent=2)
 
 def merge_summaries(previous: list, fresh: list) -> list:
     merged: dict[str, dict] = {}
@@ -176,18 +394,36 @@ def merge_summaries(previous: list, fresh: list) -> list:
         merged[row['name']] = row
     return [merged[name] for name in order if name in merged]
 
+def _seed_means(row) -> dict:
+    """{seed: val_loss} of a multi-seed aggregate; {} for single-seed rows."""
+    per = row.get('per_seed')
+    out = {}
+    if isinstance(per, list):
+        for item in per:
+            if not isinstance(item, dict) or item.get('seed') is None:
+                continue
+            if isinstance(item.get('val_loss'), (int, float)):
+                out[int(item['seed'])] = float(item['val_loss'])
+    return out
+
+def _row_std(row):
+    """Across-seed std when replicated, within-run batch std otherwise."""
+    if row.get('n_seeds', 1) >= 2:
+        return row.get('val_loss_seed_std')
+    return row.get('val_loss_std')
+
 def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alpha: float=0.05) -> dict | None:
     """Every row's held-out val_loss against the best reference baseline.
 
     The reference is the *best* (lowest val_loss) row among `baseline_names`,
     so a variant is only credited with a win if it beats the strongest simple
-    baseline on the identical protocol. Because every row evaluates the same
-    held-out batches (the runner seeds the validation generator with
-    `args.seed + 1`), per-batch losses are paired and the one-sided paired
-    z-test is used; the unpaired Welch test is the fallback when the batch
-    counts differ. `margin` is the smallest loss improvement treated as
-    meaningful; `beats_reference_significantly` additionally requires
-    p < alpha. Returns None when no baseline row has a usable val_loss.
+    baseline on the identical protocol. Significance uses the paired per-seed
+    means whenever both rows share >= 2 seeds (seeds are the independent
+    replications), and falls back to the shared held-out batches of a single
+    run (paired z when the batch counts match, otherwise Welch) when they do
+    not. `margin` is the smallest loss improvement treated as meaningful;
+    `beats_reference_significantly` additionally requires p < alpha. Returns
+    None when no baseline row has a usable val_loss.
     """
     baseline_names = set(baseline_names)
     usable = [r for r in summaries
@@ -196,13 +432,20 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     if not baselines:
         return None
     reference = min(baselines, key=lambda r: r['val_loss'])
+    ref_seeds = _seed_means(reference)
     out = {
         'reference': reference['name'],
         'reference_val_loss': reference['val_loss'],
-        'reference_val_loss_stderr': reference.get('val_loss_stderr'),
+        'reference_val_loss_std': _row_std(reference),
+        'reference_val_loss_stderr': reference.get('val_loss_seed_stderr', reference.get('val_loss_stderr')),
+        'reference_n_seeds': reference.get('n_seeds', 1),
+        'reference_seeds': sorted(ref_seeds),
         'baseline_rows': {r['name']: r['val_loss'] for r in baselines},
         'margin': margin,
         'alpha': alpha,
+        'protocol': ('seeds are the unit of replication: mean +/- std across >= 3 seeds; '
+                     'the paired test runs on per-seed means when both rows share >= 2 seeds, '
+                     'otherwise on the shared held-out batches of one run'),
         'rows': [],
     }
     ref_batches = reference.get('val_losses')
@@ -214,20 +457,34 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'name': row['name'],
             'hypothesis': row.get('hypothesis'),
             'val_loss': row['val_loss'],
+            'val_loss_std': _row_std(row),
+            'n_seeds': row.get('n_seeds', 1),
             'delta_vs_reference': delta,
             'beats_reference': bool(delta < -margin),
             'beats_reference_significantly': False,
             'test': None,
+            'test_basis': None,
+            'paired_seeds': [],
             'p_one_sided': None,
         }
-        row_batches = row.get('val_losses')
         test = None
-        if (isinstance(row_batches, list) and isinstance(ref_batches, list)
-                and len(row_batches) == len(ref_batches) and len(row_batches) >= 2):
-            test = paired_z_one_sided(row_batches, ref_batches, margin=margin)
-        elif (isinstance(row_batches, list) and isinstance(ref_batches, list)
-              and len(row_batches) >= 2 and len(ref_batches) >= 2):
-            test = welch_z_one_sided(row_batches, ref_batches, margin=margin)
+        row_seeds = _seed_means(row)
+        common = sorted(set(row_seeds) & set(ref_seeds))
+        if len(common) >= 2:
+            test = paired_z_one_sided([row_seeds[s] for s in common],
+                                      [ref_seeds[s] for s in common], margin=margin)
+            entry['test_basis'] = 'seed_means'
+            entry['paired_seeds'] = common
+        else:
+            row_batches = row.get('val_losses')
+            if (isinstance(row_batches, list) and isinstance(ref_batches, list)
+                    and len(row_batches) == len(ref_batches) and len(row_batches) >= 2):
+                test = paired_z_one_sided(row_batches, ref_batches, margin=margin)
+                entry['test_basis'] = 'val_batches'
+            elif (isinstance(row_batches, list) and isinstance(ref_batches, list)
+                  and len(row_batches) >= 2 and len(ref_batches) >= 2):
+                test = welch_z_one_sided(row_batches, ref_batches, margin=margin)
+                entry['test_basis'] = 'val_batches_unpaired'
         if test is not None:
             entry['test'] = 'paired_z_one_sided' if test['paired'] else 'welch_z_one_sided'
             entry['p_one_sided'] = test['p_one_sided']
@@ -238,20 +495,34 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
                 and test['p_one_sided'] < alpha
             )
         out['rows'].append(entry)
+    thin = {r['name'] for r in [reference, *baselines] if r.get('n_seeds', 1) < 3}
+    out['rows_with_fewer_than_3_seeds'] = sorted(thin | {e['name'] for e in out['rows'] if e['n_seeds'] < 3})
     return out
 
 def print_baseline_comparison(comparison: dict | None) -> None:
     if comparison is None:
         print('[compare] no baseline row present; comparison skipped (include a baseline row to interpret the matrix)')
         return
-    print(f"[compare] reference baseline: {comparison['reference']} val_loss={comparison['reference_val_loss']:.4f} "
-          f"(all baselines: { {k: round(v, 4) for k, v in comparison['baseline_rows'].items()} })")
+    ref_std = comparison.get('reference_val_loss_std')
+    ref_std_str = '' if ref_std is None else f" +/- {ref_std:.4f}"
+    print(f"[compare] reference baseline: {comparison['reference']} "
+          f"val_loss={comparison['reference_val_loss']:.4f}{ref_std_str} "
+          f"(seeds={comparison.get('reference_seeds')}; "
+          f"all baselines: { {k: round(v, 4) for k, v in comparison['baseline_rows'].items()} })")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_str = 'n/a' if p is None else f'{p:.3g}'
-        print(f"[compare] {entry['name']:>32s} delta={entry['delta_vs_reference']:+.4f} "
-              f"p(one-sided)={p_str} beats={entry['beats_reference']} "
+        std = entry.get('val_loss_std')
+        std_str = '' if std is None else f" +/- {std:.4f}"
+        basis = entry.get('test_basis') or '-'
+        print(f"[compare] {entry['name']:>32s} val_loss={entry['val_loss']:.4f}{std_str} "
+              f"delta={entry['delta_vs_reference']:+.4f} p(one-sided)={p_str} "
+              f"test={entry.get('test') or '-'}@{basis} "
+              f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}")
+    if comparison.get('rows_with_fewer_than_3_seeds'):
+        print(f"[compare] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
+              f"{comparison['rows_with_fewer_than_3_seeds']}")
 
 def main():
     pre = argparse.ArgumentParser(add_help=False)
@@ -260,7 +531,11 @@ def main():
     ablations = dict(ABLATIONS)
     hypotheses = dict(ABLATION_HYPOTHESES)
     if known.config:
-        from_yaml = load_ablations_from_config(known.config, include_metadata=True)
+        try:
+            from_yaml = load_ablations_from_config(known.config, include_metadata=True)
+        except ValueError as exc:
+            print(f'[matrix] FAIL: {exc}')
+            sys.exit(1)
         if from_yaml:
             ablations = {name: row['cfg'] for name, row in from_yaml.items()}
             hypotheses = {name: row['hypothesis'] for name, row in from_yaml.items()}
@@ -273,7 +548,8 @@ def main():
     p.add_argument('--seq-len', type=int, default=512)
     p.add_argument('--lr', type=float, default=0.0006)
     p.add_argument('--weight-decay', type=float, default=0.1)
-    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given')
+    p.add_argument('--seeds', type=int, nargs='+', default=list(DEFAULT_SEEDS), help='one row is trained once per seed and reported as mean +/- std across seeds (>= 3 recommended)')
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--stats-every', type=int, default=200)
     p.add_argument('--val-batches', type=int, default=20, help='held-out synthetic batches for the selection metric (val_loss); never used for gradient updates')
@@ -281,17 +557,32 @@ def main():
     p.add_argument('--baseline-margin', type=float, default=0.0, help='minimum val_loss improvement over the best baseline to count as a win')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired z-test vs the best baseline')
     p.add_argument('--sanity-check', action='store_true', help='run the small-batch overfit sanity check for every norm in the selected rows before training them')
+    p.add_argument('--check-matrix', action='store_true', help='validate controlled knobs, stated hypotheses and leave-one-out coverage of the matrix, then exit without training')
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
     apply_config_to_parser(p, known.config)
     args = p.parse_args()
+    seeds = [args.seed] if args.seed is not None else list(args.seeds or DEFAULT_SEEDS)
+    if len(seeds) < 3:
+        print(f'[warn] {len(seeds)} seed(s) selected: with <3 independent runs a difference cannot be separated from run-to-run noise; report error bars and treat significance as provisional')
+    try:
+        matrix_report = validate_matrix(ablations, hypotheses, args.model)
+    except ValueError as exc:
+        print(f'[matrix] FAIL: {exc}')
+        sys.exit(1)
+    print(f"[matrix] ok: {len(matrix_report['rows'])} rows, controlled optimizer/schedule/data, "
+          f"every row has a hypothesis, leave-one-out coverage {matrix_report['leave_one_out']}")
+    if args.check_matrix:
+        print(json.dumps(matrix_report, indent=2))
+        return
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
-    run_metadata = collect_run_metadata(seed=args.seed)
+    run_metadata = collect_run_metadata(seed=seeds[0], extra={'seeds': seeds})
     if args.sanity_check:
         from scripts.sanity_overfit import run_preflight
         norms = sorted({ablations[name].get('norm_name', 'dytcd') for name in args.names if name in ablations})
-        run_preflight(norms or ['dytcd'], args.seed, base)
+        run_preflight(norms or ['dytcd'], seeds[0], base)
+    multi = len(seeds) > 1
     all_summaries = []
     trained: dict[str, str] = {}
     for name in args.names:
@@ -299,35 +590,43 @@ def main():
             print(f"[warn] unknown ablation '{name}', skipping")
             continue
         cfg_kwargs = ablations[name]
-        run_dir = base / name
+        row_dir = base / name
+        summary_paths = {seed: (row_dir / f'seed{seed}' / 'summary.json' if multi else row_dir / 'summary.json') for seed in seeds}
+        legacy = row_dir / 'summary.json'
+        if multi and legacy.exists() and (not (row_dir / 'summary.preseed.json').exists()) and (not any(p.exists() for p in summary_paths.values())):
+            os.replace(legacy, row_dir / 'summary.preseed.json')
+            print(f'[keep] {name}: moved pre-replication single-seed summary to summary.preseed.json')
         config_key = effective_config_key(args.model, cfg_kwargs)
-        if (run_dir / 'summary.json').exists() and (not args.force):
-            print(f'[skip] {name} already done, use --force to rerun')
-            trained.setdefault(config_key, name)
-            try:
-                summary = json.loads((run_dir / 'summary.json').read_text())
-            except (OSError, json.JSONDecodeError):
-                summary = None
-            if isinstance(summary, dict):
-                all_summaries.append(summary)
-            continue
         source = trained.get(config_key)
-        if source is not None and (base / source / 'summary.json').exists():
-            try:
-                summary = json.loads((base / source / 'summary.json').read_text())
-            except (OSError, json.JSONDecodeError):
-                summary = None
-            if isinstance(summary, dict):
-                summary = dict(summary, name=name, cfg=cfg_kwargs, reused_from=source, hypothesis=hypotheses.get(name))
-                run_dir.mkdir(parents=True, exist_ok=True)
-                with open(run_dir / 'summary.json', 'w') as f:
-                    json.dump(summary, f, indent=2)
-                print(f'[alias] {name}: identical model config to {source}, reusing its summary (no retrain)')
-                all_summaries.append(summary)
-                continue
-        s = run_one(name, cfg_kwargs, args, run_dir, run_metadata=run_metadata, hypothesis=hypotheses.get(name))
+        if source is not None and (not args.force):
+            source_paths = {seed: (base / source / f'seed{seed}' / 'summary.json' if multi else base / source / 'summary.json') for seed in seeds}
+            if all(p.exists() for p in source_paths.values()):
+                reused = [_load_summary(p) for p in source_paths.values()]
+                if all(isinstance(s, dict) for s in reused):
+                    reused = [dict(s, name=name, cfg=cfg_kwargs, reused_from=source, hypothesis=hypotheses.get(name)) for s in reused]
+                    for seed, summary in zip(seeds, reused):
+                        if multi:
+                            _write_summary(summary_paths[seed], summary)
+                    agg = aggregate_seed_summaries(name, reused, cfg_kwargs, hypotheses.get(name))
+                    _write_summary(row_dir / 'summary.json', agg)
+                    print(f'[alias] {name}: identical model config to {source}, reusing its summaries (no retrain)')
+                    trained[config_key] = name
+                    all_summaries.append(agg)
+                    continue
+        seed_summaries = []
+        for seed in seeds:
+            path = summary_paths[seed]
+            if path.exists() and (not args.force):
+                summary = _load_summary(path)
+                if isinstance(summary, dict):
+                    print(f'[skip] {name} seed={seed} already done, use --force to rerun')
+                    seed_summaries.append(summary)
+                    continue
+            seed_summaries.append(run_one(name, cfg_kwargs, args, path.parent, run_metadata=run_metadata, hypothesis=hypotheses.get(name), seed=seed))
+        agg = aggregate_seed_summaries(name, seed_summaries, cfg_kwargs, hypotheses.get(name))
+        _write_summary(row_dir / 'summary.json', agg)
         trained[config_key] = name
-        all_summaries.append(s)
+        all_summaries.append(agg)
     agg_path = base / 'all_summaries.json'
     previous: list = []
     if agg_path.exists():
@@ -348,9 +647,12 @@ def main():
     manifest = dict(run_metadata)
     manifest['git'] = git_revision()
     manifest['hyperparameters'] = vars(args)
+    manifest['seeds'] = seeds
+    manifest['matrix_validation'] = matrix_report
     manifest['rows'] = [row['name'] for row in ordered]
     manifest['baseline_comparison'] = comparison
     save_run_manifest(base / 'run_manifest.json', manifest)
-    print(f'\n[done] {len(ordered)} ablations saved to {base}')
+    print(f'\n[done] {len(ordered)} ablations saved to {base} '
+          f'({len(seeds)} seed(s): {seeds}; row val_loss = mean +/- std across seeds)')
 if __name__ == '__main__':
     main()

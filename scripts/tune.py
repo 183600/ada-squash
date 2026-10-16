@@ -66,7 +66,7 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path) -> dict:
         except (OSError, json.JSONDecodeError):
             pass
     summary = run_one(f'{arm}|lr={lr:g}|seed={seed}', {'norm_name': arm},
-                      trial_args, run_dir)
+                      trial_args, run_dir, seed=seed)
     return summary
 
 
@@ -122,6 +122,20 @@ def _trial_by_seed(trials, lr):
     return {t['seed']: t for t in trials if t['lr'] == lr}
 
 
+def _split_basis(r: dict, use_confirm: bool):
+    """(mean, std, n) of an arm's selected lr on the comparison split.
+
+    The delta and p-value are already computed on the confirm split when it is
+    available; the reported absolute losses must come from the same split,
+    otherwise the printed val_loss and the printed delta disagree.
+    """
+    if use_confirm:
+        stats = (r.get('confirm') or {}).get('stats')
+        if stats:
+            return stats.get('mean'), stats.get('std'), stats.get('n')
+    return r['best']['mean'], r['best'].get('std'), r['best'].get('n')
+
+
 def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | None:
     """Best variant trials vs the best tuned baseline, paired where possible."""
     usable = {arm: r for arm, r in tuned.items() if r.get('best') is not None}
@@ -130,15 +144,23 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
         return None
     ref_arm = min(baselines, key=lambda a: baselines[a]['best']['mean'])
     ref = baselines[ref_arm]
-    use_confirm = bool(ref.get('confirm_trials')) and all(
-        r.get('confirm_trials') for r in usable.values()
-    )
+    # The confirm split is only a valid basis when *every* compared arm has
+    # confirm statistics; a mixed basis would compare some arms on fresh seeds
+    # and others on the seeds their lr was selected on.
+    confirm_ready = {a for a, r in usable.items() if (r.get('confirm') or {}).get('stats')}
+    confirm_ran = {a for a, r in usable.items() if r.get('confirm_trials')}
+    use_confirm = len(confirm_ready) == len(usable) and bool(usable)
     split = 'confirm_seeds' if use_confirm else 'selection_seeds'
+    ref_mean, ref_std, ref_n = _split_basis(ref, use_confirm)
     out = {
         'reference_arm': ref_arm,
         'reference_lr': ref['best']['lr'],
-        'reference_val_loss': ref['best']['mean'],
+        'reference_val_loss': ref_mean,
+        'reference_val_loss_std': ref_std,
+        'reference_n_seeds': ref_n,
+        'reference_selection_val_loss': ref['best']['mean'],
         'reference_split': split,
+        'confirm_ignored_arms': sorted(confirm_ran - confirm_ready),
         'margin': margin,
         'alpha': alpha,
         'rows': [],
@@ -162,10 +184,14 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
         ref_vals = [ref_seed_losses[s] for s in common]
         delta = (mean_std_stderr(arm_vals)['mean'] - mean_std_stderr(ref_vals)['mean']
                  if arm_vals else None)
+        arm_mean, arm_std, arm_n = _split_basis(r, use_confirm)
         entry = {
             'arm': arm,
             'best_lr': r['best']['lr'],
-            'val_loss': r['best']['mean'],
+            'val_loss': arm_mean,
+            'val_loss_std': arm_std,
+            'n_seeds': arm_n,
+            'selection_val_loss': r['best']['mean'],
             'delta_vs_reference': delta,
             'n_paired_seeds': len(common),
             'beats_reference': bool(delta is not None and delta < -margin),
@@ -197,6 +223,8 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
                 and test['p_one_sided'] < alpha
             )
         out['rows'].append(entry)
+    out['rows_with_fewer_than_3_seeds'] = sorted(
+        e['arm'] for e in out['rows'] if e['n_paired_seeds'] < 3)
     return out
 
 
@@ -204,16 +232,32 @@ def print_comparison(comparison: dict | None) -> None:
     if comparison is None:
         print('[tune][compare] no tuned baseline arm present; comparison skipped')
         return
+    ref_std = comparison.get('reference_val_loss_std')
+    ref_std_str = '' if ref_std is None else f" +/- {ref_std:.4f}"
     print(f"[tune][compare] reference: arm={comparison['reference_arm']} "
-          f"lr={comparison['reference_lr']:g} val_loss={comparison['reference_val_loss']:.4f} "
-          f"(decided on {comparison['reference_split']})")
+          f"lr={comparison['reference_lr']:g} "
+          f"val_loss={comparison['reference_val_loss']:.4f}{ref_std_str} "
+          f"n_seeds={comparison.get('reference_n_seeds')} "
+          f"(split={comparison['reference_split']}; "
+          f"selection-seed mean={comparison['reference_selection_val_loss']:.4f})")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_str = 'n/a' if p is None else f'{p:.3g}'
+        std = entry.get('val_loss_std')
+        std_str = '' if std is None else f" +/- {std:.4f}"
         print(f"[tune][compare] {entry['arm']:>12s} lr={entry['best_lr']:g} "
+              f"val_loss={entry['val_loss']:.4f}{std_str} "
               f"delta={entry['delta_vs_reference']:+.4f} p(one-sided)={p_str} "
+              f"paired_seeds={entry['n_paired_seeds']} "
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}")
+    if comparison.get('confirm_ignored_arms'):
+        print(f"[tune][compare] confirm runs ignored (missing confirm stats for "
+              f"{comparison['confirm_ignored_arms']}); comparison is on selection seeds")
+    if comparison.get('rows_with_fewer_than_3_seeds'):
+        print(f"[tune][compare] WARNING: <3 paired seeds for "
+              f"{comparison['rows_with_fewer_than_3_seeds']}: "
+              f"effect and noise cannot be separated reliably")
 
 
 def main():
@@ -244,6 +288,12 @@ def main():
     overlap = set(args.seeds) & set(args.confirm_seeds)
     if overlap:
         p.error(f'--confirm-seeds must be disjoint from --seeds (selection would leak into confirmation): {sorted(overlap)}')
+    if len(args.seeds) < 3:
+        print(f'[tune][warn] {len(args.seeds)} selection seed(s): the lr grid means are noisy; '
+              f'use >= 3 (and --confirm-seeds) before treating a small delta as real')
+    if not args.confirm_seeds:
+        print('[tune][warn] no --confirm-seeds: the comparison quotes the same runs the lr was '
+              'selected on (winner\'s curse); treat the p-values as optimistic')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
     tuned = {}
@@ -258,9 +308,11 @@ def main():
         if tuned[arm].get('confirm'):
             c = tuned[arm]['confirm']
             stats = c['stats']
-            print(f"[tune] {arm}: confirm on seeds={args.confirm_seeds} "
-                  f"val_loss={stats['mean']:.4f}" if stats else
-                  f"[tune] {arm}: confirm produced no usable losses")
+            if stats:
+                print(f"[tune] {arm}: confirm on seeds={args.confirm_seeds} lr={c['lr']:g} "
+                      f"val_loss={stats['mean']:.4f} +/- {stats['std']:.4f} (n={stats['n']})")
+            else:
+                print(f"[tune] {arm}: confirm produced no usable losses")
     comparison = compare(tuned, args.baselines, args.margin, args.alpha)
     print_comparison(comparison)
     out = {

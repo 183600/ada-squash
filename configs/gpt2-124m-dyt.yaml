@@ -1,6 +1,8 @@
 model: gpt2-124m
 norm: dyt
-alpha_init: 0.6
+# 0.5 is the GPTConfig default and the value the dytc / dytcd configs use, so
+# yaml-vs-yaml comparisons vary the normalization, not a tuned scalar.
+alpha_init: 0.5
 qk_norm: null
 use_layerscale: false
 
