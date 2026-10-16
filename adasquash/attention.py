@@ -114,7 +114,7 @@ class CausalSelfAttention(nn.Module):
         if cache is None or cache[0] != key:
             cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
             sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
-            self._rope_cache = (key, None, {}, cos, sin)
+            self._rope_cache = (key, freqs_cis, {}, cos, sin)
         tables = self._rope_cache[2]
         entry = tables.get(dtype)
         if entry is None:

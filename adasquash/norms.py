@@ -70,7 +70,8 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     u = t.clamp_(min=1.0).reciprocal_()
     u.mul_(lo)
     if isinstance(p, torch.Tensor):
-        s = u.log2_().mul_(p).exp2_().log1p_().mul_(-_LOG2E / p).exp2_()
+        log2e_p = _LOG2E / p.to(torch.promote_types(u.dtype, p.dtype))
+        s = u.log2_().mul_(p).exp2_().log1p_().mul_(-log2e_p).exp2_()
     else:
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     return lo.mul_(s).copysign_(xs)
@@ -85,14 +86,16 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
         if isinstance(p, torch.Tensor):
             q = u.log2_().mul_(p)
             a = q.mul(_LN2).clamp_(min=p * math.log(torch.finfo(q.dtype).tiny))
-            s = q.exp2_().log1p_().mul_(-_LOG2E / p).exp2_()
+            log2e_p = _LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))
+            s = q.exp2_().log1p_().mul_(-log2e_p).exp2_()
         else:
             s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
             a = u.log2_().mul_(p * _LN2).clamp_(min=p * math.log(torch.finfo(u.dtype).tiny))
     else:
         s = lo.mul(r)
         if isinstance(p, torch.Tensor):
-            s.log2_().mul_(p).exp2_().log1p_().mul_(-_LOG2E / p).exp2_()
+            log2e_p = _LOG2E / p.to(torch.promote_types(s.dtype, p.dtype))
+            s.log2_().mul_(p).exp2_().log1p_().mul_(-log2e_p).exp2_()
         else:
             s.pow_(p).add_(1.0).pow_(-1.0 / p)
     phi = lo.mul_(s).copysign_(xs) if need_phi else None
@@ -314,7 +317,7 @@ class _DyTCForward(torch.autograd.Function):
             grad_x_scaled = g.log2_().mul_(p_val + 1).exp2_()
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             if ctx.needs_input_grad[1]:
-                grad_alpha = _reduce_products(grad_x_scaled, x_scaled).div_(alpha)
+                grad_alpha = _reduce_products(grad_x_scaled, x)
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha)
         grad_beta = None
