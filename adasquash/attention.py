@@ -7,7 +7,9 @@ import torch.nn.functional as F
 from .norms import QKSquash, _RMSNorm
 _TRIL_MASK_CACHE: dict = {}
 _ROPE_TABLE_CACHE: dict = {}
+_LOGIT_SCRATCH_CACHE: dict = {}
 _CACHE_MAX_ENTRIES = 8
+_LOGIT_SCRATCH_MAX_ENTRIES = 2
 
 class CausalSelfAttention(nn.Module):
 
@@ -20,7 +22,6 @@ class CausalSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self._rope_cache: Optional[tuple] = None
         self._tril_cache: Optional[tuple] = None
-        self._logit_buf: Optional[tuple] = None
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
         self.attn_drop = nn.Dropout(dropout)
@@ -88,11 +89,13 @@ class CausalSelfAttention(nn.Module):
 
     def _logit_scratch(self, B: int, H: int, R: int, T: int, q: torch.Tensor) -> torch.Tensor:
         key = (B, H, R, T, q.dtype, q.device)
-        cache = self._logit_buf
-        if cache is None or cache[0] != key:
-            cache = (key, torch.empty(B, H, R, T, dtype=q.dtype, device=q.device))
-            self._logit_buf = cache
-        return cache[1]
+        buf = _LOGIT_SCRATCH_CACHE.get(key)
+        if buf is None:
+            buf = torch.empty(B, H, R, T, dtype=q.dtype, device=q.device)
+            if len(_LOGIT_SCRATCH_CACHE) >= _LOGIT_SCRATCH_MAX_ENTRIES:
+                _LOGIT_SCRATCH_CACHE.clear()
+            _LOGIT_SCRATCH_CACHE[key] = buf
+        return buf
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
         B, H = (q.shape[0], q.shape[1])

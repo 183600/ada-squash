@@ -171,7 +171,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk if total is None else total.add_(chunk)
         count = targets.ne(ignore_index).sum()
-        ctx.save_for_backward(h, w, targets)
+        ctx.save_for_backward(h, weight, targets)
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
         ctx.count = count
@@ -181,8 +181,9 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        h, w, targets = ctx.saved_tensors
+        h, weight, targets = ctx.saved_tensors
         dt = ctx.compute_dtype
+        w = weight if weight.dtype == dt else weight.to(dt)
         acc = _loss_acc_dtype(dt)
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
@@ -339,7 +340,8 @@ class _SwiGLU(torch.autograd.Function):
         if need_b or do_w2:
             h = F.silu(a, inplace=True)
         if need_b:
-            grad_b = grad_h.mul_(h)
+            grad_h.mul_(h)
+            grad_b = grad_h
         del grad_h
         if do_w2:
             grad_w2 = grad_out.t() @ h.mul_(b)
