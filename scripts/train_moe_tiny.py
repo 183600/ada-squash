@@ -13,6 +13,7 @@ from adasquash import build_norm, markov_batch
 from adasquash.attention import CausalSelfAttention
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, _LayerScaleResidual
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
+_FLAT_TOKEN_CACHE: dict = {}
 
 class MoELayer(nn.Module):
 
@@ -26,7 +27,6 @@ class MoELayer(nn.Module):
         self.experts_w1 = nn.Parameter(torch.empty(n_experts, dim, hidden))
         self.experts_w2 = nn.Parameter(torch.empty(n_experts, hidden, dim))
         self.experts_w3 = nn.Parameter(torch.empty(n_experts, dim, hidden))
-        self._flat_token_cache: dict = {}
         self.drop = nn.Dropout(dropout)
         for p in (self.experts_w1, self.experts_w2, self.experts_w3):
             nn.init.normal_(p, std=0.02)
@@ -46,11 +46,11 @@ class MoELayer(nn.Module):
         n_experts = self.n_experts
         k = self.top_k
         flat_expert = indices.reshape(-1)
-        key = (n_tokens, x.device)
-        flat_token = self._flat_token_cache.get(key)
+        key = (n_tokens, k, x.device)
+        flat_token = _FLAT_TOKEN_CACHE.get(key)
         if flat_token is None:
             flat_token = torch.arange(n_tokens, device=x.device).repeat_interleave(k)
-            self._flat_token_cache[key] = flat_token
+            _FLAT_TOKEN_CACHE[key] = flat_token
         flat_gate = scores.reshape(-1)
         order = flat_expert.argsort()
         token_of = flat_token[order]

@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .norms import QKSquash, _RMSNorm
+_TRIL_MASK_CACHE: dict = {}
+_ROPE_TABLE_CACHE: dict = {}
+_CACHE_MAX_ENTRIES = 8
 
 class CausalSelfAttention(nn.Module):
 
@@ -67,12 +70,19 @@ class CausalSelfAttention(nn.Module):
         return (out, stats)
 
     def _tril_mask(self, T: int, device) -> torch.Tensor:
+        key = (T, device)
         cache = self._tril_cache
-        if cache is None or cache[0] != (T, device):
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        mask = _TRIL_MASK_CACHE.get(key)
+        if mask is None:
             ij = torch.arange(T, device=device)
-            cache = ((T, device), ij[:, None] < ij[None, :])
-            self._tril_cache = cache
-        return cache[1]
+            mask = ij[:, None] < ij[None, :]
+            if len(_TRIL_MASK_CACHE) >= _CACHE_MAX_ENTRIES:
+                _TRIL_MASK_CACHE.clear()
+            _TRIL_MASK_CACHE[key] = mask
+        self._tril_cache = (key, mask)
+        return mask
     _LOGITS_CHUNK_BYTES = 1 << 27
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
@@ -111,19 +121,26 @@ class CausalSelfAttention(nn.Module):
     def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
         cache = self._rope_cache
-        if cache is None or cache[0] != key:
-            cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
-            sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
-            self._rope_cache = (key, freqs_cis, {}, cos, sin)
-        tables = self._rope_cache[2]
-        entry = tables.get(dtype)
+        entry = cache[1] if cache is not None and cache[0] == key else None
         if entry is None:
-            cos, sin = (self._rope_cache[3], self._rope_cache[4])
+            entry = _ROPE_TABLE_CACHE.get(key)
+            if entry is None:
+                cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
+                sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
+                entry = (freqs_cis, cos, sin, {})
+                if len(_ROPE_TABLE_CACHE) >= _CACHE_MAX_ENTRIES:
+                    _ROPE_TABLE_CACHE.clear()
+                _ROPE_TABLE_CACHE[key] = entry
+            self._rope_cache = (key, entry)
+        tables = entry[3]
+        got = tables.get(dtype)
+        if got is None:
+            cos, sin = (entry[1], entry[2])
             if cos.dtype != dtype:
                 cos, sin = (cos.to(dtype).contiguous(), sin.to(dtype).contiguous())
-            entry = (cos, sin)
-            tables[dtype] = entry
-        return entry
+            got = (cos, sin)
+            tables[dtype] = got
+        return got
 
 class RMSNormHead(nn.Module):
 

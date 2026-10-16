@@ -333,9 +333,8 @@ class _SwiGLU(torch.autograd.Function):
             a = F.linear(x, w1)
             b = F.linear(x, w3)
         if need_a:
-            prod = grad_h.mul(b)
-            grad_a = torch.ops.aten.silu_backward(prod, a)
-            del prod
+            grad_a = torch.ops.aten.silu_backward(grad_h, a)
+            grad_a.mul_(b)
         h = None
         if need_b or do_w2:
             h = F.silu(a, inplace=True)
