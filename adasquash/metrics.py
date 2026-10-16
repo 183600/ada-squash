@@ -19,7 +19,10 @@ honest:
   `macro_weighted_f1`, which *names* the averaging it uses: `macro_f1`
   (unweighted mean over classes present), `weighted_f1` (support-weighted)
   and `micro_f1` (= accuracy). Macro and micro can differ wildly under class
-  imbalance, so the caller must state which one it reports.
+  imbalance, so the caller must state which one it reports;
+* a scan that tests many rows against one reference gets `holm_adjust`, so a
+  row-by-row alpha is corrected for the family of tests actually performed
+  (Holm-Bonferroni), instead of reporting the best of many uncorrected draws.
 
 Everything is pure `math` (no scipy/sklearn), so the training scripts can run
 in a minimal environment.
@@ -28,6 +31,7 @@ import math
 from typing import Optional, Sequence
 
 __all__ = [
+    "holm_adjust",
     "macro_weighted_f1",
     "mean_std_stderr",
     "paired_z_one_sided",
@@ -75,6 +79,30 @@ def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
 def _p_one_sided_from_z(z: float) -> float:
     """P(Z <= z) for a standard normal Z (the one-sided p-value of a z-score)."""
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+
+def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
+    """Holm-Bonferroni step-down adjustment of a family of p-values.
+
+    A matrix run scans many rows against one reference, so an uncorrected
+    alpha = 0.05 makes a "significant" win almost guaranteed by chance (with
+    19 rows the family-wise error rate approaches 1 - 0.95^19 ~ 62%). Holm's
+    step-down is uniformly more powerful than plain Bonferroni and needs no
+    assumption beyond validity of the individual p-values: sort ascending and
+    multiply the k-th smallest by `m - k + 1`, then enforce monotonicity.
+    `None` entries (tests that could not run) stay `None` and are not counted
+    in `m`.
+    """
+    indexed = sorted(
+        (float(p), i) for i, p in enumerate(pvalues) if p is not None
+    )
+    m = len(indexed)
+    adjusted: list[Optional[float]] = [None] * len(pvalues)
+    running = 0.0
+    for rank, (p, i) in enumerate(indexed):
+        running = max(running, min(1.0, (m - rank) * p))
+        adjusted[i] = running
+    return adjusted
 
 
 def paired_z_one_sided(

@@ -35,6 +35,7 @@ class GPTConfig:
     p_init: float = 2.0
     learnable_p: bool = True
     learnable_k: bool = True
+    learnable_delta: bool = True
     beta: bool = True
     alpha_jitter: float = 0.05
     gradient_checkpointing: bool = False
@@ -62,7 +63,7 @@ def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=Fa
             depth_ratio = float(layer_idx) / float(cfg.n_layers)
         kwargs = dict(layer_idx=layer_idx, num_layers=cfg.n_layers, alpha_0=cfg.alpha_0, k_init=cfg.k_init, learnable_k=cfg.learnable_k)
     if cfg.norm_name == 'dytcd':
-        kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p)
+        kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p, learnable_delta=cfg.learnable_delta)
     if cfg.norm_name == 'dytc':
         kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p, alpha_init=cfg.alpha_init, alpha_jitter=cfg.alpha_jitter)
     if cfg.norm_name == 'dyt':

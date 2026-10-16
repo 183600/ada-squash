@@ -444,7 +444,7 @@ class _DyTForward(torch.autograd.Function):
 @register_norm("dytcd")
 class DyTCD(_SquashedAffine):
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, p_init: float=2.0, learnable_p: bool=True, beta: bool=True):
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, p_init: float=2.0, learnable_p: bool=True, beta: bool=True, learnable_delta: bool=True):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_layers = max(1, num_layers)
@@ -454,7 +454,16 @@ class DyTCD(_SquashedAffine):
             self.k = nn.Parameter(torch.tensor(float(k_init)))
         else:
             self.register_buffer('k', torch.tensor(float(k_init)))
-        self.delta = nn.Parameter(torch.zeros(dim))
+        if learnable_delta:
+            self.delta = nn.Parameter(torch.zeros(dim))
+        else:
+            # Per-channel axis off for the controlled ablation: `delta` is a
+            # zero buffer rather than a parameter, so `alpha_c == alpha_l`
+            # exactly. The kernel is untouched - it only sees `delta.requires_
+            # grad == False` and returns no gradient for it - which keeps the
+            # depth schedule, the softsign activation and LayerScale identical
+            # to the full model. (Frozen `k` / `p` already use this pattern.)
+            self.register_buffer('delta', torch.zeros(dim))
         if learnable_p:
             self.p = nn.Parameter(torch.tensor(float(p_init)))
         else:

@@ -43,7 +43,7 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
         parser.set_defaults(**{dest: value})
     if unknown:
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
-_TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
+_TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
 
 def build_optimizer(model: nn.Module, lr: float, weight_decay: float, beta1: float, beta2: float):
     decay = []
@@ -70,7 +70,7 @@ def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float)
 def build_lr_lambda(args):
     return lambda s: cosine_schedule(s + 1, args.max_steps, args.warmup, args.min_lr_ratio)
 _SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip')
-_ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'beta', 'alpha_0', 'k_init', 'alpha_init', 'p_init', 'alpha_jitter')
+_ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'no_learnable_delta', 'beta', 'alpha_0', 'k_init', 'alpha_init', 'p_init', 'alpha_jitter')
 _NUMERIC_ARGS = ('compile', 'compile_mode', 'no_bf16')
 _RESUME_RUN_ARGS = _ARCH_ARGS + _NUMERIC_ARGS
 
@@ -204,6 +204,7 @@ def main():
     p.add_argument('--p-init', type=float, default=2.0)
     p.add_argument('--no-learnable-p', action='store_true')
     p.add_argument('--no-learnable-k', action='store_true')
+    p.add_argument('--no-learnable-delta', action='store_true', help='freeze the DyT-CD per-channel deviation at zero (controlled per-channel off)')
     p.add_argument('--no-beta', dest='beta', action='store_false', help='disable output affine bias in DyT-family norms')
     p.add_argument('--alpha-jitter', type=float, default=0.05, help='per-channel alpha init jitter for DyTC (0 for deterministic)')
     p.add_argument('--gradient-checkpointing', action='store_true', help='enable gradient checkpointing')
@@ -282,7 +283,7 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dtype = torch.bfloat16 if args.bf16 and device == 'cuda' else torch.float32
     ctx = torch.amp.autocast(device_type='cuda', dtype=dtype) if dtype != torch.float32 else nullcontext()
-    model_cfg = dict(norm_name=args.norm, qk_norm=args.qk_norm, qk_alpha_init=args.qk_alpha_init, use_layerscale=not args.no_layerscale, alpha_0=args.alpha_0, k_init=args.k_init, alpha_init=args.alpha_init, p_init=args.p_init, learnable_p=not args.no_learnable_p, learnable_k=not args.no_learnable_k, beta=args.beta, alpha_jitter=args.alpha_jitter, gradient_checkpointing=args.gradient_checkpointing)
+    model_cfg = dict(norm_name=args.norm, qk_norm=args.qk_norm, qk_alpha_init=args.qk_alpha_init, use_layerscale=not args.no_layerscale, alpha_0=args.alpha_0, k_init=args.k_init, alpha_init=args.alpha_init, p_init=args.p_init, learnable_p=not args.no_learnable_p, learnable_k=not args.no_learnable_k, learnable_delta=not args.no_learnable_delta, beta=args.beta, alpha_jitter=args.alpha_jitter, gradient_checkpointing=args.gradient_checkpointing)
     if args.layerscale_init is not None:
         model_cfg['layerscale_init'] = args.layerscale_init
     if args.tie_embeddings is not None:
