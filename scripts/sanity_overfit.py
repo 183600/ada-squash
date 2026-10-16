@@ -72,7 +72,7 @@ def run_preflight(norms, seed: int, output_dir) -> None:
     """Run this script as a subprocess; raise CalledProcessError when it fails.
 
     Training entrypoints use this behind a `--sanity-check` flag so a broken
-    gradient/loss path aborts the run before any full-scale compute is spent.
+    gradient/loss path aborts the run before full-scale training starts.
     The default synthetic `copy` task is used, so no dataset is required.
     """
     import subprocess

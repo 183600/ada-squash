@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Budget-matched hyper-parameter tuning: never compare against an untuned baseline.
+"""Compute-matched hyper-parameter tuning: never compare against an untuned baseline.
 
 Scientific protocol (why this script exists)
 --------------------------------------------
 "The new norm beats LayerNorm/RMSNorm" is only meaningful if the baseline has
-been tuned with the *same budget and the same selection protocol* as the
+been tuned with the *same compute and the same selection protocol* as the
 proposal. A single fixed recipe can make the simplest baseline look weak
 enough that any added machinery appears to win - the strawman failure mode.
 
 This driver therefore:
 
-* gives every arm (baseline or variant) the identical budget - same
+* gives every arm (baseline or variant) the identical compute - same
   `--max-steps`, batch size, sequence length, corpus generator and seed set -
   while sweeping the learning rate, the hyper-parameter that dominates
   short-run optimization;
@@ -220,7 +220,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--model', choices=['gpt2-124m', 'gpt2-350m', 'llama-1b'], default='gpt2-124m')
-    p.add_argument('--arms', nargs='+', required=True, help='arm names (norm names) to tune, lr-swept with equal budget')
+    p.add_argument('--arms', nargs='+', required=True, help='arm names (norm names) to tune, lr-swept with equal compute')
     p.add_argument('--baselines', nargs='+', default=['ln', 'rmsnorm'], help='arms that are the simple references')
     p.add_argument('--lrs', nargs='+', type=float, default=[3e-4, 6e-4, 1.2e-3])
     p.add_argument('--seeds', nargs='+', type=int, default=[42], help='selection seeds for the lr grid')
@@ -277,7 +277,7 @@ def main():
             'weight_decay': args.weight_decay,
             'val_batches': args.val_batches,
             'selection_metric': 'held-out synthetic val_loss (mean over val batches)',
-            'budget_matched': 'every arm/seed/lr trial runs the identical max_steps x batch_size x seq_len',
+            'compute_matched': 'every arm/seed/lr trial runs the identical max_steps x batch_size x seq_len',
             'test_split': 'untouched: all losses come from the synthetic held-out generator',
         },
         'arms': tuned,

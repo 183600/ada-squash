@@ -72,7 +72,7 @@ ablations:
     norm: dytcd
     use_layerscale: false
     hypothesis: >
-      The LayerScale residual gate contributes to DyT-CD: removing it costs
+      The LayerScale residual gate contributes to DyT-CD: removing it hurts
       held-out loss.
   - name: dytcd_ls1e5
     norm: dytcd

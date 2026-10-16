@@ -30,9 +30,9 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     """Seed the Python, NumPy, torch and CUDA RNGs from `seed`.
 
     `deterministic=True` additionally pins cuDNN to its deterministic
-    algorithms (same-machine reproducibility; it can cost speed). Torch
-    workers spawned later (DataLoader, subprocess launches) inherit the seed
-    through `seed_worker` / `PYTHONHASHSEED`.
+    algorithms (same-machine reproducibility). Torch workers spawned later
+    (DataLoader, subprocess launches) inherit the seed through `seed_worker`
+    / `PYTHONHASHSEED`.
     """
     seed = int(seed)
     random.seed(seed)
