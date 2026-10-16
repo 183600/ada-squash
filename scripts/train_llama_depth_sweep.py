@@ -55,6 +55,17 @@ def launch_one(args, depth: int, norm: str, output_dir: Path):
         cmd.append('--no-beta')
     if args.alpha_jitter != 0.05:
         cmd += ['--alpha-jitter', str(args.alpha_jitter)]
+    # The split / evaluation protocol is part of the controlled variables:
+    # every depth-norm row must see the same train slice and the same held-out
+    # validation and (sealed) test slices.
+    cmd += ['--val-frac', str(args.val_frac), '--test-frac', str(args.test_frac),
+            '--val-every', str(args.val_every), '--val-batches', str(args.val_batches),
+            '--min-doc-chars', str(args.min_doc_chars), '--max-doc-chars', str(args.max_doc_chars),
+            '--train-shuffle-buffer', str(args.train_shuffle_buffer)]
+    if args.num_documents is not None:
+        cmd += ['--num-documents', str(args.num_documents)]
+    if not args.dedup:
+        cmd.append('--no-dedup')
     if args.gradient_checkpointing:
         cmd.append('--gradient-checkpointing')
     if args.compile:
@@ -91,6 +102,15 @@ def main():
     p.add_argument('--norms', nargs='+', default=['rmsnorm', 'dyt', 'dytcd'])
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
+    p.add_argument('--val-frac', type=float, default=0.005, help='chronological held-out validation fraction (identical for every row)')
+    p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction (identical for every row)')
+    p.add_argument('--num-documents', type=int, default=None, help='total documents; required when the dataset reports no size')
+    p.add_argument('--val-every', type=int, default=500, help='held-out validation period in optimizer steps')
+    p.add_argument('--val-batches', type=int, default=10, help='batches per validation pass')
+    p.add_argument('--min-doc-chars', type=int, default=0)
+    p.add_argument('--max-doc-chars', type=int, default=0)
+    p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
+    p.add_argument('--train-shuffle-buffer', type=int, default=0, help='packed training-batch shuffle window (0 = off)')
     p.add_argument('--tokenizer', default='HuggingFaceFW/fineweb-edu/llama-tokenizer')
     p.add_argument('--seq-len', type=int, default=2048)
     p.add_argument('--batch-size', type=int, default=8)

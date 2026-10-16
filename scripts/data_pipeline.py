@@ -1,0 +1,389 @@
+from __future__ import annotations
+"""Leakage-safe streaming data pipeline for the AdaSquash experiments.
+
+Principles enforced here
+------------------------
+1. **Split first, touch data second.**  The upstream document stream is
+   partitioned into train / validation / test *contiguous ranges of the
+   upstream order* before tokenization, packing or cleaning.  Train is the
+   oldest slice, then validation, then test, so a model only ever fits the
+   past and is scored on the future - no information travels backwards in
+   time.
+2. **No shuffling across the boundary.**  The split itself is deterministic
+   and order preserving.  A bounded shuffle buffer may reorder packed
+   *batches* inside the training split only (the usual SGD shuffle); it can
+   never move a validation or test document into training.
+3. **Groups stay whole.**  A document is the grouping unit of a text corpus.
+   Each split owns a disjoint set of documents and packs every window from
+   its own documents only, so one document can never straddle two sides of a
+   train/val/test boundary.
+4. **Identical cleaning on every split.**  Missing / non-string / empty
+   texts, degenerate length outliers, exact duplicates and tokenizer
+   failures are dropped by the same code on train, validation and test -
+   always *after* the split.
+5. **Train statistics only.**  Nothing here estimates a statistic (mean,
+   variance, vocabulary, length) on validation or test data and feeds it back
+   into training; the held-out splits are read-only for evaluation.
+
+`build_dataloader` deliberately keeps its historical 5-argument call
+signature (the split / cleaning knobs travel through
+`configure_data_options`) so stubs that monkeypatch it in tests keep
+working.
+"""
+import hashlib
+import math
+from collections import Counter
+
+import torch
+from torch.utils.data import IterableDataset, get_worker_info
+
+# Defaults chosen so that "just run the trainer" already reserves a small,
+# deterministic, chronological validation and test slice instead of scoring on
+# training documents.
+DEFAULT_DATA_OPTIONS = {
+    "split": "train",            # logical split: train / validation / test
+    "val_frac": 0.005,           # fraction of the document stream held out
+    "test_frac": 0.005,          # sealed until the one-shot final evaluation
+    "num_documents": None,       # override when the dataset reports no size
+    "dedup": True,               # drop exact duplicate documents per split
+    "dedup_max": 1_000_000,      # bounded memory for the duplicate hash set
+    "min_doc_chars": 0,          # drop degenerate (shorter than this) docs
+    "max_doc_chars": 0,          # length-outlier cap, 0 = no cap
+    "shuffle_buffer": 0,         # train-split batch shuffle window, 0 = off
+    "seed": 42,
+}
+
+_active_data_options = dict(DEFAULT_DATA_OPTIONS)
+
+
+def configure_data_options(**overrides) -> dict:
+    """Set the split / cleaning options used by the next `build_dataloader`."""
+    unknown = sorted(set(overrides) - set(DEFAULT_DATA_OPTIONS))
+    if unknown:
+        raise KeyError(f"unknown data-pipeline option(s): {unknown}")
+    for key, value in overrides.items():
+        _active_data_options[key] = value
+    return dict(_active_data_options)
+
+
+def get_data_options() -> dict:
+    return dict(_active_data_options)
+
+
+def infer_num_documents(ds) -> int | None:
+    """Best-effort total document count of a streaming dataset.
+
+    HuggingFace datasets usually publish `num_examples` in the split metadata;
+    when they do not (or the object is a stub), the caller must pass
+    `num_documents` explicitly so the chronological boundary can be placed.
+    """
+    info = getattr(ds, "info", None)
+    splits = getattr(info, "splits", None)
+    if not splits:
+        return None
+    for name in ("train", "validation", "test"):
+        try:
+            split_info = splits.get(name)
+        except AttributeError:
+            split_info = splits[name] if name in splits else None
+        n = getattr(split_info, "num_examples", None) if split_info is not None else None
+        if isinstance(n, int) and n > 0:
+            return n
+    return None
+
+
+def split_document_boundaries(num_documents: int, val_frac: float, test_frac: float) -> dict:
+    """Contiguous, chronological boundaries over `num_documents` documents.
+
+    The three ranges are `[train][validation][test]` in upstream order: train
+    is the past, validation and test are the future.  They are disjoint by
+    construction, so no document (group) can appear on two sides.
+    """
+    num_documents = int(num_documents)
+    if num_documents <= 0:
+        raise ValueError(f"num_documents must be positive, got {num_documents}")
+    val_frac, test_frac = float(val_frac), float(test_frac)
+    if not (0.0 <= val_frac < 1.0 and 0.0 <= test_frac < 1.0):
+        raise ValueError(f"val_frac/test_frac must be in [0, 1), got {val_frac}/{test_frac}")
+    val_n = int(round(num_documents * val_frac))
+    test_n = int(round(num_documents * test_frac))
+    train_n = num_documents - val_n - test_n
+    if train_n <= 0:
+        raise ValueError(
+            f"val_frac={val_frac} + test_frac={test_frac} leaves no training documents "
+            f"out of num_documents={num_documents}"
+        )
+    return {
+        "train": (0, train_n),
+        "validation": (train_n, val_n),
+        "test": (train_n + val_n, test_n),
+    }
+
+
+def select_stream_split(ds, split: str, options: dict | None = None):
+    """Slice `ds` to the requested logical split; return `(stream, report)`.
+
+    `report` records the boundary actually used so runs can log - and reviewers
+    can verify - which documents were held out.
+    """
+    opts = dict(DEFAULT_DATA_OPTIONS)
+    if options:
+        opts.update(options)
+    if split not in ("train", "validation", "test"):
+        raise ValueError(f"unknown split '{split}'")
+    val_frac, test_frac = float(opts["val_frac"]), float(opts["test_frac"])
+    num_documents = opts.get("num_documents")
+    num_documents = int(num_documents) if num_documents is not None else infer_num_documents(ds)
+    report = {
+        "split": split,
+        "num_documents": num_documents,
+        "val_frac": val_frac,
+        "test_frac": test_frac,
+        "dedup": bool(opts["dedup"]),
+        "min_doc_chars": int(opts["min_doc_chars"]),
+        "max_doc_chars": int(opts["max_doc_chars"]),
+    }
+    if val_frac == 0.0 and test_frac == 0.0:
+        if split != "train":
+            raise ValueError(
+                f"val_frac=0 and test_frac=0 leave no documents for the {split} split"
+            )
+        report.update(start=0, count=None)
+        return ds, report
+    if num_documents is None:
+        raise ValueError(
+            "the dataset does not report how many documents it contains, so the "
+            "chronological train/validation/test boundary cannot be placed. Pass "
+            "--num-documents <total documents>, or explicitly disable the held-out "
+            "splits with --val-frac 0 --test-frac 0 (not recommended: the model then "
+            "has no unbiased validation signal)."
+        )
+    start, count = split_document_boundaries(num_documents, val_frac, test_frac)[split]
+    if count <= 0:
+        raise ValueError(
+            f"the {split} split is empty: num_documents={num_documents}, "
+            f"val_frac={val_frac}, test_frac={test_frac}"
+        )
+    report.update(start=start, count=count)
+    return ds.skip(start).take(count), report
+
+
+def load_document_stream(dataset_name: str, dataset_config: str | None, split: str, options: dict | None = None):
+    """Raw (unpacked, uncleaned) document stream for one logical split."""
+    from datasets import load_dataset
+
+    ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True)
+    return select_stream_split(ds, split, options or get_data_options())
+
+
+def document_hash(text: str) -> bytes:
+    return hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).digest()
+
+
+class DocumentCleaner:
+    """One cleaning policy, applied identically to every split, after the split.
+
+    Drops (with counters, so a run can report what was removed):
+    missing / non-string text (NaN or None from the upstream table), empty
+    documents, degenerate short documents, length outliers and exact
+    duplicates.  The duplicate set is bounded at `dedup_max` entries; beyond
+    that the cleaner keeps dropping documents but stops recording new hashes.
+    """
+
+    def __init__(self, dedup: bool = True, dedup_max: int = 1_000_000,
+                 min_doc_chars: int = 0, max_doc_chars: int = 0):
+        self.dedup = bool(dedup)
+        self.dedup_max = int(dedup_max)
+        self.min_doc_chars = int(min_doc_chars)
+        self.max_doc_chars = int(max_doc_chars)
+        self.seen: set = set()
+        self.stats: Counter = Counter()
+
+    def __call__(self, example):
+        self.stats["documents_read"] += 1
+        if not isinstance(example, dict):
+            self.stats["dropped_unreadable"] += 1
+            return None
+        text = example.get("text")
+        if text is None or (isinstance(text, float) and math.isnan(text)):
+            self.stats["dropped_missing_text"] += 1
+            return None
+        if not isinstance(text, str):
+            self.stats["dropped_non_string_text"] += 1
+            return None
+        text = text.strip()
+        if not text:
+            self.stats["dropped_empty"] += 1
+            return None
+        if self.min_doc_chars and len(text) < self.min_doc_chars:
+            self.stats["dropped_too_short"] += 1
+            return None
+        if self.max_doc_chars and len(text) > self.max_doc_chars:
+            self.stats["dropped_too_long"] += 1
+            return None
+        if self.dedup:
+            h = document_hash(text)
+            if h in self.seen:
+                self.stats["dropped_duplicate"] += 1
+                return None
+            if len(self.seen) < self.dedup_max:
+                self.seen.add(h)
+        self.stats["documents_kept"] += 1
+        return text
+
+    def report(self) -> dict:
+        return dict(self.stats)
+
+
+class PackedStream(IterableDataset):
+    """Pack cleaned documents of one split into fixed-length LM windows.
+
+    The buffer is private to the split: documents skipped by the split
+    selector never enter it, so packed windows cannot mix splits.
+    """
+
+    tokenize_batch = 64
+
+    def __init__(self, ds, tok, seq_len: int, cleaner: DocumentCleaner | None = None,
+                 shuffle_buffer: int = 0, seed: int = 42):
+        self.ds = ds
+        self.tok = tok
+        self.seq_len = int(seq_len)
+        self.cleaner = cleaner if cleaner is not None else DocumentCleaner()
+        self.shuffle_buffer = int(shuffle_buffer or 0)
+        self.seed = int(seed)
+        self.buf: list = []
+        self.pos = 0
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        n_workers = worker_info.num_workers if worker_info is not None else 1
+        # Duplicate removal is per epoch: a document repeated inside one pass
+        # is dropped, while a legitimate second epoch over the same corpus is
+        # not silently emptied by the first pass's hash set.
+        self.cleaner.seen = set()
+        return self._shuffle(self._pack(worker_id, n_workers), worker_id)
+
+    def _shuffle(self, stream, worker_id: int):
+        if self.shuffle_buffer <= 0:
+            yield from stream
+            return
+        import random as _random
+
+        rng = _random.Random(self.seed * 1000003 + worker_id)
+        window: list = []
+        for item in stream:
+            window.append(item)
+            if len(window) >= self.shuffle_buffer:
+                j = rng.randrange(len(window))
+                window[j], window[-1] = window[-1], window[j]
+                yield window.pop()
+        rng.shuffle(window)
+        yield from window
+
+    def _pack(self, worker_id: int, n_workers: int):
+        buf = self.buf
+        pos = self.pos
+        need = self.seq_len + 1
+        texts: list = []
+
+        def drain():
+            nonlocal pos
+            while len(buf) - pos >= need:
+                x = torch.tensor(buf[pos:pos + self.seq_len], dtype=torch.long)
+                y = torch.tensor(buf[pos + 1:pos + need], dtype=torch.long)
+                pos += self.seq_len
+                yield (x, y)
+            del buf[:pos]
+            pos = 0
+
+        def extend(batch):
+            try:
+                token_lists = self.tok(batch, add_special_tokens=False)["input_ids"]
+            except Exception:
+                token_lists = []
+                for text in batch:
+                    try:
+                        token_lists.append(self.tok(text, add_special_tokens=False)["input_ids"])
+                    except Exception:
+                        self.cleaner.stats["dropped_tokenization_error"] += 1
+            for ids in token_lists:
+                if not ids:
+                    continue
+                buf.extend(ids)
+                buf.append(self.tok.eos_token_id)
+
+        i = 0
+        for ex in self.ds:
+            if i % n_workers != worker_id:
+                i += 1
+                continue
+            i += 1
+            text = self.cleaner(ex)
+            if text is None:
+                continue
+            texts.append(text)
+            if len(texts) < self.tokenize_batch and len(buf) - pos < need:
+                continue
+            extend(texts)
+            texts = []
+            yield from drain()
+        if texts:
+            extend(texts)
+            yield from drain()
+        self.pos = pos
+
+
+def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int,
+                     batch_size: int, tokenizer: str = "gpt2"):
+    """Build the DataLoader for the split currently configured.
+
+    Kept at five arguments on purpose - the split / cleaning knobs are read
+    from `configure_data_options`; existing callers and test stubs keep
+    working unchanged.
+    """
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    from torch.utils.data import DataLoader
+
+    opts = get_data_options()
+    tok = AutoTokenizer.from_pretrained(tokenizer)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    stream_ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True)
+    stream_ds, report = select_stream_split(stream_ds, opts["split"], opts)
+    report["shuffle_buffer"] = int(opts["shuffle_buffer"]) if opts["split"] == "train" else 0
+    cleaner = DocumentCleaner(
+        dedup=opts["dedup"],
+        dedup_max=opts["dedup_max"],
+        min_doc_chars=opts["min_doc_chars"],
+        max_doc_chars=opts["max_doc_chars"],
+    )
+    stream = PackedStream(
+        stream_ds,
+        tok,
+        seq_len,
+        cleaner=cleaner,
+        shuffle_buffer=report["shuffle_buffer"],
+        seed=opts["seed"],
+    )
+    loader = DataLoader(stream, batch_size=batch_size, num_workers=2,
+                        pin_memory=torch.cuda.is_available())
+    loader.split_report = report
+    return loader
+
+
+__all__ = [
+    "DEFAULT_DATA_OPTIONS",
+    "DocumentCleaner",
+    "PackedStream",
+    "build_dataloader",
+    "configure_data_options",
+    "document_hash",
+    "get_data_options",
+    "infer_num_documents",
+    "load_document_stream",
+    "select_stream_split",
+    "split_document_boundaries",
+]

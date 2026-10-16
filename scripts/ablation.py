@@ -87,11 +87,24 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
             print(f'  [step {step:4d}] loss={loss_val:.4f}', flush=True)
     if not losses:
         raise ValueError(f"ablation '{name}' produced no steps")
+    # Held-out validation loss: fresh synthetic batches from a generator the
+    # optimizer has never seen (seed + 1), evaluated with no gradients. Model
+    # comparisons must use this - the training loss above is fitted data.
+    n_val_batches = max(1, getattr(args, 'val_batches', 20))
+    val_rng = torch.Generator(device=device).manual_seed(args.seed + 1)
+    model.eval()
+    val_losses = []
+    with torch.no_grad():
+        for _ in range(n_val_batches):
+            vx, vy = markov_batch(val_rng, model.cfg.ignore_index, args.batch_size, args.seq_len, device, outlier_id=outlier_id)
+            val_losses.append(model(vx, vy, return_logits=False)[1].item())
+    model.train()
+    val_loss = sum(val_losses) / len(val_losses)
     stats = act_stats.summary()
-    summary = {'name': name, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'elapsed_s': time.time() - t0}
+    summary = {'name': name, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'elapsed_s': time.time() - t0}
     with open(output_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
-    print(f"  [done] {summary['final_loss']:.4f} max_abs_pre_norm={summary['max_abs_pre_norm']}")
+    print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} max_abs_pre_norm={summary['max_abs_pre_norm']}")
     return summary
 
 def merge_summaries(previous: list, fresh: list) -> list:
@@ -126,6 +139,7 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--stats-every', type=int, default=200)
+    p.add_argument('--val-batches', type=int, default=20, help='held-out synthetic batches for the selection metric (val_loss); never used for gradient updates')
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
     apply_config_to_parser(p, known.config)

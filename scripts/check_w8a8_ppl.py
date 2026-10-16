@@ -127,9 +127,19 @@ def _probe_markov(rng, batch_size, seq_len, device, n_states=64):
     x, _ = markov_batch(rng, -100, batch_size, seq_len, device, n_states=n_states)
     return x
 
-def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len):
+def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None):
+    # Scoring a checkpoint on the documents it trained on understates the
+    # quantization damage; the probe must come from a held-out split. The
+    # default is the chronological validation slice.
     from scripts.train_gpt2 import build_dataloader
+    from scripts.data_pipeline import configure_data_options
+    configure_data_options(split=split, val_frac=val_frac, test_frac=test_frac,
+                           num_documents=num_documents)
     loader = build_dataloader(dataset, dataset_config, seq_len, batch_size, tokenizer=tokenizer)
+    if split != 'train':
+        report = getattr(loader, 'split_report', None)
+        if report:
+            print(f'[w8a8] dataset probe split: {report}', file=sys.stderr)
     it = iter(loader)
 
     def _next():
@@ -145,6 +155,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpts', nargs='+', required=True)
     p.add_argument('--probe', default='markov', choices=['markov', 'dataset', 'random'], help="probe corpus. 'random' is uniform tokens: it has no next-token signal, so ppl_fp ~= vocab_size and the PPL drop is unmeasurable (kept only for parity)")
+    p.add_argument('--probe-split', default='validation', choices=['validation', 'test', 'train'], help="held-out split used by --probe dataset. Keep the default: 'test' is sealed for one final evaluation and 'train' reports an optimistically biased PPL")
+    p.add_argument('--val-frac', type=float, default=0.005, help='chronological validation fraction (must match the trained run)')
+    p.add_argument('--test-frac', type=float, default=0.005, help='chronological test fraction (must match the trained run)')
+    p.add_argument('--num-documents', type=int, default=None, help='total documents in the stream; required when the dataset reports no size')
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
     p.add_argument('--tokenizer', default='gpt2', help='tokenizer for --probe dataset; a checkpoint that recorded the one it was trained with wins')
@@ -169,7 +183,15 @@ def main():
     for ckpt_path in args.ckpts:
         rng = torch.Generator(device=device).manual_seed(args.seed)
         model, ckpt_args = load_ckpt(ckpt_path, device=device)
-        dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len) if args.probe == 'dataset' else None
+        # Prefer the split the checkpoint was trained with, so the probe is the
+        # same held-out slice; a flag typed on the command line wins.
+        def split_arg(name):
+            value = getattr(args, name)
+            default = p.get_default(name)
+            if value == default and name in ckpt_args and ckpt_args.get(name) is not None:
+                return ckpt_args[name]
+            return value
+        dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents')) if args.probe == 'dataset' else None
         batches = []
         for _ in range(max(1, args.n_batches)):
             x = make_probe(rng, model.cfg, dataset_probe)
@@ -194,7 +216,9 @@ def main():
             ce_q += b
         ppl_fp = math.exp(ce_fp / n_tok)
         ppl_q = math.exp(ce_q / n_tok)
-        r = {'ckpt': ckpt_path, 'probe': args.probe, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage}
+        r = {'ckpt': ckpt_path, 'probe': args.probe, 'probe_split': args.probe_split if args.probe == 'dataset' else None, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage}
+        if args.probe == 'dataset' and args.probe_split != 'validation':
+            print(f"[w8a8] WARNING: --probe dataset scored on the '{args.probe_split}' split; use 'validation' for model comparison ('test' is reserved for the single final evaluation, 'train' is optimistically biased)", file=sys.stderr)
         if ppl_fp >= 0.5 * model.cfg.vocab_size:
             print(f'[w8a8] WARNING: {ckpt_path} ppl_fp={ppl_fp:.1f} is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={coverage:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet', file=sys.stderr)
         print(f'[w8a8] {ckpt_path}: {r}')

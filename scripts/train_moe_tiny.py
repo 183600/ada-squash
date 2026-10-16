@@ -176,6 +176,10 @@ def main():
     p.add_argument('--probe', default='markov', choices=['markov', 'random'], help="corpus. 'random' is uniform token ids: it has no next-token signal, so the LM loss is pinned at log(vocab_size) and the run learns nothing")
     p.add_argument('--dataset', default=None, help='optional HF dataset name; when given, replaces the synthetic corpus with packed real text')
     p.add_argument('--dataset-config', default=None)
+    p.add_argument('--val-frac', type=float, default=0.005, help='chronological validation fraction (real-data mode)')
+    p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction (real-data mode)')
+    p.add_argument('--num-documents', type=int, default=None, help='total documents; required when the dataset reports no size')
+    p.add_argument('--val-batches', type=int, default=10, help='held-out validation batches at the end of training (0 disables)')
     p.add_argument('--tokenizer', default='gpt2')
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -238,7 +242,40 @@ def main():
             print(f'  [moe] step={step:4d} loss={loss_val:.4f} aux={aux_val:.4f} expert_cv={exp_cv:.3f}', flush=True)
     with open(Path(args.output_dir) / 'history.json', 'w') as f:
         json.dump(history, f)
+    # Held-out validation loss: real data comes from the chronological
+    # validation split; the synthetic corpus uses a generator (seed + 1) the
+    # optimizer never saw. No gradients flow from either.
+    val_loss = None
+    if args.val_batches > 0:
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            if args.dataset:
+                from scripts.data_pipeline import configure_data_options
+                configure_data_options(split='validation', val_frac=args.val_frac,
+                                       test_frac=args.test_frac, num_documents=args.num_documents)
+                val_iter = iter(build_dataloader(args.dataset, args.dataset_config, args.seq_len, args.batch_size, tokenizer=args.tokenizer))
+            else:
+                val_iter = None
+            val_rng = torch.Generator(device=device).manual_seed(args.seed + 1)
+            for _ in range(args.val_batches):
+                if val_iter is not None:
+                    try:
+                        vx, vy = next(val_iter)
+                    except StopIteration:
+                        val_iter = iter(build_dataloader(args.dataset, args.dataset_config, args.seq_len, args.batch_size, tokenizer=args.tokenizer))
+                        vx, vy = next(val_iter)
+                    vx = vx.to(device, non_blocking=True)
+                    vy = vy.to(device, non_blocking=True)
+                else:
+                    vx, vy = markov_batch(val_rng, cfg.ignore_index, args.batch_size, args.seq_len, device)
+                val_losses.append(model(vx, vy, return_logits=False)[1].item())
+        model.train()
+        val_loss = sum(val_losses) / len(val_losses)
+        print(f'[moe][val] held-out loss={val_loss:.4f}')
     s = act_stats.summary()
+    if val_loss is not None:
+        s['val_loss'] = val_loss
     with open(Path(args.output_dir) / 'stats.json', 'w') as f:
         json.dump(s, f, indent=2, default=str)
     print(f'[done] saved to {args.output_dir} | n_loss_spikes={loss_spike.n_spikes}')

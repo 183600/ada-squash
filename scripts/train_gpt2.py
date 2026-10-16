@@ -15,67 +15,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from adasquash import GPTConfig, GPT, build_norm, count_parameters, ActivationStats, LossSpikeCounter
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
-
-def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int, batch_size: int, tokenizer: str='gpt2'):
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
-    from torch.utils.data import DataLoader, IterableDataset
-    tok = AutoTokenizer.from_pretrained(tokenizer)
-    if tok.pad_token_id is None:
-        tok.pad_token_id = tok.eos_token_id
-
-    class PackedStream(IterableDataset):
-        tokenize_batch = 64
-
-        def __init__(self, ds, tok, seq_len):
-            self.ds = ds
-            self.tok = tok
-            self.seq_len = seq_len
-            self.buf: list = []
-            self.pos = 0
-
-        def __iter__(self):
-            worker_info = torch.utils.data.get_worker_info()
-            worker_id = worker_info.id if worker_info is not None else 0
-            n_workers = worker_info.num_workers if worker_info is not None else 1
-            buf = self.buf
-            pos = self.pos
-            need = self.seq_len + 1
-            texts: list = []
-
-            def drain():
-                nonlocal pos
-                while len(buf) - pos >= need:
-                    x = torch.tensor(buf[pos:pos + self.seq_len], dtype=torch.long)
-                    y = torch.tensor(buf[pos + 1:pos + need], dtype=torch.long)
-                    pos += self.seq_len
-                    yield (x, y)
-                del buf[:pos]
-                pos = 0
-
-            def extend(batch):
-                for ids in self.tok(batch, add_special_tokens=False)['input_ids']:
-                    buf.extend(ids)
-                    buf.append(self.tok.eos_token_id)
-            i = 0
-            for ex in self.ds:
-                if i % n_workers != worker_id:
-                    i += 1
-                    continue
-                i += 1
-                texts.append(ex.get('text', ''))
-                if len(texts) < self.tokenize_batch and len(buf) - pos < need:
-                    continue
-                extend(texts)
-                texts = []
-                yield from drain()
-            if texts:
-                extend(texts)
-                yield from drain()
-            self.pos = pos
-    ds = load_dataset(dataset_name, dataset_config, split='train', streaming=True)
-    stream = PackedStream(ds, tok, seq_len)
-    return DataLoader(stream, batch_size=batch_size, num_workers=2, pin_memory=torch.cuda.is_available())
+from scripts.data_pipeline import build_dataloader, configure_data_options
 
 def load_yaml_config(path: str) -> dict:
     import yaml
@@ -144,6 +84,72 @@ def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()
             continue
         setattr(args, name, ckpt_args[name])
     return changed
+# The split-defining args are part of a run's identity: resuming with a
+# different boundary could move documents the model already trained on into
+# the validation split (and vice versa), so they are restored from the
+# checkpoint exactly like the schedule flags.
+_DATA_ARGS = ('dataset', 'dataset_config', 'val_frac', 'test_frac', 'num_documents')
+
+def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
+    changed = []
+    for name in _DATA_ARGS:
+        if name not in ckpt_args:
+            continue
+        if getattr(args, name, None) != ckpt_args[name]:
+            changed.append(name)
+        if name in explicit:
+            continue
+        setattr(args, name, ckpt_args[name])
+    return changed
+
+def open_data_split(split: str, args, seq_len: int | None = None):
+    """Open one logical split through the shared leakage-safe pipeline."""
+    configure_data_options(
+        split=split,
+        val_frac=args.val_frac,
+        test_frac=args.test_frac,
+        num_documents=args.num_documents,
+        dedup=args.dedup,
+        min_doc_chars=args.min_doc_chars,
+        max_doc_chars=args.max_doc_chars,
+        shuffle_buffer=args.train_shuffle_buffer if split == 'train' else 0,
+        seed=args.seed,
+    )
+    return build_dataloader(args.dataset, args.dataset_config, seq_len or args.seq_len, args.batch_size, tokenizer=args.tokenizer)
+
+def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device) -> float | None:
+    """Mean loss over held-out batches; `state['iter']` carries the position.
+
+    Runs under `no_grad` and eval mode: no gradient ever flows from a
+    validation or test batch into the parameters.
+    """
+    model.eval()
+    it = state.get('iter')
+    total = 0.0
+    n = 0
+    with torch.no_grad():
+        for _ in range(max(1, int(n_batches))):
+            if it is None:
+                it = iter(loader)
+                state['iter'] = it
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(loader)
+                state['iter'] = it
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    break
+            x, y = batch
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with ctx:
+                loss = model(x, y, return_logits=False)[1]
+            total += float(loss.detach().item())
+            n += 1
+    model.train()
+    return total / n if n else None
 
 def load_model_state_dict(model, state_dict) -> None:
     target = getattr(model, '_orig_mod', model)
@@ -201,6 +207,18 @@ def main():
     p.add_argument('--no-tie-embeddings', dest='tie_embeddings', action='store_false')
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
+    p.add_argument('--val-frac', type=float, default=0.005, help='chronological held-out validation fraction of the document stream (split order is train=oldest, then val, then test; never shuffled)')
+    p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction of the document stream, evaluated once at the end only with --final-test-eval')
+    p.add_argument('--num-documents', type=int, default=None, help='total documents in the stream; required when the dataset reports no size')
+    p.add_argument('--val-every', type=int, default=500, help='run a held-out validation pass every N optimizer steps (0 disables; 0 is not recommended)')
+    p.add_argument('--val-batches', type=int, default=10, help='batches per held-out validation pass')
+    p.add_argument('--early-stop-patience', type=int, default=0, help='stop after this many validation passes without improvement (0 = off)')
+    p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first)')
+    p.add_argument('--test-batches', type=int, default=20, help='batches for the one-shot final test evaluation')
+    p.add_argument('--min-doc-chars', type=int, default=0, help='drop documents shorter than this many characters (0 = keep all non-empty)')
+    p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap)')
+    p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
+    p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation or test')
     p.add_argument('--seq-len', type=int, default=1024)
     p.add_argument('--batch-size', type=int, default=32, help='per-device micro batch')
     p.add_argument('--grad-accum', type=int, default=1)
@@ -226,7 +244,7 @@ def main():
     p.add_argument('--resume', default=None, help='checkpoint to resume from')
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
-    explicit = frozenset((name for name in _SCHEDULE_ARGS + _RESUME_RUN_ARGS if getattr(args, name, None) != p.get_default(name)))
+    explicit = frozenset((name for name in _SCHEDULE_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)))
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     resume_ckpt = None
     run_args: dict = {}
@@ -290,8 +308,26 @@ def main():
     n_trainable = count_parameters(model, trainable_only=True)
     print(f'[model] {args.model} | total={n_params / 1000000.0:.2f}M | trainable={n_trainable / 1000000.0:.2f}M | norm={args.norm}')
     print(f'[model] norm param breakdown: {model.norm_param_count()}')
-    loader = build_dataloader(args.dataset, args.dataset_config, args.seq_len, args.batch_size, tokenizer=args.tokenizer)
+    if resume_ckpt is not None:
+        data_changed = restore_data_args(args, run_args, explicit=explicit)
+        if data_changed:
+            kept = [n for n in data_changed if n in explicit]
+            adopted = [n for n in data_changed if n not in explicit]
+            if adopted:
+                print(f'[resume] data-split args restored from checkpoint: {adopted}')
+            if kept:
+                print(f'[resume] keeping your explicit data-split override(s) {kept} - the resumed run therefore evaluates on a different split than the one it continues')
+    loader = open_data_split('train', args)
     data_iter = iter(loader)
+    report = getattr(loader, 'split_report', None)
+    if report:
+        print(f'[data] train split: {report}')
+    val_loader = None
+    val_state: dict = {'iter': None}
+    best_val_loss = float('inf')
+    best_val_step = 0
+    val_checks_without_improvement = 0
+    last_val_loss = None
     start_step = 0
     if resume_ckpt is not None:
         changed = restore_schedule_args(args, run_args, explicit=explicit)
@@ -369,11 +405,37 @@ def main():
         sched.step()
         loss_spike.update(loss_val)
         step += 1
+        if args.val_every > 0 and step % args.val_every == 0:
+            if val_loader is None:
+                val_loader = open_data_split('validation', args)
+                rval = getattr(val_loader, 'split_report', None)
+                if rval:
+                    print(f'[data] validation split: {rval}')
+            val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device)
+            if val_loss is not None:
+                last_val_loss = val_loss
+                improved = val_loss < best_val_loss
+                if improved:
+                    best_val_loss = val_loss
+                    best_val_step = step
+                    val_checks_without_improvement = 0
+                else:
+                    val_checks_without_improvement += 1
+                print(f'[val] step={step} val_loss={val_loss:.4f} best={best_val_loss:.4f}@{best_val_step} (no improvement x{val_checks_without_improvement})', flush=True)
+                if tb:
+                    tb.add_scalar('val/loss', val_loss, step)
+                if improved:
+                    ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss}
+                    path = Path(args.output_dir) / 'ckpt_best.pt'
+                    torch.save(ckpt_best, path)
+                    print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
         if step % args.log_every == 0:
             lr = opt.param_groups[0]['lr']
             line = f'step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}'
             print(line, flush=True)
             row = {'step': step, 'loss': loss_val, 'lr': lr, 'n_loss_spikes': loss_spike.n_spikes}
+            if last_val_loss is not None:
+                row['val_loss'] = last_val_loss
             with open(log_path, 'a') as f:
                 f.write(json.dumps(row) + '\n')
             if tb:
@@ -395,10 +457,32 @@ def main():
             path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
             torch.save(ckpt, path)
             print(f'[ckpt] saved {path}')
+        if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
+            print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
+            break
     ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict()}
     path = Path(args.output_dir) / 'ckpt_final.pt'
     torch.save(ckpt, path)
     print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
+    if args.final_test_eval:
+        # The test split is opened exactly once, after training is over, and
+        # only the checkpoint selected on the validation split is scored.
+        test_loader = open_data_split('test', args)
+        rtest = getattr(test_loader, 'split_report', None)
+        if rtest:
+            print(f'[data] test split: {rtest}')
+        best_path = Path(args.output_dir) / 'ckpt_best.pt'
+        if val_loader is not None and best_path.exists():
+            best = torch.load(best_path, map_location=device, weights_only=False)
+            load_model_state_dict(model, best['model'])
+            print(f"[test] restored best-validation checkpoint (step {int(best.get('step', 0))}, val_loss={float(best.get('val_loss', float('nan'))):.4f}) before the one-shot test evaluation")
+        test_state = {'iter': iter(test_loader)}
+        test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device)
+        results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac}
+        out_path = Path(args.output_dir) / 'test_results.json'
+        with open(out_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f'[test] sealed test split evaluated once: test_loss={test_loss} -> {out_path}')
     if tb:
         tb.close()
     if args.wandb_project:
