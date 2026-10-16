@@ -384,11 +384,11 @@ class _DyTDForward(torch.autograd.Function):
         if ctx.needs_input_grad[3]:
             grad_gamma = _sum_leading_dims(w)
         w.mul_(phi)
+        del phi
         torch.sub(grad_out, w, out=w)
         w.mul_(gamma)
         grad_a = _dot_all(w, x)
         w.mul_(a)
-        del phi
         grad_x = w
         grad_alpha_0 = grad_a * exp_kdr
         grad_k = -grad_a * a * depth_ratio
@@ -430,11 +430,11 @@ class _DyTForward(torch.autograd.Function):
         if ctx.needs_input_grad[2]:
             grad_gamma = _sum_leading_dims(w)
         w.mul_(phi)
+        del phi
         torch.sub(grad_out, w, out=w)
         w.mul_(gamma)
         grad_alpha = _dot_all(w, x)
         w.mul_(alpha)
-        del phi
         grad_x = w
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[3]:

@@ -20,6 +20,7 @@ class CausalSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self._rope_cache: Optional[tuple] = None
         self._tril_cache: Optional[tuple] = None
+        self._logit_buf: Optional[tuple] = None
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
         self.attn_drop = nn.Dropout(dropout)
@@ -85,6 +86,14 @@ class CausalSelfAttention(nn.Module):
         return mask
     _LOGITS_CHUNK_BYTES = 1 << 27
 
+    def _logit_scratch(self, B: int, H: int, R: int, T: int, q: torch.Tensor) -> torch.Tensor:
+        key = (B, H, R, T, q.dtype, q.device)
+        cache = self._logit_buf
+        if cache is None or cache[0] != key:
+            cache = (key, torch.empty(B, H, R, T, dtype=q.dtype, device=q.device))
+            self._logit_buf = cache
+        return cache[1]
+
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
         B, H = (q.shape[0], q.shape[1])
         rows = max(1, self._LOGITS_CHUNK_BYTES // max(1, B * H * T * q.element_size()))
@@ -98,7 +107,7 @@ class CausalSelfAttention(nn.Module):
         peak_sq = torch.zeros((), dtype=q.dtype, device=device)
         drop = self._tril_mask(T, device)
         k_t = k.transpose(-1, -2)
-        buf = torch.empty(B, H, min(rows, T), T, dtype=q.dtype, device=device)
+        buf = self._logit_scratch(B, H, min(rows, T), T, q)
         block = None
         for start in range(0, T, rows):
             end = min(start + rows, T)

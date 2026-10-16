@@ -340,13 +340,15 @@ class _SwiGLU(torch.autograd.Function):
             h = F.silu(a, inplace=True)
         if need_b:
             grad_b = grad_h.mul_(h)
+        del grad_h
+        if do_w2:
+            grad_w2 = grad_out.t() @ h.mul_(b)
+        del a, b, h
         if do_x:
             grad_x = grad_a @ w1
             grad_x.addmm_(grad_b, w3)
         if do_w1:
             grad_w1 = grad_a.t() @ x
-        if do_w2:
-            grad_w2 = grad_out.t() @ h.mul_(b)
         if do_w3:
             grad_w3 = grad_b.t() @ x
         xd, w1d, w2d, w3d = ctx.in_dtypes
