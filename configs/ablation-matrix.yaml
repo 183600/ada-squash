@@ -58,6 +58,23 @@ ablations:
     hypothesis: >
       Combining the per-channel and depth axes beats both single-axis
       variants: the two mechanisms interact positively.
+  - name: dytcd_no_perchannel
+    norm: dytcd
+    learnable_delta: false
+    hypothesis: >
+      Leave-one-out for the main proposal's per-channel axis: delta is a
+      frozen zero buffer, so alpha_c == alpha_l exactly while the depth
+      schedule, the softsign family and the LayerScale residual stay
+      identical to dytcd_full. A loss increase here is attributable to the
+      per-channel deviation alone (the dytd_full row changes tanh -> softsign
+      as well and cannot isolate this axis).
+  - name: dytd_full
+    norm: dytd
+    hypothesis: >
+      Activation-family reference: depth-conditioned tanh (plus LayerScale)
+      against the softsign family, run on the identical protocol so the
+      dytd_full -> dytcd_full bundle (activation family + per-channel axis)
+      can be read alongside the clean per-channel contrast above.
 
   # --- Axis isolation: depth conditioning ---
   - name: dytcd_k0_no_depth_schedule
@@ -77,11 +94,6 @@ ablations:
     hypothesis: >
       Depth decay is the source of DyT-D's gain: with k pinned at 0 and
       frozen the advantage of dytd_full over scalar DyT should vanish.
-  - name: dytd_full
-    norm: dytd
-    hypothesis: >
-      Depth-conditioned alpha (plus LayerScale) beats scalar DyT at this
-      depth: strong shallow squashing with a relaxed deep response helps.
 
   # --- LayerScale residual gate ---
   - name: dytcd_no_ls

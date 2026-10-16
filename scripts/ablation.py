@@ -12,8 +12,11 @@ Comparison protocol (what the runner guarantees, and checks)
 * **Complete ablation coverage.** `validate_matrix` checks the leave-one-out
   set for the main proposal (`LOO_SPEC`): Full, Full-minus-per-channel,
   Full-minus-depth-decay and Full-minus-LayerScale must all be present and
-  differ from Full in exactly the declared knob(s). A mechanism that is never
-  isolated cannot be claimed to help.
+  differ from Full in exactly the declared knob(s) - e.g. the per-channel
+  contrast uses the frozen-delta row, not `dytd_full`, which also switches
+  tanh -> softsign. `leave_one_out_comparison` then runs the paired
+  Full-vs-Full-minus-X test (Holm-adjusted over mechanisms), so "each axis
+  helps" is a tested claim rather than an eyeballed delta.
 * **Statistical reliability.** Every row is replicated over >= 3 seeds by
   default and reported as mean +/- std across seeds; the row-vs-baseline
   significance test runs on the paired per-seed means when both rows share
@@ -34,7 +37,7 @@ from adasquash.metrics import holm_adjust, mean_std_stderr, paired_z_one_sided, 
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
-ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0)}
+ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0)}
 # Every row must state *why* it is run (the scientific hypothesis it tests),
 # not just what it configures. `load_ablations_from_config` enforces this for
 # YAML rows; these are the hypotheses of the built-in fallback rows.
@@ -44,6 +47,7 @@ ABLATION_HYPOTHESES = {
     'dyt_no_perchannel': 'Original DyT (one scalar alpha, tanh) matches or beats the LayerNorm/RMSNorm references at this scale, reproducing the paper claim under our protocol.',
     'dytc_perchannel': 'Adding the per-channel axis (p fixed at 2, jitter off, so only the axis changes) improves held-out loss over scalar DyT.',
     'dytcd_full': 'Combining the per-channel and depth axes beats both single-axis variants: the two mechanisms interact positively.',
+    'dytcd_no_perchannel': 'Leave-one-out for the per-channel axis of the main proposal: with delta frozen at zero (a zero buffer, not a parameter) alpha_c == alpha_l exactly, while the depth schedule, the softsign family and the LayerScale residual stay identical to the full model. Unlike the dytd_full row, this contrast changes no other mechanism, so a loss increase here is attributable to the per-channel deviation alone.',
     'dytcd_k0_no_depth_schedule': 'Leave-one-out for the depth axis of the main proposal: with k pinned to 0 and frozen, DyT-CD keeps its per-channel factor, softsign and LayerScale, so any loss of the full model advantage is attributable to depth decay.',
     'dytd_k0_no_depth_schedule': 'Depth decay is the source of DyT-D gain: with k pinned to 0 and frozen, dytd_full advantage should vanish.',
     'dytd_full': 'Depth-conditioned alpha (+ LayerScale) beats scalar DyT here: shallow strong squashing + deep relaxed response helps this depth.',
@@ -86,10 +90,16 @@ DEFAULT_SEEDS = (42, 43, 44)
 # one claimed mechanism and the matrix row that removes exactly it. The claim
 # "mechanism X helps" is supportable only when the Full model and its X-free
 # reference ran on the identical protocol; `validate_matrix` refuses to run
-# the matrix when a mechanism is never isolated.
+# the matrix when a mechanism is never isolated. Each removal must change the
+# declared knobs *and nothing else*: the `dytd_full` row also switches
+# tanh -> generalized softsign, so it cannot isolate the per-channel axis (it
+# stays in the matrix as the activation-family reference); the per-channel
+# contrast uses `dytcd_no_perchannel`, whose only effective difference from
+# Full is the frozen delta buffer.
 LOO_SPEC = {
     'dytcd_full': {
-        'per_channel_softsign': {'row': 'dytd_full', 'diff': ('norm_name',)},
+        'per_channel_delta': {'row': 'dytcd_no_perchannel',
+                              'diff': ('learnable_delta',)},
         'depth_decay': {'row': 'dytcd_k0_no_depth_schedule',
                         'diff': ('k_init', 'learnable_k')},
         'layerscale_residual': {'row': 'dytcd_no_ls',
@@ -412,6 +422,34 @@ def _row_std(row):
         return row.get('val_loss_seed_std')
     return row.get('val_loss_std')
 
+def _paired_row_test(row: dict, reference: dict, margin: float=0.0):
+    """One-sided paired test of `row` against `reference`, seed-paired first.
+
+    Every comparison in this module must run through the *same* test logic,
+    or `baseline_comparison` and `leave_one_out_comparison` could disagree on
+    the same pair of rows. Seeds are the unit of replication: when both rows
+    share >= 2 seeds the test runs on the paired per-seed means; otherwise it
+    falls back to the shared held-out batches of one run (paired when the
+    batch counts match, Welch when they do not). Returns
+    `(test, basis, common_seeds)`, with `test=None` when no basis exists.
+    """
+    row_seeds = _seed_means(row)
+    ref_seeds = _seed_means(reference)
+    common = sorted(set(row_seeds) & set(ref_seeds))
+    if len(common) >= 2:
+        test = paired_z_one_sided([row_seeds[s] for s in common],
+                                  [ref_seeds[s] for s in common], margin=margin)
+        return test, 'seed_means', common
+    row_batches = row.get('val_losses')
+    ref_batches = reference.get('val_losses')
+    if (isinstance(row_batches, list) and isinstance(ref_batches, list)
+            and len(row_batches) == len(ref_batches) and len(row_batches) >= 2):
+        return paired_z_one_sided(row_batches, ref_batches, margin=margin), 'val_batches', common
+    if (isinstance(row_batches, list) and isinstance(ref_batches, list)
+            and len(row_batches) >= 2 and len(ref_batches) >= 2):
+        return welch_z_one_sided(row_batches, ref_batches, margin=margin), 'val_batches_unpaired', common
+    return None, None, common
+
 def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alpha: float=0.05) -> dict | None:
     """Every row's held-out val_loss against the best reference baseline.
 
@@ -451,7 +489,6 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
                      'otherwise on the shared held-out batches of one run'),
         'rows': [],
     }
-    ref_batches = reference.get('val_losses')
     for row in usable:
         if row['name'] in baseline_names:
             continue
@@ -471,24 +508,9 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'p_one_sided': None,
             'p_one_sided_holm': None,
         }
-        test = None
-        row_seeds = _seed_means(row)
-        common = sorted(set(row_seeds) & set(ref_seeds))
-        if len(common) >= 2:
-            test = paired_z_one_sided([row_seeds[s] for s in common],
-                                      [ref_seeds[s] for s in common], margin=margin)
-            entry['test_basis'] = 'seed_means'
-            entry['paired_seeds'] = common
-        else:
-            row_batches = row.get('val_losses')
-            if (isinstance(row_batches, list) and isinstance(ref_batches, list)
-                    and len(row_batches) == len(ref_batches) and len(row_batches) >= 2):
-                test = paired_z_one_sided(row_batches, ref_batches, margin=margin)
-                entry['test_basis'] = 'val_batches'
-            elif (isinstance(row_batches, list) and isinstance(ref_batches, list)
-                  and len(row_batches) >= 2 and len(ref_batches) >= 2):
-                test = welch_z_one_sided(row_batches, ref_batches, margin=margin)
-                entry['test_basis'] = 'val_batches_unpaired'
+        test, basis, common = _paired_row_test(row, reference, margin=margin)
+        entry['test_basis'] = basis
+        entry['paired_seeds'] = common
         if test is not None:
             entry['test'] = 'paired_z_one_sided' if test['paired'] else 'welch_z_one_sided'
             entry['p_one_sided'] = test['p_one_sided']
@@ -538,6 +560,120 @@ def print_baseline_comparison(comparison: dict | None) -> None:
               f"significant={entry['beats_reference_significantly']}")
     if comparison.get('rows_with_fewer_than_3_seeds'):
         print(f"[compare] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
+              f"{comparison['rows_with_fewer_than_3_seeds']}")
+
+def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: float=0.0, alpha: float=0.05) -> dict | None:
+    """Full vs each Full-minus-X row: does removing mechanism X hurt?
+
+    `check_leave_one_out` proves the *structure* of the leave-one-out matrix -
+    the reference row differs from Full in exactly the declared knobs. This
+    function adds the statistical half: for every declared mechanism it runs
+    the same one-sided paired test as `baseline_comparison`, of H1 "Full has
+    lower held-out val_loss than the X-free row". Because all mechanisms are
+    tested against the same Full row, the per-mechanism p-values are
+    Holm-Bonferroni adjusted before a mechanism is called significantly
+    helpful; a point-estimate win inside the seed noise remains visible as
+    `mechanism_helps=True, mechanism_helps_significantly=False`. This is what
+    backs the claim that each axis of the main proposal is load-bearing on
+    its own, not merely correlated with the others. Returns None when no
+    declared contrast has both rows with a usable val_loss.
+    """
+    spec = LOO_SPEC if spec is None else spec
+    usable = {r['name']: r for r in summaries
+              if isinstance(r, dict) and 'name' in r and isinstance(r.get('val_loss'), (int, float))}
+    rows: list = []
+    for full_name, removals in spec.items():
+        full = usable.get(full_name)
+        for mechanism, info in removals.items():
+            ref_name = info['row']
+            ref = usable.get(ref_name)
+            entry = {
+                'full': full_name,
+                'mechanism': mechanism,
+                'reference_row': ref_name,
+                'declared_diff': sorted(info['diff']),
+                'full_val_loss': None if full is None else full['val_loss'],
+                'full_val_loss_std': None if full is None else _row_std(full),
+                'reference_val_loss': None if ref is None else ref['val_loss'],
+                'reference_val_loss_std': None if ref is None else _row_std(ref),
+                'n_seeds_full': None if full is None else full.get('n_seeds', 1),
+                'n_seeds_reference': None if ref is None else ref.get('n_seeds', 1),
+                'delta_full_minus_reference': None,
+                'mechanism_helps': False,
+                'mechanism_helps_significantly': False,
+                'test': None,
+                'test_basis': None,
+                'paired_seeds': [],
+                'p_one_sided': None,
+                'p_one_sided_holm': None,
+            }
+            if full is None:
+                entry['skipped'] = f"full row '{full_name}' has no usable val_loss"
+                rows.append(entry)
+                continue
+            if ref is None:
+                entry['skipped'] = f"Full-minus-X row '{ref_name}' has no usable val_loss"
+                rows.append(entry)
+                continue
+            entry['delta_full_minus_reference'] = full['val_loss'] - ref['val_loss']
+            entry['mechanism_helps'] = bool(entry['delta_full_minus_reference'] < -margin)
+            test, basis, common = _paired_row_test(full, ref, margin=margin)
+            entry['test_basis'] = basis
+            entry['paired_seeds'] = common
+            if test is not None:
+                entry['test'] = 'paired_z_one_sided' if test['paired'] else 'welch_z_one_sided'
+                entry['p_one_sided'] = test['p_one_sided']
+                entry['z'] = test['z']
+                entry['n'] = test['n']
+            rows.append(entry)
+    if not rows:
+        return None
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in rows])
+    for entry, p_holm in zip(rows, adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['mechanism_helps_significantly'] = bool(
+            entry['mechanism_helps'] and p_holm is not None and p_holm < alpha
+        )
+    thin = sorted({name for entry in rows for name in (entry['full'], entry['reference_row'])
+                   if 1 <= usable.get(name, {}).get('n_seeds', 1) < 3})
+    return {
+        'protocol': ('Full vs Full-minus-X: one-sided paired test of H1 "Full has lower '
+                     'held-out val_loss than the X-free row"; seeds are the unit of '
+                     'replication (paired per-seed means when both rows share >= 2 seeds, '
+                     'else the shared held-out batches of one run)'),
+        'margin': margin,
+        'alpha': alpha,
+        'multiple_comparison': (f'Holm-Bonferroni over the '
+                                f'{sum(e["p_one_sided"] is not None for e in rows)} tested mechanism(s); '
+                                f'`mechanism_helps_significantly` uses the adjusted p-value'),
+        'rows': rows,
+        'rows_with_fewer_than_3_seeds': thin,
+    }
+
+def print_leave_one_out_comparison(comparison: dict | None) -> None:
+    if comparison is None:
+        print('[loo] no leave-one-out contrast available; nothing to test')
+        return
+    for entry in comparison['rows']:
+        if entry.get('skipped'):
+            print(f"[loo] {entry['mechanism']}: SKIPPED ({entry['skipped']})")
+            continue
+        full_std = entry.get('full_val_loss_std')
+        ref_std = entry.get('reference_val_loss_std')
+        full_std_str = '' if full_std is None else f' +/- {full_std:.4f}'
+        ref_std_str = '' if ref_std is None else f' +/- {ref_std:.4f}'
+        p_str = 'n/a' if entry['p_one_sided'] is None else f"{entry['p_one_sided']:.3g}"
+        p_holm_str = 'n/a' if entry.get('p_one_sided_holm') is None else f"{entry['p_one_sided_holm']:.3g}"
+        print(f"[loo] {entry['mechanism']:>22s}: {entry['full']} "
+              f"val_loss={entry['full_val_loss']:.4f}{full_std_str} vs "
+              f"{entry['reference_row']} val_loss={entry['reference_val_loss']:.4f}{ref_std_str} "
+              f"delta(full-ref)={entry['delta_full_minus_reference']:+.4f} "
+              f"p(one-sided)={p_str} p(holm)={p_holm_str} "
+              f"test={entry.get('test') or '-'}@{entry.get('test_basis') or '-'} "
+              f"removing_hurts={entry['mechanism_helps']} "
+              f"significant={entry['mechanism_helps_significantly']}")
+    if comparison.get('rows_with_fewer_than_3_seeds'):
+        print(f"[loo] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
               f"{comparison['rows_with_fewer_than_3_seeds']}")
 
 def main():
@@ -660,6 +796,14 @@ def main():
         with open(base / 'baseline_comparison.json', 'w') as f:
             json.dump(comparison, f, indent=2)
     print_baseline_comparison(comparison)
+    # The second half of the ablation contract: each claimed mechanism of the
+    # main proposal must be shown to be load-bearing *on its own*, with a
+    # paired Full-vs-Full-minus-X test over the same seeds.
+    loo_comparison = leave_one_out_comparison(ordered, margin=args.baseline_margin, alpha=args.alpha)
+    if loo_comparison is not None:
+        with open(base / 'leave_one_out_comparison.json', 'w') as f:
+            json.dump(loo_comparison, f, indent=2)
+    print_leave_one_out_comparison(loo_comparison)
     manifest = dict(run_metadata)
     manifest['git'] = git_revision()
     manifest['hyperparameters'] = vars(args)
@@ -667,6 +811,7 @@ def main():
     manifest['matrix_validation'] = matrix_report
     manifest['rows'] = [row['name'] for row in ordered]
     manifest['baseline_comparison'] = comparison
+    manifest['leave_one_out_comparison'] = loo_comparison
     save_run_manifest(base / 'run_manifest.json', manifest)
     print(f'\n[done] {len(ordered)} ablations saved to {base} '
           f'({len(seeds)} seed(s): {seeds}; row val_loss = mean +/- std across seeds)')

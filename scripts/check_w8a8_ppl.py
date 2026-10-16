@@ -10,9 +10,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import GPT, markov_batch
+from adasquash.metrics import mean_std_stderr
 from adasquash.model import MLP
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from scripts.eval_downstream import load_ckpt
+DEFAULT_SEEDS = (42, 43, 44)
+# One probe draw is one sample: the PPL drop is aggregated as Mean +/- Std
+# over the `--seeds` probe replications, with the per-seed records kept so a
+# quantization result resting on one lucky probe cannot hide.
+_W8A8_SEED_METRIC_KEYS = ('ppl_fp', 'ppl_w8a8', 'ppl_drop', 'ppl_drop_pct',
+                          'probe_token_coverage')
 
 def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
     mx = w.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-06)
@@ -157,6 +164,32 @@ def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, 
             return next(it)[0]
     return _next
 
+def aggregate_w8a8_seed_rows(ckpt_path: str, per_seed: list) -> dict:
+    """Mean +/- Std of one checkpoint's W8A8 metrics over independent probes.
+
+    Each seed is one independent probe draw (a fresh generator seeded with
+    that seed). `ppl_fp`, `ppl_w8a8`, `ppl_drop`, `ppl_drop_pct` and the probe
+    coverage are averaged; each gets a `<key>_std` sibling. The per-seed
+    records stay in `per_seed`, and `n_seeds` records how many independent
+    draws the mean rests on.
+    """
+    if not per_seed:
+        raise ValueError('aggregate_w8a8_seed_rows needs at least one seed record')
+    agg = dict(per_seed[0])
+    agg.pop('seed', None)
+    agg['ckpt'] = ckpt_path
+    agg['seeds'] = [r['seed'] for r in per_seed]
+    agg['n_seeds'] = len(per_seed)
+    for key in _W8A8_SEED_METRIC_KEYS:
+        vals = [r[key] for r in per_seed if isinstance(r.get(key), (int, float))]
+        stats = mean_std_stderr(vals)
+        if stats is None:
+            continue
+        agg[key] = stats['mean']
+        agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
+    agg['per_seed'] = per_seed
+    return agg
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpts', nargs='+', required=True)
@@ -174,15 +207,21 @@ def main():
     p.add_argument('--batch-size', type=int, default=4)
     p.add_argument('--seq-len', type=int, default=512)
     p.add_argument('--n-batches', type=int, default=20)
-    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--seed', type=int, default=None, help='deprecated single-probe shorthand; overrides --seeds when given')
+    p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='one independent probe draw per seed; every metric is reported as Mean +/- Std across seeds, and >= 3 seeds keeps a single lucky probe from deciding a comparison')
     p.add_argument('--output', default='runs/w8a8/results.json')
     args = p.parse_args()
     if args.probe == 'dataset' and args.probe_split == 'test' and (not args.allow_sealed_test):
         p.error("--probe-split test is sealed: comparing checkpoints or quantization "
                 "settings on it would tune on the test set. Use 'validation' (default), "
                 "or pass --allow-sealed-test for the single final check.")
+    seeds = [args.seed] if args.seed is not None else list(args.seeds)
+    if not seeds:
+        p.error('--seeds must not be empty')
+    if len(seeds) < 3:
+        print(f'[w8a8][warn] {len(seeds)} seed(s): one probe draw is one sample; use >= 3 independent probes before treating a PPL-drop difference as real')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    set_all_seeds(args.seed)
+    set_all_seeds(seeds[0])
 
     def make_probe(rng, cfg, dataset_probe):
         if args.probe == 'random':
@@ -192,7 +231,6 @@ def main():
         return dataset_probe()
     results = []
     for ckpt_path in args.ckpts:
-        rng = torch.Generator(device=device).manual_seed(args.seed)
         model, ckpt_args = load_ckpt(ckpt_path, device=device)
         # Prefer the split the checkpoint was trained with, so the probe is the
         # same held-out slice; a flag typed on the command line wins.
@@ -203,42 +241,51 @@ def main():
                 return ckpt_args[name]
             return value
         dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file')) if args.probe == 'dataset' else None
-        batches = []
-        for _ in range(max(1, args.n_batches)):
-            x = make_probe(rng, model.cfg, dataset_probe)
-            batches.append(x)
-        coverage = probe_token_coverage(batches)
-        if coverage > args.max_probe_coverage:
-            raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
-        ce_fp = 0.0
-        n_tok = 0
-        for x in batches:
-            y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
-            y[:, :-1] = x[:, 1:]
-            a, n = compute_ce_sum(model, x, y, device=device)
-            ce_fp += a
-            n_tok += n
-        wrap_model_w8a8(model)
-        ce_q = 0.0
-        for x in batches:
-            y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
-            y[:, :-1] = x[:, 1:]
-            b, _ = compute_ce_sum(model, x, y, device=device)
-            ce_q += b
-        ppl_fp = math.exp(ce_fp / n_tok)
-        ppl_q = math.exp(ce_q / n_tok)
-        r = {'ckpt': ckpt_path, 'probe': args.probe, 'probe_split': args.probe_split if args.probe == 'dataset' else None, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage}
+        per_seed = []
+        for seed in seeds:
+            # A fresh copy per seed: `wrap_model_w8a8` quantizes the weights in
+            # place, so the next seed's fp32 reference needs its own unmodified
+            # model, and each seed is an independent probe draw.
+            model, _ = load_ckpt(ckpt_path, device=device)
+            rng = torch.Generator(device=device).manual_seed(seed)
+            batches = []
+            for _ in range(max(1, args.n_batches)):
+                x = make_probe(rng, model.cfg, dataset_probe)
+                batches.append(x)
+            coverage = probe_token_coverage(batches)
+            if coverage > args.max_probe_coverage:
+                raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
+            ce_fp = 0.0
+            n_tok = 0
+            for x in batches:
+                y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
+                y[:, :-1] = x[:, 1:]
+                a, n = compute_ce_sum(model, x, y, device=device)
+                ce_fp += a
+                n_tok += n
+            wrap_model_w8a8(model)
+            ce_q = 0.0
+            for x in batches:
+                y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
+                y[:, :-1] = x[:, 1:]
+                b, _ = compute_ce_sum(model, x, y, device=device)
+                ce_q += b
+            ppl_fp = math.exp(ce_fp / n_tok)
+            ppl_q = math.exp(ce_q / n_tok)
+            per_seed.append({'ckpt': ckpt_path, 'probe': args.probe, 'probe_split': args.probe_split if args.probe == 'dataset' else None, 'seed': seed, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage})
+        r = aggregate_w8a8_seed_rows(ckpt_path, per_seed)
         if args.probe == 'dataset' and args.probe_split != 'validation':
             print(f"[w8a8] WARNING: --probe dataset scored on the '{args.probe_split}' split; use 'validation' for model comparison ('test' is reserved for the single final evaluation, 'train' is optimistically biased)", file=sys.stderr)
-        if ppl_fp >= 0.5 * model.cfg.vocab_size:
-            print(f'[w8a8] WARNING: {ckpt_path} ppl_fp={ppl_fp:.1f} is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={coverage:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet', file=sys.stderr)
+        if r['ppl_fp'] >= 0.5 * model.cfg.vocab_size:
+            print(f"[w8a8] WARNING: {ckpt_path} ppl_fp={r['ppl_fp']:.1f} (mean over {r['n_seeds']} seeds) is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={r['probe_token_coverage']:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet", file=sys.stderr)
         print(f'[w8a8] {ckpt_path}: {r}')
         results.append(r)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
-    manifest = collect_run_metadata(seed=args.seed)
+    manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
+    manifest['seeds'] = seeds
     manifest['results_file'] = str(out_path)
     save_run_manifest(out_path.with_name('run_manifest.json'), manifest)
     print(f'[done] saved to {out_path}')

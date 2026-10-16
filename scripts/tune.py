@@ -23,7 +23,11 @@ This driver therefore:
 * compares each variant's best trial against the best tuned baseline with a
   one-sided paired z-test (same seeds -> paired samples, same held-out
   batches within a seed). A point-estimate win below `--margin` is reported
-  but flagged as not significant.
+  but flagged as not significant. Because every variant arm is tested against
+  the *same* baseline, the p-values are a family and are Holm-Bonferroni
+  adjusted before an arm is called significantly better. The default
+  selection set is three seeds: with fewer, the lr-grid means are too noisy
+  for a small delta to mean anything.
 
 Selection bias: picking the best learning rate on `--seeds` and then quoting
 that same run overstates the effect (winner's curse). Pass `--confirm-seeds`
@@ -48,7 +52,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import mean_std_stderr, paired_z_one_sided, welch_z_one_sided
+from adasquash.metrics import holm_adjust, mean_std_stderr, paired_z_one_sided, welch_z_one_sided
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest
 from scripts.ablation import run_one
 
@@ -198,6 +202,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
             'beats_reference_significantly': False,
             'test': None,
             'p_one_sided': None,
+            'p_one_sided_holm': None,
         }
         if len(common) >= 2:
             test = paired_z_one_sided(arm_vals, ref_vals, margin=margin)
@@ -218,11 +223,20 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
             entry['p_one_sided'] = test['p_one_sided']
             entry['z'] = test['z']
             entry['n'] = test['n']
-            entry['beats_reference_significantly'] = bool(
-                entry['beats_reference'] and test['p_one_sided'] is not None
-                and test['p_one_sided'] < alpha
-            )
         out['rows'].append(entry)
+    # Every arm is tested against the same reference, so the raw p-values are
+    # a family of tests; without the Holm step-down the chance of some arm
+    # looking significant grows with the number of arms.
+    adjusted = holm_adjust([e['p_one_sided'] for e in out['rows']])
+    for entry, p_holm in zip(out['rows'], adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['beats_reference_significantly'] = bool(
+            entry['beats_reference'] and p_holm is not None and p_holm < alpha
+        )
+    out['multiple_comparison'] = (
+        f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} tested arm(s) '
+        f'against the same reference; `beats_reference_significantly` uses the adjusted p-value'
+    )
     out['rows_with_fewer_than_3_seeds'] = sorted(
         e['arm'] for e in out['rows'] if e['n_paired_seeds'] < 3)
     return out
@@ -242,13 +256,15 @@ def print_comparison(comparison: dict | None) -> None:
           f"selection-seed mean={comparison['reference_selection_val_loss']:.4f})")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
+        p_holm = entry.get('p_one_sided_holm')
         p_str = 'n/a' if p is None else f'{p:.3g}'
+        p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
         std = entry.get('val_loss_std')
         std_str = '' if std is None else f" +/- {std:.4f}"
         print(f"[tune][compare] {entry['arm']:>12s} lr={entry['best_lr']:g} "
               f"val_loss={entry['val_loss']:.4f}{std_str} "
               f"delta={entry['delta_vs_reference']:+.4f} p(one-sided)={p_str} "
-              f"paired_seeds={entry['n_paired_seeds']} "
+              f"p(holm)={p_holm_str} paired_seeds={entry['n_paired_seeds']} "
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}")
     if comparison.get('confirm_ignored_arms'):
@@ -267,7 +283,7 @@ def main():
     p.add_argument('--arms', nargs='+', required=True, help='arm names (norm names) to tune, lr-swept with equal compute')
     p.add_argument('--baselines', nargs='+', default=['ln', 'rmsnorm'], help='arms that are the simple references')
     p.add_argument('--lrs', nargs='+', type=float, default=[3e-4, 6e-4, 1.2e-3])
-    p.add_argument('--seeds', nargs='+', type=int, default=[42], help='selection seeds for the lr grid')
+    p.add_argument('--seeds', nargs='+', type=int, default=[42, 43, 44], help='selection seeds for the lr grid; the default is 3 so each lr-grid mean rests on independent replications rather than a single lucky run')
     p.add_argument('--confirm-seeds', nargs='+', type=int, default=[], help='held-back seeds used only to score the selected lr (avoids winner\'s-curse comparisons)')
     p.add_argument('--max-steps', type=int, default=1000)
     p.add_argument('--batch-size', type=int, default=8)

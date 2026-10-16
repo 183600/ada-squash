@@ -9,10 +9,21 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from adasquash.metrics import mean_std_stderr
 from adasquash.model import MLP, build_gpt_124m
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import KurtosisMeter, markov_batch
 FP8_E4M3_MAX = 448.0
+DEFAULT_SEEDS = (42, 43, 44)
+# One probe draw is one sample: these per-norm quantities are aggregated as
+# Mean +/- Std over the `--seeds` replications, with the per-seed records kept
+# so an unstable seed cannot hide behind a favorable mean.
+_FP8_SEED_METRIC_KEYS = (
+    'max_abs_pre_norm', 'max_abs_post_norm', 'mean_excess_kurtosis_pre_norm',
+    'mean_overflow_rate_e4m3', 'max_overflow_rate_e4m3',
+    'mean_underflow_rate_e4m3', 'mean_rel_quant_err_e4m3',
+    'logit_rel_divergence',
+)
 
 def fp8_min_normal(exp_bits: int) -> float:
     return 2.0 ** (1 - (2 ** (exp_bits - 1) - 1))
@@ -174,6 +185,41 @@ def _excess_kurtosis(x: torch.Tensor):
 class _Float64KurtosisMeter(KurtosisMeter):
     acc_dtype = torch.float64
 
+def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
+    """Mean +/- Std of one norm's FP8 metrics over independent probes.
+
+    Each seed is one independent probe draw (and, for a fresh init, one
+    independent model initialization). The first record supplies the static
+    fields (`n_layers`, `n_norm_hooks`); every metric in
+    `_FP8_SEED_METRIC_KEYS` becomes `<key>` (mean) and `<key>_std` (sample
+    std across seeds). `logit_nan_under_fp8`/`first_nonfinite_layer` are not
+    averaged - a failure in any seed is a failure of the norm - so they are
+    reported with `_any` / `_earliest` semantics.
+    """
+    if not per_seed:
+        raise ValueError('aggregate_fp8_seed_rows needs at least one seed record')
+    agg = {k: v for k, v in per_seed[0].items() if not k.startswith('__')}
+    agg.pop('seed', None)
+    agg['norm'] = norm_name
+    agg['seeds'] = [r.get('seed') for r in per_seed]
+    agg['n_seeds'] = len(per_seed)
+    for key in _FP8_SEED_METRIC_KEYS:
+        vals = [r[key] for r in per_seed if isinstance(r.get(key), (int, float))]
+        stats = mean_std_stderr(vals)
+        if stats is None:
+            continue
+        agg[key] = stats['mean']
+        agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
+    nonfinite = [r['first_nonfinite_layer'] for r in per_seed
+                 if isinstance(r.get('first_nonfinite_layer'), int)]
+    overflowing = [r['first_overflow_layer'] for r in per_seed
+                   if isinstance(r.get('first_overflow_layer'), int)]
+    agg['first_nonfinite_layer_earliest'] = min(nonfinite) if nonfinite else None
+    agg['first_overflow_layer_earliest'] = min(overflowing) if overflowing else None
+    agg['logit_nan_under_fp8'] = any(bool(r.get('logit_nan_under_fp8')) for r in per_seed)
+    agg['per_seed'] = per_seed
+    return agg
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--norms', nargs='+', default=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
@@ -182,13 +228,19 @@ def main():
     p.add_argument('--n-states', type=int, default=64, help="state count of the synthetic 'markov' probe")
     p.add_argument('--batch-size', type=int, default=2)
     p.add_argument('--seq-len', type=int, default=512)
-    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given')
+    p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='each norm is probed once per seed (fresh probe, and fresh init in random-init mode) and reported as Mean +/- Std across seeds; >= 3 recommended so one probe draw cannot decide a comparison')
     p.add_argument('--output', default='runs/fp8_check/results.json')
     args = p.parse_args()
     if args.ckpt and len(args.ckpt) != len(args.norms):
         p.error(f'--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}')
+    seeds = [args.seed] if args.seed is not None else list(args.seeds)
+    if not seeds:
+        p.error('--seeds must not be empty')
+    if len(seeds) < 3:
+        print(f'[fp8][warn] {len(seeds)} seed(s): one probe draw is one sample; use >= 3 independent probes before treating a metric difference as real')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    set_all_seeds(args.seed)
+    set_all_seeds(seeds[0])
 
     def make_probe(rng, cfg):
         if args.probe == 'random':
@@ -197,19 +249,25 @@ def main():
         return x
     results = []
     for i, norm in enumerate(args.norms):
-        set_all_seeds(args.seed)
-        rng = torch.Generator(device=device).manual_seed(args.seed)
         if args.ckpt:
             from scripts.eval_downstream import load_ckpt
-            model, _ = load_ckpt(args.ckpt[i], device=device)
-            model.eval()
         else:
-            model = build_gpt_124m(norm_name=norm).to(device)
-            model.reset_parameters(args.seed)
-            model.eval()
             print(f'[fp8] WARNING: {norm} probed at a fresh random init. layerscale_init=1e-5 leaves the residual stream at the embedding table, so every norm reports the same pre-norm statistics and this row says nothing about the layer. Pass --ckpt <path> (one per --norms entry) to measure trained weights.', file=sys.stderr)
-        x = make_probe(rng, model.cfg)
-        r = measure_fp8_divergence(model, x, norm)
+        per_seed = []
+        for seed in seeds:
+            set_all_seeds(seed)
+            rng = torch.Generator(device=device).manual_seed(seed)
+            if args.ckpt:
+                model, _ = load_ckpt(args.ckpt[i], device=device)
+            else:
+                model = build_gpt_124m(norm_name=norm).to(device)
+                model.reset_parameters(seed)
+            model.eval()
+            x = make_probe(rng, model.cfg)
+            r = measure_fp8_divergence(model, x, norm)
+            r['seed'] = seed
+            per_seed.append(r)
+        r = aggregate_fp8_seed_rows(norm, per_seed)
         if args.ckpt:
             r['ckpt'] = args.ckpt[i]
         print(f'[fp8] {norm}: {r}')
@@ -217,8 +275,9 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
-    manifest = collect_run_metadata(seed=args.seed)
+    manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
+    manifest['seeds'] = seeds
     manifest['results_file'] = str(out_path)
     save_run_manifest(out_path.with_name('run_manifest.json'), manifest)
     print(f'[done] saved to {out_path}')

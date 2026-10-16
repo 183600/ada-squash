@@ -174,7 +174,7 @@ def main():
     p.add_argument('--beta2', type=float, default=0.95)
     p.add_argument('--grad-clip', type=float, default=1.0)
     p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given')
-    p.add_argument('--seeds', nargs='+', type=int, default=[42], help='each (depth, norm) cell is replicated over these seeds and reported as Mean +/- Std (>= 3 recommended)')
+    p.add_argument('--seeds', nargs='+', type=int, default=[42, 43, 44], help='each (depth, norm) cell is replicated over these seeds and reported as Mean +/- Std across runs; the default is 3 independent seeds because fewer cannot separate a depth/norm effect from run-to-run noise')
     p.add_argument('--qk-norm', default=None, choices=[None, 'qknorm', 'dytqk'])
     p.add_argument('--layerscale-init', type=float, default=None)
     p.add_argument('--no-bf16', action='store_true')

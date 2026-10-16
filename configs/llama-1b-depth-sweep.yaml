@@ -2,6 +2,12 @@ model: llama-1b
 depths: [12, 24, 48, 96]
 norms: [rmsnorm, dyt, dytcd]
 
+# Every (depth, norm) cell is replicated over these independent seeds and the
+# launcher reports the cell's best_val_loss as Mean +/- Std across runs. A
+# single run cannot separate a depth/norm effect from run-to-run noise, so the
+# shipped sweep uses three seeds.
+seeds: [42, 43, 44]
+
 alpha_0: 0.9
 k_init: 1.0
 alpha_init: 0.5

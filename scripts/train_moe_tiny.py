@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import build_norm, markov_batch
 from adasquash.attention import CausalSelfAttention
+from adasquash.metrics import mean_std_stderr
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, _LayerScaleResidual
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
@@ -160,37 +161,14 @@ class MoEGPT(nn.Module):
             return (logits, loss, aux_total, tpe_list)
         return (logits, loss)
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--norm', default='dytcd', choices=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
-    p.add_argument('--n-experts', type=int, default=8)
-    p.add_argument('--dim', type=int, default=512)
-    p.add_argument('--n-layers', type=int, default=8)
-    p.add_argument('--n-heads', type=int, default=8)
-    p.add_argument('--seq-len', type=int, default=1024)
-    p.add_argument('--batch-size', type=int, default=4)
-    p.add_argument('--max-steps', type=int, default=1000)
-    p.add_argument('--lr', type=float, default=0.0006)
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--log-every', type=int, default=20)
-    p.add_argument('--stats-every', type=int, default=200)
-    p.add_argument('--output-dir', default='runs/moe-tiny')
-    p.add_argument('--probe', default='markov', choices=['markov', 'random'], help="corpus. 'random' is uniform token ids: it has no next-token signal, so the LM loss is pinned at log(vocab_size) and the run learns nothing")
-    p.add_argument('--dataset', default=None, help='optional HF dataset name; when given, replaces the synthetic corpus with packed real text')
-    p.add_argument('--dataset-config', default=None)
-    p.add_argument('--val-frac', type=float, default=0.005, help='chronological validation fraction (real-data mode)')
-    p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction (real-data mode)')
-    p.add_argument('--num-documents', type=int, default=None, help='total documents; required when the dataset reports no size')
-    p.add_argument('--min-doc-chars', type=int, default=0, help='drop documents shorter than this many characters (0 = keep all non-empty); applied identically to train and validation')
-    p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap); applied identically to train and validation')
-    p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
-    p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); validation documents duplicated in train are dropped, never training documents')
-    p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation')
-    p.add_argument('--val-batches', type=int, default=10, help='held-out validation batches at the end of training (0 disables)')
-    p.add_argument('--tokenizer', default='gpt2')
-    args = p.parse_args()
+DEFAULT_SEEDS = (42, 43, 44)
+_MOE_SEED_METRIC_KEYS = ('val_loss', 'final_loss', 'final_expert_cv')
+
+def run_one(args, seed: int, output_dir: Path) -> dict:
+    """One complete MoE training run on `seed`, writing its own artifacts."""
+    output_dir = Path(output_dir)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    set_all_seeds(args.seed)
+    set_all_seeds(seed)
     cfg = GPTConfig(vocab_size=50304, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads, max_seq_len=args.seq_len, mlp_ratio=4.0, norm_name=args.norm)
     model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
     print(f'[moe] total params = {count_parameters(model) / 1000000.0:.2f}M')
@@ -198,15 +176,15 @@ def main():
     opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter()
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    manifest_path = Path(args.output_dir) / 'run_manifest.json'
-    run_manifest = collect_run_metadata(seed=args.seed)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / 'run_manifest.json'
+    run_manifest = collect_run_metadata(seed=seed)
     run_manifest['hyperparameters'] = vars(args)
     data_reports: dict = {}
     run_manifest['data'] = {'dataset': args.dataset, 'dataset_config': args.dataset_config, 'split_reports': data_reports}
     save_run_manifest(manifest_path, run_manifest)
     print(f'[moe][track] run manifest -> {manifest_path}')
-    rng = torch.Generator(device=device).manual_seed(args.seed)
+    rng = torch.Generator(device=device).manual_seed(seed)
     data_iter = None
     if args.dataset:
         # Both loaders go through the same split configuration: the training
@@ -261,7 +239,7 @@ def main():
         history.append({'step': step, 'loss': loss_val, 'aux': aux_val, 'expert_cv': exp_cv, 'expert_cv_per_block': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
         if step % args.log_every == 0:
             print(f'  [moe] step={step:4d} loss={loss_val:.4f} aux={aux_val:.4f} expert_cv={exp_cv:.3f}', flush=True)
-    with open(Path(args.output_dir) / 'history.json', 'w') as f:
+    with open(output_dir / 'history.json', 'w') as f:
         json.dump(history, f)
     # Held-out validation loss: real data comes from the chronological
     # validation split; the synthetic corpus uses a generator (seed + 1) the
@@ -280,7 +258,7 @@ def main():
                 val_iter = iter(val_loader)
             else:
                 val_iter = None
-            val_rng = torch.Generator(device=device).manual_seed(args.seed + 1)
+            val_rng = torch.Generator(device=device).manual_seed(seed + 1)
             for _ in range(args.val_batches):
                 if val_iter is not None:
                     try:
@@ -299,7 +277,7 @@ def main():
     s = act_stats.summary()
     if val_loss is not None:
         s['val_loss'] = val_loss
-    with open(Path(args.output_dir) / 'stats.json', 'w') as f:
+    with open(output_dir / 'stats.json', 'w') as f:
         json.dump(s, f, indent=2, default=str)
     run_manifest['data']['split_reports'] = data_reports
     run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
@@ -311,7 +289,93 @@ def main():
         'n_loss_spikes': loss_spike.n_spikes,
     }
     save_run_manifest(manifest_path, run_manifest)
-    print(f'[done] saved to {args.output_dir} | n_loss_spikes={loss_spike.n_spikes}')
+    print(f'[done] saved to {output_dir} | n_loss_spikes={loss_spike.n_spikes}')
+    return dict(run_manifest['results'], seed=seed, output_dir=str(output_dir))
+
+def aggregate_moe_seed_results(results: list, seeds) -> dict:
+    """Mean +/- Std of the MoE study over independent seeds.
+
+    `val_loss` (held-out) is the selection metric; `final_loss` and
+    `final_expert_cv` are reported with the same Mean +/- Std treatment. The
+    per-seed records stay in `per_seed` so a load-imbalance result resting on
+    one seed cannot hide behind the mean.
+    """
+    agg = {'seeds': [int(s) for s in seeds], 'n_seeds': len(results), 'per_seed': results}
+    for key in _MOE_SEED_METRIC_KEYS:
+        vals = [r[key] for r in results if isinstance(r.get(key), (int, float))]
+        stats = mean_std_stderr(vals)
+        if stats is None:
+            agg[key] = None
+            agg[key + '_std'] = None
+            continue
+        agg[key] = stats['mean']
+        agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
+    agg['n_loss_spikes_total'] = sum(r['n_loss_spikes'] or 0 for r in results
+                                     if isinstance(r.get('n_loss_spikes'), (int, float)))
+    agg['aggregation'] = ('Mean +/- Std across independent seeds; the unit of '
+                          'replication is the seed, not the step')
+    return agg
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--norm', default='dytcd', choices=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
+    p.add_argument('--n-experts', type=int, default=8)
+    p.add_argument('--dim', type=int, default=512)
+    p.add_argument('--n-layers', type=int, default=8)
+    p.add_argument('--n-heads', type=int, default=8)
+    p.add_argument('--seq-len', type=int, default=1024)
+    p.add_argument('--batch-size', type=int, default=4)
+    p.add_argument('--max-steps', type=int, default=1000)
+    p.add_argument('--lr', type=float, default=0.0006)
+    p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given')
+    p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='independent replication seeds; each seed reruns the identical recipe and the study is reported as Mean +/- Std across seeds (>= 3 recommended)')
+    p.add_argument('--log-every', type=int, default=20)
+    p.add_argument('--stats-every', type=int, default=200)
+    p.add_argument('--output-dir', default='runs/moe-tiny')
+    p.add_argument('--probe', default='markov', choices=['markov', 'random'], help="corpus. 'random' is uniform token ids: it has no next-token signal, so the LM loss is pinned at log(vocab_size) and the run learns nothing")
+    p.add_argument('--dataset', default=None, help='optional HF dataset name; when given, replaces the synthetic corpus with packed real text')
+    p.add_argument('--dataset-config', default=None)
+    p.add_argument('--val-frac', type=float, default=0.005, help='chronological validation fraction (real-data mode)')
+    p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction (real-data mode)')
+    p.add_argument('--num-documents', type=int, default=None, help='total documents; required when the dataset reports no size')
+    p.add_argument('--min-doc-chars', type=int, default=0, help='drop documents shorter than this many characters (0 = keep all non-empty); applied identically to train and validation')
+    p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap); applied identically to train and validation')
+    p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
+    p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); validation documents duplicated in train are dropped, never training documents')
+    p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation')
+    p.add_argument('--val-batches', type=int, default=10, help='held-out validation batches at the end of training (0 disables)')
+    p.add_argument('--tokenizer', default='gpt2')
+    args = p.parse_args()
+    seeds = [args.seed] if args.seed is not None else list(args.seeds)
+    if not seeds:
+        p.error('--seeds must not be empty')
+    if len(seeds) < 3:
+        print(f'[moe][warn] {len(seeds)} seed(s): expert load and held-out loss vary run to run; use >= 3 independent seeds before interpreting a difference')
+    multi = len(seeds) > 1
+    base = Path(args.output_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    results = []
+    for seed in seeds:
+        out_dir = base / f'seed{seed}' if multi else base
+        print(f'[moe] seed={seed} -> {out_dir}')
+        results.append(run_one(args, seed, out_dir))
+    if multi:
+        agg = aggregate_moe_seed_results(results, seeds)
+        summary_path = base / 'seeds_summary.json'
+        with open(summary_path, 'w') as f:
+            json.dump(agg, f, indent=2, default=str)
+        manifest = collect_run_metadata(seed=seeds[0])
+        manifest['hyperparameters'] = vars(args)
+        manifest['seeds'] = seeds
+        manifest['aggregate'] = agg
+        save_run_manifest(base / 'run_manifest.json', manifest)
+        val = agg.get('val_loss')
+        val_std = agg.get('val_loss_std')
+        if val is not None:
+            std_str = '' if val_std is None else f' +/- {val_std:.4f}'
+            print(f"[moe][done] {args.norm}: val_loss={val:.4f}{std_str} over {agg['n_seeds']} seeds -> {summary_path}")
+        else:
+            print(f'[moe][done] no usable val_loss across seeds -> {summary_path}')
 
 def _expert_cv(tpe) -> float:
     if not isinstance(tpe, torch.Tensor):
