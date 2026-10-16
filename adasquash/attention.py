@@ -218,10 +218,9 @@ class _ApplyRoPEOne(torch.autograd.Function):
     """In-place rotation of one Q/K tensor, for single-use inputs.
 
     ``CausalSelfAttention`` hands its freshly projected (or freshly normed) q/k
-    over exactly once, so rotating in place removes the two ``(B, H, T, D)``
-    output buffers ``_ApplyRoPE`` has to materialise per layer. A single output
-    keeps the autograd engine's view bookkeeping legal for the raw path, where
-    q/k are stride views of the shared qkv buffer.
+    over exactly once, so the rotation is applied directly to that storage. A
+    single output keeps the autograd engine's view bookkeeping legal for the
+    raw path, where q/k are stride views of the shared qkv buffer.
     """
 
     @staticmethod
