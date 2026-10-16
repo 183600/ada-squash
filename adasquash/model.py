@@ -77,22 +77,16 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     def forward(ctx, logits, targets, ignore_index, chunk_rows):
         total = None
         n = targets.numel()
-        acc = _loss_acc_dtype(logits.dtype)
         buf_rows = min(chunk_rows, n)
-        if acc == logits.dtype:
-            buf = None
-            for start in range(0, n, chunk_rows):
-                end = min(start + chunk_rows, n)
-                if buf is None:
-                    buf = torch.empty(buf_rows, logits.size(-1), dtype=acc, device=logits.device)
-                log_probs = buf[:end - start]
-                torch.log_softmax(logits[start:end], dim=-1, out=log_probs)
-                chunk_loss = F.nll_loss(log_probs, targets[start:end], ignore_index=ignore_index, reduction='sum')
-                total = chunk_loss if total is None else total.add_(chunk_loss)
-        else:
-            for start in range(0, n, chunk_rows):
-                chunk_loss = F.cross_entropy(logits[start:start + chunk_rows], targets[start:start + chunk_rows], ignore_index=ignore_index, reduction='sum')
-                total = chunk_loss if total is None else total.add_(chunk_loss)
+        buf = None
+        for start in range(0, n, chunk_rows):
+            end = min(start + chunk_rows, n)
+            if buf is None:
+                buf = torch.empty(buf_rows, logits.size(-1), dtype=logits.dtype, device=logits.device)
+            log_probs = buf[:end - start]
+            torch.log_softmax(logits[start:end], dim=-1, out=log_probs)
+            chunk_loss = F.nll_loss(log_probs, targets[start:end], ignore_index=ignore_index, reduction='sum')
+            total = chunk_loss if total is None else total.add_(chunk_loss)
         count = targets.ne(ignore_index).sum()
         ctx.save_for_backward(logits, targets)
         ctx.ignore_index = ignore_index
