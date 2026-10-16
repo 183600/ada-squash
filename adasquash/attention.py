@@ -43,7 +43,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor]=None, return_stats: bool=False):
         B, T, C = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        q, k, v = (qkv[0], qkv[1], qkv[2])
         del qkv
         if self.q_rms is not None:
             q = self.q_rms(q)
@@ -52,7 +52,7 @@ class CausalSelfAttention(nn.Module):
             q, k = self.q_squash(q, k)
         if freqs_cis is not None:
             cos, sin = self._rope_tables(freqs_cis, q.dtype)
-            q, k = apply_rope(q, k, freqs_cis, cos, sin)
+            q, k = _apply_rope_(q, k, freqs_cis, cos, sin)
         scale = self.scale
         stats = {}
         if return_stats:
@@ -166,6 +166,22 @@ def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: to
     torch.addcmul(out_hi, x_lo, hi_s, value=hi_sign, out=out_hi)
     return out
 
+def _rope_inplace_(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: torch.Tensor, hi_s: torch.Tensor):
+    """In-place ``_rope_into``: same op order per element, same rounding.
+
+    The ``lo`` row is updated first (reading the original ``hi`` row) and a
+    half-width clone carries the original ``lo`` row into the ``hi`` update.
+    """
+    half = x.shape[-1] // 2
+    x_lo = x[..., :half]
+    x_hi = x[..., half:]
+    tmp = x_lo.clone()
+    x_lo.mul_(lo_c)
+    x_lo.addcmul_(x_hi, lo_s, value=-1)
+    x_hi.mul_(hi_c)
+    x_hi.addcmul_(tmp, hi_s, value=1)
+    return x
+
 class _ApplyRoPE(torch.autograd.Function):
     """Rotary embedding for Q and K as one autograd node.
 
@@ -197,6 +213,41 @@ class _ApplyRoPE(torch.autograd.Function):
             lo_c, hi_c, lo_s, hi_s = _rope_halves(cos, sin, half)
             grad_k = _rope_into(grad_ko, lo_c, hi_c, lo_s, hi_s, transpose=True)
         return (grad_q, grad_k, None, None)
+
+class _ApplyRoPEOne(torch.autograd.Function):
+    """In-place rotation of one Q/K tensor, for single-use inputs.
+
+    ``CausalSelfAttention`` hands its freshly projected (or freshly normed) q/k
+    over exactly once, so rotating in place removes the two ``(B, H, T, D)``
+    output buffers ``_ApplyRoPE`` has to materialise per layer. A single output
+    keeps the autograd engine's view bookkeeping legal for the raw path, where
+    q/k are stride views of the shared qkv buffer.
+    """
+
+    @staticmethod
+    def forward(ctx, x, cos, sin):
+        half = x.shape[-1] // 2
+        lo_c, hi_c, lo_s, hi_s = _rope_halves(cos, sin, half)
+        ctx.save_for_backward(cos, sin)
+        _rope_inplace_(x, lo_c, hi_c, lo_s, hi_s)
+        ctx.mark_dirty(x)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        cos, sin = ctx.saved_tensors
+        half = grad_out.shape[-1] // 2
+        lo_c, hi_c, lo_s, hi_s = _rope_halves(cos, sin, half)
+        return (_rope_into(grad_out, lo_c, hi_c, lo_s, hi_s, transpose=True), None, None)
+
+def _apply_rope_(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
+    if cos is None or sin is None:
+        cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
+        sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
+    if cos.dtype != q.dtype:
+        cos = cos.to(dtype=q.dtype)
+        sin = sin.to(dtype=q.dtype)
+    return (_ApplyRoPEOne.apply(q, cos, sin), _ApplyRoPEOne.apply(k, cos, sin))
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
     if cos is None or sin is None:

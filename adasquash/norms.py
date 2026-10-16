@@ -105,7 +105,7 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
 
 def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p_raw: torch.Tensor, gamma: Optional[torch.Tensor]=None) -> torch.Tensor:
     if gamma is not None:
-        grad_phi = grad_phi.mul_(gamma)
+        grad_phi.mul_(gamma)
     sig = a.sigmoid()
     a_sig = a.mul_(sig)
     sig.neg_().log1p_().neg_()
