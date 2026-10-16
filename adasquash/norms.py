@@ -7,6 +7,8 @@ import torch.nn as nn
 NORM_REGISTRY: dict[str, type] = {}
 _MIN_ALPHA = 1e-4
 _MIN_P = 1e-3
+_LOG2E = math.log2(math.e)
+_LN2 = math.log(2.0)
 
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     if t.ndim <= 1:
@@ -68,7 +70,7 @@ def _softsign_forward(xs: torch.Tensor, p) -> torch.Tensor:
     u = t.clamp_(min=1.0).reciprocal_()
     u.mul_(lo)
     if isinstance(p, torch.Tensor):
-        s = u.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
+        s = u.log2_().mul_(p).exp2_().log1p_().mul_(-_LOG2E / p).exp2_()
     else:
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     return lo.mul_(s).copysign_(xs)
@@ -81,17 +83,16 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
     if need_u:
         u = lo.mul(r)
         if isinstance(p, torch.Tensor):
-            log_u = u.log_()
-            log_u.mul_(p)
-            s = log_u.exp().log1p_().mul_(-1.0 / p).exp_()
-            a = log_u.clamp_(min=p * math.log(torch.finfo(log_u.dtype).tiny))
+            q = u.log2_().mul_(p)
+            a = q.mul(_LN2).clamp_(min=p * math.log(torch.finfo(q.dtype).tiny))
+            s = q.exp2_().log1p_().mul_(-_LOG2E / p).exp2_()
         else:
             s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
-            a = u.log_().mul_(p).clamp_(min=p * math.log(torch.finfo(u.dtype).tiny))
+            a = u.log2_().mul_(p * _LN2).clamp_(min=p * math.log(torch.finfo(u.dtype).tiny))
     else:
         s = lo.mul(r)
         if isinstance(p, torch.Tensor):
-            s.log_().mul_(p).exp_().log1p_().mul_(-1.0 / p).exp_()
+            s.log2_().mul_(p).exp2_().log1p_().mul_(-_LOG2E / p).exp2_()
         else:
             s.pow_(p).add_(1.0).pow_(-1.0 / p)
     phi = lo.mul_(s).copysign_(xs) if need_phi else None
@@ -155,7 +156,7 @@ class _GeneralizedSoftsign(torch.autograd.Function):
         if need_x or need_p:
             g, phi, a = _softsign_backward_pieces(x, p, need_p, need_p, need_x)
         if need_x:
-            grad_x = g.log_().mul_(p + 1).exp_().mul_(grad_out)
+            grad_x = g.log2_().mul_(p + 1).exp2_().mul_(grad_out)
         if need_p:
             grad_p = _softsign_p_grad(phi.mul_(grad_out), a, p, p_raw)
         return (grad_x, grad_p)
@@ -310,7 +311,7 @@ class _DyTCForward(torch.autograd.Function):
             del phi, a, grad_phi
         grad_x = grad_alpha = None
         if need_softsign:
-            grad_x_scaled = g.log_().mul_(p_val + 1).exp_()
+            grad_x_scaled = g.log2_().mul_(p_val + 1).exp2_()
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             if ctx.needs_input_grad[1]:
                 grad_alpha = _reduce_products(grad_x_scaled, x_scaled).div_(alpha)
@@ -517,7 +518,7 @@ class _DyTCDForward(torch.autograd.Function):
             del phi, a, grad_phi
         grad_x = grad_alpha_0 = grad_k = grad_delta = None
         if need_softsign:
-            grad_x_scaled = g.log_().mul_(p_val + 1).exp_()
+            grad_x_scaled = g.log2_().mul_(p_val + 1).exp2_()
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             need_alpha_chain = ctx.needs_input_grad[1] or ctx.needs_input_grad[2] or ctx.needs_input_grad[3]
             if need_alpha_chain:
