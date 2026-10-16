@@ -92,6 +92,8 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int):
         cmd.append('--no-learnable-p')
     if args.no_learnable_k:
         cmd.append('--no-learnable-k')
+    if args.no_learnable_delta:
+        cmd.append('--no-learnable-delta')
     if args.no_layerscale:
         cmd.append('--no-layerscale')
     if args.beta is False:
@@ -185,6 +187,7 @@ def main():
     p.add_argument('--qk-alpha-init', type=float, default=1.0, help='initial alpha_q / alpha_k for --qk-norm dytqk')
     p.add_argument('--no-learnable-p', action='store_true')
     p.add_argument('--no-learnable-k', action='store_true')
+    p.add_argument('--no-learnable-delta', action='store_true', help='freeze the DyT-CD per-channel deviation at zero (controlled per-channel off)')
     p.add_argument('--no-layerscale', action='store_true')
     p.add_argument('--no-beta', dest='beta', action='store_false')
     p.add_argument('--alpha-jitter', type=float, default=0.05, help='per-channel alpha init jitter for DyTC (0 for deterministic)')

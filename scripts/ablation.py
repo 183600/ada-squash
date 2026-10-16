@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT, build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
-from adasquash.metrics import mean_std_stderr, paired_z_one_sided, welch_z_one_sided
+from adasquash.metrics import holm_adjust, mean_std_stderr, paired_z_one_sided, welch_z_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
@@ -421,9 +421,12 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     means whenever both rows share >= 2 seeds (seeds are the independent
     replications), and falls back to the shared held-out batches of a single
     run (paired z when the batch counts match, otherwise Welch) when they do
-    not. `margin` is the smallest loss improvement treated as meaningful;
-    `beats_reference_significantly` additionally requires p < alpha. Returns
-    None when no baseline row has a usable val_loss.
+    not. `margin` is the smallest loss improvement treated as meaningful.
+    Because every row is tested against the *same* reference, the per-row
+    p-values are a family of tests and are Holm-Bonferroni adjusted over the
+    matrix before anything is called significant: `beats_reference_significantly`
+    requires the adjusted p < alpha, and the raw one-sided p stays available as
+    `p_one_sided`. Returns None when no baseline row has a usable val_loss.
     """
     baseline_names = set(baseline_names)
     usable = [r for r in summaries
@@ -466,6 +469,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'test_basis': None,
             'paired_seeds': [],
             'p_one_sided': None,
+            'p_one_sided_holm': None,
         }
         test = None
         row_seeds = _seed_means(row)
@@ -490,11 +494,21 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             entry['p_one_sided'] = test['p_one_sided']
             entry['z'] = test['z']
             entry['n'] = test['n']
-            entry['beats_reference_significantly'] = bool(
-                entry['beats_reference'] and test['p_one_sided'] is not None
-                and test['p_one_sided'] < alpha
-            )
         out['rows'].append(entry)
+    # Every row above tests the same reference, so the raw p-values form a
+    # family and the per-row alpha must be corrected (Holm-Bonferroni step-down)
+    # before a row is reported as a significant win. Rows whose test could not
+    # run stay None and are excluded from the family.
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in out['rows']])
+    for entry, p_holm in zip(out['rows'], adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['beats_reference_significantly'] = bool(
+            entry['beats_reference'] and p_holm is not None and p_holm < alpha
+        )
+    out['multiple_comparison'] = (
+        f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} tested row(s) '
+        f'against the same reference; `beats_reference_significantly` uses the adjusted p-value'
+    )
     thin = {r['name'] for r in [reference, *baselines] if r.get('n_seeds', 1) < 3}
     out['rows_with_fewer_than_3_seeds'] = sorted(thin | {e['name'] for e in out['rows'] if e['n_seeds'] < 3})
     return out
@@ -511,12 +525,14 @@ def print_baseline_comparison(comparison: dict | None) -> None:
           f"all baselines: { {k: round(v, 4) for k, v in comparison['baseline_rows'].items()} })")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
+        p_holm = entry.get('p_one_sided_holm')
         p_str = 'n/a' if p is None else f'{p:.3g}'
+        p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
         std = entry.get('val_loss_std')
         std_str = '' if std is None else f" +/- {std:.4f}"
         basis = entry.get('test_basis') or '-'
         print(f"[compare] {entry['name']:>32s} val_loss={entry['val_loss']:.4f}{std_str} "
-              f"delta={entry['delta_vs_reference']:+.4f} p(one-sided)={p_str} "
+              f"delta={entry['delta_vs_reference']:+.4f} p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{basis} "
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}")
