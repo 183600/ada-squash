@@ -64,7 +64,7 @@ def register_norm(name: str):
         return cls
     return _decorator
 
-def _softsign_forward(xs: torch.Tensor, p, scale=None) -> torch.Tensor:
+def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False) -> torch.Tensor:
     if scale is None:
         t = xs.abs()
     else:
@@ -78,11 +78,11 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None) -> torch.Tensor:
     else:
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     out = lo.mul_(s).copysign_(xs)
-    if scale is not None:
+    if scale is not None and (not scale_nonneg):
         out.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     return out
 
-def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True, scale=None):
+def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True, scale=None, scale_nonneg: bool=False):
     if scale is None:
         t = xs.abs()
     else:
@@ -110,7 +110,7 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
     phi = None
     if need_phi:
         phi = lo.mul_(s).copysign_(xs)
-        if scale is not None:
+        if scale is not None and (not scale_nonneg):
             phi.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     if not need_g:
         return (None, phi, a)
@@ -481,7 +481,7 @@ class _DyTCDForward(torch.autograd.Function):
         exp_kdr = torch.exp(-k * depth_ratio)
         scale = alpha_0 * exp_kdr
         alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=_MIN_ALPHA)
-        phi = _softsign_forward(x, p, alpha_c)
+        phi = _softsign_forward(x, p, alpha_c, scale_nonneg=True)
         if beta is not None:
             out = phi.mul_(gamma).add_(beta)
         else:
@@ -516,7 +516,7 @@ class _DyTCDForward(torch.autograd.Function):
         phi = None
         a = None
         if need_softsign or need_phi:
-            g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha_c)
+            g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha_c, scale_nonneg=True)
         p_val = p if p_is_tensor else float(p)
         grad_p = grad_gamma = None
         if need_phi:
