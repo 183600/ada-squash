@@ -24,6 +24,25 @@ Tasks
 * `dataset` - one real batch from the leakage-safe pipeline; natural text
               never reaches ~0 loss, so pass `--loss-threshold` /
               `--acc-threshold` explicitly and read them as progress bounds.
+
+Metrics
+-------
+Accuracy alone can be passed by a strawman predictor, so every run also
+reports (and the dataset task gates on) the trivial baselines it must beat:
+
+* `majority_class_accuracy` - always predicting the most frequent target;
+  the check `accuracy_beats_majority_baseline` requires a margin over it, so
+  an imbalanced batch cannot be "solved" by collapsing to the common class;
+* `uniform_random_accuracy` = 1 / vocab_size;
+* `copy_input_accuracy` - the "always predict the current token" rule. On the
+  markov walk this rule is exactly at the next-token accuracy ceiling
+  (target = current + jump, jump uniform in {0,1,2}), which is why the markov
+  gate is carried by the loss, not by accuracy;
+* `macro_f1`, `weighted_f1`, `micro_f1` - all three averaging modes are named
+  explicitly because macro and micro can disagree under class imbalance
+  (`micro_f1 == accuracy` for a single-label argmax prediction);
+* `topk_accuracy` (k=3 by default) - a ceiling-free signal for tasks whose
+  top-1 accuracy is capped by label ambiguity.
 """
 import argparse
 import math
@@ -39,6 +58,7 @@ import torch
 from torch.optim import AdamW
 
 from adasquash import GPT, GPTConfig, NORM_REGISTRY, markov_batch
+from adasquash.metrics import macro_weighted_f1
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 
 DEFAULT_THRESHOLDS = {
@@ -99,13 +119,58 @@ def make_batch(task: str, args, cfg: GPTConfig, device: str):
 
 
 @torch.no_grad()
-def next_token_accuracy(model, x, y) -> float:
+def next_token_metrics(model, x, y, topk: int = 3) -> dict:
+    """Classification metrics for next-token prediction, with their baselines.
+
+    All quantities are computed on the unmasked targets only. `micro_f1` is
+    accuracy for a single-label argmax prediction; `macro_f1` averages over
+    classes present (see `adasquash.metrics.macro_weighted_f1`). The trivial
+    baselines are reported so a pass cannot hide behind class imbalance or a
+    degenerate label mapping.
+    """
     logits, _ = model(x, y, return_logits=True)
     mask = y.ne(model.cfg.ignore_index)
-    if not bool(mask.any()):
-        return 0.0
-    pred = logits.argmax(-1)
-    return float((pred[mask] == y[mask]).float().mean().item())
+    vocab = int(logits.size(-1))
+    n_valid = int(mask.sum().item())
+    if n_valid == 0:
+        return {
+            "accuracy": 0.0, "topk_accuracy": 0.0, "topk": int(topk),
+            "macro_f1": 0.0, "weighted_f1": 0.0, "micro_f1": 0.0,
+            "n_classes_present": 0, "n_valid_tokens": 0,
+            "majority_class_accuracy": 0.0,
+            "uniform_random_accuracy": 1.0 / vocab,
+            "copy_input_accuracy": None,
+        }
+    gold = y[mask]
+    pred = logits.argmax(-1)[mask]
+    accuracy = float((pred == gold).float().mean().item())
+    counts = torch.bincount(gold, minlength=vocab)
+    majority = float(counts.max().item() / n_valid)
+    f1 = macro_weighted_f1(pred.tolist(), gold.tolist(), vocab)
+    k = max(1, min(int(topk), vocab))
+    top = logits.topk(k, dim=-1).indices[mask]
+    topk_accuracy = float((top == gold.unsqueeze(-1)).any(dim=-1).float().mean().item())
+    copy_input = None
+    if tuple(x.shape) == tuple(y.shape):
+        copy_input = float((x[mask] == gold).float().mean().item())
+    return {
+        "accuracy": accuracy,
+        "topk_accuracy": topk_accuracy,
+        "topk": k,
+        "macro_f1": f1["macro_f1"],
+        "weighted_f1": f1["weighted_f1"],
+        "micro_f1": f1["micro_f1"],
+        "n_classes_present": f1["n_classes_present"],
+        "n_valid_tokens": n_valid,
+        "majority_class_accuracy": majority,
+        "uniform_random_accuracy": 1.0 / vocab,
+        "copy_input_accuracy": copy_input,
+    }
+
+
+@torch.no_grad()
+def next_token_accuracy(model, x, y) -> float:
+    return next_token_metrics(model, x, y)["accuracy"]
 
 
 def gradient_report(model) -> dict:
@@ -176,7 +241,7 @@ def run_one(norm: str, args, device: str) -> dict:
     history = []
     initial_loss = None
     final_loss = float("nan")
-    final_acc = float("nan")
+    final_metrics = next_token_metrics(model, x, y)
     grad_info = {}
     t0 = time.time()
     for step in range(1, args.max_steps + 1):
@@ -192,9 +257,12 @@ def run_one(norm: str, args, device: str) -> dict:
         if initial_loss is None:
             initial_loss = final_loss
         if step == 1 or step % args.log_every == 0 or step == args.max_steps:
-            final_acc = next_token_accuracy(model, x, y)
-            history.append({"step": step, "loss": final_loss, "accuracy": final_acc})
+            final_metrics = next_token_metrics(model, x, y)
+            history.append({"step": step, "loss": final_loss,
+                            "accuracy": final_metrics["accuracy"],
+                            "macro_f1": final_metrics["macro_f1"]})
     elapsed = time.time() - t0
+    final_acc = final_metrics["accuracy"]
 
     checks = OrderedDict()
     checks["finite_loss"] = bool(math.isfinite(final_loss))
@@ -208,7 +276,14 @@ def run_one(norm: str, args, device: str) -> dict:
     )
     checks["loss_decreased"] = bool(final_loss < initial_loss - 1e-4)
     checks["loss_below_threshold"] = bool(final_loss <= thresholds["loss"])
+    # Strawman guards: an accuracy the majority-class predictor already reaches
+    # (imbalance) or a loss no better than guessing uniformly over the vocab
+    # means the run learned nothing, whatever the threshold says.
+    checks["loss_below_uniform_baseline"] = bool(final_loss < math.log(vocab))
     checks["accuracy_above_threshold"] = bool(final_acc >= thresholds["acc"])
+    checks["accuracy_beats_majority_baseline"] = bool(
+        final_acc > final_metrics["majority_class_accuracy"] + args.baseline_margin
+    )
     passed = all(checks.values())
     return {
         "norm": norm,
@@ -217,6 +292,8 @@ def run_one(norm: str, args, device: str) -> dict:
         "initial_loss": initial_loss,
         "final_loss": final_loss,
         "final_accuracy": final_acc,
+        "final_macro_f1": final_metrics["macro_f1"],
+        "final_metrics": final_metrics,
         "loss_path_delta": loss_path_delta,
         "loss_path_tol": loss_path_tol,
         "gradients": grad_info,
@@ -251,6 +328,7 @@ def main():
     p.add_argument("--alpha-jitter", type=float, default=0.0)
     p.add_argument("--loss-threshold", type=float, default=None)
     p.add_argument("--acc-threshold", type=float, default=None)
+    p.add_argument("--baseline-margin", type=float, default=0.05, help="required accuracy margin over the majority-class predictor (guards the metric, not the model)")
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     p.add_argument("--dataset-config", default="sample-10BT")
     p.add_argument("--tokenizer", default="gpt2")
@@ -267,9 +345,14 @@ def main():
         result = run_one(norm, args, device)
         results.append(result)
         status = "PASS" if result["passed"] else "FAIL"
+        m = result["final_metrics"]
         print(
             f"[sanity] {status} {norm}: initial_loss={result['initial_loss']:.4f} "
             f"final_loss={result['final_loss']:.4f} accuracy={result['final_accuracy']:.4f} "
+            f"macro_f1={result['final_macro_f1']:.4f} "
+            f"(majority_baseline={m['majority_class_accuracy']:.4f}, "
+            f"copy_input_baseline={m['copy_input_accuracy']}, "
+            f"top{m['topk']}_accuracy={m['topk_accuracy']:.4f}) "
             f"grad_norm={result['gradients'].get('total_norm', 0.0):.3e}"
         )
         for name, ok in result["checks"].items():

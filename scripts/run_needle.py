@@ -30,9 +30,12 @@ def main():
         if L + overhead > model.cfg.max_seq_len:
             print(f'[skip] L={L} (+{overhead} scoring positions for the secret) > max_seq_len={model.cfg.max_seq_len}, RoPE scaling needed - skipping for now.')
             continue
-        acc = needle_in_haystack(model, tok, needle=args.secret, context_len=L, n_trials=args.trials, device=device, seed=args.seed)
-        print(f'[needle] L={L:5d} acc={acc:.3f}')
-        results.append({'ctx_len': L, 'acc': acc})
+        res = needle_in_haystack(model, tok, needle=args.secret, context_len=L, n_trials=args.trials, device=device, seed=args.seed, return_counts=True)
+        print(f"[needle] L={L:5d} acc={res['accuracy']:.3f} "
+              f"({res['n_correct']}/{res['n_trials']}, 95% CI [{res['ci95_low']:.3f}, {res['ci95_high']:.3f}])")
+        results.append({'ctx_len': L, 'acc': res['accuracy'],
+                        'n_correct': res['n_correct'], 'n_trials': res['n_trials'],
+                        'ci95_low': res['ci95_low'], 'ci95_high': res['ci95_high']})
     out = args.output or Path(args.ckpt).parent / 'needle_results.json'
     Path(out).write_text(json.dumps(results, indent=2))
     manifest = collect_run_metadata(seed=args.seed)

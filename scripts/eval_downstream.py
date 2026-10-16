@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT
+from adasquash.metrics import wilson_interval
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 
@@ -71,7 +72,15 @@ def needle_target_ids(tokenizer, needle: str=DEFAULT_NEEDLE) -> list:
 def needle_decode_overhead(tokenizer, needle: str=DEFAULT_NEEDLE) -> int:
     return max(0, len(needle_target_ids(tokenizer, needle)) - 1)
 
-def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0):
+def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0, return_counts: bool=False):
+    """Exact-match accuracy of the secret over `n_trials` independent placements.
+
+    A trial is pass/fail, so the point estimate alone hides its resolution:
+    with `return_counts=True` the result is
+    `{'accuracy', 'n_correct', 'n_trials', 'ci95_low', 'ci95_high'}` with a
+    Wilson 95% interval over the trials. The default return (a float) is kept
+    for callers that only need the accuracy.
+    """
     rng = random.Random(seed)
     tok = tokenizer
     needle_ids = tok(needle, add_special_tokens=False)['input_ids']
@@ -123,7 +132,12 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         n_correct += int(correct)
     if n_run == 0:
         raise ValueError('needle test produced no trials')
-    return n_correct / n_run
+    acc = n_correct / n_run
+    if return_counts:
+        low, high = wilson_interval(n_correct, n_run)
+        return {'accuracy': acc, 'n_correct': n_correct, 'n_trials': n_run,
+                'ci95_low': low, 'ci95_high': high}
+    return acc
 
 def main():
     p = argparse.ArgumentParser()
@@ -151,10 +165,12 @@ def main():
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.tokenizer)
         ctx_len = args.needle_context_len or max(1, model.cfg.max_seq_len - needle_decode_overhead(tok))
-        acc = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed)
-        results['needle_acc'] = acc
+        needle = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed, return_counts=True)
+        results['needle_acc'] = needle['accuracy']
+        results['needle'] = needle
         results['needle_ctx_len'] = ctx_len
-        print(f'[eval] needle-in-haystack accuracy @ {ctx_len} = {acc:.3f}')
+        print(f"[eval] needle-in-haystack accuracy @ {ctx_len} = {needle['accuracy']:.3f} "
+              f"({needle['n_correct']}/{needle['n_trials']}, 95% CI [{needle['ci95_low']:.3f}, {needle['ci95_high']:.3f}])")
     results['seed'] = args.seed
     results['run_metadata'] = collect_run_metadata(seed=args.seed)
     out = args.output or Path(args.ckpt).parent / 'eval_results.json'

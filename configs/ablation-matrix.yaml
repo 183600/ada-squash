@@ -1,3 +1,8 @@
+# Ablation matrix. Every row is a controlled comparison and must state the
+# scientific hypothesis it tests (`hypothesis:`); the runner refuses rows
+# without one. The two *_baseline rows are the simple statistic-based
+# references every DyT-family row is scored against (see the
+# `baseline_comparison` block the runner writes next to all_summaries.json).
 model: gpt2-124m
 
 batch_size: 8
@@ -13,65 +18,134 @@ output_dir: runs/ablation
 
 ablations:
 
+  # --- Simple baselines: the strawman bar every variant must clear ---
+  - name: ln_baseline
+    norm: ln
+    hypothesis: >
+      Reference baseline: LayerNorm on the identical protocol. The DyT family
+      must beat this plain statistical normalization before its extra
+      machinery can be claimed to help.
+  - name: rmsnorm_baseline
+    norm: rmsnorm
+    hypothesis: >
+      Reference baseline: RMSNorm, the strongest simple no-mean
+      normalization in modern LLMs. A variant is only meaningfully better if
+      it also beats the *best* of the two baselines, not just the weaker one.
+
+  # --- Axis isolation: per-channel ---
   - name: dyt_no_perchannel
     norm: dyt
+    hypothesis: >
+      Original DyT (one scalar alpha, tanh) matches or beats the
+      LayerNorm/RMSNorm references at this scale, reproducing the paper
+      claim under our protocol.
   - name: dytc_perchannel
     norm: dytc
     p_init: 2.0
     learnable_p: false
     alpha_jitter: 0.0
+    hypothesis: >
+      Turning on the per-channel axis (p fixed at 2, jitter off, so only the
+      axis changes) improves held-out loss over scalar DyT.
   - name: dytcd_full
     norm: dytcd
+    hypothesis: >
+      Combining the per-channel and depth axes beats both single-axis
+      variants: the two mechanisms interact positively.
 
+  # --- Axis isolation: depth conditioning ---
   - name: dytd_k0_no_depth_schedule
     norm: dytd
     k_init: 0.0
     learnable_k: false
+    hypothesis: >
+      Depth decay is the source of DyT-D's gain: with k pinned at 0 and
+      frozen the advantage of dytd_full over scalar DyT should vanish.
   - name: dytd_full
     norm: dytd
+    hypothesis: >
+      Depth-conditioned alpha (plus LayerScale) beats scalar DyT at this
+      depth: strong shallow squashing with a relaxed deep response helps.
 
+  # --- LayerScale residual gate ---
   - name: dytcd_no_ls
     norm: dytcd
     use_layerscale: false
+    hypothesis: >
+      The LayerScale residual gate contributes to DyT-CD: removing it costs
+      held-out loss.
   - name: dytcd_ls1e5
     norm: dytcd
     layerscale_init: 1.0e-5
+    hypothesis: >
+      The default LayerScale init 1e-5 is a competitive residual-gate scale,
+      not an arbitrary strawman - explicit-vs-default rows must coincide.
   - name: dytcd_ls1e3
     norm: dytcd
     layerscale_init: 1.0e-3
+    hypothesis: >
+      A larger LayerScale init (1e-3) changes early residual growth; the
+      default should not be beaten by it on this synthetic corpus.
 
+  # --- Softsign family (saturation sharpness p) ---
   - name: dytc_p1_softsign
     norm: dytc
     p_init: 1.0
     learnable_p: false
     alpha_jitter: 0.0
+    hypothesis: >
+      Softsign sharpness matters: p=1 (classic softsign) is worse than p=2
+      on this outlier-heavy corpus.
   - name: dytc_p2_softsign
     norm: dytc
     p_init: 2.0
     learnable_p: false
     alpha_jitter: 0.0
+    hypothesis: >
+      p=2 (smooth softsign) is the best fixed saturation exponent of
+      {1, 2, 4}: enough outlier compression without gradient starvation.
   - name: dytc_p4_softsign
     norm: dytc
     p_init: 4.0
     learnable_p: false
     alpha_jitter: 0.0
+    hypothesis: >
+      p=4 saturates harder than p=2; the hypothesis is that this hurts
+      gradient flow through large activations and loses to p=2.
   - name: dytc_plearnable
     norm: dytc
     p_init: 2.0
     learnable_p: true
     alpha_jitter: 0.0
+    hypothesis: >
+      A learnable p adapts the saturation steepness per layer and beats
+      every fixed p in the sweep (otherwise fixing p is the simpler, better
+      design).
   - name: dytc_hardtanh_eq
     norm: dytc
     p_init: 64.0
     learnable_p: false
     alpha_jitter: 0.0
+    hypothesis: >
+      The p -> infinity limit (hard tanh) starves gradients outside [-1, 1]
+      and loses to finite p.
 
+  # --- DyT alpha initialization (never compare at an untuned init) ---
   - name: dyt_alpha_0.3
     norm: dyt
     alpha_init: 0.3
+    hypothesis: >
+      DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best
+      must be reported so the family is not compared at a strawman init.
   - name: dyt_alpha_0.5
     norm: dyt
     alpha_init: 0.5
+    hypothesis: >
+      DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best
+      must be reported so the family is not compared at a strawman init.
   - name: dyt_alpha_1.0
     norm: dyt
     alpha_init: 1.0
+    hypothesis: >
+      DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best
+      must be reported so the family is not compared at a strawman init.
