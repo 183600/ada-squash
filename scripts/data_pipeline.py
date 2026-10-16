@@ -24,6 +24,14 @@ Principles enforced here
 5. **Train statistics only.**  Nothing here estimates a statistic (mean,
    variance, vocabulary, length) on validation or test data and feeds it back
    into training; the held-out splits are read-only for evaluation.
+6. **Cross-split duplicates are dropped from the held-out side.**  Per-split
+   dedup cannot see a document that occurs once in train and once in
+   validation/test.  When an `exclude_hash_file` ledger (the hashes of the
+   training documents, written by `scripts/audit_data.py
+   --write-train-hash-file`) is supplied, any held-out document whose exact
+   text is in that ledger is dropped from that held-out split - never from
+   train itself (the ledger is derived from train, so excluding it there would
+   throw the whole split away).
 
 `build_dataloader` deliberately keeps its historical 5-argument call
 signature (the split / cleaning knobs travel through
@@ -31,8 +39,10 @@ signature (the split / cleaning knobs travel through
 working.
 """
 import hashlib
+import json
 import math
 from collections import Counter
+from pathlib import Path
 
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
@@ -51,6 +61,9 @@ DEFAULT_DATA_OPTIONS = {
     "max_doc_chars": 0,          # length-outlier cap, 0 = no cap
     "shuffle_buffer": 0,         # train-split batch shuffle window, 0 = off
     "seed": 42,
+    # Optional ledger of training-document hashes: when set, held-out splits
+    # drop exact duplicates of training documents (never applied to train).
+    "exclude_hash_file": None,
 }
 
 _active_data_options = dict(DEFAULT_DATA_OPTIONS)
@@ -180,22 +193,42 @@ def document_hash(text: str) -> bytes:
     return hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).digest()
 
 
+def load_hash_file(path) -> set:
+    """Read a document-hash ledger written by `audit_data.py`.
+
+    Accepts a JSON list of hex digests or whitespace/newline separated hex
+    digests and returns the set of raw digest bytes.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        entries = json.loads(text)
+    except json.JSONDecodeError:
+        entries = None
+    if not isinstance(entries, list):
+        entries = text.split()
+    return {bytes.fromhex(str(entry).strip()) for entry in entries}
+
+
 class DocumentCleaner:
     """One cleaning policy, applied identically to every split, after the split.
 
     Drops (with counters, so a run can report what was removed):
     missing / non-string text (NaN or None from the upstream table), empty
-    documents, degenerate short documents, length outliers and exact
-    duplicates.  The duplicate set is bounded at `dedup_max` entries; beyond
+    documents, degenerate short documents, length outliers, exact
+    duplicates (within the split), and exact duplicates of documents listed
+    in `exclude_hashes` (the training-document ledger used by held-out
+    splits).  The duplicate set is bounded at `dedup_max` entries; beyond
     that the cleaner keeps dropping documents but stops recording new hashes.
     """
 
     def __init__(self, dedup: bool = True, dedup_max: int = 1_000_000,
-                 min_doc_chars: int = 0, max_doc_chars: int = 0):
+                 min_doc_chars: int = 0, max_doc_chars: int = 0,
+                 exclude_hashes: set | None = None):
         self.dedup = bool(dedup)
         self.dedup_max = int(dedup_max)
         self.min_doc_chars = int(min_doc_chars)
         self.max_doc_chars = int(max_doc_chars)
+        self.exclude_hashes = set(exclude_hashes) if exclude_hashes else set()
         self.seen: set = set()
         self.stats: Counter = Counter()
 
@@ -221,13 +254,20 @@ class DocumentCleaner:
         if self.max_doc_chars and len(text) > self.max_doc_chars:
             self.stats["dropped_too_long"] += 1
             return None
-        if self.dedup:
+        if self.dedup or self.exclude_hashes:
             h = document_hash(text)
-            if h in self.seen:
-                self.stats["dropped_duplicate"] += 1
+            if h in self.exclude_hashes:
+                # Exact duplicate of a training document: keeping it in a
+                # held-out split would leak that document across the split
+                # boundary.
+                self.stats["dropped_cross_split_duplicate"] += 1
                 return None
-            if len(self.seen) < self.dedup_max:
-                self.seen.add(h)
+            if self.dedup:
+                if h in self.seen:
+                    self.stats["dropped_duplicate"] += 1
+                    return None
+                if len(self.seen) < self.dedup_max:
+                    self.seen.add(h)
         self.stats["documents_kept"] += 1
         return text
 
@@ -354,11 +394,24 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     stream_ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True)
     stream_ds, report = select_stream_split(stream_ds, opts["split"], opts)
     report["shuffle_buffer"] = int(opts["shuffle_buffer"]) if opts["split"] == "train" else 0
+    exclude_hashes: set = set()
+    exclude_file = opts.get("exclude_hash_file")
+    if exclude_file:
+        if opts["split"] == "train":
+            # The ledger is the set of training-document hashes; applying it
+            # to the train split would drop every document.  Stay silent on
+            # train and let validation/test consume it.
+            report["exclude_hash_file"] = None
+        else:
+            exclude_hashes = load_hash_file(exclude_file)
+            report["exclude_hash_file"] = str(exclude_file)
+            report["exclude_hashes"] = len(exclude_hashes)
     cleaner = DocumentCleaner(
         dedup=opts["dedup"],
         dedup_max=opts["dedup_max"],
         min_doc_chars=opts["min_doc_chars"],
         max_doc_chars=opts["max_doc_chars"],
+        exclude_hashes=exclude_hashes,
     )
     stream = PackedStream(
         stream_ds,
@@ -384,6 +437,7 @@ __all__ = [
     "get_data_options",
     "infer_num_documents",
     "load_document_stream",
+    "load_hash_file",
     "select_stream_split",
     "split_document_boundaries",
 ]

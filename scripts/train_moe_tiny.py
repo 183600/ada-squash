@@ -179,6 +179,11 @@ def main():
     p.add_argument('--val-frac', type=float, default=0.005, help='chronological validation fraction (real-data mode)')
     p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction (real-data mode)')
     p.add_argument('--num-documents', type=int, default=None, help='total documents; required when the dataset reports no size')
+    p.add_argument('--min-doc-chars', type=int, default=0, help='drop documents shorter than this many characters (0 = keep all non-empty); applied identically to train and validation')
+    p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap); applied identically to train and validation')
+    p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
+    p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); validation documents duplicated in train are dropped, never training documents')
+    p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation')
     p.add_argument('--val-batches', type=int, default=10, help='held-out validation batches at the end of training (0 disables)')
     p.add_argument('--tokenizer', default='gpt2')
     args = p.parse_args()
@@ -187,7 +192,7 @@ def main():
     cfg = GPTConfig(vocab_size=50304, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads, max_seq_len=args.seq_len, mlp_ratio=4.0, norm_name=args.norm)
     model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
     print(f'[moe] total params = {count_parameters(model) / 1000000.0:.2f}M')
-    from scripts.train_gpt2 import build_optimizer
+    from scripts.train_gpt2 import build_optimizer, open_data_split
     opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter()
@@ -195,8 +200,14 @@ def main():
     rng = torch.Generator(device=device).manual_seed(args.seed)
     data_iter = None
     if args.dataset:
-        from scripts.train_gpt2 import build_dataloader
-        loader = build_dataloader(args.dataset, args.dataset_config, args.seq_len, args.batch_size, tokenizer=args.tokenizer)
+        # Both loaders go through the same split configuration: the training
+        # boundary must reserve exactly the held-out validation range with the
+        # same cleaning policy, otherwise validation documents could overlap
+        # the documents the model trained on.
+        loader = open_data_split('train', args)
+        report = getattr(loader, 'split_report', None)
+        if report:
+            print(f'[moe][data] train split: {report}')
         data_iter = iter(loader)
 
     def next_batch():
@@ -251,10 +262,11 @@ def main():
         val_losses = []
         with torch.no_grad():
             if args.dataset:
-                from scripts.data_pipeline import configure_data_options
-                configure_data_options(split='validation', val_frac=args.val_frac,
-                                       test_frac=args.test_frac, num_documents=args.num_documents)
-                val_iter = iter(build_dataloader(args.dataset, args.dataset_config, args.seq_len, args.batch_size, tokenizer=args.tokenizer))
+                val_loader = open_data_split('validation', args)
+                rval = getattr(val_loader, 'split_report', None)
+                if rval:
+                    print(f'[moe][data] validation split: {rval}')
+                val_iter = iter(val_loader)
             else:
                 val_iter = None
             val_rng = torch.Generator(device=device).manual_seed(args.seed + 1)
@@ -263,7 +275,7 @@ def main():
                     try:
                         vx, vy = next(val_iter)
                     except StopIteration:
-                        val_iter = iter(build_dataloader(args.dataset, args.dataset_config, args.seq_len, args.batch_size, tokenizer=args.tokenizer))
+                        val_iter = iter(val_loader)
                         vx, vy = next(val_iter)
                     vx = vx.to(device, non_blocking=True)
                     vy = vy.to(device, non_blocking=True)

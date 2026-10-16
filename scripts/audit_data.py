@@ -13,8 +13,16 @@ Reads a bounded sample of the train / validation / test splits produced by
 * split hygiene: exact duplicate documents shared between train and the
   held-out splits (a duplicate in two splits is a leak no matter how the
   split was drawn);
+* chronology: train/validation/test must be contiguous slices of the upstream
+  order, so no document can sit on two sides and no future document can
+  precede the training slice;
 * distribution shift: total-variation distance between token frequency
-  distributions of train vs validation / test, plus document-length means.
+  distributions of train vs validation / test, plus document-length means and
+  3xIQR length-outlier counts.
+
+`--write-train-hash-file` emits the training-document hash ledger consumed by
+`--exclude-hash-file` in the trainers, so held-out splits drop any document
+whose exact text also occurs in train.
 
 This script only *reads* data; it never trains or writes to a split.
 """
@@ -40,7 +48,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     overlap = 0
     tokenizer_errors = 0
     for example in stream:
-        if len(lengths) >= n_docs:
+        if n_docs and len(lengths) >= n_docs:
             break
         text = cleaner(example)
         if text is None:
@@ -63,13 +71,42 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         stats['doc_chars_mean'] = sum(lengths) / len(lengths)
         stats['doc_chars_min'] = min(lengths)
         stats['doc_chars_max'] = max(lengths)
+        # Length outliers by the 3 x IQR fence (only a report; the pipeline's
+        # min/max_doc_chars knobs are the actual cleaning policy).
+        ordered = sorted(lengths)
+        q1 = ordered[len(ordered) // 4]
+        q3 = ordered[(3 * len(ordered)) // 4]
+        iqr = q3 - q1
+        lower, upper = max(0, q1 - 3 * iqr), q3 + 3 * iqr
+        stats['doc_chars_q1'] = q1
+        stats['doc_chars_q3'] = q3
+        stats['length_outliers_3iqr'] = sum(1 for v in lengths if v < lower or v > upper)
     else:
         stats['doc_chars_mean'] = stats['doc_chars_min'] = stats['doc_chars_max'] = None
+        stats['doc_chars_q1'] = stats['doc_chars_q3'] = None
+        stats['length_outliers_3iqr'] = None
     stats['tokenizer_errors'] = tokenizer_errors
     stats['token_ids_out_of_range'] = sum(c for t, c in tokens.items() if not 0 <= t < getattr(tokenizer, 'vocab_size', 2 ** 31))
     stats['distinct_token_ids'] = len(tokens)
     stats['finite_lengths'] = bool(all(math.isfinite(v) for v in (stats['doc_chars_mean'] or 0.0, stats['doc_chars_min'] or 0.0, stats['doc_chars_max'] or 0.0)))
     return stats, tokens, report, hashes
+
+
+def _chronology_problems(reports: dict) -> list:
+    """Verify the three split reports tile the stream in time order.
+
+    train must start at 0, validation must start where train ends and test
+    must start where validation ends; anything else means a document could be
+    counted on two sides (or the split is no longer chronological).
+    """
+    train, validation, test = (reports.get(name) for name in ('train', 'validation', 'test'))
+    if not all(isinstance(r, dict) and isinstance(r.get('start'), int) and isinstance(r.get('count'), int) for r in (train, validation, test)):
+        return []
+    train_end = train['start'] + train['count']
+    validation_end = validation['start'] + validation['count']
+    if train['start'] != 0 or validation['start'] != train_end or test['start'] != validation_end:
+        return [f"split ranges are not contiguous chronological slices: train=[{train['start']},{train_end}) validation=[{validation['start']},{validation_end}) test=[{test['start']},{test['start']+test['count']})"]
+    return []
 
 
 def _total_variation(a: Counter, b: Counter) -> float:
@@ -97,10 +134,11 @@ def main():
     p.add_argument('--val-frac', type=float, default=0.005, help='must match the trained run')
     p.add_argument('--test-frac', type=float, default=0.005, help='must match the trained run')
     p.add_argument('--num-documents', type=int, default=None, help='total documents; required when the dataset reports no size')
-    p.add_argument('--n-docs', type=int, default=2000, help='documents sampled per split')
+    p.add_argument('--n-docs', type=int, default=2000, help='documents sampled per split (0 = stream every document, needed for an exhaustive hash ledger)')
     p.add_argument('--min-doc-chars', type=int, default=0)
     p.add_argument('--max-doc-chars', type=int, default=0)
     p.add_argument('--no-dedup', dest='dedup', action='store_false')
+    p.add_argument('--write-train-hash-file', default=None, help='write the hashes of the sampled training documents here; feed the file to train_gpt2.py --exclude-hash-file so validation/test drop exact duplicates of training documents (use --n-docs 0 for a full ledger)')
     p.add_argument('--max-tvd', type=float, default=None, help="fail (exit 1) when train-vs-validation token total-variation distance exceeds this")
     p.add_argument('--output', default='runs/data_audit.json')
     args = p.parse_args()
@@ -126,6 +164,12 @@ def main():
         reports[name] = report
         if name == 'train':
             train_hashes = hashes
+            if args.write_train_hash_file:
+                ledger = Path(args.write_train_hash_file)
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                ledger.write_text(json.dumps(sorted(h.hex() for h in hashes)))
+                print(f'[audit] wrote {len(hashes)} training-document hashes to {ledger}')
+    chronology = _chronology_problems(reports)
     shift = {
         'train_vs_validation_tvd': _total_variation(tokens['train'], tokens['validation']),
         'train_vs_test_tvd': _total_variation(tokens['train'], tokens['test']),
@@ -134,7 +178,7 @@ def main():
             None if splits['train']['doc_chars_mean'] is None or splits['validation']['doc_chars_mean'] is None
             else splits['validation']['doc_chars_mean'] - splits['train']['doc_chars_mean']),
     }
-    out = {'options': vars(args), 'split_reports': reports, 'cleaning_and_sanity': splits, 'distribution_shift': shift}
+    out = {'options': vars(args), 'split_reports': reports, 'split_chronology_problems': chronology, 'cleaning_and_sanity': splits, 'distribution_shift': shift}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(out, indent=2, default=str))
     for name, stats in splits.items():
@@ -144,7 +188,13 @@ def main():
     print(f"[audit] token TVD train-vs-val={shift['train_vs_validation_tvd']:.4f} "
           f"train-vs-test={shift['train_vs_test_tvd']:.4f}")
     print(f"[audit] saved to {args.output}")
-    problems = []
+    problems = list(chronology)
+    for name in ('train', 'validation', 'test'):
+        stats = splits[name]
+        if stats['length_outliers_3iqr']:
+            print(f"[audit] NOTE: {name}: {stats['length_outliers_3iqr']} length outliers beyond the 3xIQR fence "
+                  f"(q1={stats['doc_chars_q1']}, q3={stats['doc_chars_q3']}, max={stats['doc_chars_max']}); "
+                  "use --min-doc-chars/--max-doc-chars in the training run to drop them")
     if not splits['train']['finite_lengths'] or not splits['validation']['finite_lengths']:
         problems.append('non-finite document-length statistics (NaN/Inf in the data)')
     if (splits['validation']['duplicate_overlap_with_train'] or 0) > 0 or (splits['test']['duplicate_overlap_with_train'] or 0) > 0:

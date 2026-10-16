@@ -127,14 +127,19 @@ def _probe_markov(rng, batch_size, seq_len, device, n_states=64):
     x, _ = markov_batch(rng, -100, batch_size, seq_len, device, n_states=n_states)
     return x
 
-def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None):
+def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None):
     # Scoring a checkpoint on the documents it trained on understates the
     # quantization damage; the probe must come from a held-out split. The
-    # default is the chronological validation slice.
+    # default is the chronological validation slice, and the cleaning policy
+    # (dedup / length caps / cross-split duplicate ledger) is taken from the
+    # checkpoint so the probe is the same held-out distribution the model was
+    # validated on.
     from scripts.train_gpt2 import build_dataloader
     from scripts.data_pipeline import configure_data_options
     configure_data_options(split=split, val_frac=val_frac, test_frac=test_frac,
-                           num_documents=num_documents)
+                           num_documents=num_documents, dedup=dedup,
+                           min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars,
+                           exclude_hash_file=exclude_hash_file)
     loader = build_dataloader(dataset, dataset_config, seq_len, batch_size, tokenizer=tokenizer)
     if split != 'train':
         report = getattr(loader, 'split_report', None)
@@ -156,6 +161,7 @@ def main():
     p.add_argument('--ckpts', nargs='+', required=True)
     p.add_argument('--probe', default='markov', choices=['markov', 'dataset', 'random'], help="probe corpus. 'random' is uniform tokens: it has no next-token signal, so ppl_fp ~= vocab_size and the PPL drop is unmeasurable (kept only for parity)")
     p.add_argument('--probe-split', default='validation', choices=['validation', 'test', 'train'], help="held-out split used by --probe dataset. Keep the default: 'test' is sealed for one final evaluation and 'train' reports an optimistically biased PPL")
+    p.add_argument('--allow-sealed-test', action='store_true', help="permit the single final check on the sealed test split; comparing checkpoints or quantization settings on 'test' would turn it into an implicit validation set")
     p.add_argument('--val-frac', type=float, default=0.005, help='chronological validation fraction (must match the trained run)')
     p.add_argument('--test-frac', type=float, default=0.005, help='chronological test fraction (must match the trained run)')
     p.add_argument('--num-documents', type=int, default=None, help='total documents in the stream; required when the dataset reports no size')
@@ -170,6 +176,10 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--output', default='runs/w8a8/results.json')
     args = p.parse_args()
+    if args.probe == 'dataset' and args.probe_split == 'test' and (not args.allow_sealed_test):
+        p.error("--probe-split test is sealed: comparing checkpoints or quantization "
+                "settings on it would tune on the test set. Use 'validation' (default), "
+                "or pass --allow-sealed-test for the single final check.")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.manual_seed(args.seed)
 
@@ -191,7 +201,7 @@ def main():
             if value == default and name in ckpt_args and ckpt_args.get(name) is not None:
                 return ckpt_args[name]
             return value
-        dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents')) if args.probe == 'dataset' else None
+        dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file')) if args.probe == 'dataset' else None
         batches = []
         for _ in range(max(1, args.n_batches)):
             x = make_probe(rng, model.cfg, dataset_probe)

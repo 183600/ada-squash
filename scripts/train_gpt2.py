@@ -87,8 +87,11 @@ def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()
 # The split-defining args are part of a run's identity: resuming with a
 # different boundary could move documents the model already trained on into
 # the validation split (and vice versa), so they are restored from the
-# checkpoint exactly like the schedule flags.
-_DATA_ARGS = ('dataset', 'dataset_config', 'val_frac', 'test_frac', 'num_documents')
+# checkpoint exactly like the schedule flags. The cleaning knobs and the
+# cross-split duplicate ledger are part of the same identity: changing them
+# changes which documents are trained on and which are held out.
+_DATA_ARGS = ('dataset', 'dataset_config', 'val_frac', 'test_frac', 'num_documents',
+              'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file')
 
 def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
     changed = []
@@ -112,6 +115,7 @@ def open_data_split(split: str, args, seq_len: int | None = None):
         dedup=args.dedup,
         min_doc_chars=args.min_doc_chars,
         max_doc_chars=args.max_doc_chars,
+        exclude_hash_file=getattr(args, 'exclude_hash_file', None),
         shuffle_buffer=args.train_shuffle_buffer if split == 'train' else 0,
         seed=args.seed,
     )
@@ -213,10 +217,12 @@ def main():
     p.add_argument('--val-batches', type=int, default=10, help='batches per held-out validation pass')
     p.add_argument('--early-stop-patience', type=int, default=0, help='stop after this many validation passes without improvement (0 = off)')
     p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first)')
+    p.add_argument('--allow-test-rerun', action='store_true', help='permit a second one-shot evaluation of the sealed test split in the same output dir (breaks the seal: the test set becomes an implicit validation set)')
     p.add_argument('--test-batches', type=int, default=20, help='batches for the one-shot final test evaluation')
     p.add_argument('--min-doc-chars', type=int, default=0, help='drop documents shorter than this many characters (0 = keep all non-empty)')
     p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap)')
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
+    p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); held-out documents whose exact text also occurs in train are dropped from validation/test, never from train')
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation or test')
     p.add_argument('--seq-len', type=int, default=1024)
     p.add_argument('--batch-size', type=int, default=32, help='per-device micro batch')
@@ -482,6 +488,20 @@ def main():
     if args.final_test_eval:
         # The test split is opened exactly once, after training is over, and
         # only the checkpoint selected on the validation split is scored.
+        # Re-running the evaluation in the same output dir would let the test
+        # score steer the next attempt, i.e. turn the sealed set into an
+        # implicit validation set, so it is refused unless explicitly allowed.
+        out_path = Path(args.output_dir) / 'test_results.json'
+        if out_path.exists() and (not args.allow_test_rerun):
+            raise SystemExit(
+                f'[test] {out_path} already exists: the sealed test split has already been '
+                'evaluated once for this run, and scoring it again would turn it into an '
+                'implicit validation set. Pass --allow-test-rerun only if you accept that '
+                'the seal is broken.')
+        if args.val_every <= 0:
+            print('[test] WARNING: --val-every 0 disables validation-based selection; '
+                  'the sealed test split reports the final model only and must never be '
+                  'used to pick hyperparameters.', file=sys.stderr)
         test_loader = open_data_split('test', args)
         rtest = getattr(test_loader, 'split_report', None)
         if rtest:
@@ -493,8 +513,7 @@ def main():
             print(f"[test] restored best-validation checkpoint (step {int(best.get('step', 0))}, val_loss={float(best.get('val_loss', float('nan'))):.4f}) before the one-shot test evaluation")
         test_state = {'iter': iter(test_loader)}
         test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device)
-        results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac}
-        out_path = Path(args.output_dir) / 'test_results.json'
+        results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
         with open(out_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f'[test] sealed test split evaluated once: test_loss={test_loss} -> {out_path}')
