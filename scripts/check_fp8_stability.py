@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from adasquash.model import MLP, build_gpt_124m
+from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import KurtosisMeter, markov_batch
 FP8_E4M3_MAX = 448.0
 
@@ -187,7 +188,7 @@ def main():
     if args.ckpt and len(args.ckpt) != len(args.norms):
         p.error(f'--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    torch.manual_seed(args.seed)
+    set_all_seeds(args.seed)
 
     def make_probe(rng, cfg):
         if args.probe == 'random':
@@ -196,7 +197,7 @@ def main():
         return x
     results = []
     for i, norm in enumerate(args.norms):
-        torch.manual_seed(args.seed)
+        set_all_seeds(args.seed)
         rng = torch.Generator(device=device).manual_seed(args.seed)
         if args.ckpt:
             from scripts.eval_downstream import load_ckpt
@@ -216,6 +217,10 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
+    manifest = collect_run_metadata(seed=args.seed)
+    manifest['hyperparameters'] = vars(args)
+    manifest['results_file'] = str(out_path)
+    save_run_manifest(out_path.with_name('run_manifest.json'), manifest)
     print(f'[done] saved to {out_path}')
 if __name__ == '__main__':
     main()

@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
+from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from scripts.eval_downstream import load_ckpt, needle_decode_overhead, needle_in_haystack
 
 def main():
@@ -19,6 +20,7 @@ def main():
     p.add_argument('--seed', type=int, default=0)
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    set_all_seeds(args.seed)
     model, _ = load_ckpt(args.ckpt, device=device)
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
@@ -33,6 +35,10 @@ def main():
         results.append({'ctx_len': L, 'acc': acc})
     out = args.output or Path(args.ckpt).parent / 'needle_results.json'
     Path(out).write_text(json.dumps(results, indent=2))
+    manifest = collect_run_metadata(seed=args.seed)
+    manifest['hyperparameters'] = vars(args)
+    manifest['results_file'] = str(out)
+    save_run_manifest(Path(out).with_name('needle_manifest.json'), manifest)
     print(f'[done] saved to {out}')
 if __name__ == '__main__':
     main()

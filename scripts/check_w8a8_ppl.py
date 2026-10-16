@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import GPT, markov_batch
 from adasquash.model import MLP
+from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from scripts.eval_downstream import load_ckpt
 
 def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
@@ -181,7 +182,7 @@ def main():
                 "settings on it would tune on the test set. Use 'validation' (default), "
                 "or pass --allow-sealed-test for the single final check.")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    torch.manual_seed(args.seed)
+    set_all_seeds(args.seed)
 
     def make_probe(rng, cfg, dataset_probe):
         if args.probe == 'random':
@@ -236,6 +237,10 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
+    manifest = collect_run_metadata(seed=args.seed)
+    manifest['hyperparameters'] = vars(args)
+    manifest['results_file'] = str(out_path)
+    save_run_manifest(out_path.with_name('run_manifest.json'), manifest)
     print(f'[done] saved to {out_path}')
 if __name__ == '__main__':
     main()

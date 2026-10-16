@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 from adasquash import build_norm, markov_batch
 from adasquash.attention import CausalSelfAttention
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, _LayerScaleResidual
+from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 _FLAT_TOKEN_CACHE: dict = {}
 
@@ -188,7 +190,7 @@ def main():
     p.add_argument('--tokenizer', default='gpt2')
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    torch.manual_seed(args.seed)
+    set_all_seeds(args.seed)
     cfg = GPTConfig(vocab_size=50304, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads, max_seq_len=args.seq_len, mlp_ratio=4.0, norm_name=args.norm)
     model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
     print(f'[moe] total params = {count_parameters(model) / 1000000.0:.2f}M')
@@ -197,6 +199,13 @@ def main():
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(args.output_dir) / 'run_manifest.json'
+    run_manifest = collect_run_metadata(seed=args.seed)
+    run_manifest['hyperparameters'] = vars(args)
+    data_reports: dict = {}
+    run_manifest['data'] = {'dataset': args.dataset, 'dataset_config': args.dataset_config, 'split_reports': data_reports}
+    save_run_manifest(manifest_path, run_manifest)
+    print(f'[moe][track] run manifest -> {manifest_path}')
     rng = torch.Generator(device=device).manual_seed(args.seed)
     data_iter = None
     if args.dataset:
@@ -207,6 +216,7 @@ def main():
         loader = open_data_split('train', args)
         report = getattr(loader, 'split_report', None)
         if report:
+            data_reports['train'] = report
             print(f'[moe][data] train split: {report}')
         data_iter = iter(loader)
 
@@ -265,6 +275,7 @@ def main():
                 val_loader = open_data_split('validation', args)
                 rval = getattr(val_loader, 'split_report', None)
                 if rval:
+                    data_reports['validation'] = rval
                     print(f'[moe][data] validation split: {rval}')
                 val_iter = iter(val_loader)
             else:
@@ -290,6 +301,16 @@ def main():
         s['val_loss'] = val_loss
     with open(Path(args.output_dir) / 'stats.json', 'w') as f:
         json.dump(s, f, indent=2, default=str)
+    run_manifest['data']['split_reports'] = data_reports
+    run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    run_manifest['results'] = {
+        'steps': args.max_steps,
+        'final_loss': history[-1]['loss'] if history else None,
+        'final_expert_cv': history[-1]['expert_cv'] if history else None,
+        'val_loss': val_loss,
+        'n_loss_spikes': loss_spike.n_spikes,
+    }
+    save_run_manifest(manifest_path, run_manifest)
     print(f'[done] saved to {args.output_dir} | n_loss_spikes={loss_spike.n_spikes}')
 
 def _expert_cv(tpe) -> float:

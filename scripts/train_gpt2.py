@@ -15,6 +15,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from adasquash import GPTConfig, GPT, build_norm, count_parameters, ActivationStats, LossSpikeCounter
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
+from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from scripts.data_pipeline import build_dataloader, configure_data_options
 
 def load_yaml_config(path: str) -> dict:
@@ -240,6 +241,7 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--compile', action='store_true', help='enable torch.compile')
     p.add_argument('--compile-mode', default='reduce-overhead', choices=['default', 'reduce-overhead', 'max-autotune'])
+    p.add_argument('--sanity-check', action='store_true', help='run the small-batch overfit sanity check (scripts/sanity_overfit.py) before training and abort if it fails')
     p.add_argument('--output-dir', default='runs/gpt2-124m-dytcd')
     p.add_argument('--log-every', type=int, default=20)
     p.add_argument('--stats-every', type=int, default=500)
@@ -271,7 +273,10 @@ def main():
             if run_args.get(arg_name) is not None:
                 os.environ[env_name] = str(run_args[arg_name])
     args.bf16 = not args.no_bf16
-    torch.manual_seed(args.seed)
+    if args.sanity_check:
+        from scripts.sanity_overfit import run_preflight
+        run_preflight(args.norm, args.seed, args.output_dir)
+    set_all_seeds(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -322,10 +327,12 @@ def main():
                 print(f'[resume] data-split args restored from checkpoint: {adopted}')
             if kept:
                 print(f'[resume] keeping your explicit data-split override(s) {kept} - the resumed run therefore evaluates on a different split than the one it continues')
+    data_reports: dict = {}
     loader = open_data_split('train', args)
     data_iter = iter(loader)
     report = getattr(loader, 'split_report', None)
     if report:
+        data_reports['train'] = report
         print(f'[data] train split: {report}')
     val_loader = None
     val_state: dict = {'iter': None}
@@ -333,6 +340,7 @@ def main():
     best_val_step = 0
     val_checks_without_improvement = 0
     last_val_loss = None
+    last_train_loss = None
     start_step = 0
     if resume_ckpt is not None:
         changed = restore_schedule_args(args, run_args, explicit=explicit)
@@ -381,6 +389,27 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = Path(args.output_dir) / 'train.jsonl'
     log_path.touch()
+    manifest_path = Path(args.output_dir) / 'run_manifest.json'
+    run_manifest = collect_run_metadata(seed=args.seed)
+    run_manifest['hyperparameters'] = vars(args)
+    run_manifest['data'] = {
+        'dataset': args.dataset,
+        'dataset_config': args.dataset_config,
+        'tokenizer': args.tokenizer,
+        'split_reports': data_reports,
+        'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if args.exclude_hash_file else None,
+        'config_file': file_fingerprint(args.config) if args.config else None,
+    }
+    if resume_ckpt is not None:
+        run_manifest['resumed_from'] = str(args.resume)
+    save_run_manifest(manifest_path, run_manifest)
+    provenance = {
+        'git_commit': run_manifest['git']['commit'],
+        'git_dirty': run_manifest['git']['dirty'],
+        'seed': args.seed,
+        'manifest': manifest_path.name,
+    }
+    print(f'[track] run manifest -> {manifest_path}')
     tb = None
     try:
         from torch.utils.tensorboard import SummaryWriter
@@ -420,6 +449,7 @@ def main():
         if attach_stats:
             act_stats.detach()
         loss_val = loss_acc.item()
+        last_train_loss = loss_val
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
@@ -431,6 +461,7 @@ def main():
                 val_loader = open_data_split('validation', args)
                 rval = getattr(val_loader, 'split_report', None)
                 if rval:
+                    data_reports['validation'] = rval
                     print(f'[data] validation split: {rval}')
             val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device)
             if val_loss is not None:
@@ -446,7 +477,7 @@ def main():
                 if tb:
                     tb.add_scalar('val/loss', val_loss, step)
                 if improved:
-                    ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss}
+                    ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'provenance': provenance}
                     path = Path(args.output_dir) / 'ckpt_best.pt'
                     torch.save(ckpt_best, path)
                     print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
@@ -474,17 +505,28 @@ def main():
                 for k, v in s.items():
                     tb.add_scalar(f'stats/{k}', v, step)
         if step % args.save_every == 0 and step > 0:
-            ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict()}
+            ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
             path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
             torch.save(ckpt, path)
             print(f'[ckpt] saved {path}')
         if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
             print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
             break
-    ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict()}
+    ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
     path = Path(args.output_dir) / 'ckpt_final.pt'
     torch.save(ckpt, path)
     print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
+    run_manifest['data']['split_reports'] = data_reports
+    run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    run_manifest['results'] = {
+        'final_step': step,
+        'last_train_loss': last_train_loss,
+        'best_val_loss': best_val_loss if val_loader is not None else None,
+        'best_val_step': best_val_step if val_loader is not None else None,
+        'n_loss_spikes': loss_spike.n_spikes,
+        'elapsed_s': time.time() - t0,
+    }
+    save_run_manifest(manifest_path, run_manifest)
     if args.final_test_eval:
         # The test split is opened exactly once, after training is over, and
         # only the checkpoint selected on the validation split is scored.
@@ -505,6 +547,7 @@ def main():
         test_loader = open_data_split('test', args)
         rtest = getattr(test_loader, 'split_report', None)
         if rtest:
+            data_reports['test'] = rtest
             print(f'[data] test split: {rtest}')
         best_path = Path(args.output_dir) / 'ckpt_best.pt'
         if val_loader is not None and best_path.exists():
@@ -516,6 +559,9 @@ def main():
         results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
         with open(out_path, 'w') as f:
             json.dump(results, f, indent=2)
+        run_manifest['data']['split_reports'] = data_reports
+        run_manifest['results']['test_loss'] = test_loss
+        save_run_manifest(manifest_path, run_manifest)
         print(f'[test] sealed test split evaluated once: test_loss={test_loss} -> {out_path}')
     if tb:
         tb.close()

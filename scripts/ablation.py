@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT, build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
+from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
 ABLATIONS = {'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0)}
 _MODEL_BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
@@ -50,11 +51,11 @@ def load_ablations_from_config(path: str) -> dict:
         out[name] = row
     return out
 
-def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
+def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: dict | None=None):
     print(f'\n[abl] {name}: {cfg_kwargs}')
     output_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    torch.manual_seed(args.seed)
+    set_all_seeds(args.seed)
     model = _MODEL_BUILDERS[args.model](**cfg_kwargs)
     model.reset_parameters(args.seed)
     model.to(device)
@@ -102,6 +103,9 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path):
     val_loss = sum(val_losses) / len(val_losses)
     stats = act_stats.summary()
     summary = {'name': name, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'elapsed_s': time.time() - t0}
+    if run_metadata is None:
+        run_metadata = collect_run_metadata(seed=args.seed)
+    summary['run_metadata'] = run_metadata
     with open(output_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} max_abs_pre_norm={summary['max_abs_pre_norm']}")
@@ -140,12 +144,18 @@ def main():
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--stats-every', type=int, default=200)
     p.add_argument('--val-batches', type=int, default=20, help='held-out synthetic batches for the selection metric (val_loss); never used for gradient updates')
+    p.add_argument('--sanity-check', action='store_true', help='run the small-batch overfit sanity check for every norm in the selected rows before training them')
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
     apply_config_to_parser(p, known.config)
     args = p.parse_args()
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    run_metadata = collect_run_metadata(seed=args.seed)
+    if args.sanity_check:
+        from scripts.sanity_overfit import run_preflight
+        norms = sorted({ablations[name].get('norm_name', 'dytcd') for name in args.names if name in ablations})
+        run_preflight(norms or ['dytcd'], args.seed, base)
     all_summaries = []
     trained: dict[str, str] = {}
     for name in args.names:
@@ -179,7 +189,7 @@ def main():
                 print(f'[alias] {name}: identical model config to {source}, reusing its summary (no retrain)')
                 all_summaries.append(summary)
                 continue
-        s = run_one(name, cfg_kwargs, args, run_dir)
+        s = run_one(name, cfg_kwargs, args, run_dir, run_metadata=run_metadata)
         trained[config_key] = name
         all_summaries.append(s)
     agg_path = base / 'all_summaries.json'
@@ -194,6 +204,11 @@ def main():
     ordered = merge_summaries(previous, all_summaries)
     with open(agg_path, 'w') as f:
         json.dump(ordered, f, indent=2)
+    manifest = dict(run_metadata)
+    manifest['git'] = git_revision()
+    manifest['hyperparameters'] = vars(args)
+    manifest['rows'] = [row['name'] for row in ordered]
+    save_run_manifest(base / 'run_manifest.json', manifest)
     print(f'\n[done] {len(ordered)} ablations saved to {base}')
 if __name__ == '__main__':
     main()

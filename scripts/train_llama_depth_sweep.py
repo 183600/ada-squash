@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from adasquash.repro import collect_run_metadata, save_run_manifest
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
     if step < warmup:
@@ -70,6 +71,8 @@ def launch_one(args, depth: int, norm: str, output_dir: Path):
         cmd += ['--exclude-hash-file', str(args.exclude_hash_file)]
     if args.gradient_checkpointing:
         cmd.append('--gradient-checkpointing')
+    if args.sanity_check:
+        cmd.append('--sanity-check')
     if args.compile:
         cmd.append('--compile')
         cmd += ['--compile-mode', args.compile_mode]
@@ -143,6 +146,7 @@ def main():
     p.add_argument('--no-beta', dest='beta', action='store_false')
     p.add_argument('--alpha-jitter', type=float, default=0.05, help='per-channel alpha init jitter for DyTC (0 for deterministic)')
     p.add_argument('--gradient-checkpointing', action='store_true', help='enable gradient checkpointing')
+    p.add_argument('--sanity-check', action='store_true', help='run the small-batch overfit sanity check in every row before training it')
     p.add_argument('--compile', action='store_true', help='enable torch.compile')
     p.add_argument('--compile-mode', default='reduce-overhead', choices=['default', 'reduce-overhead', 'max-autotune'])
     p.add_argument('--no-dim-scaling', action='store_true', help='keep dim/n_heads fixed across depths')
@@ -155,6 +159,14 @@ def main():
     args = p.parse_args()
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    sweep_manifest = collect_run_metadata(seed=args.seed)
+    sweep_manifest['hyperparameters'] = vars(args)
+    sweep_manifest['grid'] = {
+        'depths': list(args.depths),
+        'norms': list(args.norms),
+        'runs': [f'd{depth}-{norm}' for depth in args.depths for norm in args.norms],
+    }
+    save_run_manifest(base / 'run_manifest.json', sweep_manifest)
     procs = []
     for depth in args.depths:
         for norm in args.norms:

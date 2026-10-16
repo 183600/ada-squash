@@ -47,6 +47,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
+from adasquash.repro import seed_worker
+
 # Defaults chosen so that "just run the trainer" already reserves a small,
 # deterministic, chronological validation and test slice instead of scoring on
 # training documents.
@@ -400,7 +402,10 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
 
     Kept at five arguments on purpose - the split / cleaning knobs are read
     from `configure_data_options`; existing callers and test stubs keep
-    working unchanged.
+    working unchanged. The explicit generator and `worker_init_fn` make the
+    loader's base seed - and therefore every worker's RNG - a function of the
+    configured seed alone, not of how much global RNG the caller happened to
+    consume before building it.
     """
     from datasets import load_dataset
     from transformers import AutoTokenizer
@@ -440,8 +445,11 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
         shuffle_buffer=report["shuffle_buffer"],
         seed=opts["seed"],
     )
+    generator = torch.Generator()
+    generator.manual_seed(int(opts["seed"]))
     loader = DataLoader(stream, batch_size=batch_size, num_workers=2,
-                        pin_memory=torch.cuda.is_available())
+                        pin_memory=torch.cuda.is_available(),
+                        worker_init_fn=seed_worker, generator=generator)
     loader.split_report = report
     return loader
 

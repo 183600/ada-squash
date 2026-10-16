@@ -1,0 +1,298 @@
+from __future__ import annotations
+"""Fail-fast overfit sanity check: can the model memorize one small batch?
+
+Run this before any full-scale training. It freezes one small batch (a few
+sequences of `--seq-len` tokens), turns regularization off (dropout stays 0,
+weight decay is 0), and trains on exactly that batch. If the plumbing is
+correct the training loss must fall toward 0 and next-token accuracy must
+approach 1 (for the deterministic `copy` task); a loss that stalls near its
+initial value, a missing/NaN gradient or a mismatch between the logits loss
+path and the fused/no-logits loss path means a real bug (gradients not
+backpropagated, wrong loss, broken labels) - do not launch the full run.
+
+This check is necessary but not sufficient: passing it does not prove that
+data augmentation, feature alignment or label mapping are correct on the
+real corpus, so pair it with the pipeline audit (`scripts/audit_data.py`)
+and the intermediate-statistics hooks before scaling up.
+
+Tasks
+-----
+* `copy`    - synthetic deterministic batch: target = (input + 1) mod V;
+              must reach near-zero loss / ~100% accuracy on the frozen batch.
+* `markov`  - the repo's synthetic Markov walk; a learnable signal with a
+              non-trivial floor instead of the trivially memorizable copy map.
+* `dataset` - one real batch from the leakage-safe pipeline; natural text
+              never reaches ~0 loss, so pass `--loss-threshold` /
+              `--acc-threshold` explicitly and read them as progress bounds.
+"""
+import argparse
+import math
+import sys
+import time
+from collections import OrderedDict
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import torch
+from torch.optim import AdamW
+
+from adasquash import GPT, GPTConfig, NORM_REGISTRY, markov_batch
+from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+
+DEFAULT_THRESHOLDS = {
+    "copy": {"loss": 0.05, "acc": 0.99},
+    "markov": {"loss": 1.25, "acc": 0.30},
+    "dataset": {"loss": None, "acc": None},
+}
+
+
+def run_preflight(norms, seed: int, output_dir) -> None:
+    """Run this script as a subprocess; raise CalledProcessError when it fails.
+
+    Training entrypoints use this behind a `--sanity-check` flag so a broken
+    gradient/loss path aborts the run before any full-scale compute is spent.
+    The default synthetic `copy` task is used, so no dataset is required.
+    """
+    import subprocess
+
+    if isinstance(norms, str):
+        norms = [norms]
+    cmd = [sys.executable, str(Path(__file__).resolve()),
+           "--norms", *norms, "--seed", str(seed),
+           "--output", str(Path(output_dir) / "sanity_overfit.json")]
+    print(f"[sanity] pre-flight overfit check: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, cwd=str(ROOT))
+
+
+def make_batch(task: str, args, cfg: GPTConfig, device: str):
+    if task == "dataset":
+        from scripts.train_gpt2 import open_data_split
+
+        data_args = argparse.Namespace(
+            val_frac=0.005, test_frac=0.005, num_documents=args.num_documents,
+            dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None,
+            train_shuffle_buffer=0, seed=args.seed,
+        )
+        loader = open_data_split("train", data_args)
+        x, y = next(iter(loader))
+        x = x.to(device)
+        y = y.to(device)
+        if int(x.max()) >= cfg.vocab_size:
+            raise SystemExit(
+                f"dataset batch contains token id {int(x.max())} >= vocab_size="
+                f"{cfg.vocab_size}; raise --vocab-size (GPT-2 needs 50304)"
+            )
+        return x, y
+    generator = torch.Generator(device=device)
+    generator.manual_seed(args.seed)
+    if task == "markov":
+        return markov_batch(generator, cfg.ignore_index, args.batch_size, args.seq_len, device)
+    x = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), generator=generator, device=device)
+    y = torch.full_like(x, cfg.ignore_index)
+    y[:, :-1] = (x[:, :-1] + 1) % cfg.vocab_size
+    return x, y
+
+
+@torch.no_grad()
+def next_token_accuracy(model, x, y) -> float:
+    logits, _ = model(x, y, return_logits=True)
+    mask = y.ne(model.cfg.ignore_index)
+    if not bool(mask.any()):
+        return 0.0
+    pred = logits.argmax(-1)
+    return float((pred[mask] == y[mask]).float().mean().item())
+
+
+def gradient_report(model) -> dict:
+    missing, nonfinite, zero = [], [], []
+    sq = 0.0
+    n_used = 0
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.grad is None:
+            missing.append(name)
+            continue
+        if not bool(torch.isfinite(p.grad).all()):
+            nonfinite.append(name)
+            continue
+        n_used += 1
+        norm = float(p.grad.detach().float().norm().item())
+        sq += norm * norm
+        if norm == 0.0:
+            zero.append(name)
+    return {
+        "total_norm": math.sqrt(sq),
+        "params_with_grad": n_used,
+        "missing_grad": missing[:20],
+        "nonfinite_grad": nonfinite[:20],
+        "zero_grad": zero[:20],
+    }
+
+
+def run_one(norm: str, args, device: str) -> dict:
+    vocab = args.vocab_size
+    if vocab is None:
+        vocab = 50304 if args.task == "dataset" else 64
+    if args.task == "markov" and vocab < 64:
+        raise SystemExit("the markov task draws 64 states; pass --vocab-size >= 64")
+    thresholds = dict(DEFAULT_THRESHOLDS[args.task])
+    if args.loss_threshold is not None:
+        thresholds["loss"] = args.loss_threshold
+    if args.acc_threshold is not None:
+        thresholds["acc"] = args.acc_threshold
+    if args.task == "dataset" and (thresholds["loss"] is None or thresholds["acc"] is None):
+        raise SystemExit(
+            "the dataset task cannot use the synthetic pass thresholds: pass "
+            "--loss-threshold and --acc-threshold for the real batch"
+        )
+    set_all_seeds(args.seed)
+    cfg = GPTConfig(
+        vocab_size=vocab, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads,
+        max_seq_len=args.seq_len, mlp_ratio=4.0, dropout=0.0, norm_name=norm,
+        qk_norm=None, qk_alpha_init=1.0, use_layerscale=args.use_layerscale,
+        alpha_0=args.alpha_0, k_init=args.k_init, alpha_init=args.alpha_init,
+        p_init=args.p_init, learnable_p=not args.no_learnable_p,
+        learnable_k=not args.no_learnable_k, beta=args.beta,
+        alpha_jitter=args.alpha_jitter, gradient_checkpointing=False,
+    )
+    model = GPT(cfg)
+    model.reset_parameters(args.seed)
+    model.to(device)
+    x, y = make_batch(args.task, args, cfg, device)
+    opt = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
+
+    with torch.no_grad():
+        _, loss_ref = model(x, y, return_logits=True)
+        loss_fused = model(x, y, return_logits=False)[1]
+    loss_path_delta = abs(float(loss_fused.item()) - float(loss_ref.item()))
+    loss_path_tol = max(1e-5, 1e-4 * abs(float(loss_ref.item())))
+
+    history = []
+    initial_loss = None
+    final_loss = float("nan")
+    final_acc = float("nan")
+    grad_info = {}
+    t0 = time.time()
+    for step in range(1, args.max_steps + 1):
+        opt.zero_grad(set_to_none=True)
+        loss = model(x, y, return_logits=False)[1]
+        loss.backward()
+        if step == 1:
+            grad_info = gradient_report(model)
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        opt.step()
+        final_loss = float(loss.detach().item())
+        if initial_loss is None:
+            initial_loss = final_loss
+        if step == 1 or step % args.log_every == 0 or step == args.max_steps:
+            final_acc = next_token_accuracy(model, x, y)
+            history.append({"step": step, "loss": final_loss, "accuracy": final_acc})
+    elapsed = time.time() - t0
+
+    checks = OrderedDict()
+    checks["finite_loss"] = bool(math.isfinite(final_loss))
+    checks["gradients_present_and_finite"] = (
+        not grad_info.get("missing_grad") and not grad_info.get("nonfinite_grad")
+        and grad_info.get("total_norm", 0.0) > 0.0
+    )
+    checks["loss_paths_agree"] = bool(loss_path_delta <= loss_path_tol)
+    checks["initial_loss_as_expected"] = bool(
+        initial_loss is not None and initial_loss >= math.log(vocab) * 0.5
+    )
+    checks["loss_decreased"] = bool(final_loss < initial_loss - 1e-4)
+    checks["loss_below_threshold"] = bool(final_loss <= thresholds["loss"])
+    checks["accuracy_above_threshold"] = bool(final_acc >= thresholds["acc"])
+    passed = all(checks.values())
+    return {
+        "norm": norm,
+        "passed": passed,
+        "checks": checks,
+        "initial_loss": initial_loss,
+        "final_loss": final_loss,
+        "final_accuracy": final_acc,
+        "loss_path_delta": loss_path_delta,
+        "loss_path_tol": loss_path_tol,
+        "gradients": grad_info,
+        "history": history,
+        "elapsed_s": elapsed,
+    }
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--norms", nargs="+", default=["dytcd"], choices=sorted(NORM_REGISTRY))
+    p.add_argument("--task", choices=["copy", "markov", "dataset"], default="copy")
+    p.add_argument("--n-layers", type=int, default=2)
+    p.add_argument("--dim", type=int, default=64)
+    p.add_argument("--n-heads", type=int, default=4)
+    p.add_argument("--vocab-size", type=int, default=None, help="defaults to 64 for copy/markov, 50304 for dataset")
+    p.add_argument("--seq-len", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--max-steps", type=int, default=400)
+    p.add_argument("--lr", type=float, default=3e-3)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--use-layerscale", action="store_true")
+    p.add_argument("--no-learnable-p", action="store_true")
+    p.add_argument("--no-learnable-k", action="store_true")
+    p.add_argument("--no-beta", dest="beta", action="store_false")
+    p.add_argument("--alpha-0", type=float, default=0.9)
+    p.add_argument("--alpha-init", type=float, default=0.5)
+    p.add_argument("--k-init", type=float, default=1.0)
+    p.add_argument("--p-init", type=float, default=2.0)
+    p.add_argument("--alpha-jitter", type=float, default=0.0)
+    p.add_argument("--loss-threshold", type=float, default=None)
+    p.add_argument("--acc-threshold", type=float, default=None)
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
+    p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--tokenizer", default="gpt2")
+    p.add_argument("--num-documents", type=int, default=None)
+    p.add_argument("--device", default=None)
+    p.add_argument("--output", default="runs/sanity_overfit.json")
+    args = p.parse_args()
+    if args.dim % args.n_heads:
+        p.error(f"--dim {args.dim} is not divisible by --n-heads {args.n_heads}")
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    results = []
+    for norm in args.norms:
+        print(f"[sanity] task={args.task} norm={norm} device={device}")
+        result = run_one(norm, args, device)
+        results.append(result)
+        status = "PASS" if result["passed"] else "FAIL"
+        print(
+            f"[sanity] {status} {norm}: initial_loss={result['initial_loss']:.4f} "
+            f"final_loss={result['final_loss']:.4f} accuracy={result['final_accuracy']:.4f} "
+            f"grad_norm={result['gradients'].get('total_norm', 0.0):.3e}"
+        )
+        for name, ok in result["checks"].items():
+            print(f"[sanity]   {'ok' if ok else 'FAIL'}: {name}")
+        if not result["passed"]:
+            if result["gradients"].get("missing_grad"):
+                print(f"[sanity]   missing grads: {result['gradients']['missing_grad']}")
+            if result["gradients"].get("nonfinite_grad"):
+                print(f"[sanity]   non-finite grads: {result['gradients']['nonfinite_grad']}")
+    report = {
+        "passed": all(r["passed"] for r in results),
+        "run_metadata": collect_run_metadata(seed=args.seed),
+        "config": vars(args),
+        "results": results,
+    }
+    out_path = save_run_manifest(args.output, report)
+    print(f"[sanity] report -> {out_path}")
+    if not report["passed"]:
+        print(
+            "[sanity] REJECTED: the model cannot overfit one small batch; fix the "
+            "gradient/loss plumbing before launching the full run.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    print("[sanity] PASS")
+
+
+if __name__ == "__main__":
+    main()

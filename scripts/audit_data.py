@@ -36,6 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from adasquash.repro import collect_run_metadata, save_run_manifest
 from scripts.data_pipeline import DocumentCleaner, document_hash, load_document_stream
 
 
@@ -178,9 +179,17 @@ def main():
             None if splits['train']['doc_chars_mean'] is None or splits['validation']['doc_chars_mean'] is None
             else splits['validation']['doc_chars_mean'] - splits['train']['doc_chars_mean']),
     }
-    out = {'options': vars(args), 'split_reports': reports, 'split_chronology_problems': chronology, 'cleaning_and_sanity': splits, 'distribution_shift': shift}
+    out = {'options': vars(args), 'run_metadata': collect_run_metadata(), 'split_reports': reports, 'split_chronology_problems': chronology, 'cleaning_and_sanity': splits, 'distribution_shift': shift}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(out, indent=2, default=str))
+    save_run_manifest(Path(args.output).with_name('data_manifest.json'), {
+        'run_metadata': out['run_metadata'],
+        'dataset': args.dataset,
+        'dataset_config': args.dataset_config,
+        'tokenizer': args.tokenizer,
+        'options': vars(args),
+        'split_reports': reports,
+    })
     for name, stats in splits.items():
         print(f"[audit] {name}: sampled={stats['documents_sampled']} kept={stats.get('documents_kept', 0)} "
               f"dropped_empty={stats.get('dropped_empty', 0)} dropped_missing={stats.get('dropped_missing_text', 0)} "

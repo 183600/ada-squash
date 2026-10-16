@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
+from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 
 def _strip_compile_prefix(state):
     prefix = '_orig_mod.'
@@ -132,9 +133,11 @@ def main():
     p.add_argument('--needle-test', action='store_true', help='also run needle-in-haystack')
     p.add_argument('--needle-context-len', type=int, default=None, help="needle context length (default: the checkpoint's max_seq_len minus the positions the secret's decode needs - the longest the model can actually be scored at; asking for more raises)")
     p.add_argument('--tokenizer', default='gpt2')
+    p.add_argument('--seed', type=int, default=0, help='seed for the needle-position and generation RNGs')
     p.add_argument('--output', default=None)
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    set_all_seeds(args.seed)
     model, model_args = load_ckpt(args.ckpt, device=device)
     print(f"[eval] loaded {args.ckpt} | norm={model_args['norm']} | n_layers={model.cfg.n_layers}")
     results = {'ckpt': args.ckpt, 'norm': model_args['norm'], 'tasks': {}}
@@ -148,12 +151,15 @@ def main():
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.tokenizer)
         ctx_len = args.needle_context_len or max(1, model.cfg.max_seq_len - needle_decode_overhead(tok))
-        acc = needle_in_haystack(model, tok, context_len=ctx_len, device=device)
+        acc = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed)
         results['needle_acc'] = acc
         results['needle_ctx_len'] = ctx_len
         print(f'[eval] needle-in-haystack accuracy @ {ctx_len} = {acc:.3f}')
+    results['seed'] = args.seed
+    results['run_metadata'] = collect_run_metadata(seed=args.seed)
     out = args.output or Path(args.ckpt).parent / 'eval_results.json'
-    Path(out).write_text(json.dumps(results, indent=2))
+    Path(out).write_text(json.dumps(results, indent=2, default=str))
+    save_run_manifest(Path(out).with_name('eval_manifest.json'), results['run_metadata'])
     print(f'[eval] results saved to {out}')
 if __name__ == '__main__':
     main()
