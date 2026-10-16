@@ -144,6 +144,12 @@ def main():
         if (run_dir / 'summary.json').exists() and (not args.force):
             print(f'[skip] {name} already done, use --force to rerun')
             trained.setdefault(config_key, name)
+            try:
+                summary = json.loads((run_dir / 'summary.json').read_text())
+            except (OSError, json.JSONDecodeError):
+                summary = None
+            if isinstance(summary, dict):
+                all_summaries.append(summary)
             continue
         source = trained.get(config_key)
         if source is not None and (base / source / 'summary.json').exists():
