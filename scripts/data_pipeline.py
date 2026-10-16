@@ -348,8 +348,9 @@ class PackedStream(IterableDataset):
         def drain():
             nonlocal pos
             while len(buf) - pos >= need:
-                x = torch.tensor(buf[pos:pos + self.seq_len], dtype=torch.long)
-                y = torch.tensor(buf[pos + 1:pos + need], dtype=torch.long)
+                window = torch.tensor(buf[pos:pos + need], dtype=torch.long)
+                x = window[:-1]
+                y = window[1:]
                 pos += self.seq_len
                 yield (x, y)
             del buf[:pos]

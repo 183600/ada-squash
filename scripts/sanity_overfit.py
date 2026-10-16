@@ -128,7 +128,7 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
     baselines are reported so a pass cannot hide behind class imbalance or a
     degenerate label mapping.
     """
-    logits, _ = model(x, y, return_logits=True)
+    logits, _ = model(x, return_logits=True)
     mask = y.ne(model.cfg.ignore_index)
     vocab = int(logits.size(-1))
     n_valid = int(mask.sum().item())
