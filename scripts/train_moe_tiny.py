@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import copy
 import json
 import os
 import sys
@@ -170,6 +171,12 @@ _MOE_SEED_METRIC_KEYS = ('val_loss', 'final_loss', 'final_expert_cv')
 
 def run_one(args, seed: int, output_dir: Path) -> dict:
     """One complete MoE training run on `seed`, writing its own artifacts."""
+    # The data pipeline needs an integer seed for the split/loader RNG, and
+    # every run must use its own: in the default multi-seed mode (`--seeds`)
+    # `args.seed` is None. The copy mirrors `tune.run_trial`, so the caller's
+    # namespace is not mutated.
+    args = copy.copy(args)
+    args.seed = int(seed)
     output_dir = Path(output_dir)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seed)
