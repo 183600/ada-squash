@@ -135,9 +135,9 @@ class ActivationStats:
         if reset:
             self.max_abs = defaultdict(MaxAbsMeter)
             self.kurtosis = defaultdict(KurtosisMeter)
+        from .norms import LayerNorm, RMSNorm, _SquashedAffine
         for name, m in self.model.named_modules():
-            cls_name = m.__class__.__name__
-            if cls_name in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD'}:
+            if isinstance(m, (LayerNorm, RMSNorm, _SquashedAffine)):
                 self.handles.append(m.register_forward_hook(self._make_hook(name)))
 
     def detach(self):

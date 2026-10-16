@@ -1,6 +1,9 @@
 model: llama-1b
 depths: [12, 24, 48, 96]
-norms: [rmsnorm, dyt, dytcd]
+# dytdi = depth-init control: plain DyT initialized at the DyT-D schedule.
+# The depth claims need it - without dytd vs dytdi the "depth-conditioning"
+# axis cannot distinguish the reparameterization from a better init.
+norms: [rmsnorm, dyt, dytcd, dytdi]
 
 alpha_0: 0.9
 k_init: 1.0

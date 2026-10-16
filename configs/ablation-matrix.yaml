@@ -11,67 +11,172 @@ log_every: 50
 stats_every: 200
 output_dir: runs/ablation
 
+# Single-variable ablation matrix.
+#
+# Design rule: every named contrast below differs from its reference row by
+# exactly ONE axis. Run with `--seeds 42 43 44` to get mean/std per row; a
+# 1000-step spread smaller than the seed std is not evidence.
+#
+# The outlier probe is a persistent residual-stream channel amplification
+# after the middle block (see scripts/ablation.py::install_residual_outlier);
+# it is applied identically to every row, so it is a constant of the
+# comparison, not a variable.
 ablations:
 
-  - name: dyt_no_perchannel
+  # ---- LayerScale axis: ± LayerScale under each norm family ----
+  # The old matrix jumped LN(no LS) -> dytcd(LS on), bundling the norm swap
+  # with the residual gate; these four rows unbundle it for LN and RMSNorm.
+  - name: ln
+    norm: ln
+    use_layerscale: false
+  - name: ln_ls              # ln -> ln_ls isolates LayerScale under LN
+    norm: ln
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+  - name: rmsnorm
+    norm: rmsnorm
+    use_layerscale: false
+  - name: rmsnorm_ls         # rmsnorm -> rmsnorm_ls isolates LayerScale under RMSNorm
+    norm: rmsnorm
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  # ---- Activation family x per-channel factorial (LayerScale OFF) ----
+  # {scalar, per-channel} alpha x {tanh, softsign}: the four cells of the
+  # 2x2. All four share alpha_init=0.5, jitter=0, p=2 (fixed) so the only
+  # moving parts are the two axes.
+  - name: dyt                # scalar tanh (reference cell)
     norm: dyt
-  - name: dytc_perchannel
-    norm: dytc
+    alpha_init: 0.5
+    use_layerscale: false
+  - name: dyts               # dyt -> dyts isolates the activation family (tanh -> softsign)
+    norm: dyts
+    alpha_init: 0.5
     p_init: 2.0
     learnable_p: false
-    alpha_jitter: 0.0
-  - name: dytcd_full
-    norm: dytcd
-
-  - name: dytd_k0_no_depth_schedule
-    norm: dytd
-    k_init: 0.0
-    learnable_k: false
-  - name: dytd_full
-    norm: dytd
-
-  - name: dytcd_no_ls
-    norm: dytcd
     use_layerscale: false
-  - name: dytcd_ls1e5
-    norm: dytcd
-    layerscale_init: 1.0e-5
-  - name: dytcd_ls1e3
-    norm: dytcd
-    layerscale_init: 1.0e-3
+  - name: dytp               # dyt -> dytp isolates the per-channel axis under tanh
+    norm: dytp
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    use_layerscale: false
+  - name: dytc               # dytp -> dytc isolates the family; dyts -> dytc isolates per-channel
+    norm: dytc
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: false
+    use_layerscale: false
 
+  # Softsign exponent sweep (single variable: p, under dytc, LS off)
   - name: dytc_p1_softsign
     norm: dytc
+    alpha_init: 0.5
+    alpha_jitter: 0.0
     p_init: 1.0
     learnable_p: false
-    alpha_jitter: 0.0
-  - name: dytc_p2_softsign
-    norm: dytc
-    p_init: 2.0
-    learnable_p: false
-    alpha_jitter: 0.0
+    use_layerscale: false
   - name: dytc_p4_softsign
     norm: dytc
+    alpha_init: 0.5
+    alpha_jitter: 0.0
     p_init: 4.0
     learnable_p: false
-    alpha_jitter: 0.0
-  - name: dytc_plearnable
+    use_layerscale: false
+  - name: dytc_plearnable    # dytc(fixed p=2) -> dytc_plearnable isolates learnable p
     norm: dytc
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: true
+    use_layerscale: false
+
+  # ---- Depth axis (LayerScale ON throughout, alpha_init matched) ----
+  # dyt_ls is the LS-matched reference for the depth rows.
+  - name: dyt_ls             # plain DyT + LayerScale (depth-axis reference)
+    norm: dyt
+    alpha_init: 0.5
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+  - name: dytd               # dyt_ls -> dytd adds the (alpha_0, k) reparameterization
+    norm: dytd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+  - name: dytd_k0_no_depth_schedule   # dytd -> k0 kills the schedule (k=0, frozen)
+    norm: dytd
+    alpha_0: 0.9
+    k_init: 0.0
+    learnable_k: false
+    k_min: 0.0
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+  - name: dytdi              # dytd -> dytdi: same alpha_l at init, plain per-layer alpha, no reparameterization
+    norm: dytdi
+    alpha_0: 0.9
+    k_init: 1.0
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+  - name: dytd_shared        # dytd -> dytd_shared: one (alpha_0, k) for the whole model - a true cross-layer law
+    norm: dytd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    shared_depth_schedule: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+  - name: dytc_ls            # LS-matched per-channel softsign reference (learnable p, matching dytcd)
+    norm: dytc
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+  - name: dytcd              # dytc_ls -> dytcd adds the depth reparameterization (per-channel)
+    norm: dytcd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
     p_init: 2.0
     learnable_p: true
     alpha_jitter: 0.0
-  - name: dytc_hardtanh_eq
-    norm: dytc
-    p_init: 64.0
-    learnable_p: false
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+  - name: dytcdi             # dytcd -> dytcdi: same per-channel alpha_l at init, no reparameterization
+    norm: dytcdi
+    alpha_0: 0.9
+    k_init: 1.0
+    p_init: 2.0
+    learnable_p: true
     alpha_jitter: 0.0
+    use_layerscale: true
+    layerscale_init: 1.0e-5
 
-  - name: dyt_alpha_0.3
-    norm: dyt
-    alpha_init: 0.3
-  - name: dyt_alpha_0.5
-    norm: dyt
-    alpha_init: 0.5
-  - name: dyt_alpha_1.0
-    norm: dyt
-    alpha_init: 1.0
+  # ---- LayerScale under the main proposal (the bundled axis of the old matrix) ----
+  - name: dytcd_no_ls        # dytcd -> dytcd_no_ls isolates LayerScale under DyT-CD
+    norm: dytcd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    p_init: 2.0
+    learnable_p: true
+    alpha_jitter: 0.0
+    use_layerscale: false
+  - name: dytcd_ls1e3        # dytcd -> ls1e3 isolates the LayerScale init magnitude
+    norm: dytcd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    p_init: 2.0
+    learnable_p: true
+    alpha_jitter: 0.0
+    use_layerscale: true
+    layerscale_init: 1.0e-3

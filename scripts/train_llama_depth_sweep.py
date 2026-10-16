@@ -88,7 +88,7 @@ def main():
     p.add_argument('--config', default=None, help='YAML run config; CLI flags override it')
     p.add_argument('--model', default='llama-1b')
     p.add_argument('--depths', nargs='+', type=int, default=[12, 24, 48, 96])
-    p.add_argument('--norms', nargs='+', default=['rmsnorm', 'dyt', 'dytcd'])
+    p.add_argument('--norms', nargs='+', default=['rmsnorm', 'dyt', 'dytcd', 'dytdi'], help='norm families to sweep; dytdi is the depth-init control that isolates the reparameterization from the init prior (the depth claims need it)')
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
     p.add_argument('--tokenizer', default='HuggingFaceFW/fineweb-edu/llama-tokenizer')

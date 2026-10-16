@@ -1,0 +1,38 @@
+model: gpt2-124m
+# RMSNorm + LayerScale: the LayerScale control the old plan never ran - the
+# LN(no-LS) -> dytcd(LS-on) comparison bundled the norm swap with the
+# residual gate. rmsnorm vs rmsnorm_ls isolates the gate under a norm baseline.
+norm: rmsnorm
+qk_norm: null
+use_layerscale: true
+layerscale_init: 1.0e-5
+
+dataset: HuggingFaceFW/fineweb-edu
+dataset_config: sample-10BT
+tokenizer: gpt2
+seq_len: 1024
+batch_size: 32
+grad_accum: 4
+
+max_steps: 10000
+lr: 6.0e-4
+min_lr_ratio: 0.1
+warmup: 500
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+bf16: true
+
+# Held-out validation: wikitext-103 test is disjoint from the FineWeb-Edu
+# training stream, so val_loss is never computed on data the model trained on.
+val_every: 500
+val_batches: 16
+val_dataset: Salesforce/wikitext
+val_dataset_config: wikitext-103-raw-v1
+val_split: test
+
+output_dir: runs/gpt2-124m-rmsnorm-ls
+log_every: 20
+stats_every: 500
+save_every: 2000

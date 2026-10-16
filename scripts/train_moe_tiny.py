@@ -160,7 +160,7 @@ class MoEGPT(nn.Module):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--norm', default='dytcd', choices=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
+    p.add_argument('--norm', default='dytcd', choices=['ln', 'rmsnorm', 'dyt', 'dyts', 'dytp', 'dytc', 'dytd', 'dytdi', 'dytcd', 'dytcdi'])
     p.add_argument('--n-experts', type=int, default=8)
     p.add_argument('--dim', type=int, default=512)
     p.add_argument('--n-layers', type=int, default=8)

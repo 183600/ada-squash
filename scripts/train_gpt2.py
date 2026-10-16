@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from contextlib import nullcontext
@@ -16,7 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from adasquash import GPTConfig, GPT, build_norm, count_parameters, ActivationStats, LossSpikeCounter
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 
-def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int, batch_size: int, tokenizer: str='gpt2'):
+def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int, batch_size: int, tokenizer: str='gpt2', split: str='train'):
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from torch.utils.data import DataLoader, IterableDataset
@@ -73,10 +74,9 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
                 extend(texts)
                 yield from drain()
             self.pos = pos
-    ds = load_dataset(dataset_name, dataset_config, split='train', streaming=True)
+    ds = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
     stream = PackedStream(ds, tok, seq_len)
     return DataLoader(stream, batch_size=batch_size, num_workers=2, pin_memory=torch.cuda.is_available())
-
 def load_yaml_config(path: str) -> dict:
     import yaml
     with open(path, 'r', encoding='utf-8') as f:
@@ -102,7 +102,7 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
         parser.set_defaults(**{dest: value})
     if unknown:
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
-_TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
+_TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False), 'k_min': ('k_min', False), 'shared_depth_schedule': ('shared_depth_schedule', False)}
 
 def build_optimizer(model: nn.Module, lr: float, weight_decay: float, beta1: float, beta2: float):
     decay = []
@@ -129,7 +129,7 @@ def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float)
 def build_lr_lambda(args):
     return lambda s: cosine_schedule(s + 1, args.max_steps, args.warmup, args.min_lr_ratio)
 _SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip')
-_ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'beta', 'alpha_0', 'k_init', 'alpha_init', 'p_init', 'alpha_jitter')
+_ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'beta', 'alpha_0', 'k_init', 'k_min', 'shared_depth_schedule', 'alpha_init', 'p_init', 'alpha_jitter')
 _NUMERIC_ARGS = ('compile', 'compile_mode', 'no_bf16')
 _RESUME_RUN_ARGS = _ARCH_ARGS + _NUMERIC_ARGS
 
@@ -183,7 +183,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--config', default=None, help='YAML run config; CLI flags override it')
     p.add_argument('--model', choices=['gpt2-124m', 'gpt2-350m', 'llama-1b'], default='gpt2-124m')
-    p.add_argument('--norm', default='dytcd', choices=list(['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd']))
+    p.add_argument('--norm', default='dytcd', choices=list(['ln', 'rmsnorm', 'dyt', 'dyts', 'dytp', 'dytc', 'dytd', 'dytdi', 'dytcd', 'dytcdi']))
     p.add_argument('--qk-norm', default=None, choices=[None, 'qknorm', 'dytqk'])
     p.add_argument('--qk-alpha-init', type=float, default=1.0, help='initial alpha_q / alpha_k for --qk-norm dytqk')
     p.add_argument('--no-layerscale', action='store_true')
@@ -191,6 +191,9 @@ def main():
     p.add_argument('--alpha-0', type=float, default=0.9)
     p.add_argument('--alpha-init', type=float, default=0.5)
     p.add_argument('--k-init', type=float, default=1.0)
+    p.add_argument('--k-min', type=float, default=0.0, help='floor on the per-norm depth-decay rate k of dytd/dytcd (keeps the depth schedule non-increasing); use --no-k-min to restore the old unconstrained k')
+    p.add_argument('--no-k-min', dest='k_min', action='store_const', const=None)
+    p.add_argument('--shared-depth-schedule', action='store_true', help='share one (alpha_0, k) pair across every dytd/dytcd norm so the depth law is a genuine cross-layer schedule instead of a per-layer initialization prior')
     p.add_argument('--p-init', type=float, default=2.0)
     p.add_argument('--no-learnable-p', action='store_true')
     p.add_argument('--no-learnable-k', action='store_true')
@@ -221,6 +224,13 @@ def main():
     p.add_argument('--log-every', type=int, default=20)
     p.add_argument('--stats-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=2000)
+    p.add_argument('--val-every', type=int, default=0, help='evaluate held-out validation loss every N steps (0 = off). Requires --val-dataset (or a validation split of --dataset/--dataset-config) so the number is not computed on training data')
+    p.add_argument('--val-batches', type=int, default=16)
+    p.add_argument('--val-dataset', default=None, help='held-out validation corpus, e.g. Salesforce/wikitext (wikitext-103-raw-v1, split test). Must be disjoint from the training stream')
+    p.add_argument('--val-dataset-config', default='wikitext-103-raw-v1')
+    p.add_argument('--val-split', default='test')
+    p.add_argument('--val-seq-len', type=int, default=None, help='validation sequence length (default: the training seq-len)')
+    p.add_argument('--resume-skip-data', action='store_true', help='do NOT fast-forward the dataloader past the batches the checkpoint already consumed (faster, but the resumed run replays training data)')
     p.add_argument('--wandb-project', default=None)
     p.add_argument('--run-name', default=None)
     p.add_argument('--resume', default=None, help='checkpoint to resume from')
@@ -254,7 +264,7 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dtype = torch.bfloat16 if args.bf16 and device == 'cuda' else torch.float32
     ctx = torch.amp.autocast(device_type='cuda', dtype=dtype) if dtype != torch.float32 else nullcontext()
-    model_cfg = dict(norm_name=args.norm, qk_norm=args.qk_norm, qk_alpha_init=args.qk_alpha_init, use_layerscale=not args.no_layerscale, alpha_0=args.alpha_0, k_init=args.k_init, alpha_init=args.alpha_init, p_init=args.p_init, learnable_p=not args.no_learnable_p, learnable_k=not args.no_learnable_k, beta=args.beta, alpha_jitter=args.alpha_jitter, gradient_checkpointing=args.gradient_checkpointing)
+    model_cfg = dict(norm_name=args.norm, qk_norm=args.qk_norm, qk_alpha_init=args.qk_alpha_init, use_layerscale=not args.no_layerscale, alpha_0=args.alpha_0, k_init=args.k_init, k_min=args.k_min, shared_depth_schedule=args.shared_depth_schedule, alpha_init=args.alpha_init, p_init=args.p_init, learnable_p=not args.no_learnable_p, learnable_k=not args.no_learnable_k, beta=args.beta, alpha_jitter=args.alpha_jitter, gradient_checkpointing=args.gradient_checkpointing)
     if args.layerscale_init is not None:
         model_cfg['layerscale_init'] = args.layerscale_init
     if args.tie_embeddings is not None:
@@ -292,6 +302,19 @@ def main():
     print(f'[model] norm param breakdown: {model.norm_param_count()}')
     loader = build_dataloader(args.dataset, args.dataset_config, args.seq_len, args.batch_size, tokenizer=args.tokenizer)
     data_iter = iter(loader)
+    batches_consumed = 0
+    val_iter = None
+    val_loader = None
+    if args.val_every and args.val_every > 0:
+        if args.val_dataset:
+            val_loader = build_dataloader(args.val_dataset, args.val_dataset_config, args.val_seq_len or args.seq_len, args.batch_size, tokenizer=args.tokenizer, split=args.val_split)
+        else:
+            try:
+                val_loader = build_dataloader(args.dataset, args.dataset_config, args.val_seq_len or args.seq_len, args.batch_size, tokenizer=args.tokenizer, split='validation')
+            except Exception as e:
+                raise SystemExit(f'[val] --val-every needs a held-out corpus: --dataset {args.dataset} has no usable validation split ({e}). Pass --val-dataset Salesforce/wikitext --val-dataset-config wikitext-103-raw-v1 --val-split test (or any corpus disjoint from training).')
+        val_iter = iter(val_loader)
+        print(f'[val] held-out validation every {args.val_every} steps on {args.val_dataset or args.dataset}:{args.val_dataset_config}:{args.val_split if args.val_dataset else "validation"} x {args.val_batches} batches')
     start_step = 0
     if resume_ckpt is not None:
         changed = restore_schedule_args(args, run_args, explicit=explicit)
@@ -304,6 +327,34 @@ def main():
                 print(f'[resume] keeping your explicit override(s) {kept} - the resumed run therefore follows a different schedule than the one it continues')
         start_step = int(resume_ckpt.get('step', 0))
         print(f'[resume] {args.resume} -> step {start_step}')
+        rng_state = resume_ckpt.get('rng_state')
+        if rng_state is not None:
+            torch.set_rng_state(rng_state.get('torch_cpu', torch.get_rng_state()))
+            if rng_state.get('torch_cuda') is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
+            if rng_state.get('python') is not None:
+                random.setstate(rng_state['python'])
+            print('[resume] restored RNG states (torch / cuda / python) - dropout and any stochastic step continues as if uninterrupted')
+        else:
+            print('[resume] checkpoint predates RNG-state saving: RNGs restart from --seed, so a run with dropout>0 will not bitwise-continue the original stream')
+        saved_position = resume_ckpt.get('data_position')
+        if saved_position is None:
+            print('[resume] checkpoint predates data-position tracking: the stream restarts from the beginning and REPLAYS training data - finish the run with this caveat, or restart from a newer checkpoint')
+        elif args.resume_skip_data:
+            print(f'[resume] --resume-skip-data: NOT skipping the {saved_position} batches the checkpoint already consumed - the resumed run replays training data (accepted)')
+        else:
+            print(f'[resume] fast-forwarding the dataloader past {saved_position} already-consumed batches (same streaming order, so the resumed run sees fresh data)...')
+            t_skip = time.time()
+            for i in range(saved_position):
+                try:
+                    next(data_iter)
+                except StopIteration:
+                    data_iter = iter(loader)
+                    next(data_iter)
+                if (i + 1) % 1000 == 0:
+                    print(f'  [skip] {i + 1}/{saved_position} batches ({time.time() - t_skip:.0f}s)', flush=True)
+            batches_consumed = saved_position
+            print(f'[resume] data position restored: the next batch is #{saved_position + 1} in the stream')
     opt = build_optimizer(model, args.lr, args.weight_decay, args.beta1, args.beta2)
     sched = LambdaLR(opt, build_lr_lambda(args))
     if resume_ckpt is not None:
@@ -333,6 +384,40 @@ def main():
     if args.wandb_project:
         import wandb
         wandb.init(project=args.wandb_project, name=args.run_name or args.norm, config=vars(args))
+    def _snapshot_rng_state() -> dict:
+        state = {'torch_cpu': torch.get_rng_state(), 'python': random.getstate()}
+        if torch.cuda.is_available():
+            state['torch_cuda'] = torch.cuda.get_rng_state_all()
+        return state
+
+    @torch.no_grad()
+    def run_validation() -> float:
+        """Held-out loss over a fixed number of val batches. A finite corpus
+        (e.g. wikitext-103 test) is re-iterated once exhausted; the stream has
+        no shuffle and no RNG, so every pass sees the same deterministic text."""
+        nonlocal val_iter
+        model.eval()
+        total = 0.0
+        n = 0
+        while n < max(1, args.val_batches):
+            try:
+                vx, vy = next(val_iter)
+            except StopIteration:
+                if n == 0:
+                    val_iter = iter(val_loader)
+                    continue
+                break
+            vx = vx.to(device, non_blocking=True)
+            vy = vy.to(device, non_blocking=True)
+            with ctx:
+                vloss = model(vx, vy, return_logits=False)[1]
+            total += float(vloss)
+            n += 1
+        model.train()
+        if n == 0:
+            raise RuntimeError('validation produced no batches - the held-out stream is empty')
+        return total / n
+
     step = start_step
     t0 = time.time()
     stats_windowed = False
@@ -349,6 +434,7 @@ def main():
             except StopIteration:
                 data_iter = iter(loader)
                 batch = next(data_iter)
+            batches_consumed += 1
             x, y = batch
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -383,6 +469,17 @@ def main():
             if args.wandb_project:
                 import wandb
                 wandb.log(row, step=step)
+        if val_iter is not None and step % args.val_every == 0 and step > 0:
+            val_loss = run_validation()
+            print(f'step={step:>6d} val_loss={val_loss:8.4f}', flush=True)
+            row = {'step': step, 'val_loss': val_loss}
+            with open(log_path, 'a') as f:
+                f.write(json.dumps(row) + '\n')
+            if tb:
+                tb.add_scalar('val/loss', val_loss, step)
+            if args.wandb_project:
+                import wandb
+                wandb.log({'val/loss': val_loss}, step=step)
         if step % args.stats_every == 0 and step > 0:
             stats = act_stats.summary()
             print(f"[stats] {stats.get('__summary__', {})}")
@@ -391,11 +488,11 @@ def main():
                 for k, v in s.items():
                     tb.add_scalar(f'stats/{k}', v, step)
         if step % args.save_every == 0 and step > 0:
-            ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict()}
+            ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state()}
             path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
             torch.save(ckpt, path)
             print(f'[ckpt] saved {path}')
-    ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict()}
+    ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state()}
     path = Path(args.output_dir) / 'ckpt_final.pt'
     torch.save(ckpt, path)
     print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')

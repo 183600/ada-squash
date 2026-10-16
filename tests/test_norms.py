@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
+import json
 import math
 import pytest
 import torch
@@ -32,7 +33,7 @@ import torch.nn as nn
 
 from adasquash import (
     build_norm, NORM_REGISTRY, generalized_softsign,
-    LayerNorm, RMSNorm, DyT, DyTC, DyTD, DyTCD,
+    LayerNorm, RMSNorm, DyT, DyTS, DyTP, DyTC, DyTD, DyTDI, DyTCD, DyTCDI,
     GPTConfig, GPT, build_gpt_124m, build_llama_tiny_1b,
     ActivationStats, LossSpikeCounter, KurtosisMeter,
     count_parameters,
@@ -62,7 +63,7 @@ def test_build_norm_returns_correct_type():
 # ---------------------------------------------------------------------------
 # Shape / dtype preservation
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"])
+@pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dyts", "dytp", "dytc", "dytd", "dytdi", "dytcd", "dytcdi"])
 def test_norm_preserves_shape_and_dtype(name):
     for dtype in (torch.float32, torch.bfloat16):
         norm = build_norm(name, 64).to(dtype)
@@ -72,7 +73,7 @@ def test_norm_preserves_shape_and_dtype(name):
         assert y.dtype == x.dtype
 
 
-@pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"])
+@pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dyts", "dytp", "dytc", "dytd", "dytdi", "dytcd", "dytcdi"])
 def test_norm_gradient_flows(name):
     norm = build_norm(name, 64)
     x = torch.randn(2, 16, 64, requires_grad=True)
@@ -449,19 +450,32 @@ def _fused_norm_reference(m, x):
 
     Deliberately written out of the public pieces rather than reusing the
     kernels under test, so it is an actual second opinion on both the value
-    and every gradient.
+    and every gradient. For DyTD / DyTCD the reference mirrors the module's
+    *effective* (k_min-clamped) decay rate: the floor is part of the
+    module's contract, not an implementation detail.
     """
     from adasquash.norms import generalized_softsign
 
     if isinstance(m, DyT):
+        # Also covers DyTDI (a DyT whose alpha was initialized at the
+        # schedule value) - after init it is a plain per-layer scalar alpha.
         phi = torch.tanh(m.alpha * x)
+    elif isinstance(m, DyTP):
+        phi = torch.tanh(m.alpha * x)
+    elif isinstance(m, DyTS):
+        p = m.p.clamp(min=1e-3) if isinstance(m.p, torch.Tensor) else m.p
+        phi = generalized_softsign(m.alpha * x, p)
     elif isinstance(m, DyTD):
-        a = m.alpha_0 * torch.exp(-m.k * m._depth_ratio)
+        k = m.k if m.k_min is None else m.k.clamp(min=m.k_min)
+        a = m.alpha_0 * torch.exp(-k * m._depth_ratio)
         phi = torch.tanh(a * x)
     elif isinstance(m, DyTC):
+        # Also covers DyTCDI (a DyTC whose alpha was initialized at the
+        # schedule value).
         phi = generalized_softsign(m.alpha * x, m.p)
     elif isinstance(m, DyTCD):
-        scale = m.alpha_0 * torch.exp(-m.k * m._depth_ratio)
+        k = m.k if m.k_min is None else m.k.clamp(min=m.k_min)
+        scale = m.alpha_0 * torch.exp(-k * m._depth_ratio)
         alpha_c = torch.addcmul(scale, scale, m.delta).clamp(min=1e-4)
         phi = generalized_softsign(alpha_c * x, m.p)
     else:
@@ -520,14 +534,14 @@ def _compare_norm_to_reference(build, dim=6, seed=0):
             ), f"d/d{name}"
 
 
-@pytest.mark.parametrize("name", ["dyt", "dytd", "dytc", "dytcd"])
+@pytest.mark.parametrize("name", ["dyt", "dyts", "dytp", "dytd", "dytdi", "dytc", "dytcd", "dytcdi"])
 def test_fused_norm_kernels_match_autograd(name):
     """Every hand-written backward must agree with autograd, per parameter."""
     build = lambda: build_norm(name, 6)
     _compare_norm_to_reference(build)
 
 
-@pytest.mark.parametrize("name", ["dyt", "dytd", "dytc", "dytcd"])
+@pytest.mark.parametrize("name", ["dyt", "dyts", "dytp", "dytd", "dytdi", "dytc", "dytcd", "dytcdi"])
 def test_fused_norm_kernels_match_autograd_without_beta(name):
     """Same check with the affine bias removed (`beta=False`)."""
     _compare_norm_to_reference(lambda: build_norm(name, 6, beta=False))
@@ -1039,10 +1053,15 @@ def test_fp8_quantizer_respects_format_range():
     assert q.abs().max().item() <= 448.0 + 1e-6
     q5 = to_fp8_e5m2(x)
     assert q5.abs().max().item() <= 57344.0 + 1e-3
-    # Below the smallest normal magnitude both formats flush to zero.
-    assert to_fp8_e4m3(torch.tensor([fp8_min_normal(4) * 0.5])).item() == 0.0
-    # Exact representable values round-trip.
+    # Subnormals are representable: half the min *normal* of e4m3 (2^-7)
+    # survives on the subnormal grid (2^-7 = 4 * 2^-9).
+    assert to_fp8_e4m3(torch.tensor([fp8_min_normal(4) * 0.5])).item() == pytest.approx(2.0 ** -7)
+    # Below the smallest *subnormal* (2^-9 for e4m3) values flush to zero.
+    assert to_fp8_e4m3(torch.tensor([2.0 ** -9 * 0.5])).item() == 0.0
+    assert to_fp8_e4m3(torch.tensor([2.0 ** -10])).item() == 0.0
+    # Exact representable values round-trip, including the min subnormal.
     assert to_fp8_e4m3(torch.tensor([1.0, 0.5, -2.0, 448.0])).tolist() == [1.0, 0.5, -2.0, 448.0]
+    assert to_fp8_e4m3(torch.tensor([2.0 ** -9])).item() == pytest.approx(2.0 ** -9)
 
 
 def test_build_llama_tiny_accepts_tie_override():
@@ -1167,20 +1186,153 @@ def test_ablation_aggregate_keeps_rows_from_previous_runs():
     assert merge_summaries([{"nope": 1}, "junk"], fresh) == fresh
 
 
-def test_ablation_matrix_depth_row_disables_the_schedule():
-    """`dytcd_full` vs `dytd_full` also changes the activation family, so it
-    cannot be presented as isolating the per-channel axis."""
+def test_ablation_matrix_contrasts_are_single_variable():
+    """Every documented contrast in configs/ablation-matrix.yaml must differ
+    from its reference row by exactly ONE GPTConfig axis (modulo the seed,
+    which the runner varies deliberately).
+
+    This is the guard against the old matrix's confounds: dyt->dytc used to
+    change per-channel AND tanh->softsign at once, and the LN baseline ->
+    dytcd jump bundled the norm swap with enabling LayerScale.
+    """
+    import dataclasses
     root = Path(__file__).resolve().parent.parent
-    from scripts.ablation import load_ablations_from_config
+    from scripts.ablation import load_ablations_from_config, effective_config_key
 
     rows = load_ablations_from_config(str(root / "configs" / "ablation-matrix.yaml"))
-    assert rows["dytd_full"]["norm_name"] == "dytd"
-    # dytd == tanh, dytcd == generalized softsign with learnable p.
-    assert rows["dytcd_full"]["norm_name"] == "dytcd"
-    assert rows["dytcd_full"].get("learnable_p") is not False, (
-        "the per-channel reference must use the softsign family, so the "
-        "dytd_full -> dytcd_full delta is not a pure per-channel contrast"
-    )
+
+    def cfg_of(name):
+        with torch.device("meta"):
+            return dataclasses.asdict(
+                GPT(GPTConfig(vocab_size=256, dim=64, n_layers=2, n_heads=4,
+                              max_seq_len=32, **rows[name])).cfg)
+
+    def diff_axes(a, b):
+        ca, cb = cfg_of(a), cfg_of(b)
+        return sorted(k for k in ca if ca[k] != cb[k])
+
+    # Factorial: activation family x per-channel, LS held off. (p_init
+    # coincides at 2.0, so it does not show up as a differing axis; the
+    # learnable_p flag differs but is a no-op for the tanh cell.)
+    assert diff_axes("dyt", "dyts") == ["learnable_p", "norm_name"]
+    assert diff_axes("dyt", "dytp") == ["alpha_jitter", "norm_name"]
+    assert diff_axes("dyts", "dytc") == ["alpha_jitter", "norm_name"]
+    assert diff_axes("dytp", "dytc") == ["learnable_p", "norm_name"]
+
+    # Depth axis at matched LS: reparameterization, init-only control, shared.
+    assert diff_axes("dyt_ls", "dytd") == ["norm_name"]
+    assert diff_axes("dytd", "dytdi") == ["norm_name"]
+    assert diff_axes("dytd", "dytd_shared") == ["shared_depth_schedule"]
+    assert diff_axes("dytd", "dytd_k0_no_depth_schedule") == [
+        "k_init", "learnable_k"]
+    assert diff_axes("dytc_ls", "dytcd") == ["norm_name"]
+    assert diff_axes("dytcd", "dytcdi") == ["norm_name"]
+
+    # LayerScale axis under every family (layerscale_init coincides with
+    # the default 1e-5, so only the switch itself differs).
+    assert diff_axes("ln", "ln_ls") == ["use_layerscale"]
+    assert diff_axes("rmsnorm", "rmsnorm_ls") == ["use_layerscale"]
+    assert diff_axes("dytcd", "dytcd_no_ls") == ["use_layerscale"]
+
+    # The depth-init rows must exist and be distinct model configs from their
+    # reparameterized counterparts (otherwise the contrast is vacuous).
+    assert rows["dytdi"]["norm_name"] == "dytdi"
+    assert rows["dytcdi"]["norm_name"] == "dytcdi"
+    assert effective_config_key("gpt2-124m", rows["dytd"]) != \
+        effective_config_key("gpt2-124m", rows["dytdi"])
+
+
+def test_dytd_k_min_floors_the_decay_rate():
+    """k_min keeps the depth schedule non-increasing wherever training takes
+    k, and k_min=None restores the old unconstrained behaviour."""
+    n = build_norm("dytd", 8, layer_idx=3, num_layers=12, alpha_0=0.9,
+                   k_init=1.0, learnable_k=True, k_min=0.0)
+    with torch.no_grad():
+        n.k.fill_(-5.0)
+    # k floored at 0 -> alpha_l == alpha_0 (no growth with depth).
+    assert torch.allclose(n.alpha_l, torch.tensor(0.9))
+    # Below the floor the clamp passes zero gradient to k.
+    x = torch.randn(2, 8, requires_grad=True)
+    n(x).pow(2).sum().backward()
+    assert n.k.grad is not None and n.k.grad.item() == 0.0
+
+    n2 = build_norm("dytd", 8, layer_idx=3, num_layers=12, alpha_0=0.9,
+                    k_init=1.0, learnable_k=True, k_min=None)
+    with torch.no_grad():
+        n2.k.fill_(-5.0)
+    assert n2.alpha_l.item() > 0.9  # negative k grows alpha with depth
+
+
+def test_dytd_shared_depth_schedule_shares_one_pair():
+    """--shared-depth-schedule makes every DyTD/DyTCD norm read the SAME
+    (alpha_0, k) tensors, so the depth law is identifiable (2 scalars for
+    the whole model, not 2 per norm) and checkpoints round-trip."""
+    m = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=3, n_heads=4,
+                      max_seq_len=16, norm_name="dytd",
+                      shared_depth_schedule=True))
+    alphas = [id(mod.alpha_0) for mod in m.modules() if isinstance(mod, DyTD)]
+    ks = [id(mod.k) for mod in m.modules() if isinstance(mod, DyTD)]
+    assert len(alphas) == 7 and len(set(alphas)) == 1  # 3 blocks x 2 + final
+    assert len(set(ks)) == 1
+    # state_dict carries both spellings; a fresh model loads it strictly.
+    m2 = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=3, n_heads=4,
+                       max_seq_len=16, norm_name="dytd",
+                       shared_depth_schedule=True))
+    m2.load_state_dict(m.state_dict())
+
+
+def test_dytdi_matches_dytd_bitwise_at_init():
+    """The depth-init control starts at exactly the same function as the
+    reparameterized variant (same alpha_l), so any early-training divergence
+    is attributable to the parameterization, not the start point."""
+    def build(norm):
+        torch.manual_seed(11)
+        m = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=4, n_heads=4,
+                          max_seq_len=16, norm_name=norm, alpha_0=0.9,
+                          k_init=1.0, learnable_k=False))
+        m.reset_parameters(11)
+        return m.eval()
+    x = torch.randint(0, 64, (2, 12))
+    with torch.no_grad():
+        a = build("dytd")(x)[0]
+        b = build("dytdi")(x)[0]
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_residual_outlier_probe_modifies_no_weights():
+    """The ablation outlier probe is a forward hook on the residual stream:
+    it must change the activations (that is its point) while leaving every
+    parameter untouched - unlike the old embedding-row inflation, which with
+    tied embeddings also rewrote a row of the output classifier."""
+    from scripts.ablation import install_residual_outlier
+
+    m = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=4, n_heads=4,
+                      max_seq_len=16, norm_name="dytcd")).eval()
+    x = torch.randint(0, 64, (2, 12))
+    before = {k: v.clone() for k, v in m.state_dict().items()}
+    with torch.no_grad():
+        base = m(x)[0]
+    info = install_residual_outlier(m, layer_idx=2, channel=16, scale=25.0)
+    assert info == {"kind": "residual_channel", "layer_idx": 2,
+                    "channel": 16, "scale": 25.0}
+    with torch.no_grad():
+        after = m(x)[0]
+    for k, v in before.items():
+        assert torch.equal(v, m.state_dict()[k]), f"weight {k} changed"
+    assert not torch.allclose(base, after)
+
+
+def test_activation_stats_hook_the_new_norms():
+    from adasquash.utils import ActivationStats
+    m = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
+                      max_seq_len=16, norm_name="dyts"))
+    st = ActivationStats(m)
+    st.attach()
+    m(torch.randint(0, 64, (1, 8)))
+    summary = st.summary()
+    st.detach()
+    hooked = [k for k in summary if k != "__summary__"]
+    assert len(hooked) == 5  # 2 blocks x 2 norms + final
 
 
 def test_yaml_config_overrides_parser_defaults():
@@ -1428,35 +1580,35 @@ def _tiny_variant(cfg_kwargs):
 
 
 def test_every_ablation_row_builds_its_own_hyperparameters():
-    """Two rows of the same norm family must not share hyper-parameters.
-
-    Each row has to be built with its own config: the `dyt_alpha_*` grid,
-    the whole `dytc_p*` softsign sweep and `dytd_full` must come out
-    configured exactly as the matrix spells them out. The rows below are
-    visited in matrix order, i.e. the order the runner builds them in.
-    """
+    """Every row must be built with the config the matrix spells out, and
+    the factorial cells must have the alpha shape their name promises."""
     from scripts.ablation import load_ablations_from_config
 
     root = Path(__file__).resolve().parent.parent
     rows = load_ablations_from_config(str(root / "configs" / "ablation-matrix.yaml"))
 
-    for name in ("dyt_alpha_0.3", "dyt_alpha_0.5", "dyt_alpha_1.0"):
-        assert _tiny_variant(rows[name]).alpha.item() == pytest.approx(
-            float(rows[name]["alpha_init"])
-        ), name
-
-    for name in ("dytc_p1_softsign", "dytc_p2_softsign", "dytc_p4_softsign",
-                 "dytc_hardtanh_eq"):
-        assert _tiny_variant(rows[name]).p == pytest.approx(
-            float(rows[name]["p_init"])
-        ), name
-    # A learnable `p` is a Parameter, a frozen one is a plain float: the
-    # `p`-sweep rows are only a sweep if `dytc_plearnable` really differs.
+    # Softsign exponent sweep reaches the module as p.
+    for name in ("dytc_p1_softsign", "dytc_p4_softsign"):
+        m = _tiny_variant(rows[name])
+        assert m.p == pytest.approx(float(rows[name]["p_init"])), name
     assert isinstance(_tiny_variant(rows["dytc_plearnable"]).p, nn.Parameter)
-    assert not isinstance(_tiny_variant(rows["dytc_p2_softsign"]).p, nn.Parameter)
-
+    # The factorial cells: scalar alpha vs per-channel alpha.
+    assert _tiny_variant(rows["dyt"]).alpha.ndim == 0
+    assert _tiny_variant(rows["dyts"]).alpha.ndim == 0
+    assert _tiny_variant(rows["dytp"]).alpha.ndim == 1
+    assert _tiny_variant(rows["dytc"]).alpha.ndim == 1
+    # Depth rows: the reparameterized variant owns (alpha_0, k); the
+    # depth-init control owns a plain alpha; the shared row shares one pair.
+    dytd = _tiny_variant(rows["dytd"])
+    assert isinstance(dytd, DyTD) and hasattr(dytd, "k")
+    dytdi = _tiny_variant(rows["dytdi"])
+    assert isinstance(dytdi, DyT) and not hasattr(dytdi, "k")
+    shared = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
+                           max_seq_len=16, **rows["dytd_shared"]))
+    alpha_ids = {id(m.alpha_0) for m in shared.modules() if isinstance(m, DyTD)}
+    assert len(alpha_ids) == 1
     # The depth axis: `k` on (k=1, learnable) vs off (buffered k=0).
-    on = _tiny_variant(rows["dytd_full"])
+    on = _tiny_variant(rows["dytd"])
     off = _tiny_variant(rows["dytd_k0_no_depth_schedule"])
     assert on.k.item() == pytest.approx(1.0)
     assert isinstance(on.k, nn.Parameter)
@@ -1710,7 +1862,7 @@ def _tiny_train_run(tmp_path, monkeypatch, steps, extra=()):
     from adasquash import markov_batch
 
     def fake_loader(dataset_name, dataset_config, seq_len, batch_size,
-                    tokenizer="gpt2"):
+                    tokenizer="gpt2", split="train"):
         import torch.utils.data as tud
         rng = torch.Generator().manual_seed(7)
 
@@ -2022,6 +2174,189 @@ def test_forward_smoke():
         out, _ = model(x)
     assert out.shape == (1, 32, model.cfg.vocab_size)
 
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: FP8 metric separation, held-out eval defaults, needle
+# coverage, resume semantics, validation, lm-eval wrapper
+# ---------------------------------------------------------------------------
+def test_fp8_reports_zero_quantization_separately_from_small_values():
+    """underflow (|x| < min-normal), subnormal share and quantized-to-zero
+    share are three different numbers; the old metric collapsed them."""
+    from scripts.check_fp8_stability import (
+        measure_fp8_divergence, fp8_min_normal)
+    from adasquash.model import build_gpt_124m
+
+    m = build_gpt_124m(norm_name="dytcd")
+    m.reset_parameters(3)
+    m.eval()
+    r = measure_fp8_divergence(m, torch.randint(0, 50304, (2, 64)), "dytcd")
+    # The summary must carry all three distinguished metrics.
+    for key in ("mean_underflow_rate_e4m3", "mean_subnormal_rate_e4m3",
+                "mean_quantized_zero_rate_e4m3", "mean_rel_quant_err_e4m3"):
+        assert key in r, key
+
+    # Direct quantizer check: tiny nonzero values round to zero, and that
+    # population is exactly what quantized_zero_rate counts.
+    from scripts.check_fp8_stability import to_fp8_e4m3
+    tiny = torch.full((100,), fp8_min_normal(4) * 1e-3)
+    q = to_fp8_e4m3(tiny)
+    assert (q == 0).float().mean().item() > 0.99  # subnormal grid spacing
+    # A value exactly on the subnormal grid survives as nonzero.
+    on_grid = torch.tensor([2.0 ** -9])  # e4m3 min subnormal
+    assert to_fp8_e4m3(on_grid).item() == on_grid.item()
+
+
+def test_fp8_dynamic_tensor_scaling_removes_clipping():
+    """scaling='dynamic-tensor' rescales by amax before quantizing, so a
+    tensor beyond +-448 no longer clips - the contrast that scopes the
+    no-scaling run as a stress test rather than a prediction."""
+    from scripts.check_fp8_stability import make_fp8_quant, FP8_E4M3_MAX
+
+    x = torch.randn(1000) * 1000.0
+    none_q = make_fp8_quant("e4m3", "none")
+    dyn_q = make_fp8_quant("e4m3", "dynamic-tensor")
+    # The input exceeds the format range and the no-scaling path clips it:
+    # every |x| > 448 collapses onto exactly +-448, a huge relative error
+    # at the clipped points.
+    assert (x.abs() > FP8_E4M3_MAX).any()
+    assert none_q(x).abs().max().item() <= FP8_E4M3_MAX + 1e-6
+    rel_none = ((none_q(x) - x).abs() / x.abs()).max().item()
+    assert rel_none > 0.5
+    # Dynamic per-tensor scaling keeps the RELATIVE error at the e4m3
+    # grid spacing (3 mantissa bits -> max ~6.25%) instead of clipping.
+    rel_dyn = ((dyn_q(x) - x).abs() / x.abs()).max().item()
+    assert rel_dyn < 0.07
+
+
+def test_w8a8_dataset_probe_defaults_to_a_held_out_split():
+    """The W8A8 eval must not read the training stream: build_dataloader's
+    default split stays 'train' (training behaviour unchanged), while the
+    probe builder's default is a held-out split."""
+    import inspect
+    from scripts.train_gpt2 import build_dataloader
+    from scripts.check_w8a8_ppl import make_dataset_probe
+
+    assert inspect.signature(build_dataloader).parameters["split"].default == "train"
+    assert inspect.signature(make_dataset_probe).parameters["split"].default == "test"
+
+
+def test_needle_details_report_position_buckets():
+    """return_details=True adds per-trial position fractions and tercile
+    buckets, and the default return type stays a plain float."""
+    from scripts.eval_downstream import needle_in_haystack
+
+    tok = _CharTokenizer()
+    needle = "The magic number is 12345."
+    secret = tok(" 12345")["input_ids"]
+    model = _Reciter(
+        GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                  max_seq_len=256, norm_name="rmsnorm"),
+        secret=secret,
+    ).eval()
+    acc = needle_in_haystack(model, tok, needle=needle, context_len=128,
+                             n_trials=2, device="cpu")
+    assert isinstance(acc, float)
+    acc2, details = needle_in_haystack(model, tok, needle=needle,
+                                       context_len=128, n_trials=6,
+                                       device="cpu", return_details=True)
+    assert len(details) == 6
+    assert {d["bucket"] for d in details} <= {"early", "middle", "late"}
+    for d in details:
+        assert 0.0 <= d["pos_frac"] <= 1.0
+        assert isinstance(d["correct"], bool)
+    assert acc2 == sum(d["correct"] for d in details) / len(details)
+
+
+def test_train_loop_logs_held_out_validation_loss(tmp_path, monkeypatch, capsys):
+    """--val-every runs a held-out pass on a *separate* loader and logs
+    val_loss rows to train.jsonl / stdout."""
+    _tiny_train_run(tmp_path, monkeypatch, 4,
+                    ["--val-every", "2", "--val-batches", "1",
+                     "--val-dataset", "synthetic", "--save-every", "100"])
+    rows = [json.loads(l) for l in (tmp_path / "train.jsonl").read_text().splitlines()]
+    val_rows = [r for r in rows if "val_loss" in r]
+    assert val_rows, "no val_loss row was logged"
+    assert all(isinstance(r["val_loss"], float) and math.isfinite(r["val_loss"])
+               for r in val_rows)
+    out = capsys.readouterr().out
+    assert "val_loss=" in out
+
+
+def test_resume_restores_data_position_and_rng(tmp_path, monkeypatch, capsys):
+    """The checkpoint records how many stream batches were consumed; on
+    resume the loader is fast-forwarded past them (no silent replay of the
+    beginning of the corpus) and the RNG states are restored."""
+    _tiny_train_run(tmp_path / "a", monkeypatch, 3, ["--save-every", "3"])
+    ckpt = torch.load(tmp_path / "a" / "ckpt_000003.pt", weights_only=False)
+    assert ckpt["data_position"] == 3  # one batch per step, grad_accum=1
+    assert "torch_cpu" in ckpt["rng_state"]
+
+    capsys.readouterr()
+    _tiny_train_run(tmp_path / "b", monkeypatch, 5,
+                    ["--save-every", "100", "--resume",
+                     str(tmp_path / "a" / "ckpt_000003.pt")])
+    out = capsys.readouterr().out
+    assert "restored RNG states" in out
+    assert "fast-forwarding the dataloader past 3" in out
+    ckpt2 = torch.load(tmp_path / "b" / "ckpt_final.pt", weights_only=False)
+    assert ckpt2["data_position"] == 5  # 3 skipped + 2 fresh
+
+
+def test_lm_wrapper_loglikelihood_and_generation_match_manual_scoring():
+    """AdaSquashLM scores continuations exactly like a hand-rolled loop and
+    honours stop sequences in generate_until (no lm_eval import needed)."""
+    from scripts.eval_downstream import AdaSquashLM
+
+    class Tok:
+        eos_token_id = 0
+
+        def __call__(self, s, add_special_tokens=False):
+            return {"input_ids": [ord(c) % 50 + 1 for c in s]}
+
+        def decode(self, ids):
+            return "".join(chr(int(i) + 64) for i in ids)
+
+    class Req:
+        def __init__(self, *args):
+            self.args = args
+
+    model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
+                          max_seq_len=64, norm_name="rmsnorm")).eval()
+    lm = AdaSquashLM(model, Tok(), batch_size=1)
+
+    ctx, cont = "abc", "def"
+    c_ids, w_ids = Tok()(ctx)["input_ids"], Tok()(ctx + cont)["input_ids"]
+    cont_ids = w_ids[len(c_ids):]
+    (lp, greedy), = lm.loglikelihood([Req(ctx, cont)])
+    with torch.no_grad():
+        logits = model(torch.tensor([w_ids]))[0][0]
+    logprobs = torch.log_softmax(logits.float(), dim=-1)
+    manual = sum(logprobs[len(c_ids) - 1 + i, t].item()
+                 for i, t in enumerate(cont_ids))
+    assert abs(lp - manual) < 1e-5
+    assert greedy == all(
+        int(logits[len(c_ids) - 1 + i].argmax()) == t
+        for i, t in enumerate(cont_ids))
+
+    (roll,) = lm.loglikelihood_rolling([Req("abcdefg")])
+    assert roll < 0.0  # a sum of log-probs
+
+    text, = lm.generate_until([Req("ab", {"until": ["E"], "max_gen_toks": 8})])
+    assert "E" not in text
+
+
+def test_lm_harness_reports_missing_dependency():
+    """Without lm_eval installed the harness raises a clean RuntimeError
+    (not a bare ImportError or a NotImplementedError stub)."""
+    from scripts.eval_downstream import evaluate_lm_harness
+    try:
+        import lm_eval  # noqa: F401
+        pytest.skip("lm_eval installed; the error path cannot be exercised")
+    except ImportError:
+        pass
+    with pytest.raises(RuntimeError, match="lm-eval not installed"):
+        evaluate_lm_harness(None, ["mmlu"])
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
