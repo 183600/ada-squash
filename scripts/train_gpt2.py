@@ -339,6 +339,22 @@ def main():
                 print(f'[resume] keeping your explicit override(s) {kept} - the resumed run therefore follows a different schedule than the one it continues')
         start_step = int(resume_ckpt.get('step', 0))
         print(f'[resume] {args.resume} -> step {start_step}')
+        # The best-validation tracker is run state like the step counter and
+        # the loss-spike baseline: restarting it at `inf` would let the first
+        # post-resume validation unconditionally overwrite a possibly better
+        # `ckpt_best.pt`, which is the checkpoint the final test evaluation
+        # restores. Seed it from the historical best instead.
+        best_path = Path(args.output_dir) / 'ckpt_best.pt'
+        best_candidates = []
+        if resume_ckpt.get('val_loss') is not None:
+            best_candidates.append(resume_ckpt)
+        if best_path.exists() and Path(args.resume).resolve() != best_path.resolve():
+            best_candidates.append(torch.load(best_path, map_location=device, weights_only=False))
+        if best_candidates:
+            prior_best = min(best_candidates, key=lambda c: float(c['val_loss']))
+            best_val_loss = float(prior_best['val_loss'])
+            best_val_step = int(prior_best.get('step', 0))
+            print(f'[resume] best-validation tracker seeded with val_loss={best_val_loss:.4f}@{best_val_step} from the previous best checkpoint')
     opt = build_optimizer(model, args.lr, args.weight_decay, args.beta1, args.beta2)
     sched = LambdaLR(opt, build_lr_lambda(args))
     if resume_ckpt is not None:
