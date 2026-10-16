@@ -129,6 +129,10 @@ class MoEGPT(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
+            if m.weight is self.tok_emb.weight:
+                # lm_head shares the input embedding's storage (tied); `apply`
+                # already initialized it through `tok_emb`.
+                return
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)

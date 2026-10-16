@@ -247,12 +247,6 @@ jobs:
           # 同一阶段内若优先模型刚失败/限流，则暂时回退随机，下个阶段开始时自动恢复优先。
           PREFERRED_MODEL="opencode/deepseek-v4.1-flash-free"
           PREFERRED_BROKEN=0
-          # ================= 兜底模型：big-pickle =================
-          # 优先模型 deepseek-v4.1-flash-free 失效（限流/失败/不在池中）时，
-          # 优先切换 opencode/big-pickle（Big Pickle，同为 Zen 网关免费模型）；
-          # big-pickle 也不可用时才回退随机模型。
-          FALLBACK_MODEL="opencode/big-pickle"
-          FALLBACK_BROKEN=0
 
           # ================= 副选 provider：NVIDIA GLM（每次抽样 20%） =================
           # 其余 80% 走上方免费模型池（优先 deepseek-v4.1-flash-free，池不可达时随机）。
@@ -590,18 +584,6 @@ jobs:
           CURRENT_MODEL=""
           PREVIOUS_MODEL=""
 
-          # ---------- 提交信息附带本轮实际使用的模型（写入 /tmp/last_model_used.txt） ----------
-          MODEL_TAG_FILE=/tmp/last_model_used.txt
-          record_model() {
-            printf '%s' "$1" > "$MODEL_TAG_FILE" 2>/dev/null || true
-          }
-          model_tag() {
-            local m=""
-            [ -f "$MODEL_TAG_FILE" ] && m="$(head -c 120 "$MODEL_TAG_FILE" 2>/dev/null)"
-            [ -n "$m" ] && printf ' [model: %s]' "$m"
-            return 0
-          }
-
           commit_and_push() {
             ensure_workflow
             ensure_license
@@ -610,7 +592,7 @@ jobs:
             ensure_design_notes
             ensure_gate
             git add -A || true
-            git commit -m "auto: iteration $1$(model_tag)" || true
+            git commit -m "auto: iteration $1" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
             git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
           }
@@ -632,7 +614,7 @@ jobs:
             fi
             git add -A || true
             if ! git diff --cached --quiet; then
-              git commit -m "auto: partial work saved on shutdown$(model_tag)" || true
+              git commit -m "auto: partial work saved on shutdown" || true
               git pull --rebase origin "$BRANCH" || git rebase --abort || true
               git push origin "HEAD:${BRANCH}" || true
               echo "[trap] partial work committed & pushed"
@@ -662,15 +644,6 @@ jobs:
               for x in "${FREE_MODELS[@]}"; do
                 if [ "$x" = "$PREFERRED_MODEL" ]; then m="$x"; break; fi
               done
-            fi
-            # ⭐ 优先模型不可用（刚失败/限流/不在池中）：改用兜底 big-pickle
-            if [ -z "$m" ] && [ -n "$FALLBACK_MODEL" ] && [ "$FALLBACK_BROKEN" -ne 1 ]; then
-              for x in "${FREE_MODELS[@]}"; do
-                if [ "$x" = "$FALLBACK_MODEL" ]; then m="$x"; break; fi
-              done
-              if [ -n "$m" ]; then
-                echo "[info] 优先模型不可用，改用兜底模型: $m"
-              fi
             fi
             if [ -z "$m" ]; then
               for _ in 1 2 3; do
@@ -740,7 +713,6 @@ jobs:
             # 每个阶段开始时恢复优先模型（每阶段总是优先尝试 deepseek-v4.1-flash-free）
             # 并清除 NVIDIA 的阶段内失效标记
             PREFERRED_BROKEN=0
-            FALLBACK_BROKEN=0
             PROVIDER_BROKEN=""
 
             while [ $attempt -lt 3 ]; do
@@ -774,7 +746,6 @@ jobs:
               fi
               echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$CURRENT_MODEL effort=${EFFORT:-none} ==========="
 
-              record_model "$CURRENT_MODEL"
               timeout --kill-after=180 "$budget" opencode run -m "$CURRENT_MODEL" ${VARFLAG[@]+"${VARFLAG[@]}"} "$prompt" 2>&1 | tee "$OUT"
               local EC=$?
 
@@ -798,10 +769,7 @@ jobs:
                   echo "[info] NVIDIA 命中限流，本阶段内改走免费模型"
                 elif [ "$CURRENT_MODEL" = "$PREFERRED_MODEL" ]; then
                   PREFERRED_BROKEN=1
-                  echo "[info] 优先模型命中限流，本阶段内改用兜底模型 big-pickle"
-                elif [ "$CURRENT_MODEL" = "$FALLBACK_MODEL" ]; then
-                  FALLBACK_BROKEN=1
-                  echo "[info] 兜底模型 big-pickle 命中限流，本阶段内改用随机模型"
+                  echo "[info] 优先模型命中限流，本阶段内改用随机模型"
                 fi
                 if [ $RATE_COUNT -ge 8 ]; then
                   echo "[warn] 连续 8 次限流，放弃该阶段"
@@ -824,10 +792,7 @@ jobs:
                   echo "[info] NVIDIA 失败，本阶段内改走免费模型"
                 elif [ "$CURRENT_MODEL" = "$PREFERRED_MODEL" ]; then
                   PREFERRED_BROKEN=1
-                  echo "[info] 优先模型失败，本阶段内改用兜底模型 big-pickle"
-                elif [ "$CURRENT_MODEL" = "$FALLBACK_MODEL" ]; then
-                  FALLBACK_BROKEN=1
-                  echo "[info] 兜底模型 big-pickle 失败，本阶段内改用随机模型"
+                  echo "[info] 优先模型失败，本阶段内改用随机模型"
                 fi
               if [ $FAIL_COUNT -ge 3 ]; then
                 echo "[warn] 连续 3 次失败，放弃该阶段"
@@ -980,8 +945,7 @@ jobs:
             git clean -fd
           fi
           git add -A
-          LAST_MODEL="$(head -c 120 /tmp/last_model_used.txt 2>/dev/null || true)"
-          git commit -m "auto: end of 5h run, cleanup${LAST_MODEL:+ [model: $LAST_MODEL]}" || echo "nothing to commit"
+          git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
           BRANCH="${GITHUB_REF_NAME:-master}"
           git pull --rebase origin "$BRANCH" || git rebase --abort || true
           git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"

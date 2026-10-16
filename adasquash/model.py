@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .norms import build_norm, NORM_REGISTRY, _reduce_products, _sum_leading_dims
-from .attention import CausalSelfAttention
+from .attention import CausalSelfAttention, _make_linear, _skip_init
 
 @dataclass
 class LayerConfig:
@@ -256,14 +256,14 @@ class _LayerScaleResidual(torch.autograd.Function):
 
 class Block(nn.Module):
 
-    def __init__(self, cfg: GPTConfig, layer_idx: int):
+    def __init__(self, cfg: GPTConfig, layer_idx: int, skip_init: bool=False):
         super().__init__()
         self.layer_idx = layer_idx
         norm_kwargs = build_norm_kwargs(cfg, layer_idx, is_final_norm=False)
         self.norm1 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)
-        self.attn = CausalSelfAttention(cfg.dim, cfg.n_heads, qk_norm=cfg.qk_norm, alpha_init=cfg.qk_alpha_init, dropout=cfg.dropout)
+        self.attn = CausalSelfAttention(cfg.dim, cfg.n_heads, qk_norm=cfg.qk_norm, alpha_init=cfg.qk_alpha_init, dropout=cfg.dropout, skip_init=skip_init)
         self.norm2 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)
-        self.mlp = MLP(cfg.dim, int(cfg.dim * cfg.mlp_ratio), dropout=cfg.dropout)
+        self.mlp = MLP(cfg.dim, int(cfg.dim * cfg.mlp_ratio), dropout=cfg.dropout, skip_init=skip_init)
         self.use_layerscale = cfg.use_layerscale
         if self.use_layerscale:
             self.ls1 = nn.Parameter(torch.full((cfg.dim,), cfg.layerscale_init))
@@ -363,13 +363,13 @@ class _SwiGLU(torch.autograd.Function):
 
 class MLP(nn.Module):
 
-    def __init__(self, dim: int, hidden: int, dropout: float=0.0):
+    def __init__(self, dim: int, hidden: int, dropout: float=0.0, skip_init: bool=False):
         super().__init__()
         hidden = int(hidden * 2 / 3)
         hidden = hidden + 7 & ~7
-        self.w1 = nn.Linear(dim, hidden, bias=False)
-        self.w2 = nn.Linear(hidden, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden, bias=False)
+        self.w1 = _make_linear(dim, hidden, False, skip_init)
+        self.w2 = _make_linear(hidden, dim, False, skip_init)
+        self.w3 = _make_linear(dim, hidden, False, skip_init)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -383,12 +383,16 @@ class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
-        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
-        self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.dim) if not cfg.rotary else None
+        # The constructor's own kaiming / normal passes are always overwritten
+        # by the `apply(self._init_weights)` below, so every Linear / Embedding
+        # is built with `skip_init` and the apply pass is the single
+        # initialization (norm layers keep their own init untouched).
+        self.tok_emb = _skip_init(nn.Embedding, cfg.vocab_size, cfg.dim)
+        self.pos_emb = _skip_init(nn.Embedding, cfg.max_seq_len, cfg.dim) if not cfg.rotary else None
         self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([Block(cfg, i) for i in range(cfg.n_layers)])
+        self.blocks = nn.ModuleList([Block(cfg, i, skip_init=True) for i in range(cfg.n_layers)])
         self.norm_f = build_norm(cfg.norm_name, cfg.dim, **build_norm_kwargs(cfg, cfg.n_layers, is_final_norm=True))
-        self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        self.lm_head = _skip_init(nn.Linear, cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
         self.apply(self._init_weights)
@@ -408,6 +412,11 @@ class GPT(nn.Module):
 
     def _init_weights(self, m: nn.Module):
         if isinstance(m, nn.Linear):
+            if m.weight is self.tok_emb.weight:
+                # lm_head shares the input embedding's storage (tied): `apply`
+                # already initialized that storage through `tok_emb`, so a
+                # second normal_ draw would only burn RNG and time.
+                return
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)

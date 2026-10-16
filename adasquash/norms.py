@@ -9,6 +9,19 @@ _MIN_ALPHA = 1e-4
 _MIN_P = 1e-3
 _LOG2E = math.log2(math.e)
 _LN2 = math.log(2.0)
+_TINY_LOG_CACHE: dict = {}
+
+def _log_tiny(dtype: torch.dtype) -> float:
+    """``log(finfo(dtype).tiny)`` per dtype: the softsign p-gradient floor.
+
+    The constant only depends on the dtype, so the ``finfo`` construction and
+    ``math.log`` are hoisted out of every backward call that needs the floor.
+    """
+    v = _TINY_LOG_CACHE.get(dtype)
+    if v is None:
+        v = math.log(torch.finfo(dtype).tiny)
+        _TINY_LOG_CACHE[dtype] = v
+    return v
 
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     if t.ndim <= 1:
@@ -94,12 +107,12 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
         u = lo.mul(r)
         if isinstance(p, torch.Tensor):
             q = u.log2_().mul_(p)
-            a = q.mul(_LN2).clamp_(min=p * math.log(torch.finfo(q.dtype).tiny))
+            a = q.mul(_LN2).clamp_(min=p * _log_tiny(q.dtype))
             log2e_p = _LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))
             s = q.exp2_().log1p_().mul_(-log2e_p).exp2_()
         else:
             s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
-            a = u.log2_().mul_(p * _LN2).clamp_(min=p * math.log(torch.finfo(u.dtype).tiny))
+            a = u.log2_().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
     else:
         s = lo.mul(r)
         if isinstance(p, torch.Tensor):

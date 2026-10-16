@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import skip_init
 from .norms import QKSquash, _RMSNorm
 _TRIL_MASK_CACHE: dict = {}
 _ROPE_TABLE_CACHE: dict = {}
@@ -11,9 +12,36 @@ _LOGIT_SCRATCH_CACHE: dict = {}
 _CACHE_MAX_ENTRIES = 8
 _LOGIT_SCRATCH_MAX_ENTRIES = 2
 
+def _skip_init(module_cls, *args, **kwargs):
+    """``torch.nn.utils.skip_init`` that honors the ambient default device.
+
+    ``scripts/ablation.py`` builds whole models under
+    ``with torch.device('meta')`` just to read their config; materializing
+    those to cpu would allocate the full model for nothing, so a meta default
+    device keeps the module on meta.
+    """
+    device = torch.get_default_device()
+    if device.type == 'meta':
+        with torch.device('meta'):
+            return module_cls(*args, **kwargs)
+    return skip_init(module_cls, *args, **kwargs, device=device)
+
+def _make_linear(in_features: int, out_features: int, bias: bool, skip: bool) -> nn.Linear:
+    """``nn.Linear`` whose constructor's kaiming pass can be skipped.
+
+    ``GPT.__init__`` re-initializes every Linear through ``_init_weights``
+    right after construction, so the constructor's draw is overwritten; when
+    the caller says so, build the module with uninitialized storage instead
+    (``skip_init``) and let that pass be the only initialization. Standalone
+    construction (tests, helper modules) keeps the default initialization.
+    """
+    if skip:
+        return _skip_init(nn.Linear, in_features, out_features, bias=bias)
+    return nn.Linear(in_features, out_features, bias=bias)
+
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, dim: int, n_heads: int, qk_norm: Optional[str]=None, alpha_init: float=1.0, dropout: float=0.0):
+    def __init__(self, dim: int, n_heads: int, qk_norm: Optional[str]=None, alpha_init: float=1.0, dropout: float=0.0, skip_init: bool=False):
         super().__init__()
         assert dim % n_heads == 0, 'dim must be divisible by n_heads'
         self.n_heads = n_heads
@@ -22,8 +50,8 @@ class CausalSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self._rope_cache: Optional[tuple] = None
         self._tril_cache: Optional[tuple] = None
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.proj = nn.Linear(dim, dim, bias=False)
+        self.qkv = _make_linear(dim, 3 * dim, False, skip_init)
+        self.proj = _make_linear(dim, dim, False, skip_init)
         self.attn_drop = nn.Dropout(dropout)
         self.proj_drop = nn.Dropout(dropout)
         self.scale = 1.0 / math.sqrt(self.head_dim)
