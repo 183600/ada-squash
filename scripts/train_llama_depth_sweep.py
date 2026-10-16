@@ -2,7 +2,7 @@ from __future__ import annotations
 """Compute-matched depth sweep with per-cell seed replication.
 
 Every (depth, norm) cell runs the *identical* recipe (same data slices, same
-optimizer/schedule, same token budget); depth-only comparisons must not mix in
+optimizer/schedule, same token count); depth-only comparisons must not mix in
 different training recipes. Each cell is replicated over `--seeds` (>= 3
 recommended) and the launcher aggregates `results.best_val_loss` into
 `Mean +/- Std` across those independent runs, because a single run cannot
