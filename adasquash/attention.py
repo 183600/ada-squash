@@ -49,10 +49,9 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         if freqs_cis is None or self.q_squash is not None or self.q_rms is not None:
-            # `unbind` backward concatenates the three cotangents, while
-            # `qkv[i]` backward scatters each one into a zero-filled copy of
-            # the whole buffer; the values are identical.  The raw-rotary path
-            # still needs single views because _ApplyRoPEOne edits them.
+            # `unbind` and `qkv[i]` select the same three tensors; the raw
+            # rotary path below still needs single views because
+            # _ApplyRoPEOne edits them.
             q, k, v = qkv.unbind(0)
         else:
             q, k, v = (qkv[0], qkv[1], qkv[2])
