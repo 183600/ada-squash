@@ -248,7 +248,10 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             stats_windowed = True
         logits, loss, aux, tpe_list = model(x, y, return_aux=True, return_logits=False)
         del logits
-        if not math.isfinite(float(loss.detach())):
+        # `loss` is not touched by backward, so one host read serves both the
+        # finiteness check and the recorded value.
+        loss_val = float(loss.detach())
+        if not math.isfinite(loss_val):
             triage = triage_nonfinite(model, x, y, device_type=device,
                                       lr=opt.param_groups[0]['lr'], grad_clip=1.0)
             raise SystemExit(
@@ -264,7 +267,6 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        loss_val = float(loss.detach())
         aux_val = float(aux.detach())
         loss_spike.update(loss_val)
         history.append({'step': step, 'loss': loss_val, 'aux': aux_val, 'expert_cv': exp_cv, 'expert_cv_per_block': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})

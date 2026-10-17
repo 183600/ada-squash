@@ -130,7 +130,11 @@ class CausalSelfAttention(nn.Module):
         key = (B, H, R, T, q.dtype, q.device)
         buf = _LOGIT_SCRATCH_CACHE.get(key)
         if buf is None:
-            buf = torch.empty(B, H, R, T, dtype=q.dtype, device=q.device)
+            # One flat buffer for the whole sweep: each row block takes a
+            # contiguous prefix view of the shape it needs, so the GEMM writes
+            # to contiguous memory instead of to a strided (B, H, rows, end)
+            # slice of a (B, H, R, T) tensor.
+            buf = torch.empty(B * H * R * T, dtype=q.dtype, device=q.device)
             if len(_LOGIT_SCRATCH_CACHE) >= _LOGIT_SCRATCH_MAX_ENTRIES:
                 _LOGIT_SCRATCH_CACHE.clear()
             _LOGIT_SCRATCH_CACHE[key] = buf
@@ -158,9 +162,13 @@ class CausalSelfAttention(nn.Module):
             # columns would be masked to zero. The kept values are unchanged
             # (each column is the same reduction over D).
             block = torch.matmul(q[:, :, start:end], k_t[..., :end],
-                                 out=buf[:, :, :end - start, :end])
+                                 out=buf[:B * H * (end - start) * end].view(B, H, end - start, end))
             block.mul_(scale)
-            block.masked_fill_(drop[start:end, :end], 0.0)
+            # Only the square [start:end) part of the row block can be causally
+            # masked: every earlier column is below the diagonal for all rows
+            # of this block, so the fill touches rb*rb entries instead of
+            # rb*end and the kept logits are unchanged.
+            block[:, :, :, start:end].masked_fill_(drop[start:end, start:end], 0.0)
             acc_x.add_(block.sum(dtype=reduce_dtype))
             block.abs_()
             acc_abs.add_(block.sum(dtype=reduce_dtype))

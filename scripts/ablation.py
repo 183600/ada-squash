@@ -299,7 +299,11 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
         loss = model(x, y, return_logits=False)[1]
-        if not math.isfinite(float(loss.detach().item())):
+        # One host read serves the finiteness check, the spike counter and the
+        # loss list: `loss` is not touched by backward, so the pre-backward
+        # value is the value to record.
+        loss_val = float(loss.detach())
+        if not math.isfinite(loss_val):
             triage = triage_nonfinite(model, x, y, device_type=device,
                                       lr=args.lr, grad_clip=1.0)
             raise SystemExit(
@@ -313,7 +317,6 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        loss_val = loss.item()
         loss_spike.update(loss_val)
         losses.append(loss_val)
         if step % args.log_every == 0:

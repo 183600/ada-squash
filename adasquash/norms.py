@@ -104,6 +104,8 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False)
         neg_log2e_p = -_LOG2E / p.to(torch.promote_types(u.dtype, p.dtype))
         s = u.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
     else:
+        # `u` is a forward-only temporary (the backward re-derives its own),
+        # so the first pow can write in place and save one full-tensor pass.
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     out = lo.mul_(s).copysign_(xs)
     if scale is not None and (not scale_nonneg):
