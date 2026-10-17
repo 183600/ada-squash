@@ -38,7 +38,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
-from adasquash import GPTConfig, GPT, build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
+from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
 from adasquash.diagnostics import triage_nonfinite
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b

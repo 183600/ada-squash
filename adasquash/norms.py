@@ -1,6 +1,5 @@
 from __future__ import annotations
 import math
-from dataclasses import dataclass
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -24,20 +23,16 @@ def _log_tiny(dtype: torch.dtype) -> float:
     return v
 
 def _as_scalar_exponent(p):
-    """``p`` as a Python float when reading it costs nothing to read.
+    """``p`` as a Python float when it is a one-element CPU tensor.
 
-    A one-element CPU tensor can be hoisted out of tensor land for free, and
-    the scalar ``pow`` kernel is several times faster than the
-    ``log2 / exp2 / log1p / exp2`` chain on CPU. CUDA tensors are kept as
-    tensors on purpose: reading their value would force a device
-    synchronisation on every call, so the chain stays there.
+    Other tensors (including every CUDA tensor) are returned unchanged.
     """
     if isinstance(p, torch.Tensor) and p.device.type == 'cpu' and p.numel() == 1:
         return float(p)
     return p
 
 def _as_scalar_exponent_inplace(g: torch.Tensor, p) -> torch.Tensor:
-    """``g ** (p + 1)`` written in place (``g`` is a throwaway temporary)."""
+    """``g ** (p + 1)`` written in place."""
     if isinstance(p, torch.Tensor):
         return g.log2_().mul_(p + 1).exp2_()
     return g.pow_(p + 1)

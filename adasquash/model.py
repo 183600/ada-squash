@@ -1,11 +1,10 @@
 from __future__ import annotations
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .norms import build_norm, NORM_REGISTRY, _reduce_products, _sum_leading_dims
+from .norms import build_norm, _reduce_products
 from .attention import CausalSelfAttention, _make_linear, _skip_init
 
 @dataclass

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from adasquash import GPTConfig, GPT, build_norm, count_parameters, ActivationStats, LossSpikeCounter
+from adasquash import GPTConfig, GPT, count_parameters, ActivationStats, LossSpikeCounter
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b

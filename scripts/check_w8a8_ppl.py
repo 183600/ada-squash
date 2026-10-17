@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from adasquash import GPT, markov_batch
+from adasquash import markov_batch
 from adasquash.metrics import mean_std_stderr
 from adasquash.model import MLP
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds

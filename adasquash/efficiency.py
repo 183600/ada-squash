@@ -18,7 +18,6 @@ module keeps that cost measurable and explicit:
 The functions are pure (config/model in, dict out) so ablation and sweep
 runners can attach the numbers to their summaries.
 """
-import math
 from collections import defaultdict
 from typing import Optional
 
