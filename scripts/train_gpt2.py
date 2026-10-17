@@ -518,7 +518,7 @@ def main():
             y = y.to(device, non_blocking=True)
             with ctx:
                 loss = model(x, y, return_logits=False)[1]
-            micro_loss = float(loss.detach().item())
+            micro_loss = float(loss.detach())
             if not math.isfinite(micro_loss):
                 # Do not backward a non-finite loss: it would poison every
                 # accumulated gradient before the triage ever ran.
@@ -529,18 +529,20 @@ def main():
             if loss_acc is None:
                 loss_acc = loss.detach()
             else:
-                loss_acc = loss_acc + loss.detach()
+                loss_acc.add_(loss.detach())
         if attach_stats:
             act_stats.detach()
         if nonfinite_batch is not None:
             _handle_nonfinite(step, *nonfinite_batch)
             continue
         nonfinite_streak = 0
-        loss_val = loss_acc.item()
+        loss_val = float(loss_acc)
         last_train_loss = loss_val
-        grad_norm = None
+        # Keep the returned norm as a device tensor and only materialize it on
+        # log steps: the clip itself runs every step, the host sync does not.
+        grad_norm_t = None
         if args.grad_clip > 0:
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
+            grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
         sched.step()
         loss_spike.update(loss_val)
@@ -606,6 +608,7 @@ def main():
                     tb.add_scalar('curve/generalization_gap', last_diagnosis['generalization_gap'] or 0.0, step)
         if step % args.log_every == 0:
             lr = opt.param_groups[0]['lr']
+            grad_norm = float(grad_norm_t) if grad_norm_t is not None else None
             line = f'step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}'
             if grad_norm is not None:
                 line += f' grad_norm={grad_norm:.3f}'

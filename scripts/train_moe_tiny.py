@@ -60,7 +60,8 @@ class MoELayer(nn.Module):
         order = flat_expert.argsort()
         token_of = flat_token[order]
         gate_of = flat_gate[order]
-        ends = flat_expert.bincount(minlength=n_experts).cumsum(0).tolist()
+        counts = flat_expert.bincount(minlength=n_experts)
+        ends = counts.cumsum(0).tolist()
         y = x_flat.new_zeros(n_tokens, C)
         start = 0
         for e in range(n_experts):
@@ -76,7 +77,7 @@ class MoELayer(nn.Module):
             start = end
         y = self.drop(y)
         y = y.view(B, T, C)
-        tokens_per_expert = torch.zeros_like(logits[0]).scatter_add_(0, indices.reshape(-1), torch.ones_like(flat_gate)).detach()
+        tokens_per_expert = counts.to(probs.dtype).detach()
         f_i = tokens_per_expert / n_tokens
         p_i = probs.mean(dim=0)
         aux = self.n_experts * (f_i * p_i).sum()
@@ -247,7 +248,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             stats_windowed = True
         logits, loss, aux, tpe_list = model(x, y, return_aux=True, return_logits=False)
         del logits
-        if not math.isfinite(float(loss.detach().item())):
+        if not math.isfinite(float(loss.detach())):
             triage = triage_nonfinite(model, x, y, device_type=device,
                                       lr=opt.param_groups[0]['lr'], grad_clip=1.0)
             raise SystemExit(
@@ -263,8 +264,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        loss_val = loss.detach().item()
-        aux_val = aux.detach().item()
+        loss_val = float(loss.detach())
+        aux_val = float(aux.detach())
         loss_spike.update(loss_val)
         history.append({'step': step, 'loss': loss_val, 'aux': aux_val, 'expert_cv': exp_cv, 'expert_cv_per_block': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
         if step % args.log_every == 0:
@@ -303,12 +304,14 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                 else:
                     vx, vy = markov_batch(val_rng, cfg.ignore_index, args.batch_size, args.seq_len, device)
                 _, total, aux, _ = model(vx, vy, return_aux=True, return_logits=False)
-                val_losses.append(total.item())
+                total_val = float(total)
+                vaux = float(aux)
+                val_losses.append(total_val)
                 # The total loss the router regularizer rides on is not a
                 # language-modelling number: strip the aux term back out so
                 # `val_ce` compares only predictive quality.
-                val_ce_losses.append(total.item() - model.AUX_LOSS_COEF * float(aux))
-                val_auxes.append(float(aux))
+                val_ce_losses.append(total_val - model.AUX_LOSS_COEF * vaux)
+                val_auxes.append(vaux)
         model.train()
         val_loss = sum(val_losses) / len(val_losses)
         val_ce = sum(val_ce_losses) / len(val_ce_losses)
@@ -439,11 +442,11 @@ def _expert_cv(tpe) -> float:
     return (tpe.std() / (tpe.mean() + 1e-06)).item()
 
 def _expert_cv_per_block(tpe_list) -> list:
-    cvs = [tpe.std() / (tpe.mean() + 1e-06) if isinstance(tpe, torch.Tensor) else None for tpe in tpe_list]
-    tensors = [c.detach().reshape(()) for c in cvs if c is not None]
-    if not tensors:
+    present = [t.detach().reshape(1, -1) if isinstance(t, torch.Tensor) else None for t in tpe_list]
+    if not any(t is not None for t in present):
         return [0.0] * len(tpe_list)
-    vals = iter(torch.stack(tensors).tolist())
-    return [next(vals) if c is not None else 0.0 for c in cvs]
+    stacked = torch.cat([t for t in present if t is not None], dim=0)
+    vals = iter((stacked.std(dim=-1) / (stacked.mean(dim=-1) + 1e-06)).tolist())
+    return [next(vals) if t is not None else 0.0 for t in present]
 if __name__ == '__main__':
     main()

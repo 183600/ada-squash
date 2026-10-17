@@ -195,7 +195,15 @@ def document_hash(text: str) -> bytes:
     return hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).digest()
 
 
-def _dedup_shard_owner(example, n_workers: int) -> int:
+def _dedup_hash(example) -> bytes | None:
+    """Digest of the stripped document text, or None when the example has none."""
+    raw = example.get("text") if isinstance(example, dict) else None
+    if not isinstance(raw, str):
+        return None
+    return document_hash(raw.strip())
+
+
+def _dedup_shard_owner(example, n_workers: int, hashed: bytes | None = None) -> int:
     """Which worker owns a document when dedup has to be global.
 
     Worker-local `seen` sets cannot see duplicates that the round-robin
@@ -203,11 +211,15 @@ def _dedup_shard_owner(example, n_workers: int) -> int:
     identical documents are routed by their cleaned-text hash instead: every
     copy lands in the same worker and the per-worker set then drops all but
     the first occurrence, matching the single-process cleaner the audit uses.
+
+    `hashed` lets a caller that hashed the stripped text already (to hand the
+    digest to the cleaner) share it instead of hashing the document twice.
     """
-    raw = example.get("text") if isinstance(example, dict) else None
-    if not isinstance(raw, str):
+    if hashed is None:
+        hashed = _dedup_hash(example)
+    if hashed is None:
         return 0
-    return int.from_bytes(document_hash(raw.strip()), "little") % n_workers
+    return int.from_bytes(hashed, "little") % n_workers
 
 
 def load_hash_file(path) -> set:
@@ -249,7 +261,9 @@ class DocumentCleaner:
         self.seen: set = set()
         self.stats: Counter = Counter()
 
-    def __call__(self, example):
+    def __call__(self, example, precomputed_hash: bytes | None = None):
+        """Clean one example; `precomputed_hash` must be the digest of the
+        stripped text and is reused instead of hashing the document again."""
         self.stats["documents_read"] += 1
         if not isinstance(example, dict):
             self.stats["dropped_unreadable"] += 1
@@ -272,7 +286,7 @@ class DocumentCleaner:
             self.stats["dropped_too_long"] += 1
             return None
         if self.dedup or self.exclude_hashes:
-            h = document_hash(text)
+            h = precomputed_hash if precomputed_hash is not None else document_hash(text)
             if h in self.exclude_hashes:
                 # Exact duplicate of a training document: keeping it in a
                 # held-out split would leak that document across the split
@@ -375,14 +389,16 @@ class PackedStream(IterableDataset):
         shard_by_hash = self.cleaner.dedup and n_workers > 1
         i = 0
         for ex in self.ds:
+            ex_hash = None
             if shard_by_hash:
-                if _dedup_shard_owner(ex, n_workers) != worker_id:
+                ex_hash = _dedup_hash(ex)
+                if _dedup_shard_owner(ex, n_workers, ex_hash) != worker_id:
                     continue
             elif i % n_workers != worker_id:
                 i += 1
                 continue
             i += 1
-            text = self.cleaner(ex)
+            text = self.cleaner(ex, ex_hash)
             if text is None:
                 continue
             texts.append(text)
