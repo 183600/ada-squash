@@ -18,10 +18,12 @@ picking whichever looks better:
 
 Because every cell runs the same seeds, two cells at a depth are *paired*
 samples. The launcher therefore also tests each norm against `--reference-norm`
-at each depth on the per-seed `final_val_loss` differences (paired one-sided
-test, Holm-Bonferroni over the sweep's comparison family) and reports the
-per-seed sign counts next to the p-value, since with the default 3 seeds the
-normal approximation alone is thin evidence.
+at each depth on the per-seed `final_val_loss` differences (one-sided paired
+Student-t test, Holm-Bonferroni over the sweep's comparison family) and reports
+the per-seed sign counts plus a 95% confidence interval for the delta next to
+the p-value. The t reference distribution is what makes the default 3 seeds
+readable: at df = 2 the one-sided 5% critical value is 2.92, where the normal
+approximation would use 1.64 and turn noise into "wins".
 """
 import argparse
 import json
@@ -32,7 +34,7 @@ import sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from adasquash.metrics import holm_adjust, mean_std_stderr, paired_z_one_sided
+from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.repro import collect_run_metadata, save_run_manifest
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
@@ -107,9 +109,24 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
 
     best_vals, best_stats = _pool('best_val_loss')
     final_vals, final_stats = _pool('final_val_loss')
+    seed_list = [int(s) for s in seeds]
+    # A run that crashed, diverged or never finished leaves no readable
+    # manifest. Pooling only the survivors would silently turn "this norm
+    # destabilized 2 of 3 seeds" into a clean mean over the lucky seed, so the
+    # missing seeds are recorded and the comparison refuses to certify an
+    # incomplete cell as significantly better.
+    missing_seeds = [p['seed'] for p in per_seed
+                     if not isinstance(p['best_val_loss'], (int, float))
+                     and not isinstance(p['final_val_loss'], (int, float))]
+    seeds_without_final = [p['seed'] for p in per_seed
+                           if not isinstance(p['final_val_loss'], (int, float))]
     return {
         'cell': cell_dir.name,
-        'seeds': [int(s) for s in seeds],
+        'seeds': seed_list,
+        'n_seeds_requested': len(seed_list),
+        'missing_seeds': missing_seeds,
+        'seeds_without_final_val_loss': seeds_without_final,
+        'complete': len(missing_seeds) == 0,
         'per_seed': per_seed,
         'n_seeds': len(best_vals),
         'best_val_loss': None if best_stats is None else best_stats['mean'],
@@ -121,7 +138,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         'final_val_loss_std_basis': 'seeds' if len(final_vals) >= 2 else 'single_run',
         'aggregation': ('Mean +/- Std across seeds (each seed is an independent run of the identical recipe). '
                         'best_val_loss = min over validation passes (checkpoint-selection statistic, optimistically biased); '
-                        'final_val_loss = last validation pass (fixed-step estimate, comparable across cells when early stopping is off).'),
+                        'final_val_loss = last validation pass (fixed-step estimate, comparable across cells when early stopping is off). '
+                        'missing_seeds = failed/unfinished runs, excluded from the mean but never from the report: '
+                        'a cell with missing seeds is not a clean replication.'),
     }
 
 def _cell_seed_metric(cell: dict, metric: str) -> dict:
@@ -139,13 +158,16 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
     """One-sided paired comparison of every norm against `reference_norm` per depth.
 
     Seeds are the unit of replication and every cell of the sweep shares the
-    same seed set, so candidates and reference are *paired*: the test runs on
-    the per-seed `metric` differences (default `final_val_loss`, the fixed-step
-    estimate - the selection-biased `best_val_loss` is deliberately not the
-    basis). Because the normal approximation on 3 seeds is thin evidence, the
-    per-seed sign counts (`n_seeds_favoring`, `n_seeds_tied`) are reported next
-    to the p-value as the assumption-free reading. Holm-Bonferroni adjusts the
-    whole family of sweep comparisons before any row is called significant.
+    same seed set, so candidates and reference are *paired*: the test is a
+    one-sided paired Student-t test on the per-seed `metric` differences
+    (default `final_val_loss`, the fixed-step estimate - the selection-biased
+    `best_val_loss` is deliberately not the basis). The t distribution, not
+    the normal one, is the small-sample-correct reference at the default 3
+    seeds (df = 2), and each row also reports a two-sided 95% confidence
+    interval for the delta. The assumption-free per-seed sign counts
+    (`n_seeds_favoring`, `n_seeds_tied`) are reported alongside. Holm-Bonferroni
+    adjusts the whole family of sweep comparisons before any row is called
+    significant.
     """
     rows = []
     for depth in sorted(cells_by_depth):
@@ -172,13 +194,25 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 'p_one_sided': None,
                 'p_one_sided_holm': None,
                 'beats_reference_significantly': False,
+                't': None,
+                'df': None,
+                'delta_ci_95': None,
+                'candidate_missing_seeds': None,
+                'reference_missing_seeds': None,
+                'complete': True,
             }
+            requested = sorted(set(ref.get('seeds') or []) | set(by_norm[norm].get('seeds') or []))
+            entry['candidate_missing_seeds'] = [s for s in requested if s not in cand_seeds]
+            entry['reference_missing_seeds'] = [s for s in requested if s not in ref_seeds]
+            entry['complete'] = not entry['candidate_missing_seeds'] and not entry['reference_missing_seeds']
             if len(common) >= 2:
                 a = [cand_seeds[s] for s in common]
                 b = [ref_seeds[s] for s in common]
-                test = paired_z_one_sided(a, b, margin=margin)
+                test = paired_t_one_sided(a, b, margin=margin)
                 entry['mean_delta'] = test['mean_delta']
-                entry['z'] = test['z']
+                entry['t'] = test['t']
+                entry['df'] = test['df']
+                entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
                 entry['p_one_sided'] = test['p_one_sided']
                 entry['n_seeds_favoring'] = sum(1 for x, y in zip(a, b) if x < y)
                 entry['n_seeds_tied'] = sum(1 for x, y in zip(a, b) if x == y)
@@ -190,18 +224,27 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
         entry['p_one_sided_holm'] = p_holm
         entry['beats_reference_significantly'] = bool(
             entry['mean_delta'] is not None and entry['mean_delta'] < -margin
-            and p_holm is not None and p_holm < alpha)
+            and p_holm is not None and p_holm < alpha
+            and entry['complete'])
+    incomplete = [
+        {'depth': r['depth'], 'norm': r['norm'],
+         'candidate_missing_seeds': r['candidate_missing_seeds'],
+         'reference_missing_seeds': r['reference_missing_seeds']}
+        for r in rows if not r['complete']
+    ]
     return {
         'reference_norm': reference_norm,
         'metric': metric,
         'margin': margin,
         'alpha': alpha,
         'rows': rows,
-        'multiple_comparison': (f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} '
-                                f'tested sweep comparison(s) against the same per-depth reference'),
-        'reading_guide': ('paired on the shared seeds; `mean_delta` < 0 favors the candidate. '
-                          'With 3 seeds read `n_seeds_favoring`/3 first: the z p-value is a normal '
-                          'approximation and is not trustworthy on its own at this replication count.'),
+        'incomplete_cells': incomplete,
+        'reading_guide': ('paired Student-t on the shared seeds; `mean_delta` < 0 favors the candidate. '
+                          'At 3 seeds (df = 2) the one-sided 5% critical value is t = 2.92: read '
+                          '`n_seeds_favoring`/3 and the `delta_ci_95` range next to the p-value before '
+                          'treating a delta as real. A cell with `missing_seeds` '
+                          '(`incomplete_cells`) is never certified as significantly better: which runs '
+                          'survived is itself a selection effect.'),
     }
 
 def print_sweep_comparisons(comparison: dict) -> None:
@@ -220,8 +263,18 @@ def print_sweep_comparisons(comparison: dict) -> None:
                 sign += f" tied={r['n_seeds_tied']}"
         p_holm = r['p_one_sided_holm']
         p_str = 'n/a' if p_holm is None else f'{p_holm:.4g}'
-        print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{sign} "
-              f"p_holm={p_str} significant={r['beats_reference_significantly']}")
+        ci = r.get('delta_ci_95')
+        ci_str = '' if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        miss = ''
+        if not r.get('complete', True):
+            miss = (f" INCOMPLETE(candidate missing {r['candidate_missing_seeds']}, "
+                    f"reference missing {r['reference_missing_seeds']})")
+        print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{ci_str}{sign} "
+              f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}")
+    if comparison.get('incomplete_cells'):
+        print(f"[compare] WARNING: {len(comparison['incomplete_cells'])} comparison(s) involve a cell "
+              f"with missing seed runs; significance is withheld there: "
+              f"{comparison['incomplete_cells']}")
 
 def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int):
     cmd = [sys.executable, str(Path(__file__).parent / 'train_gpt2.py'), '--model', args.model, '--norm', norm, '--dataset', args.dataset, '--dataset-config', args.dataset_config, '--tokenizer', args.tokenizer, '--seq-len', str(args.seq_len), '--batch-size', str(args.batch_size), '--grad-accum', str(args.grad_accum), '--max-steps', str(args.max_steps), '--lr', str(args.lr), '--min-lr-ratio', str(args.min_lr_ratio), '--warmup', str(args.warmup), '--weight-decay', str(args.weight_decay), '--beta1', str(args.beta1), '--beta2', str(args.beta2), '--grad-clip', str(args.grad_clip), '--seed', str(seed), '--alpha-0', str(args.alpha_0), '--alpha-init', str(args.alpha_init), '--k-init', str(args.k_init), '--p-init', str(args.p_init), '--qk-alpha-init', str(args.qk_alpha_init), '--output-dir', str(output_dir), '--log-every', str(args.log_every), '--stats-every', str(args.stats_every), '--save-every', str(args.save_every)]
@@ -394,11 +447,14 @@ def main():
                     rc = proc.wait()
                     print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
                 else:
-                    procs.append(proc)
+                    procs.append((proc, depth, norm, seed))
             cells.append((depth, norm, cell_dir))
     if not args.sequential:
-        for proc in procs:
-            proc.wait()
+        for proc, depth, norm, seed in procs:
+            rc = proc.wait()
+            if rc != 0:
+                print(f'[sweep] WARNING: d{depth}-{norm} seed={seed} exited rc={rc}; '
+                      f'its manifest may be missing, which flags the cell incomplete')
     aggs_by_depth: dict = {}
     for depth, norm, cell_dir in cells:
         agg = aggregate_sweep_cell(cell_dir, seeds, multi)
@@ -422,6 +478,11 @@ def main():
             print(line)
         else:
             print(f"[sweep] d{depth}-{norm}: no usable best_val_loss in the run manifests")
+        if agg.get('missing_seeds'):
+            print(f"[sweep] WARNING: d{depth}-{norm}: missing/unfinished runs for seeds "
+                  f"{agg['missing_seeds']}; the pooled mean covers {agg['n_seeds']} of "
+                  f"{agg['n_seeds_requested']} requested seeds and comparisons will treat the "
+                  f"cell as incomplete")
     comparison = compare_sweep_cells(aggs_by_depth, args.reference_norm)
     print_sweep_comparisons(comparison)
     comp_path = base / 'sweep_comparisons.json'

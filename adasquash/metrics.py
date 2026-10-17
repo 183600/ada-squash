@@ -10,8 +10,14 @@ honest:
 * a held-out loss is a *sample mean*: `mean_std_stderr` reports its standard
   error so a delta smaller than the noise is visible as such;
 * two arms evaluated on the *same* held-out batches are paired samples, so
-  `paired_z_one_sided` (with `welch_z_one_sided` as the unpaired fallback) is
-  the test used for "better by more than `margin`";
+  `paired_t_one_sided` (with `welch_t_one_sided` as the unpaired fallback) is
+  the test used for "better by more than `margin`". The repo replicates most
+  comparisons over only 2-4 seeds, so the Student-t reference distribution
+  matters: at n = 3 the one-sided 5% critical value is t = 2.92, while the
+  normal approximation (`paired_z_one_sided` / `welch_z_one_sided`, kept for
+  large-n callers) would use z = 1.64 and declare wins from noise. The two
+  t-tests also report a two-sided confidence interval for the mean difference,
+  so a point estimate without a plausible range is never the whole story;
 * a pass/fail rate over independent trials (needle-in-a-haystack) gets a
   Wilson interval via `wilson_interval`, which stays inside [0, 1] and is not
   degenerate at 0/1 like the normal approximation;
@@ -47,8 +53,12 @@ __all__ = [
     "imbalance_report",
     "macro_weighted_f1",
     "mean_std_stderr",
+    "paired_t_one_sided",
     "paired_z_one_sided",
     "roc_auc",
+    "student_t_cdf",
+    "student_t_ppf",
+    "welch_t_one_sided",
     "welch_z_one_sided",
     "wilson_interval",
 ]
@@ -98,6 +108,101 @@ def _p_one_sided_from_z(z: float) -> float:
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction for the regularized incomplete beta (Lentz's method)."""
+    max_it, eps, fpmin = 200, 3e-14, 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    if abs(d) < fpmin:
+        d = fpmin
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_it + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta I_x(a, b) for a, b > 0 and 0 <= x <= 1."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_bt = (
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + a * math.log(x) + b * math.log1p(-x)
+    )
+    bt = math.exp(log_bt)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def student_t_cdf(t: float, df: float) -> float:
+    """P(T <= t) for Student's t with `df` degrees of freedom.
+
+    Pure `math` and accurate to near machine precision across the small
+    degrees-of-freedom range the seed-replicated comparisons live in (df =
+    n - 1 = 1-4). This is the reference distribution for the paired and Welch
+    tests below; the normal CDF (z) is only the df -> infinity limit.
+    """
+    if df <= 0:
+        raise ValueError("student_t_cdf needs df > 0")
+    if math.isnan(t):
+        raise ValueError("student_t_cdf got a NaN statistic")
+    if t == float("inf"):
+        return 1.0
+    if t == float("-inf"):
+        return 0.0
+    tail = 0.5 * _reg_incomplete_beta(0.5 * df, 0.5, df / (df + t * t))
+    return 1.0 - tail if t > 0.0 else tail
+
+
+def student_t_ppf(p: float, df: float) -> float:
+    """Inverse Student-t CDF `t : P(T <= t) = p`, by bisection on a monotone CDF.
+
+    Used for confidence-interval critical values; bisection avoids a second
+    special-function implementation and the CDF is cheap at these df.
+    """
+    if not 0.0 < p < 1.0:
+        raise ValueError("student_t_ppf needs 0 < p < 1")
+    if df <= 0:
+        raise ValueError("student_t_ppf needs df > 0")
+    lo, hi = -1.0, 1.0
+    while student_t_cdf(lo, df) > p:
+        lo *= 2.0
+    while student_t_cdf(hi, df) < p:
+        hi *= 2.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if student_t_cdf(mid, df) < p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
 def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
     """Holm-Bonferroni step-down adjustment of a family of p-values.
 
@@ -125,12 +230,16 @@ def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
 def paired_z_one_sided(
     a: Sequence[float], b: Sequence[float], margin: float = 0.0
 ) -> dict:
-    """One-sided paired z-test of H1: mean(a - b) < -margin.
+    """One-sided paired z-test of H1: mean(a - b) < -margin (large-n only).
 
     `a` and `b` must be the same length and paired (e.g. the per-seed or
     per-batch losses of two arms measured on identical data). A negative
     `mean_delta` means `a` is better. `z = (mean_delta + margin) / stderr`,
     so a negative z supports the alternative; `p_one_sided` is P(Z <= z).
+
+    This is the df -> infinity limit: with the 2-4 replicas the experiments
+    in this repo actually run, the normal tail is anti-conservative - use
+    `paired_t_one_sided`, which also reports a confidence interval.
     """
     a = [float(v) for v in a]
     b = [float(v) for v in b]
@@ -158,6 +267,60 @@ def paired_z_one_sided(
     }
 
 
+def paired_t_one_sided(
+    a: Sequence[float], b: Sequence[float], margin: float = 0.0, alpha: float = 0.05
+) -> dict:
+    """One-sided paired Student-t test of H1: mean(a - b) < -margin.
+
+    The small-sample reference for the paired comparisons this repo runs:
+    `t = (mean_delta + margin) / stderr` against a t distribution with
+    `n - 1` degrees of freedom, so at n = 3 seeds the 5% critical value is
+    2.92 instead of the normal 1.64. A negative `mean_delta` means `a` is
+    better. Also reports a two-sided `1 - alpha` confidence interval for
+    `mean_delta` (`ci_low`, `ci_high`): a delta whose interval crosses zero
+    is inside the noise, whatever its point estimate. The zero-variance case
+    (`stderr == 0`) is the usual degenerate limit of the t statistic: the
+    sign of `mean_delta + margin` decides p = 0 or 1.
+    """
+    a = [float(v) for v in a]
+    b = [float(v) for v in b]
+    if len(a) != len(b):
+        raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
+    n = len(a)
+    empty = {
+        "mean_delta": None, "t": None, "df": None, "p_one_sided": None,
+        "ci_low": None, "ci_high": None, "ci_level": 1.0 - alpha,
+        "n": n, "paired": True, "test": "paired_t",
+    }
+    if n == 0:
+        return empty
+    d = [x - y for x, y in zip(a, b)]
+    mean = sum(d) / n
+    if n < 2:
+        empty["mean_delta"] = mean
+        return empty
+    var = sum((v - mean) ** 2 for v in d) / (n - 1)
+    se = math.sqrt(var / n)
+    df = float(n - 1)
+    if se == 0.0:
+        t = float("-inf") if mean + margin < 0.0 else (float("inf") if mean + margin > 0.0 else 0.0)
+    else:
+        t = (mean + margin) / se
+    half = student_t_ppf(1.0 - alpha / 2.0, df) * se
+    return {
+        "mean_delta": mean,
+        "t": t,
+        "df": df,
+        "p_one_sided": student_t_cdf(t, df),
+        "ci_low": mean - half,
+        "ci_high": mean + half,
+        "ci_level": 1.0 - alpha,
+        "n": n,
+        "paired": True,
+        "test": "paired_t",
+    }
+
+
 def welch_z_one_sided(
     a: Sequence[float], b: Sequence[float], margin: float = 0.0
 ) -> dict:
@@ -165,7 +328,8 @@ def welch_z_one_sided(
 
     Used only when the two arms do not share the same held-out samples (so
     pairing is impossible); the paired test above is strictly more sensitive
-    and preferred whenever the batch counts match.
+    and preferred whenever the batch counts match. Like its paired sibling
+    this is the large-n limit; `welch_t_one_sided` is the small-sample test.
     """
     a = [float(v) for v in a]
     b = [float(v) for v in b]
@@ -188,6 +352,55 @@ def welch_z_one_sided(
         "n": [len(a), len(b)],
         "paired": False,
     }
+
+
+def welch_t_one_sided(
+    a: Sequence[float], b: Sequence[float], margin: float = 0.0, alpha: float = 0.05
+) -> dict:
+    """Unpaired one-sided Welch t-test of H1: mean(a) - mean(b) < -margin.
+
+    The small-sample fallback for arms that do not share their held-out
+    samples. Uses the Welch-Satterthwaite degrees of freedom
+    `(va/na + vb/nb)^2 / ((va/na)^2/(na-1) + (vb/nb)^2/(nb-1))`, so unequal
+    variances shrink the df instead of pretending they are equal, and reports
+    the same two-sided `1 - alpha` interval for the difference as the paired
+    test. `n` is `[na, nb]`, `paired` is False.
+    """
+    a = [float(v) for v in a]
+    b = [float(v) for v in b]
+    na, nb = len(a), len(b)
+    empty = {
+        "mean_delta": None, "t": None, "df": None, "p_one_sided": None,
+        "ci_low": None, "ci_high": None, "ci_level": 1.0 - alpha,
+        "n": [na, nb], "paired": False, "test": "welch_t",
+    }
+    if na < 2 or nb < 2:
+        return empty
+    ma, mb = sum(a) / na, sum(b) / nb
+    va = sum((v - ma) ** 2 for v in a) / (na - 1)
+    vb = sum((v - mb) ** 2 for v in b) / (nb - 1)
+    delta = ma - mb
+    se = math.sqrt(va / na + vb / nb)
+    df = float(na + nb - 2)
+    if se > 0.0:
+        spread_a, spread_b = va / na, vb / nb
+        denom = spread_a ** 2 / (na - 1) + spread_b ** 2 / (nb - 1)
+        if denom > 0.0:
+            df = (spread_a + spread_b) ** 2 / denom
+    if se == 0.0:
+        t = float("-inf") if delta + margin < 0.0 else (float("inf") if delta + margin > 0.0 else 0.0)
+    else:
+        t = (delta + margin) / se
+    half = student_t_ppf(1.0 - alpha / 2.0, df) * se
+    empty.update({
+        "mean_delta": delta,
+        "t": t,
+        "df": df,
+        "p_one_sided": student_t_cdf(t, df),
+        "ci_low": delta - half,
+        "ci_high": delta + half,
+    })
+    return empty
 
 
 def f1_from_counts(

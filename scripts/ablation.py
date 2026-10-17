@@ -19,8 +19,13 @@ Comparison protocol (what the runner guarantees, and checks)
   helps" is a tested claim rather than an eyeballed delta.
 * **Statistical reliability.** Every row is replicated over >= 3 seeds by
   default and reported as mean +/- std across seeds; the row-vs-baseline
-  significance test runs on the paired per-seed means when both rows share
-  >= 2 seeds (falling back to the shared held-out batches otherwise).
+  significance test is a one-sided paired Student-t test on the per-seed
+  means when both rows share >= 2 seeds, because at 3 seeds the normal
+  approximation is anti-conservative. A single shared run is tested at the
+  batch level for description only and is never certified as significant
+  (batch noise is not run-to-run noise), and alias rows that reuse a
+  summary are counted once. Each delta also carries a 95% confidence
+  interval.
 """
 import argparse
 import dataclasses
@@ -35,7 +40,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT, build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
 from adasquash.diagnostics import triage_nonfinite
-from adasquash.metrics import holm_adjust, mean_std_stderr, paired_z_one_sided, welch_z_one_sided
+from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
@@ -403,6 +408,59 @@ def _write_summary(path: Path, summary: dict) -> None:
     with open(path, 'w') as f:
         json.dump(summary, f, indent=2)
 
+def _protocol_signature(args) -> tuple:
+    """The controlled training recipe every row of this invocation shares."""
+    return (args.model, args.lr, args.weight_decay, args.batch_size, args.seq_len, args.max_steps)
+
+def row_protocol_signature(row: dict, fallback_model=None):
+    """Recorded (model, lr, weight_decay, batch, seq, train_steps), or None.
+
+    Missing `controls` (a summary predating protocol recording) counts as
+    unknown, never as matching.
+    """
+    controls = row.get('controls')
+    if not isinstance(controls, dict):
+        return None
+    optimizer = controls.get('optimizer') or {}
+    data = controls.get('data') or {}
+    return (row.get('model', fallback_model), optimizer.get('lr'), optimizer.get('weight_decay'),
+            data.get('batch_size'), data.get('seq_len'), controls.get('train_steps'))
+
+def partition_rows_by_protocol(rows: list, args) -> tuple[list, list]:
+    """(rows recorded under this invocation's recipe, rows recorded under another).
+
+    `all_summaries.json` deliberately accumulates rows across invocations, but
+    a row trained with a different lr/step count/batch/seq/model is not the
+    same experiment: comparing it would credit the module with a change that
+    came from the recipe. Mismatched rows stay in the file and in the report,
+    but they are kept out of the statistical comparisons.
+    """
+    expected = _protocol_signature(args)
+    keep, stale = [], []
+    for row in rows:
+        signature = row_protocol_signature(row, args.model)
+        if signature == expected:
+            keep.append(row)
+        else:
+            labels = ('model', 'lr', 'weight_decay', 'batch_size', 'seq_len', 'max_steps')
+            stale.append({
+                'name': row.get('name'),
+                'reason': ('no recorded controls' if signature is None
+                           else 'trained under a different protocol than this invocation'),
+                'recorded_protocol': {} if signature is None else dict(zip(labels, signature)),
+            })
+    return keep, stale
+
+def cached_seed_matches(summary: dict, name: str, cfg_kwargs: dict, args) -> bool:
+    """Whether a cached per-seed summary is the same row under the same recipe."""
+    return bool(
+        isinstance(summary, dict)
+        and summary.get('name') == name
+        and summary.get('model') == args.model
+        and summary.get('cfg') == cfg_kwargs
+        and row_protocol_signature(summary, args.model) == _protocol_signature(args)
+    )
+
 def merge_summaries(previous: list, fresh: list) -> list:
     merged: dict[str, dict] = {}
     order: list[str] = []
@@ -415,7 +473,12 @@ def merge_summaries(previous: list, fresh: list) -> list:
     return [merged[name] for name in order if name in merged]
 
 def _seed_means(row) -> dict:
-    """{seed: val_loss} of a multi-seed aggregate; {} for single-seed rows."""
+    """{seed: val_loss} for every row shape.
+
+    Aggregates carry a `per_seed` list; a single-run summary (no `per_seed`)
+    still identifies its seed, so a legacy single-seed row can pair with the
+    same seed inside a newer aggregate.
+    """
     per = row.get('per_seed')
     out = {}
     if isinstance(per, list):
@@ -424,7 +487,29 @@ def _seed_means(row) -> dict:
                 continue
             if isinstance(item.get('val_loss'), (int, float)):
                 out[int(item['seed'])] = float(item['val_loss'])
+        return out
+    seeds = row.get('seeds') if isinstance(row.get('seeds'), list) else []
+    seeds = [s for s in seeds if s is not None] or ([row['seed']] if row.get('seed') is not None else [])
+    if isinstance(row.get('val_loss'), (int, float)):
+        for s in seeds:
+            out[int(s)] = float(row['val_loss'])
     return out
+
+def _batches_of_seed(row, seed):
+    """Held-out batch losses belonging to one run, or None.
+
+    Never returns `val_losses` when the row pooled batches from several
+    seeds: those concatenated lists must not be treated as one run's pairing
+    basis (batch k of seed 42 would otherwise be zipped with batch k of
+    seed 44).
+    """
+    by_seed = row.get('val_losses_by_seed')
+    if isinstance(by_seed, dict) and isinstance(by_seed.get(str(seed)), list):
+        return by_seed[str(seed)]
+    means = _seed_means(row)
+    if len(means) == 1 and seed in means and isinstance(row.get('val_losses'), list):
+        return row['val_losses']
+    return None
 
 def _row_std(row):
     """Across-seed std when replicated, within-run batch std otherwise."""
@@ -433,48 +518,70 @@ def _row_std(row):
     return row.get('val_loss_std')
 
 def _paired_row_test(row: dict, reference: dict, margin: float=0.0):
-    """One-sided paired test of `row` against `reference`, seed-paired first.
+    """One-sided paired Student-t test of `row` vs `reference`, seed-paired.
 
     Every comparison in this module must run through the *same* test logic,
     or `baseline_comparison` and `leave_one_out_comparison` could disagree on
-    the same pair of rows. Seeds are the unit of replication: when both rows
-    share >= 2 seeds the test runs on the paired per-seed means; otherwise it
-    falls back to the shared held-out batches of one run (paired when the
-    batch counts match, Welch when they do not). Returns
+    the same pair of rows. Seeds are the unit of replication, and only the
+    paired per-seed means (`basis='seed_means'`, >= 2 shared seeds) may
+    certify significance in the Holm family. When exactly one seed is shared,
+    the same run's held-out batches are still tested *for description only*
+    (`basis='val_batches_single_seed<s>'`): batch noise is not run-to-run
+    noise, so a single run can never establish that one norm generalizes
+    better across seeds. With no shared seed there is no test - in
+    particular, batches pooled across different seeds are never zipped
+    together. The t reference distribution - not the normal one - is the
+    small-sample-correct choice for the 2-4 seeds these matrices use, and the
+    returned interval makes the precision of the delta visible. Returns
     `(test, basis, common_seeds)`, with `test=None` when no basis exists.
     """
     row_seeds = _seed_means(row)
     ref_seeds = _seed_means(reference)
     common = sorted(set(row_seeds) & set(ref_seeds))
     if len(common) >= 2:
-        test = paired_z_one_sided([row_seeds[s] for s in common],
+        test = paired_t_one_sided([row_seeds[s] for s in common],
                                   [ref_seeds[s] for s in common], margin=margin)
         return test, 'seed_means', common
-    row_batches = row.get('val_losses')
-    ref_batches = reference.get('val_losses')
-    if (isinstance(row_batches, list) and isinstance(ref_batches, list)
-            and len(row_batches) == len(ref_batches) and len(row_batches) >= 2):
-        return paired_z_one_sided(row_batches, ref_batches, margin=margin), 'val_batches', common
-    if (isinstance(row_batches, list) and isinstance(ref_batches, list)
-            and len(row_batches) >= 2 and len(ref_batches) >= 2):
-        return welch_z_one_sided(row_batches, ref_batches, margin=margin), 'val_batches_unpaired', common
-    return None, None, common
+    if len(common) == 1:
+        seed = common[0]
+        row_batches = _batches_of_seed(row, seed)
+        ref_batches = _batches_of_seed(reference, seed)
+        if (isinstance(row_batches, list) and isinstance(ref_batches, list)
+                and len(row_batches) >= 2 and len(ref_batches) >= 2):
+            if len(row_batches) == len(ref_batches):
+                test = paired_t_one_sided(row_batches, ref_batches, margin=margin)
+                return test, f'val_batches_single_seed{seed}', common
+            test = welch_t_one_sided(row_batches, ref_batches, margin=margin)
+            return test, f'val_batches_single_seed{seed}_unpaired', common
+    basis = 'no_shared_seeds' if (row_seeds and ref_seeds) else 'insufficient_seeds'
+    return None, basis, common
+
+def _basis_counted_in_family(basis) -> bool:
+    """Only a >= 2-seed paired test is admissible to the Holm family."""
+    return basis == 'seed_means'
 
 def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alpha: float=0.05) -> dict | None:
     """Every row's held-out val_loss against the best reference baseline.
 
     The reference is the *best* (lowest val_loss) row among `baseline_names`,
     so a variant is only credited with a win if it beats the strongest simple
-    baseline on the identical protocol. Significance uses the paired per-seed
-    means whenever both rows share >= 2 seeds (seeds are the independent
-    replications), and falls back to the shared held-out batches of a single
-    run (paired z when the batch counts match, otherwise Welch) when they do
-    not. `margin` is the smallest loss improvement treated as meaningful.
-    Because every row is tested against the *same* reference, the per-row
-    p-values are a family of tests and are Holm-Bonferroni adjusted over the
-    matrix before anything is called significant: `beats_reference_significantly`
-    requires the adjusted p < alpha, and the raw one-sided p stays available as
-    `p_one_sided`. Returns None when no baseline row has a usable val_loss.
+    baseline on the identical protocol. Significance uses the one-sided paired
+    Student-t test on the per-seed means whenever both rows share >= 2 seeds
+    (seeds are the independent replications). With exactly one shared seed the
+    same run's held-out batches are tested for description only - batch noise
+    is not run-to-run noise - and with no shared seed no test runs at all.
+    Alias rows (`reused_from`) are the same underlying run and are counted
+    once, both in the report and in the Holm family. The t reference distribution matters
+    at this replication count: at n = 3, df = 2, the one-sided 5% critical
+    value is 2.92, not the normal 1.64. `margin` is the smallest loss
+    improvement treated as meaningful, and every entry carries a two-sided
+    95% interval for the delta (`delta_ci_95`) so a win smaller than its own
+    precision is visible as such. Because every row is tested against the
+    *same* reference, the per-row p-values are a family of tests and are
+    Holm-Bonferroni adjusted over the matrix before anything is called
+    significant: `beats_reference_significantly` requires the adjusted
+    p < alpha, and the raw one-sided p stays available as `p_one_sided`.
+    Returns None when no baseline row has a usable val_loss.
     """
     baseline_names = set(baseline_names)
     usable = [r for r in summaries
@@ -495,8 +602,9 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         'margin': margin,
         'alpha': alpha,
         'protocol': ('seeds are the unit of replication: mean +/- std across >= 3 seeds; '
-                     'the paired test runs on per-seed means when both rows share >= 2 seeds, '
-                     'otherwise on the shared held-out batches of one run'),
+                     'only the paired test on >= 2 shared per-seed means certifies significance, '
+                     'a single shared run is tested at batch level for description only, and '
+                     'alias rows (reused summaries) are counted once'),
         'rows': [],
     }
     for row in usable:
@@ -506,6 +614,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         entry = {
             'name': row['name'],
             'hypothesis': row.get('hypothesis'),
+            'run_identity': row.get('reused_from') or row['name'],
             'val_loss': row['val_loss'],
             'val_loss_std': _row_std(row),
             'n_seeds': row.get('n_seeds', 1),
@@ -515,31 +624,65 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'test': None,
             'test_basis': None,
             'paired_seeds': [],
+            'replicated_across_seeds': False,
+            'significance_basis': None,
+            'excluded_from_family': None,
             'p_one_sided': None,
             'p_one_sided_holm': None,
+            't': None,
+            'df': None,
+            'delta_ci_95': None,
         }
         test, basis, common = _paired_row_test(row, reference, margin=margin)
         entry['test_basis'] = basis
         entry['paired_seeds'] = common
+        entry['replicated_across_seeds'] = _basis_counted_in_family(basis)
         if test is not None:
-            entry['test'] = 'paired_z_one_sided' if test['paired'] else 'welch_z_one_sided'
+            entry['test'] = test['test']
             entry['p_one_sided'] = test['p_one_sided']
-            entry['z'] = test['z']
+            entry['t'] = test['t']
+            entry['df'] = test['df']
+            entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
+        if entry['test'] is not None and not entry['replicated_across_seeds']:
+            entry['significance_basis'] = (
+                'descriptive only: fewer than 2 shared seeds, so the batch-level test '
+                'cannot separate the norm effect from run-to-run noise; not certified and '
+                'not counted in the Holm family')
         out['rows'].append(entry)
-    # Every row above tests the same reference, so the raw p-values form a
-    # family and the per-row alpha must be corrected (Holm-Bonferroni step-down)
-    # before a row is reported as a significant win. Rows whose test could not
-    # run stay None and are excluded from the family.
-    adjusted = holm_adjust([entry['p_one_sided'] for entry in out['rows']])
-    for entry, p_holm in zip(out['rows'], adjusted):
+    # Alias rows (identical effective config, `reused_from`) are the *same*
+    # run under a second name: they are reported, but a run must not be
+    # counted twice as independent evidence nor inflate the Holm family size.
+    by_identity: dict[str, str] = {}
+    for entry in out['rows']:
+        identity = entry.get('run_identity') or entry['name']
+        canonical = by_identity.get(identity)
+        if canonical is None:
+            by_identity[identity] = entry['name']
+        else:
+            entry['excluded_from_family'] = f'duplicate run of {canonical} (reused summary, not independent evidence)'
+    # Every seed-replicated row above tests the same reference, so its raw
+    # p-values form a family and the per-row alpha must be corrected
+    # (Holm-Bonferroni step-down) before a row is reported as a significant
+    # win. Rows tested on a single run, duplicates of another row, or rows
+    # whose test could not run stay out of the family (and cannot be reported
+    # significant).
+    family = [entry for entry in out['rows']
+              if entry['replicated_across_seeds'] and entry['excluded_from_family'] is None]
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
         entry['beats_reference_significantly'] = bool(
             entry['beats_reference'] and p_holm is not None and p_holm < alpha
         )
+    described_only = [entry['name'] for entry in out['rows']
+                      if entry['test'] is not None and not entry['replicated_across_seeds']]
+    out['rows_tested_descriptively_only'] = described_only
     out['multiple_comparison'] = (
-        f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} tested row(s) '
-        f'against the same reference; `beats_reference_significantly` uses the adjusted p-value'
+        f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} seed-replicated row(s) '
+        f'against the same reference; `beats_reference_significantly` uses the adjusted p-value. '
+        f'Single-run batch-level tests are descriptive only ('
+        f'{described_only}) and duplicates/aliases are counted once.'
     )
     thin = {r['name'] for r in [reference, *baselines] if r.get('n_seeds', 1) < 3}
     out['rows_with_fewer_than_3_seeds'] = sorted(thin | {e['name'] for e in out['rows'] if e['n_seeds'] < 3})
@@ -563,11 +706,21 @@ def print_baseline_comparison(comparison: dict | None) -> None:
         std = entry.get('val_loss_std')
         std_str = '' if std is None else f" +/- {std:.4f}"
         basis = entry.get('test_basis') or '-'
+        ci = entry.get('delta_ci_95')
+        ci_str = '' if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        note = ''
+        if entry.get('excluded_from_family'):
+            note = f" [{entry['excluded_from_family']}]"
+        elif entry.get('significance_basis'):
+            note = ' [descriptive only, not certified]'
         print(f"[compare] {entry['name']:>32s} val_loss={entry['val_loss']:.4f}{std_str} "
-              f"delta={entry['delta_vs_reference']:+.4f} p(one-sided)={p_str} p(holm)={p_holm_str} "
+              f"delta={entry['delta_vs_reference']:+.4f}{ci_str} p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{basis} "
               f"beats={entry['beats_reference']} "
-              f"significant={entry['beats_reference_significantly']}")
+              f"significant={entry['beats_reference_significantly']}{note}")
+    if comparison.get('rows_tested_descriptively_only'):
+        print(f"[compare] NOTE: single-run batch-level tests (fewer than 2 shared seeds) are described "
+              f"but never certified: {comparison['rows_tested_descriptively_only']}")
     if comparison.get('rows_with_fewer_than_3_seeds'):
         print(f"[compare] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
               f"{comparison['rows_with_fewer_than_3_seeds']}")
@@ -608,14 +761,22 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 'reference_val_loss_std': None if ref is None else _row_std(ref),
                 'n_seeds_full': None if full is None else full.get('n_seeds', 1),
                 'n_seeds_reference': None if ref is None else ref.get('n_seeds', 1),
+                'run_identity_full': None if full is None else (full.get('reused_from') or full_name),
+                'run_identity_reference': None if ref is None else (ref.get('reused_from') or ref_name),
                 'delta_full_minus_reference': None,
                 'mechanism_helps': False,
                 'mechanism_helps_significantly': False,
                 'test': None,
                 'test_basis': None,
                 'paired_seeds': [],
+                'replicated_across_seeds': False,
+                'significance_basis': None,
+                'excluded_from_family': None,
                 'p_one_sided': None,
                 'p_one_sided_holm': None,
+                't': None,
+                'df': None,
+                'delta_ci_95': None,
             }
             if full is None:
                 entry['skipped'] = f"full row '{full_name}' has no usable val_loss"
@@ -625,38 +786,73 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['skipped'] = f"Full-minus-X row '{ref_name}' has no usable val_loss"
                 rows.append(entry)
                 continue
+            if entry['run_identity_full'] == entry['run_identity_reference']:
+                entry['skipped'] = (f"'{full_name}' and '{ref_name}' are the same run "
+                                    f"(reused summary); the contrast is vacuous")
+                rows.append(entry)
+                continue
             entry['delta_full_minus_reference'] = full['val_loss'] - ref['val_loss']
             entry['mechanism_helps'] = bool(entry['delta_full_minus_reference'] < -margin)
             test, basis, common = _paired_row_test(full, ref, margin=margin)
             entry['test_basis'] = basis
             entry['paired_seeds'] = common
+            entry['replicated_across_seeds'] = _basis_counted_in_family(basis)
             if test is not None:
-                entry['test'] = 'paired_z_one_sided' if test['paired'] else 'welch_z_one_sided'
+                entry['test'] = test['test']
                 entry['p_one_sided'] = test['p_one_sided']
-                entry['z'] = test['z']
+                entry['t'] = test['t']
+                entry['df'] = test['df']
+                entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
                 entry['n'] = test['n']
+            if entry['test'] is not None and not entry['replicated_across_seeds']:
+                entry['significance_basis'] = (
+                    'descriptive only: fewer than 2 shared seeds, so the batch-level test '
+                    'cannot separate the mechanism effect from run-to-run noise; not certified '
+                    'and not counted in the Holm family')
             rows.append(entry)
     if not rows:
         return None
-    adjusted = holm_adjust([entry['p_one_sided'] for entry in rows])
-    for entry, p_holm in zip(rows, adjusted):
+    # A contrast is identified by the underlying runs, not the row names: an
+    # alias pair would otherwise appear as two independent mechanism tests,
+    # and a run could even be contrasted with itself via aliases. Each
+    # underlying contrast enters the Holm family exactly once.
+    seen_contrasts: dict[tuple, str] = {}
+    for entry in rows:
+        if entry.get('skipped') or entry.get('run_identity_full') is None:
+            continue
+        key = (entry['run_identity_full'], entry['run_identity_reference'])
+        canonical = seen_contrasts.get(key)
+        if canonical is None:
+            seen_contrasts[key] = entry['mechanism']
+        else:
+            entry['excluded_from_family'] = (f"duplicate of mechanism '{canonical}' "
+                                             f"(same underlying runs, not independent evidence)")
+    family = [entry for entry in rows
+              if entry['replicated_across_seeds'] and entry['excluded_from_family'] is None]
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
         entry['mechanism_helps_significantly'] = bool(
             entry['mechanism_helps'] and p_holm is not None and p_holm < alpha
         )
     thin = sorted({name for entry in rows for name in (entry['full'], entry['reference_row'])
                    if 1 <= usable.get(name, {}).get('n_seeds', 1) < 3})
+    tested_descriptively = [entry['mechanism'] for entry in rows
+                            if entry['test'] is not None and not entry['replicated_across_seeds']]
     return {
         'protocol': ('Full vs Full-minus-X: one-sided paired test of H1 "Full has lower '
-                     'held-out val_loss than the X-free row"; seeds are the unit of '
-                     'replication (paired per-seed means when both rows share >= 2 seeds, '
-                     'else the shared held-out batches of one run)'),
+                     'held-out val_loss than the X-free row"; only the paired test on >= 2 '
+                     'shared per-seed means certifies significance (a single shared run is '
+                     'tested at batch level for description only), and each underlying '
+                     'contrast is counted once even when rows are aliases'),
         'margin': margin,
         'alpha': alpha,
         'multiple_comparison': (f'Holm-Bonferroni over the '
-                                f'{sum(e["p_one_sided"] is not None for e in rows)} tested mechanism(s); '
-                                f'`mechanism_helps_significantly` uses the adjusted p-value'),
+                                f'{sum(e["p_one_sided"] is not None for e in family)} seed-replicated '
+                                f'mechanism(s); `mechanism_helps_significantly` uses the adjusted '
+                                f'p-value'),
         'rows': rows,
+        'rows_tested_descriptively_only': tested_descriptively,
         'rows_with_fewer_than_3_seeds': thin,
     }
 
@@ -674,14 +870,24 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
         ref_std_str = '' if ref_std is None else f' +/- {ref_std:.4f}'
         p_str = 'n/a' if entry['p_one_sided'] is None else f"{entry['p_one_sided']:.3g}"
         p_holm_str = 'n/a' if entry.get('p_one_sided_holm') is None else f"{entry['p_one_sided_holm']:.3g}"
+        ci = entry.get('delta_ci_95')
+        ci_str = '' if ci is None else f"ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}] "
+        note = ''
+        if entry.get('excluded_from_family'):
+            note = f" [{entry['excluded_from_family']}]"
+        elif entry.get('significance_basis'):
+            note = ' [descriptive only, not certified]'
         print(f"[loo] {entry['mechanism']:>22s}: {entry['full']} "
               f"val_loss={entry['full_val_loss']:.4f}{full_std_str} vs "
               f"{entry['reference_row']} val_loss={entry['reference_val_loss']:.4f}{ref_std_str} "
-              f"delta(full-ref)={entry['delta_full_minus_reference']:+.4f} "
+              f"delta(full-ref)={entry['delta_full_minus_reference']:+.4f} {ci_str}"
               f"p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{entry.get('test_basis') or '-'} "
               f"removing_hurts={entry['mechanism_helps']} "
-              f"significant={entry['mechanism_helps_significantly']}")
+              f"significant={entry['mechanism_helps_significantly']}{note}")
+    if comparison.get('rows_tested_descriptively_only'):
+        print(f"[loo] NOTE: single-run batch-level tests (fewer than 2 shared seeds) are described "
+              f"but never certified: {comparison['rows_tested_descriptively_only']}")
     if comparison.get('rows_with_fewer_than_3_seeds'):
         print(f"[loo] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
               f"{comparison['rows_with_fewer_than_3_seeds']}")
@@ -781,9 +987,12 @@ def main():
             if path.exists() and (not args.force):
                 summary = _load_summary(path)
                 if isinstance(summary, dict):
-                    print(f'[skip] {name} seed={seed} already done, use --force to rerun')
-                    seed_summaries.append(summary)
-                    continue
+                    if cached_seed_matches(summary, name, cfg_kwargs, args):
+                        print(f'[skip] {name} seed={seed} already done, use --force to rerun')
+                        seed_summaries.append(summary)
+                        continue
+                    print(f'[stale] {name} seed={seed}: cached summary recorded a different '
+                          f'model/cfg/protocol; retraining and overwriting')
             seed_summaries.append(run_one(name, cfg_kwargs, args, path.parent, run_metadata=run_metadata, hypothesis=hypotheses.get(name), seed=seed))
         agg = aggregate_seed_summaries(name, seed_summaries, cfg_kwargs, hypotheses.get(name))
         _write_summary(row_dir / 'summary.json', agg)
@@ -801,16 +1010,26 @@ def main():
     ordered = merge_summaries(previous, all_summaries)
     with open(agg_path, 'w') as f:
         json.dump(ordered, f, indent=2)
-    comparison = baseline_comparison(ordered, args.baselines, margin=args.baseline_margin, alpha=args.alpha)
+    # Accumulated rows whose recorded recipe differs from this invocation are
+    # reported but excluded from both comparisons: a delta produced by a
+    # different lr/step/batch/seq recipe is not a property of the module.
+    comparable, stale_rows = partition_rows_by_protocol(ordered, args)
+    if stale_rows:
+        print(f"[compare] WARNING: {len(stale_rows)} accumulated row(s) excluded from the comparisons "
+              f"(trained under a different model/cfg/protocol than this invocation): "
+              f"{[r['name'] for r in stale_rows]}; rerun them under this recipe to include them")
+    comparison = baseline_comparison(comparable, args.baselines, margin=args.baseline_margin, alpha=args.alpha)
     if comparison is not None:
+        comparison['rows_excluded_protocol_mismatch'] = stale_rows
         with open(base / 'baseline_comparison.json', 'w') as f:
             json.dump(comparison, f, indent=2)
     print_baseline_comparison(comparison)
     # The second half of the ablation contract: each claimed mechanism of the
     # main proposal must be shown to be load-bearing *on its own*, with a
     # paired Full-vs-Full-minus-X test over the same seeds.
-    loo_comparison = leave_one_out_comparison(ordered, margin=args.baseline_margin, alpha=args.alpha)
+    loo_comparison = leave_one_out_comparison(comparable, margin=args.baseline_margin, alpha=args.alpha)
     if loo_comparison is not None:
+        loo_comparison['rows_excluded_protocol_mismatch'] = stale_rows
         with open(base / 'leave_one_out_comparison.json', 'w') as f:
             json.dump(loo_comparison, f, indent=2)
     print_leave_one_out_comparison(loo_comparison)
@@ -820,6 +1039,7 @@ def main():
     manifest['seeds'] = seeds
     manifest['matrix_validation'] = matrix_report
     manifest['rows'] = [row['name'] for row in ordered]
+    manifest['rows_excluded_protocol_mismatch'] = stale_rows
     manifest['baseline_comparison'] = comparison
     manifest['leave_one_out_comparison'] = loo_comparison
     save_run_manifest(base / 'run_manifest.json', manifest)

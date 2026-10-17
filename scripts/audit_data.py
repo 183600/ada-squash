@@ -204,12 +204,18 @@ def main():
             print(f"[audit] NOTE: {name}: {stats['length_outliers_3iqr']} length outliers beyond the 3xIQR fence "
                   f"(q1={stats['doc_chars_q1']}, q3={stats['doc_chars_q3']}, max={stats['doc_chars_max']}); "
                   "use --min-doc-chars/--max-doc-chars in the training run to drop them")
-    if not splits['train']['finite_lengths'] or not splits['validation']['finite_lengths']:
-        problems.append('non-finite document-length statistics (NaN/Inf in the data)')
+    # Every split is audited, test included: the final numbers come from test,
+    # so corruption there must fail the audit just like corruption in train.
+    non_finite = [name for name in ('train', 'validation', 'test')
+                  if not splits[name]['finite_lengths']]
+    if non_finite:
+        problems.append(f"non-finite document-length statistics (NaN/Inf in the data) in: {', '.join(non_finite)}")
     if (splits['validation']['duplicate_overlap_with_train'] or 0) > 0 or (splits['test']['duplicate_overlap_with_train'] or 0) > 0:
         problems.append('exact duplicate documents appear in both train and a held-out split (group/duplicate leakage)')
-    if splits['train']['token_ids_out_of_range'] or splits['validation']['token_ids_out_of_range']:
-        problems.append('token ids outside the tokenizer vocabulary range')
+    out_of_range = [name for name in ('train', 'validation', 'test')
+                    if splits[name]['token_ids_out_of_range']]
+    if out_of_range:
+        problems.append(f"token ids outside the tokenizer vocabulary range in: {', '.join(out_of_range)}")
     if args.max_tvd is not None and shift['train_vs_validation_tvd'] > args.max_tvd:
         problems.append(f"train-vs-validation distribution shift TVD={shift['train_vs_validation_tvd']:.4f} > max-tvd={args.max_tvd}")
     if problems:

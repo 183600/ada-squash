@@ -21,13 +21,19 @@ This driver therefore:
 * runs each trial through `ablation.run_one`, so the tuning protocol and the
   ablation protocol cannot silently drift apart;
 * compares each variant's best trial against the best tuned baseline with a
-  one-sided paired z-test (same seeds -> paired samples, same held-out
-  batches within a seed). A point-estimate win below `--margin` is reported
-  but flagged as not significant. Because every variant arm is tested against
-  the *same* baseline, the p-values are a family and are Holm-Bonferroni
-  adjusted before an arm is called significantly better. The default
-  selection set is three seeds: with fewer, the lr-grid means are too noisy
-  for a small delta to mean anything.
+  one-sided paired Student-t test over the shared seeds (>= 2 shared seeds
+  required to certify a win). The t reference distribution is the right
+  small-sample choice: over the default three seeds a two-sided 95% critical
+  value is 4.30, not the normal 1.96. Each delta is also reported with a
+  two-sided 95% confidence interval. A point-estimate win below `--margin`
+  is reported but flagged as not significant, and with only one shared seed
+  the same run's batches are tested for description only (batch noise is not
+  run-to-run noise): such an arm is never certified and stays out of the Holm
+  family. Because every variant arm is tested against the *same* baseline,
+  the seed-replicated p-values are a family and are Holm-Bonferroni adjusted
+  before an arm is called significantly better.
+  The default selection set is three seeds: with fewer, the lr-grid means
+  are too noisy for a small delta to mean anything.
 
 Selection bias: picking the best learning rate on `--seeds` and then quoting
 that same run overstates the effect (winner's curse). Pass `--confirm-seeds`
@@ -52,9 +58,36 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import holm_adjust, mean_std_stderr, paired_z_one_sided, welch_z_one_sided
+from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest
 from scripts.ablation import run_one
+
+
+def cached_trial_matches(summary: dict, arm: str, lr: float, args) -> bool:
+    """Whether a cached trial ran under the *same protocol* as this invocation.
+
+    The trial path (`arm/lr/seed`) does not encode `--max-steps`,
+    `--batch-size`, `--seq-len` or `--weight-decay`, so reusing a summary
+    without checking those would silently compare and select under two
+    different recipes.
+    """
+    if not isinstance(summary, dict):
+        return False
+    controls = summary.get('controls')
+    if not isinstance(controls, dict):
+        return False
+    optimizer = controls.get('optimizer') or {}
+    data = controls.get('data') or {}
+    cfg = summary.get('cfg')
+    return bool(
+        isinstance(cfg, dict) and cfg.get('norm_name') == arm
+        and summary.get('model') == args.model
+        and optimizer.get('lr') == float(lr)
+        and optimizer.get('weight_decay') == args.weight_decay
+        and data.get('batch_size') == args.batch_size
+        and data.get('seq_len') == args.seq_len
+        and controls.get('train_steps') == args.max_steps
+    )
 
 
 def run_trial(arm: str, lr: float, seed: int, args, base: Path) -> dict:
@@ -64,9 +97,13 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path) -> dict:
     trial_args.seed = int(seed)
     run_dir = base / 'trials' / arm / f'lr{lr:g}' / f'seed{seed}'
     if (run_dir / 'summary.json').exists() and (not args.force):
-        print(f'[tune][skip] {arm} lr={lr:g} seed={seed} (summary exists, --force to rerun)')
         try:
-            return json.loads((run_dir / 'summary.json').read_text())
+            cached = json.loads((run_dir / 'summary.json').read_text())
+            if cached_trial_matches(cached, arm, lr, args):
+                print(f'[tune][skip] {arm} lr={lr:g} seed={seed} (summary exists, --force to rerun)')
+                return cached
+            print(f'[tune][stale] {arm} lr={lr:g} seed={seed}: cached trial ran under a different '
+                  f'protocol (max_steps/batch/seq/weight_decay/model); retraining and overwriting')
         except (OSError, json.JSONDecodeError):
             pass
     summary = run_one(
@@ -145,7 +182,14 @@ def _split_basis(r: dict, use_confirm: bool):
 
 
 def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | None:
-    """Best variant trials vs the best tuned baseline, paired where possible."""
+    """Best variant trials vs the best tuned baseline, paired where possible.
+
+    Only the paired test on >= 2 shared seeds certifies an arm as better:
+    with exactly one shared seed the same run's held-out batches are tested
+    for description only (batch noise is not run-to-run noise), and with no
+    shared seed no test runs at all. Only the seed-replicated rows enter the
+    Holm family.
+    """
     usable = {arm: r for arm, r in tuned.items() if r.get('best') is not None}
     baselines = {arm: r for arm, r in usable.items() if arm in set(baseline_arms)}
     if not baselines:
@@ -205,41 +249,71 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
             'beats_reference': bool(delta is not None and delta < -margin),
             'beats_reference_significantly': False,
             'test': None,
+            'test_basis': None,
+            'replicated_across_seeds': False,
+            'significance_basis': None,
             'p_one_sided': None,
             'p_one_sided_holm': None,
+            't': None,
+            'df': None,
+            'delta_ci_95': None,
         }
+        test = None
         if len(common) >= 2:
-            test = paired_z_one_sided(arm_vals, ref_vals, margin=margin)
-        else:
-            # One shared seed (or none): fall back to the shared held-out
-            # batches of the single paired run, then to the unpaired test.
-            a_trial = _trial_by_seed(_split_trials(r), r['best']['lr']).get(common[0]) if common else None
-            b_trial = _trial_by_seed(_split_trials(ref), ref['best']['lr']).get(common[0]) if common else None
+            test = paired_t_one_sided(arm_vals, ref_vals, margin=margin)
+            entry['test_basis'] = 'seed_means'
+            entry['replicated_across_seeds'] = True
+        elif len(common) == 1:
+            # One shared seed: test that run's held-out batches for
+            # *description only*. Batch-level noise is not run-to-run noise,
+            # so a single run can never certify that an arm generalizes better
+            # (and it must not enter the Holm family).
+            seed = common[0]
+            a_trial = _trial_by_seed(_split_trials(r), r['best']['lr']).get(seed)
+            b_trial = _trial_by_seed(_split_trials(ref), ref['best']['lr']).get(seed)
             a_batches = a_trial.get('val_losses') if a_trial else None
             b_batches = b_trial.get('val_losses') if b_trial else None
+            test = None
+            entry['test_basis'] = f'val_batches_single_seed{seed}'
             if (isinstance(a_batches, list) and isinstance(b_batches, list)
-                    and len(a_batches) == len(b_batches) and len(a_batches) >= 2):
-                test = paired_z_one_sided(a_batches, b_batches, margin=margin)
-            else:
-                test = welch_z_one_sided(arm_vals, ref_vals, margin=margin)
+                    and len(a_batches) >= 2 and len(b_batches) >= 2):
+                if len(a_batches) == len(b_batches):
+                    test = paired_t_one_sided(a_batches, b_batches, margin=margin)
+                else:
+                    test = welch_t_one_sided(a_batches, b_batches, margin=margin)
+                    entry['test_basis'] = f'val_batches_single_seed{seed}_unpaired'
+            entry['significance_basis'] = (
+                'descriptive only: one shared seed, so the batch-level test cannot separate '
+                'the arm effect from run-to-run noise; not certified and not counted in the '
+                'Holm family')
+        else:
+            entry['test_basis'] = 'no_shared_seeds' if (arm_seed_losses and ref_seed_losses) else 'insufficient_seeds'
         if test is not None:
-            entry['test'] = 'paired_z_one_sided' if test['paired'] else 'welch_z_one_sided'
+            entry['test'] = test['test']
             entry['p_one_sided'] = test['p_one_sided']
-            entry['z'] = test['z']
+            entry['t'] = test['t']
+            entry['df'] = test['df']
+            entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
         out['rows'].append(entry)
-    # Every arm is tested against the same reference, so the raw p-values are
-    # a family of tests; without the Holm step-down the chance of some arm
-    # looking significant grows with the number of arms.
-    adjusted = holm_adjust([e['p_one_sided'] for e in out['rows']])
-    for entry, p_holm in zip(out['rows'], adjusted):
+    # Every seed-replicated arm is tested against the same reference, so those
+    # raw p-values are a family of tests; without the Holm step-down the chance
+    # of some arm looking significant grows with the number of arms. Single-run
+    # batch tests stay out of the family (and can never be called significant).
+    family = [e for e in out['rows'] if e['replicated_across_seeds']]
+    adjusted = holm_adjust([e['p_one_sided'] for e in family])
+    for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
         entry['beats_reference_significantly'] = bool(
             entry['beats_reference'] and p_holm is not None and p_holm < alpha
         )
+    out['rows_tested_descriptively_only'] = [e['arm'] for e in out['rows']
+                                             if e['test'] is not None and not e['replicated_across_seeds']]
     out['multiple_comparison'] = (
-        f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} tested arm(s) '
-        f'against the same reference; `beats_reference_significantly` uses the adjusted p-value'
+        f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} seed-replicated arm(s) '
+        f'against the same reference; `beats_reference_significantly` uses the adjusted p-value. '
+        f'Single-run batch-level tests are descriptive only '
+        f'({out["rows_tested_descriptively_only"]}).'
     )
     out['rows_with_fewer_than_3_seeds'] = sorted(
         e['arm'] for e in out['rows'] if e['n_paired_seeds'] < 3)
@@ -265,12 +339,20 @@ def print_comparison(comparison: dict | None) -> None:
         p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
         std = entry.get('val_loss_std')
         std_str = '' if std is None else f" +/- {std:.4f}"
+        ci = entry.get('delta_ci_95')
+        ci_str = '' if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        basis = entry.get('test_basis') or '-'
+        note = ' [descriptive only, not certified]' if entry.get('significance_basis') else ''
         print(f"[tune][compare] {entry['arm']:>12s} lr={entry['best_lr']:g} "
               f"val_loss={entry['val_loss']:.4f}{std_str} "
-              f"delta={entry['delta_vs_reference']:+.4f} p(one-sided)={p_str} "
+              f"delta={entry['delta_vs_reference']:+.4f}{ci_str} p(one-sided)={p_str} "
               f"p(holm)={p_holm_str} paired_seeds={entry['n_paired_seeds']} "
+              f"test={entry.get('test') or '-'}@{basis} "
               f"beats={entry['beats_reference']} "
-              f"significant={entry['beats_reference_significantly']}")
+              f"significant={entry['beats_reference_significantly']}{note}")
+    if comparison.get('rows_tested_descriptively_only'):
+        print(f"[tune][compare] NOTE: single-run batch-level tests (fewer than 2 shared seeds) "
+              f"are described but never certified: {comparison['rows_tested_descriptively_only']}")
     if comparison.get('confirm_ignored_arms'):
         print(f"[tune][compare] confirm runs ignored (missing confirm stats for "
               f"{comparison['confirm_ignored_arms']}); comparison is on selection seeds")

@@ -115,6 +115,11 @@ class MoEBlock(nn.Module):
         return (x, aux, tpe)
 
 class MoEGPT(nn.Module):
+    # Coefficient of the switch load-balancing penalty. The training loss
+    # combines it with the cross-entropy; held-out reports keep the two apart
+    # (`val_ce` vs `val_aux`) because the aux term is feature of the *router*,
+    # not of language modelling.
+    AUX_LOSS_COEF = 0.001
 
     def __init__(self, cfg: GPTConfig, n_experts: int=8):
         super().__init__()
@@ -157,19 +162,19 @@ class MoEGPT(nn.Module):
         z = self.norm_f(z)
         loss = None
         if y is not None and (not return_logits):
-            loss = fused_cross_entropy_mean(z.reshape(-1, z.size(-1)), self.lm_head.weight, y.reshape(-1), ignore_index=self.cfg.ignore_index) + 0.001 * aux_total
+            loss = fused_cross_entropy_mean(z.reshape(-1, z.size(-1)), self.lm_head.weight, y.reshape(-1), ignore_index=self.cfg.ignore_index) + self.AUX_LOSS_COEF * aux_total
             logits = None
         else:
             logits = self.lm_head(z)
             if y is not None:
                 ce = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=self.cfg.ignore_index)
-                loss = ce + 0.001 * aux_total
+                loss = ce + self.AUX_LOSS_COEF * aux_total
         if return_aux:
             return (logits, loss, aux_total, tpe_list)
         return (logits, loss)
 
 DEFAULT_SEEDS = (42, 43, 44)
-_MOE_SEED_METRIC_KEYS = ('val_loss', 'final_loss', 'final_expert_cv')
+_MOE_SEED_METRIC_KEYS = ('val_ce', 'val_loss', 'final_loss', 'final_expert_cv')
 
 def run_one(args, seed: int, output_dir: Path) -> dict:
     """One complete MoE training run on `seed`, writing its own artifacts."""
@@ -265,10 +270,12 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     # Held-out validation loss: real data comes from the chronological
     # validation split; the synthetic corpus uses a generator (seed + 1) the
     # optimizer never saw. No gradients flow from either.
-    val_loss = None
+    val_loss = val_ce = val_aux = None
     if args.val_batches > 0:
         model.eval()
         val_losses = []
+        val_ce_losses = []
+        val_auxes = []
         with torch.no_grad():
             if args.dataset:
                 val_loader = open_data_split('validation', args)
@@ -291,13 +298,25 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                     vy = vy.to(device, non_blocking=True)
                 else:
                     vx, vy = markov_batch(val_rng, cfg.ignore_index, args.batch_size, args.seq_len, device)
-                val_losses.append(model(vx, vy, return_logits=False)[1].item())
+                _, total, aux, _ = model(vx, vy, return_aux=True, return_logits=False)
+                val_losses.append(total.item())
+                # The total loss the router regularizer rides on is not a
+                # language-modelling number: strip the aux term back out so
+                # `val_ce` compares only predictive quality.
+                val_ce_losses.append(total.item() - model.AUX_LOSS_COEF * float(aux))
+                val_auxes.append(float(aux))
         model.train()
         val_loss = sum(val_losses) / len(val_losses)
-        print(f'[moe][val] held-out loss={val_loss:.4f}')
+        val_ce = sum(val_ce_losses) / len(val_ce_losses)
+        val_aux = sum(val_auxes) / len(val_auxes)
+        print(f'[moe][val] held-out cross-entropy={val_ce:.4f} '
+              f'(combined loss={val_loss:.4f}, aux={val_aux:.4f} - the combined '
+              f'number is confounded with routing and is not the comparison metric)')
     s = act_stats.summary()
     if val_loss is not None:
         s['val_loss'] = val_loss
+        s['val_ce'] = val_ce
+        s['val_aux'] = val_aux
     with open(output_dir / 'stats.json', 'w') as f:
         json.dump(s, f, indent=2, default=str)
     run_manifest['data']['split_reports'] = data_reports
@@ -307,6 +326,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         'final_loss': history[-1]['loss'] if history else None,
         'final_expert_cv': history[-1]['expert_cv'] if history else None,
         'val_loss': val_loss,
+        'val_ce': val_ce,
+        'val_aux': val_aux,
         'n_loss_spikes': loss_spike.n_spikes,
     }
     save_run_manifest(manifest_path, run_manifest)
@@ -316,10 +337,14 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
 def aggregate_moe_seed_results(results: list, seeds) -> dict:
     """Mean +/- Std of the MoE study over independent seeds.
 
-    `val_loss` (held-out) is the selection metric; `final_loss` and
-    `final_expert_cv` are reported with the same Mean +/- Std treatment. The
-    per-seed records stay in `per_seed` so a load-imbalance result resting on
-    one seed cannot hide behind the mean.
+    `val_ce` (held-out cross-entropy) is the language-modelling selection
+    metric: it excludes the router's load-balancing penalty, which depends on
+    how the norm changes routing and would otherwise be scored as if it were
+    predictive quality. The combined `val_loss` (= val_ce + 0.001 * aux) and
+    its `val_aux` component are still reported (and aggregated) next to it for
+    reference, as are `final_loss` and `final_expert_cv`. The per-seed records
+    stay in `per_seed` so a load-imbalance result resting on one seed cannot
+    hide behind the mean.
     """
     agg = {'seeds': [int(s) for s in seeds], 'n_seeds': len(results), 'per_seed': results}
     for key in _MOE_SEED_METRIC_KEYS:
@@ -390,13 +415,16 @@ def main():
         manifest['seeds'] = seeds
         manifest['aggregate'] = agg
         save_run_manifest(base / 'run_manifest.json', manifest)
-        val = agg.get('val_loss')
-        val_std = agg.get('val_loss_std')
+        val = agg.get('val_ce')
+        val_std = agg.get('val_ce_std')
         if val is not None:
             std_str = '' if val_std is None else f' +/- {val_std:.4f}'
-            print(f"[moe][done] {args.norm}: val_loss={val:.4f}{std_str} over {agg['n_seeds']} seeds -> {summary_path}")
+            loss = agg.get('val_loss')
+            loss_str = '' if loss is None else f' (combined incl. aux={loss:.4f})'
+            print(f"[moe][done] {args.norm}: val_ce={val:.4f}{std_str}{loss_str} "
+                  f"over {agg['n_seeds']} seeds -> {summary_path}")
         else:
-            print(f'[moe][done] no usable val_loss across seeds -> {summary_path}')
+            print(f'[moe][done] no usable val_ce across seeds -> {summary_path}')
 
 def _expert_cv(tpe) -> float:
     if not isinstance(tpe, torch.Tensor):
