@@ -11,12 +11,15 @@ Comparison protocol (what the runner guarantees, and checks)
   a gain obtained by switching the optimizer is not a gain of the module.
 * **Complete ablation coverage.** `validate_matrix` checks the leave-one-out
   set for the main proposal (`LOO_SPEC`): Full, Full-minus-per-channel,
-  Full-minus-depth-decay, Full-minus-LayerScale, Full-minus-softsign and
-  Full-minus-learnable-p must all be present and differ from Full in exactly
-  the declared knob(s) - e.g. the per-channel contrast uses the frozen-delta
-  row, not `dytd_full`, which also switches tanh -> softsign, and the
-  activation family has its own `dytcd_tanh` comparator so no claimed
-  mechanism is only ever removed together with another one.
+  Full-minus-depth-decay, Full-minus-LayerScale, Full-minus-softsign,
+  Full-minus-learnable-p and Full-minus-QK-squash must all be present and
+  differ from Full in exactly the declared knob(s) - e.g. the per-channel
+  contrast uses the frozen-delta row, not `dytd_full`, which also switches
+  tanh -> softsign, and the activation family has its own `dytcd_tanh`
+  comparator so no claimed mechanism is only ever removed together with
+  another one. The attention-logits axis (DyT-QK, Variant C) is removed on
+  both the main proposal and the strongest simple baseline, and gets the
+  QK-Norm alternative as a comparator.
   `leave_one_out_comparison` then runs the paired Full-vs-Full-minus-X test
   (Holm-adjusted over mechanisms), so "each axis helps" is a tested claim
   rather than an eyeballed delta.
@@ -47,7 +50,7 @@ from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, 
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
-ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0)}
+ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
 # Every row must state *why* it is run (the scientific hypothesis it tests),
 # not just what it configures. `load_ablations_from_config` enforces this for
 # YAML rows; these are the hypotheses of the built-in fallback rows.
@@ -74,6 +77,9 @@ ABLATION_HYPOTHESES = {
     'dyt_alpha_0.3': 'DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best must be reported so the family is not compared at a strawman init.',
     'dyt_alpha_0.5': 'DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best must be reported so the family is not compared at a strawman init.',
     'dyt_alpha_1.0': 'DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best must be reported so the family is not compared at a strawman init.',
+    'rmsnorm_qk': 'Attention-logits axis, standalone: adding the tanh Q/K scalar squashing to the strongest simple baseline (RMSNorm) changes exactly qk_norm, so a held-out-loss reduction is attributable to the QK squashing alone rather than to an interaction with the DyT-CD stack.',
+    'dytcd_qk': 'Leave-one-out for the attention-logits axis of the proposal (DyT-QK, Variant C) in combination: with the norm stack, optimizer, data and qk_alpha_init (shared default 1.0) identical to dytcd_full, the only effective difference is qk_norm = dytqk, so the paired Full-minus-QK contrast attributes any held-out-loss change to the tanh Q/K squashing alone.',
+    'dytcd_qknorm': 'QK-Norm comparator for the attention-logits axis: per-head RMSNorm on Q/K is the standard alternative the DyT-QK variant claims to sharpen, run on the identical protocol so a dytcd_qk win is only credited if it also beats this comparator, not just the no-QK row.',
 }
 _MODEL_BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
 _ABLATION_METADATA_KEYS = ('hypothesis',)
@@ -111,7 +117,11 @@ DEFAULT_SEEDS = (42, 43, 44)
 # `dytcd_tanh` (plain-autograd comparator, per-channel x depth alpha kept),
 # so Full-minus-softsign changes exactly `norm_name`, and learnable p through
 # the frozen-p row (`p_init` explicit at its default so only `learnable_p`
-# differs).
+# differs). The attention-logits axis (DyT-QK, Variant C) is isolated once on
+# the main proposal (`dytcd_qk`, only `qk_norm` differs from Full) and once on
+# the strongest simple baseline (`rmsnorm_qk`), so the QK squashing is tested
+# both in combination and standalone; `dytcd_qknorm` is the QK-Norm
+# alternative comparator, not a removal.
 LOO_SPEC = {
     'dytcd_full': {
         'per_channel_delta': {'row': 'dytcd_no_perchannel',
@@ -124,6 +134,14 @@ LOO_SPEC = {
                               'diff': ('norm_name',)},
         'learnable_p': {'row': 'dytcd_fixed_p',
                         'diff': ('learnable_p',)},
+    },
+    'rmsnorm_qk': {
+        'qk_squash': {'row': 'rmsnorm_baseline',
+                      'diff': ('qk_norm',)},
+    },
+    'dytcd_qk': {
+        'qk_squash': {'row': 'dytcd_full',
+                      'diff': ('qk_norm',)},
     },
 }
 

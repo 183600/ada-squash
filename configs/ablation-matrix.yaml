@@ -136,6 +136,36 @@ ablations:
       A larger LayerScale init (1e-3) changes early residual growth; the
       default should not be beaten by it on this synthetic corpus.
 
+  # --- Attention logits axis: DyT-QK (Variant C) ---
+  - name: rmsnorm_qk
+    norm: rmsnorm
+    qk_norm: dytqk
+    hypothesis: >
+      Attention-logits axis, standalone: adding the tanh Q/K scalar
+      squashing to the strongest simple baseline (RMSNorm) changes exactly
+      qk_norm, so a held-out-loss reduction is attributable to the QK
+      squashing alone rather than to an interaction with the DyT-CD stack.
+      The mechanism bounds every pre-dot-product q/k coordinate to (-1, 1).
+  - name: dytcd_qk
+    norm: dytcd
+    qk_norm: dytqk
+    hypothesis: >
+      Leave-one-out for the attention-logits axis of the proposal (DyT-QK,
+      Variant C) in combination: with the norm stack, optimizer, data and
+      qk_alpha_init (shared default 1.0) identical to dytcd_full, the only
+      effective difference is qk_norm = dytqk, so the paired Full-minus-QK
+      contrast attributes any held-out-loss change to the tanh Q/K
+      squashing alone. At seq_len=512 the effect may be small; a
+      non-significant delta is reported as such rather than dropped.
+  - name: dytcd_qknorm
+    norm: dytcd
+    qk_norm: qknorm
+    hypothesis: >
+      QK-Norm comparator for the attention-logits axis: per-head RMSNorm on
+      Q/K is the standard alternative the DyT-QK variant claims to sharpen,
+      run on the identical protocol so a dytcd_qk win is only credited if it
+      also beats this comparator, not just the no-QK row.
+
   # --- Softsign family (saturation sharpness p) ---
   - name: dytc_p1_softsign
     norm: dytc
