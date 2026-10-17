@@ -604,9 +604,9 @@ class DyTCDTanh(nn.Module):
     exp(-k*l/L) * (1 + delta)`, clamped at `_MIN_ALPHA`), same `gamma`/`beta`,
     same LayerScale residual (it lives in `Block`): the only change is the
     squash. This is what makes the activation family (generalized softsign vs
-    tanh) a leave-one-out axis of the main proposal - the previously used
-    `dytd_full` reference could not isolate it because it also removes the
-    per-channel factor.
+    tanh) a leave-one-out axis of the main proposal - the `dytd_full`
+    reference cannot isolate it because it also removes the per-channel
+    factor.
 
     `tanh` primitives are only used here; the fused-kernel family above stays
     untouched. Like `LayerNorm`, this comparator is plain autograd (it is a

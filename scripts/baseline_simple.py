@@ -149,8 +149,7 @@ def collect_counts(split: dict, n_symbols: int, with_trigram: bool=True) -> dict
     """Full-order count tables over the compact alphabet.
 
     The corpus uses at most `n_states + 1` distinct ids, so the dense bigram
-    (and trigram) tables stay tiny; the compact remap is what makes a small
-    count model cheap enough to tune honestly.
+    and trigram tables are indexed by the compact remap.
     """
     uni = torch.bincount(split['y'], minlength=n_symbols).to(torch.float64)
     bi = torch.bincount(split['x'] * n_symbols + split['y'],

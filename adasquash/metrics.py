@@ -182,8 +182,7 @@ def student_t_cdf(t: float, df: float) -> float:
 def student_t_ppf(p: float, df: float) -> float:
     """Inverse Student-t CDF `t : P(T <= t) = p`, by bisection on a monotone CDF.
 
-    Used for confidence-interval critical values; bisection avoids a second
-    special-function implementation and the CDF is cheap at these df.
+    Used for confidence-interval critical values.
     """
     if not 0.0 < p < 1.0:
         raise ValueError("student_t_ppf needs 0 < p < 1")
