@@ -275,7 +275,7 @@ def main():
     p.add_argument('--n-batches', type=int, default=8)
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--seq-len', type=int, default=512)
-    p.add_argument('--eval-chunk', type=int, default=64, help='positions per softmax chunk (memory bound)')
+    p.add_argument('--eval-chunk', type=int, default=64, help='positions per softmax chunk')
     p.add_argument('--topk', type=int, default=5)
     p.add_argument('--confidence', type=float, default=0.8, help='pred_prob at/above which a wrong prediction counts as confident')
     p.add_argument('--rare-quantile', type=float, default=0.1, help='bottom fraction of target frequencies treated as rare')

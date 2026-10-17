@@ -14,8 +14,8 @@ _TINY_LOG_CACHE: dict = {}
 def _log_tiny(dtype: torch.dtype) -> float:
     """``log(finfo(dtype).tiny)`` per dtype: the softsign p-gradient floor.
 
-    The constant only depends on the dtype, so the ``finfo`` construction and
-    ``math.log`` are hoisted out of every backward call that needs the floor.
+    The constant only depends on the dtype; the cache keyed by dtype returns
+    the same value every time.
     """
     v = _TINY_LOG_CACHE.get(dtype)
     if v is None:

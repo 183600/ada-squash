@@ -16,9 +16,8 @@ def _skip_init(module_cls, *args, **kwargs):
     """``torch.nn.utils.skip_init`` that honors the ambient default device.
 
     ``scripts/ablation.py`` builds whole models under
-    ``with torch.device('meta')`` just to read their config; materializing
-    those to cpu would allocate the full model for nothing, so a meta default
-    device keeps the module on meta.
+    ``with torch.device('meta')`` just to read their config, so the module
+    is kept on the ambient default device.
     """
     device = torch.get_default_device()
     if device.type == 'meta':
@@ -148,11 +147,9 @@ class CausalSelfAttention(nn.Module):
         block = None
         for start in range(0, T, rows):
             end = min(start + rows, T)
-            # Only keys up to `end` can be causal for this row block, so the
-            # GEMM reads a [D, end] slab of K instead of all T columns and the
-            # [rows, T] scratch is written over [rows, end] only. The kept
-            # values are unchanged (each column is the same reduction over D);
-            # the skipped columns were about to be masked to zero.
+            # Only keys up to `end` are causal for this row block; later
+            # columns would be masked to zero. The kept values are unchanged
+            # (each column is the same reduction over D).
             block = torch.matmul(q[:, :, start:end], k_t[..., :end],
                                  out=buf[:, :, :end - start, :end])
             block.mul_(scale)

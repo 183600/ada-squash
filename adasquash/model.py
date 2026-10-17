@@ -237,12 +237,9 @@ def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets
         hidden = hidden.reshape(n, -1)
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(weight.size(0))
-    # The plain pair materializes (and, for the backward, retains) the full
-    # logits and their log-softmax, so it is only used when that block is
-    # small *and* fits in a single chunk. Past the byte budget the fused
-    # kernel folds the projection into the loss node and keeps at most one
-    # chunk resident; the small-batch shortcut just avoids its per-call
-    # overhead. An explicit small `chunk_rows` still selects the fused node.
+    # The plain pair is taken only when the whole block fits in a single
+    # chunk; otherwise the fused kernel folds the projection into the loss
+    # node. An explicit small `chunk_rows` still selects the fused node.
     fast_rows = max(1, _CROSS_ENTROPY_FAST_PATH_BYTES // max(1, weight.size(0) * hidden.element_size()))
     if n <= min(fast_rows, chunk_rows):
         return F.cross_entropy(F.linear(hidden, weight), targets, ignore_index=ignore_index)
@@ -423,7 +420,7 @@ class GPT(nn.Module):
             if m.weight is self.tok_emb.weight:
                 # lm_head shares the input embedding's storage (tied): `apply`
                 # already initialized that storage through `tok_emb`, so a
-                # second normal_ draw would only burn RNG and time.
+                # second normal_ draw would only burn RNG.
                 return
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if m.bias is not None:
