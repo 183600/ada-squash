@@ -119,11 +119,9 @@ class CausalSelfAttention(nn.Module):
         self._tril_cache = (key, mask)
         return mask
     _LOGITS_CHUNK_BYTES = 1 << 27
-    # Row-block cap for the causal logit sweep. The sweep only reads the lower
-    # triangle, so a narrow row block keeps the GEMM's rectangular slab close
-    # to that triangle (the masked upper-right corner is never computed) while
-    # the block is wide enough for the batched GEMM to stay efficient. The byte
-    # budget above still bounds the scratch, now over the capped row count.
+    # Row-block cap for the causal logit sweep: the sweep walks the lower
+    # triangle in row blocks of at most this many rows, the block size being
+    # further bounded by the byte budget above.
     _LOGITS_BLOCK_ROWS = 128
 
     def _logit_scratch(self, B: int, H: int, R: int, T: int, q: torch.Tensor) -> torch.Tensor:
