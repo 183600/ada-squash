@@ -38,6 +38,7 @@ def main():
                         'n_correct': res['n_correct'], 'n_trials': res['n_trials'],
                         'ci95_low': res['ci95_low'], 'ci95_high': res['ci95_high']})
     out = args.output or Path(args.ckpt).parent / 'needle_results.json'
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps(results, indent=2))
     manifest = collect_run_metadata(seed=args.seed)
     manifest['hyperparameters'] = vars(args)

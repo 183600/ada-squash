@@ -102,11 +102,14 @@ def memoryless_bayes_floor_nats(n_states: int, max_jump: int, spike_prob: float=
         floor = (1.0 - float(spike_prob)) * floor + float(spike_prob) * math.log(int(n_states))
     return floor
 
-def build_remap(vocab_size: int, support) -> torch.Tensor:
-    """Map corpus ids to compact indices; index `len(support)` is "unseen"."""
-    remap = torch.full((int(vocab_size) + 1,), len(support), dtype=torch.long)
+def build_remap(vocab_size: int, support, device='cpu') -> torch.Tensor:
+    """Map corpus ids to compact indices; index `len(support)` is "unseen".
+
+    Built on `device` so it can index the (possibly CUDA) corpus batches.
+    """
+    remap = torch.full((int(vocab_size) + 1,), len(support), dtype=torch.long, device=device)
     if support:
-        remap[torch.tensor([int(s) for s in support], dtype=torch.long)] = torch.arange(len(support))
+        remap[torch.tensor([int(s) for s in support], dtype=torch.long, device=device)] = torch.arange(len(support), device=device)
     return remap
 
 def generate_batches(seed: int, n_batches: int, args, device: str):
@@ -233,7 +236,11 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
     `full_context` ceiling above the memoryless `walk_rule`.
     """
     n_states = int(n_states)
-    transition = torch.zeros(n_states, n_states, dtype=torch.float64)
+    batches = list(batches)
+    # The filter lives on the batch device: indexing with `rows`/`x`/`y`
+    # (which come from the caller's batches) must not mix CPU and CUDA tensors.
+    transition = torch.zeros(n_states, n_states, dtype=torch.float64,
+                             device=batches[0][0].device)
     for s in range(n_states):
         for j in range(int(max_jump)):
             transition[s, (s + j) % n_states] = 1.0 / int(max_jump)
@@ -243,11 +250,11 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
         rows = torch.arange(batch, device=x.device)
         first = x[:, 0]
         if outlier_id is None:
-            belief = torch.zeros(batch, n_states, dtype=torch.float64)
+            belief = torch.zeros(batch, n_states, dtype=torch.float64, device=x.device)
             belief[rows, first] = 1.0
         else:
             is_oid = first.eq(int(outlier_id))
-            belief = torch.full((batch, n_states), 1.0 / n_states, dtype=torch.float64)
+            belief = torch.full((batch, n_states), 1.0 / n_states, dtype=torch.float64, device=x.device)
             keep = (~is_oid).nonzero(as_tuple=True)[0]
             if keep.numel():
                 belief[keep] = 0.0
@@ -297,7 +304,7 @@ def evaluate_seed(seed: int, args, device: str) -> dict:
     outlier_id = args.vocab_size - 1 if args.outlier_channel else None
     support = build_support(args.n_states, outlier_id)
     n_symbols = len(support) + 1
-    remap = build_remap(args.vocab_size, support)
+    remap = build_remap(args.vocab_size, support, device)
     train = flatten_split(generate_batches(seed, args.train_batches, args, device), remap, len(support))
     tune = flatten_split(generate_batches(seed + 2, args.tune_batches, args, device), remap, len(support))
     val_batches = list(generate_batches(seed + 1, args.val_batches, args, device))

@@ -352,7 +352,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         'schedule': {'type': 'constant', 'lr': args.lr},
         'data': {'generator': 'markov_batch', 'batch_size': args.batch_size,
                  'seq_len': args.seq_len, 'outlier_id': outlier_id,
-                 'val_seed_offset': 1},
+                 'val_seed_offset': 1, 'val_batches': n_val_batches},
         'train_steps': args.max_steps,
         'seed': seed,
     }
@@ -469,22 +469,32 @@ def partition_rows_by_protocol(rows: list, args) -> tuple[list, list]:
     `all_summaries.json` deliberately accumulates rows across invocations, but
     a row trained with a different lr/step count/batch/seq/model is not the
     same experiment: comparing it would credit the module with a change that
-    came from the recipe. Mismatched rows stay in the file and in the report,
-    but they are kept out of the statistical comparisons.
+    came from the recipe. The same holds for the number of held-out validation
+    batches, which defines the precision of the selection metric these
+    comparisons use. Mismatched rows stay in the file and in the report, but
+    they are kept out of the statistical comparisons.
     """
     expected = _protocol_signature(args)
+    budget = max(1, int(getattr(args, 'val_batches', 20)))
     keep, stale = [], []
     for row in rows:
         signature = row_protocol_signature(row, args.model)
-        if signature == expected:
+        recorded_batches = row.get('n_val_batches')
+        if signature == expected and recorded_batches == budget:
             keep.append(row)
         else:
             labels = ('model', 'lr', 'weight_decay', 'batch_size', 'seq_len', 'max_steps')
+            if signature is None:
+                reason = 'no recorded controls'
+            elif recorded_batches is None:
+                reason = 'no recorded validation budget'
+            else:
+                reason = 'trained under a different protocol than this invocation'
             stale.append({
                 'name': row.get('name'),
-                'reason': ('no recorded controls' if signature is None
-                           else 'trained under a different protocol than this invocation'),
+                'reason': reason,
                 'recorded_protocol': {} if signature is None else dict(zip(labels, signature)),
+                'recorded_val_batches': recorded_batches,
             })
     return keep, stale
 
@@ -493,13 +503,17 @@ def cached_seed_matches(summary: dict, name: str, cfg_kwargs: dict, args, seed: 
 
     The path does not always encode the seed (a single-seed run writes its
     summary directly under the row directory), so the recorded seed is
-    compared too.
+    compared too. The held-out validation budget is part of the recipe: a
+    cached row evaluated on a different number of batches is not the same
+    selection metric, so it is re-trained (a cached summary without the
+    recorded budget counts as unknown, never as matching).
     """
     if not (isinstance(summary, dict)
             and summary.get('name') == name
             and summary.get('model') == args.model
             and summary.get('cfg') == cfg_kwargs
-            and row_protocol_signature(summary, args.model) == _protocol_signature(args)):
+            and row_protocol_signature(summary, args.model) == _protocol_signature(args)
+            and summary.get('n_val_batches') == max(1, int(getattr(args, 'val_batches', 20)))):
         return False
     per_seed = summary.get('per_seed')
     if isinstance(per_seed, list) and len(per_seed) > 1:
@@ -609,6 +623,23 @@ def _basis_counted_in_family(basis) -> bool:
     """Only a >= 2-seed paired test is admissible to the Holm family."""
     return basis == 'seed_means'
 
+def _run_identity(row: dict, parent_of: dict) -> str:
+    """Name of the run a row ultimately reuses, following `reused_from` chains.
+
+    A row can be reused more than once (C reuses B, which reuses A), so a
+    single hop would misread C and B as two independent runs; resolving to the
+    root keeps "aliases are counted once" true for chains too.
+    """
+    name = row.get('name')
+    seen = set()
+    while isinstance(name, str) and name not in seen:
+        seen.add(name)
+        parent = parent_of.get(name)
+        if not isinstance(parent, str):
+            return name
+        name = parent
+    return row.get('name')
+
 def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alpha: float=0.05) -> dict | None:
     """Every row's held-out val_loss against the best reference baseline.
 
@@ -638,6 +669,8 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     baselines = [r for r in usable if r['name'] in baseline_names]
     if not baselines:
         return None
+    parent_of = {r['name']: r['reused_from'] for r in summaries
+                 if isinstance(r, dict) and 'name' in r and isinstance(r.get('reused_from'), str)}
     reference = min(baselines, key=lambda r: r['val_loss'])
     ref_seeds = _seed_means(reference)
     out = {
@@ -663,7 +696,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         entry = {
             'name': row['name'],
             'hypothesis': row.get('hypothesis'),
-            'run_identity': row.get('reused_from') or row['name'],
+            'run_identity': _run_identity(row, parent_of),
             'val_loss': row['val_loss'],
             'val_loss_std': _row_std(row),
             'n_seeds': row.get('n_seeds', 1),
@@ -885,6 +918,8 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
     spec = LOO_SPEC if spec is None else spec
     usable = {r['name']: r for r in summaries
               if isinstance(r, dict) and 'name' in r and isinstance(r.get('val_loss'), (int, float))}
+    parent_of = {r['name']: r['reused_from'] for r in summaries
+                 if isinstance(r, dict) and 'name' in r and isinstance(r.get('reused_from'), str)}
     rows: list = []
     for full_name, removals in spec.items():
         full = usable.get(full_name)
@@ -902,8 +937,8 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 'reference_val_loss_std': None if ref is None else _row_std(ref),
                 'n_seeds_full': None if full is None else full.get('n_seeds', 1),
                 'n_seeds_reference': None if ref is None else ref.get('n_seeds', 1),
-                'run_identity_full': None if full is None else (full.get('reused_from') or full_name),
-                'run_identity_reference': None if ref is None else (ref.get('reused_from') or ref_name),
+                'run_identity_full': None if full is None else _run_identity(full, parent_of),
+                'run_identity_reference': None if ref is None else _run_identity(ref, parent_of),
                 'delta_full_minus_reference': None,
                 'mechanism_helps': False,
                 'mechanism_helps_significantly': False,

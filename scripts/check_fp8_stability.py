@@ -219,8 +219,10 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
                  if isinstance(r.get('first_nonfinite_layer'), int)]
     overflowing = [r['first_overflow_layer'] for r in per_seed
                    if isinstance(r.get('first_overflow_layer'), int)]
-    agg['first_nonfinite_layer_earliest'] = min(nonfinite) if nonfinite else None
-    agg['first_overflow_layer_earliest'] = min(overflowing) if overflowing else None
+    agg['first_nonfinite_layer'] = min(nonfinite) if nonfinite else None
+    agg['first_nonfinite_layer_earliest'] = agg['first_nonfinite_layer']
+    agg['first_overflow_layer'] = min(overflowing) if overflowing else None
+    agg['first_overflow_layer_earliest'] = agg['first_overflow_layer']
     agg['logit_nan_under_fp8'] = any(bool(r.get('logit_nan_under_fp8')) for r in per_seed)
     agg['per_seed'] = per_seed
     return agg

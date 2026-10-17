@@ -153,6 +153,10 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     prev_gold_keys = []          # encoded (prev_id * vocab + gold_id) over all tokens
     n_tokens = n_correct = 0
     topk = max(1, int(args.topk))
+    # A k above the number of classes cannot be measured: top-k with k >= V is
+    # the whole distribution. Clamp to vocab - 1 so the report key names the
+    # radius actually analyzed.
+    analyzed_topk = min(topk, max(1, vocab - 1))
     topk_hits = 0
     gold_prob_sum = 0.0
     gold_rank_sum = 0.0
@@ -192,7 +196,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             correct_counts += torch.bincount(gold[m & (pred == gold)].long().cpu(), minlength=vocab)
             gold_p = probs.gather(-1, gold.clamp(min=0).unsqueeze(-1)).squeeze(-1)
             gold_prob_sum += float(gold_p[m].sum().item())
-            k = min(topk, V - 1)
+            k = analyzed_topk
             top = probs.topk(k, dim=-1)
             # 1-based rank; ties count above (>= counts the gold token itself,
             # every strictly-larger probability and every tie, so a tie cannot
@@ -320,7 +324,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
                              'weighted = support-weighted; micro = accuracy'),
             'imbalance': imbalance,
             'prefer_pr_auc': imbalance['prefer_pr_auc'],
-            f'top{topk}_accuracy': topk_hits / n_tokens,
+            f'top{analyzed_topk}_accuracy': topk_hits / n_tokens,
             'mean_gold_prob': gold_prob_sum / n_tokens,
             'mean_gold_rank_capped': gold_rank_sum / n_tokens,
             'rank_cap': args.rank_clip,
@@ -367,7 +371,7 @@ def main():
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--seq-len', type=int, default=512)
     p.add_argument('--eval-chunk', type=int, default=64, help='positions per softmax chunk')
-    p.add_argument('--topk', type=int, default=5, help='oracle top-k radius; values below 1 are clamped to 1 so the report key always matches the analyzed k')
+    p.add_argument('--topk', type=int, default=5, help='oracle top-k radius; values below 1 are clamped to 1 and values above vocab-1 to vocab-1 so the report key always matches the analyzed k')
     p.add_argument('--confidence', type=float, default=0.8, help='pred_prob at/above which a wrong prediction counts as confident')
     p.add_argument('--rare-quantile', type=float, default=0.1, help='bottom fraction of target frequencies treated as rare')
     p.add_argument('--rank-clip', type=int, default=100)
@@ -395,6 +399,9 @@ def main():
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     set_all_seeds(args.seed)
     model, model_args = load_ckpt(args.ckpt, device=device)
+    # Keep the CLI value identical to the analyzed radius (see `analyze`) so
+    # the printed/`config`-recorded topk names the key that is in the summary.
+    args.topk = max(1, min(int(args.topk), max(1, int(model.cfg.vocab_size) - 1)))
     print(f"[errors] loaded {args.ckpt} | norm={model_args['norm']} | corpus={args.corpus} | device={device}")
 
     tokenizer = None
