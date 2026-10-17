@@ -23,6 +23,25 @@ def _log_tiny(dtype: torch.dtype) -> float:
         _TINY_LOG_CACHE[dtype] = v
     return v
 
+def _as_scalar_exponent(p):
+    """``p`` as a Python float when reading it costs nothing to read.
+
+    A one-element CPU tensor can be hoisted out of tensor land for free, and
+    the scalar ``pow`` kernel is several times faster than the
+    ``log2 / exp2 / log1p / exp2`` chain on CPU. CUDA tensors are kept as
+    tensors on purpose: reading their value would force a device
+    synchronisation on every call, so the chain stays there.
+    """
+    if isinstance(p, torch.Tensor) and p.device.type == 'cpu' and p.numel() == 1:
+        return float(p)
+    return p
+
+def _as_scalar_exponent_inplace(g: torch.Tensor, p) -> torch.Tensor:
+    """``g ** (p + 1)`` written in place (``g`` is a throwaway temporary)."""
+    if isinstance(p, torch.Tensor):
+        return g.log2_().mul_(p + 1).exp2_()
+    return g.pow_(p + 1)
+
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     if t.ndim <= 1:
         return t.clone()
@@ -78,6 +97,7 @@ def register_norm(name: str):
     return _decorator
 
 def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False) -> torch.Tensor:
+    p = _as_scalar_exponent(p)
     if scale is None:
         t = xs.abs()
     else:
@@ -96,6 +116,7 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False)
     return out
 
 def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True, scale=None, scale_nonneg: bool=False):
+    p = _as_scalar_exponent(p)
     if scale is None:
         t = xs.abs()
     else:
@@ -191,7 +212,7 @@ class _GeneralizedSoftsign(torch.autograd.Function):
         if need_x or need_p:
             g, phi, a = _softsign_backward_pieces(x, p, need_p, need_p, need_x)
         if need_x:
-            grad_x = g.log2_().mul_(p + 1).exp2_().mul_(grad_out)
+            grad_x = _as_scalar_exponent_inplace(g, _as_scalar_exponent(p)).mul_(grad_out)
         if need_p:
             grad_p = _softsign_p_grad(phi.mul_(grad_out), a, p, p_raw)
         return (grad_x, grad_p)
@@ -332,7 +353,7 @@ class _DyTCForward(torch.autograd.Function):
         a = None
         if need_softsign or need_phi:
             g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha)
-        p_val = p if p_is_tensor else float(p)
+        p_val = _as_scalar_exponent(p)
         grad_p = grad_gamma = None
         if need_phi:
             grad_phi = phi.mul_(grad_out)
@@ -343,7 +364,7 @@ class _DyTCForward(torch.autograd.Function):
             del phi, a, grad_phi
         grad_x = grad_alpha = None
         if need_softsign:
-            grad_x_scaled = g.log2_().mul_(p_val + 1).exp2_()
+            grad_x_scaled = _as_scalar_exponent_inplace(g, p_val)
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             if ctx.needs_input_grad[1]:
                 grad_alpha = _reduce_products(grad_x_scaled, x)
@@ -545,7 +566,7 @@ class _DyTCDForward(torch.autograd.Function):
         a = None
         if need_softsign or need_phi:
             g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha_c, scale_nonneg=True)
-        p_val = p if p_is_tensor else float(p)
+        p_val = _as_scalar_exponent(p)
         grad_p = grad_gamma = None
         if need_phi:
             grad_phi = phi.mul_(grad_out)
@@ -556,7 +577,7 @@ class _DyTCDForward(torch.autograd.Function):
             del phi, a, grad_phi
         grad_x = grad_alpha_0 = grad_k = grad_delta = None
         if need_softsign:
-            grad_x_scaled = g.log2_().mul_(p_val + 1).exp2_()
+            grad_x_scaled = _as_scalar_exponent_inplace(g, p_val)
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             need_alpha_chain = ctx.needs_input_grad[1] or ctx.needs_input_grad[2] or ctx.needs_input_grad[3]
             if need_alpha_chain:
