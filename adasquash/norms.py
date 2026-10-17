@@ -596,6 +596,51 @@ class _DyTCDForward(torch.autograd.Function):
             grad_beta = _sum_leading_dims(grad_out)
         return (grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None)
 
+@register_norm("dytcd_tanh")
+class DyTCDTanh(nn.Module):
+    """Ablation-only comparator: DyT-CD with `tanh` instead of the softsign family.
+
+    Same per-channel x depth alpha as `DyTCD` (`alpha_c,l = alpha_0 *
+    exp(-k*l/L) * (1 + delta)`, clamped at `_MIN_ALPHA`), same `gamma`/`beta`,
+    same LayerScale residual (it lives in `Block`): the only change is the
+    squash. This is what makes the activation family (generalized softsign vs
+    tanh) a leave-one-out axis of the main proposal - the previously used
+    `dytd_full` reference could not isolate it because it also removes the
+    per-channel factor.
+
+    `tanh` primitives are only used here; the fused-kernel family above stays
+    untouched. Like `LayerNorm`, this comparator is plain autograd (it is a
+    control, not part of the research core), so its gradients are torch's own.
+    """
+
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, learnable_delta: bool=True):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.num_layers = max(1, num_layers)
+        self._depth_ratio = float(layer_idx) / float(self.num_layers)
+        self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
+        if learnable_k:
+            self.k = nn.Parameter(torch.tensor(float(k_init)))
+        else:
+            self.register_buffer('k', torch.tensor(float(k_init)))
+        if learnable_delta:
+            self.delta = nn.Parameter(torch.zeros(dim))
+        else:
+            self.register_buffer('delta', torch.zeros(dim))
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
+
+    @property
+    def alpha_per_channel(self) -> torch.Tensor:
+        scale = self.alpha_0 * torch.exp(self.k.mul(-self._depth_ratio))
+        return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        phi = torch.tanh(self.alpha_per_channel * x)
+        if self.beta is not None:
+            return phi * self.gamma + self.beta
+        return phi * self.gamma
+
 class _QKSquashTanh(torch.autograd.Function):
     """tanh(alpha * Q) and tanh(alpha * K) as one autograd node.
 
@@ -645,4 +690,4 @@ class QKSquash(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
         return _QKSquashTanh.apply(q, k, self.alpha_q, self.alpha_k)
-__all__ = ['NORM_REGISTRY', 'register_norm', 'build_norm', 'generalized_softsign', 'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'QKSquash']
+__all__ = ['NORM_REGISTRY', 'register_norm', 'build_norm', 'generalized_softsign', 'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'DyTCDTanh', 'QKSquash']

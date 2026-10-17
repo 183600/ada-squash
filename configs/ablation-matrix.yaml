@@ -71,10 +71,31 @@ ablations:
   - name: dytd_full
     norm: dytd
     hypothesis: >
-      Activation-family reference: depth-conditioned tanh (plus LayerScale)
-      against the softsign family, run on the identical protocol so the
-      dytd_full -> dytcd_full bundle (activation family + per-channel axis)
-      can be read alongside the clean per-channel contrast above.
+      Depth-axis reference: depth-conditioned tanh (plus LayerScale) against
+      the softsign family, run on the identical protocol so the dytd_full ->
+      dytcd_full bundle (activation family + per-channel axis) can be read
+      alongside the clean per-channel and activation-family contrasts above.
+  - name: dytcd_no_softsign
+    norm: dytcd_tanh
+    hypothesis: >
+      Leave-one-out for the main proposal's activation family: the
+      plain-autograd dytcd_tanh comparator (not part of the fused-kernel
+      family) keeps the per-channel x depth alpha with learnable delta, the
+      LayerScale residual and gamma/beta identical to dytcd_full and swaps
+      only the generalized softsign for tanh, so a loss increase here is
+      attributable to the activation family alone. This closes the gap the
+      dytd_full row leaves open, where the activation-family change is
+      bundled with the removal of the per-channel axis.
+  - name: dytcd_fixed_p
+    norm: dytcd
+    p_init: 2.0
+    learnable_p: false
+    hypothesis: >
+      Leave-one-out for the learnable saturation exponent of the main
+      proposal: with p frozen at its init (2.0, written explicitly so only
+      `learnable_p` differs from dytcd_full) every other mechanism stays
+      identical, so a loss increase here is attributable to the per-layer
+      adaptation of the softsign steepness alone.
 
   # --- Axis isolation: depth conditioning ---
   - name: dytcd_k0_no_depth_schedule

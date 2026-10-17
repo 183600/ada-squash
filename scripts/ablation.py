@@ -11,12 +11,15 @@ Comparison protocol (what the runner guarantees, and checks)
   a gain obtained by switching the optimizer is not a gain of the module.
 * **Complete ablation coverage.** `validate_matrix` checks the leave-one-out
   set for the main proposal (`LOO_SPEC`): Full, Full-minus-per-channel,
-  Full-minus-depth-decay and Full-minus-LayerScale must all be present and
-  differ from Full in exactly the declared knob(s) - e.g. the per-channel
-  contrast uses the frozen-delta row, not `dytd_full`, which also switches
-  tanh -> softsign. `leave_one_out_comparison` then runs the paired
-  Full-vs-Full-minus-X test (Holm-adjusted over mechanisms), so "each axis
-  helps" is a tested claim rather than an eyeballed delta.
+  Full-minus-depth-decay, Full-minus-LayerScale, Full-minus-softsign and
+  Full-minus-learnable-p must all be present and differ from Full in exactly
+  the declared knob(s) - e.g. the per-channel contrast uses the frozen-delta
+  row, not `dytd_full`, which also switches tanh -> softsign, and the
+  activation family has its own `dytcd_tanh` comparator so no claimed
+  mechanism is only ever removed together with another one.
+  `leave_one_out_comparison` then runs the paired Full-vs-Full-minus-X test
+  (Holm-adjusted over mechanisms), so "each axis helps" is a tested claim
+  rather than an eyeballed delta.
 * **Statistical reliability.** Every row is replicated over >= 3 seeds by
   default and reported as mean +/- std across seeds; the row-vs-baseline
   significance test is a one-sided paired Student-t test on the per-seed
@@ -44,7 +47,7 @@ from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, 
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
-ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0)}
+ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0)}
 # Every row must state *why* it is run (the scientific hypothesis it tests),
 # not just what it configures. `load_ablations_from_config` enforces this for
 # YAML rows; these are the hypotheses of the built-in fallback rows.
@@ -59,6 +62,8 @@ ABLATION_HYPOTHESES = {
     'dytd_k0_no_depth_schedule': 'Depth decay is the source of DyT-D gain: with k pinned to 0 and frozen, dytd_full advantage should vanish.',
     'dytd_full': 'Depth-conditioned alpha (+ LayerScale) beats scalar DyT here: shallow strong squashing + deep relaxed response helps this depth.',
     'dytcd_no_ls': 'The LayerScale residual gate contributes to DyT-CD; removing it (use_layerscale off) hurts held-out loss.',
+    'dytcd_no_softsign': 'Leave-one-out for the activation family of the main proposal: the dytcd_tanh comparator keeps the per-channel x depth alpha, the LayerScale residual and gamma/beta identical to dytcd_full and swaps only the generalized softsign for tanh, so a loss increase here is attributable to the activation family alone. Unlike the dytd_full row, it does not also remove the per-channel factor, so the dytd -> dytcd bundle is no longer the only activation-family evidence.',
+    'dytcd_fixed_p': 'Leave-one-out for the learnable saturation exponent of the main proposal: with p frozen at its init (2.0) the model keeps every mechanism of dytcd_full except the per-layer adaptation of the softsign steepness, so a loss increase here is attributable to learnable p alone.',
     'dytcd_ls1e5': 'LayerScale init 1e-5 (the DyT-CD default) is a competitive residual-gate scale, not an arbitrary strawman.',
     'dytcd_ls1e3': 'LayerScale init 1e-3 trades warmup stability for stronger early residual growth; the default should not be beaten by it.',
     'dytc_p1_softsign': 'Softsign sharpness matters: p=1 (classic softsign) is worse than p=2 on this outlier-heavy corpus.',
@@ -100,9 +105,13 @@ DEFAULT_SEEDS = (42, 43, 44)
 # the matrix when a mechanism is never isolated. Each removal must change the
 # declared knobs *and nothing else*: the `dytd_full` row also switches
 # tanh -> generalized softsign, so it cannot isolate the per-channel axis (it
-# stays in the matrix as the activation-family reference); the per-channel
-# contrast uses `dytcd_no_perchannel`, whose only effective difference from
-# Full is the frozen delta buffer.
+# stays in the matrix as the depth-axis reference); the per-channel contrast
+# uses `dytcd_no_perchannel`, whose only effective difference from Full is the
+# frozen delta buffer. The activation family gets the same treatment through
+# `dytcd_tanh` (plain-autograd comparator, per-channel x depth alpha kept),
+# so Full-minus-softsign changes exactly `norm_name`, and learnable p through
+# the frozen-p row (`p_init` explicit at its default so only `learnable_p`
+# differs).
 LOO_SPEC = {
     'dytcd_full': {
         'per_channel_delta': {'row': 'dytcd_no_perchannel',
@@ -111,6 +120,10 @@ LOO_SPEC = {
                         'diff': ('k_init', 'learnable_k')},
         'layerscale_residual': {'row': 'dytcd_no_ls',
                                 'diff': ('use_layerscale',)},
+        'activation_family': {'row': 'dytcd_no_softsign',
+                              'diff': ('norm_name',)},
+        'learnable_p': {'row': 'dytcd_fixed_p',
+                        'diff': ('learnable_p',)},
     },
 }
 

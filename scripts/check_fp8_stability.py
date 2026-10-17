@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from adasquash.metrics import mean_std_stderr
+from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.model import MLP, build_gpt_124m
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import KurtosisMeter, markov_batch
@@ -17,7 +17,12 @@ FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
 # One probe draw is one sample: these per-norm quantities are aggregated as
 # Mean +/- Std over the `--seeds` replications, with the per-seed records kept
-# so an unstable seed cannot hide behind a favorable mean.
+# so an unstable seed cannot hide behind a favorable mean. Cross-norm
+# differences are additionally tested for significance in `compare_fp8_norms`
+# (paired across the shared seeds, Holm-adjusted over metrics x pairs), because
+# a "more stable" claim resting on a mean difference inside the seed spread is
+# not a result; the comparison is saved next to the results as
+# `comparison.json`.
 _FP8_SEED_METRIC_KEYS = (
     'max_abs_pre_norm', 'max_abs_post_norm', 'mean_excess_kurtosis_pre_norm',
     'mean_overflow_rate_e4m3', 'max_overflow_rate_e4m3',
@@ -138,7 +143,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
     with torch.no_grad():
         logits_fp32, _ = model(x)
     for name, m in model.named_modules():
-        if m.__class__.__name__ in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD'}:
+        if m.__class__.__name__ in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'DyTCDTanh'}:
             handles.append(m.register_forward_hook(make_stat_hook()))
     block_handles = [blk.register_forward_hook(make_block_hook(i)) for i, blk in enumerate(model.blocks)]
     with fp8_forward(model, to_fp8_e4m3):
@@ -220,6 +225,79 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
     agg['per_seed'] = per_seed
     return agg
 
+# The seed-varying metrics on which "norm A is more FP8-stable than norm B" is
+# actually decided. All three share the same direction: lower is more stable.
+# `first_overflow_layer` / `first_nonfinite_layer` are event counts, not
+# continuous per-seed quantities, so they are reported with `_any` /
+# `_earliest` semantics instead of being averaged or tested.
+FP8_COMPARISON_METRICS = ('logit_rel_divergence', 'mean_overflow_rate_e4m3',
+                          'mean_underflow_rate_e4m3')
+
+def _seed_metric_values(agg: dict, key: str) -> list:
+    return [float(r[key]) for r in agg.get('per_seed', [])
+            if isinstance(r.get(key), (int, float))]
+
+def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list, list]:
+    """Per-seed values of `key` for the seeds both norms measured, paired by seed.
+
+    For a fixed seed the probe draw (and, in random-init mode, the model
+    initialization seed) is identical for every norm, so the two norms'
+    records are paired samples - the same reason the ablation runner pairs its
+    rows by seed.
+    """
+    a_by_seed = {r.get('seed'): r.get(key) for r in agg_a.get('per_seed', [])}
+    b_by_seed = {r.get('seed'): r.get(key) for r in agg_b.get('per_seed', [])}
+    shared = sorted(s for s in set(a_by_seed) & set(b_by_seed)
+                    if isinstance(a_by_seed[s], (int, float))
+                    and isinstance(b_by_seed[s], (int, float)))
+    return shared, [float(a_by_seed[s]) for s in shared], [float(b_by_seed[s]) for s in shared]
+
+def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alpha: float=0.05) -> dict:
+    """Paired, Holm-adjusted significance of one norm's FP8 metrics vs another's.
+
+    For every metric and every unordered norm pair the test is the one-sided
+    paired Student-t `H1: mean(A - B) < 0`, so a negative `mean_delta` means A
+    is more FP8-stable on that metric. Pairs with fewer than 2 shared seeds
+    are reported without a p-value rather than silently tested unpaired.
+    p-values are Holm-adjusted across the whole metric x pair family, so
+    scanning six norms does not hand a "significant" win to the luckiest pair.
+    `main` writes this next to the results as `comparison.json`, mirroring the
+    ablation runner's `leave_one_out_comparison.json`.
+    """
+    labels = [str(r.get('norm') or r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
+    tests = []
+    for metric in metrics:
+        for i in range(len(results)):
+            for j in range(i + 1, len(results)):
+                shared, av, bv = _shared_seed_samples(results[i], results[j], metric)
+                t = {'a': labels[i], 'b': labels[j], 'metric': metric,
+                     'n_shared_seeds': len(shared), 'shared_seeds': shared,
+                     'direction': f'negative mean_delta means A has lower {metric} (more FP8-stable)'}
+                if len(shared) < 2:
+                    t['mean_delta'] = (sum(av) - sum(bv)) / len(shared) if shared else None
+                    t['p_one_sided'] = None
+                    t['reason'] = 'need >= 2 seeds measured for both norms to pair a test'
+                else:
+                    t.update(paired_t_one_sided(av, bv, alpha=alpha))
+                tests.append(t)
+    for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
+        t['p_holm'] = p_adj
+        t['significant'] = bool(p_adj is not None and p_adj < alpha)
+    ranking = {}
+    for metric in metrics:
+        rows = []
+        for label, r in zip(labels, results):
+            vals = _seed_metric_values(r, metric)
+            stats = mean_std_stderr(vals)
+            rows.append({'norm': label, 'n_seeds': len(vals),
+                         'mean': stats['mean'] if stats else None,
+                         'std': stats['std'] if stats and stats['n'] >= 2 else None})
+        rows.sort(key=lambda row: (row['mean'] is None, row['mean']))
+        ranking[metric] = rows
+    return {'metrics': list(metrics), 'alpha': alpha,
+            'pairing': 'per-seed probe draws are identical across norms (and identical init seeds in random-init mode)',
+            'ranking': ranking, 'tests': tests}
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--norms', nargs='+', default=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
@@ -230,6 +308,7 @@ def main():
     p.add_argument('--seq-len', type=int, default=512)
     p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given')
     p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='each norm is probed once per seed (fresh probe, and fresh init in random-init mode) and reported as Mean +/- Std across seeds; >= 3 recommended so one probe draw cannot decide a comparison')
+    p.add_argument('--alpha', type=float, default=0.05, help='significance level of the paired cross-norm tests in comparison.json (Holm-adjusted over metrics x pairs)')
     p.add_argument('--output', default='runs/fp8_check/results.json')
     args = p.parse_args()
     if args.ckpt and len(args.ckpt) != len(args.norms):
@@ -275,10 +354,20 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
+    comparison = compare_fp8_norms(results, alpha=args.alpha)
+    comparison_path = out_path.with_name('comparison.json')
+    comparison_path.write_text(json.dumps(comparison, indent=2))
+    for t in comparison['tests']:
+        if t.get('p_one_sided') is None:
+            print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: {t['reason']}")
+            continue
+        verdict = 'A more stable' if t['significant'] and t['mean_delta'] < 0 else ('B more stable' if t['significant'] else 'inside the noise')
+        print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4g}, 95% CI [{t['ci_low']:+.4g}, {t['ci_high']:+.4g}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}) -> {verdict}")
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
     manifest['seeds'] = seeds
     manifest['results_file'] = str(out_path)
+    manifest['comparison_file'] = str(comparison_path)
     save_run_manifest(out_path.with_name('run_manifest.json'), manifest)
     print(f'[done] saved to {out_path}')
 if __name__ == '__main__':

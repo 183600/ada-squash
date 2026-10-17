@@ -54,16 +54,18 @@ def _cross_entropy_chunk_rows(vocab_size: int) -> int:
 
 def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=False) -> dict:
     kwargs: dict = {}
-    is_dyt_family = cfg.norm_name in ('dyt', 'dytd', 'dytc', 'dytcd')
-    if cfg.norm_name in ('dytd', 'dytcd'):
+    is_dyt_family = cfg.norm_name in ('dyt', 'dytd', 'dytc', 'dytcd', 'dytcd_tanh')
+    if cfg.norm_name in ('dytd', 'dytcd', 'dytcd_tanh'):
         if is_final_norm:
             depth_ratio = 1.0
             layer_idx = cfg.n_layers
         else:
             depth_ratio = float(layer_idx) / float(cfg.n_layers)
         kwargs = dict(layer_idx=layer_idx, num_layers=cfg.n_layers, alpha_0=cfg.alpha_0, k_init=cfg.k_init, learnable_k=cfg.learnable_k)
+    if cfg.norm_name in ('dytcd', 'dytcd_tanh'):
+        kwargs.update(learnable_delta=cfg.learnable_delta)
     if cfg.norm_name == 'dytcd':
-        kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p, learnable_delta=cfg.learnable_delta)
+        kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p)
     if cfg.norm_name == 'dytc':
         kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p, alpha_init=cfg.alpha_init, alpha_jitter=cfg.alpha_jitter)
     if cfg.norm_name == 'dyt':
