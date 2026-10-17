@@ -101,8 +101,8 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False)
     u = t.clamp_(min=1.0).reciprocal_()
     u.mul_(lo)
     if isinstance(p, torch.Tensor):
-        log2e_p = _LOG2E / p.to(torch.promote_types(u.dtype, p.dtype))
-        s = u.log2_().mul_(p).exp2_().log1p_().mul_(-log2e_p).exp2_()
+        neg_log2e_p = -_LOG2E / p.to(torch.promote_types(u.dtype, p.dtype))
+        s = u.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
     else:
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     out = lo.mul_(s).copysign_(xs)
@@ -124,16 +124,16 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
         if isinstance(p, torch.Tensor):
             q = u.log2_().mul_(p)
             a = q.mul(_LN2).clamp_(min=p * _log_tiny(q.dtype))
-            log2e_p = _LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))
-            s = q.exp2_().log1p_().mul_(-log2e_p).exp2_()
+            neg_log2e_p = -_LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))
+            s = q.exp2_().log1p_().mul_(neg_log2e_p).exp2_()
         else:
             s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
             a = u.log2_().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
     else:
         s = lo.mul(r)
         if isinstance(p, torch.Tensor):
-            log2e_p = _LOG2E / p.to(torch.promote_types(s.dtype, p.dtype))
-            s.log2_().mul_(p).exp2_().log1p_().mul_(-log2e_p).exp2_()
+            neg_log2e_p = -_LOG2E / p.to(torch.promote_types(s.dtype, p.dtype))
+            s.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
         else:
             s.pow_(p).add_(1.0).pow_(-1.0 / p)
     phi = None
@@ -388,7 +388,7 @@ class DyTD(_SquashedAffine):
 
     @property
     def alpha_l(self) -> torch.Tensor:
-        return self.alpha_0 * torch.exp(-self.k * self._depth_ratio)
+        return self.alpha_0 * torch.exp(self.k.mul(-self._depth_ratio))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _DyTDForward.apply(x, self.alpha_0, self.k, self.gamma, self.beta, self._depth_ratio)
@@ -397,7 +397,7 @@ class _DyTDForward(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, alpha_0, k, gamma, beta, depth_ratio):
-        exp_kdr = torch.exp(-k * depth_ratio)
+        exp_kdr = torch.exp(k.mul(-depth_ratio))
         a = alpha_0 * exp_kdr
         phi = x.mul(a).tanh_()
         if beta is not None:
@@ -508,7 +508,7 @@ class DyTCD(_SquashedAffine):
 
     @property
     def alpha_per_channel(self) -> torch.Tensor:
-        scale = self.alpha_0 * torch.exp(-self.k * self._depth_ratio)
+        scale = self.alpha_0 * torch.exp(self.k.mul(-self._depth_ratio))
         return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -522,7 +522,7 @@ class _DyTCDForward(torch.autograd.Function):
         if p_is_tensor:
             p_raw = p
             p = p.clamp(min=_MIN_P)
-        exp_kdr = torch.exp(-k * depth_ratio)
+        exp_kdr = torch.exp(k.mul(-depth_ratio))
         scale = alpha_0 * exp_kdr
         alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=_MIN_ALPHA)
         phi = _softsign_forward(x, p, alpha_c, scale_nonneg=True)
