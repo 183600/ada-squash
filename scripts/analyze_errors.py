@@ -118,7 +118,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         with torch.no_grad():
             logits, _ = model(x, return_logits=True)
         mask = y.ne(ignore)
-        prev = torch.cat([x[:, :1], x[:, :-1]], dim=1)
+        prev = x
         valid = mask
         n_tokens += int(valid.sum().item())
         target_counts += torch.bincount(y[valid].cpu(), minlength=vocab)
