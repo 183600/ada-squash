@@ -262,7 +262,7 @@ class _RMSNorm(torch.autograd.Function):
                 u = torch.addcmul(u, x, corr, value=-1)
             grad_x = u
         elif need_w:
-            grad_weight = _sum_leading_dims(grad_out.mul(rstd).mul(x))
+            grad_weight = _sum_leading_dims(grad_out.mul(rstd).mul_(x))
         if grad_x is not None and grad_x.dtype != x.dtype:
             grad_x = grad_x.to(x.dtype)
         if grad_weight is not None and grad_weight.dtype != weight.dtype:

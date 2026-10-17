@@ -44,6 +44,7 @@ class GPTConfig:
     tie_word_embeddings: bool = True
     rotary: bool = False
 _CROSSENTROPY_CHUNK_BYTES = 1 << 27
+_CROSS_ENTROPY_FAST_PATH_BYTES = 1 << 23
 _CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
 
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
@@ -236,7 +237,14 @@ def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets
         hidden = hidden.reshape(n, -1)
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(weight.size(0))
-    if n <= chunk_rows:
+    # The plain pair materializes (and, for the backward, retains) the full
+    # logits and their log-softmax, so it is only used when that block is
+    # small *and* fits in a single chunk. Past the byte budget the fused
+    # kernel folds the projection into the loss node and keeps at most one
+    # chunk resident; the small-batch shortcut just avoids its per-call
+    # overhead. An explicit small `chunk_rows` still selects the fused node.
+    fast_rows = max(1, _CROSS_ENTROPY_FAST_PATH_BYTES // max(1, weight.size(0) * hidden.element_size()))
+    if n <= min(fast_rows, chunk_rows):
         return F.cross_entropy(F.linear(hidden, weight), targets, ignore_index=ignore_index)
     return _FusedLinearCrossEntropy.apply(hidden, weight, targets, int(ignore_index), int(chunk_rows))
 

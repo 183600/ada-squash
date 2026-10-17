@@ -148,9 +148,15 @@ class CausalSelfAttention(nn.Module):
         block = None
         for start in range(0, T, rows):
             end = min(start + rows, T)
-            block = torch.matmul(q[:, :, start:end], k_t, out=buf[:, :, :end - start])
+            # Only keys up to `end` can be causal for this row block, so the
+            # GEMM reads a [D, end] slab of K instead of all T columns and the
+            # [rows, T] scratch is written over [rows, end] only. The kept
+            # values are unchanged (each column is the same reduction over D);
+            # the skipped columns were about to be masked to zero.
+            block = torch.matmul(q[:, :, start:end], k_t[..., :end],
+                                 out=buf[:, :, :end - start, :end])
             block.mul_(scale)
-            block.masked_fill_(drop[start:end], 0.0)
+            block.masked_fill_(drop[start:end, :end], 0.0)
             acc_x.add_(block.sum(dtype=reduce_dtype))
             block.abs_()
             acc_abs.add_(block.sum(dtype=reduce_dtype))
