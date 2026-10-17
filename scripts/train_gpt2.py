@@ -53,9 +53,8 @@ _ADAMW_FUSED_CPU_SUPPORTED: bool | None = None
 def _adamw_fused_supported(device: torch.device) -> bool:
     """One-time probe for a usable fused AdamW kernel on `device`.
 
-    CUDA has always had it; CPU builds only gained it recently and older
-    builds raise at step time, so a one-element probe decides portability
-    without special-casing torch versions.
+    CUDA always has one; CPU support depends on the build, so a one-element
+    probe decides portability without special-casing torch versions.
     """
     if device.type == 'cuda':
         return True

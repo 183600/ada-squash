@@ -489,8 +489,8 @@ def cached_seed_matches(summary: dict, name: str, cfg_kwargs: dict, args, seed: 
     """Whether a cached summary is the same seed of the same row under the same recipe.
 
     The path does not always encode the seed (a single-seed run writes its
-    summary directly under the row directory), so the recorded seed must be
-    compared too: otherwise a cached run is silently reused as another seed.
+    summary directly under the row directory), so the recorded seed is
+    compared too.
     """
     if not (isinstance(summary, dict)
             and summary.get('name') == name

@@ -168,12 +168,9 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk if total is None else total.add_(chunk)
         count = targets.ne(ignore_index).sum()
-        # The cast weight is what the forward GEMM actually consumed, so it is
-        # what the backward needs: saving it (instead of the raw weight and
-        # re-casting it here) keeps the saved matrix at the compute dtype -
-        # half the footprint under bf16 autocast - and removes one full
-        # vocab-sized cast per training step. The original dtype is kept in
-        # `in_dtypes` for the returned gradient.
+        # The cast weight is what the forward GEMM consumed, so the backward
+        # reuses it instead of re-casting the raw weight. The original dtype
+        # is kept in `in_dtypes` for the returned gradient.
         ctx.save_for_backward(h, w, targets)
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
@@ -305,9 +302,8 @@ class _SwiGLU(torch.autograd.Function):
         if x2.dtype != dt:
             x2 = x2.to(dt)
         # Cast the weights once and keep the cast copies: the forward GEMMs
-        # need them anyway (autocast would otherwise cast them itself), the
-        # backward needs the same values again, and the saved copies are
-        # half the size of the fp32 masters under bf16/fp16 autocast.
+        # need them anyway (autocast would otherwise cast them itself) and
+        # the backward needs the same values again.
         w1c = w1 if w1.dtype == dt else w1.to(dt)
         w2c = w2 if w2.dtype == dt else w2.to(dt)
         w3c = w3 if w3.dtype == dt else w3.to(dt)
