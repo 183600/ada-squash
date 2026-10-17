@@ -25,6 +25,7 @@ Comparison protocol (what the runner guarantees, and checks)
 import argparse
 import dataclasses
 import json
+import math
 import os
 import sys
 import time
@@ -33,6 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT, build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
+from adasquash.diagnostics import triage_nonfinite
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_z_one_sided, welch_z_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
@@ -261,6 +263,14 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
         loss = model(x, y, return_logits=False)[1]
+        if not math.isfinite(float(loss.detach().item())):
+            triage = triage_nonfinite(model, x, y, device_type=device,
+                                      lr=args.lr, grad_clip=1.0)
+            raise SystemExit(
+                f"[abl][nan] '{name}' loss is non-finite at step {step} "
+                f"(seed={seed}): triage stage='{triage['stage']}' "
+                f"({triage['diagnosis']}); fixes: " + ' | '.join(triage['recommendations'])
+            )
         loss.backward()
         if measure:
             act_stats.detach()

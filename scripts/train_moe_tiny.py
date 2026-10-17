@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 import time
@@ -12,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import build_norm, markov_batch
+from adasquash.diagnostics import triage_nonfinite
 from adasquash.attention import CausalSelfAttention
 from adasquash.metrics import mean_std_stderr
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, _LayerScaleResidual
@@ -236,6 +238,14 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             stats_windowed = True
         logits, loss, aux, tpe_list = model(x, y, return_aux=True, return_logits=False)
         del logits
+        if not math.isfinite(float(loss.detach().item())):
+            triage = triage_nonfinite(model, x, y, device_type=device,
+                                      lr=opt.param_groups[0]['lr'], grad_clip=1.0)
+            raise SystemExit(
+                f"[moe][nan] non-finite loss at step {step}: triage stage="
+                f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
+                + ' | '.join(triage['recommendations'])
+            )
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()

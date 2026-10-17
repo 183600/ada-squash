@@ -2,5 +2,7 @@ from .norms import LayerNorm, RMSNorm, DyT, DyTC, DyTD, DyTCD, build_norm, gener
 from .attention import CausalSelfAttention
 from .model import GPTConfig, GPT, LayerConfig, build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 from .utils import ActivationStats, LossSpikeCounter, KurtosisMeter, MaxAbsMeter, measure_activation_stats, markov_batch, count_parameters
+from .diagnostics import diagnose_train_val_curve, triage_nonfinite, classify_nan_stage, tensor_finite_report, NAN_TRIAGE_ORDER
+from .efficiency import analytic_flops_per_token, efficiency_verdict, parameter_breakdown
 __version__ = '0.1.0'
-__all__ = ['LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'build_norm', 'generalized_softsign', 'NORM_REGISTRY', 'CausalSelfAttention', 'GPTConfig', 'GPT', 'LayerConfig', 'build_gpt_124m', 'build_gpt_350m', 'build_llama_tiny_1b', 'ActivationStats', 'LossSpikeCounter', 'KurtosisMeter', 'MaxAbsMeter', 'measure_activation_stats', 'markov_batch', 'count_parameters']
+__all__ = ['LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'build_norm', 'generalized_softsign', 'NORM_REGISTRY', 'CausalSelfAttention', 'GPTConfig', 'GPT', 'LayerConfig', 'build_gpt_124m', 'build_gpt_350m', 'build_llama_tiny_1b', 'ActivationStats', 'LossSpikeCounter', 'KurtosisMeter', 'MaxAbsMeter', 'measure_activation_stats', 'markov_batch', 'count_parameters', 'diagnose_train_val_curve', 'triage_nonfinite', 'classify_nan_stage', 'tensor_finite_report', 'NAN_TRIAGE_ORDER', 'analytic_flops_per_token', 'efficiency_verdict', 'parameter_breakdown']

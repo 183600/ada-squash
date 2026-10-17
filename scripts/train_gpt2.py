@@ -14,6 +14,8 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from adasquash import GPTConfig, GPT, build_norm, count_parameters, ActivationStats, LossSpikeCounter
+from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
+from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from scripts.data_pipeline import build_dataloader, configure_data_options
@@ -218,6 +220,7 @@ def main():
     p.add_argument('--val-every', type=int, default=500, help='run a held-out validation pass every N optimizer steps (0 disables; 0 is not recommended)')
     p.add_argument('--val-batches', type=int, default=10, help='batches per held-out validation pass')
     p.add_argument('--early-stop-patience', type=int, default=0, help='stop after this many validation passes without improvement (0 = off)')
+    p.add_argument('--nonfinite-policy', choices=['abort', 'skip'], default='abort', help='what to do when a training loss is NaN/Inf: abort (default) runs the ordered data->math->precision->gradient triage and stops; skip runs the triage and discards only that step (5 consecutive non-finite steps still abort)')
     p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first)')
     p.add_argument('--allow-test-rerun', action='store_true', help='permit a second one-shot evaluation of the sealed test split in the same output dir (breaks the seal: the test set becomes an implicit validation set)')
     p.add_argument('--test-batches', type=int, default=20, help='batches for the one-shot final test evaluation')
@@ -423,6 +426,52 @@ def main():
     step = start_step
     t0 = time.time()
     stats_windowed = False
+    # Curve-monitoring state: `train_window` is the mean training loss over the
+    # step interval since the last validation pass; together with the held-out
+    # points it forms the (train, val) curves the diagnosis reads. The final
+    # number alone is not a verdict.
+    train_window: list = []
+    curve_train: list = []
+    curve_val: list = []
+    curve_steps: list = []
+    diagnosis_history: list = []
+    last_diagnosis = None
+    n_nonfinite_losses = 0
+    nonfinite_streak = 0
+
+    def _handle_nonfinite(step: int, x_bad, y_bad, bad_value: float) -> None:
+        """Ordered NaN triage: data -> fp32 math -> precision -> gradients."""
+        nonlocal n_nonfinite_losses, nonfinite_streak
+        n_nonfinite_losses += 1
+        nonfinite_streak += 1
+        lr_now = opt.param_groups[0]['lr']
+        triage = triage_nonfinite(
+            model, x_bad, y_bad,
+            autocast_dtype=dtype if (args.bf16 and device == 'cuda') else None,
+            device_type=device,
+            lr=lr_now, grad_clip=args.grad_clip,
+        )
+        print(f'[nan] step={step + 1} loss={bad_value} -> triage stage={triage["stage"]}: {triage["diagnosis"]}', flush=True)
+        for line in triage['recommendations']:
+            print(f'[nan]   fix: {line}')
+        opt.zero_grad(set_to_none=True)
+        with open(log_path, 'a') as f:
+            f.write(json.dumps({
+                'step': step + 1, 'event': 'nonfinite_loss', 'loss': bad_value,
+                'lr': lr_now, 'triage_stage': triage['stage'],
+                'triage_diagnosis': triage['diagnosis'],
+                'triage_evidence': triage['evidence'],
+                'n_nonfinite_losses': n_nonfinite_losses,
+            }, default=str) + '\n')
+        if args.nonfinite_policy == 'abort' or nonfinite_streak >= 5:
+            raise SystemExit(
+                f'[nan] aborting at step {step + 1}: loss is non-finite and the triage '
+                f'localized the first failure to stage "{triage["stage"]}". '
+                f'Fix it (or raise --grad-clip / lower --lr) before resuming from the '
+                f'last checkpoint; see the [nan] recommendations above.'
+            )
+        print(f'[nan] policy=skip: discarding step {step + 1} without an optimizer step', flush=True)
+
     while step < args.max_steps:
         opt.zero_grad(set_to_none=True)
         attach_stats = (step + 1) % args.stats_every == 0
@@ -430,6 +479,7 @@ def main():
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
         loss_acc = None
+        nonfinite_batch = None
         for _ in range(args.grad_accum):
             try:
                 batch = next(data_iter)
@@ -441,6 +491,12 @@ def main():
             y = y.to(device, non_blocking=True)
             with ctx:
                 loss = model(x, y, return_logits=False)[1]
+            micro_loss = float(loss.detach().item())
+            if not math.isfinite(micro_loss):
+                # Do not backward a non-finite loss: it would poison every
+                # accumulated gradient before the triage ever ran.
+                nonfinite_batch = (x, y, micro_loss)
+                break
             loss = loss / args.grad_accum
             loss.backward()
             if loss_acc is None:
@@ -449,13 +505,19 @@ def main():
                 loss_acc = loss_acc + loss.detach()
         if attach_stats:
             act_stats.detach()
+        if nonfinite_batch is not None:
+            _handle_nonfinite(step, *nonfinite_batch)
+            continue
+        nonfinite_streak = 0
         loss_val = loss_acc.item()
         last_train_loss = loss_val
+        grad_norm = None
         if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
         opt.step()
         sched.step()
         loss_spike.update(loss_val)
+        train_window.append(loss_val)
         step += 1
         if args.val_every > 0 and step % args.val_every == 0:
             if val_loader is None:
@@ -482,19 +544,61 @@ def main():
                     path = Path(args.output_dir) / 'ckpt_best.pt'
                     torch.save(ckpt_best, path)
                     print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
+                # Curve diagnosis: pair the held-out point with the mean
+                # training loss over the interval it covers, then classify the
+                # regime (overfit / underfit / diverging / healthy) and print
+                # the concrete remedy.
+                train_point = (sum(train_window) / len(train_window)) if train_window else loss_val
+                train_window = []
+                curve_train.append(train_point)
+                curve_val.append(val_loss)
+                curve_steps.append(step)
+                last_diagnosis = diagnose_train_val_curve(
+                    curve_train, curve_val, train_steps=curve_steps, val_steps=curve_steps,
+                    log_vocab_size=math.log(model.cfg.vocab_size),
+                )
+                diagnosis_history.append({
+                    'step': step,
+                    'classification': last_diagnosis['classification'],
+                    'train_trend': last_diagnosis['train_trend'],
+                    'val_trend': last_diagnosis['val_trend'],
+                    'train_relative_change': last_diagnosis['train_relative_change'],
+                    'val_relative_change': last_diagnosis['val_relative_change'],
+                    'generalization_gap': last_diagnosis['generalization_gap'],
+                    'recommendations': last_diagnosis['recommendations'],
+                })
+                print(f"[curve] step={step} train_window={train_point:.4f} val={val_loss:.4f} "
+                      f"-> {last_diagnosis['classification']} "
+                      f"(train {last_diagnosis['train_trend']}, val {last_diagnosis['val_trend']})", flush=True)
+                if last_diagnosis['classification'] not in ('healthy', 'insufficient_data'):
+                    for line in last_diagnosis['recommendations']:
+                        print(f'[curve]   action: {line}')
+                if tb:
+                    tb.add_scalar('curve/train_window_loss', train_point, step)
+                    tb.add_scalar('curve/generalization_gap', last_diagnosis['generalization_gap'] or 0.0, step)
         if step % args.log_every == 0:
             lr = opt.param_groups[0]['lr']
             line = f'step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}'
+            if grad_norm is not None:
+                line += f' grad_norm={grad_norm:.3f}'
             print(line, flush=True)
             row = {'step': step, 'loss': loss_val, 'lr': lr, 'n_loss_spikes': loss_spike.n_spikes}
+            if grad_norm is not None:
+                row['grad_norm'] = grad_norm
             if last_val_loss is not None:
                 row['val_loss'] = last_val_loss
+            if last_diagnosis is not None:
+                row['curve_classification'] = last_diagnosis['classification']
+                row['curve_train_trend'] = last_diagnosis['train_trend']
+                row['curve_val_trend'] = last_diagnosis['val_trend']
             with open(log_path, 'a') as f:
                 f.write(json.dumps(row) + '\n')
             if tb:
                 tb.add_scalar('train/loss', loss_val, step)
                 tb.add_scalar('train/lr', lr, step)
                 tb.add_scalar('train/n_loss_spikes', loss_spike.n_spikes, step)
+                if grad_norm is not None:
+                    tb.add_scalar('train/grad_norm_pre_clip', grad_norm, step)
             if args.wandb_project:
                 import wandb
                 wandb.log(row, step=step)
@@ -519,14 +623,33 @@ def main():
     print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
     run_manifest['data']['split_reports'] = data_reports
     run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    flops = analytic_flops_per_token(model.cfg)
     run_manifest['results'] = {
         'final_step': step,
         'last_train_loss': last_train_loss,
         'best_val_loss': best_val_loss if val_loader is not None else None,
         'best_val_step': best_val_step if val_loader is not None else None,
         'n_loss_spikes': loss_spike.n_spikes,
+        'n_nonfinite_losses': n_nonfinite_losses,
         'elapsed_s': time.time() - t0,
+        # Curve monitoring: the full (train window, val) pairs and the latest
+        # classification, so a reviewer can read the regime, not just the end.
+        'curve_train_window_loss': curve_train,
+        'curve_val_loss': curve_val,
+        'curve_steps': curve_steps,
+        'curve_diagnosis': last_diagnosis,
+        'curve_diagnosis_history': diagnosis_history,
+        # Efficiency accounting travels with the accuracy numbers: parameters
+        # by role and the analytic matmul FLOPs per token.
+        'n_params': n_params,
+        'n_trainable': n_trainable,
+        'parameter_breakdown': parameter_breakdown(model),
+        'flops_per_token_forward': flops['forward_per_token'],
+        'flops_per_token_training_est': flops['training_per_token'],
     }
+    if n_nonfinite_losses:
+        print(f'[warn] {n_nonfinite_losses} non-finite loss step(s) were handled by '
+              f'--nonfinite-policy {args.nonfinite_policy}; see train.jsonl event rows')
     save_run_manifest(manifest_path, run_manifest)
     if args.final_test_eval:
         # The test split is opened exactly once, after training is over, and
