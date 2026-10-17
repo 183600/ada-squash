@@ -23,8 +23,26 @@ rank, and a small taxonomy of causes:
 * ``unexplained`` - none of the above.
 
 It also reports the baselines the accuracy must be read against
-(majority-class, uniform-random, copy-the-current-token) and an oracle
-``topk_accuracy`` that bounds how much of the error is a ranking problem.
+(majority-class, uniform-random, copy-the-current-token, and the
+``bigram_majority_accuracy`` rule "predict the most frequent successor of the
+current token") and an oracle ``topk_accuracy`` that bounds how much of the
+error is a ranking problem.
+
+Metrics
+-------
+Target tokens over a 50k vocabulary are strongly imbalanced, so accuracy and
+``micro_f1`` are dominated by the frequent classes and are reported together
+with the metrics that can disagree with them:
+
+* ``macro_f1`` / ``weighted_f1`` / ``micro_f1`` from
+  :func:`adasquash.metrics.f1_from_counts` - all three averaging modes are
+  named explicitly (macro and micro can rank models very differently);
+* one-vs-rest PR-AUC (``average_precision``) and ROC-AUC for a bounded set of
+  target classes taken from the first batch (half by frequency, half sampled
+  from its long tail), accumulated over the scanned tokens and capped by
+  ``--auc-max-tokens``. ``prefer_pr_auc`` is set when some class has >= 1000
+  negatives per positive; in that regime ROC-AUC is optimistic (its FPR
+  denominator is the huge negative count) and PR-AUC is the number to read.
 
 Corpora
 -------
@@ -36,8 +54,10 @@ Corpora
   run.
 """
 import argparse
+import itertools
 import json
 import math
+import random
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -47,6 +67,7 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
+from adasquash.metrics import binary_auc_report, f1_from_counts, imbalance_report
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import markov_batch
 from scripts.eval_downstream import load_ckpt
@@ -102,6 +123,36 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     ignore = int(cfg.ignore_index)
     vocab = int(cfg.vocab_size)
     target_counts = torch.zeros(vocab, dtype=torch.long)
+    # Confusion-matrix marginals for the named F1 report: keeping the full
+    # pred/gold lists for a 50k vocabulary over many batches would not fit
+    # memory, so only the three per-class counts are accumulated.
+    pred_counts = torch.zeros(vocab, dtype=torch.long)
+    correct_counts = torch.zeros(vocab, dtype=torch.long)
+    # Ranking-metric diagnostics: the class set is fixed from the first batch
+    # (half by frequency, half sampled from its tail), then every scanned
+    # token contributes one score per chosen class, capped so the
+    # accumulation is memory-bounded.
+    auc_class_ids: list = []
+    auc_scores: list = []
+    auc_labels: list = []
+    auc_seen = 0
+    auc_max_tokens = max(0, int(getattr(args, 'auc_max_tokens', 0)))
+    batches = iter(batches)
+    first_batch = None
+    if int(getattr(args, 'auc_classes', 0)) > 0:
+        first_batch = next(batches, None)
+        if first_batch is not None:
+            _, y0 = first_batch
+            counts0 = torch.bincount(y0[y0.ne(ignore)].long().cpu(), minlength=vocab)
+            present0 = torch.nonzero(counts0).flatten().tolist()
+            k = min(int(args.auc_classes), len(present0))
+            n_head = (k + 1) // 2
+            head = sorted(present0, key=lambda c: (-int(counts0[c]), c))[:n_head]
+            head_set = set(head)
+            tail_pool = [c for c in present0 if c not in head_set]
+            rng = random.Random(int(getattr(args, 'seed', 0)))
+            tail = rng.sample(tail_pool, min(k - len(head), len(tail_pool)))
+            auc_class_ids = sorted(head + tail)
     prev_gold_keys = []          # encoded (prev_id * vocab + gold_id) over all tokens
     n_tokens = n_correct = 0
     topk = max(1, int(args.topk))
@@ -114,6 +165,8 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     copy_input_correct = 0
     n_positional = 0
 
+    if first_batch is not None:
+        batches = itertools.chain([first_batch], batches)
     for x, y in batches:
         with torch.no_grad():
             logits, _ = model(x, return_logits=True)
@@ -138,6 +191,8 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             gold = y[:, t0:t1]
             pred = probs.argmax(-1)
             n_correct += int((pred[m] == gold[m]).sum().item())
+            pred_counts += torch.bincount(pred[m].long().cpu(), minlength=vocab)
+            correct_counts += torch.bincount(gold[m & (pred == gold)].long().cpu(), minlength=vocab)
             gold_p = probs.gather(-1, gold.clamp(min=0).unsqueeze(-1)).squeeze(-1)
             gold_prob_sum += float(gold_p[m].sum().item())
             k = min(topk, V - 1)
@@ -167,6 +222,15 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
                         'prev': int(prev[b, t0 + tt]),
                         'context': [int(v) for v in x[b, max(0, t0 + tt - args.context_tokens):t0 + tt + 1].tolist()],
                     })
+            if auc_class_ids:
+                sel = probs[..., auc_class_ids][m]
+                take = int(sel.shape[0])
+                if auc_max_tokens > 0:
+                    take = min(take, auc_max_tokens - auc_seen)
+                if take > 0:
+                    auc_scores.append(sel[:take].detach().cpu())
+                    auc_labels.append(gold[m][:take].detach().cpu())
+                    auc_seen += take
             del probs, top, lc
 
     if n_tokens == 0:
@@ -233,23 +297,50 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         rec['gold_text'] = _decode([rec['gold']], tokenizer)
         rec['pred_text'] = _decode([rec['pred']], tokenizer)
     majority_acc = float(target_counts.max().item() / n_tokens) if n_tokens else 0.0
+    # The context-majority rule ("predict the most frequent successor of the
+    # current token"): a tuned-then-scored trivial baseline, not a strawman.
+    bigram_correct = sum(count for _, count in prev_majority.values())
+    bigram_acc = (bigram_correct / n_tokens) if n_tokens else 0.0
+    f1 = f1_from_counts(target_counts.tolist(), pred_counts.tolist(), correct_counts.tolist())
+    imbalance = imbalance_report(target_counts.tolist())
+    auc_report = None
+    if auc_class_ids and auc_scores:
+        auc_report = binary_auc_report(
+            torch.cat(auc_scores, dim=0).tolist(),
+            torch.cat(auc_labels, dim=0).tolist(),
+            auc_class_ids,
+        )
     return {
         'summary': {
             'n_tokens': n_tokens,
             'n_errors': n_errors,
             'error_rate': n_errors / n_tokens,
             'accuracy': n_correct / n_tokens,
-            'micro_f1': n_correct / n_tokens,
+            'micro_f1': f1['micro_f1'],
+            'macro_f1': f1['macro_f1'],
+            'weighted_f1': f1['weighted_f1'],
+            'f1_averaging': ('macro = unweighted mean over classes present; '
+                             'weighted = support-weighted; micro = accuracy'),
+            'imbalance': imbalance,
+            'prefer_pr_auc': imbalance['prefer_pr_auc'],
             f'top{topk}_accuracy': topk_hits / n_tokens,
             'mean_gold_prob': gold_prob_sum / n_tokens,
             'mean_gold_rank_capped': gold_rank_sum / n_tokens,
             'rank_cap': args.rank_clip,
             'majority_class_accuracy': majority_acc,
+            'bigram_majority_accuracy': bigram_acc,
             'uniform_random_accuracy': 1.0 / vocab,
             'copy_input_accuracy': (copy_input_correct / n_tokens) if n_positional else None,
+            'auc_classes': auc_class_ids,
+            'auc_tokens_scored': auc_seen,
+            'macro_average_precision': None if auc_report is None else auc_report['macro_average_precision'],
+            'weighted_average_precision': None if auc_report is None else auc_report['weighted_average_precision'],
+            'macro_roc_auc': None if auc_report is None else auc_report['macro_roc_auc'],
+            'weighted_roc_auc': None if auc_report is None else auc_report['weighted_roc_auc'],
             'errors_scanned': n_scanned,
             'errors_total': n_errors,
         },
+        'auc_report': auc_report,
         'cause_distribution': dict(primary.most_common()),
         'flag_counts': dict(categories.most_common()),
         'reading_guide': {
@@ -286,6 +377,8 @@ def main():
     p.add_argument('--context-tokens', type=int, default=32, help='preceding tokens kept/printed per error')
     p.add_argument('--max-scan-errors', type=int, default=2000)
     p.add_argument('--max-examples', type=int, default=20)
+    p.add_argument('--auc-classes', type=int, default=8, help='target classes for the one-vs-rest PR-AUC/ROC-AUC diagnostics: half the most frequent classes in the first batch, half sampled from its long tail; 0 disables')
+    p.add_argument('--auc-max-tokens', type=int, default=200000, help='cap on scored tokens for the AUC diagnostics (deterministic first-N subsample; 0 = no cap)')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--device', default=None)
     p.add_argument('--output', default=None)
@@ -325,8 +418,21 @@ def main():
     print(f"[errors] tokens={s['n_tokens']} errors={s['n_errors']} "
           f"accuracy={s['accuracy']:.4f} error_rate={s['error_rate']:.4f} "
           f"top{args.topk}_accuracy={s[f'top{args.topk}_accuracy']:.4f} "
+          f"macro_f1={s['macro_f1']:.4f} weighted_f1={s['weighted_f1']:.4f} "
           f"majority_baseline={s['majority_class_accuracy']:.4f} "
+          f"bigram_baseline={s['bigram_majority_accuracy']:.4f} "
           f"uniform_baseline={s['uniform_random_accuracy']:.2e}")
+    if s['imbalance']['prefer_pr_auc']:
+        print(f"[errors] WARNING: target imbalance {s['imbalance']['note']}; "
+              f"accuracy/micro_f1 overstate - read macro_f1 and the PR-AUC block")
+    if s['macro_average_precision'] is not None:
+        print(f"[errors] one-vs-rest over {len(s['auc_classes'])} classes "
+              f"({s['auc_tokens_scored']} tokens): "
+              f"macro_pr_auc={s['macro_average_precision']:.4f} "
+              f"weighted_pr_auc={s['weighted_average_precision']:.4f} "
+              f"macro_roc_auc={s['macro_roc_auc']:.4f} "
+              f"weighted_roc_auc={s['weighted_roc_auc']:.4f} "
+              f"prefer_pr_auc={s['prefer_pr_auc']}")
     print(f"[errors] cause distribution (over {s['errors_scanned']} scanned errors): "
           f"{report['cause_distribution']}")
     for rec in report['examples']:

@@ -265,6 +265,18 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int):
     if args.compile:
         cmd.append('--compile')
         cmd += ['--compile-mode', args.compile_mode]
+    # Every cell carries the hypothesis the sweep tests, recorded in the run
+    # manifest: the reference cell establishes the bar, a candidate cell
+    # claims to clear it at the same depth and step budget.
+    if norm == args.reference_norm:
+        hypothesis = (f'd{depth} reference cell: {norm} fixes the held-out final_val_loss '
+                      f'every candidate norm must beat under the identical recipe (paired over '
+                      f'the shared seeds).')
+    else:
+        hypothesis = (f'd{depth}: {norm} reaches a lower final_val_loss than the '
+                      f'{args.reference_norm} reference at the same depth, recipe and step '
+                      f'budget, paired over the shared seeds.')
+    cmd += ['--hypothesis', hypothesis]
     env = dict(os.environ)
     env['ADASQUASH_DEPTH_OVERRIDE'] = str(depth)
     shape = ''

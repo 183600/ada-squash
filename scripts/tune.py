@@ -69,8 +69,12 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path) -> dict:
             return json.loads((run_dir / 'summary.json').read_text())
         except (OSError, json.JSONDecodeError):
             pass
-    summary = run_one(f'{arm}|lr={lr:g}|seed={seed}', {'norm_name': arm},
-                      trial_args, run_dir, seed=seed)
+    summary = run_one(
+        f'{arm}|lr={lr:g}|seed={seed}', {'norm_name': arm}, trial_args, run_dir, seed=seed,
+        hypothesis=(f'Compute-matched lr-sweep cell for arm {arm}: baselines and variants get the '
+                    f'identical grid and compute, so the selected lr makes the later arm '
+                    f'comparison a test against a tuned reference, not against a strawman.'),
+    )
     return summary
 
 

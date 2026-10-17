@@ -42,7 +42,14 @@ reports (and the dataset task gates on) the trivial baselines it must beat:
   explicitly because macro and micro can disagree under class imbalance
   (`micro_f1 == accuracy` for a single-label argmax prediction);
 * `topk_accuracy` (k=3 by default) - a ceiling-free signal for tasks whose
-  top-1 accuracy is capped by label ambiguity.
+  top-1 accuracy is capped by label ambiguity;
+* one-vs-rest `macro_average_precision` / `weighted_average_precision`
+  (PR-AUC) and `macro_roc_auc` / `weighted_roc_auc` over the target classes
+  present in the batch - the ranking metrics that expose a collapse accuracy
+  hides. The two averaging modes are named for the same reason as the F1
+  ones, and when `prefer_pr_auc` is set (>= 1000 negatives per positive on
+  some class) PR-AUC is the one to read: ROC-AUC's false-positive rate has a
+  huge negative denominator and therefore stays optimistic.
 """
 import argparse
 import math
@@ -58,7 +65,7 @@ import torch
 from torch.optim import AdamW
 
 from adasquash import GPT, GPTConfig, NORM_REGISTRY, markov_batch
-from adasquash.metrics import macro_weighted_f1
+from adasquash.metrics import binary_auc_report, macro_weighted_f1
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 
 DEFAULT_THRESHOLDS = {
@@ -140,6 +147,9 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
             "majority_class_accuracy": 0.0,
             "uniform_random_accuracy": 1.0 / vocab,
             "copy_input_accuracy": None,
+            "macro_average_precision": None, "weighted_average_precision": None,
+            "macro_roc_auc": None, "weighted_roc_auc": None,
+            "prefer_pr_auc": False, "auc_report": None,
         }
     gold = y[mask]
     pred = logits.argmax(-1)[mask]
@@ -153,6 +163,13 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
     copy_input = None
     if tuple(x.shape) == tuple(y.shape):
         copy_input = float((x[mask] == gold).float().mean().item())
+    # One-vs-rest ranking metrics over the classes that actually occur in this
+    # batch (at most one column per valid token, so this stays cheap). The
+    # softmax is monotone, so it does not change the ranking; it keeps the
+    # scores comparable across calls.
+    present = torch.unique(gold).tolist()
+    probs = torch.softmax(logits.float(), dim=-1)
+    auc = binary_auc_report(probs[mask][:, present].tolist(), gold.tolist(), present)
     return {
         "accuracy": accuracy,
         "topk_accuracy": topk_accuracy,
@@ -165,6 +182,12 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
         "majority_class_accuracy": majority,
         "uniform_random_accuracy": 1.0 / vocab,
         "copy_input_accuracy": copy_input,
+        "macro_average_precision": auc["macro_average_precision"],
+        "weighted_average_precision": auc["weighted_average_precision"],
+        "macro_roc_auc": auc["macro_roc_auc"],
+        "weighted_roc_auc": auc["weighted_roc_auc"],
+        "prefer_pr_auc": auc["prefer_pr_auc"],
+        "auc_report": auc,
     }
 
 
@@ -346,15 +369,25 @@ def main():
         results.append(result)
         status = "PASS" if result["passed"] else "FAIL"
         m = result["final_metrics"]
+        ap = m["macro_average_precision"]
+        roc = m["macro_roc_auc"]
+        ap_str = "n/a" if ap is None else f"{ap:.4f}"
+        roc_str = "n/a" if roc is None else f"{roc:.4f}"
         print(
             f"[sanity] {status} {norm}: initial_loss={result['initial_loss']:.4f} "
             f"final_loss={result['final_loss']:.4f} accuracy={result['final_accuracy']:.4f} "
             f"macro_f1={result['final_macro_f1']:.4f} "
+            f"macro_pr_auc={ap_str} macro_roc_auc={roc_str} "
             f"(majority_baseline={m['majority_class_accuracy']:.4f}, "
             f"copy_input_baseline={m['copy_input_accuracy']}, "
             f"top{m['topk']}_accuracy={m['topk_accuracy']:.4f}) "
             f"grad_norm={result['gradients'].get('total_norm', 0.0):.3e}"
         )
+        if m["prefer_pr_auc"]:
+            print(
+                "[sanity]   note: >=1000 negatives per positive on some class: read "
+                "macro_pr_auc (PR-AUC) over ROC-AUC, whose FPR denominator is huge"
+            )
         for name, ok in result["checks"].items():
             print(f"[sanity]   {'ok' if ok else 'FAIL'}: {name}")
         if not result["passed"]:

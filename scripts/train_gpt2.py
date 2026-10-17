@@ -252,6 +252,7 @@ def main():
     p.add_argument('--save-every', type=int, default=2000)
     p.add_argument('--wandb-project', default=None)
     p.add_argument('--run-name', default=None)
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this run tests; recorded in the run manifest (and checkpoint args) so a result can be audited against the claim it was meant to support, the same contract the ablation matrix enforces per row')
     p.add_argument('--resume', default=None, help='checkpoint to resume from')
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
@@ -397,6 +398,9 @@ def main():
     manifest_path = Path(args.output_dir) / 'run_manifest.json'
     run_manifest = collect_run_metadata(seed=args.seed)
     run_manifest['hyperparameters'] = vars(args)
+    if args.hypothesis:
+        run_manifest['hypothesis'] = args.hypothesis
+        print(f'[hypothesis] {args.hypothesis}')
     run_manifest['data'] = {
         'dataset': args.dataset,
         'dataset_config': args.dataset_config,
