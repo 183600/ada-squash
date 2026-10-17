@@ -17,6 +17,7 @@ from adasquash import GPTConfig, GPT, count_parameters, ActivationStats, LossSpi
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
+from adasquash.norms import NORM_REGISTRY
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from scripts.data_pipeline import build_dataloader, configure_data_options
 
@@ -195,7 +196,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--config', default=None, help='YAML run config; CLI flags override it')
     p.add_argument('--model', choices=['gpt2-124m', 'gpt2-350m', 'llama-1b'], default='gpt2-124m')
-    p.add_argument('--norm', default='dytcd', choices=list(['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd']))
+    p.add_argument('--norm', default='dytcd', choices=sorted(NORM_REGISTRY))
     p.add_argument('--qk-norm', default=None, choices=[None, 'qknorm', 'dytqk'])
     p.add_argument('--qk-alpha-init', type=float, default=1.0, help='initial alpha_q / alpha_k for --qk-norm dytqk')
     p.add_argument('--no-layerscale', action='store_true')
