@@ -74,12 +74,6 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor]=None, return_stats: bool=False):
         B, T, C = x.shape
-        # Keep the 3-axis in its original middle position so the three Q/K/V
-        # tensors are transposed views of the projection's own [B, T, 3, H, D]
-        # layout. They have exactly the sizes/strides of the old
-        # permute-then-unbind, but the backward assembles the linear's
-        # [B, T, 3C] cotangent with a single concatenation instead of a
-        # concatenation plus a permute copy.
         qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.head_dim)
         if freqs_cis is None or self.q_squash is not None or self.q_rms is not None:
             # `unbind` and `qkv[:, :, i]` select the same three tensors; the
