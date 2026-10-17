@@ -37,6 +37,21 @@ def _as_scalar_exponent_inplace(g: torch.Tensor, p) -> torch.Tensor:
         return g.log2_().mul_(p + 1).exp2_()
     return g.pow_(p + 1)
 
+def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
+    """Whether the compensating `±1` multiply has to run.
+
+    Multiplying by `+1.0` is exact, so when no `scale` entry is negative that
+    full-tensor correction is a no-op and is skipped (one saved pass per
+    forward and per backward for the `dytc` arm). The `signbit().any()` probe
+    is a `[dim]` reduction whose result is only read on the host: that is free
+    on CPU, while on CUDA it would synchronise once per layer, so CUDA tensors
+    keep the multiply unconditionally. `signbit` (rather than `< 0`) is what
+    makes `-0.0` count as negative.
+    """
+    if scale.device.type != 'cpu':
+        return True
+    return bool(torch.signbit(scale).any())
+
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     if t.ndim <= 1:
         return t.clone()
@@ -108,7 +123,7 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False)
         # so the first pow can write in place.
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     out = lo.mul_(s).copysign_(xs)
-    if scale is not None and (not scale_nonneg):
+    if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
         out.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     return out
 
@@ -141,7 +156,7 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
     phi = None
     if need_phi:
         phi = lo.mul_(s).copysign_(xs)
-        if scale is not None and (not scale_nonneg):
+        if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
             phi.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     if not need_g:
         return (None, phi, a)
