@@ -130,12 +130,18 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
     return (r.mul_(s), phi, a)
 
 def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p_raw: torch.Tensor, gamma: Optional[torch.Tensor]=None) -> torch.Tensor:
+    """Gradient w.r.t. ``p`` from the cotangent of the squashed output.
+
+    ``a`` is the clamped ``p * ln(u)`` from ``_softsign_backward_pieces`` and is
+    a backward-only temporary at every call site, so the ``a * sigmoid(a)``
+    factor is written into it instead of allocating a second full-size tensor.
+    """
     if gamma is not None:
         grad_phi.mul_(gamma)
     sig = a.sigmoid()
-    a_sig = a.mul_(sig)
+    a.mul_(sig)
     sig.neg_().log1p_().neg_()
-    k = sig.sub_(a_sig)
+    k = sig.sub_(a)
     acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
     red = grad_phi.mul_(k).sum(dtype=acc)
     red = red.div_(p * p)
