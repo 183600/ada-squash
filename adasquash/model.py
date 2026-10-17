@@ -168,7 +168,13 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk if total is None else total.add_(chunk)
         count = targets.ne(ignore_index).sum()
-        ctx.save_for_backward(h, weight, targets)
+        # The cast weight is what the forward GEMM actually consumed, so it is
+        # what the backward needs: saving it (instead of the raw weight and
+        # re-casting it here) keeps the saved matrix at the compute dtype -
+        # half the footprint under bf16 autocast - and removes one full
+        # vocab-sized cast per training step. The original dtype is kept in
+        # `in_dtypes` for the returned gradient.
+        ctx.save_for_backward(h, w, targets)
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
         ctx.count = count
@@ -178,9 +184,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        h, weight, targets = ctx.saved_tensors
+        h, w, targets = ctx.saved_tensors
         dt = ctx.compute_dtype
-        w = weight if weight.dtype == dt else weight.to(dt)
         acc = _loss_acc_dtype(dt)
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
@@ -294,19 +299,27 @@ class _SwiGLU(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1, w2, w3):
         lead = x.shape[:-1]
+        in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)
         dt = _autocast_dtype(x.device.type, x.dtype, w1.dtype, w2.dtype, w3.dtype)
         x2 = x.reshape(-1, x.shape[-1])
         if x2.dtype != dt:
             x2 = x2.to(dt)
-        a = F.linear(x2, w1)
-        b = F.linear(x2, w3)
+        # Cast the weights once and keep the cast copies: the forward GEMMs
+        # need them anyway (autocast would otherwise cast them itself), the
+        # backward needs the same values again, and the saved copies are
+        # half the size of the fp32 masters under bf16/fp16 autocast.
+        w1c = w1 if w1.dtype == dt else w1.to(dt)
+        w2c = w2 if w2.dtype == dt else w2.to(dt)
+        w3c = w3 if w3.dtype == dt else w3.to(dt)
+        a = F.linear(x2, w1c)
+        b = F.linear(x2, w3c)
         h = F.silu(a, inplace=True)
         h.mul_(b)
         del b
-        y = F.linear(h, w2)
-        ctx.save_for_backward(x2, w1, w2, w3)
+        y = F.linear(h, w2c)
+        ctx.save_for_backward(x2, w1c, w2c, w3c)
         ctx.compute_dtype = y.dtype
-        ctx.in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)
+        ctx.in_dtypes = in_dtypes
         ctx.lead = lead
         return y.view(*lead, -1)
 
@@ -314,8 +327,6 @@ class _SwiGLU(torch.autograd.Function):
     def backward(ctx, grad_out):
         x, w1, w2, w3 = ctx.saved_tensors
         dt = ctx.compute_dtype
-        if w1.dtype != dt:
-            w1, w2, w3 = (w1.to(dt), w2.to(dt), w3.to(dt))
         if x.dtype != dt:
             x = x.to(dt)
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])

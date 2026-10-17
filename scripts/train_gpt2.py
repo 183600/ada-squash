@@ -48,6 +48,28 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
 _TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
 
+_ADAMW_FUSED_CPU_SUPPORTED: bool | None = None
+
+def _adamw_fused_supported(device: torch.device) -> bool:
+    """One-time probe for a usable fused AdamW kernel on `device`.
+
+    CUDA has always had it; CPU builds only gained it recently and older
+    builds raise at step time, so a one-element probe decides portability
+    without special-casing torch versions.
+    """
+    if device.type == 'cuda':
+        return True
+    global _ADAMW_FUSED_CPU_SUPPORTED
+    if _ADAMW_FUSED_CPU_SUPPORTED is None:
+        probe = nn.Parameter(torch.zeros(1, device=device))
+        probe.grad = torch.zeros(1, device=device)
+        try:
+            AdamW([probe], lr=0.0, fused=True).step()
+            _ADAMW_FUSED_CPU_SUPPORTED = True
+        except Exception:
+            _ADAMW_FUSED_CPU_SUPPORTED = False
+    return _ADAMW_FUSED_CPU_SUPPORTED
+
 def build_optimizer(model: nn.Module, lr: float, weight_decay: float, beta1: float, beta2: float):
     decay = []
     no_decay = []
@@ -60,7 +82,7 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float, beta1: flo
             decay.append(p)
     groups = [{'params': decay, 'weight_decay': weight_decay}, {'params': no_decay, 'weight_decay': 0.0}]
     devices = {p.device for p in decay + no_decay}
-    fused = len(devices) == 1 and next(iter(devices)).type == 'cuda'
+    fused = len(devices) == 1 and _adamw_fused_supported(next(iter(devices)))
     return AdamW(groups, lr=lr, betas=(beta1, beta2), fused=fused)
 
 def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float):
