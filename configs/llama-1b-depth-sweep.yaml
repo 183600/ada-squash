@@ -3,9 +3,12 @@ depths: [12, 24, 48, 96]
 norms: [rmsnorm, dyt, dytcd]
 
 # Every (depth, norm) cell is replicated over these independent seeds and the
-# launcher reports the cell's best_val_loss as Mean +/- Std across runs. A
-# single run cannot separate a depth/norm effect from run-to-run noise, so the
-# shipped sweep uses three seeds.
+# launcher reports Mean +/- Std across runs for both validation statistics:
+# best_val_loss (min over validation passes, the checkpoint-selection number,
+# optimistically biased) and final_val_loss (last validation pass, the
+# fixed-step estimate cells are compared on). A single run cannot separate a
+# depth/norm effect from run-to-run noise, so the shipped sweep uses three
+# seeds.
 seeds: [42, 43, 44]
 
 alpha_0: 0.9

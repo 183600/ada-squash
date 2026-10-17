@@ -4,9 +4,24 @@ from __future__ import annotations
 Every (depth, norm) cell runs the *identical* recipe (same data slices, same
 optimizer/schedule, same token count); depth-only comparisons must not mix in
 different training recipes. Each cell is replicated over `--seeds` (>= 3
-recommended) and the launcher aggregates `results.best_val_loss` into
-`Mean +/- Std` across those independent runs, because a single run cannot
-separate a depth/norm effect from run-to-run noise.
+recommended) and the launcher aggregates the runs into `Mean +/- Std` across
+those independent runs, because a single run cannot separate a depth/norm
+effect from run-to-run noise.
+
+Two numbers travel side by side, and the sweep reports both rather than
+picking whichever looks better:
+
+* `best_val_loss` (min over the validation passes) is the checkpoint-selection
+  statistic; reporting it as the cell's loss is optimistically biased;
+* `final_val_loss` (last validation pass at the fixed step budget) is the
+  comparable fixed-step estimate used for depth/norm comparisons.
+
+Because every cell runs the same seeds, two cells at a depth are *paired*
+samples. The launcher therefore also tests each norm against `--reference-norm`
+at each depth on the per-seed `final_val_loss` differences (paired one-sided
+test, Holm-Bonferroni over the sweep's comparison family) and reports the
+per-seed sign counts next to the p-value, since with the default 3 seeds the
+normal approximation alone is thin evidence.
 """
 import argparse
 import json
@@ -17,7 +32,7 @@ import sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from adasquash.metrics import mean_std_stderr
+from adasquash.metrics import holm_adjust, mean_std_stderr, paired_z_one_sided
 from adasquash.repro import collect_run_metadata, save_run_manifest
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
@@ -53,30 +68,160 @@ def seed_dir(cell_dir: Path, seed: int, multi: bool) -> Path:
     return cell_dir / f'seed{seed}' if multi else cell_dir
 
 def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
-    """Pool each seed's `results.best_val_loss` into a Mean +/- Std record."""
+    """Pool each seed's reported losses into Mean +/- Std records.
+
+    The two validation statistics a run reports are not the same number:
+
+    * `best_val_loss` is the minimum over the validation passes - the
+      checkpoint-selection statistic. As a *reported* estimate it is
+      optimistically biased (the minimum of noisy draws), so it must not be
+      quoted as the cell's generalization loss;
+    * `final_val_loss` is the last held-out pass of the run. With early
+      stopping off (the sweep default) every cell validates at the same
+      training-step budget, so it is the fixed-step estimate that makes
+      depth/norm cells comparable.
+
+    Both are pooled over the per-seed independent runs of the identical
+    recipe. Legacy manifests without `final_val_loss` leave the final-pass
+    fields at `None` with `n_seeds_final = 0` instead of silently mixing the
+    two statistics.
+    """
     per_seed = []
     for seed in seeds:
         path = seed_dir(cell_dir, seed, multi) / 'run_manifest.json'
         best = None
+        final = None
         try:
             manifest = json.loads(path.read_text())
             if isinstance(manifest, dict):
-                best = (manifest.get('results') or {}).get('best_val_loss')
+                results = manifest.get('results') or {}
+                best = results.get('best_val_loss')
+                final = results.get('final_val_loss')
         except (OSError, json.JSONDecodeError):
             pass
-        per_seed.append({'seed': int(seed), 'best_val_loss': best})
-    vals = [p['best_val_loss'] for p in per_seed if isinstance(p['best_val_loss'], (int, float))]
-    stats = mean_std_stderr(vals)
+        per_seed.append({'seed': int(seed), 'best_val_loss': best, 'final_val_loss': final})
+
+    def _pool(key: str):
+        vals = [p[key] for p in per_seed if isinstance(p[key], (int, float))]
+        return vals, mean_std_stderr(vals)
+
+    best_vals, best_stats = _pool('best_val_loss')
+    final_vals, final_stats = _pool('final_val_loss')
     return {
         'cell': cell_dir.name,
         'seeds': [int(s) for s in seeds],
         'per_seed': per_seed,
-        'n_seeds': len(vals),
-        'best_val_loss': None if stats is None else stats['mean'],
-        'best_val_loss_std': None if stats is None or len(vals) < 2 else stats['std'],
-        'best_val_loss_std_basis': 'seeds' if len(vals) >= 2 else 'single_run',
-        'aggregation': 'Mean +/- Std across seeds; each seed is an independent run of the identical recipe',
+        'n_seeds': len(best_vals),
+        'best_val_loss': None if best_stats is None else best_stats['mean'],
+        'best_val_loss_std': None if best_stats is None or len(best_vals) < 2 else best_stats['std'],
+        'best_val_loss_std_basis': 'seeds' if len(best_vals) >= 2 else 'single_run',
+        'n_seeds_final': len(final_vals),
+        'final_val_loss': None if final_stats is None else final_stats['mean'],
+        'final_val_loss_std': None if final_stats is None or len(final_vals) < 2 else final_stats['std'],
+        'final_val_loss_std_basis': 'seeds' if len(final_vals) >= 2 else 'single_run',
+        'aggregation': ('Mean +/- Std across seeds (each seed is an independent run of the identical recipe). '
+                        'best_val_loss = min over validation passes (checkpoint-selection statistic, optimistically biased); '
+                        'final_val_loss = last validation pass (fixed-step estimate, comparable across cells when early stopping is off).'),
     }
+
+def _cell_seed_metric(cell: dict, metric: str) -> dict:
+    """{seed: metric value} of an aggregate cell; seeds without the metric dropped."""
+    out = {}
+    for item in cell.get('per_seed') or []:
+        if not isinstance(item, dict) or item.get('seed') is None:
+            continue
+        value = item.get(metric)
+        if isinstance(value, (int, float)):
+            out[int(item['seed'])] = float(value)
+    return out
+
+def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='final_val_loss', margin: float=0.0, alpha: float=0.05) -> dict:
+    """One-sided paired comparison of every norm against `reference_norm` per depth.
+
+    Seeds are the unit of replication and every cell of the sweep shares the
+    same seed set, so candidates and reference are *paired*: the test runs on
+    the per-seed `metric` differences (default `final_val_loss`, the fixed-step
+    estimate - the selection-biased `best_val_loss` is deliberately not the
+    basis). Because the normal approximation on 3 seeds is thin evidence, the
+    per-seed sign counts (`n_seeds_favoring`, `n_seeds_tied`) are reported next
+    to the p-value as the assumption-free reading. Holm-Bonferroni adjusts the
+    whole family of sweep comparisons before any row is called significant.
+    """
+    rows = []
+    for depth in sorted(cells_by_depth):
+        by_norm = cells_by_depth[depth]
+        ref = by_norm.get(reference_norm)
+        if ref is None:
+            continue
+        ref_seeds = _cell_seed_metric(ref, metric)
+        for norm in sorted(by_norm):
+            if norm == reference_norm:
+                continue
+            cand_seeds = _cell_seed_metric(by_norm[norm], metric)
+            common = sorted(set(ref_seeds) & set(cand_seeds))
+            entry = {
+                'depth': depth,
+                'norm': norm,
+                'reference_norm': reference_norm,
+                'metric': metric,
+                'n_paired_seeds': len(common),
+                'paired_seeds': common,
+                'mean_delta': None,
+                'n_seeds_favoring': None,
+                'n_seeds_tied': None,
+                'p_one_sided': None,
+                'p_one_sided_holm': None,
+                'beats_reference_significantly': False,
+            }
+            if len(common) >= 2:
+                a = [cand_seeds[s] for s in common]
+                b = [ref_seeds[s] for s in common]
+                test = paired_z_one_sided(a, b, margin=margin)
+                entry['mean_delta'] = test['mean_delta']
+                entry['z'] = test['z']
+                entry['p_one_sided'] = test['p_one_sided']
+                entry['n_seeds_favoring'] = sum(1 for x, y in zip(a, b) if x < y)
+                entry['n_seeds_tied'] = sum(1 for x, y in zip(a, b) if x == y)
+            elif common:
+                entry['mean_delta'] = cand_seeds[common[0]] - ref_seeds[common[0]]
+            rows.append(entry)
+    adjusted = holm_adjust([r['p_one_sided'] for r in rows])
+    for entry, p_holm in zip(rows, adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['beats_reference_significantly'] = bool(
+            entry['mean_delta'] is not None and entry['mean_delta'] < -margin
+            and p_holm is not None and p_holm < alpha)
+    return {
+        'reference_norm': reference_norm,
+        'metric': metric,
+        'margin': margin,
+        'alpha': alpha,
+        'rows': rows,
+        'multiple_comparison': (f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} '
+                                f'tested sweep comparison(s) against the same per-depth reference'),
+        'reading_guide': ('paired on the shared seeds; `mean_delta` < 0 favors the candidate. '
+                          'With 3 seeds read `n_seeds_favoring`/3 first: the z p-value is a normal '
+                          'approximation and is not trustworthy on its own at this replication count.'),
+    }
+
+def print_sweep_comparisons(comparison: dict) -> None:
+    if not comparison['rows']:
+        print(f"[compare] no (depth, candidate) cell for reference '{comparison['reference_norm']}'; comparison skipped")
+        return
+    print(f"[compare] reference norm '{comparison['reference_norm']}' on {comparison['metric']} (paired per seed):")
+    for r in comparison['rows']:
+        if r['mean_delta'] is None:
+            print(f"[compare] d{r['depth']}-{r['norm']}: no paired seeds - not testable")
+            continue
+        sign = ''
+        if r['n_seeds_favoring'] is not None:
+            sign = f" seeds_favoring={r['n_seeds_favoring']}/{r['n_paired_seeds']}"
+            if r['n_seeds_tied']:
+                sign += f" tied={r['n_seeds_tied']}"
+        p_holm = r['p_one_sided_holm']
+        p_str = 'n/a' if p_holm is None else f'{p_holm:.4g}'
+        print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{sign} "
+              f"p_holm={p_str} significant={r['beats_reference_significantly']}")
 
 def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int):
     cmd = [sys.executable, str(Path(__file__).parent / 'train_gpt2.py'), '--model', args.model, '--norm', norm, '--dataset', args.dataset, '--dataset-config', args.dataset_config, '--tokenizer', args.tokenizer, '--seq-len', str(args.seq_len), '--batch-size', str(args.batch_size), '--grad-accum', str(args.grad_accum), '--max-steps', str(args.max_steps), '--lr', str(args.lr), '--min-lr-ratio', str(args.min_lr_ratio), '--warmup', str(args.warmup), '--weight-decay', str(args.weight_decay), '--beta1', str(args.beta1), '--beta2', str(args.beta2), '--grad-clip', str(args.grad_clip), '--seed', str(seed), '--alpha-0', str(args.alpha_0), '--alpha-init', str(args.alpha_init), '--k-init', str(args.k_init), '--p-init', str(args.p_init), '--qk-alpha-init', str(args.qk_alpha_init), '--output-dir', str(output_dir), '--log-every', str(args.log_every), '--stats-every', str(args.stats_every), '--save-every', str(args.save_every)]
@@ -149,6 +294,7 @@ def main():
     p.add_argument('--model', default='llama-1b')
     p.add_argument('--depths', nargs='+', type=int, default=[12, 24, 48, 96])
     p.add_argument('--norms', nargs='+', default=['rmsnorm', 'dyt', 'dytcd'])
+    p.add_argument('--reference-norm', default='rmsnorm', help='baseline norm each other norm is compared against at every depth (paired per seed, Holm-adjusted)')
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
     p.add_argument('--val-frac', type=float, default=0.005, help='chronological held-out validation fraction (identical for every row)')
@@ -241,18 +387,35 @@ def main():
     if not args.sequential:
         for proc in procs:
             proc.wait()
+    aggs_by_depth: dict = {}
     for depth, norm, cell_dir in cells:
         agg = aggregate_sweep_cell(cell_dir, seeds, multi)
         with open(cell_dir / 'aggregate.json', 'w') as f:
             json.dump(agg, f, indent=2)
+        aggs_by_depth.setdefault(depth, {})[norm] = agg
         mean = agg['best_val_loss']
         std = agg.get('best_val_loss_std')
+        final_mean = agg.get('final_val_loss')
+        final_std = agg.get('final_val_loss_std')
         if mean is not None:
             std_str = '' if std is None else f' +/- {std:.4f}'
-            print(f"[sweep] d{depth}-{norm}: best_val_loss={mean:.4f}{std_str} "
-                  f"over {agg['n_seeds']} seed(s)")
+            line = (f"[sweep] d{depth}-{norm}: best_val_loss={mean:.4f}{std_str} "
+                    f"over {agg['n_seeds']} seed(s) [selection statistic]")
+            if final_mean is not None:
+                final_std_str = '' if final_std is None else f' +/- {final_std:.4f}'
+                line += (f"; final_val_loss={final_mean:.4f}{final_std_str} "
+                         f"over {agg['n_seeds_final']} seed(s) [fixed-step estimate]")
+            else:
+                line += '; final_val_loss missing (legacy manifest) - cannot compare cells on the fixed-step estimate'
+            print(line)
         else:
             print(f"[sweep] d{depth}-{norm}: no usable best_val_loss in the run manifests")
+    comparison = compare_sweep_cells(aggs_by_depth, args.reference_norm)
+    print_sweep_comparisons(comparison)
+    comp_path = base / 'sweep_comparisons.json'
+    with open(comp_path, 'w') as f:
+        json.dump(comparison, f, indent=2)
+    print(f'[compare] comparisons -> {comp_path}')
     print('[sweep] done')
 if __name__ == '__main__':
     main()

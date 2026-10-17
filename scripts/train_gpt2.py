@@ -344,6 +344,7 @@ def main():
     best_val_step = 0
     val_checks_without_improvement = 0
     last_val_loss = None
+    last_val_step = None
     last_train_loss = None
     start_step = 0
     if resume_ckpt is not None:
@@ -529,6 +530,7 @@ def main():
             val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device)
             if val_loss is not None:
                 last_val_loss = val_loss
+                last_val_step = step
                 improved = val_loss < best_val_loss
                 if improved:
                     best_val_loss = val_loss
@@ -627,8 +629,15 @@ def main():
     run_manifest['results'] = {
         'final_step': step,
         'last_train_loss': last_train_loss,
+        # `best_val_loss` is the minimum over the validation passes: it is the
+        # checkpoint-selection statistic, so as a reported generalization
+        # estimate it is optimistically biased (the minimum of noisy draws).
+        # `final_val_loss` is the last held-out pass at the fixed training-step
+        # budget and is the number that makes two arms comparable.
         'best_val_loss': best_val_loss if val_loader is not None else None,
         'best_val_step': best_val_step if val_loader is not None else None,
+        'final_val_loss': last_val_loss if val_loader is not None else None,
+        'final_val_step': last_val_step if val_loader is not None else None,
         'n_loss_spikes': loss_spike.n_spikes,
         'n_nonfinite_losses': n_nonfinite_losses,
         'elapsed_s': time.time() - t0,
@@ -680,7 +689,7 @@ def main():
             print(f"[test] restored best-validation checkpoint (step {int(best.get('step', 0))}, val_loss={float(best.get('val_loss', float('nan'))):.4f}) before the one-shot test evaluation")
         test_state = {'iter': iter(test_loader)}
         test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device)
-        results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
+        results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
         with open(out_path, 'w') as f:
             json.dump(results, f, indent=2)
         run_manifest['data']['split_reports'] = data_reports

@@ -142,7 +142,10 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             gold_prob_sum += float(gold_p[m].sum().item())
             k = min(topk, V - 1)
             top = probs.topk(k, dim=-1)
-            gold_rank = (probs > gold_p.unsqueeze(-1)).sum(-1) + 1  # 1-based; ties count above
+            # 1-based rank; ties count above (>= counts the gold token itself,
+            # every strictly-larger probability and every tie, so a tie cannot
+            # flatter the model's ranking).
+            gold_rank = (probs >= gold_p.unsqueeze(-1)).sum(-1)
             topk_hits += int((top.indices == gold.unsqueeze(-1)).any(-1)[m].sum().item())
             gold_rank_sum += float(gold_rank[m].clamp(max=args.rank_clip).sum().item())
             n_positional += int(m.sum().item())
