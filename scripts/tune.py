@@ -87,6 +87,7 @@ def cached_trial_matches(summary: dict, arm: str, lr: float, args) -> bool:
         and data.get('batch_size') == args.batch_size
         and data.get('seq_len') == args.seq_len
         and controls.get('train_steps') == args.max_steps
+        and summary.get('n_val_batches') == max(1, args.val_batches)
     )
 
 
@@ -341,11 +342,13 @@ def print_comparison(comparison: dict | None) -> None:
         std_str = '' if std is None else f" +/- {std:.4f}"
         ci = entry.get('delta_ci_95')
         ci_str = '' if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        delta = entry.get('delta_vs_reference')
+        delta_str = 'n/a' if delta is None else f'{delta:+.4f}'
         basis = entry.get('test_basis') or '-'
         note = ' [descriptive only, not certified]' if entry.get('significance_basis') else ''
         print(f"[tune][compare] {entry['arm']:>12s} lr={entry['best_lr']:g} "
               f"val_loss={entry['val_loss']:.4f}{std_str} "
-              f"delta={entry['delta_vs_reference']:+.4f}{ci_str} p(one-sided)={p_str} "
+              f"delta={delta_str}{ci_str} p(one-sided)={p_str} "
               f"p(holm)={p_holm_str} paired_seeds={entry['n_paired_seeds']} "
               f"test={entry.get('test') or '-'}@{basis} "
               f"beats={entry['beats_reference']} "

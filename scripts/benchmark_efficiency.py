@@ -50,9 +50,13 @@ from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_see
 _BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
 
 
+def _is_cuda(device: str) -> bool:
+    return torch.device(device).type == 'cuda'
+
+
 def _sync(device: str) -> None:
-    if device == 'cuda':
-        torch.cuda.synchronize()
+    if _is_cuda(device):
+        torch.cuda.synchronize(device)
 
 
 def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
@@ -74,12 +78,12 @@ def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
 
 
 def measure_peak_memory(fn, device: str):
-    if device != 'cuda':
+    if not _is_cuda(device):
         return None
-    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_peak_memory_stats(device)
     fn()
     _sync(device)
-    return float(torch.cuda.max_memory_allocated()) / (1024 ** 2)
+    return float(torch.cuda.max_memory_allocated(device)) / (1024 ** 2)
 
 
 def measured_forward_flops(fn, tokens: int):
@@ -107,7 +111,7 @@ def benchmark_norm(model_name: str, norm: str, args, device: str) -> dict:
 
     autocast_ctx = (
         torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-        if (args.bf16 and device == 'cuda') else torch.autocast(device_type='cpu', enabled=False)
+        if (args.bf16 and _is_cuda(device)) else torch.autocast(device_type='cpu', enabled=False)
     )
 
     def forward():
@@ -124,8 +128,8 @@ def benchmark_norm(model_name: str, norm: str, args, device: str) -> dict:
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     fwd_timing = measure_timed(forward, args.iters, args.warmup, device)
-    train_timing = measure_timed(train_step, args.iters, args.warmup, device)
     fwd_mem = measure_peak_memory(forward, device)
+    train_timing = measure_timed(train_step, args.iters, args.warmup, device)
     train_mem = measure_peak_memory(train_step, device)
     model.zero_grad(set_to_none=True)
     flops = analytic_flops_per_token(model.cfg)
@@ -230,7 +234,7 @@ def main():
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     set_all_seeds(args.seed)
     print(f'[bench] model={args.model} device={device} batch={args.batch_size} seq={args.seq_len} '
-          f'iters={args.iters} warmup={args.warmup} bf16={args.bf16 and device == "cuda"}')
+          f'iters={args.iters} warmup={args.warmup} bf16={args.bf16 and _is_cuda(device)}')
     if args.hypothesis:
         print(f'[hypothesis] {args.hypothesis}')
     else:

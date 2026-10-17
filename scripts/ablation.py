@@ -338,6 +338,9 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     summary = {'name': name, 'hypothesis': hypothesis, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'seed': seed, 'seeds': [seed], 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'val_losses': val_losses, 'val_loss_std': val_stats['std'], 'val_loss_stderr': val_stats['stderr'], 'val_loss_std_basis': 'val_batches', 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'controls': controls, 'elapsed_s': time.time() - t0}
     if run_metadata is None:
         run_metadata = collect_run_metadata(seed=seed)
+    else:
+        run_metadata = dict(run_metadata)
+        run_metadata['seed'] = seed
     summary['run_metadata'] = run_metadata
     with open(output_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
@@ -464,15 +467,27 @@ def partition_rows_by_protocol(rows: list, args) -> tuple[list, list]:
             })
     return keep, stale
 
-def cached_seed_matches(summary: dict, name: str, cfg_kwargs: dict, args) -> bool:
-    """Whether a cached per-seed summary is the same row under the same recipe."""
-    return bool(
-        isinstance(summary, dict)
-        and summary.get('name') == name
-        and summary.get('model') == args.model
-        and summary.get('cfg') == cfg_kwargs
-        and row_protocol_signature(summary, args.model) == _protocol_signature(args)
-    )
+def cached_seed_matches(summary: dict, name: str, cfg_kwargs: dict, args, seed: int) -> bool:
+    """Whether a cached summary is the same seed of the same row under the same recipe.
+
+    The path does not always encode the seed (a single-seed run writes its
+    summary directly under the row directory), so the recorded seed must be
+    compared too: otherwise a cached run is silently reused as another seed.
+    """
+    if not (isinstance(summary, dict)
+            and summary.get('name') == name
+            and summary.get('model') == args.model
+            and summary.get('cfg') == cfg_kwargs
+            and row_protocol_signature(summary, args.model) == _protocol_signature(args)):
+        return False
+    per_seed = summary.get('per_seed')
+    if isinstance(per_seed, list) and len(per_seed) > 1:
+        return False
+    recorded = summary.get('seed')
+    if recorded is None:
+        seeds = summary.get('seeds')
+        recorded = seeds[0] if isinstance(seeds, list) and seeds else None
+    return recorded is not None and int(recorded) == int(seed)
 
 def merge_summaries(previous: list, fresh: list) -> list:
     merged: dict[str, dict] = {}
@@ -1093,7 +1108,7 @@ def main():
             if path.exists() and (not args.force):
                 summary = _load_summary(path)
                 if isinstance(summary, dict):
-                    if cached_seed_matches(summary, name, cfg_kwargs, args):
+                    if cached_seed_matches(summary, name, cfg_kwargs, args, seed):
                         print(f'[skip] {name} seed={seed} already done, use --force to rerun')
                         seed_summaries.append(summary)
                         continue
