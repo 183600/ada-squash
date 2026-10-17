@@ -40,12 +40,13 @@ import math
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
-from adasquash.diagnostics import triage_nonfinite
+from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
@@ -291,6 +292,24 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     outlier_id = install_outlier_channel(model)
     losses = []
     stats_windowed = False
+    # In-training curve monitoring. The held-out stream for the curve is a
+    # *separate* generator (seed + 2): the selection metric's generator
+    # (seed + 1) is only consumed after training, so the per-batch val losses
+    # that rows are paired on stay bit-identical whether or not the curve ran.
+    # Without this a row is summarized by its final number alone, and a delta
+    # produced while one arm was still underfit/overfit reads as a norm effect.
+    curve_every = int(getattr(args, 'curve_every', 0) or 0)
+    if curve_every == 0:
+        curve_every = max(1, int(args.max_steps) // 5)
+    elif curve_every < 0:
+        curve_every = 0
+    curve_batches = max(1, int(getattr(args, 'curve_batches', 5) or 5))
+    curve_rng = torch.Generator(device=device).manual_seed(seed + 2)
+    curve_train: list = []
+    curve_val: list = []
+    curve_steps: list = []
+    curve_diagnoses: list = []
+    curve_window_start = 0
     t0 = time.time()
     for step in range(args.max_steps):
         x, y = markov_batch(rng, model.cfg.ignore_index, args.batch_size, args.seq_len, device, outlier_id=outlier_id)
@@ -321,6 +340,41 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         losses.append(loss_val)
         if step % args.log_every == 0:
             print(f'  [step {step:4d}] loss={loss_val:.4f}', flush=True)
+        if curve_every > 0 and (step + 1) % curve_every == 0:
+            window = losses[curve_window_start:]
+            curve_window_start = len(losses)
+            train_point = sum(window) / max(1, len(window))
+            model.eval()
+            with torch.no_grad():
+                held = [model(*markov_batch(curve_rng, model.cfg.ignore_index, args.batch_size,
+                                            args.seq_len, device, outlier_id=outlier_id),
+                              return_logits=False)[1].item()
+                        for _ in range(curve_batches)]
+            model.train()
+            curve_train.append(train_point)
+            curve_val.append(sum(held) / len(held))
+            curve_steps.append(step + 1)
+            diagnosis = diagnose_train_val_curve(
+                curve_train, curve_val, train_steps=curve_steps, val_steps=curve_steps,
+                log_vocab_size=math.log(model.cfg.vocab_size),
+            )
+            curve_diagnoses.append({
+                'step': step + 1,
+                'classification': diagnosis['classification'],
+                'train_trend': diagnosis['train_trend'],
+                'val_trend': diagnosis['val_trend'],
+                'train_window_loss': train_point,
+                'val_loss': curve_val[-1],
+                'generalization_gap': diagnosis['generalization_gap'],
+                'recommendations': diagnosis['recommendations'],
+            })
+            if diagnosis['classification'] != 'insufficient_data':
+                print(f"  [curve] step={step + 1} train_window={train_point:.4f} "
+                      f"val={curve_val[-1]:.4f} -> {diagnosis['classification']} "
+                      f"(train {diagnosis['train_trend']}, val {diagnosis['val_trend']})", flush=True)
+                if diagnosis['classification'] not in ('healthy', 'insufficient_data'):
+                    for line in diagnosis['recommendations']:
+                        print(f'  [curve]   action: {line}')
     if not losses:
         raise ValueError(f"ablation '{name}' produced no steps")
     # Held-out validation loss: fresh synthetic batches from a generator the
@@ -353,6 +407,13 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         'data': {'generator': 'markov_batch', 'batch_size': args.batch_size,
                  'seq_len': args.seq_len, 'outlier_id': outlier_id,
                  'val_seed_offset': 1, 'val_batches': n_val_batches},
+        'curve_monitoring': {
+            'every': curve_every, 'batches': curve_batches,
+            'val_seed_offset': 2,
+            'note': ('curve points are held-out; their generator (seed+2) is disjoint '
+                     'from the selection-val generator (seed+1), so enabling the curve '
+                     'does not change the paired val batches'),
+        },
         'train_steps': args.max_steps,
         'seed': seed,
     }
@@ -363,9 +424,26 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         run_metadata = dict(run_metadata)
         run_metadata['seed'] = seed
     summary['run_metadata'] = run_metadata
+    # The curve block: the per-point train/val pair and the regime verdict made
+    # at each point, so a row is read as a training curve, not a final number.
+    summary['curve_train_window_loss'] = curve_train
+    summary['curve_val_loss'] = curve_val
+    summary['curve_steps'] = curve_steps
+    summary['curve_diagnosis'] = curve_diagnoses[-1] if curve_diagnoses else None
+    summary['curve_diagnosis_history'] = curve_diagnoses
+    summary['curve_classification'] = (curve_diagnoses[-1]['classification']
+                                       if curve_diagnoses else None)
     with open(output_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
-    print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} max_abs_pre_norm={summary['max_abs_pre_norm']}")
+    final_curve = ''
+    if curve_diagnoses:
+        last_curve = curve_diagnoses[-1]
+        gap = last_curve['generalization_gap']
+        gap_str = 'n/a' if gap is None else f'{gap:+.4f}'
+        final_curve = (f" curve={last_curve['classification']} "
+                       f"(train {last_curve['train_trend']}, val {last_curve['val_trend']}, gap={gap_str})")
+    print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} "
+          f"max_abs_pre_norm={summary['max_abs_pre_norm']}{final_curve}")
     return summary
 
 def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None=None, hypothesis: str | None=None) -> dict:
@@ -393,6 +471,10 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
             'mean_last_100_loss': s.get('mean_last_100_loss'),
             'n_loss_spikes': s.get('n_loss_spikes'),
             'elapsed_s': s.get('elapsed_s'),
+            # The final curve verdict of this run (None for summaries written
+            # before curve monitoring existed, or for very short runs).
+            'curve_classification': s.get('curve_classification'),
+            'curve_diagnosis': s.get('curve_diagnosis'),
         })
     seed_losses = [p['val_loss'] for p in per_seed if isinstance(p['val_loss'], (int, float))]
     stats = mean_std_stderr(seed_losses) or {'mean': None, 'std': None, 'stderr': None, 'n': 0}
@@ -430,6 +512,18 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
                              if isinstance(p.get('n_loss_spikes'), (int, float))),
         'elapsed_s': sum(p['elapsed_s'] or 0.0 for p in per_seed
                          if isinstance(p.get('elapsed_s'), (int, float))),
+        # Curve regimes across the row's seeds: a seed whose run was still
+        # underfit/stalled or already overfitting/diverging makes its
+        # val_loss a statement about that regime as much as about the norm,
+        # so the aggregate keeps the verdicts visible instead of hiding them
+        # behind one mean.
+        'curve_classification_counts': dict(Counter(
+            p['curve_classification'] for p in per_seed if p.get('curve_classification'))),
+        'curve_classifications_by_seed': {
+            str(p['seed']): p.get('curve_classification') for p in per_seed},
+        'curve_last_generalization_gap_by_seed': {
+            str(p['seed']): (p.get('curve_diagnosis') or {}).get('generalization_gap')
+            for p in per_seed},
     })
     return agg
 
@@ -714,6 +808,12 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             't': None,
             'df': None,
             'delta_ci_95': None,
+            # Curve regimes of the row's seeds (None for pre-monitoring
+            # summaries): a delta measured while one arm is underfit or
+            # overfitting is annotated, so it cannot be read as pure norm
+            # effect. It does not alter the significance test - the regime is
+            # itself a property of the norm at the fixed step budget.
+            'curve_classification_counts': row.get('curve_classification_counts'),
         }
         test, basis, common = _paired_row_test(row, reference, margin=margin)
         entry['test_basis'] = basis
@@ -795,11 +895,19 @@ def print_baseline_comparison(comparison: dict | None) -> None:
             note = f" [{entry['excluded_from_family']}]"
         elif entry.get('significance_basis'):
             note = ' [descriptive only, not certified]'
+        regimes = entry.get('curve_classification_counts')
+        regime_note = ''
+        if regimes:
+            off_regime = {k: v for k, v in regimes.items()
+                          if k not in ('healthy', 'insufficient_data')}
+            if off_regime:
+                regime_note = (f" [curve regimes {off_regime}: the delta was not measured "
+                               f"in a healthy falling-falling regime - read the curve block]")
         print(f"[compare] {entry['name']:>32s} val_loss={entry['val_loss']:.4f}{std_str} "
               f"delta={entry['delta_vs_reference']:+.4f}{ci_str} p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{basis} "
               f"beats={entry['beats_reference']} "
-              f"significant={entry['beats_reference_significantly']}{note}")
+              f"significant={entry['beats_reference_significantly']}{note}{regime_note}")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[compare] NOTE: single-run batch-level tests (fewer than 2 shared seeds) are described "
               f"but never certified: {comparison['rows_tested_descriptively_only']}")
@@ -937,6 +1045,8 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 'reference_val_loss_std': None if ref is None else _row_std(ref),
                 'n_seeds_full': None if full is None else full.get('n_seeds', 1),
                 'n_seeds_reference': None if ref is None else ref.get('n_seeds', 1),
+                'full_curve_classification_counts': None if full is None else full.get('curve_classification_counts'),
+                'reference_curve_classification_counts': None if ref is None else ref.get('curve_classification_counts'),
                 'run_identity_full': None if full is None else _run_identity(full, parent_of),
                 'run_identity_reference': None if ref is None else _run_identity(ref, parent_of),
                 'delta_full_minus_reference': None,
@@ -1053,6 +1163,14 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
             note = f" [{entry['excluded_from_family']}]"
         elif entry.get('significance_basis'):
             note = ' [descriptive only, not certified]'
+        regime_note = ''
+        for label, key in (('full', 'full_curve_classification_counts'),
+                           ('ref', 'reference_curve_classification_counts')):
+            regimes = entry.get(key)
+            off_regime = {k: v for k, v in (regimes or {}).items()
+                          if k not in ('healthy', 'insufficient_data')}
+            if off_regime:
+                regime_note += f" [{label} curve regimes {off_regime}]"
         print(f"[loo] {entry['mechanism']:>22s}: {entry['full']} "
               f"val_loss={entry['full_val_loss']:.4f}{full_std_str} vs "
               f"{entry['reference_row']} val_loss={entry['reference_val_loss']:.4f}{ref_std_str} "
@@ -1060,7 +1178,7 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
               f"p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{entry.get('test_basis') or '-'} "
               f"removing_hurts={entry['mechanism_helps']} "
-              f"significant={entry['mechanism_helps_significantly']}{note}")
+              f"significant={entry['mechanism_helps_significantly']}{note}{regime_note}")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[loo] NOTE: single-run batch-level tests (fewer than 2 shared seeds) are described "
               f"but never certified: {comparison['rows_tested_descriptively_only']}")
@@ -1097,6 +1215,8 @@ def main():
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--stats-every', type=int, default=200)
     p.add_argument('--val-batches', type=int, default=20, help='held-out synthetic batches for the selection metric (val_loss); never used for gradient updates')
+    p.add_argument('--curve-every', type=int, default=0, help='held-out curve-monitoring period in steps (0 = auto: max_steps//5; negative = disabled). Curve points come from a separate generator (seed+2) and never touch the selection batches, so a row reports its train/val regime, not only its final number')
+    p.add_argument('--curve-batches', type=int, default=5, help='held-out batches per curve-monitoring point')
     p.add_argument('--baselines', nargs='+', default=['ln_baseline', 'rmsnorm_baseline'], help='rows treated as the simple reference baselines in the baseline-relative comparison')
     p.add_argument('--simple-baselines', default=None, help='Bayes-limit calibration JSON from scripts/baseline_simple.py; when omitted, auto-detected at <output-dir>/simple_baselines.json. Adds the tuned simple baseline and the memoryless-Bayes-floor / full-context-ceiling gaps to baseline_comparison.json')
     p.add_argument('--baseline-margin', type=float, default=0.0, help='minimum val_loss improvement over the best baseline to count as a win')
@@ -1130,6 +1250,23 @@ def main():
     multi = len(seeds) > 1
     all_summaries = []
     trained: dict[str, str] = {}
+
+    def _report_curve_regimes(agg: dict) -> None:
+        """Print the row's per-seed curve verdicts next to its aggregate."""
+        regimes = agg.get('curve_classification_counts') or {}
+        if not regimes:
+            print(f"  [curve] {agg.get('name')}: no curve diagnosis in the cached "
+                  f"summaries (pre-monitoring row); rerun with --force to record the "
+                  f"train/val regimes")
+            return
+        print(f"  [curve] {agg['name']}: {regimes}")
+        off = {k: v for k, v in regimes.items() if k not in ('healthy', 'insufficient_data')}
+        if off:
+            print(f"  [curve] WARNING: {agg['name']} has seed(s) in {off}: the val_loss "
+                  f"delta may reflect that regime (underfit/stalled/overfit/diverging) as "
+                  f"much as the module; read curve_val_loss and the per-seed verdicts "
+                  f"before attributing it to the norm")
+
     for name in args.names:
         if name not in ablations:
             print(f"[warn] unknown ablation '{name}', skipping")
@@ -1155,6 +1292,7 @@ def main():
                     agg = aggregate_seed_summaries(name, reused, cfg_kwargs, hypotheses.get(name))
                     _write_summary(row_dir / 'summary.json', agg)
                     print(f'[alias] {name}: identical model config to {source}, reusing its summaries (no retrain)')
+                    _report_curve_regimes(agg)
                     trained[config_key] = name
                     all_summaries.append(agg)
                     continue
@@ -1173,6 +1311,7 @@ def main():
             seed_summaries.append(run_one(name, cfg_kwargs, args, path.parent, run_metadata=run_metadata, hypothesis=hypotheses.get(name), seed=seed))
         agg = aggregate_seed_summaries(name, seed_summaries, cfg_kwargs, hypotheses.get(name))
         _write_summary(row_dir / 'summary.json', agg)
+        _report_curve_regimes(agg)
         trained[config_key] = name
         all_summaries.append(agg)
     agg_path = base / 'all_summaries.json'
@@ -1225,6 +1364,14 @@ def main():
     manifest['matrix_validation'] = matrix_report
     manifest['rows'] = [row['name'] for row in ordered]
     manifest['rows_excluded_protocol_mismatch'] = stale_rows
+    # Curve regimes per row (per-seed classification counts): the run manifest
+    # keeps the train/val regime each comparison was measured in, so a future
+    # reader can tell a healthy falling-falling delta from an early-stopped
+    # underfit or an overfitting one without re-reading every summary.json.
+    manifest['curve_regimes'] = {
+        row.get('name'): row.get('curve_classification_counts')
+        for row in ordered if isinstance(row, dict) and row.get('name')
+    }
     manifest['baseline_comparison'] = comparison
     manifest['leave_one_out_comparison'] = loo_comparison
     save_run_manifest(base / 'run_manifest.json', manifest)

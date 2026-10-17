@@ -93,15 +93,43 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         path = seed_dir(cell_dir, seed, multi) / 'run_manifest.json'
         best = None
         final = None
+        curve = None
+        n_params = None
+        breakdown = None
+        flops_fwd = None
+        flops_train = None
+        spikes = None
+        nonfinite = None
         try:
             manifest = json.loads(path.read_text())
             if isinstance(manifest, dict):
                 results = manifest.get('results') or {}
                 best = results.get('best_val_loss')
                 final = results.get('final_val_loss')
+                # Curve + efficiency records already travel in every run
+                # manifest; the sweep must pool them instead of dropping them,
+                # otherwise a depth cell is read from one final number and a
+                # wider/deeper cell's extra cost is invisible.
+                curve = results.get('curve_diagnosis')
+                n_params = results.get('n_params')
+                breakdown = results.get('parameter_breakdown')
+                flops_fwd = results.get('flops_per_token_forward')
+                flops_train = results.get('flops_per_token_training_est')
+                spikes = results.get('n_loss_spikes')
+                nonfinite = results.get('n_nonfinite_losses')
         except (OSError, json.JSONDecodeError):
             pass
-        per_seed.append({'seed': int(seed), 'best_val_loss': best, 'final_val_loss': final})
+        per_seed.append({
+            'seed': int(seed), 'best_val_loss': best, 'final_val_loss': final,
+            'curve_classification': (curve or {}).get('classification'),
+            'curve_generalization_gap': (curve or {}).get('generalization_gap'),
+            'n_params': n_params,
+            'norm_share_of_params': (breakdown or {}).get('norm_share_of_total'),
+            'flops_per_token_forward': flops_fwd,
+            'flops_per_token_training_est': flops_train,
+            'n_loss_spikes': spikes,
+            'n_nonfinite_losses': nonfinite,
+        })
 
     def _pool(key: str):
         vals = [p[key] for p in per_seed if isinstance(p[key], (int, float))]
@@ -110,6 +138,22 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
     best_vals, best_stats = _pool('best_val_loss')
     final_vals, final_stats = _pool('final_val_loss')
     seed_list = [int(s) for s in seeds]
+    curve_counts: dict = {}
+    for p in per_seed:
+        if p.get('curve_classification'):
+            curve_counts[p['curve_classification']] = curve_counts.get(p['curve_classification'], 0) + 1
+    gaps = [p['curve_generalization_gap'] for p in per_seed
+            if isinstance(p.get('curve_generalization_gap'), (int, float))]
+    # Efficiency accounting pooled next to the losses: the shared recipe
+    # (same dim/heads per depth) makes n_params and FLOPs/token identical
+    # across a cell's seeds, so any cross-seed spread here is a red flag.
+    params = [p['n_params'] for p in per_seed if isinstance(p.get('n_params'), (int, float))]
+    norm_shares = [p['norm_share_of_params'] for p in per_seed
+                   if isinstance(p.get('norm_share_of_params'), (int, float))]
+    flops_fwd = [p['flops_per_token_forward'] for p in per_seed
+                 if isinstance(p.get('flops_per_token_forward'), (int, float))]
+    flops_train = [p['flops_per_token_training_est'] for p in per_seed
+                   if isinstance(p.get('flops_per_token_training_est'), (int, float))]
     # A run that crashed, diverged or never finished leaves no readable
     # manifest. Pooling only the survivors would silently turn "this norm
     # destabilized 2 of 3 seeds" into a clean mean over the lucky seed, so the
@@ -136,9 +180,25 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         'final_val_loss': None if final_stats is None else final_stats['mean'],
         'final_val_loss_std': None if final_stats is None or len(final_vals) < 2 else final_stats['std'],
         'final_val_loss_std_basis': 'seeds' if len(final_vals) >= 2 else 'single_run',
+        'curve_classification_counts': curve_counts,
+        'curve_classifications_by_seed': {p['seed']: p.get('curve_classification') for p in per_seed},
+        'curve_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
+        'n_params': (sum(params) / len(params)) if params else None,
+        'n_params_by_seed': {p['seed']: p.get('n_params') for p in per_seed},
+        'norm_share_of_params': (sum(norm_shares) / len(norm_shares)) if norm_shares else None,
+        'flops_per_token_forward': (sum(flops_fwd) / len(flops_fwd)) if flops_fwd else None,
+        'flops_per_token_training_est': (sum(flops_train) / len(flops_train)) if flops_train else None,
+        'n_loss_spikes': sum(p['n_loss_spikes'] or 0 for p in per_seed
+                             if isinstance(p.get('n_loss_spikes'), (int, float))),
+        'n_nonfinite_losses': sum(p['n_nonfinite_losses'] or 0 for p in per_seed
+                                  if isinstance(p.get('n_nonfinite_losses'), (int, float))),
         'aggregation': ('Mean +/- Std across seeds (each seed is an independent run of the identical recipe). '
                         'best_val_loss = min over validation passes (checkpoint-selection statistic, optimistically biased); '
                         'final_val_loss = last validation pass (fixed-step estimate, comparable across cells when early stopping is off). '
+                        'curve_classification_counts = per-seed final train/val regime: a cell whose mean was produced '
+                        'while some seed was underfit/stalled or overfitting/diverging must not be read as a clean '
+                        'depth/norm effect. n_params/flops_per_token_* = efficiency accounting (identical across the '
+                        'cell seeds by construction) so the accuracy delta can be weighed against its cost. '
                         'missing_seeds = failed/unfinished runs, excluded from the mean but never from the report: '
                         'a cell with missing seeds is not a clean replication.'),
     }
@@ -200,6 +260,15 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 'candidate_missing_seeds': None,
                 'reference_missing_seeds': None,
                 'complete': True,
+                # Each side's per-seed curve regimes and cost, so a delta is
+                # read next to the regime it was measured in and the
+                # params/FLOPs it bought.
+                'candidate_curve_classification_counts': by_norm[norm].get('curve_classification_counts'),
+                'reference_curve_classification_counts': ref.get('curve_classification_counts'),
+                'candidate_n_params': by_norm[norm].get('n_params'),
+                'reference_n_params': ref.get('n_params'),
+                'candidate_flops_per_token_forward': by_norm[norm].get('flops_per_token_forward'),
+                'reference_flops_per_token_forward': ref.get('flops_per_token_forward'),
             }
             requested = sorted(set(ref.get('seeds') or []) | set(by_norm[norm].get('seeds') or []))
             entry['candidate_missing_seeds'] = [s for s in requested if s not in cand_seeds]
@@ -244,7 +313,10 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                           '`n_seeds_favoring`/3 and the `delta_ci_95` range next to the p-value before '
                           'treating a delta as real. A cell with `missing_seeds` '
                           '(`incomplete_cells`) is never certified as significantly better: which runs '
-                          'survived is itself a selection effect.'),
+                          'survived is itself a selection effect. Every row also carries the two sides\' '
+                          '`*_curve_classification_counts` and `*_n_params` / '
+                          '`*_flops_per_token_forward`: an off-healthy-regime side or an uncounted '
+                          'params/FLOPs increase means the delta is not yet a depth/norm claim.'),
     }
 
 def print_sweep_comparisons(comparison: dict) -> None:
@@ -269,8 +341,19 @@ def print_sweep_comparisons(comparison: dict) -> None:
         if not r.get('complete', True):
             miss = (f" INCOMPLETE(candidate missing {r['candidate_missing_seeds']}, "
                     f"reference missing {r['reference_missing_seeds']})")
+        regime = ''
+        for label, key in (('cand', 'candidate_curve_classification_counts'),
+                           ('ref', 'reference_curve_classification_counts')):
+            off = {k: v for k, v in (r.get(key) or {}).items()
+                   if k not in ('healthy', 'insufficient_data')}
+            if off:
+                regime += f" [{label} curve regimes {off}: delta measured off a healthy regime]"
+        cost = ''
+        c_params, r_params = r.get('candidate_n_params'), r.get('reference_n_params')
+        if c_params is not None and r_params is not None:
+            cost = f" params={c_params / 1e6:.2f}M vs {r_params / 1e6:.2f}M"
         print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{ci_str}{sign} "
-              f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}")
+              f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}{cost}{regime}")
     if comparison.get('incomplete_cells'):
         print(f"[compare] WARNING: {len(comparison['incomplete_cells'])} comparison(s) involve a cell "
               f"with missing seed runs; significance is withheld there: "
@@ -478,6 +561,36 @@ def main():
             print(line)
         else:
             print(f"[sweep] d{depth}-{norm}: no usable best_val_loss in the run manifests")
+        regimes = agg.get('curve_classification_counts') or {}
+        if regimes:
+            line = f"[sweep] d{depth}-{norm}: curve regimes {regimes}"
+            gap = agg.get('curve_generalization_gap')
+            if gap is not None:
+                line += f" (mean gap={gap:+.4f})"
+            print(line)
+            off = {k: v for k, v in regimes.items()
+                   if k not in ('healthy', 'insufficient_data')}
+            if off:
+                print(f"[sweep] WARNING: d{depth}-{norm}: {sum(off.values())} seed(s) ended in "
+                      f"{off}: the pooled val_loss describes that regime as much as the norm; "
+                      f"read the per-seed curves before attributing depth/norm effects")
+        else:
+            print(f"[sweep] d{depth}-{norm}: no curve diagnosis in the run manifests (legacy run)")
+        if agg.get('n_params') is not None:
+            eff = f"[sweep] d{depth}-{norm}: n_params={agg['n_params'] / 1e6:.2f}M"
+            share = agg.get('norm_share_of_params')
+            if share is not None:
+                eff += f" (norm share={share * 100:.2f}%)"
+            fwd = agg.get('flops_per_token_forward')
+            train = agg.get('flops_per_token_training_est')
+            if fwd is not None:
+                eff += f" flops/token fwd={fwd / 1e6:.2f}M"
+            if train is not None:
+                eff += f" train_est={train / 1e6:.2f}M"
+            print(eff)
+        if agg.get('n_nonfinite_losses'):
+            print(f"[sweep] WARNING: d{depth}-{norm}: {agg['n_nonfinite_losses']} non-finite "
+                  f"loss step(s) across seeds; triage with adasquash.diagnostics.triage_nonfinite")
         if agg.get('missing_seeds'):
             print(f"[sweep] WARNING: d{depth}-{norm}: missing/unfinished runs for seeds "
                   f"{agg['missing_seeds']}; the pooled mean covers {agg['n_seeds']} of "

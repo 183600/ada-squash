@@ -3,6 +3,7 @@ import argparse
 import sys
 import json
 import random
+from collections import Counter
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -77,9 +78,26 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
 
     A trial is pass/fail, so the point estimate alone hides its resolution:
     with `return_counts=True` the result is
-    `{'accuracy', 'n_correct', 'n_trials', 'ci95_low', 'ci95_high'}` with a
-    Wilson 95% interval over the trials. The default return (a float) is kept
-    for callers that only need the accuracy.
+    `{'accuracy', 'n_correct', 'n_trials', 'ci95_low', 'ci95_high', 'failures',
+    'failure_causes', 'failure_confidence'}` with a Wilson 95% interval over
+    the trials. The default return (a float) is kept for callers that only
+    need the accuracy.
+
+    Every failed trial also yields a *bad-case record* (token ids and logit
+    statistics only, no text: tokenizer mocks in tests have no decode): where
+    the needle sat, at which decode step the model first diverged from the
+    secret, what it predicted instead, the expected token's rank and
+    probability, the logit margin, whether the wrong prediction merely copied
+    a context token, and a cause/confidence label. `failure_causes` aggregates
+    those labels as
+    `retrieval_miss` (failed on the first secret token),
+    `context_copy` (drifted, predicted a token present in the context) or
+    `decode_drift` (drifted otherwise); `failure_confidence` separates
+    `near_miss` (expected in top-5), `confident_wrong` (top-1 prob >= 0.5)
+    from `diffuse`. A reported accuracy of 0.0 with `retrieval_miss` for every
+    trial means something different from 0.0 with `decode_drift`: the first
+    says the model never located the needle, the second says it found it and
+    lost it while decoding.
     """
     rng = random.Random(seed)
     tok = tokenizer
@@ -99,8 +117,9 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         raise ValueError('haystack_prompt tokenizes to zero tokens')
     n_correct = 0
     n_run = 0
+    failures: list = []
     last_logits = getattr(model, 'last_position_logits', None)
-    for _ in range(n_trials):
+    for trial_idx in range(n_trials):
         body_len = context_len - len(needle_ids) - len(question_ids) - 2
         if body_len < len(prompt_ids):
             raise ValueError(f'context_len={context_len} is too short to hold the needle ({len(needle_ids)} tok) + question ({len(question_ids)} tok) + one haystack repeat ({len(prompt_ids)} tok)')
@@ -126,6 +145,45 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                 generated.append(nxt)
                 if nxt != want:
                     correct = False
+                    # Bad-case record: enough statistics to say *how* the
+                    # decode failed, without decoding any token id to text
+                    # (tokenizer mocks in tests have no decode method).
+                    probs = torch.softmax(step_logits[0].float(), dim=-1)
+                    rank = int((torch.argsort(step_logits[0], descending=True) == want)
+                               .nonzero(as_tuple=True)[0][0].item())
+                    top_prob = float(probs[nxt].item())
+                    in_context = bool((buf[0, :n] == nxt).any().item())
+                    prefix_ok = len(generated) - 1
+                    if prefix_ok == 0:
+                        cause = 'retrieval_miss'
+                    elif in_context:
+                        cause = 'context_copy'
+                    else:
+                        cause = 'decode_drift'
+                    if rank <= 5:
+                        confidence = 'near_miss'
+                    elif top_prob >= 0.5:
+                        confidence = 'confident_wrong'
+                    else:
+                        confidence = 'diffuse'
+                    failures.append({
+                        'trial': trial_idx,
+                        'needle_position': pos,
+                        'context_len': len(full),
+                        'failure_step': prefix_ok,
+                        'n_target_tokens': len(target_ids),
+                        'generated_ids': list(generated),
+                        'expected_id': int(want),
+                        'predicted_id': nxt,
+                        'expected_rank': rank,
+                        'expected_prob': float(probs[want].item()),
+                        'predicted_prob': top_prob,
+                        'logit_margin_over_expected': float(
+                            (step_logits[0, nxt] - step_logits[0, want]).item()),
+                        'predicted_in_context': in_context,
+                        'cause': cause,
+                        'confidence': confidence,
+                    })
                     break
                 buf[0, n] = nxt
                 n += 1
@@ -136,7 +194,10 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     if return_counts:
         low, high = wilson_interval(n_correct, n_run)
         return {'accuracy': acc, 'n_correct': n_correct, 'n_trials': n_run,
-                'ci95_low': low, 'ci95_high': high}
+                'ci95_low': low, 'ci95_high': high,
+                'failures': failures,
+                'failure_causes': dict(Counter(f['cause'] for f in failures)),
+                'failure_confidence': dict(Counter(f['confidence'] for f in failures))}
     return acc
 
 def main():
@@ -171,6 +232,10 @@ def main():
         results['needle_ctx_len'] = ctx_len
         print(f"[eval] needle-in-haystack accuracy @ {ctx_len} = {needle['accuracy']:.3f} "
               f"({needle['n_correct']}/{needle['n_trials']}, 95% CI [{needle['ci95_low']:.3f}, {needle['ci95_high']:.3f}])")
+        if needle['failure_causes']:
+            print(f"[eval] needle failure causes: {needle['failure_causes']} "
+                  f"confidence: {needle['failure_confidence']} "
+                  f"(per-trial bad-case records in the results JSON)")
     results['seed'] = args.seed
     results['run_metadata'] = collect_run_metadata(seed=args.seed)
     out = args.output or Path(args.ckpt).parent / 'eval_results.json'

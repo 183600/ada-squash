@@ -53,6 +53,7 @@ import argparse
 import copy
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -125,6 +126,12 @@ def _trial_record(summary: dict, lr: float, seed: int) -> dict:
         'val_loss_stderr': summary.get('val_loss_stderr'),
         'val_losses': summary.get('val_losses'),
         'final_loss': summary.get('final_loss'),
+        # The trial's final train/val regime: a trial still flat on both
+        # curves is an underfit/stalled optimization cell whose val_loss
+        # describes that regime, not the norm; selecting the lr grid must not
+        # hide it.
+        'curve_classification': summary.get('curve_classification'),
+        'curve_generalization_gap': (summary.get('curve_diagnosis') or {}).get('generalization_gap'),
     }
 
 
@@ -137,10 +144,15 @@ def tune_arm(arm: str, args, base: Path) -> dict:
             trials.append(_trial_record(summary, lr, seed))
     lr_grid = {}
     for lr in args.lrs:
-        losses = [t['val_loss'] for t in trials
-                  if t['lr'] == lr and isinstance(t['val_loss'], (int, float))]
+        cell = [t for t in trials if t['lr'] == lr]
+        losses = [t['val_loss'] for t in cell if isinstance(t['val_loss'], (int, float))]
         stats = mean_std_stderr(losses)
         if stats is not None:
+            stats = dict(stats)
+            stats['curve_classification_counts'] = dict(Counter(
+                t['curve_classification'] for t in cell if t.get('curve_classification')))
+            stats['curve_classifications_by_seed'] = {
+                t['seed']: t.get('curve_classification') for t in cell}
             lr_grid[f'{lr:g}'] = stats
     if not lr_grid:
         return {'arm': arm, 'trials': trials, 'lr_grid': {}, 'best': None}
@@ -212,6 +224,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
         'reference_val_loss_std': ref_std,
         'reference_n_seeds': ref_n,
         'reference_selection_val_loss': ref['best']['mean'],
+        'reference_curve_classification_counts': ref['best'].get('curve_classification_counts'),
         'reference_split': split,
         'confirm_ignored_arms': sorted(confirm_ran - confirm_ready),
         'margin': margin,
@@ -245,6 +258,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
             'val_loss_std': arm_std,
             'n_seeds': arm_n,
             'selection_val_loss': r['best']['mean'],
+            'curve_classification_counts': r['best'].get('curve_classification_counts'),
             'delta_vs_reference': delta,
             'n_paired_seeds': len(common),
             'beats_reference': bool(delta is not None and delta < -margin),
@@ -321,18 +335,28 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
     return out
 
 
+def _off_regime(regimes) -> dict:
+    """Seeds of the tuned cell whose final train/val regime is not healthy."""
+    return {k: v for k, v in (regimes or {}).items()
+            if k not in ('healthy', 'insufficient_data')}
+
+
 def print_comparison(comparison: dict | None) -> None:
     if comparison is None:
         print('[tune][compare] no tuned baseline arm present; comparison skipped')
         return
     ref_std = comparison.get('reference_val_loss_std')
     ref_std_str = '' if ref_std is None else f" +/- {ref_std:.4f}"
+    ref_note = ''
+    ref_off = _off_regime(comparison.get('reference_curve_classification_counts'))
+    if ref_off:
+        ref_note = f" [curve regimes {ref_off}: the reference lr was selected in a non-healthy regime]"
     print(f"[tune][compare] reference: arm={comparison['reference_arm']} "
           f"lr={comparison['reference_lr']:g} "
           f"val_loss={comparison['reference_val_loss']:.4f}{ref_std_str} "
           f"n_seeds={comparison.get('reference_n_seeds')} "
           f"(split={comparison['reference_split']}; "
-          f"selection-seed mean={comparison['reference_selection_val_loss']:.4f})")
+          f"selection-seed mean={comparison['reference_selection_val_loss']:.4f}){ref_note}")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_holm = entry.get('p_one_sided_holm')
@@ -346,6 +370,10 @@ def print_comparison(comparison: dict | None) -> None:
         delta_str = 'n/a' if delta is None else f'{delta:+.4f}'
         basis = entry.get('test_basis') or '-'
         note = ' [descriptive only, not certified]' if entry.get('significance_basis') else ''
+        off = _off_regime(entry.get('curve_classification_counts'))
+        if off:
+            note += (f" [curve regimes {off}: the arm's best lr was picked in a non-healthy "
+                     f"regime - read the trial curves before attributing the delta to the norm]")
         print(f"[tune][compare] {entry['arm']:>12s} lr={entry['best_lr']:g} "
               f"val_loss={entry['val_loss']:.4f}{std_str} "
               f"delta={delta_str}{ci_str} p(one-sided)={p_str} "
@@ -381,6 +409,8 @@ def main():
     p.add_argument('--log-every', type=int, default=200)
     p.add_argument('--stats-every', type=int, default=10 ** 9)
     p.add_argument('--val-batches', type=int, default=20, help='held-out synthetic batches per trial (selection metric)')
+    p.add_argument('--curve-every', type=int, default=0, help='held-out curve-monitoring period in steps per trial (0 = auto: max_steps//5; negative = disabled); forwarded to ablation.run_one, so every trial records the train/val regime its val_loss was selected in')
+    p.add_argument('--curve-batches', type=int, default=5, help='held-out batches per curve-monitoring point')
     p.add_argument('--margin', type=float, default=0.0, help='minimum val_loss improvement over the tuned baseline to count as a win')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided test')
     p.add_argument('--output-dir', default='runs/tune')
@@ -409,6 +439,19 @@ def main():
             b = tuned[arm]['best']
             print(f"[tune] {arm}: best lr={b['lr']:g} val_loss={b['mean']:.4f} "
                   f"(stderr={b['stderr']:.4f} over {b['n']} runs)")
+            regimes = b.get('curve_classification_counts') or {}
+            if regimes:
+                print(f"[tune] {arm}: best-lr curve regimes {regimes}")
+            else:
+                print(f"[tune] {arm}: best-lr trials have no curve diagnosis (cached "
+                      f"pre-monitoring summaries); rerun with --force to record the regimes")
+            off = _off_regime(regimes)
+            if off:
+                print(f"[tune][warn] {arm}: lr={b['lr']:g} was selected while "
+                      f"{sum(off.values())} trial(s) were in {off}: the selected val_loss "
+                      f"describes that regime (underfit/stalled/overfit/diverging), not "
+                      f"just the norm; check the trial curves and the lr grid before "
+                      f"quoting this arm's win")
         tuned[arm] = add_confirm_trials(tuned[arm], args, base)
         if tuned[arm].get('confirm'):
             c = tuned[arm]['confirm']
@@ -435,6 +478,12 @@ def main():
             'val_batches': args.val_batches,
             'selection_metric': 'held-out synthetic val_loss (mean over val batches)',
             'compute_matched': 'every arm/seed/lr trial runs the identical max_steps x batch_size x seq_len',
+            'curve_monitoring': {
+                'every': args.curve_every, 'batches': args.curve_batches,
+                'note': ('per-trial train/val regime recorded by ablation.run_one; curve '
+                         'batches come from a generator the lr selection never uses, so the '
+                         'monitoring does not bias the grid'),
+            },
             'test_split': 'untouched: all losses come from the synthetic held-out generator',
         },
         'arms': tuned,
