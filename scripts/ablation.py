@@ -738,6 +738,98 @@ def print_baseline_comparison(comparison: dict | None) -> None:
         print(f"[compare] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
               f"{comparison['rows_with_fewer_than_3_seeds']}")
 
+def load_simple_baselines(path) -> dict | None:
+    """Load the Bayes-limit calibration written by scripts/baseline_simple.py.
+
+    Returns None - with a warning for a malformed file - when the path is
+    absent or does not look like a calibration report, so a stale side file
+    can never abort the matrix; it only removes the floor annotation.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[compare] WARNING: ignoring unreadable simple-baseline file {path}: {exc}")
+        return None
+    limits = data.get('bayes_limits') if isinstance(data, dict) else None
+    tuned = data.get('tuned_count_baseline') if isinstance(data, dict) else None
+    if not isinstance(limits, dict) or not isinstance(limits.get('memoryless_nats'), (int, float)):
+        print(f"[compare] WARNING: ignoring simple-baseline file {path}: missing bayes_limits.memoryless_nats")
+        return None
+    if not isinstance(tuned, dict) or not isinstance(tuned.get('mean_ce_nats'), (int, float)):
+        print(f"[compare] WARNING: ignoring simple-baseline file {path}: missing tuned_count_baseline.mean_ce_nats")
+        return None
+    return data
+
+def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, source) -> dict:
+    """Annotate every comparison row with its distance to the task's Bayes limits.
+
+    `baseline_comparison` answers "which row is best among these
+    transformers"; this annotation answers "how much of the task's learnable
+    signal did the row capture". Both are needed: a row can win the matrix
+    while still sitting far above the ceiling, which means the comparison
+    ranked under-trained models. The ceiling is the exact HMM-filter CE when
+    the corpus carries the outlier channel (the transformer reads the full
+    observed prefix), reported next to the closed-form memoryless walk floor.
+    `excess_over_bayes_ceiling_nats` = val_loss - ceiling (0 = Bayes optimal),
+    `excess_over_tuned_simple_nats` = distance to the tuned count model, and
+    `signal_captured_fraction` rescales the remaining gap against the
+    uniform-over-vocabulary strawman.
+    """
+    limits = floor_data['bayes_limits']
+    floor = float(limits['memoryless_nats'])
+    ceiling = limits.get('full_context_nats')
+    ceiling = float(ceiling) if isinstance(ceiling, (int, float)) else None
+    tuned = floor_data['tuned_count_baseline']
+    tuned_ce = float(tuned['mean_ce_nats'])
+    protocol = floor_data.get('protocol') or {}
+    vocab_size = protocol.get('vocab_size')
+    log_vocab = math.log(vocab_size) if isinstance(vocab_size, (int, float)) and vocab_size > 0 else None
+    for entry in comparison['rows']:
+        val_loss = entry.get('val_loss')
+        if not isinstance(val_loss, (int, float)):
+            continue
+        entry['excess_over_bayes_floor_nats'] = val_loss - floor
+        if ceiling is not None:
+            entry['excess_over_bayes_ceiling_nats'] = val_loss - ceiling
+        entry['excess_over_tuned_simple_nats'] = val_loss - tuned_ce
+        entry['beats_tuned_simple_baseline'] = bool(val_loss < tuned_ce)
+        if log_vocab is not None and ceiling is not None and log_vocab > ceiling:
+            entry['signal_captured_fraction'] = (log_vocab - val_loss) / (log_vocab - ceiling)
+    annotated = [entry for entry in comparison['rows'] if isinstance(entry.get('val_loss'), (int, float))]
+    block = {
+        'source': str(source),
+        'memoryless_floor_nats': floor,
+        'full_context_ceiling_nats': ceiling,
+        'tuned_simple_predictor': tuned.get('predictor'),
+        'tuned_simple_ce_nats': tuned_ce,
+        'tuned_simple_std_ce_nats': tuned.get('std_ce_nats'),
+        'uniform_vocab_strawman_nats': log_vocab,
+        'calibration_seeds': protocol.get('seeds'),
+        'hypothesis': floor_data.get('hypothesis'),
+        'reading': ('excess_over_bayes_ceiling_nats is the gap to the exact full-context Bayes predictor '
+                    '(hmm_bayes) and the number that says whether a row learned the task; '
+                    'beats_tuned_simple_baseline only says it beat a tuned count model, and '
+                    'signal_captured_fraction rescales the gap against uniform-over-vocab'),
+        'rows': [{key: entry.get(key) for key in (
+            'name', 'val_loss', 'excess_over_bayes_ceiling_nats', 'excess_over_bayes_floor_nats',
+            'excess_over_tuned_simple_nats', 'beats_tuned_simple_baseline', 'signal_captured_fraction',
+        )} for entry in annotated],
+    }
+    if annotated:
+        best = min(annotated, key=lambda entry: entry.get('excess_over_bayes_ceiling_nats', float('inf')))
+        ceiling_str = 'n/a' if ceiling is None else f"{ceiling:.4f}"
+        best_gap = best.get('excess_over_bayes_ceiling_nats')
+        best_str = 'n/a' if best_gap is None else f"{best_gap:+.4f}"
+        print(f"[compare] Bayes calibration ({source}): memoryless floor {floor:.4f} nats, full-context "
+              f"ceiling {ceiling_str} nats, tuned simple baseline {tuned_ce:.4f} nats "
+              f"({tuned.get('predictor')}); closest row to the ceiling: {best['name']} "
+              f"{best_str} nats; rows beating the tuned simple baseline: "
+              f"{sum(1 for entry in annotated if entry.get('beats_tuned_simple_baseline'))}/{len(annotated)}")
+    return block
+
 def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: float=0.0, alpha: float=0.05) -> dict | None:
     """Full vs each Full-minus-X row: does removing mechanism X hurt?
 
@@ -935,6 +1027,7 @@ def main():
     p.add_argument('--stats-every', type=int, default=200)
     p.add_argument('--val-batches', type=int, default=20, help='held-out synthetic batches for the selection metric (val_loss); never used for gradient updates')
     p.add_argument('--baselines', nargs='+', default=['ln_baseline', 'rmsnorm_baseline'], help='rows treated as the simple reference baselines in the baseline-relative comparison')
+    p.add_argument('--simple-baselines', default=None, help='Bayes-limit calibration JSON from scripts/baseline_simple.py; when omitted, auto-detected at <output-dir>/simple_baselines.json. Adds the tuned simple baseline and the memoryless-Bayes-floor / full-context-ceiling gaps to baseline_comparison.json')
     p.add_argument('--baseline-margin', type=float, default=0.0, help='minimum val_loss improvement over the best baseline to count as a win')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired z-test vs the best baseline')
     p.add_argument('--sanity-check', action='store_true', help='run the small-batch overfit sanity check for every norm in the selected rows before training them')
@@ -1032,6 +1125,14 @@ def main():
               f"(trained under a different model/cfg/protocol than this invocation): "
               f"{[r['name'] for r in stale_rows]}; rerun them under this recipe to include them")
     comparison = baseline_comparison(comparable, args.baselines, margin=args.baseline_margin, alpha=args.alpha)
+    simple_path = Path(args.simple_baselines) if args.simple_baselines else base / 'simple_baselines.json'
+    floor_data = load_simple_baselines(simple_path)
+    if comparison is not None and floor_data is not None:
+        comparison['simple_baseline'] = attach_simple_baseline_calibration(comparison, floor_data, simple_path)
+    elif comparison is not None:
+        print(f"[compare] note: no tuned simple-baseline calibration at {simple_path}; run "
+              f"'python3 scripts/baseline_simple.py --output {simple_path}' so every row is read against the "
+              f"task's Bayes limits and a tuned count model, not only against the other transformer rows")
     if comparison is not None:
         comparison['rows_excluded_protocol_mismatch'] = stale_rows
         with open(base / 'baseline_comparison.json', 'w') as f:

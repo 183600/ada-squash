@@ -310,6 +310,7 @@ def main():
     p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='each norm is probed once per seed (fresh probe, and fresh init in random-init mode) and reported as Mean +/- Std across seeds; >= 3 recommended so one probe draw cannot decide a comparison')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the paired cross-norm tests in comparison.json (Holm-adjusted over metrics x pairs)')
     p.add_argument('--output', default='runs/fp8_check/results.json')
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this check tests (e.g. "DyT-CD limits fp8 activation blowup versus RMSNorm at matched init"); recorded in the run manifest so the result can be audited against the claim it was meant to support')
     args = p.parse_args()
     if args.ckpt and len(args.ckpt) != len(args.norms):
         p.error(f'--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}')
@@ -366,6 +367,11 @@ def main():
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
     manifest['seeds'] = seeds
+    if args.hypothesis:
+        manifest['hypothesis'] = args.hypothesis
+        print(f'[hypothesis] {args.hypothesis}')
+    else:
+        print('[hypothesis] none stated: pass --hypothesis "..." so this check is auditable as a test of a claim, not a sweep')
     manifest['results_file'] = str(out_path)
     manifest['comparison_file'] = str(comparison_path)
     save_run_manifest(out_path.with_name('run_manifest.json'), manifest)

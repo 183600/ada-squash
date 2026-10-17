@@ -197,6 +197,11 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     manifest_path = output_dir / 'run_manifest.json'
     run_manifest = collect_run_metadata(seed=seed)
     run_manifest['hyperparameters'] = vars(args)
+    if args.hypothesis:
+        run_manifest['hypothesis'] = args.hypothesis
+        print(f'[hypothesis] {args.hypothesis}')
+    else:
+        print('[hypothesis] none stated: pass --hypothesis "..." so this run is auditable as a test of a claim, not a sweep')
     data_reports: dict = {}
     run_manifest['data'] = {'dataset': args.dataset, 'dataset_config': args.dataset_config, 'split_reports': data_reports}
     save_run_manifest(manifest_path, run_manifest)
@@ -390,6 +395,7 @@ def main():
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation')
     p.add_argument('--val-batches', type=int, default=10, help='held-out validation batches at the end of training (0 disables)')
     p.add_argument('--tokenizer', default='gpt2')
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this study tests (e.g. "DyT-CD keeps expert load balanced and matches ln/RMSNorm val_ce at this scale"); recorded in the per-seed and aggregate run manifests so the result can be audited against the claim it was meant to support')
     args = p.parse_args()
     seeds = [args.seed] if args.seed is not None else list(args.seeds)
     if not seeds:
@@ -412,6 +418,8 @@ def main():
         manifest = collect_run_metadata(seed=seeds[0])
         manifest['hyperparameters'] = vars(args)
         manifest['seeds'] = seeds
+        if args.hypothesis:
+            manifest['hypothesis'] = args.hypothesis
         manifest['aggregate'] = agg
         save_run_manifest(base / 'run_manifest.json', manifest)
         val = agg.get('val_ce')

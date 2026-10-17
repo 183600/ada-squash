@@ -18,6 +18,7 @@ def main():
     p.add_argument('--secret', default='The magic number is 98765.')
     p.add_argument('--output', default=None)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests (e.g. "DyT-CD retains needle accuracy at 4k tokens"); recorded in the manifest so a pass/fail is auditable as a test rather than a fishing trip')
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(args.seed)
@@ -40,6 +41,11 @@ def main():
     Path(out).write_text(json.dumps(results, indent=2))
     manifest = collect_run_metadata(seed=args.seed)
     manifest['hyperparameters'] = vars(args)
+    if args.hypothesis:
+        manifest['hypothesis'] = args.hypothesis
+        print(f'[hypothesis] {args.hypothesis}')
+    else:
+        print('[hypothesis] none stated: pass --hypothesis "..." so this evaluation is auditable as a test of a claim, not a sweep')
     manifest['results_file'] = str(out)
     save_run_manifest(Path(out).with_name('needle_manifest.json'), manifest)
     print(f'[done] saved to {out}')

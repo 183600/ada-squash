@@ -225,11 +225,16 @@ def main():
     p.add_argument('--max-cost-ratio', type=float, default=DEFAULT_MAX_COST_RATIO)
     p.add_argument('--require-viable', action='store_true', help='exit 1 when a candidate is not viable at the given margins')
     p.add_argument('--output', default='runs/efficiency/efficiency.json')
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this benchmark tests (e.g. "DyT-CD reaches a lower loss per point of training cost than RMSNorm at the same lr"); recorded in the report and manifest so the tradeoff verdict is auditable against a claim')
     args = p.parse_args()
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     set_all_seeds(args.seed)
     print(f'[bench] model={args.model} device={device} batch={args.batch_size} seq={args.seq_len} '
           f'iters={args.iters} warmup={args.warmup} bf16={args.bf16 and device == "cuda"}')
+    if args.hypothesis:
+        print(f'[hypothesis] {args.hypothesis}')
+    else:
+        print('[hypothesis] none stated: pass --hypothesis "..." so this tradeoff verdict is auditable as a test of a claim, not a sweep')
     results = []
     for norm in args.norms:
         r = benchmark_norm(args.model, norm, args, device)
@@ -327,6 +332,7 @@ def main():
     report = {
         'model': args.model,
         'device': device,
+        'hypothesis': args.hypothesis,
         'config': vars(args),
         'results': results,
         'tradeoff': tradeoff,
@@ -341,7 +347,8 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, default=str))
     save_run_manifest(out.with_name('efficiency_manifest.json'), {
-        'run_metadata': report['run_metadata'], 'config': vars(args), 'results': results, 'tradeoff': tradeoff,
+        'run_metadata': report['run_metadata'], 'hypothesis': args.hypothesis,
+        'config': vars(args), 'results': results, 'tradeoff': tradeoff,
     })
     print(f'[bench] report -> {out}')
 
