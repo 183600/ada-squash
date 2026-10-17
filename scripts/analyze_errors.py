@@ -122,15 +122,13 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     ignore = int(cfg.ignore_index)
     vocab = int(cfg.vocab_size)
     target_counts = torch.zeros(vocab, dtype=torch.long)
-    # Confusion-matrix marginals for the named F1 report: keeping the full
-    # pred/gold lists for a 50k vocabulary over many batches would not fit
-    # memory, so only the three per-class counts are accumulated.
+    # Confusion-matrix marginals for the named F1 report: the three per-class
+    # counts are accumulated instead of the full pred/gold lists.
     pred_counts = torch.zeros(vocab, dtype=torch.long)
     correct_counts = torch.zeros(vocab, dtype=torch.long)
     # Ranking-metric diagnostics: the class set is fixed from the first batch
     # (half by frequency, half sampled from its tail), then every scanned
-    # token contributes one score per chosen class, capped so the
-    # accumulation is memory-bounded.
+    # token contributes one score per chosen class, up to --auc-max-tokens.
     auc_class_ids: list = []
     auc_scores: list = []
     auc_labels: list = []

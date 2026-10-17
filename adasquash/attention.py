@@ -123,8 +123,7 @@ class CausalSelfAttention(nn.Module):
         return mask
     _LOGITS_CHUNK_BYTES = 1 << 27
     # Row-block cap for the causal logit sweep: the sweep walks the lower
-    # triangle in row blocks of at most this many rows, the block size being
-    # further bounded by the byte budget above.
+    # triangle in row blocks of at most this many rows.
     _LOGITS_BLOCK_ROWS = 128
 
     def _logit_scratch(self, B: int, H: int, R: int, T: int, q: torch.Tensor) -> torch.Tensor:
@@ -241,7 +240,7 @@ def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: to
     return out
 
 def _rope_inplace_(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: torch.Tensor, hi_s: torch.Tensor):
-    """In-place ``_rope_into``: same op order per element, same rounding.
+    """Apply the ``_rope_into`` rotation to ``x`` itself.
 
     The ``lo`` row is updated first (reading the original ``hi`` row) and a
     half-width clone carries the original ``lo`` row into the ``hi`` update.
@@ -289,12 +288,11 @@ class _ApplyRoPE(torch.autograd.Function):
         return (grad_q, grad_k, None, None)
 
 class _ApplyRoPEOne(torch.autograd.Function):
-    """In-place rotation of one Q/K tensor, for single-use inputs.
+    """Rotary rotation of one Q/K tensor, applied to ``x`` itself.
 
-    ``CausalSelfAttention`` hands its freshly projected (or freshly normed) q/k
-    over exactly once, so the rotation is applied directly to that storage. A
-    single output keeps the autograd engine's view bookkeeping legal for the
-    raw path, where q/k are stride views of the shared qkv buffer.
+    A single returned tensor keeps the autograd engine's view bookkeeping
+    legal for the raw path, where q/k are stride views of the shared qkv
+    buffer.
     """
 
     @staticmethod

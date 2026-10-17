@@ -414,9 +414,8 @@ def f1_from_counts(
     `gold_counts[c]` support of class `c`, `pred_counts[c]` how often class
     `c` was predicted, `correct_counts[c]` their overlap (the diagonal).
     Streaming evaluations (a 50k-token vocabulary over millions of tokens)
-    cannot keep the full `pred`/`gold` lists in memory, so they accumulate
-    these vectors instead; the semantics are identical to `macro_weighted_f1`,
-    which delegates here.
+    accumulate these vectors instead of the full `pred`/`gold` lists; the
+    semantics are identical to `macro_weighted_f1`, which delegates here.
 
     * `macro_f1`: unweighted mean of per-class F1 over classes occurring in
       `gold` or `pred`. Every class counts once, so rare classes are not

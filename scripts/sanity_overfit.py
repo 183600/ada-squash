@@ -164,9 +164,9 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
     if tuple(x.shape) == tuple(y.shape):
         copy_input = float((x[mask] == gold).float().mean().item())
     # One-vs-rest ranking metrics over the classes that actually occur in this
-    # batch (at most one column per valid token, so this stays cheap). The
-    # softmax is monotone, so it does not change the ranking; it keeps the
-    # scores comparable across calls.
+    # batch (at most one column per valid token). The softmax is monotone, so
+    # it does not change the ranking; it keeps the scores comparable across
+    # calls.
     present = torch.unique(gold).tolist()
     probs = torch.softmax(logits.float(), dim=-1)
     auc = binary_auc_report(probs[mask][:, present].tolist(), gold.tolist(), present)
