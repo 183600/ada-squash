@@ -538,8 +538,7 @@ def main():
         nonfinite_streak = 0
         loss_val = float(loss_acc)
         last_train_loss = loss_val
-        # Keep the returned norm as a device tensor and only materialize it on
-        # log steps: the clip itself runs every step, the host sync does not.
+        # Clipped every step; materialized below only when logging.
         grad_norm_t = None
         if args.grad_clip > 0:
             grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)

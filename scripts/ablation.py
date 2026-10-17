@@ -318,9 +318,8 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
         loss = model(x, y, return_logits=False)[1]
-        # One host read serves the finiteness check, the spike counter and the
-        # loss list: `loss` is not touched by backward, so the pre-backward
-        # value is the value to record.
+        # `loss` is not touched by backward, so the pre-backward value is the
+        # value to record.
         loss_val = float(loss.detach())
         if not math.isfinite(loss_val):
             triage = triage_nonfinite(model, x, y, device_type=device,

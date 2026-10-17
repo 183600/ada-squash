@@ -20,6 +20,12 @@ wandb/
 mlruns/
 *.log
 
+# Experiment outputs & cycle reports (never commit)
+results/
+*_results.json
+REPORT*.md
+autodl_budget*.json
+
 # OS
 .DS_Store
 Thumbs.db

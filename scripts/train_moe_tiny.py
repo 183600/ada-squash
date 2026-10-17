@@ -248,8 +248,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             stats_windowed = True
         logits, loss, aux, tpe_list = model(x, y, return_aux=True, return_logits=False)
         del logits
-        # `loss` is not touched by backward, so one host read serves both the
-        # finiteness check and the recorded value.
+        # `loss` is not touched by backward, so the pre-backward value is the
+        # value to record.
         loss_val = float(loss.detach())
         if not math.isfinite(loss_val):
             triage = triage_nonfinite(model, x, y, device_type=device,

@@ -212,8 +212,8 @@ def _dedup_shard_owner(example, n_workers: int, hashed: bytes | None = None) -> 
     copy lands in the same worker and the per-worker set then drops all but
     the first occurrence, matching the single-process cleaner the audit uses.
 
-    `hashed` lets a caller that hashed the stripped text already (to hand the
-    digest to the cleaner) share it instead of hashing the document twice.
+    `hashed` lets a caller that already hashed the stripped text pass the
+    digest in.
     """
     if hashed is None:
         hashed = _dedup_hash(example)
@@ -262,8 +262,8 @@ class DocumentCleaner:
         self.stats: Counter = Counter()
 
     def __call__(self, example, precomputed_hash: bytes | None = None):
-        """Clean one example; `precomputed_hash` must be the digest of the
-        stripped text and is reused instead of hashing the document again."""
+        """Clean one example; `precomputed_hash`, when given, must be the
+        digest of the stripped text."""
         self.stats["documents_read"] += 1
         if not isinstance(example, dict):
             self.stats["dropped_unreadable"] += 1
