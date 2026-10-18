@@ -546,7 +546,13 @@ def main():
                 # accumulated gradient before the triage ever ran.
                 nonfinite_batch = (x, y, micro_loss)
                 break
-            loss = loss / args.grad_accum
+            if args.grad_accum > 1:
+                # In-place scaling: `loss` is the output of the CE autograd
+                # Function, whose backward does not need its output value, so
+                # this saves a loss-sized allocation plus a graph node per
+                # micro-batch. With accumulation 1 the division is the exact
+                # identity, so the op is skipped altogether.
+                loss.div_(args.grad_accum)
             loss.backward()
             if loss_acc is None:
                 loss_acc = loss.detach()

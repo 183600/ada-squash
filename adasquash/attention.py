@@ -184,24 +184,9 @@ class CausalSelfAttention(nn.Module):
         cache = self._rope_cache
         entry = cache[1] if cache is not None and cache[0] == key else None
         if entry is None:
-            entry = _ROPE_TABLE_CACHE.get(key)
-            if entry is None:
-                cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
-                sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
-                entry = (freqs_cis, cos, sin, {})
-                if len(_ROPE_TABLE_CACHE) >= _CACHE_MAX_ENTRIES:
-                    _ROPE_TABLE_CACHE.clear()
-                _ROPE_TABLE_CACHE[key] = entry
+            key, entry = _rope_table_entry(freqs_cis)
             self._rope_cache = (key, entry)
-        tables = entry[3]
-        got = tables.get(dtype)
-        if got is None:
-            cos, sin = (entry[1], entry[2])
-            if cos.dtype != dtype:
-                cos, sin = (cos.to(dtype).contiguous(), sin.to(dtype).contiguous())
-            got = (cos, sin)
-            tables[dtype] = got
-        return got
+        return _rope_pair_for_dtype(entry, dtype)
 
 class RMSNormHead(nn.Module):
 
@@ -212,6 +197,39 @@ class RMSNormHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _RMSNorm.apply(x, self.weight, self.eps)
+
+def _rope_table_entry(freqs_cis: torch.Tensor):
+    """``(key, entry)`` for ``freqs_cis`` from the shared table cache.
+
+    The key is the ``(data_ptr, shape, device, dtype)`` tuple D6 fixes; the
+    entry keeps a strong reference to ``freqs_cis`` so the storage pointer can
+    never be recycled into a key collision while the entry is cached. Both the
+    attention modules and the standalone `apply_rope` go through here, so a
+    caller that re-passes the same (e.g. model-owned) frequency buffer pays
+    the ``real``/``imag``/``contiguous`` expansion once instead of per call.
+    """
+    key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
+    entry = _ROPE_TABLE_CACHE.get(key)
+    if entry is None:
+        cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
+        sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
+        entry = (freqs_cis, cos, sin, {})
+        if len(_ROPE_TABLE_CACHE) >= _CACHE_MAX_ENTRIES:
+            _ROPE_TABLE_CACHE.clear()
+        _ROPE_TABLE_CACHE[key] = entry
+    return (key, entry)
+
+def _rope_pair_for_dtype(entry, dtype: torch.dtype):
+    """``(cos, sin)`` of an entry in ``dtype``; the cast pair is cached too."""
+    tables = entry[3]
+    got = tables.get(dtype)
+    if got is None:
+        cos, sin = (entry[1], entry[2])
+        if cos.dtype != dtype:
+            cos, sin = (cos.to(dtype).contiguous(), sin.to(dtype).contiguous())
+        got = (cos, sin)
+        tables[dtype] = got
+    return got
 
 def _rope_halves(cos: torch.Tensor, sin: torch.Tensor, half: int):
     if cos.shape[-1] == half:
@@ -316,21 +334,26 @@ class _ApplyRoPEOne(torch.autograd.Function):
         lo_c, hi_c, lo_s, hi_s = _rope_halves(cos, sin, half)
         return (_rope_into(grad_out, lo_c, hi_c, lo_s, hi_s, transpose=True), None, None)
 
-def _apply_rope_(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
+def _resolve_rope_tables(freqs_cis: torch.Tensor, cos: Optional[torch.Tensor], sin: Optional[torch.Tensor], dtype: torch.dtype):
+    """``(cos, sin)`` in ``dtype``, from the caller or the shared cache.
+
+    A caller-supplied pair is only cast (never re-expanded); otherwise the
+    shared table cache serves both the expansion and the per-dtype casts, so
+    repeated calls on the same frequency buffer stop rebuilding them.
+    """
     if cos is None or sin is None:
-        cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
-        sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
-    if cos.dtype != q.dtype:
-        cos = cos.to(dtype=q.dtype)
-        sin = sin.to(dtype=q.dtype)
+        _, entry = _rope_table_entry(freqs_cis)
+        return _rope_pair_for_dtype(entry, dtype)
+    if cos.dtype != dtype:
+        cos = cos.to(dtype=dtype)
+        sin = sin.to(dtype=dtype)
+    return (cos, sin)
+
+def _apply_rope_(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
+    cos, sin = _resolve_rope_tables(freqs_cis, cos, sin, q.dtype)
     return (_ApplyRoPEOne.apply(q, cos, sin), _ApplyRoPEOne.apply(k, cos, sin))
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
-    if cos is None or sin is None:
-        cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
-        sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
-    if cos.dtype != q.dtype:
-        cos = cos.to(dtype=q.dtype)
-        sin = sin.to(dtype=q.dtype)
+    cos, sin = _resolve_rope_tables(freqs_cis, cos, sin, q.dtype)
     return _ApplyRoPE.apply(q, k, cos, sin)
 __all__ = ['CausalSelfAttention', 'RMSNormHead']

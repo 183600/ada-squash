@@ -46,7 +46,10 @@ class MoELayer(nn.Module):
             scores, indices = probs.max(dim=-1, keepdim=True)
         else:
             scores, indices = probs.topk(self.top_k, dim=-1)
-        scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-09)
+        # In-place renormalization: `scores` is a fresh topk/max output, so the
+        # division can write into it instead of allocating a second
+        # (tokens, top_k) tensor per layer per step.
+        scores.div_(scores.sum(dim=-1, keepdim=True).clamp_min(1e-09))
         n_tokens = x_flat.shape[0]
         n_experts = self.n_experts
         k = self.top_k
