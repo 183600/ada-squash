@@ -118,7 +118,10 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_out):
         logits, targets = ctx.saved_tensors
         grad_logits = torch.empty_like(logits)
-        grad_scale = (grad_out / ctx.count).to(logits.dtype)
+        # With no valid targets the reference loss divides by nothing: the
+        # leading `total / count` is already NaN, and scaling the (all-zero)
+        # mask by 1 / 0 would turn the gradient into 0 * inf = NaN.
+        grad_scale = (grad_out / ctx.count).to(logits.dtype) if int(ctx.count) > 0 else grad_out.to(logits.dtype)
         chunk_rows = ctx.chunk_rows
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
@@ -207,7 +210,9 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         need_w = ctx.needs_input_grad[1]
         grad_h = torch.empty_like(h) if need_h else None
         grad_w = torch.empty_like(w) if need_w else None
-        grad_scale = (grad_out / ctx.count).to(dt)
+        # See `_ChunkedCrossEntropy.backward`: with no valid targets the
+        # gradient must stay zero instead of 0 * inf = NaN.
+        grad_scale = (grad_out / ctx.count).to(dt) if int(ctx.count) > 0 else grad_out.to(dt)
         chunk_rows = ctx.chunk_rows
         w_t = w.t()
         first = True
