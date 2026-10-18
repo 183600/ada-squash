@@ -40,13 +40,10 @@ def _as_scalar_exponent_inplace(g: torch.Tensor, p) -> torch.Tensor:
 def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
     """Whether the compensating `±1` multiply has to run.
 
-    Multiplying by `+1.0` is exact, so when no `scale` entry is negative that
-    full-tensor correction is a no-op and is skipped (one saved pass per
-    forward and per backward for the `dytc` arm). The `signbit().any()` probe
-    is a `[dim]` reduction whose result is only read on the host: that is free
-    on CPU, while on CUDA it would synchronise once per layer, so CUDA tensors
-    keep the multiply unconditionally. `signbit` (rather than `< 0`) is what
-    makes `-0.0` count as negative.
+    Multiplying by `+1.0` is exact, so when no `scale` entry is negative the
+    full-tensor correction is a no-op. The `signbit().any()` probe is a
+    `[dim]` reduction; non-CPU tensors keep the multiply unconditionally.
+    `signbit` (rather than `< 0`) is what makes `-0.0` count as negative.
     """
     if scale.device.type != 'cpu':
         return True

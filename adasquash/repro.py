@@ -66,7 +66,7 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
         # cuBLAS needs a fixed workspace to run deterministic reductions once
         # `torch.use_deterministic_algorithms(True)` is enabled; pinning it
         # here keeps the environment reproducible without forcing the
-        # (slower, sometimes unsupported) deterministic-algorithm mode on.
+        # deterministic-algorithm mode on.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     os.environ["PYTHONHASHSEED"] = str(seed % (2 ** 32))
     return seed

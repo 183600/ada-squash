@@ -106,10 +106,11 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
                 results = manifest.get('results') or {}
                 best = results.get('best_val_loss')
                 final = results.get('final_val_loss')
-                # Curve + efficiency records already travel in every run
-                # manifest; the sweep must pool them instead of dropping them,
-                # otherwise a depth cell is read from one final number and a
-                # wider/deeper cell's extra cost is invisible.
+                # Curve, parameter and FLOPs accounting already travel in
+                # every run manifest; the sweep must pool them instead of
+                # dropping them, otherwise a depth cell is read from one final
+                # number and a wider/deeper cell's shape accounting is
+                # invisible.
                 curve = results.get('curve_diagnosis')
                 n_params = results.get('n_params')
                 breakdown = results.get('parameter_breakdown')
@@ -260,9 +261,9 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 'candidate_missing_seeds': None,
                 'reference_missing_seeds': None,
                 'complete': True,
-                # Each side's per-seed curve regimes and cost, so a delta is
-                # read next to the regime it was measured in and the
-                # params/FLOPs it bought.
+                # Each side's per-seed curve regimes, parameter count and
+                # FLOPs, so a delta is read next to the regime it was
+                # measured in.
                 'candidate_curve_classification_counts': by_norm[norm].get('curve_classification_counts'),
                 'reference_curve_classification_counts': ref.get('curve_classification_counts'),
                 'candidate_n_params': by_norm[norm].get('n_params'),
