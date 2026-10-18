@@ -35,6 +35,7 @@ __all__ = [
     "diagnose_train_val_curve",
     "first_nonfinite_module",
     "gradient_health_report",
+    "parameter_finite_report",
     "relative_change",
     "tensor_finite_report",
     "triage_nonfinite",
@@ -426,6 +427,64 @@ def gradient_health_report(model) -> dict:
         "nonfinite_grad": nonfinite[:20],
         "zero_grad": zero[:20],
         "gradients_finite": not nonfinite,
+    }
+
+
+def parameter_finite_report(model) -> dict:
+    """NaN/Inf census over a model's parameters and floating buffers.
+
+    The evaluation-side counterpart of `gradient_health_report`: a diverged
+    run can still write a checkpoint, and every later evaluation of it (error
+    analysis, needle, perplexity) would then silently measure arithmetic on
+    NaN rather than the model. Before *reading* results out of a checkpoint,
+    confirm the weights themselves are finite; the first offenders are named
+    so the triage can start at the module that went bad. Integer buffers
+    (position ids, masks) are skipped: NaN/Inf are floating-point states.
+    """
+    bad_params: list = []
+    bad_buffers: list = []
+    n_params = 0
+    n_buffers = 0
+
+    def _inspect(name: str, t: torch.Tensor, bucket: list) -> None:
+        if not (t.is_floating_point() or t.is_complex()) or t.numel() == 0:
+            return
+        report = tensor_finite_report(t)
+        if not report["finite"]:
+            bucket.append(
+                {
+                    "name": name,
+                    "shape": report["shape"],
+                    "dtype": report["dtype"],
+                    "n_nan": report["n_nan"],
+                    "n_inf": report["n_inf"],
+                }
+            )
+
+    for name, p in model.named_parameters():
+        n_params += 1
+        _inspect(name, p.detach(), bad_params)
+    for name, b in model.named_buffers():
+        n_buffers += 1
+        _inspect(name, b.detach(), bad_buffers)
+
+    finite = not bad_params and not bad_buffers
+    return {
+        "finite": finite,
+        "n_parameters": n_params,
+        "n_buffers": n_buffers,
+        "n_nonfinite_parameters": len(bad_params),
+        "nonfinite_parameters": bad_params[:20],
+        "n_nonfinite_buffers": len(bad_buffers),
+        "nonfinite_buffers": bad_buffers[:20],
+        "recommendation": (
+            "all parameters and floating buffers are finite"
+            if finite else
+            "the checkpoint's weights are already non-finite: do not trust any "
+            "metric computed from it. Re-run the NaN triage on the training "
+            "step that produced it (data -> fp32 math -> mixed precision -> "
+            "gradients) and restore the last finite ckpt_best.pt instead"
+        ),
     }
 
 

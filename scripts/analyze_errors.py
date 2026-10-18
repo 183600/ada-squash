@@ -28,6 +28,18 @@ It also reports the baselines the accuracy must be read against
 current token") and an oracle ``topk_accuracy`` that bounds how much of the
 error is a ranking problem.
 
+Paired mode (``--reference-ckpt``)
+----------------------------------
+A single-model taxonomy says how often a model is wrong; the decision "did
+the candidate improve?" is a property of the difference. With
+``--reference-ckpt`` both checkpoints consume the *identical* batches and the
+report becomes a paired bad-case analysis: exact ``fixed``/``broken`` counts,
+the exact McNemar test on the discordant tokens, the same taxonomy applied to
+each side (what kind of error did the candidate repair, what kind did it
+introduce), the shared blind spots (both arms confidently wrong - label-noise
+/ inherent-ambiguity candidates) and the parameter/FLOP cost of both sides.
+See :func:`analyze_pair`.
+
 Metrics
 -------
 Target tokens over a 50k vocabulary are strongly imbalanced, so accuracy and
@@ -66,7 +78,9 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from adasquash.metrics import binary_auc_report, f1_from_counts, imbalance_report
+from adasquash.diagnostics import parameter_finite_report
+from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
+from adasquash.metrics import binary_auc_report, f1_from_counts, imbalance_report, mcnemar_test
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import markov_batch
 from scripts.eval_downstream import load_ckpt
@@ -114,6 +128,96 @@ def _quantile(values, q):
     ordered = sorted(values)
     idx = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
     return ordered[idx]
+
+
+def _prev_majority(prev_gold_keys, vocab):
+    """Bigram statistics: (prev, gold) counts and the majority successor per `prev`.
+
+    Kept model-independent and shared by the single-model and paired passes, so
+    both classify the same context-ambiguity evidence.
+    """
+    prev_gold = Counter()
+    if prev_gold_keys:
+        keys = torch.cat(prev_gold_keys)
+        uniq, counts = torch.unique(keys, return_counts=True)
+        for key, count in zip(uniq.tolist(), counts.tolist()):
+            prev_gold[key] = count
+    prev_majority = {}
+    for key, count in prev_gold.items():
+        p = key // vocab
+        g = key % vocab
+        if p not in prev_majority or count > prev_majority[p][1]:
+            prev_majority[p] = (g, count)
+    return prev_gold, prev_majority
+
+
+def _rare_ids(target_counts, rare_quantile):
+    """Token ids in the bottom `rare_quantile` of the observed target frequencies."""
+    positive_counts = [int(c) for c in target_counts.tolist() if c > 0]
+    rare_threshold = _quantile(positive_counts, rare_quantile)
+    return {i for i, c in enumerate(target_counts.tolist())
+            if 0 < c <= (rare_threshold or 0)}, rare_threshold
+
+
+def _error_flags(rec, prev_gold, prev_majority, rare_ids, vocab, confidence):
+    """The cause flags of one error record (model-side fields live in `rec`).
+
+    Pure: every flag names a *checkable* property of the error, so the same
+    function serves a single model, both arms of a paired comparison and any
+    future per-token re-analysis.
+    """
+    gold, pred, prev = rec['gold'], rec['pred'], rec['prev']
+    flags = {}
+    flags['ambiguous_topk'] = bool(rec['gold_in_topk'])
+    maj = prev_majority.get(prev)
+    gold_here = prev_gold.get(prev * vocab + gold, 0)
+    flags['prev_context_ambiguous'] = bool(
+        maj is not None and maj[0] != gold and maj[1] >= gold_here and gold_here > 0
+    )
+    flags['rare_gold'] = gold in rare_ids
+    flags['repetition_bias'] = bool(pred in rec['context'] and gold not in rec['context'])
+    flags['high_confidence_wrong'] = bool(rec['pred_prob'] >= confidence)
+    return flags
+
+
+def _primary_cause(flags):
+    """One disjoint cause per error, with the overlap kept in `flags`."""
+    if flags['ambiguous_topk']:
+        return 'label_ambiguity_topk'
+    if flags['prev_context_ambiguous']:
+        return 'context_ambiguity'
+    if flags['rare_gold']:
+        return 'long_tail_target'
+    if flags['high_confidence_wrong'] and flags['repetition_bias']:
+        return 'model_blind_spot_copying'
+    if flags['high_confidence_wrong']:
+        return 'model_blind_spot_high_confidence'
+    if flags['repetition_bias']:
+        return 'model_copying_bias'
+    return 'unexplained'
+
+
+def _classify_scan(error_scan, prev_gold, prev_majority, vocab, rare_ids, confidence):
+    """Attach flags and a primary cause to every scanned error record.
+
+    Returns ``(categories, primary, examples)``; `categories` counts the
+    overlapping flags, `primary` the disjoint primary causes.
+    """
+    categories = Counter()
+    primary = Counter()
+    examples = []
+    for rec in error_scan:
+        flags = _error_flags(rec, prev_gold, prev_majority, rare_ids, vocab, confidence)
+        for name, value in flags.items():
+            if value:
+                categories[name] += 1
+        cause = _primary_cause(flags)
+        primary[cause] += 1
+        record = dict(rec)
+        record['flags'] = flags
+        record['primary_cause'] = cause
+        examples.append(record)
+    return categories, primary, examples
 
 
 def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
@@ -237,59 +341,10 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     if n_tokens == 0:
         raise SystemExit('[errors] no valid target tokens in the selected batches')
 
-    prev_gold = Counter()
-    if prev_gold_keys:
-        keys = torch.cat(prev_gold_keys)
-        uniq, counts = torch.unique(keys, return_counts=True)
-        for key, count in zip(uniq.tolist(), counts.tolist()):
-            prev_gold[key] = count
-    prev_majority = {}
-    for key, count in prev_gold.items():
-        p = key // vocab
-        g = key % vocab
-        if p not in prev_majority or count > prev_majority[p][1]:
-            prev_majority[p] = (g, count)
-    positive_counts = [int(c) for c in target_counts.tolist() if c > 0]
-    rare_threshold = _quantile(positive_counts, args.rare_quantile)
-    rare_ids = {i for i, c in enumerate(target_counts.tolist()) if 0 < c <= (rare_threshold or 0)}
-
-    categories = Counter()
-    primary = Counter()
-    examples = []
-    for rec in error_scan:
-        gold, pred, prev = rec['gold'], rec['pred'], rec['prev']
-        flags = {}
-        flags['ambiguous_topk'] = bool(rec['gold_in_topk'])
-        maj = prev_majority.get(prev)
-        flags['prev_context_ambiguous'] = bool(
-            maj is not None and maj[0] != gold and maj[1] >= prev_gold.get(prev * vocab + gold, 0)
-            and prev_gold.get(prev * vocab + gold, 0) > 0
-        )
-        flags['rare_gold'] = gold in rare_ids
-        flags['repetition_bias'] = bool(pred in rec['context'] and gold not in rec['context'])
-        flags['high_confidence_wrong'] = bool(rec['pred_prob'] >= args.confidence)
-        for name, value in flags.items():
-            if value:
-                categories[name] += 1
-        if flags['ambiguous_topk']:
-            cause = 'label_ambiguity_topk'
-        elif flags['prev_context_ambiguous']:
-            cause = 'context_ambiguity'
-        elif flags['rare_gold']:
-            cause = 'long_tail_target'
-        elif flags['high_confidence_wrong'] and flags['repetition_bias']:
-            cause = 'model_blind_spot_copying'
-        elif flags['high_confidence_wrong']:
-            cause = 'model_blind_spot_high_confidence'
-        elif flags['repetition_bias']:
-            cause = 'model_copying_bias'
-        else:
-            cause = 'unexplained'
-        primary[cause] += 1
-        record = dict(rec)
-        record['flags'] = flags
-        record['primary_cause'] = cause
-        examples.append(record)
+    prev_gold, prev_majority = _prev_majority(prev_gold_keys, vocab)
+    rare_ids, rare_threshold = _rare_ids(target_counts, args.rare_quantile)
+    categories, primary, examples = _classify_scan(
+        error_scan, prev_gold, prev_majority, vocab, rare_ids, args.confidence)
 
     examples.sort(key=lambda r: (-r['pred_prob'], r['gold_rank']))
     shown = examples[: args.max_examples]
@@ -362,9 +417,293 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     }
 
 
+def _chunk_stats(logits_chunk, gold, topk):
+    """Per-position prediction statistics of one chunk, for pairing two models."""
+    probs = torch.softmax(logits_chunk.detach().float(), dim=-1)
+    pred = probs.argmax(-1)
+    gold_p = probs.gather(-1, gold.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    pred_p = probs.gather(-1, pred.unsqueeze(-1)).squeeze(-1)
+    gold_rank = (probs >= gold_p.unsqueeze(-1)).sum(-1)
+    top = probs.topk(topk, dim=-1)
+    return {
+        'pred': pred,
+        'gold_prob': gold_p,
+        'pred_prob': pred_p,
+        'gold_rank': gold_rank,
+        'gold_in_topk': (top.indices == gold.unsqueeze(-1)).any(-1),
+        'ok': pred == gold,
+    }
+
+
+def _side_record(stats, b, tt, rank_clip):
+    """One model's per-token record at (b, tt), detached to plain Python."""
+    return {
+        'pred': int(stats['pred'][b, tt]),
+        'pred_prob': float(stats['pred_prob'][b, tt]),
+        'gold_prob': float(stats['gold_prob'][b, tt]),
+        'gold_rank': int(min(stats['gold_rank'][b, tt].item(), rank_clip)),
+        'gold_in_topk': bool(stats['gold_in_topk'][b, tt]),
+    }
+
+
+def _side_error_input(rec, side_name):
+    """Reshape a paired record into the single-model error-record schema."""
+    side = rec[side_name]
+    return {
+        'gold': rec['gold'], 'pred': side['pred'], 'prev': rec['prev'],
+        'context': rec['context'], 'gold_in_topk': side['gold_in_topk'],
+        'pred_prob': side['pred_prob'],
+    }
+
+
+def _bump(cause_summary, cause, field):
+    cause_summary.setdefault(cause, Counter())[field] += 1
+
+
+def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None, device='cpu') -> dict:
+    """Paired bad-case analysis of a candidate against a reference checkpoint.
+
+    A single-model error taxonomy says *how often* a model is wrong; the
+    decision "did the change help?" is a statement about the *difference* of
+    two models on the same samples. Both models consume the identical batches
+    here (the tensors are shared, not re-drawn), so every token is a paired
+    observation with four possible outcomes: both right, both wrong, fixed
+    (reference wrong / candidate right) and broken (reference right /
+    candidate wrong).
+
+    The report is built for hypothesis generation, in this order:
+
+    * the exact McNemar test on the discordant pairs (`fixed`, `broken`):
+      only the tokens where the two models disagree carry information about
+      which one is better, and at the few-hundred-error scale this analysis
+      runs at the exact test is the honest reference;
+    * each error is classified with the same taxonomy as the single-model
+      analysis, so `fixed_by_reference_cause` names *what kind* of error the
+      candidate repairs and `broken_by_candidate_cause` names the new ones;
+    * the ``shared blind spots`` - tokens both models get confidently wrong,
+      often with the same wrong prediction - are printed separately: these
+      are the strongest label-noise / inherent-ambiguity candidates, because
+      two independently trained arms agreeing on a wrong answer is not a
+      property of either model's mechanism;
+    * the cost side (parameters, analytic FLOPs) of both checkpoints travels
+      in the same report, so a fixed-minus-broken count is read next to what
+      the candidate costs (wall-clock latency and memory are measured by
+      `scripts/benchmark_efficiency.py`, not guessed here).
+
+    The AUC block is deliberately not duplicated here: it is a single-model
+    ranking diagnostic, and running it for two models would double the
+    softmax cost of the error scan without sharpening the pairing.
+    """
+    ref_cfg, cand_cfg = reference_model.cfg, candidate_model.cfg
+    if int(ref_cfg.vocab_size) != int(cand_cfg.vocab_size):
+        raise SystemExit(
+            f"[pair] the checkpoints disagree on vocab_size ({int(ref_cfg.vocab_size)} vs "
+            f"{int(cand_cfg.vocab_size)}): their predicted classes are not comparable, "
+            "so a paired analysis would be meaningless")
+    if int(ref_cfg.ignore_index) != int(cand_cfg.ignore_index):
+        raise SystemExit(
+            f"[pair] the checkpoints disagree on ignore_index ({int(ref_cfg.ignore_index)} vs "
+            f"{int(cand_cfg.ignore_index)}): the two models would be scored on different tokens")
+    ignore = int(ref_cfg.ignore_index)
+    vocab = int(ref_cfg.vocab_size)
+    topk = min(max(1, int(args.topk)), max(1, vocab - 1))
+    max_scan = max(0, int(args.max_scan_errors))
+    target_counts = torch.zeros(vocab, dtype=torch.long)
+    prev_gold_keys = []
+    n_tokens = 0
+    n_both_right = n_fixed = n_broken = n_both_wrong = 0
+    copy_input_correct = 0
+    n_positional = 0
+    scans = {'fixed': [], 'broken': [], 'both_wrong': []}
+    scanned = {'fixed': 0, 'broken': 0, 'both_wrong': 0}
+    for x, y in batches:
+        with torch.no_grad():
+            logits_ref, _ = reference_model(x, return_logits=True)
+            logits_cand, _ = candidate_model(x, return_logits=True)
+        mask = y.ne(ignore)
+        n_tok = int(mask.sum().item())
+        n_tokens += n_tok
+        target_counts += torch.bincount(y[mask].cpu(), minlength=vocab)
+        prev_gold_keys.append((x[mask].long().cpu() * vocab + y[mask].long().cpu()))
+        if tuple(x.shape) == tuple(y.shape):
+            copy_input_correct += int((x[mask] == y[mask]).sum().item())
+        n_positional += n_tok
+        B, T, V = logits_ref.shape
+        chunk = max(1, int(args.eval_chunk))
+        for t0 in range(0, T, chunk):
+            t1 = min(T, t0 + chunk)
+            m = mask[:, t0:t1]
+            if not bool(m.any()):
+                continue
+            gold = y[:, t0:t1]
+            stats_ref = _chunk_stats(logits_ref[:, t0:t1], gold, topk)
+            stats_cand = _chunk_stats(logits_cand[:, t0:t1], gold, topk)
+            selectors = {
+                'fixed': m & ~stats_ref['ok'] & stats_cand['ok'],
+                'broken': m & stats_ref['ok'] & ~stats_cand['ok'],
+                'both_wrong': m & ~stats_ref['ok'] & ~stats_cand['ok'],
+            }
+            n_both_right += int((m & stats_ref['ok'] & stats_cand['ok']).sum().item())
+            n_fixed += int(selectors['fixed'].sum().item())
+            n_broken += int(selectors['broken'].sum().item())
+            n_both_wrong += int(selectors['both_wrong'].sum().item())
+            for status, selector in selectors.items():
+                remaining = max_scan - scanned[status]
+                if remaining <= 0:
+                    continue
+                for b, tt in selector.nonzero(as_tuple=False)[:remaining].tolist():
+                    scanned[status] += 1
+                    pos = t0 + tt
+                    scans[status].append({
+                        'batch_row': b,
+                        'position': pos,
+                        'gold': int(gold[b, tt]),
+                        'prev': int(x[b, pos]),
+                        'context': [int(v) for v in x[b, max(0, pos - args.context_tokens):pos + 1].tolist()],
+                        'reference': _side_record(stats_ref, b, tt, args.rank_clip),
+                        'candidate': _side_record(stats_cand, b, tt, args.rank_clip),
+                    })
+            del stats_ref, stats_cand, selectors
+        del logits_ref, logits_cand
+
+    if n_tokens == 0:
+        raise SystemExit('[pair] no valid target tokens in the selected batches')
+
+    prev_gold, prev_majority = _prev_majority(prev_gold_keys, vocab)
+    rare_ids, rare_threshold = _rare_ids(target_counts, args.rare_quantile)
+    cause_summary: dict = {}
+    reference_cause = Counter()
+    candidate_cause = Counter()
+    examples = {'fixed': [], 'broken': [], 'shared_blind_spots': []}
+
+    def _classify_one(rec, side_name):
+        flags = _error_flags(_side_error_input(rec, side_name), prev_gold,
+                             prev_majority, rare_ids, vocab, args.confidence)
+        return flags, _primary_cause(flags)
+
+    for rec in scans['fixed']:
+        flags, cause = _classify_one(rec, 'reference')
+        reference_cause[cause] += 1
+        _bump(cause_summary, cause, 'reference_errors')
+        _bump(cause_summary, cause, 'fixed')
+        rec['reference_flags'] = flags
+        rec['reference_cause'] = cause
+        examples['fixed'].append(rec)
+    for rec in scans['broken']:
+        flags, cause = _classify_one(rec, 'candidate')
+        candidate_cause[cause] += 1
+        _bump(cause_summary, cause, 'candidate_errors')
+        _bump(cause_summary, cause, 'broken')
+        rec['candidate_flags'] = flags
+        rec['candidate_cause'] = cause
+        examples['broken'].append(rec)
+    n_both_wrong_confident = 0
+    for rec in scans['both_wrong']:
+        ref_flags, ref_cause = _classify_one(rec, 'reference')
+        cand_flags, cand_cause = _classify_one(rec, 'candidate')
+        reference_cause[ref_cause] += 1
+        candidate_cause[cand_cause] += 1
+        rec['reference_flags'] = ref_flags
+        rec['candidate_flags'] = cand_flags
+        rec['reference_cause'] = ref_cause
+        rec['candidate_cause'] = cand_cause
+        if min(rec['reference']['pred_prob'], rec['candidate']['pred_prob']) >= args.confidence:
+            n_both_wrong_confident += 1
+        examples['shared_blind_spots'].append(rec)
+
+    examples['fixed'].sort(key=lambda r: (-r['reference']['pred_prob'], r['reference']['gold_rank']))
+    examples['broken'].sort(key=lambda r: (-r['candidate']['pred_prob'], r['candidate']['gold_rank']))
+    examples['shared_blind_spots'].sort(
+        key=lambda r: (-min(r['reference']['pred_prob'], r['candidate']['pred_prob']),
+                       r['reference']['gold_rank']))
+    shown = {status: records[: args.max_examples] for status, records in examples.items()}
+    for records in shown.values():
+        for rec in records:
+            rec['context_text'] = _decode(rec['context'], tokenizer)
+            rec['gold_text'] = _decode([rec['gold']], tokenizer)
+            rec['reference']['pred_text'] = _decode([rec['reference']['pred']], tokenizer)
+            rec['candidate']['pred_text'] = _decode([rec['candidate']['pred']], tokenizer)
+
+    def _cost(model):
+        breakdown = parameter_breakdown(model)
+        flops = analytic_flops_per_token(model.cfg, seq_len=int(args.seq_len))
+        return {
+            'n_params': breakdown['total'],
+            'norm_share_of_total': breakdown['norm_share_of_total'],
+            'parameter_breakdown': breakdown['by_role'],
+            'flops_per_token_forward': flops['forward_per_token'],
+        }
+
+    cost = {'reference': _cost(reference_model), 'candidate': _cost(candidate_model)}
+    ref_params, cand_params = cost['reference']['n_params'], cost['candidate']['n_params']
+    ref_flops, cand_flops = (cost['reference']['flops_per_token_forward'],
+                             cost['candidate']['flops_per_token_forward'])
+    cost['params_ratio_candidate_over_reference'] = (cand_params / ref_params) if ref_params else None
+    cost['flops_ratio_candidate_over_reference'] = (cand_flops / ref_flops) if ref_flops else None
+    cost['note'] = ('parameters and analytic matmul FLOPs at the analysis seq_len; norm layers '
+                    'are elementwise so they barely move FLOPs - measure wall-clock latency and '
+                    'memory with scripts/benchmark_efficiency.py before calling a win viable')
+
+    bigram_correct = sum(count for _, count in prev_majority.values())
+    mcnemar = mcnemar_test(n_fixed, n_broken)
+    summary = {
+        'n_tokens': n_tokens,
+        'reference_accuracy': (n_tokens - n_fixed - n_both_wrong) / n_tokens,
+        'candidate_accuracy': (n_tokens - n_broken - n_both_wrong) / n_tokens,
+        'accuracy_delta_candidate_minus_reference': (n_fixed - n_broken) / n_tokens,
+        'fixed': n_fixed,
+        'broken': n_broken,
+        'both_wrong': n_both_wrong,
+        'both_right': n_both_right,
+        'net_fixed_minus_broken': n_fixed - n_broken,
+        'fixed_per_1000_tokens': 1000.0 * n_fixed / n_tokens,
+        'broken_per_1000_tokens': 1000.0 * n_broken / n_tokens,
+        'mcnemar': mcnemar,
+        'shared_blind_spot_confident': n_both_wrong_confident,
+        'reference_errors_total': n_fixed + n_both_wrong,
+        'candidate_errors_total': n_broken + n_both_wrong,
+        'majority_class_accuracy': float(target_counts.max().item()) / n_tokens,
+        'bigram_majority_accuracy': bigram_correct / n_tokens,
+        'uniform_random_accuracy': 1.0 / vocab,
+        'copy_input_accuracy': (copy_input_correct / n_tokens) if n_positional else None,
+        'topk': topk,
+        'errors_scanned': scanned,
+    }
+    return {
+        'summary': summary,
+        'cost': cost,
+        'cause_summary': {c: dict(v) for c, v in sorted(cause_summary.items())},
+        'reference_cause_distribution': dict(reference_cause.most_common()),
+        'candidate_cause_distribution': dict(candidate_cause.most_common()),
+        'reading_guide': {
+            'fixed': ('reference errors the candidate repaired, classified by why the '
+                      'reference failed: this names what the candidate mechanism buys'),
+            'broken': ('errors the candidate introduced, classified by the candidate cause: '
+                       'this is the candidate\'s new failure mode'),
+            'shared_blind_spots': ('both arms wrong on the same token; when both are confident '
+                                   '(min pred_prob >= --confidence) and predict the same wrong '
+                                   'token, suspect label noise / inherent ambiguity rather than '
+                                   'a model-specific defect - that class is not fixable by either '
+                                   'mechanism'),
+            'mcnemar': 'exact paired test over the discordant (fixed/broken) tokens only',
+            'cost': ('parameters / analytic FLOPs of both checkpoints next to the error delta; '
+                     'wall-clock and memory come from scripts/benchmark_efficiency.py'),
+        },
+        'examples': shown,
+        'rarest_target_threshold': rare_threshold,
+        'note': (
+            f'discordant counts (fixed/broken) are exact over all {n_tokens} scored tokens; '
+            f'the taxonomy covers the first {max_scan} scanned records per bucket '
+            f'(fixed={scanned["fixed"]}, broken={scanned["broken"]}, '
+            f'both_wrong={scanned["both_wrong"]}). The AUC block is not run in pair mode.'
+        ),
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--ckpt', required=True)
+    p.add_argument('--ckpt', required=True, help='checkpoint to analyze; with --reference-ckpt this is the candidate')
+    p.add_argument('--reference-ckpt', default=None, help='second checkpoint: when given, the analysis becomes a paired reference-vs-candidate bad-case comparison on identical batches (fixed/broken errors, exact McNemar, shared blind spots) - see analyze_pair')
     p.add_argument('--corpus', choices=['markov', 'dataset'], default='markov')
     p.add_argument('--split', choices=['validation', 'test', 'train'], default='validation')
     p.add_argument('--n-batches', type=int, default=8)
@@ -408,6 +747,26 @@ def main():
     # the printed/`config`-recorded topk names the key that is in the summary.
     args.topk = max(1, min(int(args.topk), max(1, int(model.cfg.vocab_size) - 1)))
     print(f"[errors] loaded {args.ckpt} | norm={model_args['norm']} | corpus={args.corpus} | device={device}")
+    reference_model = reference_args = None
+    if args.reference_ckpt:
+        reference_model, reference_args = load_ckpt(args.reference_ckpt, device=device)
+        print(f"[pair] reference {args.reference_ckpt} | norm={reference_args['norm']}")
+
+    # A checkpoint's weights themselves must be finite before any result is
+    # read out of it: a diverged run can still save, and every later metric
+    # would then silently be arithmetic on NaN.
+    checkpoint_health = {'candidate': parameter_finite_report(model)}
+    if reference_model is not None:
+        checkpoint_health['reference'] = parameter_finite_report(reference_model)
+    for label, health in checkpoint_health.items():
+        if not health['finite']:
+            print(f"[errors] ERROR: the {label} checkpoint has "
+                  f"{health['n_nonfinite_parameters']} non-finite parameter tensor(s) "
+                  f"and {health['n_nonfinite_buffers']} non-finite buffer(s): "
+                  f"{health['nonfinite_parameters'][:5]}")
+            print(f"[errors] {health['recommendation']}", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"[errors] {label} checkpoint weights finite ({health['n_parameters']} tensors checked)")
 
     tokenizer = None
     if args.corpus == 'markov':
@@ -419,44 +778,104 @@ def main():
             tokenizer.pad_token_id = tokenizer.eos_token_id
         batches = _dataset_batches(args, model, device)
 
-    report = analyze(model, batches, args, tokenizer=tokenizer, device=device)
+    if reference_model is not None:
+        report = analyze_pair(reference_model, model, batches, args,
+                              tokenizer=tokenizer, device=device)
+        report['model_args'] = {k: v for k, v in model_args.items()
+                                if isinstance(v, (str, int, float, bool, type(None)))}
+        report['reference_model_args'] = {k: v for k, v in reference_args.items()
+                                          if isinstance(v, (str, int, float, bool, type(None)))}
+        out = args.output or str(Path(args.ckpt).parent / f'error_analysis_pair_{args.corpus}.json')
+    else:
+        report = analyze(model, batches, args, tokenizer=tokenizer, device=device)
+        report['model_args'] = {k: v for k, v in model_args.items()
+                                if isinstance(v, (str, int, float, bool, type(None)))}
+        out = args.output or str(Path(args.ckpt).parent / f'error_analysis_{args.corpus}.json')
     report['config'] = vars(args)
-    report['model_args'] = {k: v for k, v in model_args.items() if isinstance(v, (str, int, float, bool, type(None)))}
+    report['checkpoint_health'] = checkpoint_health
     report['run_metadata'] = collect_run_metadata(seed=args.seed)
 
-    s = report['summary']
-    print(f"[errors] tokens={s['n_tokens']} errors={s['n_errors']} "
-          f"accuracy={s['accuracy']:.4f} error_rate={s['error_rate']:.4f} "
-          f"top{args.topk}_accuracy={s[f'top{args.topk}_accuracy']:.4f} "
-          f"macro_f1={s['macro_f1']:.4f} weighted_f1={s['weighted_f1']:.4f} "
-          f"majority_baseline={s['majority_class_accuracy']:.4f} "
-          f"bigram_baseline={s['bigram_majority_accuracy']:.4f} "
-          f"uniform_baseline={s['uniform_random_accuracy']:.2e}")
-    if s['imbalance']['prefer_pr_auc']:
-        print(f"[errors] WARNING: target imbalance {s['imbalance']['note']}; "
-              f"accuracy/micro_f1 overstate - read macro_f1 and the PR-AUC block")
-    if s['macro_average_precision'] is not None:
-        print(f"[errors] one-vs-rest over {len(s['auc_classes'])} classes "
-              f"({s['auc_tokens_scored']} tokens): "
-              f"macro_pr_auc={s['macro_average_precision']:.4f} "
-              f"weighted_pr_auc={s['weighted_average_precision']:.4f} "
-              f"macro_roc_auc={s['macro_roc_auc']:.4f} "
-              f"weighted_roc_auc={s['weighted_roc_auc']:.4f} "
-              f"prefer_pr_auc={s['prefer_pr_auc']}")
-    print(f"[errors] cause distribution (over {s['errors_scanned']} scanned errors): "
-          f"{report['cause_distribution']}")
-    for rec in report['examples']:
-        flags = ','.join(k for k, v in rec['flags'].items() if v) or 'none'
-        print(f"[errors] pos={rec['position']:>5d} gold={rec['gold_text']!r}(p={rec['gold_prob']:.3f}, rank={rec['gold_rank']}) "
-              f"pred={rec['pred_text']!r}(p={rec['pred_prob']:.3f}) cause={rec['primary_cause']} flags={flags}")
-        print(f"[errors]   context: ...{rec['context_text']}")
-    out = args.output or str(Path(args.ckpt).parent / f'error_analysis_{args.corpus}.json')
+    if reference_model is not None:
+        s = report['summary']
+        m = s['mcnemar']
+        print(f"[pair] tokens={s['n_tokens']} reference_accuracy={s['reference_accuracy']:.4f} "
+              f"candidate_accuracy={s['candidate_accuracy']:.4f} "
+              f"delta={s['accuracy_delta_candidate_minus_reference']:+.4f}")
+        print(f"[pair] fixed={s['fixed']} ({s['fixed_per_1000_tokens']:.1f}/1k tok) "
+              f"broken={s['broken']} ({s['broken_per_1000_tokens']:.1f}/1k tok) "
+              f"net={s['net_fixed_minus_broken']:+d} both_wrong={s['both_wrong']} "
+              f"both_right={s['both_right']}")
+        p1 = 'n/a' if m['p_one_sided'] is None else f"{m['p_one_sided']:.4g}"
+        p2 = 'n/a' if m['p_two_sided'] is None else f"{m['p_two_sided']:.4g}"
+        print(f"[pair] exact McNemar on {m['n_discordant']} discordant tokens: "
+              f"p_one_sided={p1} p_two_sided={p2} favors={m['favors']}")
+        if m['p_two_sided'] is not None and m['p_two_sided'] < 0.05 and m['favors'] == 'reference':
+            print("[pair] WARNING: the candidate is significantly WORSE than the reference on the "
+                  "discordant tokens; read the BROKEN examples before proposing the change as an improvement")
+        elif m['p_one_sided'] is not None and m['p_one_sided'] >= 0.05:
+            print("[pair] NOTE: the fixed-minus-broken difference is not significant at 5%; "
+                  "the point estimate is within what coin-flipping the discordant tokens explains")
+        cost = report['cost']
+        print(f"[pair] cost: params={cost['reference']['n_params']} -> "
+              f"{cost['candidate']['n_params']} "
+              f"(x{cost['params_ratio_candidate_over_reference']:.4f}), "
+              f"flops/token={cost['reference']['flops_per_token_forward']:.4g} -> "
+              f"{cost['candidate']['flops_per_token_forward']:.4g} "
+              f"(x{cost['flops_ratio_candidate_over_reference']:.4f}); "
+              "latency/memory via scripts/benchmark_efficiency.py")
+        print(f"[pair] reference causes (scanned reference errors): "
+              f"{report['reference_cause_distribution']}")
+        print(f"[pair] candidate causes (scanned candidate errors): "
+              f"{report['candidate_cause_distribution']}")
+        print(f"[pair] shared blind spots: {s['both_wrong']} tokens, "
+              f"{s['shared_blind_spot_confident']} with both arms confident "
+              f"(candidate label noise / inherent ambiguity)")
+        for status, label in (('fixed', 'FIXED'), ('broken', 'BROKEN'),
+                              ('shared_blind_spots', 'SHARED-BLIND-SPOT')):
+            for rec in report['examples'][status]:
+                ref, cand = rec['reference'], rec['candidate']
+                print(f"[pair] {label} pos={rec['position']:>5d} gold={rec['gold_text']!r} "
+                      f"ref_pred={ref['pred_text']!r}(p={ref['pred_prob']:.3f}, rank={ref['gold_rank']}) "
+                      f"cand_pred={cand['pred_text']!r}(p={cand['pred_prob']:.3f}, rank={cand['gold_rank']}) "
+                      f"gold_p_ref={ref['gold_prob']:.3f} gold_p_cand={cand['gold_prob']:.3f}")
+                print(f"[pair]   context: ...{rec['context_text']}")
+    else:
+        s = report['summary']
+        print(f"[errors] tokens={s['n_tokens']} errors={s['n_errors']} "
+              f"accuracy={s['accuracy']:.4f} error_rate={s['error_rate']:.4f} "
+              f"top{args.topk}_accuracy={s[f'top{args.topk}_accuracy']:.4f} "
+              f"macro_f1={s['macro_f1']:.4f} weighted_f1={s['weighted_f1']:.4f} "
+              f"majority_baseline={s['majority_class_accuracy']:.4f} "
+              f"bigram_baseline={s['bigram_majority_accuracy']:.4f} "
+              f"uniform_baseline={s['uniform_random_accuracy']:.2e}")
+        if s['imbalance']['prefer_pr_auc']:
+            print(f"[errors] WARNING: target imbalance {s['imbalance']['note']}; "
+                  f"accuracy/micro_f1 overstate - read macro_f1 and the PR-AUC block")
+        if s['macro_average_precision'] is not None:
+            print(f"[errors] one-vs-rest over {len(s['auc_classes'])} classes "
+                  f"({s['auc_tokens_scored']} tokens): "
+                  f"macro_pr_auc={s['macro_average_precision']:.4f} "
+                  f"weighted_pr_auc={s['weighted_average_precision']:.4f} "
+                  f"macro_roc_auc={s['macro_roc_auc']:.4f} "
+                  f"weighted_roc_auc={s['weighted_roc_auc']:.4f} "
+                  f"prefer_pr_auc={s['prefer_pr_auc']}")
+        print(f"[errors] cause distribution (over {s['errors_scanned']} scanned errors): "
+              f"{report['cause_distribution']}")
+        for rec in report['examples']:
+            flags = ','.join(k for k, v in rec['flags'].items() if v) or 'none'
+            print(f"[errors] pos={rec['position']:>5d} gold={rec['gold_text']!r}(p={rec['gold_prob']:.3f}, rank={rec['gold_rank']}) "
+                  f"pred={rec['pred_text']!r}(p={rec['pred_prob']:.3f}) cause={rec['primary_cause']} flags={flags}")
+            print(f"[errors]   context: ...{rec['context_text']}")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps(report, indent=2, default=str))
-    save_run_manifest(Path(out).with_name('error_analysis_manifest.json'), {
+    manifest = {
         'run_metadata': report['run_metadata'], 'ckpt': args.ckpt,
-        'corpus': args.corpus, 'config': vars(args), 'summary': s,
-    })
+        'corpus': args.corpus, 'config': vars(args),
+        'summary': report['summary'], 'checkpoint_health': checkpoint_health,
+    }
+    if args.reference_ckpt:
+        manifest['reference_ckpt'] = args.reference_ckpt
+    save_run_manifest(Path(out).with_name('error_analysis_manifest.json'), manifest)
     print(f'[errors] report -> {out}')
 
 

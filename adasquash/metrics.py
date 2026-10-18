@@ -52,6 +52,7 @@ __all__ = [
     "holm_adjust",
     "imbalance_report",
     "macro_weighted_f1",
+    "mcnemar_test",
     "mean_ci",
     "mean_std_stderr",
     "paired_t_one_sided",
@@ -88,6 +89,66 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
         p * (1.0 - p) / n_total + z2 / (4.0 * n_total * n_total)
     )
     return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def mcnemar_test(n_fixed: int, n_broke: int) -> dict:
+    """Exact McNemar test on the discordant pairs of a paired comparison.
+
+    Two classifiers evaluated on the *same* samples split into four cells:
+    both right, both wrong, and the two discordant cells - `n_fixed`
+    (reference wrong, candidate right) and `n_broke` (reference right,
+    candidate wrong). The question "is the candidate better?" lives entirely
+    in the discordant cells: under the null hypothesis that both classifiers
+    have the same error rate on these samples, each discordant pair is a fair
+    coin, so `n_fixed ~ Binomial(n_fixed + n_broke, 0.5)`.
+
+    The exact p-value is computed with the regularized incomplete beta (the
+    binomial CDF at p = 1/2), not the normal approximation: paired bad-case
+    analysis runs on a few hundred to a few thousand scanned errors, and at
+    the small discordant counts that survive there the normal tail is
+    anti-conservative. `p_one_sided` is P(X >= n_fixed) and supports
+    "candidate better"; `p_two_sided` doubles the smaller tail (capped at 1).
+    `normal_z_continuity_corrected` is reported for reference only.
+
+    Degenerate case `n_discordant = 0`: the models agree on every compared
+    sample, so there is no evidence either way and both p-values are `None`
+    (not 1.0, which would read as "no difference").
+    """
+    n_fixed = int(n_fixed)
+    n_broke = int(n_broke)
+    if n_fixed < 0 or n_broke < 0:
+        raise ValueError(f"mcnemar_test needs non-negative counts, got {n_fixed} and {n_broke}")
+    n = n_fixed + n_broke
+    out = {
+        "n_fixed": n_fixed,
+        "n_broke": n_broke,
+        "n_discordant": n,
+        "p_one_sided": None,
+        "p_two_sided": None,
+        "favors": "tied",
+        "normal_z_continuity_corrected": None,
+        "test": "mcnemar_exact",
+    }
+    if n == 0:
+        out["note"] = (
+            "no discordant pairs: the two arms agreed on every compared sample, "
+            "so the comparison carries no evidence either way"
+        )
+        return out
+    # P(X <= k) for X ~ Bin(n, 1/2) is I_{1/2}(n - k, k + 1); the one-sided
+    # p-value P(X >= n_fixed) is the mirror image I_{1/2}(n_fixed, n_broke + 1).
+    p_ge = _reg_incomplete_beta(n_fixed, n_broke + 1, 0.5) if n_fixed > 0 else 1.0
+    p_le = _reg_incomplete_beta(n_broke, n_fixed + 1, 0.5) if n_broke > 0 else 1.0
+    out["p_one_sided"] = p_ge
+    out["p_two_sided"] = min(1.0, 2.0 * min(p_ge, p_le))
+    out["favors"] = "candidate" if n_fixed > n_broke else ("reference" if n_broke > n_fixed else "tied")
+    out["normal_z_continuity_corrected"] = (abs(n_fixed - n_broke) - 1.0) / math.sqrt(n)
+    out["note"] = (
+        "p_one_sided = P(Binomial(n_discordant, 0.5) >= n_fixed); the exact test "
+        "is the small-discordant-count reference (the normal approximation is "
+        "anti-conservative there)"
+    )
+    return out
 
 
 def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
