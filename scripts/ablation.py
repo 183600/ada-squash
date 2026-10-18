@@ -333,9 +333,6 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         loss.backward()
         if measure:
             act_stats.detach()
-            # The `_logit_stats` scratch only serves the sweep of the forward
-            # that just finished; between stats steps it would otherwise pin
-            # a full-sweep buffer on the device for nothing.
             clear_logit_scratch_cache()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()

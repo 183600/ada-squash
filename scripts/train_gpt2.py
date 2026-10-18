@@ -155,9 +155,8 @@ def open_data_split(split: str, args, seq_len: int | None = None):
 def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device) -> float | None:
     """Mean loss over held-out batches; `state['iter']` carries the position.
 
-    Runs under `inference_mode` and eval mode: no gradient ever flows from a
-    validation or test batch into the parameters, and the pass skips the
-    autograd bookkeeping a training forward would pay for.
+    Runs under `inference_mode` and eval mode, so no gradient ever flows from
+    a validation or test batch into the parameters.
     """
     model.eval()
     it = state.get('iter')
@@ -563,9 +562,6 @@ def main():
                 loss_acc.add_(loss.detach())
         if attach_stats:
             act_stats.detach()
-            # The `_logit_stats` scratch only serves the sweep of the forward
-            # that just finished; between stats windows it would otherwise
-            # pin a full-sweep buffer on the device for nothing.
             clear_logit_scratch_cache()
         if nonfinite_batch is not None:
             _handle_nonfinite(step, *nonfinite_batch)

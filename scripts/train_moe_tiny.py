@@ -290,12 +290,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()
-            # The `_logit_stats` scratch only serves the sweep of the forward
-            # that just finished; between stats steps it would otherwise pin
-            # a full-sweep buffer on the device for nothing.
             clear_logit_scratch_cache()
-        # Per-block routed-load CVs stay on the device; the history
-        # serialization materializes them once at the end of the run.
         expert_cv = _expert_cv_per_block(tpe_list)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()

@@ -13,14 +13,7 @@ _CACHE_MAX_ENTRIES = 8
 _LOGIT_SCRATCH_MAX_ENTRIES = 2
 
 def clear_logit_scratch_cache() -> None:
-    """Drop the `_logit_scratch` buffers when a stats window ends.
-
-    The scratch is only needed while `_logit_stats` sweeps run, so holding it
-    between windows pins up to `_LOGIT_SCRATCH_MAX_ENTRIES` buffers on the
-    device for nothing. Intra-forward reuse still hits the cache (the blocks
-    that share a key sweep inside one forward, before the caller detaches the
-    stats hooks); the tril and rope caches keep their own retention.
-    """
+    """Drop the cached `_logit_scratch` buffers when a stats window ends."""
     _LOGIT_SCRATCH_CACHE.clear()
 
 def _skip_init(module_cls, *args, **kwargs):
