@@ -187,6 +187,11 @@ class CausalSelfAttention(nn.Module):
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
         cache = self._rope_cache
         entry = cache[1] if cache is not None and cache[0] == key else None
+        if entry is not None and entry[1].is_inference() and (not torch.is_inference_mode_enabled()):
+            # A table built under `inference_mode` cannot be saved for
+            # backward; a later grad-mode forward through this module has to
+            # get normal tables.
+            entry = None
         if entry is None:
             key, entry = _rope_table_entry(freqs_cis)
             self._rope_cache = (key, entry)
@@ -212,6 +217,11 @@ def _rope_table_entry(freqs_cis: torch.Tensor):
     """
     key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
     entry = _ROPE_TABLE_CACHE.get(key)
+    if entry is not None and entry[1].is_inference() and (not torch.is_inference_mode_enabled()):
+        # Inference-mode tables are immutable constants: they cannot be saved
+        # for backward, so grad-mode callers need a normal rebuild (the key
+        # and the values are unchanged).
+        entry = None
     if entry is None:
         cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
         sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
@@ -225,6 +235,8 @@ def _rope_pair_for_dtype(entry, dtype: torch.dtype):
     """``(cos, sin)`` of an entry in ``dtype``; the cast pair is cached too."""
     tables = entry[3]
     got = tables.get(dtype)
+    if got is not None and got[0].is_inference() and (not torch.is_inference_mode_enabled()):
+        got = None
     if got is None:
         cos, sin = (entry[1], entry[2])
         if cos.dtype != dtype:
