@@ -133,7 +133,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         buf = torch.empty((1, len(full) + len(target_ids)), dtype=torch.long, device=device)
         buf[0, :len(full)] = torch.tensor(full, dtype=torch.long, device=device)
         n = len(full)
-        with torch.no_grad():
+        with torch.inference_mode():
             for want in target_ids:
                 ctx = buf[:, :n]
                 if last_logits is not None:

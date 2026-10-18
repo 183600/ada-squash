@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from adasquash import GPTConfig, GPT, count_parameters, ActivationStats, LossSpikeCounter
+from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
@@ -154,14 +155,15 @@ def open_data_split(split: str, args, seq_len: int | None = None):
 def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device) -> float | None:
     """Mean loss over held-out batches; `state['iter']` carries the position.
 
-    Runs under `no_grad` and eval mode: no gradient ever flows from a
-    validation or test batch into the parameters.
+    Runs under `inference_mode` and eval mode: no gradient ever flows from a
+    validation or test batch into the parameters, and the pass skips the
+    autograd bookkeeping a training forward would pay for.
     """
     model.eval()
     it = state.get('iter')
     total = None
     n = 0
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(max(1, int(n_batches))):
             if it is None:
                 it = iter(loader)
@@ -561,6 +563,10 @@ def main():
                 loss_acc.add_(loss.detach())
         if attach_stats:
             act_stats.detach()
+            # The `_logit_stats` scratch only serves the sweep of the forward
+            # that just finished; between stats windows it would otherwise
+            # pin a full-sweep buffer on the device for nothing.
+            clear_logit_scratch_cache()
         if nonfinite_batch is not None:
             _handle_nonfinite(step, *nonfinite_batch)
             continue

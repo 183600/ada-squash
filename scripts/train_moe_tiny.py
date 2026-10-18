@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import build_norm, markov_batch
 from adasquash.diagnostics import triage_nonfinite
-from adasquash.attention import CausalSelfAttention
+from adasquash.attention import CausalSelfAttention, clear_logit_scratch_cache
 from adasquash.metrics import mean_std_stderr
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, _LayerScaleResidual
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
@@ -290,6 +290,10 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()
+            # The `_logit_stats` scratch only serves the sweep of the forward
+            # that just finished; between stats steps it would otherwise pin
+            # a full-sweep buffer on the device for nothing.
+            clear_logit_scratch_cache()
         # Per-block routed-load CVs stay on the device; the history
         # serialization materializes them once at the end of the run.
         expert_cv = _expert_cv_per_block(tpe_list)
@@ -317,7 +321,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         val_losses = []
         val_ce_losses = []
         val_auxes = []
-        with torch.no_grad():
+        with torch.inference_mode():
             if args.dataset:
                 val_loader = open_data_split('validation', args)
                 rval = getattr(val_loader, 'split_report', None)

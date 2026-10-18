@@ -115,7 +115,9 @@ def benchmark_norm(model_name: str, norm: str, args, device: str) -> dict:
     )
 
     def forward():
-        with torch.no_grad(), autocast_ctx:
+        # `inference_mode` (not `no_grad`): the timed pass pays no autograd
+        # bookkeeping, so the latency reflects inference cost alone.
+        with torch.inference_mode(), autocast_ctx:
             model(x, targets=None, return_logits=True)
 
     def train_step():

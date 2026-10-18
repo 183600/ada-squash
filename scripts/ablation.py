@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
+from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b
@@ -332,6 +333,10 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         loss.backward()
         if measure:
             act_stats.detach()
+            # The `_logit_stats` scratch only serves the sweep of the forward
+            # that just finished; between stats steps it would otherwise pin
+            # a full-sweep buffer on the device for nothing.
+            clear_logit_scratch_cache()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
@@ -344,7 +349,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             curve_window_start = len(losses)
             train_point = sum(window) / max(1, len(window))
             model.eval()
-            with torch.no_grad():
+            with torch.inference_mode():
                 held = [model(*markov_batch(curve_rng, model.cfg.ignore_index, args.batch_size,
                                             args.seq_len, device, outlier_id=outlier_id),
                               return_logits=False)[1].item()
@@ -383,7 +388,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     val_rng = torch.Generator(device=device).manual_seed(seed + 1)
     model.eval()
     val_losses = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(n_val_batches):
             vx, vy = markov_batch(val_rng, model.cfg.ignore_index, args.batch_size, args.seq_len, device, outlier_id=outlier_id)
             val_losses.append(model(vx, vy, return_logits=False)[1].item())
