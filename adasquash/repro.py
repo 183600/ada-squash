@@ -7,9 +7,16 @@ cuDNN) and `seed_worker` extends that to DataLoader worker processes.
 seed, the environment and any data fingerprints next to the run outputs so
 every experiment is traceable after the fact.
 
-Bit-identical results across different hardware/frameworks are not promised;
-the contract here is that a run on the same machine with the same manifest
-reproduces its own curve and final metrics.
+The contract is same-machine reproducibility: bit-identical results across
+different hardware/frameworks are not promised, but a rerun on the same
+machine with the same manifest must reproduce its own curve and final
+metrics. `environment_info` therefore also records the *RNG/determinism
+configuration* the run actually used (cuDNN flags, TF32 flags, thread
+counts, hash seeds), so a manifest mismatch can be diagnosed from the
+record instead of from memory.
+
+TensorFlow is not a dependency of this repository; the training stack is
+pure PyTorch, so no TF RNG is seeded here.
 """
 import hashlib
 import json
@@ -18,6 +25,7 @@ import platform
 import random
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -33,6 +41,13 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     algorithms (same-machine reproducibility). Torch workers spawned later
     (DataLoader, subprocess launches) inherit the seed through `seed_worker`
     / `PYTHONHASHSEED`.
+
+    Note on `PYTHONHASHSEED`: it is exported here so child processes
+    (DataLoader workers, subprocess launches) get a fixed string-hash seed
+    from interpreter startup. The *current* process already picked its hash
+    seed at startup, so a launcher that spawns training subprocesses (e.g.
+    the depth sweep) should also put `PYTHONHASHSEED=<seed>` in the child
+    environment explicitly - that is the only point where it takes effect.
     """
     seed = int(seed)
     random.seed(seed)
@@ -48,6 +63,11 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # cuBLAS needs a fixed workspace to run deterministic reductions once
+        # `torch.use_deterministic_algorithms(True)` is enabled; pinning it
+        # here keeps the environment reproducible without forcing the
+        # (slower, sometimes unsupported) deterministic-algorithm mode on.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     os.environ["PYTHONHASHSEED"] = str(seed % (2 ** 32))
     return seed
 
@@ -57,10 +77,14 @@ def seed_worker(worker_id: int) -> None:
 
     `torch.initial_seed()` in a worker is the loader's base seed (from the
     explicit `generator` the pipeline passes) plus the worker id, so worker
-    randomness is a deterministic function of the run seed.
+    randomness is a deterministic function of the run seed. Python and NumPy
+    are re-seeded from that same value; torch is re-seeded as well (idempotent
+    with the loader's own worker seeding) so the worker contract does not
+    depend on torch-version internals.
     """
     seed = torch.initial_seed() % (2 ** 32)
     random.seed(seed)
+    torch.manual_seed(seed)
     try:
         import numpy as np
     except ImportError:
@@ -118,7 +142,14 @@ def file_fingerprint(path) -> dict:
 
 
 def environment_info() -> dict:
-    """Software/hardware fingerprint of the process that produced a run."""
+    """Software/hardware fingerprint of the process that produced a run.
+
+    Besides library versions it records the reproducibility configuration:
+    the cuDNN/TF32/deterministic-algorithm flags and the thread counts that
+    decide the reduction order of CPU/GPU kernels, plus the hash seeds. Two
+    manifests with different values here are not expected to match even on
+    the same machine.
+    """
     info = {
         "python": platform.python_version(),
         "platform": platform.platform(),
@@ -131,6 +162,22 @@ def environment_info() -> dict:
         "cuda_available": torch.cuda.is_available(),
         "cuda_version": getattr(torch.version, "cuda", None),
         "cudnn_version": torch.backends.cudnn.version() if torch.cuda.is_available() else None,
+        # Reproducibility configuration actually in effect for this process.
+        "rng_config": {
+            "torch_num_threads": torch.get_num_threads(),
+            "torch_num_interop_threads": torch.get_num_interop_threads(),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "tf32_matmul_allowed": bool(torch.backends.cuda.matmul.allow_tf32),
+            "tf32_cudnn_allowed": bool(torch.backends.cudnn.allow_tf32),
+            "deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
+            "deterministic_algorithms_warn_only": bool(
+                getattr(torch, "is_deterministic_algorithms_warn_only_enabled", lambda: False)()
+            ),
+            "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+            "hash_randomization": bool(sys.flags.hash_randomization),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        },
     }
     if torch.cuda.is_available():
         info["device_names"] = [

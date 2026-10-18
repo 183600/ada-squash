@@ -394,10 +394,16 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int):
         cmd.append('--no-dedup')
     if args.exclude_hash_file:
         cmd += ['--exclude-hash-file', str(args.exclude_hash_file)]
+    if args.dataset_revision:
+        cmd += ['--dataset-revision', str(args.dataset_revision)]
+    if args.tokenizer_revision:
+        cmd += ['--tokenizer-revision', str(args.tokenizer_revision)]
     if args.gradient_checkpointing:
         cmd.append('--gradient-checkpointing')
-    if args.sanity_check:
-        cmd.append('--sanity-check')
+    # The child training script runs the small-batch overfit sanity check by
+    # default; forward the opt-out so a sweep can intentionally skip it.
+    if not args.sanity_check:
+        cmd.append('--no-sanity-check')
     if args.compile:
         cmd.append('--compile')
         cmd += ['--compile-mode', args.compile_mode]
@@ -445,6 +451,8 @@ def main():
     p.add_argument('--reference-norm', default='rmsnorm', help='baseline norm each other norm is compared against at every depth (paired per seed, Holm-adjusted)')
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
+    p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) pinned for every row; recorded in each run manifest')
+    p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) pinned for every row; recorded in each run manifest')
     p.add_argument('--val-frac', type=float, default=0.005, help='chronological held-out validation fraction (identical for every row)')
     p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction (identical for every row)')
     p.add_argument('--num-documents', type=int, default=None, help='total documents; required when the dataset reports no size')
@@ -486,7 +494,8 @@ def main():
     p.add_argument('--no-beta', dest='beta', action='store_false')
     p.add_argument('--alpha-jitter', type=float, default=0.05, help='per-channel alpha init jitter for DyTC (0 for deterministic)')
     p.add_argument('--gradient-checkpointing', action='store_true', help='enable gradient checkpointing')
-    p.add_argument('--sanity-check', action='store_true', help='run the small-batch overfit sanity check in every row before training it')
+    p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check in every row before training it (default: on, forwarded to the child trainers)')
+    p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the per-row overfit sanity check')
     p.add_argument('--compile', action='store_true', help='enable torch.compile')
     p.add_argument('--compile-mode', default='reduce-overhead', choices=['default', 'reduce-overhead', 'max-autotune'])
     p.add_argument('--no-dim-scaling', action='store_true', help='keep dim/n_heads fixed across depths')

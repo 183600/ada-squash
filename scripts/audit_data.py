@@ -131,7 +131,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
+    p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) to audit; must match the trained run, because auditing a moved upstream branch checks different data than was trained on')
     p.add_argument('--tokenizer', default='gpt2')
+    p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) to pin')
     p.add_argument('--val-frac', type=float, default=0.005, help='must match the trained run')
     p.add_argument('--test-frac', type=float, default=0.005, help='must match the trained run')
     p.add_argument('--num-documents', type=int, default=None, help='total documents; required when the dataset reports no size')
@@ -147,10 +149,12 @@ def main():
         from transformers import AutoTokenizer
     except ImportError as e:
         raise SystemExit(f'audit_data needs transformers + datasets installed: {e}')
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, revision=args.tokenizer_revision)
     options = {'val_frac': args.val_frac, 'test_frac': args.test_frac,
                'num_documents': args.num_documents, 'dedup': args.dedup,
-               'min_doc_chars': args.min_doc_chars, 'max_doc_chars': args.max_doc_chars}
+               'min_doc_chars': args.min_doc_chars, 'max_doc_chars': args.max_doc_chars,
+               'dataset_revision': args.dataset_revision,
+               'tokenizer_revision': args.tokenizer_revision}
     splits = {}
     tokens = {}
     reports = {}

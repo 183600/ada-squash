@@ -11,7 +11,7 @@ import torch
 from adasquash import GPTConfig, GPT
 from adasquash.metrics import wilson_interval
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 
 def _strip_compile_prefix(state):
     prefix = '_orig_mod.'
@@ -237,10 +237,19 @@ def main():
                   f"confidence: {needle['failure_confidence']} "
                   f"(per-trial bad-case records in the results JSON)")
     results['seed'] = args.seed
+    results['hyperparameters'] = vars(args)
     results['run_metadata'] = collect_run_metadata(seed=args.seed)
     out = args.output or Path(args.ckpt).parent / 'eval_results.json'
     Path(out).write_text(json.dumps(results, indent=2, default=str))
-    save_run_manifest(Path(out).with_name('eval_manifest.json'), results['run_metadata'])
+    # The manifest mirrors what the run needs to be auditable: which checkpoint
+    # (hashed), with which args, and what came out. Task scores live in the
+    # results file, which is fingerprinted here rather than duplicated.
+    manifest = dict(results['run_metadata'])
+    manifest['hyperparameters'] = vars(args)
+    manifest['checkpoint'] = file_fingerprint(args.ckpt)
+    manifest['results_file'] = file_fingerprint(out)
+    manifest['summary'] = {k: results[k] for k in ('norm', 'needle_acc', 'needle_ctx_len') if k in results}
+    save_run_manifest(Path(out).with_name('eval_manifest.json'), manifest)
     print(f'[eval] results saved to {out}')
 if __name__ == '__main__':
     main()

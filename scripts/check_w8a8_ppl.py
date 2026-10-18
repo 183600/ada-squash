@@ -139,19 +139,22 @@ def _probe_markov(rng, batch_size, seq_len, device, n_states=64):
     x, _ = markov_batch(rng, -100, batch_size, seq_len, device, n_states=n_states)
     return x
 
-def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None):
+def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None, dataset_revision=None, tokenizer_revision=None):
     # Scoring a checkpoint on the documents it trained on understates the
     # quantization damage; the probe must come from a held-out split. The
     # default is the chronological validation slice, and the cleaning policy
     # (dedup / length caps / cross-split duplicate ledger) is taken from the
     # checkpoint so the probe is the same held-out distribution the model was
-    # validated on.
+    # validated on. The dataset/tokenizer revisions are the data *version*:
+    # a probe on a moved upstream branch would not be the same held-out slice.
     from scripts.train_gpt2 import build_dataloader
     from scripts.data_pipeline import configure_data_options
     configure_data_options(split=split, val_frac=val_frac, test_frac=test_frac,
                            num_documents=num_documents, dedup=dedup,
                            min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars,
-                           exclude_hash_file=exclude_hash_file)
+                           exclude_hash_file=exclude_hash_file,
+                           dataset_revision=dataset_revision,
+                           tokenizer_revision=tokenizer_revision)
     loader = build_dataloader(dataset, dataset_config, seq_len, batch_size, tokenizer=tokenizer)
     if split != 'train':
         report = getattr(loader, 'split_report', None)
@@ -287,7 +290,9 @@ def main():
     p.add_argument('--num-documents', type=int, default=None, help='total documents in the stream; required when the dataset reports no size')
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
+    p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) for --probe dataset; a checkpoint that recorded the one it was trained with wins (None = upstream default branch)')
     p.add_argument('--tokenizer', default='gpt2', help='tokenizer for --probe dataset; a checkpoint that recorded the one it was trained with wins')
+    p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) for --probe dataset; same precedence as --tokenizer')
     p.add_argument('--n-states', type=int, default=64, help="state count of the synthetic 'markov' probe")
     p.add_argument('--max-probe-coverage', type=float, default=0.5, help='reject a probe whose tokens are more than this fraction distinct (uniform noise is ~1.0)')
     p.add_argument('--batch-size', type=int, default=4)
@@ -328,7 +333,11 @@ def main():
             if value == default and name in ckpt_args and ckpt_args.get(name) is not None:
                 return ckpt_args[name]
             return value
-        dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file')) if args.probe == 'dataset' else None
+        # Same precedence for the data version: an explicit flag wins, else
+        # the revision the checkpoint recorded, else upstream default branch.
+        dataset_revision = args.dataset_revision if args.dataset_revision is not None else ckpt_args.get('dataset_revision')
+        tokenizer_revision = args.tokenizer_revision if args.tokenizer_revision is not None else ckpt_args.get('tokenizer_revision')
+        dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision) if args.probe == 'dataset' else None
         per_seed = []
         for seed in seeds:
             # A fresh copy per seed: `wrap_model_w8a8` quantizes the weights in

@@ -25,6 +25,14 @@ Tasks
               never reaches ~0 loss, so pass `--loss-threshold` /
               `--acc-threshold` explicitly and read them as progress bounds.
 
+Models
+------
+`--model gpt` (default) exercises the dense GPT; `--model moe` exercises the
+MoE whole-model path (router, top-k dispatch and the auxiliary load-balancing
+loss) used by `scripts/train_moe_tiny.py`. `--repro-check` additionally
+retrains the same configuration a second time from the same seed and requires
+a bit-identical curve, so seed stability itself is checked, not assumed.
+
 Metrics
 -------
 Accuracy alone can be passed by a strawman predictor, so every run also
@@ -75,12 +83,15 @@ DEFAULT_THRESHOLDS = {
 }
 
 
-def run_preflight(norms, seed: int, output_dir) -> None:
+def run_preflight(norms, seed: int, output_dir, model: str = "gpt", n_experts: int = 8,
+                  repro_check: bool = False) -> None:
     """Run this script as a subprocess; raise CalledProcessError when it fails.
 
     Training entrypoints use this behind a `--sanity-check` flag so a broken
     gradient/loss path aborts the run before full-scale training starts.
     The default synthetic `copy` task is used, so no dataset is required.
+    `model='moe'` exercises the MoE whole-model path (router + aux loss)
+    instead of the dense GPT.
     """
     import subprocess
 
@@ -88,9 +99,21 @@ def run_preflight(norms, seed: int, output_dir) -> None:
         norms = [norms]
     cmd = [sys.executable, str(Path(__file__).resolve()),
            "--norms", *norms, "--seed", str(seed),
+           "--model", model, "--n-experts", str(int(n_experts)),
            "--output", str(Path(output_dir) / "sanity_overfit.json")]
+    if repro_check:
+        cmd.append("--repro-check")
     print(f"[sanity] pre-flight overfit check: {' '.join(cmd)}")
     subprocess.run(cmd, check=True, cwd=str(ROOT))
+
+
+def build_model(args, cfg: GPTConfig):
+    """Construct the model under test: the dense GPT or the tiny MoE GPT."""
+    if args.model == "moe":
+        from scripts.train_moe_tiny import MoEGPT
+
+        return MoEGPT(cfg, n_experts=args.n_experts)
+    return GPT(cfg)
 
 
 def make_batch(task: str, args, cfg: GPTConfig, device: str):
@@ -104,6 +127,8 @@ def make_batch(task: str, args, cfg: GPTConfig, device: str):
             dataset=args.dataset, dataset_config=args.dataset_config,
             tokenizer=args.tokenizer, seq_len=args.seq_len,
             batch_size=args.batch_size,
+            dataset_revision=args.dataset_revision,
+            tokenizer_revision=args.tokenizer_revision,
         )
         loader = open_data_split("train", data_args)
         x, y = next(iter(loader))
@@ -249,8 +274,9 @@ def run_one(norm: str, args, device: str) -> dict:
         learnable_k=not args.no_learnable_k, beta=args.beta,
         alpha_jitter=args.alpha_jitter, gradient_checkpointing=False,
     )
-    model = GPT(cfg)
-    model.reset_parameters(args.seed)
+    model = build_model(args, cfg)
+    if hasattr(model, "reset_parameters"):
+        model.reset_parameters(args.seed)
     model.to(device)
     x, y = make_batch(args.task, args, cfg, device)
     opt = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
@@ -328,6 +354,9 @@ def run_one(norm: str, args, device: str) -> dict:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--norms", nargs="+", default=["dytcd"], choices=sorted(NORM_REGISTRY))
+    p.add_argument("--model", choices=["gpt", "moe"], default="gpt",
+                   help="which whole-model path to exercise: the dense GPT or the tiny MoE GPT (router + aux loss)")
+    p.add_argument("--n-experts", type=int, default=8, help="experts per MoE layer (only for --model moe)")
     p.add_argument("--task", choices=["copy", "markov", "dataset"], default="copy")
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--dim", type=int, default=64)
@@ -352,9 +381,13 @@ def main():
     p.add_argument("--loss-threshold", type=float, default=None)
     p.add_argument("--acc-threshold", type=float, default=None)
     p.add_argument("--baseline-margin", type=float, default=0.05, help="required accuracy margin over the majority-class predictor (guards the metric, not the model)")
+    p.add_argument("--repro-check", action="store_true",
+                   help="retrain the same configuration a second time in-process and require a bit-identical loss curve / accuracy: a direct same-machine seed-stability check (fails if the RNGs, thread counts or kernels introduce run-to-run variance)")
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--dataset-revision", default=None, help="dataset commit/revision to pin (recorded in the report; None = upstream default branch)")
     p.add_argument("--tokenizer", default="gpt2")
+    p.add_argument("--tokenizer-revision", default=None, help="tokenizer commit/revision to pin (recorded in the report; None = upstream default branch)")
     p.add_argument("--num-documents", type=int, default=None)
     p.add_argument("--device", default=None)
     p.add_argument("--output", default="runs/sanity_overfit.json")
@@ -364,8 +397,27 @@ def main():
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     results = []
     for norm in args.norms:
-        print(f"[sanity] task={args.task} norm={norm} device={device}")
+        print(f"[sanity] task={args.task} model={args.model} norm={norm} device={device}")
         result = run_one(norm, args, device)
+        if args.repro_check:
+            # Independent rerun from the same seed: the second `run_one`
+            # re-seeds every RNG and rebuilds model + batch from scratch, so
+            # an identical curve is direct evidence that same-machine
+            # reproduction holds for this configuration.
+            rerun = run_one(norm, args, device)
+            history_matched = rerun["history"] == result["history"]
+            loss_matched = rerun["final_loss"] == result["final_loss"]
+            acc_matched = rerun["final_accuracy"] == result["final_accuracy"]
+            result["repro_check"] = {
+                "history_matched": bool(history_matched),
+                "final_loss_matched": bool(loss_matched),
+                "final_accuracy_matched": bool(acc_matched),
+                "rerun_final_loss": rerun["final_loss"],
+                "rerun_final_accuracy": rerun["final_accuracy"],
+            }
+            result["checks"]["deterministic_rerun"] = bool(
+                history_matched and loss_matched and acc_matched)
+            result["passed"] = all(result["checks"].values())
         results.append(result)
         status = "PASS" if result["passed"] else "FAIL"
         m = result["final_metrics"]

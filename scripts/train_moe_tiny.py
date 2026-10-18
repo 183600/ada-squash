@@ -16,7 +16,7 @@ from adasquash.diagnostics import triage_nonfinite
 from adasquash.attention import CausalSelfAttention
 from adasquash.metrics import mean_std_stderr
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, _LayerScaleResidual
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 _FLAT_TOKEN_CACHE: dict = {}
 
@@ -187,6 +187,14 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     output_dir = Path(output_dir)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seed)
+    sanity_report_path = None
+    if getattr(args, 'sanity_check', False):
+        # Fail fast on the exact model class being trained: the dense-GPT
+        # preflight would not catch a broken router / aux-loss path. Seeding
+        # first exports PYTHONHASHSEED for the child interpreter.
+        from scripts.sanity_overfit import run_preflight
+        run_preflight(args.norm, seed, output_dir, model='moe', n_experts=args.n_experts)
+        sanity_report_path = output_dir / 'sanity_overfit.json'
     cfg = GPTConfig(vocab_size=50304, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads, max_seq_len=args.seq_len, mlp_ratio=4.0, norm_name=args.norm)
     model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
     print(f'[moe] total params = {count_parameters(model) / 1000000.0:.2f}M')
@@ -204,7 +212,18 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     else:
         print('[hypothesis] none stated: pass --hypothesis "..." so this run is auditable as a test of a claim, not a sweep')
     data_reports: dict = {}
-    run_manifest['data'] = {'dataset': args.dataset, 'dataset_config': args.dataset_config, 'split_reports': data_reports}
+    run_manifest['data'] = {
+        'dataset': args.dataset,
+        'dataset_config': args.dataset_config,
+        'dataset_revision': getattr(args, 'dataset_revision', None),
+        'tokenizer': getattr(args, 'tokenizer', None),
+        'tokenizer_revision': getattr(args, 'tokenizer_revision', None),
+        'split_reports': data_reports,
+    }
+    if sanity_report_path is not None:
+        run_manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
+    else:
+        run_manifest['overfit_sanity_check'] = {'enabled': False}
     save_run_manifest(manifest_path, run_manifest)
     print(f'[moe][track] run manifest -> {manifest_path}')
     rng = torch.Generator(device=device).manual_seed(seed)
@@ -400,6 +419,10 @@ def main():
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation')
     p.add_argument('--val-batches', type=int, default=10, help='held-out validation batches at the end of training (0 disables)')
     p.add_argument('--tokenizer', default='gpt2')
+    p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) to pin; recorded in the run manifest so the trained-on data version is auditable (None = upstream default branch, which can move)')
+    p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) to pin; recorded in the run manifest (None = upstream default branch)')
+    p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='per-seed small-batch overfit sanity check on the MoE model (router + aux loss) before training; aborts the run if it fails (default: on)')
+    p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. offline runs where the preflight cannot be spawned)')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this study tests (e.g. "DyT-CD keeps expert load balanced and matches ln/RMSNorm val_ce at this scale"); recorded in the per-seed and aggregate run manifests so the result can be audited against the claim it was meant to support')
     args = p.parse_args()
     seeds = [args.seed] if args.seed is not None else list(args.seeds)

@@ -63,6 +63,13 @@ DEFAULT_DATA_OPTIONS = {
     "max_doc_chars": 0,          # length-outlier cap, 0 = no cap
     "shuffle_buffer": 0,         # train-split batch shuffle window, 0 = off
     "seed": 42,
+    # Data-version pins: HuggingFace datasets/tokenizers are mutable remote
+    # artifacts, so a run that does not pin a revision cannot be reproduced
+    # after the upstream branch moves. None keeps the historical "latest on
+    # the default branch" behaviour; the resolved values are recorded in the
+    # split reports / run manifests either way.
+    "dataset_revision": None,    # e.g. a commit hash of the dataset repo
+    "tokenizer_revision": None,  # e.g. a commit hash of the tokenizer repo
     # Optional ledger of training-document hashes: when set, held-out splits
     # drop exact duplicates of training documents (never applied to train).
     "exclude_hash_file": None,
@@ -157,6 +164,8 @@ def select_stream_split(ds, split: str, options: dict | None = None):
         "dedup": bool(opts["dedup"]),
         "min_doc_chars": int(opts["min_doc_chars"]),
         "max_doc_chars": int(opts["max_doc_chars"]),
+        "dataset_revision": opts.get("dataset_revision"),
+        "tokenizer_revision": opts.get("tokenizer_revision"),
     }
     if val_frac == 0.0 and test_frac == 0.0:
         if split != "train":
@@ -187,8 +196,12 @@ def load_document_stream(dataset_name: str, dataset_config: str | None, split: s
     """Raw (unpacked, uncleaned) document stream for one logical split."""
     from datasets import load_dataset
 
-    ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True)
-    return select_stream_split(ds, split, options or get_data_options())
+    opts = dict(DEFAULT_DATA_OPTIONS)
+    if options:
+        opts.update(options)
+    ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True,
+                      revision=opts.get("dataset_revision"))
+    return select_stream_split(ds, split, opts)
 
 
 def document_hash(text: str) -> bytes:
@@ -422,18 +435,22 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     working unchanged. The explicit generator and `worker_init_fn` make the
     loader's base seed - and therefore every worker's RNG - a function of the
     configured seed alone, not of how much global RNG the caller happened to
-    consume before building it.
+    consume before building it. The optional `dataset_revision` /
+    `tokenizer_revision` options pin the mutable remote artifacts and are
+    copied into the split report (data-version tracking).
     """
     from datasets import load_dataset
     from transformers import AutoTokenizer
     from torch.utils.data import DataLoader
 
     opts = get_data_options()
-    tok = AutoTokenizer.from_pretrained(tokenizer)
+    tok = AutoTokenizer.from_pretrained(tokenizer, revision=opts.get("tokenizer_revision"))
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id
-    stream_ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True)
+    stream_ds = load_dataset(dataset_name, dataset_config, split="train",
+                             streaming=True, revision=opts.get("dataset_revision"))
     stream_ds, report = select_stream_split(stream_ds, opts["split"], opts)
+    report["tokenizer"] = tokenizer
     report["shuffle_buffer"] = int(opts["shuffle_buffer"]) if opts["split"] == "train" else 0
     exclude_hashes: set = set()
     exclude_file = opts.get("exclude_hash_file")

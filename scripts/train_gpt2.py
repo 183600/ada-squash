@@ -114,8 +114,11 @@ def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()
 # the validation split (and vice versa), so they are restored from the
 # checkpoint exactly like the schedule flags. The cleaning knobs and the
 # cross-split duplicate ledger are part of the same identity: changing them
-# changes which documents are trained on and which are held out.
-_DATA_ARGS = ('dataset', 'dataset_config', 'val_frac', 'test_frac', 'num_documents',
+# changes which documents are trained on and which are held out. The dataset /
+# tokenizer revisions are the data *version*: resuming a run against a moved
+# upstream branch would continue on different data under the same manifest.
+_DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer_revision',
+              'val_frac', 'test_frac', 'num_documents',
               'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file')
 
 def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
@@ -141,6 +144,8 @@ def open_data_split(split: str, args, seq_len: int | None = None):
         min_doc_chars=args.min_doc_chars,
         max_doc_chars=args.max_doc_chars,
         exclude_hash_file=getattr(args, 'exclude_hash_file', None),
+        dataset_revision=getattr(args, 'dataset_revision', None),
+        tokenizer_revision=getattr(args, 'tokenizer_revision', None),
         shuffle_buffer=args.train_shuffle_buffer if split == 'train' else 0,
         seed=args.seed,
     )
@@ -236,6 +241,8 @@ def main():
     p.add_argument('--no-tie-embeddings', dest='tie_embeddings', action='store_false')
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
+    p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) to pin; recorded in the run manifest so the trained-on data version is auditable (None = upstream default branch, which can move)')
+    p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) to pin; recorded in the run manifest (None = upstream default branch)')
     p.add_argument('--val-frac', type=float, default=0.005, help='chronological held-out validation fraction of the document stream (split order is train=oldest, then val, then test; never shuffled)')
     p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction of the document stream, evaluated once at the end only with --final-test-eval')
     p.add_argument('--num-documents', type=int, default=None, help='total documents in the stream; required when the dataset reports no size')
@@ -267,7 +274,8 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--compile', action='store_true', help='enable torch.compile')
     p.add_argument('--compile-mode', default='reduce-overhead', choices=['default', 'reduce-overhead', 'max-autotune'])
-    p.add_argument('--sanity-check', action='store_true', help='run the small-batch overfit sanity check (scripts/sanity_overfit.py) before training and abort if it fails')
+    p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check (scripts/sanity_overfit.py) before training and abort if it fails (default: on; a model that cannot overfit one batch has a gradient/loss bug and must not start a full run)')
+    p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. offline runs where the preflight cannot be spawned)')
     p.add_argument('--output-dir', default='runs/gpt2-124m-dytcd')
     p.add_argument('--log-every', type=int, default=20)
     p.add_argument('--stats-every', type=int, default=500)
@@ -300,10 +308,18 @@ def main():
             if run_args.get(arg_name) is not None:
                 os.environ[env_name] = str(run_args[arg_name])
     args.bf16 = not args.no_bf16
+    set_all_seeds(args.seed)
+    sanity_report_path = None
     if args.sanity_check:
+        # Fail fast: a model that cannot overfit one small batch has a
+        # gradient/loss plumbing bug and must not start the full run. The
+        # preflight subprocess writes its report into the output dir; the
+        # manifest below fingerprints it. Seeding first also exports
+        # PYTHONHASHSEED so the child interpreter starts with a fixed hash
+        # seed.
         from scripts.sanity_overfit import run_preflight
         run_preflight(args.norm, args.seed, args.output_dir)
-    set_all_seeds(args.seed)
+        sanity_report_path = Path(args.output_dir) / 'sanity_overfit.json'
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -426,11 +442,17 @@ def main():
     run_manifest['data'] = {
         'dataset': args.dataset,
         'dataset_config': args.dataset_config,
+        'dataset_revision': args.dataset_revision,
         'tokenizer': args.tokenizer,
+        'tokenizer_revision': args.tokenizer_revision,
         'split_reports': data_reports,
         'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if args.exclude_hash_file else None,
         'config_file': file_fingerprint(args.config) if args.config else None,
     }
+    if sanity_report_path is not None:
+        run_manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
+    else:
+        run_manifest['overfit_sanity_check'] = {'enabled': False}
     if resume_ckpt is not None:
         run_manifest['resumed_from'] = str(args.resume)
     save_run_manifest(manifest_path, run_manifest)
