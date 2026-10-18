@@ -572,12 +572,14 @@ def main():
             y = y.to(device, non_blocking=True)
             with ctx:
                 loss = model(x, y, return_logits=False)[1]
-            micro_losses.append(loss.detach())
+            micro_losses.append(loss.detach().clone())
             micro_xy.append((x, y))
             if args.grad_accum > 1:
                 # Scale in place: the CE autograd Function's backward does not
                 # need its output value. With accumulation 1 the division is
-                # the exact identity, so the op is skipped.
+                # the exact identity, so the op is skipped. The clone above
+                # keeps the recorded per-micro value unscaled, so the reported
+                # mean loss is the true mean and not mean/G.
                 loss.div_(args.grad_accum)
             loss.backward()
         # One host sync per optimizer step instead of one per micro-batch: the

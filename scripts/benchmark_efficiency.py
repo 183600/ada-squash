@@ -26,6 +26,7 @@ The elementwise norm math is not a matmul, so FLOPs do not see it; the
 wall-clock latency does. Read the two together.
 """
 import argparse
+import dataclasses
 import json
 import statistics
 import sys
@@ -163,6 +164,24 @@ def load_losses(summaries_path: str) -> dict:
     return out
 
 
+def load_row_cfgs(summaries_path: str) -> dict:
+    """{row name: builder kwargs} for ablation rows that record their config."""
+    data = json.loads(Path(summaries_path).read_text())
+    rows = data if isinstance(data, list) else (data.get('rows') or data.get('summaries') or [])
+    out = {}
+    for row in rows:
+        if isinstance(row, dict) and row.get('name') is not None and isinstance(row.get('cfg'), dict):
+            out[row['name']] = row['cfg']
+    return out
+
+
+def _cfg_key(model_name: str, cfg_kwargs: dict) -> str:
+    """Canonical identity of the model a config builds (like the ablation runner)."""
+    with torch.device('meta'):
+        cfg = _BUILDERS[model_name](**cfg_kwargs).cfg
+    return json.dumps(dataclasses.asdict(cfg), sort_keys=True)
+
+
 def load_significance(comparison_path) -> dict:
     """Per-row `beats_reference_significantly` from baseline_comparison.json.
 
@@ -262,8 +281,13 @@ def main():
         if significance:
             print(f"[tradeoff] significance gate -> {comparison_path}")
         # The candidate cost is measured here for the same model/norm; the
-        # reference cost is the --reference norm's measurement.
+        # reference cost is the --reference norm's measurement. The benchmark
+        # only builds the base norm, so a row whose trained architecture
+        # differs beyond that base (qk_norm / activation / parameterization
+        # variants) gets a proxy cost: flagged per row instead of silently
+        # substituting the model.
         by_norm = {r['norm']: r for r in results}
+        cand_cfgs = load_row_cfgs(args.summaries)
         rows = []
         for cand in args.candidate:
             cand_loss = losses.get(cand)
@@ -277,6 +301,18 @@ def main():
             if cand_bench is None or ref_bench is None:
                 rows.append({'candidate': cand, 'error': f'missing benchmark for norm {cand_norm!r} or reference {args.reference!r}'})
                 continue
+            cand_cfg = cand_cfgs.get(cand)
+            cost_is_proxy = None
+            if isinstance(cand_cfg, dict):
+                try:
+                    cost_is_proxy = (_cfg_key(args.model, cand_cfg)
+                                     != _cfg_key(args.model, {'norm_name': cand_norm}))
+                except Exception:
+                    cost_is_proxy = bool(set(cand_cfg) - {'norm_name'})
+                if cost_is_proxy:
+                    print(f"[tradeoff][warn] {cand}: the benchmark has no row for its exact "
+                          f"architecture; cost is measured on the base '{cand_norm}' model "
+                          f"(proxy cost)")
             loss_improvement = losses[args.reference_name] - cand_loss
             cost_ratio = cand_bench['training_latency_ms_per_token'] / ref_bench['training_latency_ms_per_token']
             verdict = efficiency_verdict(loss_improvement, cost_ratio,
@@ -298,11 +334,14 @@ def main():
             rows.append({
                 'candidate': cand,
                 'candidate_norm': cand_norm,
+                'candidate_cfg': cand_cfg,
                 'reference_row': args.reference_name,
                 'reference_norm': args.reference,
                 'candidate_val_loss': cand_loss,
                 'reference_val_loss': losses[args.reference_name],
                 'significance': sig,
+                'cost_model_norm': cand_norm,
+                'cost_is_proxy': cost_is_proxy,
                 'verdict': verdict,
             })
         tradeoff = {
@@ -313,6 +352,10 @@ def main():
             'min_loss_gain': args.min_loss_gain,
             'max_cost_ratio': args.max_cost_ratio,
             'rows': rows,
+            'cost_model': ("each candidate's cost is measured on the base norm taken "
+                           "from its row name; rows whose trained architecture differs "
+                           "beyond that base (e.g. qk_norm or activation variants) record "
+                           "cost_is_proxy=true and their cost ratio is a proxy"),
         }
         for row in rows:
             if row.get('error'):
@@ -322,11 +365,12 @@ def main():
             sig_str = ''
             if v.get('statistically_significant') is not None:
                 sig_str = f" significant={v['statistically_significant']} (p_holm={v['p_one_sided_holm']})"
+            proxy_str = ' [proxy cost]' if row.get('cost_is_proxy') else ''
             print(f"[tradeoff] {row['candidate']}: val_loss={row['candidate_val_loss']:.4f} vs "
                   f"{row['reference_row']}={row['reference_val_loss']:.4f} "
                   f"gain={v['loss_improvement']:+.4f} cost={v['cost_ratio']:.3f}x "
                   f"cost/loss_point={v['cost_per_loss_point'] and round(v['cost_per_loss_point'], 3)} "
-                  f"viable={v['viable']}{sig_str} ({v['reason']})")
+                  f"viable={v['viable']}{sig_str} ({v['reason']}){proxy_str}")
         if args.require_viable:
             not_viable = [row['candidate'] for row in rows if row.get('verdict', {}).get('viable') is not True]
             if not_viable:
