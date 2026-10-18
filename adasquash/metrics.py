@@ -111,10 +111,10 @@ def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
     and a sample mean without an interval hides its own resolution. This
     extends `mean_std_stderr` with ``mean +/- t_{1-alpha/2, n-1} * stderr``,
     the same small-sample reference distribution the paired/Welch tests use:
-    the normal critical value would understate the interval at the 2-4 seed
-    counts this repo can afford. With n < 2 there are no degrees of freedom
-    and `ci_low`/`ci_high` are `None` (the mean is still returned); the caller
-    should not quote an interval it never measured.
+    the normal critical value would understate the interval at the small
+    seed counts the comparisons run with. With n < 2 there are no degrees
+    of freedom and `ci_low`/`ci_high` are `None` (the mean is still returned);
+    the caller should not quote an interval it never measured.
     """
     stats = mean_std_stderr(values)
     if stats is None:

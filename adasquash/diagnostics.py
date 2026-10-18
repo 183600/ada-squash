@@ -294,12 +294,9 @@ def tensor_finite_report(t: torch.Tensor) -> dict:
         else:
             out["abs_max"] = float(t.detach().abs().max().item())
     elif t.is_floating_point():
-        # The finite case is the common one and `aminmax` answers it in a
-        # single fused reduction: NaN propagates into both extrema, and +Inf
-        # / -Inf always land in max / min. The full-size `isfinite` mask
-        # (plus its negation and an `abs` copy) the census used to build is
-        # only needed once a non-finite extremum is actually seen - and this
-        # runs on tensors as large as a whole logits block.
+        # NaN propagates into both extrema and +Inf / -Inf land in max / min,
+        # so a finite extremum pair gives the range directly and a non-finite
+        # one marks the tensor and needs the per-symbol NaN/Inf census below.
         td = t.detach()
         t_min, t_max = (float(v) for v in torch.aminmax(td))
         if math.isfinite(t_min) and math.isfinite(t_max):
@@ -363,9 +360,6 @@ def first_nonfinite_module(model, run_forward, max_modules: int = 8) -> list[dic
                 n_bad = int((~finite).sum().item())
                 if n_bad:
                     seen.add(id(module))
-                    # One NaN count: it used to be scanned twice (once for
-                    # `n_nan`, once for `n_inf`), i.e. a second full-tensor
-                    # pass and device sync per offending module.
                     n_nan = int(torch.isnan(t).sum().item())
                     found.append(
                         {
