@@ -15,7 +15,7 @@ _ROPE_HALF_SCRATCH_CACHE: dict = {}
 _ROPE_HALF_SCRATCH_MAX_ENTRIES = 4
 
 def _rope_half_scratch(x_lo: torch.Tensor) -> torch.Tensor:
-    """Reusable half-width buffer for the in-place rotary rotation.
+    """Shared half-width buffer for the rotary rotation.
 
     Keyed by (shape, dtype, device) like the other aux caches (never by
     `id()`); an inference-mode buffer is rebuilt for a grad-mode caller.

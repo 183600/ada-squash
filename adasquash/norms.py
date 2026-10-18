@@ -59,8 +59,7 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim <= 1:
         return a * b
     if a.ndim == 2 and a.is_contiguous() and b.is_contiguous() and a.numel() <= _REDUCE_CHUNK_ELEMS:
-        # The materialized product is capped at _REDUCE_CHUNK_ELEMS (4M
-        # elements = a few MiB); larger shapes take the chunked branches below.
+        # Larger shapes take the chunked branches below.
         acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
         return (a * b).sum(dim=0, dtype=acc).to(a.dtype)
     if a.is_contiguous() and b.is_contiguous():
@@ -118,8 +117,6 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False)
         neg_log2e_p = -_LOG2E / p.to(torch.promote_types(u.dtype, p.dtype))
         s = u.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
     else:
-        # `u` is a forward-only temporary (the backward re-derives its own),
-        # so the first pow can write in place.
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     out = lo.mul_(s).copysign_(xs)
     if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
@@ -136,8 +133,8 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
     r = t.clamp_(min=1.0).reciprocal_()
     a = None
     if need_u:
-        # `lo` only feeds `phi`; when that output is not requested it is
-        # overwritten in place instead of spending a second full-size buffer.
+        # `lo` only feeds `phi`; when that output is not requested it is not
+        # needed separately.
         u = lo.mul(r) if need_phi else lo.mul_(r)
         if isinstance(p, torch.Tensor):
             q = u.log2_().mul_(p)
@@ -166,9 +163,9 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
 def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p_raw: torch.Tensor, gamma: Optional[torch.Tensor]=None) -> torch.Tensor:
     """Gradient w.r.t. ``p`` from the cotangent of the squashed output.
 
-    ``a`` is the clamped ``p * ln(u)`` from ``_softsign_backward_pieces`` and is
-    a backward-only temporary at every call site; it is overwritten with the
-    ``a * sigmoid(a)`` factor and consumed by the end of the call.
+    ``a`` is the clamped ``p * ln(u)`` from ``_softsign_backward_pieces``; it is
+    overwritten with the ``a * sigmoid(a)`` factor and consumed by the end of
+    the call.
     """
     if gamma is not None:
         grad_phi.mul_(gamma)

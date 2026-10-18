@@ -47,8 +47,7 @@ _CROSS_ENTROPY_FAST_PATH_BYTES = 1 << 23
 _CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
 _CE_SCRATCH_CACHE: dict[tuple, torch.Tensor] = {}
 # At most one shape pair is live at a time: the fp32 accumulator plus (under
-# autocast) its low-precision cast twin. Keeping two entries bounds the
-# resident scratch at ~2 x chunk size instead of ~1GiB across model switches.
+# autocast) its low-precision cast twin.
 _CE_SCRATCH_MAX_ENTRIES = 2
 
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
@@ -217,10 +216,9 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         need_w = ctx.needs_input_grad[1]
         grad_h = torch.empty_like(h) if need_h else None
         # The weight gradient accumulates into its final buffer from the first
-        # chunk on: a low-precision weight keeps a low-precision accumulator
-        # (no full-size fp32 copy ever exists), while an fp32/fp64 weight (the
-        # autocast case `w = weight.to(bf16)`) accumulates directly in
-        # `acc`, so the end-of-backward `to(fp32)` full-size copy disappears.
+        # chunk on: a low-precision weight keeps a low-precision accumulator,
+        # while an fp32/fp64 weight (the autocast case `w = weight.to(bf16)`)
+        # accumulates directly in `acc`.
         grad_w_dtype = None
         if need_w:
             weight_dtype = ctx.in_dtypes[1]
@@ -274,10 +272,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                 else:
                     # Mixed dtypes cannot write into `grad_w` directly
                     # (`torch.mm`'s out tensor must have the product's dtype),
-                    # so the product is reduced in vocab blocks: the fp32
-                    # gradient is the only full-size buffer, and each block
-                    # only stages (rows, block) / (block, dim) temporaries
-                    # instead of the full (V, dim) product.
+                    # so the product is reduced in vocab blocks.
                     hcf = hc.to(acc)
                     block = max(1, (_CROSSENTROPY_CHUNK_BYTES // 4)
                                 // max(1, hcf.shape[1] * hcf.element_size()))

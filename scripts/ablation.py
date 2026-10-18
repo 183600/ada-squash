@@ -450,9 +450,8 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                        f"(train {last_curve['train_trend']}, val {last_curve['val_trend']}, gap={gap_str})")
     print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} "
           f"max_abs_pre_norm={summary['max_abs_pre_norm']}{final_curve}")
-    # Rows run back-to-back in one process; the shape-keyed fp32 CE scratch
-    # blocks are dead the moment this row finishes and would otherwise sit on
-    # the GPU until the next row's shapes evict them.
+    # Rows run back-to-back in one process, so the shape-keyed CE scratch
+    # cache is dropped when this row finishes.
     clear_ce_scratch_cache()
     return summary
 

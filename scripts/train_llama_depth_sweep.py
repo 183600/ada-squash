@@ -464,8 +464,8 @@ def _child_env(args, gpu=None) -> dict:
 
     Each cell is pinned to one GPU (round-robin over --gpus) and its BLAS
     thread count is capped: without this every concurrent child lands on the
-    same visible device and the host oversubscribes its cores, which is the
-    fastest way to OOM or to make the sweep unreproducible.
+    same visible device and the host oversubscribes its cores, which makes
+    the sweep unreproducible.
     """
     env = dict(os.environ)
     if gpu is not None:
@@ -682,8 +682,7 @@ def main():
             print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
     else:
         # A bounded launch queue: at most `max_parallel` training children
-        # alive at once, each pinned to one GPU, instead of launching the whole
-        # grid (36 1B runs by default) into one device.
+        # alive at once, each pinned to one GPU.
         running: list = []
         next_job = 0
         while next_job < len(jobs) or running:

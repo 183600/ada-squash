@@ -320,8 +320,7 @@ def run_one(norm: str, args, device: str) -> dict:
     # The logits path necessarily materializes a (rows, vocab) block, so the
     # equality check between the two loss paths runs on a bounded prefix
     # slice: causal attention makes every kept position's logits independent
-    # of the dropped suffix, so the comparison is exact while the peak logits
-    # allocation is a small constant instead of the whole preflight batch.
+    # of the dropped suffix, so the comparison is exact.
     b_ref = min(int(x.shape[0]), 2)
     t_ref = min(int(x.shape[1]), 64)
     x_ref, y_ref = x[:b_ref, :t_ref], y[:b_ref, :t_ref]

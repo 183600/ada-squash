@@ -50,10 +50,9 @@ def load_ckpt(path: str, device: str='cuda'):
     model.load_state_dict(_strip_compile_prefix(ckpt['model']))
     model.to(device)
     model.eval()
-    # Evaluation switches between models in-process (per-task loops, sweeps).
-    # The CE scratch cache holds fp32 logits-sized buffers keyed by shape, so
-    # without a clear the previous model's blocks stay alive through the next
-    # one's forwards; nothing downstream depends on cache residency.
+    # Evaluation switches between models in-process (per-task loops, sweeps),
+    # so the shape-keyed CE scratch cache is dropped between models; nothing
+    # downstream depends on cache residency.
     clear_ce_scratch_cache()
     return (model, args)
 
@@ -173,8 +172,6 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                     step_logits, _ = model(ctx)
                     step_logits = step_logits[:, -1]
                 nxt = step_logits.argmax(-1)
-                # One host sync per decode step for the whole batch (the same
-                # cost the single-trial loop paid), instead of one per row.
                 nxt_list = nxt.tolist()
                 bad_rows = [i for i, v in enumerate(nxt_list) if v != want]
                 if bad_rows:

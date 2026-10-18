@@ -286,11 +286,10 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         B, T = x.shape
         chunk = max(1, int(args.eval_chunk))
         step = fwd_chunk if fwd_chunk > 0 else B
-        # Forward the batch in row blocks: the (B, T, V) logits block is the
-        # dominant allocation here, and every model row is independent, so
-        # splitting the batch lowers the peak logits. Integer statistics are
-        # identical; float accumulators can differ at the last ulp because the
-        # reduction grouping changes with the block size.
+        # Forward the batch in row blocks. Every model row is independent, so
+        # the statistics are unchanged (integer statistics are identical;
+        # float accumulators can differ at the last ulp because the reduction
+        # grouping changes with the block size).
         for b0 in range(0, B, step):
             b1 = min(B, b0 + step)
             with torch.no_grad():
@@ -340,8 +339,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
                             'context': [int(v) for v in x[b0 + b, max(0, t0 + tt - args.context_tokens):t0 + tt + 1].tolist()],
                         })
                 if auc_class_ids:
-                    # `index_select` picks the scored columns without first
-                    # copying the whole (B, T, V) softmax block.
+                    # `index_select` picks the scored columns directly.
                     sel = probs.index_select(
                         -1, torch.as_tensor(auc_class_ids, device=probs.device)
                     )[m]

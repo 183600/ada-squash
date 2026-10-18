@@ -748,10 +748,9 @@ def main():
                 # mean loss is the true mean and not mean/G.
                 loss.div_(args.grad_accum)
             loss.backward()
-        # One host sync per optimizer step instead of one per micro-batch: the
-        # detached scalars stay on the GPU and the whole accumulation group is
-        # materialized at once. Detecting a non-finite loss before its own
-        # backward is impossible without a per-micro sync, so a bad micro is
+        # The accumulation group is read back once per optimizer step. A
+        # non-finite loss cannot be detected before its own backward without
+        # inspecting each micro-batch separately, so a bad micro is
         # backpropped and the step is discarded wholesale by _handle_nonfinite
         # (which zeroes the gradients); the optimizer trajectory is unchanged.
         micro_vals = torch.stack(micro_losses).tolist()
@@ -1031,9 +1030,9 @@ def main():
     if args.wandb_project:
         import wandb
         wandb.finish()
-    # The shape-keyed fp32 CE scratch blocks (up to ~0.5GiB each) are only
-    # useful while this model keeps training; drop them so the process exits
-    # lean and so any embedding caller reusing this module starts clean.
+    # The shape-keyed CE scratch blocks are only useful while this model keeps
+    # training; drop them so any embedding caller reusing this module starts
+    # clean.
     clear_ce_scratch_cache()
 if __name__ == '__main__':
     main()

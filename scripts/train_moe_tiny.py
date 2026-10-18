@@ -404,8 +404,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     }
     save_run_manifest(manifest_path, run_manifest)
     print(f'[done] saved to {output_dir} | n_loss_spikes={loss_spike.n_spikes}')
-    # Training is over: release the shape-keyed fp32 CE scratch blocks instead
-    # of leaving them resident for the rest of the (possibly multi-run) process.
+    # Training is over: release the shape-keyed CE scratch blocks instead of
+    # keeping them for the rest of the (possibly multi-run) process.
     clear_ce_scratch_cache()
     return dict(run_manifest['results'], seed=seed, output_dir=str(output_dir))
 
