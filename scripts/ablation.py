@@ -49,7 +49,7 @@ from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpi
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
-from adasquash.model import build_gpt_350m, build_llama_tiny_1b
+from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
 ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
@@ -450,6 +450,10 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                        f"(train {last_curve['train_trend']}, val {last_curve['val_trend']}, gap={gap_str})")
     print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} "
           f"max_abs_pre_norm={summary['max_abs_pre_norm']}{final_curve}")
+    # Rows run back-to-back in one process; the shape-keyed fp32 CE scratch
+    # blocks are dead the moment this row finishes and would otherwise sit on
+    # the GPU until the next row's shapes evict them.
+    clear_ce_scratch_cache()
     return summary
 
 def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None=None, hypothesis: str | None=None) -> dict:

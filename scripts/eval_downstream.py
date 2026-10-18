@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT
 from adasquash.metrics import wilson_interval
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
+from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 
 def _strip_compile_prefix(state):
@@ -50,6 +50,11 @@ def load_ckpt(path: str, device: str='cuda'):
     model.load_state_dict(_strip_compile_prefix(ckpt['model']))
     model.to(device)
     model.eval()
+    # Evaluation switches between models in-process (per-task loops, sweeps).
+    # The CE scratch cache holds fp32 logits-sized buffers keyed by shape, so
+    # without a clear the previous model's blocks stay alive through the next
+    # one's forwards; nothing downstream depends on cache residency.
+    clear_ce_scratch_cache()
     return (model, args)
 
 def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16, tokenizer: str | None=None):
@@ -73,8 +78,15 @@ def needle_target_ids(tokenizer, needle: str=DEFAULT_NEEDLE) -> list:
 def needle_decode_overhead(tokenizer, needle: str=DEFAULT_NEEDLE) -> int:
     return max(0, len(needle_target_ids(tokenizer, needle)) - 1)
 
-def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0, return_counts: bool=False):
+def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0, return_counts: bool=False, decode_batch: int=8):
     """Exact-match accuracy of the secret over `n_trials` independent placements.
+
+    Cost: every trial generates `len(target_ids)` steps and each step runs one
+    full forward over the whole prefix, so the flops are
+    ``O(n_trials * len(target_ids) * prompt_len)``. There is no KV cache (the
+    SDPA baseline path is fixed, see docs/design_notes.md D1); `decode_batch`
+    only batches independent trials together so the shared part of the prefix
+    is forwarded in one pass instead of `n_trials` sequential passes.
 
     A trial is pass/fail, so the point estimate alone hides its resolution:
     with `return_counts=True` the result is
@@ -115,11 +127,10 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         raise ValueError(f'could not derive a secret to score from needle={needle!r}')
     if len(prompt_ids) == 0:
         raise ValueError('haystack_prompt tokenizes to zero tokens')
-    n_correct = 0
-    n_run = 0
-    failures: list = []
-    last_logits = getattr(model, 'last_position_logits', None)
-    for trial_idx in range(n_trials):
+    # Every trial uses the same fix-up RNG order as the sequential version, so
+    # batching (which only groups independent trials) changes no placement.
+    contexts: list = []
+    for _ in range(n_trials):
         body_len = context_len - len(needle_ids) - len(question_ids) - 2
         if body_len < len(prompt_ids):
             raise ValueError(f'context_len={context_len} is too short to hold the needle ({len(needle_ids)} tok) + question ({len(question_ids)} tok) + one haystack repeat ({len(prompt_ids)} tok)')
@@ -127,13 +138,25 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         body = prompt_ids * n_repeats
         pos = rng.randint(0, max(1, len(body) - 1))
         full = body[:pos] + needle_ids + body[pos:] + question_ids
-        n_run += 1
-        generated: list[int] = []
-        correct = True
-        buf = torch.empty((1, len(full) + len(target_ids)), dtype=torch.long, device=device)
-        buf[0, :len(full)] = torch.tensor(full, dtype=torch.long, device=device)
-        n = len(full)
-        with torch.inference_mode():
+        contexts.append((pos, full))
+    n_run = len(contexts)
+    if n_run == 0:
+        raise ValueError('needle test produced no trials')
+    n_correct = 0
+    failures: list = []
+    last_logits = getattr(model, 'last_position_logits', None)
+    decode_batch = max(1, int(decode_batch))
+    with torch.inference_mode():
+        for b0 in range(0, n_run, decode_batch):
+            group = contexts[b0:b0 + decode_batch]
+            n_rows = len(group)
+            seq_len = len(group[0][1])
+            buf = torch.empty((n_rows, seq_len + len(target_ids)), dtype=torch.long, device=device)
+            for i, (_, full) in enumerate(group):
+                buf[i, :seq_len] = torch.tensor(full, dtype=torch.long, device=device)
+            generated: list[list[int]] = [[] for _ in range(n_rows)]
+            failed = [False] * n_rows
+            n = seq_len
             for want in target_ids:
                 ctx = buf[:, :n]
                 if last_logits is not None:
@@ -141,53 +164,66 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                 else:
                     step_logits, _ = model(ctx)
                     step_logits = step_logits[:, -1]
-                nxt = int(step_logits[0].argmax(-1).item())
-                generated.append(nxt)
-                if nxt != want:
-                    correct = False
-                    # Bad-case record: enough statistics to say *how* the
-                    # decode failed, without decoding any token id to text
-                    # (tokenizer mocks in tests have no decode method).
-                    probs = torch.softmax(step_logits[0].float(), dim=-1)
-                    rank = int((torch.argsort(step_logits[0], descending=True) == want)
-                               .nonzero(as_tuple=True)[0][0].item())
-                    top_prob = float(probs[nxt].item())
-                    in_context = bool((buf[0, :n] == nxt).any().item())
-                    prefix_ok = len(generated) - 1
-                    if prefix_ok == 0:
-                        cause = 'retrieval_miss'
-                    elif in_context:
-                        cause = 'context_copy'
-                    else:
-                        cause = 'decode_drift'
-                    if rank < 5:
-                        confidence = 'near_miss'
-                    elif top_prob >= 0.5:
-                        confidence = 'confident_wrong'
-                    else:
-                        confidence = 'diffuse'
-                    failures.append({
-                        'trial': trial_idx,
-                        'needle_position': pos,
-                        'context_len': len(full),
-                        'failure_step': prefix_ok,
-                        'n_target_tokens': len(target_ids),
-                        'generated_ids': list(generated),
-                        'expected_id': int(want),
-                        'predicted_id': nxt,
-                        'expected_rank': rank,
-                        'expected_prob': float(probs[want].item()),
-                        'predicted_prob': top_prob,
-                        'logit_margin_over_expected': float(
-                            (step_logits[0, nxt] - step_logits[0, want]).item()),
-                        'predicted_in_context': in_context,
-                        'cause': cause,
-                        'confidence': confidence,
-                    })
-                    break
-                buf[0, n] = nxt
+                nxt = step_logits.argmax(-1)
+                # One host sync per decode step for the whole batch (the same
+                # cost the single-trial loop paid), instead of one per row.
+                nxt_list = nxt.tolist()
+                bad_rows = [i for i, v in enumerate(nxt_list) if v != want]
+                if bad_rows:
+                    for i in bad_rows:
+                        if failed[i]:
+                            continue
+                        # Bad-case record: enough statistics to say *how* the
+                        # decode failed, without decoding any token id to text
+                        # (tokenizer mocks in tests have no decode method).
+                        nxt_i = nxt_list[i]
+                        generated[i].append(nxt_i)
+                        row_logits = step_logits[i]
+                        probs = torch.softmax(row_logits.float(), dim=-1)
+                        rank = int((torch.argsort(row_logits, descending=True) == want)
+                                   .nonzero(as_tuple=True)[0][0].item())
+                        top_prob = float(probs[nxt_i].item())
+                        in_context = bool((buf[i, :n] == nxt_i).any().item())
+                        prefix_ok = len(generated[i]) - 1
+                        if prefix_ok == 0:
+                            cause = 'retrieval_miss'
+                        elif in_context:
+                            cause = 'context_copy'
+                        else:
+                            cause = 'decode_drift'
+                        if rank < 5:
+                            confidence = 'near_miss'
+                        elif top_prob >= 0.5:
+                            confidence = 'confident_wrong'
+                        else:
+                            confidence = 'diffuse'
+                        failures.append({
+                            'trial': b0 + i,
+                            'needle_position': group[i][0],
+                            'context_len': seq_len,
+                            'failure_step': prefix_ok,
+                            'n_target_tokens': len(target_ids),
+                            'generated_ids': list(generated[i]),
+                            'expected_id': int(want),
+                            'predicted_id': nxt_i,
+                            'expected_rank': rank,
+                            'expected_prob': float(probs[want].item()),
+                            'predicted_prob': top_prob,
+                            'logit_margin_over_expected': float(
+                                (row_logits[nxt_i] - row_logits[want]).item()),
+                            'predicted_in_context': in_context,
+                            'cause': cause,
+                            'confidence': confidence,
+                        })
+                        failed[i] = True
+                for i in range(n_rows):
+                    if not failed[i]:
+                        generated[i].append(nxt_list[i])
+                buf[:, n] = nxt
                 n += 1
-        n_correct += int(correct)
+                if all(failed):
+                    break
+            n_correct += sum(not f for f in failed)
     if n_run == 0:
         raise ValueError('needle test produced no trials')
     acc = n_correct / n_run
@@ -208,6 +244,7 @@ def main():
     p.add_argument('--needle-test', action='store_true', help='also run needle-in-haystack')
     p.add_argument('--needle-context-len', type=int, default=None, help="needle context length (default: the checkpoint's trained seq_len, or its max_seq_len minus the positions the secret's decode needs when the checkpoint records no seq_len - so a model trained short is not silently evaluated at an extrapolated length; asking for more than max_seq_len raises)")
     p.add_argument('--tokenizer', default='gpt2')
+    p.add_argument('--decode-batch', type=int, default=8, help='independent needle trials decoded per forward pass (bounds peak memory; each step still recomputes the whole prefix)')
     p.add_argument('--seed', type=int, default=0, help='seed for the needle-position and generation RNGs')
     p.add_argument('--output', default=None)
     args = p.parse_args()
@@ -256,7 +293,7 @@ def main():
             print(f'[eval][warn] needle context length {ctx_len} exceeds the trained seq_len='
                   f'{trained_seq_len}: the result measures positional extrapolation, not '
                   f'in-distribution long-context accuracy', file=sys.stderr)
-        needle = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed, return_counts=True)
+        needle = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed, return_counts=True, decode_batch=args.decode_batch)
         results['needle_acc'] = needle['accuracy']
         results['needle'] = needle
         results['needle_ctx_len'] = ctx_len

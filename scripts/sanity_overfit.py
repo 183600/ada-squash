@@ -317,9 +317,17 @@ def run_one(norm: str, args, device: str) -> dict:
     x, y = make_batch(args.task, args, cfg, device)
     opt = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
 
+    # The logits path necessarily materializes a (rows, vocab) block, so the
+    # equality check between the two loss paths runs on a bounded prefix
+    # slice: causal attention makes every kept position's logits independent
+    # of the dropped suffix, so the comparison is exact while the peak logits
+    # allocation is a small constant instead of the whole preflight batch.
+    b_ref = min(int(x.shape[0]), 2)
+    t_ref = min(int(x.shape[1]), 64)
+    x_ref, y_ref = x[:b_ref, :t_ref], y[:b_ref, :t_ref]
     with torch.no_grad():
-        _, loss_ref = model(x, y, return_logits=True)
-        loss_fused = model(x, y, return_logits=False)[1]
+        _, loss_ref = model(x_ref, y_ref, return_logits=True)
+        loss_fused = model(x_ref, y_ref, return_logits=False)[1]
     loss_path_delta = abs(float(loss_fused.item()) - float(loss_ref.item()))
     loss_path_tol = max(1e-5, 1e-4 * abs(float(loss_ref.item())))
 

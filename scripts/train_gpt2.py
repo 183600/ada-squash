@@ -18,7 +18,7 @@ from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import mean_ci
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
+from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache
 from adasquash.norms import NORM_REGISTRY
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from scripts.data_pipeline import build_dataloader, configure_data_options
@@ -49,6 +49,24 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
     if unknown:
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
 _TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
+
+def _atomic_torch_save(obj, path: Path) -> None:
+    """Serialize to a sibling `.tmp` file, then atomically replace `path`.
+
+    A checkpoint (model + optimizer + scheduler) can be ~1.5GB; writing it
+    straight to the target means a crash or full disk leaves a truncated file
+    where the previous usable best/periodic checkpoint used to be.
+    """
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 _ADAMW_FUSED_CPU_SUPPORTED: bool | None = None
 
@@ -540,7 +558,8 @@ def main():
         if attach_stats:
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
-        loss_acc = None
+        micro_losses: list = []
+        micro_xy: list = []
         nonfinite_batch = None
         for _ in range(args.grad_accum):
             try:
@@ -553,22 +572,24 @@ def main():
             y = y.to(device, non_blocking=True)
             with ctx:
                 loss = model(x, y, return_logits=False)[1]
-            micro_loss = float(loss.detach())
-            if not math.isfinite(micro_loss):
-                # Do not backward a non-finite loss: it would poison every
-                # accumulated gradient before the triage ever ran.
-                nonfinite_batch = (x, y, micro_loss)
-                break
+            micro_losses.append(loss.detach())
+            micro_xy.append((x, y))
             if args.grad_accum > 1:
                 # Scale in place: the CE autograd Function's backward does not
                 # need its output value. With accumulation 1 the division is
                 # the exact identity, so the op is skipped.
                 loss.div_(args.grad_accum)
             loss.backward()
-            if loss_acc is None:
-                loss_acc = loss.detach()
-            else:
-                loss_acc.add_(loss.detach())
+        # One host sync per optimizer step instead of one per micro-batch: the
+        # detached scalars stay on the GPU and the whole accumulation group is
+        # materialized at once. Detecting a non-finite loss before its own
+        # backward is impossible without a per-micro sync, so a bad micro is
+        # backpropped and the step is discarded wholesale by _handle_nonfinite
+        # (which zeroes the gradients); the optimizer trajectory is unchanged.
+        micro_vals = torch.stack(micro_losses).tolist()
+        bad_idx = next((i for i, v in enumerate(micro_vals) if not math.isfinite(v)), None)
+        if bad_idx is not None:
+            nonfinite_batch = (micro_xy[bad_idx][0], micro_xy[bad_idx][1], micro_vals[bad_idx])
         if attach_stats:
             act_stats.detach()
             clear_logit_scratch_cache()
@@ -576,7 +597,7 @@ def main():
             _handle_nonfinite(step, *nonfinite_batch)
             continue
         nonfinite_streak = 0
-        loss_val = micro_loss if args.grad_accum == 1 else float(loss_acc)
+        loss_val = micro_vals[0] if args.grad_accum == 1 else sum(micro_vals) / args.grad_accum
         last_train_loss = loss_val
         # Clipped every step; materialized below only when logging.
         grad_norm_t = None
@@ -625,7 +646,7 @@ def main():
                 if improved:
                     ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'provenance': provenance}
                     path = Path(args.output_dir) / 'ckpt_best.pt'
-                    torch.save(ckpt_best, path)
+                    _atomic_torch_save(ckpt_best, path)
                     print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
                 # Curve diagnosis: pair the held-out point with the mean
                 # training loss over the interval it covers, then classify the
@@ -696,14 +717,14 @@ def main():
         if step % args.save_every == 0 and step > 0:
             ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
             path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
-            torch.save(ckpt, path)
+            _atomic_torch_save(ckpt, path)
             print(f'[ckpt] saved {path}')
         if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
             print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
             break
     ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
     path = Path(args.output_dir) / 'ckpt_final.pt'
-    torch.save(ckpt, path)
+    _atomic_torch_save(ckpt, path)
     print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
     run_manifest['data']['split_reports'] = data_reports
     run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
@@ -834,5 +855,9 @@ def main():
     if args.wandb_project:
         import wandb
         wandb.finish()
+    # The shape-keyed fp32 CE scratch blocks (up to ~0.5GiB each) are only
+    # useful while this model keeps training; drop them so the process exits
+    # lean and so any embedding caller reusing this module starts clean.
+    clear_ce_scratch_cache()
 if __name__ == '__main__':
     main()

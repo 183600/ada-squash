@@ -59,6 +59,8 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim <= 1:
         return a * b
     if a.ndim == 2 and a.is_contiguous() and b.is_contiguous() and a.numel() <= _REDUCE_CHUNK_ELEMS:
+        # The materialized product is capped at _REDUCE_CHUNK_ELEMS (4M
+        # elements = a few MiB); larger shapes take the chunked branches below.
         acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
         return (a * b).sum(dim=0, dtype=acc).to(a.dtype)
     if a.is_contiguous() and b.is_contiguous():
@@ -134,7 +136,9 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
     r = t.clamp_(min=1.0).reciprocal_()
     a = None
     if need_u:
-        u = lo.mul(r)
+        # `lo` only feeds `phi`; when that output is not requested it is
+        # overwritten in place instead of spending a second full-size buffer.
+        u = lo.mul(r) if need_phi else lo.mul_(r)
         if isinstance(p, torch.Tensor):
             q = u.log2_().mul_(p)
             a = q.mul(_LN2).clamp_(min=p * _log_tiny(q.dtype))
@@ -144,7 +148,7 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
             s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
             a = u.log2_().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
     else:
-        s = lo.mul(r)
+        s = lo.mul(r) if need_phi else lo.mul_(r)
         if isinstance(p, torch.Tensor):
             neg_log2e_p = -_LOG2E / p.to(torch.promote_types(s.dtype, p.dtype))
             s.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()

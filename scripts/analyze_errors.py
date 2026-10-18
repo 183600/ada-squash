@@ -272,9 +272,8 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
 
     if first_batch is not None:
         batches = itertools.chain([first_batch], batches)
+    fwd_chunk = max(0, int(getattr(args, 'forward_batch_chunk', 0) or 0))
     for x, y in batches:
-        with torch.no_grad():
-            logits, _ = model(x, return_logits=True)
         mask = y.ne(ignore)
         prev = x
         valid = mask
@@ -284,59 +283,77 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         prev_gold_keys.append(keys)
         if tuple(x.shape) == tuple(y.shape):
             copy_input_correct += int((x[valid] == y[valid]).sum().item())
-        B, T, V = logits.shape
+        B, T = x.shape
         chunk = max(1, int(args.eval_chunk))
-        for t0 in range(0, T, chunk):
-            t1 = min(T, t0 + chunk)
-            lc = logits[:, t0:t1].detach().float()
-            m = mask[:, t0:t1]
-            if not bool(m.any()):
-                continue
-            probs = torch.softmax(lc, dim=-1)
-            gold = y[:, t0:t1]
-            pred = probs.argmax(-1)
-            n_correct += int((pred[m] == gold[m]).sum().item())
-            pred_counts += torch.bincount(pred[m].long().cpu(), minlength=vocab)
-            correct_counts += torch.bincount(gold[m & (pred == gold)].long().cpu(), minlength=vocab)
-            gold_p = probs.gather(-1, gold.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-            gold_prob_sum += float(gold_p[m].sum().item())
-            k = analyzed_topk
-            top = probs.topk(k, dim=-1)
-            # 1-based rank; ties count above (>= counts the gold token itself,
-            # every strictly-larger probability and every tie, so a tie cannot
-            # flatter the model's ranking).
-            gold_rank = (probs >= gold_p.unsqueeze(-1)).sum(-1)
-            topk_hits += int((top.indices == gold.unsqueeze(-1)).any(-1)[m].sum().item())
-            gold_rank_sum += float(gold_rank[m].clamp(max=args.rank_clip).sum().item())
-            n_positional += int(m.sum().item())
-            wrong = m & (pred != gold)
-            n_errors += int(wrong.sum().item())
-            if n_scanned < args.max_scan_errors:
-                idx = wrong.nonzero(as_tuple=False)
-                for b, tt in idx[: args.max_scan_errors - n_scanned].tolist():
-                    n_scanned += 1
-                    error_scan.append({
-                        'batch_row': b,
-                        'position': t0 + tt,
-                        'gold': int(gold[b, tt]),
-                        'pred': int(pred[b, tt]),
-                        'gold_prob': float(gold_p[b, tt]),
-                        'pred_prob': float(probs[b, tt, pred[b, tt]].item()),
-                        'gold_rank': int(min(gold_rank[b, tt].item(), args.rank_clip)),
-                        'gold_in_topk': bool((top.indices[b, tt] == gold[b, tt]).any().item()),
-                        'prev': int(prev[b, t0 + tt]),
-                        'context': [int(v) for v in x[b, max(0, t0 + tt - args.context_tokens):t0 + tt + 1].tolist()],
-                    })
-            if auc_class_ids:
-                sel = probs[..., auc_class_ids][m]
-                take = int(sel.shape[0])
-                if auc_max_tokens > 0:
-                    take = min(take, auc_max_tokens - auc_seen)
-                if take > 0:
-                    auc_scores.append(sel[:take].detach().cpu())
-                    auc_labels.append(gold[m][:take].detach().cpu())
-                    auc_seen += take
-            del probs, top, lc
+        step = fwd_chunk if fwd_chunk > 0 else B
+        # Forward the batch in row blocks: the (B, T, V) logits block is the
+        # dominant allocation here, and every model row is independent, so
+        # splitting the batch lowers the peak logits. Integer statistics are
+        # identical; float accumulators can differ at the last ulp because the
+        # reduction grouping changes with the block size.
+        for b0 in range(0, B, step):
+            b1 = min(B, b0 + step)
+            with torch.no_grad():
+                logits, _ = model(x[b0:b1], return_logits=True)
+            mask_b = mask[b0:b1]
+            y_b = y[b0:b1]
+            x_b = x[b0:b1]
+            for t0 in range(0, T, chunk):
+                t1 = min(T, t0 + chunk)
+                lc = logits[:, t0:t1].detach().float()
+                m = mask_b[:, t0:t1]
+                if not bool(m.any()):
+                    continue
+                probs = torch.softmax(lc, dim=-1)
+                gold = y_b[:, t0:t1]
+                pred = probs.argmax(-1)
+                n_correct += int((pred[m] == gold[m]).sum().item())
+                pred_counts += torch.bincount(pred[m].long().cpu(), minlength=vocab)
+                correct_counts += torch.bincount(gold[m & (pred == gold)].long().cpu(), minlength=vocab)
+                gold_p = probs.gather(-1, gold.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+                gold_prob_sum += float(gold_p[m].sum().item())
+                k = analyzed_topk
+                top = probs.topk(k, dim=-1)
+                # 1-based rank; ties count above (>= counts the gold token
+                # itself, every strictly-larger probability and every tie, so
+                # a tie cannot flatter the model's ranking).
+                gold_rank = (probs >= gold_p.unsqueeze(-1)).sum(-1)
+                topk_hits += int((top.indices == gold.unsqueeze(-1)).any(-1)[m].sum().item())
+                gold_rank_sum += float(gold_rank[m].clamp(max=args.rank_clip).sum().item())
+                n_positional += int(m.sum().item())
+                wrong = m & (pred != gold)
+                n_errors += int(wrong.sum().item())
+                if n_scanned < args.max_scan_errors:
+                    idx = wrong.nonzero(as_tuple=False)
+                    for b, tt in idx[: args.max_scan_errors - n_scanned].tolist():
+                        n_scanned += 1
+                        error_scan.append({
+                            'batch_row': b0 + b,
+                            'position': t0 + tt,
+                            'gold': int(gold[b, tt]),
+                            'pred': int(pred[b, tt]),
+                            'gold_prob': float(gold_p[b, tt]),
+                            'pred_prob': float(probs[b, tt, pred[b, tt]].item()),
+                            'gold_rank': int(min(gold_rank[b, tt].item(), args.rank_clip)),
+                            'gold_in_topk': bool((top.indices[b, tt] == gold[b, tt]).any().item()),
+                            'prev': int(prev[b0 + b, t0 + tt]),
+                            'context': [int(v) for v in x[b0 + b, max(0, t0 + tt - args.context_tokens):t0 + tt + 1].tolist()],
+                        })
+                if auc_class_ids:
+                    # `index_select` picks the scored columns without first
+                    # copying the whole (B, T, V) softmax block.
+                    sel = probs.index_select(
+                        -1, torch.as_tensor(auc_class_ids, device=probs.device)
+                    )[m]
+                    take = int(sel.shape[0])
+                    if auc_max_tokens > 0:
+                        take = min(take, auc_max_tokens - auc_seen)
+                    if take > 0:
+                        auc_scores.append(sel[:take].detach().cpu())
+                        auc_labels.append(gold[m][:take].detach().cpu())
+                        auc_seen += take
+                del probs, top, lc
+            del logits
 
     if n_tokens == 0:
         raise SystemExit('[errors] no valid target tokens in the selected batches')
@@ -516,10 +533,8 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     n_positional = 0
     scans = {'fixed': [], 'broken': [], 'both_wrong': []}
     scanned = {'fixed': 0, 'broken': 0, 'both_wrong': 0}
+    fwd_chunk = max(0, int(getattr(args, 'forward_batch_chunk', 0) or 0))
     for x, y in batches:
-        with torch.no_grad():
-            logits_ref, _ = reference_model(x, return_logits=True)
-            logits_cand, _ = candidate_model(x, return_logits=True)
         mask = y.ne(ignore)
         n_tok = int(mask.sum().item())
         n_tokens += n_tok
@@ -528,43 +543,56 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         if tuple(x.shape) == tuple(y.shape):
             copy_input_correct += int((x[mask] == y[mask]).sum().item())
         n_positional += n_tok
-        B, T, V = logits_ref.shape
+        B, T = x.shape
         chunk = max(1, int(args.eval_chunk))
-        for t0 in range(0, T, chunk):
-            t1 = min(T, t0 + chunk)
-            m = mask[:, t0:t1]
-            if not bool(m.any()):
-                continue
-            gold = y[:, t0:t1]
-            stats_ref = _chunk_stats(logits_ref[:, t0:t1], gold, topk)
-            stats_cand = _chunk_stats(logits_cand[:, t0:t1], gold, topk)
-            selectors = {
-                'fixed': m & ~stats_ref['ok'] & stats_cand['ok'],
-                'broken': m & stats_ref['ok'] & ~stats_cand['ok'],
-                'both_wrong': m & ~stats_ref['ok'] & ~stats_cand['ok'],
-            }
-            n_both_right += int((m & stats_ref['ok'] & stats_cand['ok']).sum().item())
-            n_fixed += int(selectors['fixed'].sum().item())
-            n_broken += int(selectors['broken'].sum().item())
-            n_both_wrong += int(selectors['both_wrong'].sum().item())
-            for status, selector in selectors.items():
-                remaining = max_scan - scanned[status]
-                if remaining <= 0:
-                    continue
-                for b, tt in selector.nonzero(as_tuple=False)[:remaining].tolist():
-                    scanned[status] += 1
-                    pos = t0 + tt
-                    scans[status].append({
-                        'batch_row': b,
-                        'position': pos,
-                        'gold': int(gold[b, tt]),
-                        'prev': int(x[b, pos]),
-                        'context': [int(v) for v in x[b, max(0, pos - args.context_tokens):pos + 1].tolist()],
-                        'reference': _side_record(stats_ref, b, tt, args.rank_clip),
-                        'candidate': _side_record(stats_cand, b, tt, args.rank_clip),
-                    })
-            del stats_ref, stats_cand, selectors
-        del logits_ref, logits_cand
+        step = fwd_chunk if fwd_chunk > 0 else B
+        for b0 in range(0, B, step):
+            b1 = min(B, b0 + step)
+            x_b, y_b, mask_b = x[b0:b1], y[b0:b1], mask[b0:b1]
+            bounds = [(t0, min(T, t0 + chunk)) for t0 in range(0, T, chunk)
+                      if bool(mask_b[:, t0:min(T, t0 + chunk)].any())]
+            # Reference and candidate never hold a full logits block at the
+            # same time: the reference's per-position statistics are small, so
+            # its logits are dropped before the candidate forward runs.
+            with torch.no_grad():
+                logits_ref, _ = reference_model(x_b, return_logits=True)
+                ref_stats = [_chunk_stats(logits_ref[:, t0:t1], y_b[:, t0:t1], topk)
+                             for t0, t1 in bounds]
+            del logits_ref
+            with torch.no_grad():
+                logits_cand, _ = candidate_model(x_b, return_logits=True)
+                cand_stats = [_chunk_stats(logits_cand[:, t0:t1], y_b[:, t0:t1], topk)
+                              for t0, t1 in bounds]
+            del logits_cand
+            for (t0, t1), stats_ref, stats_cand in zip(bounds, ref_stats, cand_stats):
+                m = mask_b[:, t0:t1]
+                gold = y_b[:, t0:t1]
+                selectors = {
+                    'fixed': m & ~stats_ref['ok'] & stats_cand['ok'],
+                    'broken': m & stats_ref['ok'] & ~stats_cand['ok'],
+                    'both_wrong': m & ~stats_ref['ok'] & ~stats_cand['ok'],
+                }
+                n_both_right += int((m & stats_ref['ok'] & stats_cand['ok']).sum().item())
+                n_fixed += int(selectors['fixed'].sum().item())
+                n_broken += int(selectors['broken'].sum().item())
+                n_both_wrong += int(selectors['both_wrong'].sum().item())
+                for status, selector in selectors.items():
+                    remaining = max_scan - scanned[status]
+                    if remaining <= 0:
+                        continue
+                    for b, tt in selector.nonzero(as_tuple=False)[:remaining].tolist():
+                        scanned[status] += 1
+                        pos = t0 + tt
+                        scans[status].append({
+                            'batch_row': b0 + b,
+                            'position': pos,
+                            'gold': int(gold[b, tt]),
+                            'prev': int(x_b[b, pos]),
+                            'context': [int(v) for v in x_b[b, max(0, pos - args.context_tokens):pos + 1].tolist()],
+                            'reference': _side_record(stats_ref, b, tt, args.rank_clip),
+                            'candidate': _side_record(stats_cand, b, tt, args.rank_clip),
+                        })
+                del stats_ref, stats_cand, selectors
 
     if n_tokens == 0:
         raise SystemExit('[pair] no valid target tokens in the selected batches')
@@ -710,6 +738,7 @@ def main():
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--seq-len', type=int, default=512)
     p.add_argument('--eval-chunk', type=int, default=64, help='positions per softmax chunk')
+    p.add_argument('--forward-batch-chunk', type=int, default=4, help='rows per forward pass: the (rows, seq, vocab) logits block is forwarded in slices of at most this many rows, bounding the analysis peak; each model row is independent, so the statistics are unchanged (0 = one pass over the whole batch)')
     p.add_argument('--topk', type=int, default=5, help='oracle top-k radius; values below 1 are clamped to 1 and values above vocab-1 to vocab-1 so the report key always matches the analyzed k')
     p.add_argument('--confidence', type=float, default=0.8, help='pred_prob at/above which a wrong prediction counts as confident')
     p.add_argument('--rare-quantile', type=float, default=0.1, help='bottom fraction of target frequencies treated as rare')

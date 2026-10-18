@@ -426,6 +426,30 @@ class PackedStream(IterableDataset):
         self.pos = pos
 
 
+_TOKENIZER_CACHE: dict = {}
+_TOKENIZER_CACHE_MAX_ENTRIES = 8
+
+
+def _cached_tokenizer(name: str, revision):
+    """Process-wide `AutoTokenizer` cache keyed by (name, revision).
+
+    Checkpoint scans call `build_dataloader` once per checkpoint; without the
+    cache each call repeats the tokenizer resolution (network/cache lookup and
+    config parsing) even though the tokenizer identity is fixed by the model.
+    The cache is a plain dict keyed by the revision-pinned name, bounded like
+    the other scratch caches, and `pad_token_id` is still normalized per call.
+    """
+    key = (name, revision)
+    tok = _TOKENIZER_CACHE.get(key)
+    if tok is None:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(name, revision=revision)
+        if len(_TOKENIZER_CACHE) >= _TOKENIZER_CACHE_MAX_ENTRIES:
+            _TOKENIZER_CACHE.clear()
+        _TOKENIZER_CACHE[key] = tok
+    return tok
+
+
 def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int,
                      batch_size: int, tokenizer: str = "gpt2"):
     """Build the DataLoader for the split currently configured.
@@ -440,11 +464,10 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     copied into the split report (data-version tracking).
     """
     from datasets import load_dataset
-    from transformers import AutoTokenizer
     from torch.utils.data import DataLoader
 
     opts = get_data_options()
-    tok = AutoTokenizer.from_pretrained(tokenizer, revision=opts.get("tokenizer_revision"))
+    tok = _cached_tokenizer(tokenizer, opts.get("tokenizer_revision"))
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id
     stream_ds = load_dataset(dataset_name, dataset_config, split="train",

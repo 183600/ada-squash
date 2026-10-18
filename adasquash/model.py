@@ -46,7 +46,10 @@ _CROSSENTROPY_CHUNK_BYTES = 1 << 27
 _CROSS_ENTROPY_FAST_PATH_BYTES = 1 << 23
 _CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
 _CE_SCRATCH_CACHE: dict[tuple, torch.Tensor] = {}
-_CE_SCRATCH_MAX_ENTRIES = 4
+# At most one shape pair is live at a time: the fp32 accumulator plus (under
+# autocast) its low-precision cast twin. Keeping two entries bounds the
+# resident scratch at ~2 x chunk size instead of ~1GiB across model switches.
+_CE_SCRATCH_MAX_ENTRIES = 2
 
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
     if vocab_size not in _CROSS_ENTROPY_CHUNK_ROWS_CACHE:
@@ -68,6 +71,10 @@ def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tens
             _CE_SCRATCH_CACHE.clear()
         _CE_SCRATCH_CACHE[key] = buf
     return buf
+
+def clear_ce_scratch_cache() -> None:
+    """Release the cached CE scratch buffers (model switch / run end)."""
+    _CE_SCRATCH_CACHE.clear()
 
 def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=False) -> dict:
     kwargs: dict = {}
@@ -209,7 +216,17 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
         grad_h = torch.empty_like(h) if need_h else None
-        grad_w = torch.empty_like(w) if need_w else None
+        # The weight gradient accumulates into its final buffer from the first
+        # chunk on: a low-precision weight keeps a low-precision accumulator
+        # (no full-size fp32 copy ever exists), while an fp32/fp64 weight (the
+        # autocast case `w = weight.to(bf16)`) accumulates directly in
+        # `acc`, so the end-of-backward `to(fp32)` full-size copy disappears.
+        grad_w_dtype = None
+        if need_w:
+            weight_dtype = ctx.in_dtypes[1]
+            low_precision = weight_dtype in (torch.bfloat16, torch.float16)
+            grad_w_dtype = weight_dtype if low_precision else acc
+            grad_w = torch.empty_like(w, dtype=grad_w_dtype)
         # See `_ChunkedCrossEntropy.backward`: with no valid targets the
         # gradient must stay zero instead of 0 * inf = NaN.
         grad_scale = (grad_out / ctx.count).to(dt) if int(ctx.count) > 0 else grad_out.to(dt)
@@ -249,10 +266,29 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             if need_h:
                 torch.mm(g, w, out=grad_h[start:end])
             if need_w:
-                if first:
-                    torch.mm(g.t(), hc, out=grad_w)
+                if g.dtype == grad_w.dtype and hc.dtype == grad_w.dtype:
+                    if first:
+                        torch.mm(g.t(), hc, out=grad_w)
+                    else:
+                        grad_w.addmm_(g.t(), hc)
                 else:
-                    grad_w.addmm_(g.t(), hc)
+                    # Mixed dtypes cannot write into `grad_w` directly
+                    # (`torch.mm`'s out tensor must have the product's dtype),
+                    # so the product is reduced in vocab blocks: the fp32
+                    # gradient is the only full-size buffer, and each block
+                    # only stages (rows, block) / (block, dim) temporaries
+                    # instead of the full (V, dim) product.
+                    hcf = hc.to(acc)
+                    block = max(1, (_CROSSENTROPY_CHUNK_BYTES // 4)
+                                // max(1, hcf.shape[1] * hcf.element_size()))
+                    for v0 in range(0, w.shape[0], block):
+                        v1 = min(w.shape[0], v0 + block)
+                        part = torch.mm(g[:, v0:v1].to(acc).t(), hcf)
+                        if first and v0 == 0:
+                            grad_w[v0:v1].copy_(part)
+                        else:
+                            grad_w[v0:v1].add_(part)
+                    del hcf
             first = False
         hidden_dtype, weight_dtype = ctx.in_dtypes
         if need_h and grad_h.dtype != hidden_dtype:
@@ -546,4 +582,4 @@ def build_llama_tiny_1b(norm_name: str='dytcd', **over) -> GPT:
     over.setdefault('rotary', True)
     cfg = GPTConfig(vocab_size=32000, dim=2048, n_layers=24, n_heads=16, max_seq_len=2048, mlp_ratio=8.0 / 3.0, norm_name=norm_name, **over)
     return GPT(cfg)
-__all__ = ['GPTConfig', 'LayerConfig', 'Block', 'MLP', 'GPT', 'build_norm_kwargs', 'cross_entropy_mean', 'fused_cross_entropy_mean', 'build_gpt_124m', 'build_gpt_350m', 'build_llama_tiny_1b']
+__all__ = ['GPTConfig', 'LayerConfig', 'Block', 'MLP', 'GPT', 'build_norm_kwargs', 'cross_entropy_mean', 'fused_cross_entropy_mean', 'clear_ce_scratch_cache', 'build_gpt_124m', 'build_gpt_350m', 'build_llama_tiny_1b']

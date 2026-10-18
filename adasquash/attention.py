@@ -11,6 +11,25 @@ _ROPE_TABLE_CACHE: dict = {}
 _LOGIT_SCRATCH_CACHE: dict = {}
 _CACHE_MAX_ENTRIES = 8
 _LOGIT_SCRATCH_MAX_ENTRIES = 2
+_ROPE_HALF_SCRATCH_CACHE: dict = {}
+_ROPE_HALF_SCRATCH_MAX_ENTRIES = 4
+
+def _rope_half_scratch(x_lo: torch.Tensor) -> torch.Tensor:
+    """Reusable half-width buffer for the in-place rotary rotation.
+
+    Keyed by (shape, dtype, device) like the other aux caches (never by
+    `id()`); an inference-mode buffer is rebuilt for a grad-mode caller.
+    """
+    key = (tuple(x_lo.shape), x_lo.dtype, x_lo.device)
+    buf = _ROPE_HALF_SCRATCH_CACHE.get(key)
+    if buf is not None and buf.is_inference() and (not torch.is_inference_mode_enabled()):
+        buf = None
+    if buf is None:
+        buf = torch.empty(x_lo.shape, dtype=x_lo.dtype, device=x_lo.device)
+        if len(_ROPE_HALF_SCRATCH_CACHE) >= _ROPE_HALF_SCRATCH_MAX_ENTRIES:
+            _ROPE_HALF_SCRATCH_CACHE.clear()
+        _ROPE_HALF_SCRATCH_CACHE[key] = buf
+    return buf
 
 def clear_logit_scratch_cache() -> None:
     """Drop the cached `_logit_scratch` buffers when a stats window ends."""
@@ -153,7 +172,10 @@ class CausalSelfAttention(nn.Module):
         acc_abs = torch.zeros((), dtype=torch.float64, device=device)
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
-        peak_sq = torch.zeros((), dtype=q.dtype, device=device)
+        # The max statistic is kept in the reduce dtype: squaring a bf16/fp16
+        # logit can overflow (|x| > ~1.8e19) to inf, exactly when a blown-up
+        # logit is the thing the monitor is looking for.
+        peak = torch.zeros((), dtype=reduce_dtype, device=device)
         drop = self._tril_mask(T, device)
         k_t = k.transpose(-1, -2)
         buf = self._logit_scratch(B, H, min(rows, T), T, q)
@@ -173,15 +195,15 @@ class CausalSelfAttention(nn.Module):
             acc_x.add_(block.sum(dtype=reduce_dtype))
             block.abs_()
             acc_abs.add_(block.sum(dtype=reduce_dtype))
+            torch.maximum(peak, block.amax().to(reduce_dtype), out=peak)
             block.square_()
             acc_sq.add_(block.sum(dtype=reduce_dtype))
-            torch.maximum(peak_sq, block.amax(), out=peak_sq)
         del k_t, block
         total = float(acc_abs)
         signed = float(acc_x)
         mean_abs = total / n_valid
         var = (float(acc_sq) - signed * signed / n_valid) / (n_valid - 1)
-        return {'logit_abs_mean': mean_abs, 'logit_abs_max': math.sqrt(float(peak_sq)), 'logit_std': math.sqrt(var) if var > 0.0 else 0.0}
+        return {'logit_abs_mean': mean_abs, 'logit_abs_max': float(peak), 'logit_std': math.sqrt(var) if var > 0.0 else 0.0}
 
     def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
@@ -285,7 +307,8 @@ def _rope_inplace_(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
     x_hi = x[..., half:]
-    tmp = x_lo.clone()
+    tmp = _rope_half_scratch(x_lo)
+    tmp.copy_(x_lo)
     x_lo.mul_(lo_c)
     x_lo.addcmul_(x_hi, lo_s, value=-1)
     x_hi.mul_(hi_c)

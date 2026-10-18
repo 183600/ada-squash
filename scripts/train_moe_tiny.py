@@ -15,7 +15,7 @@ from adasquash import build_norm, markov_batch
 from adasquash.diagnostics import triage_nonfinite
 from adasquash.attention import CausalSelfAttention, clear_logit_scratch_cache
 from adasquash.metrics import mean_std_stderr
-from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, _LayerScaleResidual
+from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, _LayerScaleResidual
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 _FLAT_TOKEN_CACHE: dict = {}
@@ -63,20 +63,44 @@ class MoELayer(nn.Module):
         token_of = flat_token[order]
         gate_of = flat_gate[order]
         counts = flat_expert.bincount(minlength=n_experts)
-        ends = counts.cumsum(0).tolist()
         y = x_flat.new_zeros(n_tokens, C)
-        start = 0
-        for e in range(n_experts):
-            end = ends[e]
-            n_e = end - start
-            if n_e:
-                tok = token_of[start:end]
-                gate = gate_of[start:end].unsqueeze(-1)
-                xe = x_flat.index_select(0, tok)
-                h = F.silu(xe @ self.experts_w1[e])
-                h.mul_(xe @ self.experts_w3[e])
-                y.index_add_(0, tok, (h @ self.experts_w2[e]).mul_(gate))
-            start = end
+        n_slots = int(token_of.numel())
+        max_n = int(counts.max().item()) if n_experts and n_slots else 0
+        if max_n and n_experts * max_n <= 4 * max(1, n_slots):
+            # One batched GEMM per weight: each expert's sorted bucket is
+            # padded to `max_n` rows, padding slots reference the bucket's
+            # first token with a gate of exactly zero, so the sum is the same
+            # as the per-expert loop but without n_experts tiny serial GEMMs.
+            starts = counts.cumsum(0) - counts
+            arange = torch.arange(max_n, device=x.device)
+            slot_ok = arange.unsqueeze(0) < counts.unsqueeze(1)
+            gather = starts.unsqueeze(1) + arange.unsqueeze(0)
+            # Padding slots borrow a real slot (the last one) rather than
+            # `starts`, which is past the end of the sorted list for an empty
+            # expert; their gate is exactly zero, so they contribute nothing.
+            pad = starts.clamp(max=n_slots - 1).unsqueeze(1)
+            gather = torch.where(slot_ok, gather, pad)
+            tok_e = token_of[gather]
+            gate_e = (gate_of[gather] * slot_ok.to(gate_of.dtype)).unsqueeze(-1)
+            xe = x_flat[tok_e]
+            h = F.silu(torch.bmm(xe, self.experts_w1))
+            h.mul_(torch.bmm(xe, self.experts_w3))
+            ye = torch.bmm(h, self.experts_w2).mul_(gate_e)
+            y.index_add_(0, tok_e.reshape(-1), ye.reshape(-1, C))
+        else:
+            ends = counts.cumsum(0).tolist()
+            start = 0
+            for e in range(n_experts):
+                end = ends[e]
+                n_e = end - start
+                if n_e:
+                    tok = token_of[start:end]
+                    gate = gate_of[start:end].unsqueeze(-1)
+                    xe = x_flat.index_select(0, tok)
+                    h = F.silu(xe @ self.experts_w1[e])
+                    h.mul_(xe @ self.experts_w3[e])
+                    y.index_add_(0, tok, (h @ self.experts_w2[e]).mul_(gate))
+                start = end
         y = self.drop(y)
         y = y.view(B, T, C)
         tokens_per_expert = counts.to(probs.dtype).detach()
@@ -380,6 +404,9 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     }
     save_run_manifest(manifest_path, run_manifest)
     print(f'[done] saved to {output_dir} | n_loss_spikes={loss_spike.n_spikes}')
+    # Training is over: release the shape-keyed fp32 CE scratch blocks instead
+    # of leaving them resident for the rest of the (possibly multi-run) process.
+    clear_ce_scratch_cache()
     return dict(run_manifest['results'], seed=seed, output_dir=str(output_dir))
 
 def aggregate_moe_seed_results(results: list, seeds) -> dict:

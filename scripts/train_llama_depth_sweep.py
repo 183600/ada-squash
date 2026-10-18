@@ -31,6 +31,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -410,7 +411,25 @@ def print_sweep_comparisons(comparison: dict) -> None:
               f"with missing seed runs; significance is withheld there: "
               f"{comparison['incomplete_cells']}")
 
-def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int):
+def _child_env(args, gpu=None) -> dict:
+    """Environment for one training child.
+
+    Each cell is pinned to one GPU (round-robin over --gpus) and its BLAS
+    thread count is capped: without this every concurrent child lands on the
+    same visible device and the host oversubscribes its cores, which is the
+    fastest way to OOM or to make the sweep unreproducible.
+    """
+    env = dict(os.environ)
+    if gpu is not None:
+        env['CUDA_VISIBLE_DEVICES'] = str(gpu)
+    threads = int(getattr(args, 'threads_per_run', 0) or 0)
+    if threads > 0:
+        for var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                    'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+            env[var] = str(threads)
+    return env
+
+def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=None):
     cmd = [sys.executable, str(Path(__file__).parent / 'train_gpt2.py'), '--model', args.model, '--norm', norm, '--dataset', args.dataset, '--dataset-config', args.dataset_config, '--tokenizer', args.tokenizer, '--seq-len', str(args.seq_len), '--batch-size', str(args.batch_size), '--grad-accum', str(args.grad_accum), '--max-steps', str(args.max_steps), '--lr', str(args.lr), '--min-lr-ratio', str(args.min_lr_ratio), '--warmup', str(args.warmup), '--weight-decay', str(args.weight_decay), '--beta1', str(args.beta1), '--beta2', str(args.beta2), '--grad-clip', str(args.grad_clip), '--seed', str(seed), '--alpha-0', str(args.alpha_0), '--alpha-init', str(args.alpha_init), '--k-init', str(args.k_init), '--p-init', str(args.p_init), '--qk-alpha-init', str(args.qk_alpha_init), '--output-dir', str(output_dir), '--log-every', str(args.log_every), '--stats-every', str(args.stats_every), '--save-every', str(args.save_every)]
     if args.qk_norm:
         cmd += ['--qk-norm', args.qk_norm]
@@ -470,7 +489,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int):
                       f'{args.reference_norm} reference at the same depth, recipe and step '
                       f'budget, paired over the shared seeds.')
     cmd += ['--hypothesis', hypothesis]
-    env = dict(os.environ)
+    env = _child_env(args, gpu)
     env['ADASQUASH_DEPTH_OVERRIDE'] = str(depth)
     shape = ''
     if not args.no_dim_scaling:
@@ -554,7 +573,10 @@ def main():
     p.add_argument('--log-every', type=int, default=20)
     p.add_argument('--stats-every', type=int, default=500)
     p.add_argument('--save-every', type=int, default=1000)
-    p.add_argument('--sequential', action='store_true', help='run configs sequentially')
+    p.add_argument('--sequential', action='store_true', help='run configs strictly one at a time (equivalent to --max-parallel 1, which is the default)')
+    p.add_argument('--max-parallel', type=int, default=1, help='maximum number of concurrently training cells; the default 1 keeps a 4x3x3 depth/norm/seed grid from launching 36 1B runs at once. Only raise it together with --gpus so each child has its own device')
+    p.add_argument('--gpus', nargs='+', default=None, metavar='ID', help='GPU ids the cells are pinned to, round-robin in launch order (written to CUDA_VISIBLE_DEVICES of each child); without it all children share the ambient CUDA_VISIBLE_DEVICES')
+    p.add_argument('--threads-per-run', type=int, default=1, help='OMP/MKL/OpenBLAS/etc thread cap for each child (0 = inherit the parent environment); 1 avoids oversubscription when cells share a host, raise it for a single serial run')
     apply_config_to_parser(p, known.config, _SWEEP_CONFIG_ALIASES)
     args = p.parse_args()
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [42])
@@ -579,8 +601,8 @@ def main():
                  for depth in args.depths for norm in args.norms for seed in seeds],
     }
     save_run_manifest(base / 'run_manifest.json', sweep_manifest)
-    procs = []
     cells = []
+    jobs = []
     for depth in args.depths:
         for norm in args.norms:
             cell_dir = base / f'd{depth}-{norm}'
@@ -589,19 +611,46 @@ def main():
                 out_dir = seed_dir(cell_dir, seed, multi)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 (out_dir / 'depth.txt').write_text(str(depth))
-                proc = launch_one(args, depth, norm, out_dir, seed)
-                if args.sequential:
-                    rc = proc.wait()
-                    print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
-                else:
-                    procs.append((proc, depth, norm, seed))
+                jobs.append((depth, norm, out_dir, seed))
             cells.append((depth, norm, cell_dir))
-    if not args.sequential:
-        for proc, depth, norm, seed in procs:
+    gpus = list(args.gpus) if args.gpus else []
+
+    def _gpu_for(idx: int):
+        return gpus[idx % len(gpus)] if gpus else None
+
+    def _reap(proc, depth, norm, seed):
+        rc = proc.wait()
+        if rc != 0:
+            print(f'[sweep] WARNING: d{depth}-{norm} seed={seed} exited rc={rc}; '
+                  f'its manifest may be missing, which flags the cell incomplete')
+
+    max_parallel = max(1, int(args.max_parallel))
+    if args.sequential or max_parallel == 1:
+        if args.sequential and int(args.max_parallel) > 1:
+            print('[sweep][warn] --sequential overrides --max-parallel')
+        for idx, (depth, norm, out_dir, seed) in enumerate(jobs):
+            proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(idx))
             rc = proc.wait()
-            if rc != 0:
-                print(f'[sweep] WARNING: d{depth}-{norm} seed={seed} exited rc={rc}; '
-                      f'its manifest may be missing, which flags the cell incomplete')
+            print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
+    else:
+        # A bounded launch queue: at most `max_parallel` training children
+        # alive at once, each pinned to one GPU, instead of launching the whole
+        # grid (36 1B runs by default) into one device.
+        running: list = []
+        next_job = 0
+        while next_job < len(jobs) or running:
+            while next_job < len(jobs) and len(running) < max_parallel:
+                depth, norm, out_dir, seed = jobs[next_job]
+                proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(next_job))
+                next_job += 1
+                running.append((proc, depth, norm, seed))
+            done = [entry for entry in running if entry[0].poll() is not None]
+            if not done:
+                time.sleep(0.5)
+                continue
+            for entry in done:
+                running.remove(entry)
+                _reap(*entry)
     aggs_by_depth: dict = {}
     for depth, norm, cell_dir in cells:
         agg = aggregate_sweep_cell(cell_dir, seeds, multi)

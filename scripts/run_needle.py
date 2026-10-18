@@ -14,6 +14,7 @@ def main():
     p.add_argument('--ckpt', required=True)
     p.add_argument('--ctx-lens', nargs='+', type=int, default=[512, 1024, 2048, 4096])
     p.add_argument('--trials', type=int, default=20)
+    p.add_argument('--decode-batch', type=int, default=8, help='independent trials decoded per forward pass (bounds peak memory; the per-trial prefix is still recomputed every step)')
     p.add_argument('--tokenizer', default='gpt2')
     p.add_argument('--secret', default='The magic number is 98765.')
     p.add_argument('--output', default=None)
@@ -43,7 +44,7 @@ def main():
                             'model_max_seq_len': int(model.cfg.max_seq_len),
                             'scoring_overhead': overhead})
             continue
-        res = needle_in_haystack(model, tok, needle=args.secret, context_len=L, n_trials=args.trials, device=device, seed=args.seed, return_counts=True)
+        res = needle_in_haystack(model, tok, needle=args.secret, context_len=L, n_trials=args.trials, device=device, seed=args.seed, return_counts=True, decode_batch=args.decode_batch)
         print(f"[needle] L={L:5d} acc={res['accuracy']:.3f} "
               f"({res['n_correct']}/{res['n_trials']}, 95% CI [{res['ci95_low']:.3f}, {res['ci95_high']:.3f}])")
         # Bad cases: a bare accuracy cannot tell "never found the needle"
