@@ -43,6 +43,19 @@ def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
     progress = (step - warmup) / max(1, max_steps - warmup)
     progress = min(1.0, max(0.0, progress))
     return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+def _finite(value) -> bool:
+    """A usable numeric statistic: not None/NaN/Inf (bool is not a number here).
+
+    A diverged run can report `Inf`/`NaN` from a readable manifest; pooling it
+    would poison the cell mean while looking like a complete seed.
+    """
+    return isinstance(value, (int, float)) and (not isinstance(value, bool)) and math.isfinite(value)
+
+# Both ratios are reported next to every comparison row; a cell pair outside
+# this band is not compute-matched, so its loss delta is not a depth/norm-only
+# effect and must be read against the cost difference.
+_COMPUTE_MATCH_TOL = 0.25
 _BASE_DEPTH = 24
 _BASE_DIM = 2048
 _BASE_HEADS = 16
@@ -133,7 +146,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         })
 
     def _pool(key: str):
-        vals = [p[key] for p in per_seed if isinstance(p[key], (int, float))]
+        vals = [p[key] for p in per_seed if _finite(p[key])]
         return vals, mean_std_stderr(vals)
 
     best_vals, best_stats = _pool('best_val_loss')
@@ -144,34 +157,40 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         if p.get('curve_classification'):
             curve_counts[p['curve_classification']] = curve_counts.get(p['curve_classification'], 0) + 1
     gaps = [p['curve_generalization_gap'] for p in per_seed
-            if isinstance(p.get('curve_generalization_gap'), (int, float))]
+            if _finite(p.get('curve_generalization_gap'))]
     # Efficiency accounting pooled next to the losses: the shared recipe
     # (same dim/heads per depth) makes n_params and FLOPs/token identical
     # across a cell's seeds, so any cross-seed spread here is a red flag.
-    params = [p['n_params'] for p in per_seed if isinstance(p.get('n_params'), (int, float))]
+    params = [p['n_params'] for p in per_seed if _finite(p.get('n_params'))]
     norm_shares = [p['norm_share_of_params'] for p in per_seed
-                   if isinstance(p.get('norm_share_of_params'), (int, float))]
+                   if _finite(p.get('norm_share_of_params'))]
     flops_fwd = [p['flops_per_token_forward'] for p in per_seed
-                 if isinstance(p.get('flops_per_token_forward'), (int, float))]
+                 if _finite(p.get('flops_per_token_forward'))]
     flops_train = [p['flops_per_token_training_est'] for p in per_seed
-                   if isinstance(p.get('flops_per_token_training_est'), (int, float))]
+                   if _finite(p.get('flops_per_token_training_est'))]
     # A run that crashed, diverged or never finished leaves no readable
     # manifest. Pooling only the survivors would silently turn "this norm
     # destabilized 2 of 3 seeds" into a clean mean over the lucky seed, so the
     # missing seeds are recorded and the comparison refuses to certify an
-    # incomplete cell as significantly better.
+    # incomplete cell as significantly better. A manifest that exists but
+    # reports NaN/Inf is *not* a usable replication either: it is excluded from
+    # the mean like a missing seed and listed separately.
     missing_seeds = [p['seed'] for p in per_seed
-                     if not isinstance(p['best_val_loss'], (int, float))
-                     and not isinstance(p['final_val_loss'], (int, float))]
+                     if not _finite(p['best_val_loss'])
+                     and not _finite(p['final_val_loss'])]
+    invalid_seeds = [p['seed'] for p in per_seed
+                     if (isinstance(p['best_val_loss'], float) and not math.isfinite(p['best_val_loss']))
+                     or (isinstance(p['final_val_loss'], float) and not math.isfinite(p['final_val_loss']))]
     seeds_without_final = [p['seed'] for p in per_seed
-                           if not isinstance(p['final_val_loss'], (int, float))]
+                           if not _finite(p['final_val_loss'])]
     return {
         'cell': cell_dir.name,
         'seeds': seed_list,
         'n_seeds_requested': len(seed_list),
         'missing_seeds': missing_seeds,
+        'invalid_seeds': invalid_seeds,
         'seeds_without_final_val_loss': seeds_without_final,
-        'complete': len(missing_seeds) == 0,
+        'complete': len(missing_seeds) == 0 and len(invalid_seeds) == 0,
         'per_seed': per_seed,
         'n_seeds': len(best_vals),
         'best_val_loss': None if best_stats is None else best_stats['mean'],
@@ -200,8 +219,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
                         'while some seed was underfit/stalled or overfitting/diverging must not be read as a clean '
                         'depth/norm effect. n_params/flops_per_token_* = efficiency accounting (identical across the '
                         'cell seeds by construction) so the accuracy delta can be weighed against its cost. '
-                        'missing_seeds = failed/unfinished runs, excluded from the mean but never from the report: '
-                        'a cell with missing seeds is not a clean replication.'),
+                        'missing_seeds = failed/unfinished runs, invalid_seeds = runs whose manifest reports '
+                        'NaN/Inf; both are excluded from the mean but never from the report, because a cell with '
+                        'missing/invalid seeds is not a clean replication.'),
     }
 
 def _cell_seed_metric(cell: dict, metric: str) -> dict:
@@ -211,7 +231,7 @@ def _cell_seed_metric(cell: dict, metric: str) -> dict:
         if not isinstance(item, dict) or item.get('seed') is None:
             continue
         value = item.get(metric)
-        if isinstance(value, (int, float)):
+        if _finite(value):
             out[int(item['seed'])] = float(value)
     return out
 
@@ -270,7 +290,26 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 'reference_n_params': ref.get('n_params'),
                 'candidate_flops_per_token_forward': by_norm[norm].get('flops_per_token_forward'),
                 'reference_flops_per_token_forward': ref.get('flops_per_token_forward'),
+                # The sweep's premise is a compute-matched depth/norm
+                # comparison; these two ratios make that premise checkable
+                # instead of assumed (candidate/reference, 1.0 = matched).
+                'params_ratio_vs_reference': None,
+                'flops_ratio_vs_reference': None,
+                'cost_matched_within_25pct': None,
             }
+            c_params = by_norm[norm].get('n_params')
+            r_params = ref.get('n_params')
+            c_flops = by_norm[norm].get('flops_per_token_forward')
+            r_flops = ref.get('flops_per_token_forward')
+            if _finite(c_params) and _finite(r_params) and r_params:
+                entry['params_ratio_vs_reference'] = c_params / r_params
+            if _finite(c_flops) and _finite(r_flops) and r_flops:
+                entry['flops_ratio_vs_reference'] = c_flops / r_flops
+            ratios = [r for r in (entry['params_ratio_vs_reference'],
+                                  entry['flops_ratio_vs_reference']) if r is not None]
+            if ratios:
+                entry['cost_matched_within_25pct'] = all(
+                    abs(r - 1.0) <= _COMPUTE_MATCH_TOL for r in ratios)
             requested = sorted(set(ref.get('seeds') or []) | set(by_norm[norm].get('seeds') or []))
             entry['candidate_missing_seeds'] = [s for s in requested if s not in cand_seeds]
             entry['reference_missing_seeds'] = [s for s in requested if s not in ref_seeds]
@@ -316,8 +355,10 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                           '(`incomplete_cells`) is never certified as significantly better: which runs '
                           'survived is itself a selection effect. Every row also carries the two sides\' '
                           '`*_curve_classification_counts` and `*_n_params` / '
-                          '`*_flops_per_token_forward`: an off-healthy-regime side or an uncounted '
-                          'params/FLOPs increase means the delta is not yet a depth/norm claim.'),
+                          '`*_flops_per_token_forward` (with `params_ratio_vs_reference` / '
+                          '`flops_ratio_vs_reference` / `cost_matched_within_25pct`): an off-healthy-regime '
+                          'side, an uncounted params/FLOPs increase, or a `cost_matched_within_25pct = false` '
+                          'row means the delta is not yet a clean depth/norm claim - it is confounded with cost.'),
     }
 
 def print_sweep_comparisons(comparison: dict) -> None:
@@ -353,6 +394,15 @@ def print_sweep_comparisons(comparison: dict) -> None:
         c_params, r_params = r.get('candidate_n_params'), r.get('reference_n_params')
         if c_params is not None and r_params is not None:
             cost = f" params={c_params / 1e6:.2f}M vs {r_params / 1e6:.2f}M"
+        ratios = []
+        if r.get('params_ratio_vs_reference') is not None:
+            ratios.append(f"params_ratio={r['params_ratio_vs_reference']:.3f}")
+        if r.get('flops_ratio_vs_reference') is not None:
+            ratios.append(f"flops_ratio={r['flops_ratio_vs_reference']:.3f}")
+        if ratios:
+            cost += ' (' + ', '.join(ratios) + ')'
+        if r.get('cost_matched_within_25pct') is False:
+            cost += ' [NOT compute-matched: delta confounded with cost]'
         print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{ci_str}{sign} "
               f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}{cost}{regime}")
     if comparison.get('incomplete_cells'):
@@ -507,7 +557,11 @@ def main():
     p.add_argument('--sequential', action='store_true', help='run configs sequentially')
     apply_config_to_parser(p, known.config, _SWEEP_CONFIG_ALIASES)
     args = p.parse_args()
-    seeds = [args.seed] if args.seed is not None else list(args.seeds or [42])
+    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [42])
+    seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    if len(seeds) != len(raw_seeds):
+        print(f'[sweep][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
+              f'(a repeated seed is the same run, not an independent replication)')
     if len(seeds) < 3:
         print(f'[sweep][warn] {len(seeds)} seed(s): a single depth/norm cell cannot be '
               f'separated from run-to-run noise; use >= 3 seeds before interpreting deltas')
@@ -606,6 +660,10 @@ def main():
                   f"{agg['missing_seeds']}; the pooled mean covers {agg['n_seeds']} of "
                   f"{agg['n_seeds_requested']} requested seeds and comparisons will treat the "
                   f"cell as incomplete")
+        if agg.get('invalid_seeds'):
+            print(f"[sweep] WARNING: d{depth}-{norm}: seeds {agg['invalid_seeds']} report "
+                  f"NaN/Inf losses; they are excluded from the pooled mean exactly like "
+                  f"missing runs (a diverged run is not a clean replication)")
     comparison = compare_sweep_cells(aggs_by_depth, args.reference_norm)
     print_sweep_comparisons(comparison)
     comp_path = base / 'sweep_comparisons.json'

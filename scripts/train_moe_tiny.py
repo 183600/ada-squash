@@ -196,7 +196,13 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         # preflight would not catch a broken router / aux-loss path. Seeding
         # first exports PYTHONHASHSEED for the child interpreter.
         from scripts.sanity_overfit import run_preflight
-        run_preflight(args.norm, seed, output_dir, model='moe', n_experts=args.n_experts)
+        # The preflight must exercise the *actual* architecture (same depth /
+        # width / heads / context), otherwise it validates plumbing on a model
+        # this run does not use.
+        run_preflight(args.norm, seed, output_dir, model='moe', n_experts=args.n_experts,
+                      arch_args=['--dim', str(args.dim), '--n-layers', str(args.n_layers),
+                                 '--n-heads', str(args.n_heads), '--seq-len', str(args.seq_len),
+                                 '--batch-size', str(args.batch_size)])
         sanity_report_path = output_dir / 'sanity_overfit.json'
     cfg = GPTConfig(vocab_size=50304, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads, max_seq_len=args.seq_len, mlp_ratio=4.0, norm_name=args.norm)
     model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
@@ -388,9 +394,13 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
     stay in `per_seed` so a load-imbalance result resting on one seed cannot
     hide behind the mean.
     """
+    def _usable(value) -> bool:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value))
+
     agg = {'seeds': [int(s) for s in seeds], 'n_seeds': len(results), 'per_seed': results}
     for key in _MOE_SEED_METRIC_KEYS:
-        vals = [r[key] for r in results if isinstance(r.get(key), (int, float))]
+        vals = [r[key] for r in results if _usable(r.get(key))]
         stats = mean_std_stderr(vals)
         if stats is None:
             agg[key] = None
@@ -398,10 +408,19 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
             continue
         agg[key] = stats['mean']
         agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
+    # A readable manifest can still report NaN/Inf (a diverged validation
+    # pass); it is not a usable replication and is listed rather than silently
+    # pooled into the mean.
+    agg['invalid_seeds'] = sorted({
+        int(r['seed']) for r in results
+        if isinstance(r.get('seed'), int)
+        and any(isinstance(r.get(k), float) and not math.isfinite(r[k])
+                for k in _MOE_SEED_METRIC_KEYS)})
     agg['n_loss_spikes_total'] = sum(r['n_loss_spikes'] or 0 for r in results
                                      if isinstance(r.get('n_loss_spikes'), (int, float)))
     agg['aggregation'] = ('Mean +/- Std across independent seeds; the unit of '
-                          'replication is the seed, not the step')
+                          'replication is the seed, not the step. NaN/Inf seed '
+                          'values are excluded and listed in invalid_seeds.')
     return agg
 
 def main():
@@ -439,9 +458,13 @@ def main():
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. offline runs where the preflight cannot be spawned)')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this study tests (e.g. "DyT-CD keeps expert load balanced and matches ln/RMSNorm val_ce at this scale"); recorded in the per-seed and aggregate run manifests so the result can be audited against the claim it was meant to support')
     args = p.parse_args()
-    seeds = [args.seed] if args.seed is not None else list(args.seeds)
-    if not seeds:
+    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds)
+    if not raw_seeds:
         p.error('--seeds must not be empty')
+    seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    if len(seeds) != len(raw_seeds):
+        print(f'[moe][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
+              f'(a repeated seed reruns the identical run, it is not an independent replication)')
     if len(seeds) < 3:
         print(f'[moe][warn] {len(seeds)} seed(s): expert load and held-out loss vary run to run; use >= 3 independent seeds before interpreting a difference')
     multi = len(seeds) > 1
@@ -474,6 +497,9 @@ def main():
                   f"over {agg['n_seeds']} seeds -> {summary_path}")
         else:
             print(f'[moe][done] no usable val_ce across seeds -> {summary_path}')
+        if agg.get('invalid_seeds'):
+            print(f"[moe][warn] seeds {agg['invalid_seeds']} produced NaN/Inf metrics; "
+                  f"they are excluded from the pooled mean, not treated as clean replications")
 
 def _expert_cv(tpe) -> float:
     if not isinstance(tpe, torch.Tensor):

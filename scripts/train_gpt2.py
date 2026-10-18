@@ -686,7 +686,7 @@ def main():
     print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
     run_manifest['data']['split_reports'] = data_reports
     run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    flops = analytic_flops_per_token(model.cfg)
+    flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
     run_manifest['results'] = {
         'final_step': step,
         'last_train_loss': last_train_loss,

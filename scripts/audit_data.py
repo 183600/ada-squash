@@ -22,7 +22,10 @@ Reads a bounded sample of the train / validation / test splits produced by
 
 `--write-train-hash-file` emits the training-document hash ledger consumed by
 `--exclude-hash-file` in the trainers, so held-out splits drop any document
-whose exact text also occurs in train.
+whose exact text also occurs in train. A full ledger requires `--n-docs 0`;
+with a bounded sample the file covers only the sampled prefix, and the run
+records `train_hash_ledger.exhaustive = false` and warns instead of implying
+full coverage.
 
 This script only *reads* data; it never trains or writes to a split.
 """
@@ -67,7 +70,12 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             tokenizer_errors += 1
     stats = cleaner.report()
     stats['documents_sampled'] = len(lengths)
+    # Whether the counters cover the whole split (--n-docs 0) or a prefix: with
+    # a bounded sample, `duplicate_overlap_with_train = 0` is a lower bound on
+    # the true overlap, not evidence that the splits are disjoint.
+    stats['exhaustive'] = not n_docs
     stats['duplicate_overlap_with_train'] = overlap if known_hashes is not None else None
+    stats['duplicate_overlap_is_lower_bound'] = bool(n_docs) if known_hashes is not None else None
     if lengths:
         stats['doc_chars_mean'] = sum(lengths) / len(lengths)
         stats['doc_chars_min'] = min(lengths)
@@ -159,6 +167,7 @@ def main():
     tokens = {}
     reports = {}
     train_hashes = None
+    ledger_info = None
     for name in ('train', 'validation', 'test'):
         stats, tok_counter, report, hashes = _collect_split(
             name, args.dataset, args.dataset_config, tokenizer, options,
@@ -173,7 +182,24 @@ def main():
                 ledger = Path(args.write_train_hash_file)
                 ledger.parent.mkdir(parents=True, exist_ok=True)
                 ledger.write_text(json.dumps(sorted(h.hex() for h in hashes)))
-                print(f'[audit] wrote {len(hashes)} training-document hashes to {ledger}')
+                # With a bounded --n-docs sample the ledger only contains the
+                # prefix that was read; using it as `--exclude-hash-file` then
+                # removes duplicates of that prefix only. Say so loudly instead
+                # of implying full coverage.
+                exhaustive = not args.n_docs
+                ledger_info = {
+                    'path': str(ledger),
+                    'n_hashes': len(hashes),
+                    'exhaustive': exhaustive,
+                    'n_docs_limit': args.n_docs,
+                }
+                print(f'[audit] wrote {len(hashes)} training-document hashes to {ledger}'
+                      f'{" (exhaustive)" if exhaustive else " (SAMPLED PREFIX ONLY)"}')
+                if not exhaustive:
+                    print(f'[audit] WARNING: the ledger covers at most the first {args.n_docs} '
+                          f'training documents; fed to --exclude-hash-file it only drops '
+                          f'duplicates of that prefix. Re-run with --n-docs 0 for a full ledger.',
+                          file=sys.stderr)
     chronology = _chronology_problems(reports)
     shift = {
         'train_vs_validation_tvd': _total_variation(tokens['train'], tokens['validation']),
@@ -183,7 +209,10 @@ def main():
             None if splits['train']['doc_chars_mean'] is None or splits['validation']['doc_chars_mean'] is None
             else splits['validation']['doc_chars_mean'] - splits['train']['doc_chars_mean']),
     }
-    out = {'options': vars(args), 'run_metadata': collect_run_metadata(), 'split_reports': reports, 'split_chronology_problems': chronology, 'cleaning_and_sanity': splits, 'distribution_shift': shift}
+    out = {'options': vars(args), 'run_metadata': collect_run_metadata(),
+           'split_reports': reports, 'split_chronology_problems': chronology,
+           'cleaning_and_sanity': splits, 'distribution_shift': shift,
+           'train_hash_ledger': ledger_info}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(out, indent=2, default=str))
     save_run_manifest(Path(args.output).with_name('data_manifest.json'), {
@@ -193,6 +222,7 @@ def main():
         'tokenizer': args.tokenizer,
         'options': vars(args),
         'split_reports': reports,
+        'train_hash_ledger': ledger_info,
     })
     for name, stats in splits.items():
         print(f"[audit] {name}: sampled={stats['documents_sampled']} kept={stats.get('documents_kept', 0)} "

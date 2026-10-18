@@ -8,9 +8,10 @@ module keeps that cost measurable and explicit:
   attention / MLP / normalization / LayerScale / LM head), counting tied
   storage once, so "the norm adds <0.1% parameters" is a number, not a claim;
 * `analytic_flops_per_token` derives the matmul FLOPs per token from the
-  config (forward and backward) - the norm layers are elementwise and add no
-  matmul FLOPs, but they also occupy no separate step in this count, so
-  latency is measured empirically by the benchmark script;
+  config (forward and backward), including the quadratic T x T attention
+  score/context matmuls - the norm layers are elementwise and add no matmul
+  FLOPs, but they also occupy no separate step in this count, so latency is
+  measured empirically by the benchmark script;
 * `efficiency_verdict` refuses to call a win a win when the gain is below the
   practical margin or the cost ratio is above budget: "+0.5% at 10x compute"
   is reported as not viable instead of being quoted as a headline.
@@ -40,13 +41,24 @@ def mlp_hidden_size(dim: int, mlp_ratio: float) -> int:
     return hidden + 7 & ~7
 
 
-def analytic_flops_per_token(cfg, backward: bool = False) -> dict:
+def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = None) -> dict:
     """Matmul FLOPs per token of the GPT decoder defined by `cfg`.
 
     Counts every weight-matrix multiplication (attention qkv/proj, SwiGLU
-    w1/w2/w3, LM head) as 2 x multiply-adds. Elementwise work (norms,
-    softmax, activation functions) is not a matmul and is therefore excluded -
-    the benchmark script measures wall-clock latency, which does include it.
+    w1/w2/w3, LM head) as 2 x multiply-adds *plus* the attention score and
+    context matmuls: ``Q @ K^T`` and ``softmax(QK^T) @ V`` cost
+    ``4 * d * T^2`` FLOPs per layer, i.e. ``4 * d * T`` per token. Omitting
+    those quadratic terms makes longer-context cells look artificially cheap,
+    so the FLOPs-based cost comparison between depths/context lengths would be
+    wrong (at T = d = 2048 the score matmuls alone are half the qkv/proj
+    FLOPs).
+
+    `seq_len` is the context length the model is actually run at (defaults to
+    `cfg.max_seq_len`, which can overstate the cost of a run trained at a
+    shorter context - pass the trained length when it differs). The score
+    count is the dense T x T convention; the causal mask serves only the lower
+    triangle, so a causal-exact count is about half - the dense convention is
+    the conservative upper bound and is applied identically to every cell.
 
     `backward=True` returns the training-step estimate, ~3x forward (the
     backward pass costs about twice the forward for these matmul-dominated
@@ -56,23 +68,30 @@ def analytic_flops_per_token(cfg, backward: bool = False) -> dict:
     n_layers = int(cfg.n_layers)
     vocab = int(cfg.vocab_size)
     h = mlp_hidden_size(d, float(cfg.mlp_ratio))
+    T = int(seq_len) if seq_len is not None else int(getattr(cfg, "max_seq_len", 0) or 0)
+    T = max(0, T)
     attn = float(n_layers * 8 * d * d)          # 4 d x d matmuls/token/layer
+    attn_scores = float(4 * n_layers * d * T)   # QK^T + AV, 4 d T^2 per layer / T
     mlp = float(n_layers * 6 * d * h)           # 3 d x h matmuls/token/layer
     lm_head = float(2 * d * vocab)
-    forward = attn + mlp + lm_head
+    forward = attn + attn_scores + mlp + lm_head
     return {
         "attention": attn,
+        "attention_scores": attn_scores,
         "mlp": mlp,
         "lm_head": lm_head,
         "forward_per_token": forward,
         "training_per_token": 3.0 * forward,
         "backward_factor": 3.0,
         "mlp_hidden": h,
+        "seq_len": T,
         "note": (
-            "matmul FLOPs per token (2 x MACs); elementwise ops (softsign/tanh, "
-            "LayerScale, softmax, SiLU) are not counted, so norm variants differ "
-            "here only through the shared backbone - measure latency for the "
-            "elementwise cost"
+            "matmul FLOPs per token (2 x MACs), including the quadratic attention "
+            "score/context matmuls counted densely (causal masking roughly halves "
+            "them; the dense convention is the conservative upper bound applied to "
+            "every cell). Elementwise ops (softsign/tanh, LayerScale, softmax, "
+            "SiLU) are not counted, so norm variants differ here only through the "
+            "shared backbone - measure latency for the elementwise cost"
         ),
     }
 

@@ -39,7 +39,10 @@ Selection bias: picking the best learning rate on `--seeds` and then quoting
 that same run overstates the effect (winner's curse). Pass `--confirm-seeds`
 (split off before tuning) to score the selected learning rates on fresh seeds;
 the comparison then uses the confirm runs, and the output records which split
-the decision was made on.
+the decision was made on. Without `--confirm-seeds` the p-values are still
+reported for description, but no arm is certified as significantly better:
+the rows carry `beats_reference_significantly = false` and a
+`significance_basis` saying the comparison ran on selection seeds.
 
 Usage
 -----
@@ -194,14 +197,17 @@ def _split_basis(r: dict, use_confirm: bool):
     return r['best']['mean'], r['best'].get('std'), r['best'].get('n')
 
 
-def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | None:
+def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bool = True) -> dict | None:
     """Best variant trials vs the best tuned baseline, paired where possible.
 
     Only the paired test on >= 2 shared seeds certifies an arm as better:
     with exactly one shared seed the same run's held-out batches are tested
     for description only (batch noise is not run-to-run noise), and with no
     shared seed no test runs at all. Only the seed-replicated rows enter the
-    Holm family.
+    Holm family. `certify=False` (no held-back confirm seeds were provided)
+    keeps the p-values for description but withholds every significance call:
+    a lr selected on `--seeds` and then tested on those same runs is the
+    winner's curse.
     """
     usable = {arm: r for arm, r in tuned.items() if r.get('best') is not None}
     baselines = {arm: r for arm, r in usable.items() if arm in set(baseline_arms)}
@@ -216,6 +222,10 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
     confirm_ran = {a for a, r in usable.items() if r.get('confirm_trials')}
     use_confirm = len(confirm_ready) == len(usable) and bool(usable)
     split = 'confirm_seeds' if use_confirm else 'selection_seeds'
+    # Only a comparison on held-back seeds can certify: without --confirm-seeds
+    # the same runs selected the lr and then "proved" it, which is the
+    # winner's curse regardless of how small the p-value looks.
+    certified = bool(certify and use_confirm)
     ref_mean, ref_std, ref_n = _split_basis(ref, use_confirm)
     out = {
         'reference_arm': ref_arm,
@@ -227,6 +237,12 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
         'reference_curve_classification_counts': ref['best'].get('curve_classification_counts'),
         'reference_split': split,
         'confirm_ignored_arms': sorted(confirm_ran - confirm_ready),
+        'certified': certified,
+        'certification': (
+            'confirm_seeds: significance tested on seeds held back from lr selection'
+            if certified else
+            "none: no held-back --confirm-seeds, so the p-values are descriptive "
+            "only and no arm is certified as significantly better (winner's curse)"),
         'margin': margin,
         'alpha': alpha,
         'rows': [],
@@ -320,8 +336,12 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float) -> dict | N
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
         entry['beats_reference_significantly'] = bool(
-            entry['beats_reference'] and p_holm is not None and p_holm < alpha
+            certified and entry['beats_reference'] and p_holm is not None and p_holm < alpha
         )
+        if not certified:
+            entry['significance_basis'] = (
+                "descriptive only: no --confirm-seeds, so the comparison ran on the seeds "
+                "the lr was selected on (winner's curse); the p-value is reported but not certified")
     out['rows_tested_descriptively_only'] = [e['arm'] for e in out['rows']
                                              if e['test'] is not None and not e['replicated_across_seeds']]
     out['multiple_comparison'] = (
@@ -357,6 +377,9 @@ def print_comparison(comparison: dict | None) -> None:
           f"n_seeds={comparison.get('reference_n_seeds')} "
           f"(split={comparison['reference_split']}; "
           f"selection-seed mean={comparison['reference_selection_val_loss']:.4f}){ref_note}")
+    if comparison.get('certified') is False:
+        print("[tune][compare] NOT CERTIFIED: no --confirm-seeds, so these p-values compare runs "
+              "that also selected the lr (winner's curse); no arm is called significant")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_holm = entry.get('p_one_sided_holm')
@@ -420,6 +443,12 @@ def main():
         p.error('--lrs must not be empty')
     if not args.seeds:
         p.error('--seeds must not be empty')
+    if len(set(args.seeds)) != len(args.seeds):
+        p.error(f'--seeds contains duplicates: {args.seeds}; a repeated seed reruns the identical '
+                f'run, so it inflates n and fakes replication (std would collapse toward 0)')
+    if len(set(args.confirm_seeds)) != len(args.confirm_seeds):
+        p.error(f'--confirm-seeds contains duplicates: {args.confirm_seeds}; confirmation seeds must '
+                f'be independent runs')
     overlap = set(args.seeds) & set(args.confirm_seeds)
     if overlap:
         p.error(f'--confirm-seeds must be disjoint from --seeds (selection would leak into confirmation): {sorted(overlap)}')
@@ -461,7 +490,8 @@ def main():
                       f"val_loss={stats['mean']:.4f} +/- {stats['std']:.4f} (n={stats['n']})")
             else:
                 print(f"[tune] {arm}: confirm produced no usable losses")
-    comparison = compare(tuned, args.baselines, args.margin, args.alpha)
+    comparison = compare(tuned, args.baselines, args.margin, args.alpha,
+                         certify=bool(args.confirm_seeds))
     print_comparison(comparison)
     out = {
         'protocol': {

@@ -132,7 +132,7 @@ def benchmark_norm(model_name: str, norm: str, args, device: str) -> dict:
     train_timing = measure_timed(train_step, args.iters, args.warmup, device)
     train_mem = measure_peak_memory(train_step, device)
     model.zero_grad(set_to_none=True)
-    flops = analytic_flops_per_token(model.cfg)
+    flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
     measured = measured_forward_flops(forward, tokens)
     breakdown = parameter_breakdown(model)
     return {

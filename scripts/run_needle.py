@@ -23,14 +23,25 @@ def main():
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(args.seed)
-    model, _ = load_ckpt(args.ckpt, device=device)
+    model, model_args = load_ckpt(args.ckpt, device=device)
+    trained_seq_len = model_args.get('seq_len')
+    trained_seq_len = int(trained_seq_len) if isinstance(trained_seq_len, int) else None
+    if trained_seq_len is None:
+        print('[needle][warn] checkpoint args carry no seq_len: whether a context length was inside '
+              'the training distribution cannot be checked')
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     overhead = needle_decode_overhead(tok, args.secret)
     results = []
+    skipped = []
     for L in args.ctx_lens:
         if L + overhead > model.cfg.max_seq_len:
+            reason = (f'{L} + {overhead} scoring positions for the secret exceed '
+                      f'max_seq_len={model.cfg.max_seq_len}; RoPE scaling needed')
             print(f'[skip] L={L} (+{overhead} scoring positions for the secret) > max_seq_len={model.cfg.max_seq_len}, RoPE scaling needed - skipping for now.')
+            skipped.append({'ctx_len': L, 'reason': reason,
+                            'model_max_seq_len': int(model.cfg.max_seq_len),
+                            'scoring_overhead': overhead})
             continue
         res = needle_in_haystack(model, tok, needle=args.secret, context_len=L, n_trials=args.trials, device=device, seed=args.seed, return_counts=True)
         print(f"[needle] L={L:5d} acc={res['accuracy']:.3f} "
@@ -55,15 +66,34 @@ def main():
                       f"{_tok(f['predicted_id'])} (p={f['predicted_prob']:.4f}, "
                       f"margin={f['logit_margin_over_expected']:+.2f}, "
                       f"in_context={f['predicted_in_context']})")
-        results.append({'ctx_len': L, 'acc': res['accuracy'],
-                        'n_correct': res['n_correct'], 'n_trials': res['n_trials'],
-                        'ci95_low': res['ci95_low'], 'ci95_high': res['ci95_high'],
-                        'failures': res['failures'],
-                        'failure_causes': res['failure_causes'],
-                        'failure_confidence': res['failure_confidence']})
+        record = {'ctx_len': L, 'acc': res['accuracy'],
+                  'n_correct': res['n_correct'], 'n_trials': res['n_trials'],
+                  'ci95_low': res['ci95_low'], 'ci95_high': res['ci95_high'],
+                  'failures': res['failures'],
+                  'failure_causes': res['failure_causes'],
+                  'failure_confidence': res['failure_confidence'],
+                  'exceeds_trained_seq_len': (trained_seq_len is not None and L > trained_seq_len)}
+        if record['exceeds_trained_seq_len']:
+            print(f"[needle][warn] L={L} exceeds the trained seq_len={trained_seq_len}: this is "
+                  f"positional extrapolation, not measured in-distribution long-context ability")
+        results.append(record)
     out = args.output or Path(args.ckpt).parent / 'needle_results.json'
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    Path(out).write_text(json.dumps(results, indent=2))
+    # Skipped context lengths are part of the result, not a console aside: a
+    # JSON holding only the lengths that ran silently reads as "the model held
+    # up to the maximum requested length" when the longest ones were never
+    # measured.
+    payload = {
+        'ckpt': args.ckpt,
+        'model_max_seq_len': int(model.cfg.max_seq_len),
+        'trained_seq_len': trained_seq_len,
+        'secret': args.secret,
+        'trials': args.trials,
+        'ctx_lens_requested': list(args.ctx_lens),
+        'runs': results,
+        'skipped': skipped,
+    }
+    Path(out).write_text(json.dumps(payload, indent=2))
     manifest = collect_run_metadata(seed=args.seed)
     manifest['hyperparameters'] = vars(args)
     if args.hypothesis:
@@ -72,7 +102,15 @@ def main():
     else:
         print('[hypothesis] none stated: pass --hypothesis "..." so this evaluation is auditable as a test of a claim, not a sweep')
     manifest['results_file'] = str(out)
+    manifest['trained_seq_len'] = trained_seq_len
+    manifest['skipped_ctx_lens'] = [s['ctx_len'] for s in skipped]
+    manifest['evaluated_ctx_lens'] = [r['ctx_len'] for r in results]
     save_run_manifest(Path(out).with_name('needle_manifest.json'), manifest)
-    print(f'[done] saved to {out}')
+    print(f'[done] saved to {out} ({len(results)} context length(s) evaluated, '
+          f'{len(skipped)} skipped: {[s["ctx_len"] for s in skipped]})')
+    if not results:
+        print('[needle][error] no requested context length could be evaluated; nothing was measured',
+              file=sys.stderr)
+        raise SystemExit(2)
 if __name__ == '__main__':
     main()

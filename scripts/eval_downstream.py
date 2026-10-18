@@ -203,10 +203,10 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True)
-    p.add_argument('--tasks', nargs='+', default=['mmlu', 'gsm8k', 'hellaswag'])
+    p.add_argument('--tasks', nargs='+', default=[], help='lm-eval tasks to request (none by default: the in-script harness is a NotImplementedError placeholder, so requesting tasks without the documented HF-export + `lm_eval --model hf` recipe is a hard error, never an empty "successful" result)')
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--needle-test', action='store_true', help='also run needle-in-haystack')
-    p.add_argument('--needle-context-len', type=int, default=None, help="needle context length (default: the checkpoint's max_seq_len minus the positions the secret's decode needs - the longest the model can actually be scored at; asking for more raises)")
+    p.add_argument('--needle-context-len', type=int, default=None, help="needle context length (default: the checkpoint's trained seq_len, or its max_seq_len minus the positions the secret's decode needs when the checkpoint records no seq_len - so a model trained short is not silently evaluated at an extrapolated length; asking for more than max_seq_len raises)")
     p.add_argument('--tokenizer', default='gpt2')
     p.add_argument('--seed', type=int, default=0, help='seed for the needle-position and generation RNGs')
     p.add_argument('--output', default=None)
@@ -220,12 +220,42 @@ def main():
         try:
             res = evaluate_lm_harness(model, args.tasks, args.batch_size)
             results['tasks'].update(res)
+            results['tasks_ran'] = True
         except (NotImplementedError, RuntimeError) as e:
+            # A requested benchmark that did not run must not be written out as
+            # an empty-but-successful result: that is how "evaluated on MMLU"
+            # gets claimed with zero scores behind it.
             print(f'[eval] lm-eval path not available: {e}', file=sys.stderr)
+            results['tasks_ran'] = False
+            results['tasks_error'] = str(e)
+    else:
+        results['tasks_ran'] = None
     if args.needle_test:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(args.tokenizer)
-        ctx_len = args.needle_context_len or max(1, model.cfg.max_seq_len - needle_decode_overhead(tok))
+        trained_seq_len = model_args.get('seq_len')
+        trained_seq_len = int(trained_seq_len) if isinstance(trained_seq_len, int) else None
+        max_scoreable = max(1, model.cfg.max_seq_len - needle_decode_overhead(tok))
+        # The longest length the model can be *scored* at is not the same as
+        # the length it was *trained* at: evaluating at max_seq_len after
+        # training at a shorter context measures out-of-distribution positional
+        # extrapolation, so the trained length is the honest default.
+        if args.needle_context_len is not None:
+            ctx_len = args.needle_context_len
+            ctx_source = 'cli'
+        elif trained_seq_len is not None:
+            ctx_len = max(1, min(trained_seq_len, max_scoreable))
+            ctx_source = 'trained_seq_len'
+        else:
+            ctx_len = max_scoreable
+            ctx_source = 'max_seq_len'
+        results['needle_trained_seq_len'] = trained_seq_len
+        results['needle_ctx_source'] = ctx_source
+        if trained_seq_len is not None and ctx_len > trained_seq_len:
+            results['needle_ctx_exceeds_trained_seq_len'] = True
+            print(f'[eval][warn] needle context length {ctx_len} exceeds the trained seq_len='
+                  f'{trained_seq_len}: the result measures positional extrapolation, not '
+                  f'in-distribution long-context accuracy', file=sys.stderr)
         needle = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed, return_counts=True)
         results['needle_acc'] = needle['accuracy']
         results['needle'] = needle
@@ -248,8 +278,14 @@ def main():
     manifest['hyperparameters'] = vars(args)
     manifest['checkpoint'] = file_fingerprint(args.ckpt)
     manifest['results_file'] = file_fingerprint(out)
-    manifest['summary'] = {k: results[k] for k in ('norm', 'needle_acc', 'needle_ctx_len') if k in results}
+    manifest['summary'] = {k: results[k] for k in
+                           ('norm', 'tasks_ran', 'needle_acc', 'needle_ctx_len',
+                            'needle_ctx_source', 'needle_trained_seq_len') if k in results}
     save_run_manifest(Path(out).with_name('eval_manifest.json'), manifest)
     print(f'[eval] results saved to {out}')
+    if args.tasks and not results.get('tasks_ran', False):
+        print(f'[eval] ERROR: tasks {args.tasks} were requested but lm-eval did not run them; '
+              f'nothing about {args.tasks} was measured (see tasks_error in {out})', file=sys.stderr)
+        raise SystemExit(2)
 if __name__ == '__main__':
     main()

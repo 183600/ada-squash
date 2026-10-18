@@ -84,14 +84,16 @@ DEFAULT_THRESHOLDS = {
 
 
 def run_preflight(norms, seed: int, output_dir, model: str = "gpt", n_experts: int = 8,
-                  repro_check: bool = False) -> None:
+                  repro_check: bool = False, arch_args: list | None = None) -> None:
     """Run this script as a subprocess; raise CalledProcessError when it fails.
 
     Training entrypoints use this behind a `--sanity-check` flag so a broken
     gradient/loss path aborts the run before full-scale training starts.
     The default synthetic `copy` task is used, so no dataset is required.
     `model='moe'` exercises the MoE whole-model path (router + aux loss)
-    instead of the dense GPT.
+    instead of the dense GPT. `arch_args` forwards the caller's architecture
+    flags (depth/width/heads/context/batch), so the preflight exercises the
+    actual configuration instead of the tiny default model.
     """
     import subprocess
 
@@ -101,6 +103,8 @@ def run_preflight(norms, seed: int, output_dir, model: str = "gpt", n_experts: i
            "--norms", *norms, "--seed", str(seed),
            "--model", model, "--n-experts", str(int(n_experts)),
            "--output", str(Path(output_dir) / "sanity_overfit.json")]
+    if arch_args:
+        cmd += [str(a) for a in arch_args]
     if repro_check:
         cmd.append("--repro-check")
     print(f"[sanity] pre-flight overfit check: {' '.join(cmd)}")
@@ -221,6 +225,24 @@ def next_token_accuracy(model, x, y) -> float:
     return next_token_metrics(model, x, y)["accuracy"]
 
 
+def _structurally_zero_grad_names(model) -> set:
+    """Parameter names whose gradient is exactly zero *by construction*.
+
+    DyT-D / DyT-CD depth conditioning uses ``alpha_l = alpha_0 * exp(-k * l/L)``:
+    at depth ratio 0 (the first layer) the k parameter does not enter the
+    computation at all, so its gradient is exactly zero by design. Treating
+    that as a wiring bug would reject a correct model.
+    """
+    out = set()
+    for mod_name, mod in model.named_modules():
+        depth_ratio = getattr(mod, "_depth_ratio", None)
+        if depth_ratio is None or float(depth_ratio) != 0.0:
+            continue
+        if "k" in dict(mod.named_parameters(recurse=False)):
+            out.add(f"{mod_name}.k" if mod_name else "k")
+    return out
+
+
 def gradient_report(model) -> dict:
     missing, nonfinite, zero = [], [], []
     sq = 0.0
@@ -239,12 +261,15 @@ def gradient_report(model) -> dict:
         sq += norm * norm
         if norm == 0.0:
             zero.append(name)
+    structural = _structurally_zero_grad_names(model)
     return {
         "total_norm": math.sqrt(sq),
         "params_with_grad": n_used,
         "missing_grad": missing[:20],
         "nonfinite_grad": nonfinite[:20],
         "zero_grad": zero[:20],
+        "zero_grad_unaccounted": [n for n in zero if n not in structural][:20],
+        "structurally_zero_grad": sorted(n for n in zero if n in structural)[:20],
     }
 
 
@@ -319,6 +344,15 @@ def run_one(norm: str, args, device: str) -> dict:
         not grad_info.get("missing_grad") and not grad_info.get("nonfinite_grad")
         and grad_info.get("total_norm", 0.0) > 0.0
     )
+    if args.model == "gpt":
+        # Every dense-model parameter must participate in the loss: a trainable
+        # tensor whose gradient is exactly zero after the first backward is
+        # silently untrained (an unwired norm parameter, a dead branch), and the
+        # overfit check alone would not notice. Layer-0 k of the depth-conditioned
+        # norms is exempt ("structurally zero": depth ratio 0, so k never enters).
+        # MoE is not gated here at all: an expert that receives no routed tokens
+        # in this batch legitimately has zero gradient.
+        checks["no_zero_grad_parameters"] = not grad_info.get("zero_grad_unaccounted")
     checks["loss_paths_agree"] = bool(loss_path_delta <= loss_path_tol)
     checks["initial_loss_as_expected"] = bool(
         initial_loss is not None and initial_loss >= math.log(vocab) * 0.5
@@ -447,6 +481,9 @@ def main():
                 print(f"[sanity]   missing grads: {result['gradients']['missing_grad']}")
             if result["gradients"].get("nonfinite_grad"):
                 print(f"[sanity]   non-finite grads: {result['gradients']['nonfinite_grad']}")
+            if result["gradients"].get("zero_grad_unaccounted"):
+                print(f"[sanity]   exactly-zero grads (silently untrained parameters): "
+                      f"{result['gradients']['zero_grad_unaccounted']}")
     report = {
         "passed": all(r["passed"] for r in results),
         "run_metadata": collect_run_metadata(seed=args.seed),
