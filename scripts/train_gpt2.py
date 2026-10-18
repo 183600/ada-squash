@@ -17,6 +17,7 @@ from adasquash import GPTConfig, GPT, count_parameters, ActivationStats, LossSpi
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
+from adasquash.metrics import mean_ci
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 from adasquash.norms import NORM_REGISTRY
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
@@ -152,11 +153,16 @@ def open_data_split(split: str, args, seq_len: int | None = None):
     )
     return build_dataloader(args.dataset, args.dataset_config, seq_len or args.seq_len, args.batch_size, tokenizer=args.tokenizer)
 
-def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device) -> float | None:
+def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, collect: list | None = None) -> float | None:
     """Mean loss over held-out batches; `state['iter']` carries the position.
 
     Runs under `inference_mode` and eval mode, so no gradient ever flows from
-    a validation or test batch into the parameters.
+    a validation or test batch into the parameters. When `collect` is given,
+    every batch's loss is also appended to it: the mean alone cannot say how
+    noisy the held-out estimate is, nor whether two arms were scored on the
+    same held-out segments (the pairing a paired test needs). The accumulator
+    is untouched by `collect`, so the returned mean is bit-identical either
+    way.
     """
     model.eval()
     it = state.get('iter')
@@ -184,6 +190,8 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device) ->
             # Accumulate in a device fp64 scalar; fp64 keeps the sequential
             # summation bit-identical to host float accumulation.
             term = loss.detach().double()
+            if collect is not None:
+                collect.append(float(term))
             total = term if total is None else total.add_(term)
             n += 1
     model.train()
@@ -254,7 +262,7 @@ def main():
     p.add_argument('--val-batches', type=int, default=10, help='batches per held-out validation pass')
     p.add_argument('--early-stop-patience', type=int, default=0, help='stop after this many validation passes without improvement (0 = off)')
     p.add_argument('--nonfinite-policy', choices=['abort', 'skip'], default='abort', help='what to do when a training loss is NaN/Inf: abort (default) runs the ordered data->math->precision->gradient triage and stops; skip runs the triage and discards only that step (5 consecutive non-finite steps still abort)')
-    p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first)')
+    p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first); per-batch losses and the data-pairing block are stored in test_results.json so scripts/compare_sealed_tests.py can test two arms on the shared sealed batches')
     p.add_argument('--allow-test-rerun', action='store_true', help='permit a second one-shot evaluation of the sealed test split in the same output dir (breaks the seal: the test set becomes an implicit validation set)')
     p.add_argument('--test-batches', type=int, default=20, help='batches for the one-shot final test evaluation')
     p.add_argument('--min-doc-chars', type=int, default=0, help='drop documents shorter than this many characters (0 = keep all non-empty)')
@@ -388,6 +396,7 @@ def main():
     val_checks_without_improvement = 0
     last_val_loss = None
     last_val_step = None
+    last_val_batches: list = []
     last_train_loss = None
     start_step = 0
     if resume_ckpt is not None:
@@ -585,7 +594,8 @@ def main():
                 if rval:
                     data_reports['validation'] = rval
                     print(f'[data] validation split: {rval}')
-            val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device)
+            val_batch_losses: list = []
+            val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device, collect=val_batch_losses)
             if val_loss is None:
                 # The loader yielded zero batches: the held-out slice is empty.
                 # Silently continuing would train with no selection signal (and
@@ -601,6 +611,7 @@ def main():
             if val_loss is not None:
                 last_val_loss = val_loss
                 last_val_step = step
+                last_val_batches = val_batch_losses
                 improved = val_loss < best_val_loss
                 if improved:
                     best_val_loss = val_loss
@@ -697,6 +708,7 @@ def main():
     run_manifest['data']['split_reports'] = data_reports
     run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
+    final_val_stats = mean_ci(last_val_batches) if last_val_batches else None
     run_manifest['results'] = {
         'final_step': step,
         'last_train_loss': last_train_loss,
@@ -709,6 +721,15 @@ def main():
         'best_val_step': best_val_step if val_loader is not None else None,
         'final_val_loss': last_val_loss if val_loader is not None else None,
         'final_val_step': last_val_step if val_loader is not None else None,
+        # The final pass is a sample mean over batches: its standard error and
+        # interval are the resolution of the number quoted above. A delta
+        # smaller than the stderr is not evidence of a difference.
+        'final_val_loss_n_batches': len(last_val_batches),
+        'final_val_loss_std': final_val_stats['std'] if final_val_stats else None,
+        'final_val_loss_stderr': final_val_stats['stderr'] if final_val_stats else None,
+        'final_val_loss_ci_level': final_val_stats['ci_level'] if final_val_stats else None,
+        'final_val_loss_ci_low': final_val_stats['ci_low'] if final_val_stats else None,
+        'final_val_loss_ci_high': final_val_stats['ci_high'] if final_val_stats else None,
         'n_loss_spikes': loss_spike.n_spikes,
         'n_nonfinite_losses': n_nonfinite_losses,
         'elapsed_s': time.time() - t0,
@@ -759,7 +780,8 @@ def main():
             load_model_state_dict(model, best['model'])
             print(f"[test] restored best-validation checkpoint (step {int(best.get('step', 0))}, val_loss={float(best.get('val_loss', float('nan'))):.4f}) before the one-shot test evaluation")
         test_state = {'iter': iter(test_loader)}
-        test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device)
+        test_batch_losses: list = []
+        test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device, collect=test_batch_losses)
         if test_loss is None:
             # Writing test_results.json now would consume the one-shot seal
             # without any measurement: the next run would refuse to evaluate
@@ -771,13 +793,42 @@ def main():
                 'test_results.json so the one-shot seal is not consumed by a void '
                 'evaluation. Check that --num-documents matches the dataset and that the '
                 'dataset/tokenizer revisions still resolve, then re-run.')
-        results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
+        if len(test_batch_losses) < args.test_batches:
+            print(f'[test] WARNING: only {len(test_batch_losses)} of the requested '
+                  f'{args.test_batches} test batches were available; the mean and interval '
+                  f'rest on {len(test_batch_losses)} batch(es).', file=sys.stderr)
+        test_stats = mean_ci(test_batch_losses)
+        # The per-batch losses are kept, not just their mean: they are the
+        # resolution of the headline number and, because the held-out loader
+        # never shuffles, two runs sharing `pairing` below were scored on the
+        # same sealed segments - which is what makes their difference a paired
+        # sample (`scripts/compare_sealed_tests.py` enforces exactly this).
+        pairing = {
+            'dataset': args.dataset, 'dataset_config': args.dataset_config,
+            'dataset_revision': args.dataset_revision,
+            'tokenizer': args.tokenizer, 'tokenizer_revision': args.tokenizer_revision,
+            'num_documents': args.num_documents,
+            'val_frac': args.val_frac, 'test_frac': args.test_frac,
+            'dedup': args.dedup,
+            'min_doc_chars': args.min_doc_chars, 'max_doc_chars': args.max_doc_chars,
+            'exclude_hash_file': args.exclude_hash_file,
+            'batch_size': args.batch_size, 'seq_len': args.seq_len,
+        }
+        results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
         with open(out_path, 'w') as f:
             json.dump(results, f, indent=2)
         run_manifest['data']['split_reports'] = data_reports
         run_manifest['results']['test_loss'] = test_loss
+        run_manifest['results']['test_loss_n_batches'] = len(test_batch_losses)
+        run_manifest['results']['test_loss_stderr'] = test_stats['stderr']
+        run_manifest['results']['test_loss_ci_level'] = test_stats['ci_level']
+        run_manifest['results']['test_loss_ci_low'] = test_stats['ci_low']
+        run_manifest['results']['test_loss_ci_high'] = test_stats['ci_high']
         save_run_manifest(manifest_path, run_manifest)
-        print(f'[test] sealed test split evaluated once: test_loss={test_loss} -> {out_path}')
+        ci = ('no interval (a single batch has no degrees of freedom)' if test_stats['ci_low'] is None
+              else f"{100 * test_stats['ci_level']:.0f}% CI [{test_stats['ci_low']:.4f}, {test_stats['ci_high']:.4f}]")
+        print(f'[test] sealed test split evaluated once: test_loss={test_loss:.4f} '
+              f'(n={len(test_batch_losses)} batches, stderr={test_stats["stderr"]:.4f}, {ci}) -> {out_path}')
     if tb:
         tb.close()
     if args.wandb_project:

@@ -52,6 +52,7 @@ __all__ = [
     "holm_adjust",
     "imbalance_report",
     "macro_weighted_f1",
+    "mean_ci",
     "mean_std_stderr",
     "paired_t_one_sided",
     "paired_z_one_sided",
@@ -101,6 +102,32 @@ def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     var = sum((v - mean) ** 2 for v in vals) / (n - 1)
     std = math.sqrt(var)
     return {"mean": mean, "std": std, "stderr": std / math.sqrt(n), "n": n}
+
+
+def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
+    """Sample mean with a two-sided Student-t confidence interval.
+
+    A held-out loss (validation or sealed test) is a sample mean over batches,
+    and a sample mean without an interval hides its own resolution. This
+    extends `mean_std_stderr` with ``mean +/- t_{1-alpha/2, n-1} * stderr``,
+    the same small-sample reference distribution the paired/Welch tests use:
+    the normal critical value would understate the interval at the 2-4 seed
+    counts this repo can afford. With n < 2 there are no degrees of freedom
+    and `ci_low`/`ci_high` are `None` (the mean is still returned); the caller
+    should not quote an interval it never measured.
+    """
+    stats = mean_std_stderr(values)
+    if stats is None:
+        return None
+    out = dict(stats)
+    out["ci_level"] = 1.0 - float(alpha)
+    out["ci_low"] = None
+    out["ci_high"] = None
+    if stats["n"] >= 2:
+        half = student_t_ppf(1.0 - alpha / 2.0, float(stats["n"] - 1)) * stats["stderr"]
+        out["ci_low"] = stats["mean"] - half
+        out["ci_high"] = stats["mean"] + half
+    return out
 
 
 def _p_one_sided_from_z(z: float) -> float:
