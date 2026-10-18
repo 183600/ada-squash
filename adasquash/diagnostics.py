@@ -284,7 +284,7 @@ def tensor_finite_report(t: torch.Tensor) -> dict:
     }
     if t.numel() == 0:
         return out
-    if t.is_floating_point() or t.is_complex():
+    if t.is_complex():
         finite = torch.isfinite(t)
         n_bad = int((~finite).sum().item())
         out["finite"] = n_bad == 0
@@ -293,6 +293,23 @@ def tensor_finite_report(t: torch.Tensor) -> dict:
             out["n_inf"] = n_bad - out["n_nan"]
         else:
             out["abs_max"] = float(t.detach().abs().max().item())
+    elif t.is_floating_point():
+        # The finite case is the common one and `aminmax` answers it in a
+        # single fused reduction: NaN propagates into both extrema, and +Inf
+        # / -Inf always land in max / min. The full-size `isfinite` mask
+        # (plus its negation and an `abs` copy) the census used to build is
+        # only needed once a non-finite extremum is actually seen - and this
+        # runs on tensors as large as a whole logits block.
+        td = t.detach()
+        t_min, t_max = (float(v) for v in torch.aminmax(td))
+        if math.isfinite(t_min) and math.isfinite(t_max):
+            out["abs_max"] = max(abs(t_min), abs(t_max))
+        else:
+            n_nan = int(torch.isnan(t).sum().item())
+            n_inf = int(torch.isinf(t).sum().item())
+            out["finite"] = False
+            out["n_nan"] = n_nan
+            out["n_inf"] = n_inf
     return out
 
 
@@ -346,12 +363,16 @@ def first_nonfinite_module(model, run_forward, max_modules: int = 8) -> list[dic
                 n_bad = int((~finite).sum().item())
                 if n_bad:
                     seen.add(id(module))
+                    # One NaN count: it used to be scanned twice (once for
+                    # `n_nan`, once for `n_inf`), i.e. a second full-tensor
+                    # pass and device sync per offending module.
+                    n_nan = int(torch.isnan(t).sum().item())
                     found.append(
                         {
                             "module": names.get(id(module), module.__class__.__name__),
                             "class": module.__class__.__name__,
-                            "n_nan": int(torch.isnan(t).sum().item()),
-                            "n_inf": n_bad - int(torch.isnan(t).sum().item()),
+                            "n_nan": n_nan,
+                            "n_inf": n_bad - n_nan,
                         }
                     )
                     break
