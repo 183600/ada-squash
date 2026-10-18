@@ -279,7 +279,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                     for v0 in range(0, w.shape[0], block):
                         v1 = min(w.shape[0], v0 + block)
                         part = torch.mm(g[:, v0:v1].to(acc).t(), hcf)
-                        if first and v0 == 0:
+                        if first:
                             grad_w[v0:v1].copy_(part)
                         else:
                             grad_w[v0:v1].add_(part)
