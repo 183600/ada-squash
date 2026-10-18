@@ -204,9 +204,7 @@ def _rope_table_entry(freqs_cis: torch.Tensor):
     The key is the ``(data_ptr, shape, device, dtype)`` tuple D6 fixes; the
     entry keeps a strong reference to ``freqs_cis`` so the storage pointer can
     never be recycled into a key collision while the entry is cached. Both the
-    attention modules and the standalone `apply_rope` go through here, so a
-    caller that re-passes the same (e.g. model-owned) frequency buffer pays
-    the ``real``/``imag``/``contiguous`` expansion once instead of per call.
+    attention modules and the standalone `apply_rope` go through here.
     """
     key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
     entry = _ROPE_TABLE_CACHE.get(key)
@@ -338,8 +336,7 @@ def _resolve_rope_tables(freqs_cis: torch.Tensor, cos: Optional[torch.Tensor], s
     """``(cos, sin)`` in ``dtype``, from the caller or the shared cache.
 
     A caller-supplied pair is only cast (never re-expanded); otherwise the
-    shared table cache serves both the expansion and the per-dtype casts, so
-    repeated calls on the same frequency buffer stop rebuilding them.
+    shared table cache serves both the expansion and the per-dtype casts.
     """
     if cos is None or sin is None:
         _, entry = _rope_table_entry(freqs_cis)

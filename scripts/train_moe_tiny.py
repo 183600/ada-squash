@@ -46,9 +46,8 @@ class MoELayer(nn.Module):
             scores, indices = probs.max(dim=-1, keepdim=True)
         else:
             scores, indices = probs.topk(self.top_k, dim=-1)
-        # In-place renormalization: `scores` is a fresh topk/max output, so the
-        # division can write into it instead of allocating a second
-        # (tokens, top_k) tensor per layer per step.
+        # Renormalize the top-k gates to sum to 1; `scores` is a fresh
+        # topk/max output, so the division can write into it.
         scores.div_(scores.sum(dim=-1, keepdim=True).clamp_min(1e-09))
         n_tokens = x_flat.shape[0]
         n_experts = self.n_experts
@@ -268,10 +267,9 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     stats_windowed = False
     for step in range(args.max_steps):
         x, y = next_batch()
-        # `next_batch` always hands back a freshly built pair (probe generators
-        # or a freshly collated loader batch), so the next-token column can be
-        # masked in place: neither the defensive clone nor the device sync the
-        # `.any()` guard cost is needed.
+        # `next_batch` hands back a freshly built pair (probe generators or a
+        # freshly collated loader batch), so the next-token column can be
+        # masked in place.
         y[:, -1] = cfg.ignore_index
         if step % args.stats_every == 0:
             act_stats.attach(reset=not stats_windowed)
@@ -292,15 +290,12 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()
-        # Per-block routed-load CVs stay on the device here; `.tolist()` runs
-        # once when the history is serialized, so no step pays a device
-        # synchronisation for a value only the final JSON reads.
+        # Per-block routed-load CVs stay on the device; the history
+        # serialization materializes them once at the end of the run.
         expert_cv = _expert_cv_per_block(tpe_list)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        # The auxiliary loss is only read by the history/JSON, so like the CVs
-        # it stays on the device until the single end-of-run materialization.
         loss_spike.update(loss_val)
         history.append({'step': step, 'loss': loss_val, 'aux_t': aux.detach(), 'expert_cv_t': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
         if step % args.log_every == 0:
@@ -509,8 +504,7 @@ def _expert_cv(tpe) -> float:
 def _expert_cv_per_block(tpe_list) -> torch.Tensor:
     """Per-block routed-load CVs as a device tensor.
 
-    Kept on the device so the training loop never synchronizes for them; the
-    single host materialization happens when the run history is written.
+    The host materialization happens when the run history is written.
     """
     n = len(tpe_list)
     present = [t.detach().reshape(1, -1) if isinstance(t, torch.Tensor) else None for t in tpe_list]

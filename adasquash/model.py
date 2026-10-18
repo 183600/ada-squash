@@ -111,9 +111,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             valid = chunk_targets.ne(ctx.ignore_index)
             gold = chunk_targets.masked_fill(~valid, 0).unsqueeze(-1)
             keep = valid.unsqueeze(-1).to(probs.dtype)
-            # `keep` is a private float copy of the mask, so the negation the
-            # scatter needs can ride on it in place: the `keep.neg()` temporary
-            # (one per chunk) is what this saves.
+            # Negate the mask copy for the scatter, then restore it below.
             keep.neg_()
             probs.scatter_add_(-1, gold, keep)
             keep.neg_()
@@ -220,8 +218,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             valid = tc.ne(ctx.ignore_index)
             gold = tc.masked_fill(~valid, 0).unsqueeze(-1)
             keep = valid.unsqueeze(-1).to(buf.dtype)
-            # Private float mask copy: fold the scatter's negation into it in
-            # place instead of allocating a negated temporary per chunk.
+            # Negate the mask copy for the scatter, then restore it below.
             keep.neg_()
             buf.scatter_add_(-1, gold, keep)
             keep.neg_()

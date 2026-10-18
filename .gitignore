@@ -20,7 +20,7 @@ wandb/
 mlruns/
 *.log
 
-# Experiment outputs & cycle reports (never commit)
+# Experiment outputs (never commit)
 results/
 *_results.json
 REPORT*.md

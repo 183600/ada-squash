@@ -180,10 +180,8 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device) ->
             y = y.to(device, non_blocking=True)
             with ctx:
                 loss = model(x, y, return_logits=False)[1]
-            # Accumulate in a device fp64 scalar and read it back once: a
-            # per-batch `.item()` stalls the pipeline on every held-out batch.
-            # fp64 keeps the sequential summation bit-identical to the host
-            # float accumulation this replaces.
+            # Accumulate in a device fp64 scalar; fp64 keeps the sequential
+            # summation bit-identical to host float accumulation.
             term = loss.detach().double()
             total = term if total is None else total.add_(term)
             n += 1
@@ -552,11 +550,9 @@ def main():
                 nonfinite_batch = (x, y, micro_loss)
                 break
             if args.grad_accum > 1:
-                # In-place scaling: `loss` is the output of the CE autograd
-                # Function, whose backward does not need its output value, so
-                # this saves a loss-sized allocation plus a graph node per
-                # micro-batch. With accumulation 1 the division is the exact
-                # identity, so the op is skipped altogether.
+                # Scale in place: the CE autograd Function's backward does not
+                # need its output value. With accumulation 1 the division is
+                # the exact identity, so the op is skipped.
                 loss.div_(args.grad_accum)
             loss.backward()
             if loss_acc is None:
