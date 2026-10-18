@@ -19,6 +19,7 @@ from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_me
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 _FLAT_TOKEN_CACHE: dict = {}
+_FLAT_TOKEN_CACHE_MAX_ENTRIES = 8
 
 class MoELayer(nn.Module):
 
@@ -57,6 +58,8 @@ class MoELayer(nn.Module):
         flat_token = _FLAT_TOKEN_CACHE.get(key)
         if flat_token is None:
             flat_token = torch.arange(n_tokens, device=x.device).repeat_interleave(k)
+            if len(_FLAT_TOKEN_CACHE) >= _FLAT_TOKEN_CACHE_MAX_ENTRIES:
+                _FLAT_TOKEN_CACHE.clear()
             _FLAT_TOKEN_CACHE[key] = flat_token
         flat_gate = scores.reshape(-1)
         order = flat_expert.argsort()

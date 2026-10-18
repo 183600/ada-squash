@@ -132,7 +132,8 @@ def benchmark_norm(model_name: str, norm: str, args, device: str) -> dict:
         if args.include_optimizer:
             opt.step()
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    from scripts.train_gpt2 import build_optimizer
+    opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     fwd_timing = measure_timed(forward, args.iters, args.warmup, device)
     fwd_mem = measure_peak_memory(forward, device)
     train_timing = measure_timed(train_step, args.iters, args.warmup, device)

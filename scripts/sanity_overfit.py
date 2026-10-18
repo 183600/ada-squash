@@ -70,7 +70,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import torch
-from torch.optim import AdamW
 
 from adasquash import GPT, GPTConfig, NORM_REGISTRY, markov_batch
 from adasquash.metrics import binary_auc_report, macro_weighted_f1
@@ -315,7 +314,8 @@ def run_one(norm: str, args, device: str) -> dict:
         model.reset_parameters(args.seed)
     model.to(device)
     x, y = make_batch(args.task, args, cfg, device)
-    opt = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
+    from scripts.train_gpt2 import build_optimizer
+    opt = build_optimizer(model, args.lr, 0.0, 0.9, 0.95)
 
     # The logits path necessarily materializes a (rows, vocab) block, so the
     # equality check between the two loss paths runs on a bounded prefix
