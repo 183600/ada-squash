@@ -159,7 +159,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device) ->
     """
     model.eval()
     it = state.get('iter')
-    total = 0.0
+    total = None
     n = 0
     with torch.no_grad():
         for _ in range(max(1, int(n_batches))):
@@ -180,10 +180,15 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device) ->
             y = y.to(device, non_blocking=True)
             with ctx:
                 loss = model(x, y, return_logits=False)[1]
-            total += float(loss.detach().item())
+            # Accumulate in a device fp64 scalar and read it back once: a
+            # per-batch `.item()` stalls the pipeline on every held-out batch.
+            # fp64 keeps the sequential summation bit-identical to the host
+            # float accumulation this replaces.
+            term = loss.detach().double()
+            total = term if total is None else total.add_(term)
             n += 1
     model.train()
-    return total / n if n else None
+    return float(total) / n if n else None
 
 def load_model_state_dict(model, state_dict) -> None:
     target = getattr(model, '_orig_mod', model)

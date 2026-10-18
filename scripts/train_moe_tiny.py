@@ -262,9 +262,11 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     stats_windowed = False
     for step in range(args.max_steps):
         x, y = next_batch()
-        if y[:, -1].ne(cfg.ignore_index).any():
-            y = y.clone()
-            y[:, -1] = cfg.ignore_index
+        # `next_batch` always hands back a freshly built pair (probe generators
+        # or a freshly collated loader batch), so the next-token column can be
+        # masked in place: neither the defensive clone nor the device sync the
+        # `.any()` guard cost is needed.
+        y[:, -1] = cfg.ignore_index
         if step % args.stats_every == 0:
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
@@ -284,16 +286,25 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         loss.backward()
         if step % args.stats_every == 0:
             act_stats.detach()
+        # Per-block routed-load CVs stay on the device here; `.tolist()` runs
+        # once when the history is serialized, so no step pays a device
+        # synchronisation for a value only the final JSON reads.
         expert_cv = _expert_cv_per_block(tpe_list)
-        exp_cv = expert_cv[-1]
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        aux_val = float(aux.detach())
+        # The auxiliary loss is only read by the history/JSON, so like the CVs
+        # it stays on the device until the single end-of-run materialization.
         loss_spike.update(loss_val)
-        history.append({'step': step, 'loss': loss_val, 'aux': aux_val, 'expert_cv': exp_cv, 'expert_cv_per_block': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
+        history.append({'step': step, 'loss': loss_val, 'aux_t': aux.detach(), 'expert_cv_t': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
         if step % args.log_every == 0:
-            print(f'  [moe] step={step:4d} loss={loss_val:.4f} aux={aux_val:.4f} expert_cv={exp_cv:.3f}', flush=True)
+            exp_cv = float(expert_cv[-1])
+            print(f'  [moe] step={step:4d} loss={loss_val:.4f} aux={float(aux.detach()):.4f} expert_cv={exp_cv:.3f}', flush=True)
+    for row in history:
+        row['aux'] = float(row.pop('aux_t'))
+        cv = row.pop('expert_cv_t').tolist()
+        row['expert_cv_per_block'] = cv
+        row['expert_cv'] = cv[-1]
     with open(output_dir / 'history.json', 'w') as f:
         json.dump(history, f)
     # Held-out validation loss: real data comes from the chronological
@@ -469,12 +480,22 @@ def _expert_cv(tpe) -> float:
         return 0.0
     return (tpe.std() / (tpe.mean() + 1e-06)).item()
 
-def _expert_cv_per_block(tpe_list) -> list:
+def _expert_cv_per_block(tpe_list) -> torch.Tensor:
+    """Per-block routed-load CVs as a device tensor.
+
+    Kept on the device so the training loop never synchronizes for them; the
+    single host materialization happens when the run history is written.
+    """
+    n = len(tpe_list)
     present = [t.detach().reshape(1, -1) if isinstance(t, torch.Tensor) else None for t in tpe_list]
     if not any(t is not None for t in present):
-        return [0.0] * len(tpe_list)
+        return torch.zeros(n)
     stacked = torch.cat([t for t in present if t is not None], dim=0)
-    vals = iter((stacked.std(dim=-1) / (stacked.mean(dim=-1) + 1e-06)).tolist())
-    return [next(vals) if t is not None else 0.0 for t in present]
+    vals = stacked.std(dim=-1) / (stacked.mean(dim=-1) + 1e-06)
+    if n == vals.numel():
+        return vals
+    out = torch.zeros(n, dtype=vals.dtype, device=vals.device)
+    idx = torch.tensor([i for i, t in enumerate(present) if t is not None], device=vals.device)
+    return out.index_copy_(0, idx, vals)
 if __name__ == '__main__':
     main()
