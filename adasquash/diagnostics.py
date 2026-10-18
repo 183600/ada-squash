@@ -387,8 +387,6 @@ def gradient_health_report(model) -> dict:
         abs_t.append(g.abs().amax().to(torch.float64) if g.numel()
                     else torch.zeros((), dtype=torch.float64, device=g.device))
         sq_t.append(g.float().pow(2).sum().to(torch.float64))
-    # Per-parameter scalars are accumulated on-device and transferred in one
-    # batch: a sync per parameter turns into three transfers per census.
     finite = torch.stack(finite_t).tolist() if finite_t else []
     abs_vals = torch.stack(abs_t).tolist() if abs_t else []
     sq_vals = torch.stack(sq_t).tolist() if sq_t else []

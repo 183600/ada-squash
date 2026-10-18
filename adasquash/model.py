@@ -58,8 +58,7 @@ def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tens
     """Reusable ``(rows, vocab)`` logit scratch for the chunked losses.
 
     The buffers are private to the forward/backward sweeps (never returned,
-    never saved for backward), so a per-shape buffer can be reused across
-    steps instead of paying a fresh large allocation per micro-batch.
+    never saved for backward) and keyed by shape, dtype and device.
     """
     key = (rows, vocab, dtype, device)
     buf = _CE_SCRATCH_CACHE.get(key)
@@ -474,10 +473,8 @@ class GPT(nn.Module):
         freqs = self.freqs_cis[:T] if self.freqs_cis is not None else None
         all_logit_stats = []
         if self.cfg.gradient_checkpointing and self.training:
-            # Without dropout no RNG is consumed inside a block, so recording
-            # and restoring the ambient RNG state around every block is dead
-            # weight; it only has to run when a dropout draw needs the same
-            # state in the recomputation.
+            # The ambient RNG state only has to be preserved for the
+            # recomputation when a dropout draw consumes it.
             preserve_rng = self.drop.p > 0.0
             for block in self.blocks:
                 x, ls = torch.utils.checkpoint.checkpoint(block, x, freqs, return_stats, use_reentrant=False, preserve_rng_state=preserve_rng)

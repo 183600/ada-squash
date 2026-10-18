@@ -388,8 +388,6 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     val_rng = torch.Generator(device=device).manual_seed(seed + 1)
     model.eval()
     with torch.inference_mode():
-        # Same batches in the same generator order; only the per-batch host
-        # sync is deferred to one transfer for the whole held-out set.
         val_losses = torch.stack([
             model(*markov_batch(val_rng, model.cfg.ignore_index, args.batch_size,
                                 args.seq_len, device, outlier_id=outlier_id),

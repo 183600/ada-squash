@@ -197,8 +197,8 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
     # it does not change the ranking; it keeps the scores comparable across
     # calls.
     present = torch.unique(gold).tolist()
-    # The softmax is row-wise, so selecting the scored rows first yields the
-    # identical scores while never materializing the full [B, T, V] fp32 copy.
+    # The softmax is row-wise, so selecting the scored rows first gives the
+    # identical scores.
     probs = torch.softmax(logits[mask].float(), dim=-1)[:, present]
     auc = binary_auc_report(probs.tolist(), gold.tolist(), present)
     return {
@@ -260,7 +260,6 @@ def gradient_report(model) -> dict:
         names.append(name)
         finite_t.append(torch.isfinite(g).all())
         norm_t.append(g.float().norm().to(torch.float64))
-    # One host transfer for the whole census instead of a sync per parameter.
     finite = torch.stack(finite_t).tolist() if finite_t else []
     norms = torch.stack(norm_t).tolist() if norm_t else []
     sq = 0.0

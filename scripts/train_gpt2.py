@@ -589,8 +589,8 @@ def main():
             if val_loss is None:
                 # The loader yielded zero batches: the held-out slice is empty.
                 # Silently continuing would train with no selection signal (and
-                # save no best checkpoint), so fail before spending more compute
-                # on a run whose model-selection protocol is already void.
+                # save no best checkpoint), so fail before continuing a run
+                # whose model-selection protocol is already void.
                 raise SystemExit(
                     f'[val] the validation split produced no batches, so checkpoint selection is '
                     f'impossible; refusing to continue without a held-out signal. Likely causes: '

@@ -543,12 +543,10 @@ def imbalance_report(counts: Sequence[int]) -> dict:
 def _tie_groups_ascending(scores: list, labels: list):
     """``(order, groups)`` of one ascending sort, ties collected into groups.
 
-    Both ranking metrics only read tie *groups*, so one sort serves them:
     `order` is the ascending permutation and `groups` the ``(start, end)``
     index pairs (inclusive) into ``order`` for each equal-score run. The
     group contents are order-insensitive downstream (average rank for ROC-AUC,
-    threshold groups for AP), so neither metric changes with the sort
-    direction.
+    threshold groups for AP), so neither metric depends on the tie order.
     """
     n = len(scores)
     order = sorted(range(n), key=scores.__getitem__)
@@ -684,9 +682,6 @@ def binary_auc_report(
                 "reason": "no positives" if n_pos == 0 else "no negatives",
             })
             continue
-        # One ordering per class serves both metrics (their tie groups are the
-        # same set); going through the public helpers would sort twice and
-        # re-convert the already-float column and 0/1 labels.
         order, groups = _tie_groups_ascending(col, labels)
         records.append({
             "class": cls,
