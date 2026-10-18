@@ -80,8 +80,14 @@ def clear_ce_scratch_cache() -> None:
 # kernels are invoked per micro-batch inside one autocast context, so without
 # a cache the same fp32 weight is recast (and held by save_for_backward) once
 # per micro. `_version` bumps on every in-place update, so an optimizer step
-# can never leave a stale cast behind.
-_CAST_WEIGHT_CACHE: dict[tuple, torch.Tensor] = {}
+# can never leave a stale cast behind. Each entry keeps a strong reference to
+# its source weight (the guard the RoPE table cache uses): the storage address
+# in the key can then never be recycled by a *different* model's parameter,
+# and the identity check rejects a same-address / same-version collision
+# outright. Otherwise a freed model's address could be reused by the next
+# model and silently serve that model's forward/backward with the previous
+# model's weights.
+_CAST_WEIGHT_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _CAST_WEIGHT_CACHE_BYTES = 0
 _CAST_WEIGHT_CACHE_MAX_BYTES = 1 << 28
 
@@ -91,24 +97,35 @@ def clear_cast_weight_cache() -> None:
     _CAST_WEIGHT_CACHE.clear()
     _CAST_WEIGHT_CACHE_BYTES = 0
 
+def _cast_entry_bytes(entry: tuple) -> int:
+    cast = entry[1]
+    return cast.numel() * cast.element_size()
+
 def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     global _CAST_WEIGHT_CACHE_BYTES
     if w.dtype == dt:
         return w
     key = (w.data_ptr(), w._version, dt, str(w.device))
-    got = _CAST_WEIGHT_CACHE.get(key)
-    if got is not None and got.shape == w.shape:
-        return got
+    entry = _CAST_WEIGHT_CACHE.get(key)
+    if entry is not None and entry[0] is w and entry[1].shape == w.shape:
+        if not (entry[1].is_inference() and (not torch.is_inference_mode_enabled())):
+            return entry[1]
+        # An inference-mode cast cannot be saved for backward; a grad-mode
+        # forward has to rebuild it (the key and the values are unchanged).
     nbytes = w.numel() * (torch.finfo(dt).bits // 8)
     if nbytes > _CAST_WEIGHT_CACHE_MAX_BYTES:
         # A single cast larger than the whole budget (e.g. the 1B CE weight):
         # caching it would just crowd out everything else.
         return w.to(dt)
+    if entry is not None:
+        # Stale same-key entry (collided identity or an inference cast):
+        # the replacement gives back the bytes it shadows.
+        _CAST_WEIGHT_CACHE_BYTES -= _cast_entry_bytes(entry)
     if _CAST_WEIGHT_CACHE_BYTES + nbytes > _CAST_WEIGHT_CACHE_MAX_BYTES:
         _CAST_WEIGHT_CACHE.clear()
         _CAST_WEIGHT_CACHE_BYTES = 0
     got = w.to(dt)
-    _CAST_WEIGHT_CACHE[key] = got
+    _CAST_WEIGHT_CACHE[key] = (w, got)
     _CAST_WEIGHT_CACHE_BYTES += nbytes
     return got
 

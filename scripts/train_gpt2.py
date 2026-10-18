@@ -201,7 +201,10 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     # recompiles the whole graph (and under reduce-overhead keeps a second
     # CUDA-graph pool resident). With dropout at its default 0 the switch
     # changes no numerics, so skip it; inference_mode already blocks grads.
-    toggle_mode = float(getattr(getattr(model, 'cfg', None), 'dropout', 0.0)) > 0.0
+    # `training` does more than dropout, though: gradient checkpointing keys
+    # its recompute branch on it, so the switch must stay when that is on.
+    cfg = getattr(model, 'cfg', None)
+    toggle_mode = float(getattr(cfg, 'dropout', 0.0)) > 0.0 or bool(getattr(cfg, 'gradient_checkpointing', False))
     if toggle_mode:
         model.eval()
     it = state.get('iter')
@@ -681,426 +684,428 @@ def main():
     # NaN-triage record. Line buffering keeps each written row visible to
     # tail -f / crash inspection without a full flush per event.
     log_file = open(log_path, 'a', buffering=1)
-    manifest_path = Path(args.output_dir) / 'run_manifest.json'
-    run_manifest = collect_run_metadata(seed=args.seed)
-    run_manifest['hyperparameters'] = vars(args)
-    if args.hypothesis:
-        run_manifest['hypothesis'] = args.hypothesis
-        print(f'[hypothesis] {args.hypothesis}')
-    run_manifest['data'] = {
-        'dataset': args.dataset,
-        'dataset_config': args.dataset_config,
-        'dataset_revision': args.dataset_revision,
-        'tokenizer': args.tokenizer,
-        'tokenizer_revision': args.tokenizer_revision,
-        'split_reports': data_reports,
-        'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if args.exclude_hash_file else None,
-        'config_file': file_fingerprint(args.config) if args.config else None,
-    }
-    if sanity_report_path is not None:
-        run_manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
-    else:
-        run_manifest['overfit_sanity_check'] = {'enabled': False}
-    if resume_ckpt is not None:
-        run_manifest['resumed_from'] = str(args.resume)
-    save_run_manifest(manifest_path, run_manifest)
-    provenance = {
-        'git_commit': run_manifest['git']['commit'],
-        'git_dirty': run_manifest['git']['dirty'],
-        'seed': args.seed,
-        'manifest': manifest_path.name,
-    }
-    print(f'[track] run manifest -> {manifest_path}')
-    tb = None
     try:
-        from torch.utils.tensorboard import SummaryWriter
-        tb = SummaryWriter(log_dir=str(Path(args.output_dir) / 'tb'))
-    except Exception:
-        pass
-    if args.wandb_project:
-        import wandb
-        wandb.init(project=args.wandb_project, name=args.run_name or args.norm, config=vars(args))
-    step = start_step
-    t0 = time.time()
-    stats_windowed = False
-    # Curve-monitoring state: `train_window` is the mean training loss over the
-    # step interval since the last validation pass; together with the held-out
-    # points it forms the (train, val) curves the diagnosis reads. The final
-    # number alone is not a verdict.
-    train_window: list = []
-    curve_train: list = []
-    curve_val: list = []
-    curve_steps: list = []
-    diagnosis_history: list = []
-    last_diagnosis = None
-    n_nonfinite_losses = 0
-    nonfinite_streak = 0
-
-    def _handle_nonfinite(step: int, x_bad, y_bad, bad_value: float) -> None:
-        """Ordered NaN triage: data -> fp32 math -> precision -> gradients."""
-        nonlocal n_nonfinite_losses, nonfinite_streak
-        n_nonfinite_losses += 1
-        nonfinite_streak += 1
-        lr_now = opt.param_groups[0]['lr']
-        triage = triage_nonfinite(
-            model, x_bad, y_bad,
-            autocast_dtype=dtype if (args.bf16 and device == 'cuda') else None,
-            device_type=device,
-            lr=lr_now, grad_clip=args.grad_clip,
-        )
-        print(f'[nan] step={step + 1} loss={bad_value} -> triage stage={triage["stage"]}: {triage["diagnosis"]}', flush=True)
-        for line in triage['recommendations']:
-            print(f'[nan]   fix: {line}')
-        opt.zero_grad(set_to_none=True)
-        log_file.write(json.dumps({
-            'step': step + 1, 'event': 'nonfinite_loss', 'loss': bad_value,
-            'lr': lr_now, 'triage_stage': triage['stage'],
-            'triage_diagnosis': triage['diagnosis'],
-            'triage_evidence': triage['evidence'],
-            'n_nonfinite_losses': n_nonfinite_losses,
-        }, default=str) + '\n')
-        log_file.flush()
-        if args.nonfinite_policy == 'abort' or nonfinite_streak >= 5:
-            raise SystemExit(
-                f'[nan] aborting at step {step + 1}: loss is non-finite and the triage '
-                f'localized the first failure to stage "{triage["stage"]}". '
-                f'Fix it (or raise --grad-clip / lower --lr) before resuming from the '
-                f'last checkpoint; see the [nan] recommendations above.'
-            )
-        print(f'[nan] policy=skip: discarding step {step + 1} without an optimizer step', flush=True)
-
-    while step < args.max_steps:
-        opt.zero_grad(set_to_none=True)
-        attach_stats = (step + 1) % args.stats_every == 0
-        if attach_stats:
-            act_stats.attach(reset=not stats_windowed)
-            stats_windowed = True
-        micro_losses: list = []
-        micro_xy: list = []
-        nonfinite_batch = None
-        for _ in range(args.grad_accum):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(loader)
-                batch = next(data_iter)
-            x, y = batch
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            with ctx:
-                loss = model(x, y, return_logits=False)[1]
-            # Keep the device scalar (no clone): the scaling below is
-            # out-of-place, so the recorded per-micro value is never mutated.
-            micro_losses.append(loss.detach())
-            micro_xy.append((x, y))
-            if args.grad_accum > 1:
-                # Out-of-place: `loss` is still needed for the recorded
-                # per-micro value above. With accumulation 1 the op is
-                # skipped, so the reported loss is the raw CE value.
-                loss = loss / args.grad_accum
-            loss.backward()
-        # Device-side group reduction: the common path materializes one host
-        # scalar instead of the whole per-micro list. `mean` propagates
-        # NaN/Inf, so a finite group mean certifies every micro. A non-finite
-        # mean is the rare path and pays the `.tolist()` to locate the bad
-        # micro for triage. A non-finite loss cannot be detected before its
-        # own backward without inspecting each micro separately, so a bad
-        # micro is backpropped and the step is discarded wholesale by
-        # _handle_nonfinite (which zeroes the gradients); the optimizer
-        # trajectory is unchanged.
-        loss_vec = torch.stack(micro_losses)
-        loss_val = float(loss_vec.mean()) if args.grad_accum > 1 else float(loss_vec[0])
-        if not math.isfinite(loss_val):
-            micro_vals = loss_vec.tolist()
-            bad_idx = next((i for i, v in enumerate(micro_vals) if not math.isfinite(v)), None)
-            if bad_idx is None:
-                # The group mean is non-finite although every micro is finite
-                # (an overflowed sum): treat the first micro as the bad case.
-                bad_idx = 0
-                micro_vals[0] = loss_val
-            nonfinite_batch = (micro_xy[bad_idx][0], micro_xy[bad_idx][1], micro_vals[bad_idx])
-        if attach_stats:
-            act_stats.detach()
-            clear_logit_scratch_cache()
-        if nonfinite_batch is not None:
-            _handle_nonfinite(step, *nonfinite_batch)
-            continue
-        nonfinite_streak = 0
-        last_train_loss = loss_val
-        # Clipped every step; materialized below only when logging.
-        grad_norm_t = None
-        if args.grad_clip > 0:
-            grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        opt.step()
-        sched.step()
-        loss_spike.update(loss_val)
-        if args.val_every > 0:
-            # The window is only consumed by the validation block below; with
-            # --val-every 0 nothing ever resets it, so appending would grow it
-            # for the entire run.
-            train_window.append(loss_val)
-        step += 1
-        if args.val_every > 0 and step % args.val_every == 0:
-            if val_loader is None:
-                val_loader = open_data_split('validation', args)
-                rval = getattr(val_loader, 'split_report', None)
-                if rval:
-                    data_reports['validation'] = rval
-                    print(f'[data] validation split: {rval}')
-            val_batch_losses: list = []
-            val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device, collect=val_batch_losses)
-            if val_loss is None:
-                # The loader yielded zero batches: the held-out slice is empty.
-                # Silently continuing would train with no selection signal (and
-                # save no best checkpoint), so fail before continuing a run
-                # whose model-selection protocol is already void.
-                raise SystemExit(
-                    f'[val] the validation split produced no batches, so checkpoint selection is '
-                    f'impossible; refusing to continue without a held-out signal. Likely causes: '
-                    f'--num-documents={args.num_documents} is larger than the actual stream (the '
-                    f'chronological boundary points past its end), the dataset/tokenizer revision '
-                    f'changed, or the split fractions leave validation empty. Verify the split '
-                    f'layout with scripts/audit_data.py before re-running.')
-            if val_loss is not None:
-                last_val_loss = val_loss
-                last_val_step = step
-                last_val_batches = val_batch_losses
-                improved = val_loss < best_val_loss
-                if improved:
-                    best_val_loss = val_loss
-                    best_val_step = step
-                    val_checks_without_improvement = 0
-                else:
-                    val_checks_without_improvement += 1
-                print(f'[val] step={step} val_loss={val_loss:.4f} best={best_val_loss:.4f}@{best_val_step} (no improvement x{val_checks_without_improvement})', flush=True)
-                if tb:
-                    tb.add_scalar('val/loss', val_loss, step)
-                if improved:
-                    ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'provenance': provenance}
-                    path = Path(args.output_dir) / 'ckpt_best.pt'
-                    _atomic_torch_save(ckpt_best, path)
-                    print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
-                # Curve diagnosis: pair the held-out point with the mean
-                # training loss over the interval it covers, then classify the
-                # regime (overfit / underfit / diverging / healthy) and print
-                # the concrete remedy.
-                train_point = (sum(train_window) / len(train_window)) if train_window else loss_val
-                train_window = []
-                curve_train.append(train_point)
-                curve_val.append(val_loss)
-                curve_steps.append(step)
-                last_diagnosis = diagnose_train_val_curve(
-                    curve_train, curve_val, train_steps=curve_steps, val_steps=curve_steps,
-                    log_vocab_size=math.log(model.cfg.vocab_size),
-                )
-                diagnosis_history.append({
-                    'step': step,
-                    'classification': last_diagnosis['classification'],
-                    'train_trend': last_diagnosis['train_trend'],
-                    'val_trend': last_diagnosis['val_trend'],
-                    'train_relative_change': last_diagnosis['train_relative_change'],
-                    'val_relative_change': last_diagnosis['val_relative_change'],
-                    'generalization_gap': last_diagnosis['generalization_gap'],
-                    'recommendations': last_diagnosis['recommendations'],
-                })
-                print(f"[curve] step={step} train_window={train_point:.4f} val={val_loss:.4f} "
-                      f"-> {last_diagnosis['classification']} "
-                      f"(train {last_diagnosis['train_trend']}, val {last_diagnosis['val_trend']})", flush=True)
-                if last_diagnosis['classification'] not in ('healthy', 'insufficient_data'):
-                    for line in last_diagnosis['recommendations']:
-                        print(f'[curve]   action: {line}')
-                if tb:
-                    tb.add_scalar('curve/train_window_loss', train_point, step)
-                    tb.add_scalar('curve/generalization_gap', last_diagnosis['generalization_gap'] or 0.0, step)
-        if step % args.log_every == 0:
-            lr = opt.param_groups[0]['lr']
-            grad_norm = float(grad_norm_t) if grad_norm_t is not None else None
-            line = f'step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}'
-            if grad_norm is not None:
-                line += f' grad_norm={grad_norm:.3f}'
-            print(line, flush=True)
-            row = {'step': step, 'loss': loss_val, 'lr': lr, 'n_loss_spikes': loss_spike.n_spikes}
-            if grad_norm is not None:
-                row['grad_norm'] = grad_norm
-            if last_val_loss is not None:
-                row['val_loss'] = last_val_loss
-            if last_diagnosis is not None:
-                row['curve_classification'] = last_diagnosis['classification']
-                row['curve_train_trend'] = last_diagnosis['train_trend']
-                row['curve_val_trend'] = last_diagnosis['val_trend']
-            log_file.write(json.dumps(row) + '\n')
-            if tb:
-                tb.add_scalar('train/loss', loss_val, step)
-                tb.add_scalar('train/lr', lr, step)
-                tb.add_scalar('train/n_loss_spikes', loss_spike.n_spikes, step)
-                if grad_norm is not None:
-                    tb.add_scalar('train/grad_norm_pre_clip', grad_norm, step)
-            if args.wandb_project:
-                import wandb
-                wandb.log(row, step=step)
-        if step % args.stats_every == 0 and step > 0:
-            stats = act_stats.summary()
-            print(f"[stats] {stats.get('__summary__', {})}")
-            if tb:
-                s = stats.get('__summary__', {})
-                for k, v in s.items():
-                    tb.add_scalar(f'stats/{k}', v, step)
-        if step % args.save_every == 0 and step > 0:
-            ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
-            path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
-            _atomic_torch_save(ckpt, path)
-            print(f'[ckpt] saved {path}')
-        if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
-            print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
-            break
-    ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
-    path = Path(args.output_dir) / 'ckpt_final.pt'
-    _atomic_torch_save(ckpt, path)
-    print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
-    run_manifest['data']['split_reports'] = data_reports
-    run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
-    final_val_stats = mean_ci(last_val_batches) if last_val_batches else None
-    run_manifest['results'] = {
-        'final_step': step,
-        'last_train_loss': last_train_loss,
-        # `best_val_loss` is the minimum over the validation passes: it is the
-        # checkpoint-selection statistic, so as a reported generalization
-        # estimate it is optimistically biased (the minimum of noisy draws).
-        # `final_val_loss` is the last held-out pass at the fixed training-step
-        # budget and is the number that makes two arms comparable.
-        'best_val_loss': best_val_loss if val_loader is not None else None,
-        'best_val_step': best_val_step if val_loader is not None else None,
-        'final_val_loss': last_val_loss if val_loader is not None else None,
-        'final_val_step': last_val_step if val_loader is not None else None,
-        # The final pass is a sample mean over batches: its standard error and
-        # interval are the resolution of the number quoted above. A delta
-        # smaller than the stderr is not evidence of a difference.
-        'final_val_loss_n_batches': len(last_val_batches),
-        'final_val_loss_std': final_val_stats['std'] if final_val_stats else None,
-        'final_val_loss_stderr': final_val_stats['stderr'] if final_val_stats else None,
-        'final_val_loss_ci_level': final_val_stats['ci_level'] if final_val_stats else None,
-        'final_val_loss_ci_low': final_val_stats['ci_low'] if final_val_stats else None,
-        'final_val_loss_ci_high': final_val_stats['ci_high'] if final_val_stats else None,
-        'n_loss_spikes': loss_spike.n_spikes,
-        'n_nonfinite_losses': n_nonfinite_losses,
-        'elapsed_s': time.time() - t0,
-        # Curve monitoring: the full (train window, val) pairs and the latest
-        # classification, so a reviewer can read the regime, not just the end.
-        'curve_train_window_loss': curve_train,
-        'curve_val_loss': curve_val,
-        'curve_steps': curve_steps,
-        'curve_diagnosis': last_diagnosis,
-        'curve_diagnosis_history': diagnosis_history,
-        # Efficiency accounting travels with the accuracy numbers: parameters
-        # by role and the analytic matmul FLOPs per token.
-        'n_params': n_params,
-        'n_trainable': n_trainable,
-        # Shape accounting: the depth sweep scales dim/heads with depth to hold
-        # parameters ~constant, so "depth" is really a depth+width trade-off
-        # there. Recording the shape next to the loss keeps that covariance
-        # visible in every aggregate instead of inferable only from launcher
-        # env vars.
-        'n_layers': int(model.cfg.n_layers),
-        'dim': int(model.cfg.dim),
-        'n_heads': int(model.cfg.n_heads),
-        'parameter_breakdown': parameter_breakdown(model),
-        'flops_per_token_forward': flops['forward_per_token'],
-        'flops_per_token_training_est': flops['training_per_token'],
-    }
-    if n_nonfinite_losses:
-        print(f'[warn] {n_nonfinite_losses} non-finite loss step(s) were handled by '
-              f'--nonfinite-policy {args.nonfinite_policy}; see train.jsonl event rows')
-    save_run_manifest(manifest_path, run_manifest)
-    if args.final_test_eval:
-        # The test split is opened exactly once, after training is over, and
-        # only the checkpoint selected on the validation split is scored.
-        # Re-running the evaluation in the same output dir would let the test
-        # score steer the next attempt, i.e. turn the sealed set into an
-        # implicit validation set, so it is refused unless explicitly allowed.
-        out_path = Path(args.output_dir) / 'test_results.json'
-        if out_path.exists() and (not args.allow_test_rerun):
-            raise SystemExit(
-                f'[test] {out_path} already exists: the sealed test split has already been '
-                'evaluated once for this run, and scoring it again would turn it into an '
-                'implicit validation set. Pass --allow-test-rerun only if you accept that '
-                'the seal is broken.')
-        if args.val_every <= 0:
-            print('[test] WARNING: --val-every 0 disables validation-based selection; '
-                  'the sealed test split reports the final model only and must never be '
-                  'used to pick hyperparameters.', file=sys.stderr)
-        test_loader = open_data_split('test', args)
-        rtest = getattr(test_loader, 'split_report', None)
-        if rtest:
-            data_reports['test'] = rtest
-            print(f'[data] test split: {rtest}')
-        best_path = Path(args.output_dir) / 'ckpt_best.pt'
-        if val_loader is not None and best_path.exists():
-            best = _load_checkpoint_cpu(best_path)
-            load_model_state_dict(model, best['model'])
-            best_step = int(best.get('step', 0))
-            best_val = float(best.get('val_loss', float('nan')))
-            # The weights are copied; the optimizer state in the file must not
-            # occupy VRAM during the test pass (that is exactly where the
-            # memory budget is tightest).
-            del best
-            print(f"[test] restored best-validation checkpoint (step {best_step}, val_loss={best_val:.4f}) before the one-shot test evaluation")
-        test_state = {'iter': iter(test_loader)}
-        test_batch_losses: list = []
-        test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device, collect=test_batch_losses)
-        if test_loss is None:
-            # Writing test_results.json now would consume the one-shot seal
-            # without any measurement: the next run would refuse to evaluate
-            # the test split again (without --allow-test-rerun) even though no
-            # number was ever produced. Refuse instead, and leave the seal
-            # intact so the fixed data configuration can be re-evaluated once.
-            raise SystemExit(
-                '[test] the sealed test split produced no batches; refusing to write '
-                'test_results.json so the one-shot seal is not consumed by a void '
-                'evaluation. Check that --num-documents matches the dataset and that the '
-                'dataset/tokenizer revisions still resolve, then re-run.')
-        if len(test_batch_losses) < args.test_batches:
-            print(f'[test] WARNING: only {len(test_batch_losses)} of the requested '
-                  f'{args.test_batches} test batches were available; the mean and interval '
-                  f'rest on {len(test_batch_losses)} batch(es).', file=sys.stderr)
-        test_stats = mean_ci(test_batch_losses)
-        # The per-batch losses are kept, not just their mean: they are the
-        # resolution of the headline number and, because the held-out loader
-        # never shuffles, two runs sharing `pairing` below were scored on the
-        # same sealed segments - which is what makes their difference a paired
-        # sample (`scripts/compare_sealed_tests.py` enforces exactly this).
-        pairing = {
-            'dataset': args.dataset, 'dataset_config': args.dataset_config,
+        manifest_path = Path(args.output_dir) / 'run_manifest.json'
+        run_manifest = collect_run_metadata(seed=args.seed)
+        run_manifest['hyperparameters'] = vars(args)
+        if args.hypothesis:
+            run_manifest['hypothesis'] = args.hypothesis
+            print(f'[hypothesis] {args.hypothesis}')
+        run_manifest['data'] = {
+            'dataset': args.dataset,
+            'dataset_config': args.dataset_config,
             'dataset_revision': args.dataset_revision,
-            'tokenizer': args.tokenizer, 'tokenizer_revision': args.tokenizer_revision,
-            'num_documents': args.num_documents,
-            'val_frac': args.val_frac, 'test_frac': args.test_frac,
-            'dedup': args.dedup,
-            'min_doc_chars': args.min_doc_chars, 'max_doc_chars': args.max_doc_chars,
-            'exclude_hash_file': args.exclude_hash_file,
-            'batch_size': args.batch_size, 'seq_len': args.seq_len,
+            'tokenizer': args.tokenizer,
+            'tokenizer_revision': args.tokenizer_revision,
+            'split_reports': data_reports,
+            'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if args.exclude_hash_file else None,
+            'config_file': file_fingerprint(args.config) if args.config else None,
         }
-        results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
-        with open(out_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        run_manifest['data']['split_reports'] = data_reports
-        run_manifest['results']['test_loss'] = test_loss
-        run_manifest['results']['test_loss_n_batches'] = len(test_batch_losses)
-        run_manifest['results']['test_loss_stderr'] = test_stats['stderr']
-        run_manifest['results']['test_loss_ci_level'] = test_stats['ci_level']
-        run_manifest['results']['test_loss_ci_low'] = test_stats['ci_low']
-        run_manifest['results']['test_loss_ci_high'] = test_stats['ci_high']
+        if sanity_report_path is not None:
+            run_manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
+        else:
+            run_manifest['overfit_sanity_check'] = {'enabled': False}
+        if resume_ckpt is not None:
+            run_manifest['resumed_from'] = str(args.resume)
         save_run_manifest(manifest_path, run_manifest)
-        ci = ('no interval (a single batch has no degrees of freedom)' if test_stats['ci_low'] is None
-              else f"{100 * test_stats['ci_level']:.0f}% CI [{test_stats['ci_low']:.4f}, {test_stats['ci_high']:.4f}]")
-        print(f'[test] sealed test split evaluated once: test_loss={test_loss:.4f} '
-              f'(n={len(test_batch_losses)} batches, stderr={test_stats["stderr"]:.4f}, {ci}) -> {out_path}')
-    if tb:
-        tb.close()
-    if args.wandb_project:
-        import wandb
-        wandb.finish()
-    log_file.close()
+        provenance = {
+            'git_commit': run_manifest['git']['commit'],
+            'git_dirty': run_manifest['git']['dirty'],
+            'seed': args.seed,
+            'manifest': manifest_path.name,
+        }
+        print(f'[track] run manifest -> {manifest_path}')
+        tb = None
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb = SummaryWriter(log_dir=str(Path(args.output_dir) / 'tb'))
+        except Exception:
+            pass
+        if args.wandb_project:
+            import wandb
+            wandb.init(project=args.wandb_project, name=args.run_name or args.norm, config=vars(args))
+        step = start_step
+        t0 = time.time()
+        stats_windowed = False
+        # Curve-monitoring state: `train_window` is the mean training loss over the
+        # step interval since the last validation pass; together with the held-out
+        # points it forms the (train, val) curves the diagnosis reads. The final
+        # number alone is not a verdict.
+        train_window: list = []
+        curve_train: list = []
+        curve_val: list = []
+        curve_steps: list = []
+        diagnosis_history: list = []
+        last_diagnosis = None
+        n_nonfinite_losses = 0
+        nonfinite_streak = 0
+
+        def _handle_nonfinite(step: int, x_bad, y_bad, bad_value: float) -> None:
+            """Ordered NaN triage: data -> fp32 math -> precision -> gradients."""
+            nonlocal n_nonfinite_losses, nonfinite_streak
+            n_nonfinite_losses += 1
+            nonfinite_streak += 1
+            lr_now = opt.param_groups[0]['lr']
+            triage = triage_nonfinite(
+                model, x_bad, y_bad,
+                autocast_dtype=dtype if (args.bf16 and device == 'cuda') else None,
+                device_type=device,
+                lr=lr_now, grad_clip=args.grad_clip,
+            )
+            print(f'[nan] step={step + 1} loss={bad_value} -> triage stage={triage["stage"]}: {triage["diagnosis"]}', flush=True)
+            for line in triage['recommendations']:
+                print(f'[nan]   fix: {line}')
+            opt.zero_grad(set_to_none=True)
+            log_file.write(json.dumps({
+                'step': step + 1, 'event': 'nonfinite_loss', 'loss': bad_value,
+                'lr': lr_now, 'triage_stage': triage['stage'],
+                'triage_diagnosis': triage['diagnosis'],
+                'triage_evidence': triage['evidence'],
+                'n_nonfinite_losses': n_nonfinite_losses,
+            }, default=str) + '\n')
+            log_file.flush()
+            if args.nonfinite_policy == 'abort' or nonfinite_streak >= 5:
+                raise SystemExit(
+                    f'[nan] aborting at step {step + 1}: loss is non-finite and the triage '
+                    f'localized the first failure to stage "{triage["stage"]}". '
+                    f'Fix it (or raise --grad-clip / lower --lr) before resuming from the '
+                    f'last checkpoint; see the [nan] recommendations above.'
+                )
+            print(f'[nan] policy=skip: discarding step {step + 1} without an optimizer step', flush=True)
+
+        while step < args.max_steps:
+            opt.zero_grad(set_to_none=True)
+            attach_stats = (step + 1) % args.stats_every == 0
+            if attach_stats:
+                act_stats.attach(reset=not stats_windowed)
+                stats_windowed = True
+            micro_losses: list = []
+            micro_xy: list = []
+            nonfinite_batch = None
+            for _ in range(args.grad_accum):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(loader)
+                    batch = next(data_iter)
+                x, y = batch
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                with ctx:
+                    loss = model(x, y, return_logits=False)[1]
+                # Keep the device scalar (no clone): the scaling below is
+                # out-of-place, so the recorded per-micro value is never mutated.
+                micro_losses.append(loss.detach())
+                micro_xy.append((x, y))
+                if args.grad_accum > 1:
+                    # Out-of-place: `loss` is still needed for the recorded
+                    # per-micro value above. With accumulation 1 the op is
+                    # skipped, so the reported loss is the raw CE value.
+                    loss = loss / args.grad_accum
+                loss.backward()
+            # Device-side group reduction: the common path materializes one host
+            # scalar instead of the whole per-micro list. `mean` propagates
+            # NaN/Inf, so a finite group mean certifies every micro. A non-finite
+            # mean is the rare path and pays the `.tolist()` to locate the bad
+            # micro for triage. A non-finite loss cannot be detected before its
+            # own backward without inspecting each micro separately, so a bad
+            # micro is backpropped and the step is discarded wholesale by
+            # _handle_nonfinite (which zeroes the gradients); the optimizer
+            # trajectory is unchanged.
+            loss_vec = torch.stack(micro_losses)
+            loss_val = float(loss_vec.mean()) if args.grad_accum > 1 else float(loss_vec[0])
+            if not math.isfinite(loss_val):
+                micro_vals = loss_vec.tolist()
+                bad_idx = next((i for i, v in enumerate(micro_vals) if not math.isfinite(v)), None)
+                if bad_idx is None:
+                    # The group mean is non-finite although every micro is finite
+                    # (an overflowed sum): treat the first micro as the bad case.
+                    bad_idx = 0
+                    micro_vals[0] = loss_val
+                nonfinite_batch = (micro_xy[bad_idx][0], micro_xy[bad_idx][1], micro_vals[bad_idx])
+            if attach_stats:
+                act_stats.detach()
+                clear_logit_scratch_cache()
+            if nonfinite_batch is not None:
+                _handle_nonfinite(step, *nonfinite_batch)
+                continue
+            nonfinite_streak = 0
+            last_train_loss = loss_val
+            # Clipped every step; materialized below only when logging.
+            grad_norm_t = None
+            if args.grad_clip > 0:
+                grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            opt.step()
+            sched.step()
+            loss_spike.update(loss_val)
+            if args.val_every > 0:
+                # The window is only consumed by the validation block below; with
+                # --val-every 0 nothing ever resets it, so appending would grow it
+                # for the entire run.
+                train_window.append(loss_val)
+            step += 1
+            if args.val_every > 0 and step % args.val_every == 0:
+                if val_loader is None:
+                    val_loader = open_data_split('validation', args)
+                    rval = getattr(val_loader, 'split_report', None)
+                    if rval:
+                        data_reports['validation'] = rval
+                        print(f'[data] validation split: {rval}')
+                val_batch_losses: list = []
+                val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device, collect=val_batch_losses)
+                if val_loss is None:
+                    # The loader yielded zero batches: the held-out slice is empty.
+                    # Silently continuing would train with no selection signal (and
+                    # save no best checkpoint), so fail before continuing a run
+                    # whose model-selection protocol is already void.
+                    raise SystemExit(
+                        f'[val] the validation split produced no batches, so checkpoint selection is '
+                        f'impossible; refusing to continue without a held-out signal. Likely causes: '
+                        f'--num-documents={args.num_documents} is larger than the actual stream (the '
+                        f'chronological boundary points past its end), the dataset/tokenizer revision '
+                        f'changed, or the split fractions leave validation empty. Verify the split '
+                        f'layout with scripts/audit_data.py before re-running.')
+                if val_loss is not None:
+                    last_val_loss = val_loss
+                    last_val_step = step
+                    last_val_batches = val_batch_losses
+                    improved = val_loss < best_val_loss
+                    if improved:
+                        best_val_loss = val_loss
+                        best_val_step = step
+                        val_checks_without_improvement = 0
+                    else:
+                        val_checks_without_improvement += 1
+                    print(f'[val] step={step} val_loss={val_loss:.4f} best={best_val_loss:.4f}@{best_val_step} (no improvement x{val_checks_without_improvement})', flush=True)
+                    if tb:
+                        tb.add_scalar('val/loss', val_loss, step)
+                    if improved:
+                        ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'provenance': provenance}
+                        path = Path(args.output_dir) / 'ckpt_best.pt'
+                        _atomic_torch_save(ckpt_best, path)
+                        print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
+                    # Curve diagnosis: pair the held-out point with the mean
+                    # training loss over the interval it covers, then classify the
+                    # regime (overfit / underfit / diverging / healthy) and print
+                    # the concrete remedy.
+                    train_point = (sum(train_window) / len(train_window)) if train_window else loss_val
+                    train_window = []
+                    curve_train.append(train_point)
+                    curve_val.append(val_loss)
+                    curve_steps.append(step)
+                    last_diagnosis = diagnose_train_val_curve(
+                        curve_train, curve_val, train_steps=curve_steps, val_steps=curve_steps,
+                        log_vocab_size=math.log(model.cfg.vocab_size),
+                    )
+                    diagnosis_history.append({
+                        'step': step,
+                        'classification': last_diagnosis['classification'],
+                        'train_trend': last_diagnosis['train_trend'],
+                        'val_trend': last_diagnosis['val_trend'],
+                        'train_relative_change': last_diagnosis['train_relative_change'],
+                        'val_relative_change': last_diagnosis['val_relative_change'],
+                        'generalization_gap': last_diagnosis['generalization_gap'],
+                        'recommendations': last_diagnosis['recommendations'],
+                    })
+                    print(f"[curve] step={step} train_window={train_point:.4f} val={val_loss:.4f} "
+                          f"-> {last_diagnosis['classification']} "
+                          f"(train {last_diagnosis['train_trend']}, val {last_diagnosis['val_trend']})", flush=True)
+                    if last_diagnosis['classification'] not in ('healthy', 'insufficient_data'):
+                        for line in last_diagnosis['recommendations']:
+                            print(f'[curve]   action: {line}')
+                    if tb:
+                        tb.add_scalar('curve/train_window_loss', train_point, step)
+                        tb.add_scalar('curve/generalization_gap', last_diagnosis['generalization_gap'] or 0.0, step)
+            if step % args.log_every == 0:
+                lr = opt.param_groups[0]['lr']
+                grad_norm = float(grad_norm_t) if grad_norm_t is not None else None
+                line = f'step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}'
+                if grad_norm is not None:
+                    line += f' grad_norm={grad_norm:.3f}'
+                print(line, flush=True)
+                row = {'step': step, 'loss': loss_val, 'lr': lr, 'n_loss_spikes': loss_spike.n_spikes}
+                if grad_norm is not None:
+                    row['grad_norm'] = grad_norm
+                if last_val_loss is not None:
+                    row['val_loss'] = last_val_loss
+                if last_diagnosis is not None:
+                    row['curve_classification'] = last_diagnosis['classification']
+                    row['curve_train_trend'] = last_diagnosis['train_trend']
+                    row['curve_val_trend'] = last_diagnosis['val_trend']
+                log_file.write(json.dumps(row) + '\n')
+                if tb:
+                    tb.add_scalar('train/loss', loss_val, step)
+                    tb.add_scalar('train/lr', lr, step)
+                    tb.add_scalar('train/n_loss_spikes', loss_spike.n_spikes, step)
+                    if grad_norm is not None:
+                        tb.add_scalar('train/grad_norm_pre_clip', grad_norm, step)
+                if args.wandb_project:
+                    import wandb
+                    wandb.log(row, step=step)
+            if step % args.stats_every == 0 and step > 0:
+                stats = act_stats.summary()
+                print(f"[stats] {stats.get('__summary__', {})}")
+                if tb:
+                    s = stats.get('__summary__', {})
+                    for k, v in s.items():
+                        tb.add_scalar(f'stats/{k}', v, step)
+            if step % args.save_every == 0 and step > 0:
+                ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
+                path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
+                _atomic_torch_save(ckpt, path)
+                print(f'[ckpt] saved {path}')
+            if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
+                print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
+                break
+        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
+        path = Path(args.output_dir) / 'ckpt_final.pt'
+        _atomic_torch_save(ckpt, path)
+        print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
+        run_manifest['data']['split_reports'] = data_reports
+        run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
+        final_val_stats = mean_ci(last_val_batches) if last_val_batches else None
+        run_manifest['results'] = {
+            'final_step': step,
+            'last_train_loss': last_train_loss,
+            # `best_val_loss` is the minimum over the validation passes: it is the
+            # checkpoint-selection statistic, so as a reported generalization
+            # estimate it is optimistically biased (the minimum of noisy draws).
+            # `final_val_loss` is the last held-out pass at the fixed training-step
+            # budget and is the number that makes two arms comparable.
+            'best_val_loss': best_val_loss if val_loader is not None else None,
+            'best_val_step': best_val_step if val_loader is not None else None,
+            'final_val_loss': last_val_loss if val_loader is not None else None,
+            'final_val_step': last_val_step if val_loader is not None else None,
+            # The final pass is a sample mean over batches: its standard error and
+            # interval are the resolution of the number quoted above. A delta
+            # smaller than the stderr is not evidence of a difference.
+            'final_val_loss_n_batches': len(last_val_batches),
+            'final_val_loss_std': final_val_stats['std'] if final_val_stats else None,
+            'final_val_loss_stderr': final_val_stats['stderr'] if final_val_stats else None,
+            'final_val_loss_ci_level': final_val_stats['ci_level'] if final_val_stats else None,
+            'final_val_loss_ci_low': final_val_stats['ci_low'] if final_val_stats else None,
+            'final_val_loss_ci_high': final_val_stats['ci_high'] if final_val_stats else None,
+            'n_loss_spikes': loss_spike.n_spikes,
+            'n_nonfinite_losses': n_nonfinite_losses,
+            'elapsed_s': time.time() - t0,
+            # Curve monitoring: the full (train window, val) pairs and the latest
+            # classification, so a reviewer can read the regime, not just the end.
+            'curve_train_window_loss': curve_train,
+            'curve_val_loss': curve_val,
+            'curve_steps': curve_steps,
+            'curve_diagnosis': last_diagnosis,
+            'curve_diagnosis_history': diagnosis_history,
+            # Efficiency accounting travels with the accuracy numbers: parameters
+            # by role and the analytic matmul FLOPs per token.
+            'n_params': n_params,
+            'n_trainable': n_trainable,
+            # Shape accounting: the depth sweep scales dim/heads with depth to hold
+            # parameters ~constant, so "depth" is really a depth+width trade-off
+            # there. Recording the shape next to the loss keeps that covariance
+            # visible in every aggregate instead of inferable only from launcher
+            # env vars.
+            'n_layers': int(model.cfg.n_layers),
+            'dim': int(model.cfg.dim),
+            'n_heads': int(model.cfg.n_heads),
+            'parameter_breakdown': parameter_breakdown(model),
+            'flops_per_token_forward': flops['forward_per_token'],
+            'flops_per_token_training_est': flops['training_per_token'],
+        }
+        if n_nonfinite_losses:
+            print(f'[warn] {n_nonfinite_losses} non-finite loss step(s) were handled by '
+                  f'--nonfinite-policy {args.nonfinite_policy}; see train.jsonl event rows')
+        save_run_manifest(manifest_path, run_manifest)
+        if args.final_test_eval:
+            # The test split is opened exactly once, after training is over, and
+            # only the checkpoint selected on the validation split is scored.
+            # Re-running the evaluation in the same output dir would let the test
+            # score steer the next attempt, i.e. turn the sealed set into an
+            # implicit validation set, so it is refused unless explicitly allowed.
+            out_path = Path(args.output_dir) / 'test_results.json'
+            if out_path.exists() and (not args.allow_test_rerun):
+                raise SystemExit(
+                    f'[test] {out_path} already exists: the sealed test split has already been '
+                    'evaluated once for this run, and scoring it again would turn it into an '
+                    'implicit validation set. Pass --allow-test-rerun only if you accept that '
+                    'the seal is broken.')
+            if args.val_every <= 0:
+                print('[test] WARNING: --val-every 0 disables validation-based selection; '
+                      'the sealed test split reports the final model only and must never be '
+                      'used to pick hyperparameters.', file=sys.stderr)
+            test_loader = open_data_split('test', args)
+            rtest = getattr(test_loader, 'split_report', None)
+            if rtest:
+                data_reports['test'] = rtest
+                print(f'[data] test split: {rtest}')
+            best_path = Path(args.output_dir) / 'ckpt_best.pt'
+            if val_loader is not None and best_path.exists():
+                best = _load_checkpoint_cpu(best_path)
+                load_model_state_dict(model, best['model'])
+                best_step = int(best.get('step', 0))
+                best_val = float(best.get('val_loss', float('nan')))
+                # The weights are copied; the optimizer state in the file must not
+                # occupy VRAM during the test pass (that is exactly where the
+                # memory budget is tightest).
+                del best
+                print(f"[test] restored best-validation checkpoint (step {best_step}, val_loss={best_val:.4f}) before the one-shot test evaluation")
+            test_state = {'iter': iter(test_loader)}
+            test_batch_losses: list = []
+            test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device, collect=test_batch_losses)
+            if test_loss is None:
+                # Writing test_results.json now would consume the one-shot seal
+                # without any measurement: the next run would refuse to evaluate
+                # the test split again (without --allow-test-rerun) even though no
+                # number was ever produced. Refuse instead, and leave the seal
+                # intact so the fixed data configuration can be re-evaluated once.
+                raise SystemExit(
+                    '[test] the sealed test split produced no batches; refusing to write '
+                    'test_results.json so the one-shot seal is not consumed by a void '
+                    'evaluation. Check that --num-documents matches the dataset and that the '
+                    'dataset/tokenizer revisions still resolve, then re-run.')
+            if len(test_batch_losses) < args.test_batches:
+                print(f'[test] WARNING: only {len(test_batch_losses)} of the requested '
+                      f'{args.test_batches} test batches were available; the mean and interval '
+                      f'rest on {len(test_batch_losses)} batch(es).', file=sys.stderr)
+            test_stats = mean_ci(test_batch_losses)
+            # The per-batch losses are kept, not just their mean: they are the
+            # resolution of the headline number and, because the held-out loader
+            # never shuffles, two runs sharing `pairing` below were scored on the
+            # same sealed segments - which is what makes their difference a paired
+            # sample (`scripts/compare_sealed_tests.py` enforces exactly this).
+            pairing = {
+                'dataset': args.dataset, 'dataset_config': args.dataset_config,
+                'dataset_revision': args.dataset_revision,
+                'tokenizer': args.tokenizer, 'tokenizer_revision': args.tokenizer_revision,
+                'num_documents': args.num_documents,
+                'val_frac': args.val_frac, 'test_frac': args.test_frac,
+                'dedup': args.dedup,
+                'min_doc_chars': args.min_doc_chars, 'max_doc_chars': args.max_doc_chars,
+                'exclude_hash_file': args.exclude_hash_file,
+                'batch_size': args.batch_size, 'seq_len': args.seq_len,
+            }
+            results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
+            with open(out_path, 'w') as f:
+                json.dump(results, f, indent=2)
+            run_manifest['data']['split_reports'] = data_reports
+            run_manifest['results']['test_loss'] = test_loss
+            run_manifest['results']['test_loss_n_batches'] = len(test_batch_losses)
+            run_manifest['results']['test_loss_stderr'] = test_stats['stderr']
+            run_manifest['results']['test_loss_ci_level'] = test_stats['ci_level']
+            run_manifest['results']['test_loss_ci_low'] = test_stats['ci_low']
+            run_manifest['results']['test_loss_ci_high'] = test_stats['ci_high']
+            save_run_manifest(manifest_path, run_manifest)
+            ci = ('no interval (a single batch has no degrees of freedom)' if test_stats['ci_low'] is None
+                  else f"{100 * test_stats['ci_level']:.0f}% CI [{test_stats['ci_low']:.4f}, {test_stats['ci_high']:.4f}]")
+            print(f'[test] sealed test split evaluated once: test_loss={test_loss:.4f} '
+                  f'(n={len(test_batch_losses)} batches, stderr={test_stats["stderr"]:.4f}, {ci}) -> {out_path}')
+        if tb:
+            tb.close()
+        if args.wandb_project:
+            import wandb
+            wandb.finish()
+    finally:
+        log_file.close()
     # The shape-keyed CE scratch blocks are only useful while this model keeps
     # training; drop them so any embedding caller reusing this module starts
     # clean.

@@ -201,20 +201,14 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
     if tuple(x.shape) == tuple(y.shape):
         copy_input = float((x[mask] == gold).float().mean().item())
     # One-vs-rest ranking metrics over the classes that actually occur in this
-    # batch (at most one column per valid token). The softmax is monotone, so
-    # it does not change the ranking; it keeps the scores comparable across
-    # calls.
+    # batch (at most one column per valid token). The scores must be the
+    # row-wise softmax, not raw logits: the softmax normalizes over the whole
+    # vocabulary, so its per-row factor differs across rows and it does change
+    # the cross-row ordering that the per-class ROC-AUC / PR-AUC compare. A
+    # raw-logit column is not an equivalent re-basing.
     present = torch.unique(gold).tolist()
-    # Select the |present| score columns out of the flattened logits, then the
-    # valid rows: the old `logits[mask].float()` + full-vocabulary softmax
-    # materialized two (n_valid, 50304) fp32 blocks just to keep a few
-    # thousand columns. The rank metrics only need a monotone per-column
-    # score, so the raw logit column is used directly; the V-wide softmax
-    # blocks are gone.
-    present_t = torch.tensor(present, dtype=torch.long, device=logits.device)
-    sub = logits.reshape(-1, vocab)[:, present_t]
-    sub = sub.index_select(0, mask.reshape(-1).nonzero(as_tuple=True)[0])
-    auc = binary_auc_report(sub.tolist(), gold.tolist(), present)
+    probs = torch.softmax(logits[mask].float(), dim=-1)[:, present]
+    auc = binary_auc_report(probs.tolist(), gold.tolist(), present)
     return {
         "accuracy": accuracy,
         "topk_accuracy": topk_accuracy,

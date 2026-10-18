@@ -120,8 +120,14 @@ def git_revision() -> dict:
         dirty = False
         if lines and lines[0].startswith("## "):
             header = lines[0][3:].strip()
-            name = header.split("...")[0].split(" ")[0]
-            branch = name or None
+            if header.startswith("No commits yet"):
+                # Unborn repository: the header names the branch-to-be
+                # (`## No commits yet on master`) but no branch exists yet,
+                # so ask the same command the old implementation used.
+                branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
+            else:
+                name = header.split("...")[0].split(" ")[0]
+                branch = name or None
             dirty = len(lines) > 1
         else:
             # No branch header (e.g. unborn repository): fall back to the
