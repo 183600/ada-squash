@@ -176,7 +176,10 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
     sig.neg_().log1p_().neg_()
     k = sig.sub_(a)
     acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
-    red = grad_phi.mul_(k).sum(dtype=acc)
+    if acc is None:
+        red = _dot_all(grad_phi, k)
+    else:
+        red = grad_phi.mul_(k).sum(dtype=acc)
     red = red.div_(p * p)
     red.mul_(p_raw > _MIN_P)
     if red.dtype != p.dtype:

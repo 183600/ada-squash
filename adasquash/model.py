@@ -326,7 +326,6 @@ class _SwiGLU(torch.autograd.Function):
         if x.dtype != dt:
             x = x.to(dt)
         grad_out = grad_out.reshape(-1, grad_out.shape[-1])
-        grad_h = grad_out @ w2
         grad_x = grad_w1 = grad_w2 = grad_w3 = None
         do_x = ctx.needs_input_grad[0]
         do_w1 = ctx.needs_input_grad[1]
@@ -334,6 +333,7 @@ class _SwiGLU(torch.autograd.Function):
         do_w3 = ctx.needs_input_grad[3]
         need_a = do_x or do_w1
         need_b = do_x or do_w3
+        grad_h = grad_out @ w2 if (need_a or need_b) else None
         grad_a = grad_b = None
         a = None
         b = None
