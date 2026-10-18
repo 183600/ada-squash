@@ -586,6 +586,18 @@ def main():
                     data_reports['validation'] = rval
                     print(f'[data] validation split: {rval}')
             val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device)
+            if val_loss is None:
+                # The loader yielded zero batches: the held-out slice is empty.
+                # Silently continuing would train with no selection signal (and
+                # save no best checkpoint), so fail before spending more compute
+                # on a run whose model-selection protocol is already void.
+                raise SystemExit(
+                    f'[val] the validation split produced no batches, so checkpoint selection is '
+                    f'impossible; refusing to continue without a held-out signal. Likely causes: '
+                    f'--num-documents={args.num_documents} is larger than the actual stream (the '
+                    f'chronological boundary points past its end), the dataset/tokenizer revision '
+                    f'changed, or the split fractions leave validation empty. Verify the split '
+                    f'layout with scripts/audit_data.py before re-running.')
             if val_loss is not None:
                 last_val_loss = val_loss
                 last_val_step = step
@@ -748,6 +760,17 @@ def main():
             print(f"[test] restored best-validation checkpoint (step {int(best.get('step', 0))}, val_loss={float(best.get('val_loss', float('nan'))):.4f}) before the one-shot test evaluation")
         test_state = {'iter': iter(test_loader)}
         test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device)
+        if test_loss is None:
+            # Writing test_results.json now would consume the one-shot seal
+            # without any measurement: the next run would refuse to evaluate
+            # the test split again (without --allow-test-rerun) even though no
+            # number was ever produced. Refuse instead, and leave the seal
+            # intact so the fixed data configuration can be re-evaluated once.
+            raise SystemExit(
+                '[test] the sealed test split produced no batches; refusing to write '
+                'test_results.json so the one-shot seal is not consumed by a void '
+                'evaluation. Check that --num-documents matches the dataset and that the '
+                'dataset/tokenizer revisions still resolve, then re-run.')
         results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
         with open(out_path, 'w') as f:
             json.dump(results, f, indent=2)

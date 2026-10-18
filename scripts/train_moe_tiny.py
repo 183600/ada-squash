@@ -333,7 +333,13 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                         vx, vy = next(val_iter)
                     except StopIteration:
                         val_iter = iter(val_loader)
-                        vx, vy = next(val_iter)
+                        try:
+                            vx, vy = next(val_iter)
+                        except StopIteration:
+                            raise SystemExit(
+                                '[moe][val] the validation split produced no batches; '
+                                'refusing to report a run without a held-out signal. '
+                                'Check --num-documents / the dataset revision, then re-run.')
                     vx = vx.to(device, non_blocking=True)
                     vy = vy.to(device, non_blocking=True)
                 else:

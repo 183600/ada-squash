@@ -151,6 +151,7 @@ def main():
     p.add_argument('--no-dedup', dest='dedup', action='store_false')
     p.add_argument('--write-train-hash-file', default=None, help='write the hashes of the sampled training documents here; feed the file to train_gpt2.py --exclude-hash-file so validation/test drop exact duplicates of training documents (use --n-docs 0 for a full ledger)')
     p.add_argument('--max-tvd', type=float, default=None, help="fail (exit 1) when train-vs-validation token total-variation distance exceeds this")
+    p.add_argument('--max-test-tvd', type=float, default=None, help="fail (exit 1) when train-vs-test token total-variation distance exceeds this; the test split backs the final reported number, so unchecked drift there changes what that number measures")
     p.add_argument('--output', default='runs/data_audit.json')
     args = p.parse_args()
     try:
@@ -252,6 +253,8 @@ def main():
         problems.append(f"token ids outside the tokenizer vocabulary range in: {', '.join(out_of_range)}")
     if args.max_tvd is not None and shift['train_vs_validation_tvd'] > args.max_tvd:
         problems.append(f"train-vs-validation distribution shift TVD={shift['train_vs_validation_tvd']:.4f} > max-tvd={args.max_tvd}")
+    if args.max_test_tvd is not None and shift['train_vs_test_tvd'] > args.max_test_tvd:
+        problems.append(f"train-vs-test distribution shift TVD={shift['train_vs_test_tvd']:.4f} > max-test-tvd={args.max_test_tvd}")
     if problems:
         for problem in problems:
             print(f'[audit] PROBLEM: {problem}', file=sys.stderr)

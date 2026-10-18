@@ -396,6 +396,11 @@ def main():
     p.add_argument('--exclude-hash-file', default=None)
     args = p.parse_args()
     args.topk = max(1, int(args.topk))
+    if args.corpus == 'dataset' and args.split == 'test':
+        print("[errors] WARNING: --corpus dataset --split test inspects the sealed test split; "
+              "reading its error cases and iterating turns test into an implicit validation "
+              "set. Use --split validation unless this is the single final diagnosis.",
+              file=sys.stderr)
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     set_all_seeds(args.seed)
     model, model_args = load_ckpt(args.ckpt, device=device)
