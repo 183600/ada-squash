@@ -160,7 +160,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                         cause = 'context_copy'
                     else:
                         cause = 'decode_drift'
-                    if rank <= 5:
+                    if rank < 5:
                         confidence = 'near_miss'
                     elif top_prob >= 0.5:
                         confidence = 'confident_wrong'
