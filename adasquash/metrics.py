@@ -195,6 +195,10 @@ def student_t_ppf(p: float, df: float) -> float:
         hi *= 2.0
     for _ in range(200):
         mid = 0.5 * (lo + hi)
+        if mid == lo or mid == hi:
+            # Adjacent floats: no later iteration can move the interval, so
+            # the fixed-point 200-iteration return value is already reached.
+            break
         if student_t_cdf(mid, df) < p:
             lo = mid
         else:
@@ -536,6 +540,54 @@ def imbalance_report(counts: Sequence[int]) -> dict:
     }
 
 
+def _tie_groups_ascending(scores: list, labels: list):
+    """``(order, groups)`` of one ascending sort, ties collected into groups.
+
+    Both ranking metrics only read tie *groups*, so one sort serves them:
+    `order` is the ascending permutation and `groups` the ``(start, end)``
+    index pairs (inclusive) into ``order`` for each equal-score run. The
+    group contents are order-insensitive downstream (average rank for ROC-AUC,
+    threshold groups for AP), so neither metric changes with the sort
+    direction.
+    """
+    n = len(scores)
+    order = sorted(range(n), key=scores.__getitem__)
+    groups = []
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and scores[order[j + 1]] == scores[order[i]]:
+            j += 1
+        groups.append((i, j))
+        i = j + 1
+    return order, groups
+
+
+def _roc_auc_from_groups(n: int, n_pos: int, n_neg: int, order: list,
+                         groups: list, labels: list) -> float:
+    ranks = [0.0] * n
+    for i, j in groups:
+        avg_rank = 0.5 * ((i + 1) + (j + 1))
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+    rank_sum_pos = sum(r for r, lab in zip(ranks, labels) if lab)
+    return (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def _average_precision_from_groups(n_pos: int, order: list, groups: list,
+                                   labels: list) -> float:
+    ap = 0.0
+    tp = fp = 0
+    for i, j in reversed(groups):
+        group = order[i:j + 1]
+        group_pos = sum(labels[k] for k in group)
+        tp += group_pos
+        fp += len(group) - group_pos
+        if group_pos:
+            ap += (tp / (tp + fp)) * (group_pos / n_pos)
+    return ap
+
+
 def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
     """Binary ROC-AUC via the rank statistic, ties averaged (`None` if undefined).
 
@@ -559,19 +611,8 @@ def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
     n_neg = n - n_pos
     if n_pos == 0 or n_neg == 0:
         return None
-    order = sorted(range(n), key=lambda i: scores[i])
-    ranks = [0.0] * n
-    i = 0
-    while i < n:
-        j = i
-        while j + 1 < n and scores[order[j + 1]] == scores[order[i]]:
-            j += 1
-        avg_rank = 0.5 * ((i + 1) + (j + 1))
-        for k in range(i, j + 1):
-            ranks[order[k]] = avg_rank
-        i = j + 1
-    rank_sum_pos = sum(r for r, lab in zip(ranks, labels) if lab)
-    return (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    order, groups = _tie_groups_ascending(scores, labels)
+    return _roc_auc_from_groups(n, n_pos, n_neg, order, groups, labels)
 
 
 def average_precision(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
@@ -590,26 +631,11 @@ def average_precision(scores: Sequence[float], labels: Sequence[int]) -> Optiona
     labels = [int(bool(v)) for v in labels]
     if len(scores) != len(labels):
         raise ValueError(f"score/label length mismatch: {len(scores)} vs {len(labels)}")
-    n = len(scores)
     n_pos = sum(labels)
     if n_pos == 0:
         return None
-    order = sorted(range(n), key=lambda i: -scores[i])
-    ap = 0.0
-    tp = fp = 0
-    i = 0
-    while i < n:
-        j = i
-        while j + 1 < n and scores[order[j + 1]] == scores[order[i]]:
-            j += 1
-        group = order[i:j + 1]
-        group_pos = sum(labels[k] for k in group)
-        tp += group_pos
-        fp += len(group) - group_pos
-        if group_pos:
-            ap += (tp / (tp + fp)) * (group_pos / n_pos)
-        i = j + 1
-    return ap
+    order, groups = _tie_groups_ascending(scores, labels)
+    return _average_precision_from_groups(n_pos, order, groups, labels)
 
 
 def binary_auc_report(
@@ -658,13 +684,17 @@ def binary_auc_report(
                 "reason": "no positives" if n_pos == 0 else "no negatives",
             })
             continue
+        # One ordering per class serves both metrics (their tie groups are the
+        # same set); going through the public helpers would sort twice and
+        # re-convert the already-float column and 0/1 labels.
+        order, groups = _tie_groups_ascending(col, labels)
         records.append({
             "class": cls,
             "positives": n_pos,
             "negatives": n_neg,
             "negatives_per_positive": n_neg / n_pos,
-            "average_precision": average_precision(col, labels),
-            "roc_auc": roc_auc(col, labels),
+            "average_precision": _average_precision_from_groups(n_pos, order, groups, labels),
+            "roc_auc": _roc_auc_from_groups(len(labels), n_pos, n_neg, order, groups, labels),
         })
     support_total = sum(r["positives"] for r in records)
     macro_ap = (

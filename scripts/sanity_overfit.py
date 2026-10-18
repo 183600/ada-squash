@@ -197,8 +197,10 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
     # it does not change the ranking; it keeps the scores comparable across
     # calls.
     present = torch.unique(gold).tolist()
-    probs = torch.softmax(logits.float(), dim=-1)
-    auc = binary_auc_report(probs[mask][:, present].tolist(), gold.tolist(), present)
+    # The softmax is row-wise, so selecting the scored rows first yields the
+    # identical scores while never materializing the full [B, T, V] fp32 copy.
+    probs = torch.softmax(logits[mask].float(), dim=-1)[:, present]
+    auc = binary_auc_report(probs.tolist(), gold.tolist(), present)
     return {
         "accuracy": accuracy,
         "topk_accuracy": topk_accuracy,
@@ -245,19 +247,29 @@ def _structurally_zero_grad_names(model) -> set:
 
 def gradient_report(model) -> dict:
     missing, nonfinite, zero = [], [], []
-    sq = 0.0
-    n_used = 0
+    names = []
+    finite_t = []
+    norm_t = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         if p.grad is None:
             missing.append(name)
             continue
-        if not bool(torch.isfinite(p.grad).all()):
+        g = p.grad.detach()
+        names.append(name)
+        finite_t.append(torch.isfinite(g).all())
+        norm_t.append(g.float().norm().to(torch.float64))
+    # One host transfer for the whole census instead of a sync per parameter.
+    finite = torch.stack(finite_t).tolist() if finite_t else []
+    norms = torch.stack(norm_t).tolist() if norm_t else []
+    sq = 0.0
+    n_used = 0
+    for name, is_finite, norm in zip(names, finite, norms):
+        if not is_finite:
             nonfinite.append(name)
             continue
         n_used += 1
-        norm = float(p.grad.detach().float().norm().item())
         sq += norm * norm
         if norm == 0.0:
             zero.append(name)

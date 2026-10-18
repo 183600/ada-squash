@@ -369,9 +369,11 @@ def first_nonfinite_module(model, run_forward, max_modules: int = 8) -> list[dic
 def gradient_health_report(model) -> dict:
     """Non-finite/zero/huge gradient census over every parameter with a grad."""
     missing, nonfinite, zero = [], [], []
-    max_abs = 0.0
-    total_sq = 0.0
     n_with_grad = 0
+    names = []
+    finite_t = []
+    abs_t = []
+    sq_t = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
@@ -380,14 +382,26 @@ def gradient_health_report(model) -> dict:
             continue
         g = p.grad.detach()
         n_with_grad += 1
-        if bool(torch.isfinite(g).all().item()):
-            g_abs = float(g.abs().max().item()) if g.numel() else 0.0
-            max_abs = max(max_abs, g_abs)
-            total_sq += float(g.float().pow(2).sum().item())
-            if g_abs == 0.0:
-                zero.append(name)
-        else:
+        names.append(name)
+        finite_t.append(torch.isfinite(g).all())
+        abs_t.append(g.abs().amax().to(torch.float64) if g.numel()
+                    else torch.zeros((), dtype=torch.float64, device=g.device))
+        sq_t.append(g.float().pow(2).sum().to(torch.float64))
+    # Per-parameter scalars are accumulated on-device and transferred in one
+    # batch: a sync per parameter turns into three transfers per census.
+    finite = torch.stack(finite_t).tolist() if finite_t else []
+    abs_vals = torch.stack(abs_t).tolist() if abs_t else []
+    sq_vals = torch.stack(sq_t).tolist() if sq_t else []
+    max_abs = 0.0
+    total_sq = 0.0
+    for name, is_finite, g_abs, g_sq in zip(names, finite, abs_vals, sq_vals):
+        if not is_finite:
             nonfinite.append(name)
+            continue
+        max_abs = max(max_abs, g_abs)
+        total_sq += g_sq
+        if g_abs == 0.0:
+            zero.append(name)
     return {
         "total_norm": math.sqrt(total_sq),
         "max_abs_grad": max_abs,

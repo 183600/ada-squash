@@ -45,12 +45,30 @@ class GPTConfig:
 _CROSSENTROPY_CHUNK_BYTES = 1 << 27
 _CROSS_ENTROPY_FAST_PATH_BYTES = 1 << 23
 _CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
+_CE_SCRATCH_CACHE: dict[tuple, torch.Tensor] = {}
+_CE_SCRATCH_MAX_ENTRIES = 4
 
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
     if vocab_size not in _CROSS_ENTROPY_CHUNK_ROWS_CACHE:
         row_bytes = max(1, vocab_size) * 4
         _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
     return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
+
+def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tensor:
+    """Reusable ``(rows, vocab)`` logit scratch for the chunked losses.
+
+    The buffers are private to the forward/backward sweeps (never returned,
+    never saved for backward), so a per-shape buffer can be reused across
+    steps instead of paying a fresh large allocation per micro-batch.
+    """
+    key = (rows, vocab, dtype, device)
+    buf = _CE_SCRATCH_CACHE.get(key)
+    if buf is None:
+        buf = torch.empty(rows, vocab, dtype=dtype, device=device)
+        if len(_CE_SCRATCH_CACHE) >= _CE_SCRATCH_MAX_ENTRIES:
+            _CE_SCRATCH_CACHE.clear()
+        _CE_SCRATCH_CACHE[key] = buf
+    return buf
 
 def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=False) -> dict:
     kwargs: dict = {}
@@ -85,7 +103,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         for start in range(0, n, chunk_rows):
             end = min(start + chunk_rows, n)
             if buf is None:
-                buf = torch.empty(buf_rows, logits.size(-1), dtype=logits.dtype, device=logits.device)
+                buf = _ce_scratch(buf_rows, logits.size(-1), logits.dtype, logits.device)
             log_probs = buf[:end - start]
             torch.log_softmax(logits[start:end], dim=-1, out=log_probs)
             chunk_loss = F.nll_loss(log_probs, targets[start:end], ignore_index=ignore_index, reduction='sum')
@@ -158,8 +176,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             end = min(start + chunk_rows, n)
             rows = end - start
             if logits is None or logits.size(0) < rows:
-                logits = torch.empty(buf_rows, w.shape[0], dtype=acc, device=h.device)
-                cast_buf = None if acc == dt else torch.empty(buf_rows, w.shape[0], dtype=dt, device=h.device)
+                logits = _ce_scratch(buf_rows, w.shape[0], acc, h.device)
+                cast_buf = None if acc == dt else _ce_scratch(buf_rows, w.shape[0], dt, h.device)
             buf = logits[:rows]
             if cast_buf is None:
                 torch.mm(h[start:end], w_t, out=buf)
@@ -204,8 +222,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             hc = h[start:end]
             tc = targets[start:end]
             if probs is None or probs.size(0) < rows:
-                probs = torch.empty(buf_rows, w.shape[0], dtype=acc, device=h.device)
-                cast_buf = None if acc == dt else torch.empty(buf_rows, w.shape[0], dtype=dt, device=h.device)
+                probs = _ce_scratch(buf_rows, w.shape[0], acc, h.device)
+                cast_buf = None if acc == dt else _ce_scratch(buf_rows, w.shape[0], dt, h.device)
             buf = probs[:rows]
             if cast_buf is None:
                 torch.mm(hc, w_t, out=buf)
@@ -456,8 +474,13 @@ class GPT(nn.Module):
         freqs = self.freqs_cis[:T] if self.freqs_cis is not None else None
         all_logit_stats = []
         if self.cfg.gradient_checkpointing and self.training:
+            # Without dropout no RNG is consumed inside a block, so recording
+            # and restoring the ambient RNG state around every block is dead
+            # weight; it only has to run when a dropout draw needs the same
+            # state in the recomputation.
+            preserve_rng = self.drop.p > 0.0
             for block in self.blocks:
-                x, ls = torch.utils.checkpoint.checkpoint(block, x, freqs, return_stats, use_reentrant=False)
+                x, ls = torch.utils.checkpoint.checkpoint(block, x, freqs, return_stats, use_reentrant=False, preserve_rng_state=preserve_rng)
                 if return_stats:
                     all_logit_stats.append(ls)
         else:

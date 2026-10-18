@@ -347,11 +347,14 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             train_point = sum(window) / max(1, len(window))
             model.eval()
             with torch.inference_mode():
-                held = [model(*markov_batch(curve_rng, model.cfg.ignore_index, args.batch_size,
-                                            args.seq_len, device, outlier_id=outlier_id),
-                              return_logits=False)[1].item()
-                        for _ in range(curve_batches)]
+                held_t = torch.stack([
+                    model(*markov_batch(curve_rng, model.cfg.ignore_index, args.batch_size,
+                                        args.seq_len, device, outlier_id=outlier_id),
+                          return_logits=False)[1]
+                    for _ in range(curve_batches)
+                ])
             model.train()
+            held = held_t.to(torch.float64).tolist()
             curve_train.append(train_point)
             curve_val.append(sum(held) / len(held))
             curve_steps.append(step + 1)
@@ -384,11 +387,15 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     n_val_batches = max(1, getattr(args, 'val_batches', 20))
     val_rng = torch.Generator(device=device).manual_seed(seed + 1)
     model.eval()
-    val_losses = []
     with torch.inference_mode():
-        for _ in range(n_val_batches):
-            vx, vy = markov_batch(val_rng, model.cfg.ignore_index, args.batch_size, args.seq_len, device, outlier_id=outlier_id)
-            val_losses.append(model(vx, vy, return_logits=False)[1].item())
+        # Same batches in the same generator order; only the per-batch host
+        # sync is deferred to one transfer for the whole held-out set.
+        val_losses = torch.stack([
+            model(*markov_batch(val_rng, model.cfg.ignore_index, args.batch_size,
+                                args.seq_len, device, outlier_id=outlier_id),
+                  return_logits=False)[1]
+            for _ in range(n_val_batches)
+        ]).to(torch.float64).tolist()
     model.train()
     # `val_loss` is a sample mean over held-out batches; keep the per-batch
     # losses (and their standard error) so comparisons can be *paired* across
