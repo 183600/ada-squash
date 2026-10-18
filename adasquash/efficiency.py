@@ -119,7 +119,7 @@ def _param_bucket(name: str) -> str:
 def parameter_breakdown(model) -> dict:
     """Per-role parameter counts, tied storage counted once.
 
-    Returns ``{'total', 'by_role', 'norm_share_of_total', 'tied_storage'}``.
+    Returns ``{'total', 'by_role', 'norm_share_of_total', 'tied_storage_skipped'}``.
     Tied embeddings share one tensor between `tok_emb.weight` and
     `lm_head.weight`; the second reference is counted under
     `tied_storage_skipped` rather than double-counting it.
@@ -127,7 +127,7 @@ def parameter_breakdown(model) -> dict:
     by_role: dict = defaultdict(int)
     seen: set = set()
     skipped = 0
-    for name, p in model.named_parameters():
+    for name, p in model.named_parameters(remove_duplicate=False):
         key = p.data_ptr()
         if key in seen:
             skipped += int(p.numel())
