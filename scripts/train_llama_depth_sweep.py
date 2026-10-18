@@ -114,6 +114,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         flops_train = None
         spikes = None
         nonfinite = None
+        n_layers = None
+        dim = None
+        n_heads = None
         try:
             manifest = json.loads(path.read_text())
             if isinstance(manifest, dict):
@@ -127,6 +130,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
                 # invisible.
                 curve = results.get('curve_diagnosis')
                 n_params = results.get('n_params')
+                n_layers = results.get('n_layers')
+                dim = results.get('dim')
+                n_heads = results.get('n_heads')
                 breakdown = results.get('parameter_breakdown')
                 flops_fwd = results.get('flops_per_token_forward')
                 flops_train = results.get('flops_per_token_training_est')
@@ -139,6 +145,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
             'curve_classification': (curve or {}).get('classification'),
             'curve_generalization_gap': (curve or {}).get('generalization_gap'),
             'n_params': n_params,
+            'n_layers': n_layers,
+            'dim': dim,
+            'n_heads': n_heads,
             'norm_share_of_params': (breakdown or {}).get('norm_share_of_total'),
             'flops_per_token_forward': flops_fwd,
             'flops_per_token_training_est': flops_train,
@@ -163,6 +172,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
     # (same dim/heads per depth) makes n_params and FLOPs/token identical
     # across a cell's seeds, so any cross-seed spread here is a red flag.
     params = [p['n_params'] for p in per_seed if _finite(p.get('n_params'))]
+    layers = [p['n_layers'] for p in per_seed if _finite(p.get('n_layers'))]
+    dims = [p['dim'] for p in per_seed if _finite(p.get('dim'))]
+    heads = [p['n_heads'] for p in per_seed if _finite(p.get('n_heads'))]
     norm_shares = [p['norm_share_of_params'] for p in per_seed
                    if _finite(p.get('norm_share_of_params'))]
     flops_fwd = [p['flops_per_token_forward'] for p in per_seed
@@ -206,6 +218,19 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         'curve_generalization_gap': (sum(gaps) / len(gaps)) if gaps else None,
         'n_params': (sum(params) / len(params)) if params else None,
         'n_params_by_seed': {p['seed']: p.get('n_params') for p in per_seed},
+        # Shape covariates: under the equal-parameter scaling (shape_for_depth)
+        # a deeper cell is also a narrower one, so depth, dim and n_heads move
+        # together and a cross-depth delta is never a pure depth effect. They
+        # are pooled and flagged instead of left to be guessed from the cell
+        # name.
+        'n_layers': layers[0] if layers else None,
+        'dim': (sum(dims) / len(dims)) if dims else None,
+        'n_heads': heads[0] if heads else None,
+        'shape_by_seed': {p['seed']: {'n_layers': p.get('n_layers'), 'dim': p.get('dim'),
+                                      'n_heads': p.get('n_heads')} for p in per_seed},
+        'shape_consistent_across_seeds': len({(p.get('n_layers'), p.get('dim'), p.get('n_heads'))
+                                              for p in per_seed
+                                              if any(_finite(p.get(k)) for k in ('n_layers', 'dim', 'n_heads'))}) <= 1,
         'norm_share_of_params': (sum(norm_shares) / len(norm_shares)) if norm_shares else None,
         'flops_per_token_forward': (sum(flops_fwd) / len(flops_fwd)) if flops_fwd else None,
         'flops_per_token_training_est': (sum(flops_train) / len(flops_train)) if flops_train else None,
@@ -220,6 +245,10 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
                         'while some seed was underfit/stalled or overfitting/diverging must not be read as a clean '
                         'depth/norm effect. n_params/flops_per_token_* = efficiency accounting (identical across the '
                         'cell seeds by construction) so the accuracy delta can be weighed against its cost. '
+                        'n_layers/dim/n_heads = shape covariates: under the equal-parameter scaling a deeper cell '
+                        'is narrower (dim and n_heads change with depth), so a cross-depth delta confounds depth '
+                        'with width/head count and must not be read as a pure depth effect; a cross-norm delta at '
+                        'the same depth is not affected. '
                         'missing_seeds = failed/unfinished runs, invalid_seeds = runs whose manifest reports '
                         'NaN/Inf; both are excluded from the mean but never from the report, because a cell with '
                         'missing/invalid seeds is not a clean replication.'),
@@ -289,6 +318,15 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 'reference_curve_classification_counts': ref.get('curve_classification_counts'),
                 'candidate_n_params': by_norm[norm].get('n_params'),
                 'reference_n_params': ref.get('n_params'),
+                # Shape covariates of both sides: depth is what the sweep
+                # varies, but under the equal-parameter scaling dim/n_heads
+                # move with it, so the pair also fixes how much width differs.
+                'candidate_shape': {'n_layers': by_norm[norm].get('n_layers'),
+                                    'dim': by_norm[norm].get('dim'),
+                                    'n_heads': by_norm[norm].get('n_heads')},
+                'reference_shape': {'n_layers': ref.get('n_layers'),
+                                    'dim': ref.get('dim'),
+                                    'n_heads': ref.get('n_heads')},
                 'candidate_flops_per_token_forward': by_norm[norm].get('flops_per_token_forward'),
                 'reference_flops_per_token_forward': ref.get('flops_per_token_forward'),
                 # The sweep's premise is a compute-matched depth/norm
@@ -359,7 +397,11 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                           '`*_flops_per_token_forward` (with `params_ratio_vs_reference` / '
                           '`flops_ratio_vs_reference` / `cost_matched_within_25pct`): an off-healthy-regime '
                           'side, an uncounted params/FLOPs increase, or a `cost_matched_within_25pct = false` '
-                          'row means the delta is not yet a clean depth/norm claim - it is confounded with cost.'),
+                          'row means the delta is not yet a clean depth/norm claim - it is confounded with cost. '
+                          'Rows also carry both sides\' `*_shape` (n_layers/dim/n_heads): with the equal-parameter '
+                          'scaling a deeper cell is also narrower, so `candidate_shape.dim` (and n_heads) differ '
+                          'across depths by construction - a same-depth cross-norm delta is a norm claim, a '
+                          'cross-depth delta is depth *and* width/head count, never depth alone.'),
     }
 
 def print_sweep_comparisons(comparison: dict) -> None:
@@ -404,8 +446,14 @@ def print_sweep_comparisons(comparison: dict) -> None:
             cost += ' (' + ', '.join(ratios) + ')'
         if r.get('cost_matched_within_25pct') is False:
             cost += ' [NOT compute-matched: delta confounded with cost]'
+        shape = ''
+        c_shape = r.get('candidate_shape') or {}
+        r_shape = r.get('reference_shape') or {}
+        if any(v is not None for v in c_shape.values()) or any(v is not None for v in r_shape.values()):
+            shape = (f" shape cand L={c_shape.get('n_layers')},dim={c_shape.get('dim')},h={c_shape.get('n_heads')} vs "
+                     f"ref L={r_shape.get('n_layers')},dim={r_shape.get('dim')},h={r_shape.get('n_heads')}")
         print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{ci_str}{sign} "
-              f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}{cost}{regime}")
+              f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}{cost}{shape}{regime}")
     if comparison.get('incomplete_cells'):
         print(f"[compare] WARNING: {len(comparison['incomplete_cells'])} comparison(s) involve a cell "
               f"with missing seed runs; significance is withheld there: "
@@ -691,6 +739,9 @@ def main():
             print(f"[sweep] d{depth}-{norm}: no curve diagnosis in the run manifests (legacy run)")
         if agg.get('n_params') is not None:
             eff = f"[sweep] d{depth}-{norm}: n_params={agg['n_params'] / 1e6:.2f}M"
+            if agg.get('dim') is not None:
+                eff += (f" shape L={agg.get('n_layers')},dim={agg.get('dim')},"
+                        f"h={agg.get('n_heads')}")
             share = agg.get('norm_share_of_params')
             if share is not None:
                 eff += f" (norm share={share * 100:.2f}%)"
@@ -713,6 +764,10 @@ def main():
             print(f"[sweep] WARNING: d{depth}-{norm}: seeds {agg['invalid_seeds']} report "
                   f"NaN/Inf losses; they are excluded from the pooled mean exactly like "
                   f"missing runs (a diverged run is not a clean replication)")
+    print('[sweep][note] shape covariates: under the equal-parameter scaling dim and n_heads move with '
+          'depth by construction, so a cross-depth loss delta confounds depth with width/head count and '
+          'must not be read as a pure depth effect (same-depth cross-norm deltas are unaffected); every '
+          'comparison row records both sides\' shape.')
     comparison = compare_sweep_cells(aggs_by_depth, args.reference_norm)
     print_sweep_comparisons(comparison)
     comp_path = base / 'sweep_comparisons.json'

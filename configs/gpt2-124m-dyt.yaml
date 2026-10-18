@@ -1,10 +1,24 @@
 model: gpt2-124m
 norm: dyt
 # 0.5 is the GPTConfig default and the value the dytc / dytcd configs use, so
-# yaml-vs-yaml comparisons vary the normalization, not a tuned scalar.
+# dyt-vs-dytc varies the normalization readout, not a tuned scalar. Note that
+# the dytd / dytcd configs additionally enable the LayerScale residual that is
+# intrinsic to the depth axis (docs/design_notes.md, DyT-D), so dyt-vs-dytd
+# and dytc-vs-dytcd change the norm *and* LayerScale. Use
+# configs/gpt2-124m-dytd-no-ls.yaml and configs/gpt2-124m-dytcd-no-ls.yaml to
+# isolate the LayerScale component, and configs/gpt2-124m-dytcd-tanh.yaml to
+# isolate the activation family.
 alpha_init: 0.5
 qk_norm: null
 use_layerscale: false
+
+# Phase 1 statistics: each variant is replicated over these training seeds,
+# every seed a full independent run under <output_dir>/seed{N}/; the launcher
+# aggregates Mean +/- Std across seeds into <output_dir>/aggregate.json.
+# Seeds are the unit of replication (>= 3), because one run cannot separate
+# the normalization effect from run-to-run noise. Pass `--seeds <one>` for the
+# single-run layout in place, or the legacy `--seed N` shorthand.
+seeds: [42, 43, 44]
 
 dataset: HuggingFaceFW/fineweb-edu
 dataset_config: sample-10BT

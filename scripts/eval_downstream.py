@@ -90,10 +90,17 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
 
     A trial is pass/fail, so the point estimate alone hides its resolution:
     with `return_counts=True` the result is
-    `{'accuracy', 'n_correct', 'n_trials', 'ci95_low', 'ci95_high', 'failures',
-    'failure_causes', 'failure_confidence'}` with a Wilson 95% interval over
-    the trials. The default return (a float) is kept for callers that only
-    need the accuracy.
+    `{'accuracy', 'n_correct', 'n_trials', 'trial_correct', 'ci95_low',
+    'ci95_high', 'failures', 'failure_causes', 'failure_confidence'}` with a
+    Wilson 95% interval over the trials. The Wilson interval describes the
+    trial noise *within one placement draw*: it does not cover run-to-run or
+    placement-to-placement variability, so callers comparing arms must recur
+    over several `seed` values. `trial_correct` is the per-trial pass/fail
+    vector in trial order; since the placement RNG is seeded with `seed`, two
+    arms evaluated with the same seed see the *same* placements, so their
+    `trial_correct` vectors can be paired (McNemar) - the same pairing the
+    ablation runner does across seeds. The default return (a float) is kept
+    for callers that only need the accuracy.
 
     Every failed trial also yields a *bad-case record* (token ids and logit
     statistics only, no text: tokenizer mocks in tests have no decode): where
@@ -143,6 +150,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     if n_run == 0:
         raise ValueError('needle test produced no trials')
     n_correct = 0
+    trial_correct: list = []
     failures: list = []
     last_logits = getattr(model, 'last_position_logits', None)
     decode_batch = max(1, int(decode_batch))
@@ -224,12 +232,14 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                 if all(failed):
                     break
             n_correct += sum(not f for f in failed)
+            trial_correct.extend(not f for f in failed)
     if n_run == 0:
         raise ValueError('needle test produced no trials')
     acc = n_correct / n_run
     if return_counts:
         low, high = wilson_interval(n_correct, n_run)
         return {'accuracy': acc, 'n_correct': n_correct, 'n_trials': n_run,
+                'trial_correct': trial_correct,
                 'ci95_low': low, 'ci95_high': high,
                 'failures': failures,
                 'failure_causes': dict(Counter(f['cause'] for f in failures)),

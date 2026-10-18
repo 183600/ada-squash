@@ -17,11 +17,18 @@ from scripts.eval_downstream import load_ckpt
 DEFAULT_SEEDS = (42, 43, 44)
 # One probe draw is one sample: the PPL drop is aggregated as Mean +/- Std
 # over the `--seeds` probe replications, with the per-seed records kept so a
-# quantization result resting on one lucky probe cannot hide. Checkpoint
-# differences are additionally tested for significance in
-# `compare_w8a8_checkpoints` (paired across the shared seeds, Holm-adjusted),
-# because "0.2% drop under a 0.5% seed spread" is not a result; the comparison
-# is saved next to the results as `ppl_comparison.json`.
+# quantization result resting on one lucky probe cannot hide.
+#
+# Significance needs the training-run dimension replicated too: a `--ckpts`
+# entry may be a comma-separated list of checkpoints (ideally distinct training
+# seeds of the same arm), which are all probed and averaged per probe seed.
+# `compare_w8a8_checkpoints` certifies a cross-arm Delta only when both arms
+# supply >= 2 checkpoints with shared training seeds; with a single trained
+# checkpoint per arm the probe-paired test is descriptive only, because one run
+# per arm cannot separate the quantization effect from run-to-run noise. The
+# same applies to the per-arm degradation test, so "0.2% drop under a 0.5% seed
+# spread" is not a result; the comparison is saved next to the results as
+# `ppl_comparison.json`.
 _W8A8_SEED_METRIC_KEYS = ('ppl_fp', 'ppl_w8a8', 'ppl_drop', 'ppl_drop_pct',
                           'probe_token_coverage')
 
@@ -201,6 +208,15 @@ def _seed_metric_values(agg: dict, key: str) -> list:
     return [float(r[key]) for r in agg.get('per_seed', [])
             if isinstance(r.get(key), (int, float))]
 
+def _train_seed_metric_values(agg: dict, key: str) -> dict:
+    """Per-training-seed mean of `key` (averaged over that seed's checkpoints)."""
+    out = {}
+    for train_seed, metrics in (agg.get('per_train_seed') or {}).items():
+        value = metrics.get(key) if isinstance(metrics, dict) else None
+        if isinstance(value, (int, float)):
+            out[int(train_seed)] = float(value)
+    return out
+
 def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list, list]:
     """Per-seed values of `key` for the seeds both runs measured, paired by seed.
 
@@ -218,70 +234,116 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
 def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: float=0.05) -> dict:
     """Paired, Holm-adjusted significance of one checkpoint's PPL drop vs another's.
 
-    For every unordered checkpoint pair the test is the one-sided paired
-    Student-t `H1: mean(A - B) < 0` on the per-seed `ppl_drop_pct` values, so
-    a negative `mean_delta` means A loses less quality to W8A8. A pair with
-    fewer than 2 shared seeds is reported without a p-value rather than
-    silently tested unpaired. p-values are Holm-adjusted over the whole family
-    of pairwise tests, so "the best of many pairs" is not read as significant
-    by chance. The same report tests per checkpoint whether the degradation is
-    real (`H1: mean(ppl_drop_pct) > 0`): a drop of 0.2% under a 0.5% seed
-    spread is inside the noise. `main` writes this next to the results as
+    The test family is the one-sided paired Student-t `H1: mean(A - B) < 0` on
+    `ppl_drop_pct`, so a negative `mean_delta` means A loses less quality to
+    W8A8; pairs with fewer than 2 shared samples are reported without a
+    p-value rather than silently tested unpaired. p-values are Holm-adjusted
+    over the whole family of pairwise tests, so "the best of many pairs" is not
+    read as significant by chance. `main` writes this next to the results as
     `ppl_comparison.json`, mirroring the ablation runner's
     `leave_one_out_comparison.json`.
+
+    Every arm is a trained checkpoint, so the run-to-run unit is the *training*
+    seed: a pairwise test is certifiable (`basis='train_seed_means'`) only when
+    both arms supply >= 2 checkpoints with shared training seeds (comma-separated
+    `--ckpts` entries for the same arm). A single trained checkpoint per arm
+    leaves just probe noise in the denominator: the probe-paired test is still
+    computed, but labeled `basis='probe_paired_single_train_run'`,
+    `certifiable=False`, and `significant` stays False. The per-arm degradation
+    test (`H1: mean(ppl_drop_pct) > 0`) is likewise certifiable only across
+    >= 2 training seeds; with one run it is a descriptive probe-only test, so a
+    0.2% drop under a 0.5% seed spread is never sold as a real degradation.
     """
     labels = [str(r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
     tests = []
     for i in range(len(results)):
         for j in range(i + 1, len(results)):
+            a_train = _train_seed_metric_values(results[i], metric)
+            b_train = _train_seed_metric_values(results[j], metric)
+            shared_train = sorted(set(a_train) & set(b_train))
             shared, av, bv = _shared_seed_samples(results[i], results[j], metric)
             t = {'a': labels[i], 'b': labels[j], 'metric': metric,
-                 'n_shared_seeds': len(shared), 'shared_seeds': shared,
-                 'direction': f'negative mean_delta means A has lower {metric} (more W8A8-robust)'}
-            if len(shared) < 2:
-                t['mean_delta'] = (sum(av) - sum(bv)) / len(shared) if shared else None
-                t['p_one_sided'] = None
-                t['reason'] = 'need >= 2 seeds measured for both checkpoints to pair a test'
+                 'direction': f'negative mean_delta means A has lower {metric} (more W8A8-robust)',
+                 'a_train_seeds': sorted(a_train), 'b_train_seeds': sorted(b_train),
+                 'n_shared_train_seeds': len(shared_train), 'shared_train_seeds': shared_train,
+                 'n_shared_seeds': len(shared), 'shared_seeds': shared}
+            if len(shared_train) >= 2:
+                t['basis'] = 'train_seed_means'
+                t['certifiable'] = True
+                t.update(paired_t_one_sided([a_train[s] for s in shared_train],
+                                            [b_train[s] for s in shared_train], alpha=alpha))
             else:
-                t.update(paired_t_one_sided(av, bv, alpha=alpha))
+                t['basis'] = 'probe_paired_single_train_run'
+                t['certifiable'] = False
+                if len(shared) < 2:
+                    t['mean_delta'] = (sum(av) - sum(bv)) / len(shared) if shared else None
+                    t['p_one_sided'] = None
+                    t['reason'] = 'need >= 2 shared samples to pair a test'
+                else:
+                    t.update(paired_t_one_sided(av, bv, alpha=alpha))
+                t['reason'] = (f'only {len(shared_train)} shared training seed(s): one run per arm cannot '
+                               'separate the checkpoint from run-to-run noise, so the probe-paired test is '
+                               'descriptive only; pass comma-separated checkpoints with distinct training '
+                               'seeds per arm to certify')
             tests.append(t)
     for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
         t['p_holm'] = p_adj
-        t['significant'] = bool(p_adj is not None and p_adj < alpha)
+        t['significant'] = bool(t.get('certifiable') and p_adj is not None and p_adj < alpha)
     degradation = []
     for label, r in zip(labels, results):
         vals = _seed_metric_values(r, metric)
         stats = mean_std_stderr(vals)
+        train_vals = list(_train_seed_metric_values(r, metric).values())
+        train_stats = mean_std_stderr(train_vals)
         d = {'ckpt': label, 'metric': metric, 'n_seeds': len(vals),
+             'n_train_seeds': len(train_vals),
              'mean_drop_pct': stats['mean'] if stats else None,
+             'mean_drop_pct_across_train_seeds': train_stats['mean'] if train_stats else None,
              'direction': f'H1: mean({metric}) > 0 (quantization measurably hurts)'}
-        if len(vals) >= 2:
+        if len(train_vals) >= 2:
+            d['basis'] = 'train_seed_means'
+            d['certifiable'] = True
             # paired_t_one_sided(zeros, vals) tests mean(0 - vals) < 0, i.e.
             # mean(vals) > 0; the interval is for -mean(vals), so flip it back.
-            t = paired_t_one_sided([0.0] * len(vals), vals, alpha=alpha)
+            t = paired_t_one_sided([0.0] * len(train_vals), train_vals, alpha=alpha)
             d.update({'p_one_sided': t['p_one_sided'], 'ci_low': -t['ci_high'],
                       'ci_high': -t['ci_low']})
         else:
-            d.update({'p_one_sided': None, 'reason': 'need >= 2 seeds'})
+            d['basis'] = 'probe_only_single_train_run'
+            d['certifiable'] = False
+            if len(vals) >= 2:
+                t = paired_t_one_sided([0.0] * len(vals), vals, alpha=alpha)
+                d.update({'p_one_sided': t['p_one_sided'], 'ci_low': -t['ci_high'],
+                          'ci_high': -t['ci_low'],
+                          'reason': (f'only {len(train_vals)} training seed(s): the drop is measured on one '
+                                     'trained run, so the probe-paired p-value is descriptive only')})
+            else:
+                d.update({'p_one_sided': None, 'reason': 'need >= 2 probe seeds'})
         degradation.append(d)
     for d, p_adj in zip(degradation, holm_adjust([d.get('p_one_sided') for d in degradation])):
         d['p_holm'] = p_adj
-        d['significant'] = bool(p_adj is not None and p_adj < alpha)
+        d['significant'] = bool(d.get('certifiable') and p_adj is not None and p_adj < alpha)
     ranking = []
     for label, r in zip(labels, results):
         vals = _seed_metric_values(r, metric)
         stats = mean_std_stderr(vals)
-        ranking.append({'ckpt': label, 'n_seeds': len(vals),
+        train_vals = list(_train_seed_metric_values(r, metric).values())
+        train_stats = mean_std_stderr(train_vals)
+        ranking.append({'ckpt': label, 'n_seeds': len(vals), 'n_train_seeds': len(train_vals),
                         'mean': stats['mean'] if stats else None,
-                        'std': stats['std'] if stats and stats['n'] >= 2 else None})
+                        'std': stats['std'] if stats and stats['n'] >= 2 else None,
+                        'mean_across_train_seeds': train_stats['mean'] if train_stats else None,
+                        'std_across_train_seeds': (train_stats['std']
+                                                   if train_stats and train_stats['n'] >= 2 else None)})
     ranking.sort(key=lambda row: (row['mean'] is None, row['mean']))
     return {'metric': metric, 'alpha': alpha,
-            'pairing': 'per-seed probe batches are identical across checkpoints (same generator seed)',
+            'pairing': ('probe batches are paired across arms by probe seed; certification additionally '
+                        'requires >= 2 shared training seeds per arm and otherwise stays descriptive'),
             'ranking': ranking, 'pairwise_tests': tests, 'degradation_tests': degradation}
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpts', nargs='+', required=True)
+    p.add_argument('--ckpts', nargs='+', required=True, help='one entry per arm; a plain path is one trained checkpoint. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-arm certification in ppl_comparison.json pairs training seeds, so >= 2 shared training seeds across the compared arms are required to certify a winner')
     p.add_argument('--probe', default='markov', choices=['markov', 'dataset', 'random'], help="probe corpus. 'random' is uniform tokens: it has no next-token signal, so ppl_fp ~= vocab_size and the PPL drop is unmeasurable (kept only for parity)")
     p.add_argument('--probe-split', default='validation', choices=['validation', 'test', 'train'], help="held-out split used by --probe dataset. Keep the default: 'test' is sealed for one final evaluation and 'train' reports an optimistically biased PPL")
     p.add_argument('--allow-sealed-test', action='store_true', help="permit the single final check on the sealed test split; comparing checkpoints or quantization settings on 'test' would turn it into an implicit validation set")
@@ -322,60 +384,106 @@ def main():
         if args.probe == 'markov':
             return _probe_markov(rng, args.batch_size, args.seq_len, device, n_states=args.n_states)
         return dataset_probe()
+    ckpt_groups = [[path for path in str(entry).split(',') if path] for entry in args.ckpts]
+    if any(not group for group in ckpt_groups):
+        p.error('--ckpts entries must not be empty')
     results = []
-    for ckpt_path in args.ckpts:
-        model, ckpt_args = load_ckpt(ckpt_path, device=device)
-        # Prefer the split the checkpoint was trained with, so the probe is the
-        # same held-out slice; a flag typed on the command line wins.
-        def split_arg(name):
-            value = getattr(args, name)
-            default = p.get_default(name)
-            if value == default and name in ckpt_args and ckpt_args.get(name) is not None:
-                return ckpt_args[name]
-            return value
-        # Same precedence for the data version: an explicit flag wins, else
-        # the revision the checkpoint recorded, else upstream default branch.
-        dataset_revision = args.dataset_revision if args.dataset_revision is not None else ckpt_args.get('dataset_revision')
-        tokenizer_revision = args.tokenizer_revision if args.tokenizer_revision is not None else ckpt_args.get('tokenizer_revision')
-        dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision) if args.probe == 'dataset' else None
+    for group in ckpt_groups:
+        label = group[0] if len(group) == 1 else f'{group[0]} (+{len(group) - 1} more)'
+        per_ckpt = []
+        for ckpt_path in group:
+            model, ckpt_args = load_ckpt(ckpt_path, device=device)
+            # Prefer the split the checkpoint was trained with, so the probe is
+            # the same held-out slice; a flag typed on the command line wins.
+            def split_arg(name):
+                value = getattr(args, name)
+                default = p.get_default(name)
+                if value == default and name in ckpt_args and ckpt_args.get(name) is not None:
+                    return ckpt_args[name]
+                return value
+            # Same precedence for the data version: an explicit flag wins, else
+            # the revision the checkpoint recorded, else upstream default branch.
+            dataset_revision = args.dataset_revision if args.dataset_revision is not None else ckpt_args.get('dataset_revision')
+            tokenizer_revision = args.tokenizer_revision if args.tokenizer_revision is not None else ckpt_args.get('tokenizer_revision')
+            dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision) if args.probe == 'dataset' else None
+            raw_seed = ckpt_args.get('seed')
+            train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
+            per_seed = []
+            for seed in seeds:
+                # A fresh copy per seed: `wrap_model_w8a8` quantizes the weights in
+                # place, so the next seed's fp32 reference needs its own unmodified
+                # model, and each seed is an independent probe draw.
+                model, _ = load_ckpt(ckpt_path, device=device)
+                rng = torch.Generator(device=device).manual_seed(seed)
+                batches = []
+                for _ in range(max(1, args.n_batches)):
+                    x = make_probe(rng, model.cfg, dataset_probe)
+                    batches.append(x)
+                coverage = probe_token_coverage(batches)
+                if coverage > args.max_probe_coverage:
+                    raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
+                ce_fp = 0.0
+                n_tok = 0
+                for x in batches:
+                    y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
+                    y[:, :-1] = x[:, 1:]
+                    a, n = compute_ce_sum(model, x, y, device=device)
+                    ce_fp += a
+                    n_tok += n
+                wrap_model_w8a8(model)
+                ce_q = 0.0
+                for x in batches:
+                    y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
+                    y[:, :-1] = x[:, 1:]
+                    b, _ = compute_ce_sum(model, x, y, device=device)
+                    ce_q += b
+                ppl_fp = math.exp(ce_fp / n_tok)
+                ppl_q = math.exp(ce_q / n_tok)
+                per_seed.append({'ckpt': ckpt_path, 'probe': args.probe, 'probe_split': args.probe_split if args.probe == 'dataset' else None, 'seed': seed, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage})
+            r_ckpt = aggregate_w8a8_seed_rows(ckpt_path, per_seed)
+            if args.probe == 'dataset' and args.probe_split != 'validation':
+                print(f"[w8a8] WARNING: --probe dataset scored on the '{args.probe_split}' split; use 'validation' for model comparison ('test' is reserved for the single final evaluation, 'train' is optimistically biased)", file=sys.stderr)
+            if r_ckpt['ppl_fp'] >= 0.5 * model.cfg.vocab_size:
+                print(f"[w8a8] WARNING: {ckpt_path} ppl_fp={r_ckpt['ppl_fp']:.1f} (mean over {r_ckpt['n_seeds']} seeds) is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={r_ckpt['probe_token_coverage']:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet", file=sys.stderr)
+            per_ckpt.append({'path': ckpt_path, 'train_seed': train_seed,
+                             'agg': {k: v for k, v in r_ckpt.items() if k != 'per_seed'},
+                             'per_seed': per_seed})
+        # Arm-level probe records: each probe seed keeps one row whose metrics
+        # are the mean over this arm's checkpoints (the probe seed is the
+        # shared draw; checkpoints replicate the training run).
         per_seed = []
-        for seed in seeds:
-            # A fresh copy per seed: `wrap_model_w8a8` quantizes the weights in
-            # place, so the next seed's fp32 reference needs its own unmodified
-            # model, and each seed is an independent probe draw.
-            model, _ = load_ckpt(ckpt_path, device=device)
-            rng = torch.Generator(device=device).manual_seed(seed)
-            batches = []
-            for _ in range(max(1, args.n_batches)):
-                x = make_probe(rng, model.cfg, dataset_probe)
-                batches.append(x)
-            coverage = probe_token_coverage(batches)
-            if coverage > args.max_probe_coverage:
-                raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
-            ce_fp = 0.0
-            n_tok = 0
-            for x in batches:
-                y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
-                y[:, :-1] = x[:, 1:]
-                a, n = compute_ce_sum(model, x, y, device=device)
-                ce_fp += a
-                n_tok += n
-            wrap_model_w8a8(model)
-            ce_q = 0.0
-            for x in batches:
-                y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
-                y[:, :-1] = x[:, 1:]
-                b, _ = compute_ce_sum(model, x, y, device=device)
-                ce_q += b
-            ppl_fp = math.exp(ce_fp / n_tok)
-            ppl_q = math.exp(ce_q / n_tok)
-            per_seed.append({'ckpt': ckpt_path, 'probe': args.probe, 'probe_split': args.probe_split if args.probe == 'dataset' else None, 'seed': seed, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage})
-        r = aggregate_w8a8_seed_rows(ckpt_path, per_seed)
-        if args.probe == 'dataset' and args.probe_split != 'validation':
-            print(f"[w8a8] WARNING: --probe dataset scored on the '{args.probe_split}' split; use 'validation' for model comparison ('test' is reserved for the single final evaluation, 'train' is optimistically biased)", file=sys.stderr)
-        if r['ppl_fp'] >= 0.5 * model.cfg.vocab_size:
-            print(f"[w8a8] WARNING: {ckpt_path} ppl_fp={r['ppl_fp']:.1f} (mean over {r['n_seeds']} seeds) is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={r['probe_token_coverage']:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet", file=sys.stderr)
-        print(f'[w8a8] {ckpt_path}: {r}')
+        for j, seed in enumerate(seeds):
+            record = dict(per_ckpt[0]['per_seed'][j])
+            for key in _W8A8_SEED_METRIC_KEYS:
+                vals = [c['per_seed'][j][key] for c in per_ckpt
+                        if isinstance(c['per_seed'][j].get(key), (int, float))]
+                if vals:
+                    record[key] = sum(vals) / len(vals)
+            record['seed'] = seed
+            record['n_checkpoints'] = len(per_ckpt)
+            per_seed.append(record)
+        r = aggregate_w8a8_seed_rows(label, per_seed)
+        train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
+        r['train_seeds'] = train_seeds
+        r['n_train_seeds'] = len(train_seeds)
+        r['ckpts'] = list(group)
+        r['per_checkpoint'] = per_ckpt
+        per_train_seed = {}
+        for c in per_ckpt:
+            if c['train_seed'] is None:
+                continue
+            bucket = per_train_seed.setdefault(c['train_seed'], {key: [] for key in _W8A8_SEED_METRIC_KEYS})
+            for rec in c['per_seed']:
+                for key in _W8A8_SEED_METRIC_KEYS:
+                    value = rec.get(key)
+                    if isinstance(value, (int, float)):
+                        bucket[key].append(float(value))
+        r['per_train_seed'] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
+                               for ts, bucket in per_train_seed.items()}
+        if len(group) > 1 and len(train_seeds) < 2:
+            print(f'[w8a8][warn] {label}: {len(group)} checkpoints but {len(train_seeds)} distinct training '
+                  'seed(s); cross-arm certification needs >= 2 independent training runs per arm', file=sys.stderr)
+        print(f'[w8a8] {label}: {r}')
         results.append(r)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -388,13 +496,17 @@ def main():
             print(f"[w8a8][compare] {t['a']} vs {t['b']} on {t['metric']}: {t['reason']}")
             continue
         verdict = 'A more robust' if t['significant'] and t['mean_delta'] < 0 else ('B more robust' if t['significant'] else 'inside the noise')
-        print(f"[w8a8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4f} pts, 95% CI [{t['ci_low']:+.4f}, {t['ci_high']:+.4f}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}) -> {verdict}")
+        if not t.get('certifiable'):
+            verdict = 'descriptive only (single training run per arm)'
+        print(f"[w8a8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4f} pts, 95% CI [{t['ci_low']:+.4f}, {t['ci_high']:+.4f}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}, basis={t['basis']}) -> {verdict}")
     for d in comparison['degradation_tests']:
         if d.get('p_one_sided') is None:
             print(f"[w8a8][compare] {d['ckpt']}: degradation not testable ({d['reason']})")
             continue
         verdict = 'real degradation' if d['significant'] else 'inside the noise'
-        print(f"[w8a8][compare] {d['ckpt']}: mean drop {d['mean_drop_pct']:.4f}% pts, 95% CI [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}], Holm p={d['p_holm']:.4f} (n={d['n_seeds']}) -> {verdict}")
+        if not d.get('certifiable'):
+            verdict = 'descriptive only (single training run)'
+        print(f"[w8a8][compare] {d['ckpt']}: mean drop {d['mean_drop_pct']:.4f}% pts, 95% CI [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}], Holm p={d['p_holm']:.4f} (n={d['n_seeds']}, basis={d['basis']}) -> {verdict}")
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
     manifest['seeds'] = seeds

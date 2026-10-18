@@ -17,12 +17,23 @@ FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
 # One probe draw is one sample: these per-norm quantities are aggregated as
 # Mean +/- Std over the `--seeds` replications, with the per-seed records kept
-# so an unstable seed cannot hide behind a favorable mean. Cross-norm
-# differences are additionally tested for significance in `compare_fp8_norms`
-# (paired across the shared seeds, Holm-adjusted over metrics x pairs), because
-# a "more stable" claim resting on a mean difference inside the seed spread is
-# not a result; the comparison is saved next to the results as
-# `comparison.json`.
+# so an unstable seed cannot hide behind a favorable mean.
+#
+# Cross-norm certification needs both dimensions to be replicated:
+# * the training run (initialization / data order) is the run-to-run unit. A
+#   `--ckpt` entry may be a comma-separated list of checkpoint paths (training
+#   seeds) for one norm; when two norms share >= 2 *training* seeds the
+#   comparison pairs their per-training-seed probe means and certifies
+#   significance on that basis.
+# * a single trained checkpoint per norm (the common case) leaves only probe
+#   noise in the denominator: `compare_fp8_norms(trained=True)` then reports
+#   the probe-paired tests as descriptive and never calls them significant,
+#   because "norm A is more FP8-stable" is a claim about training runs, not
+#   about one draw of probe batches on one trained model. In random-init mode
+#   each seed re-initializes the model too, so the paired test does cover
+#   independent (init, probe) draws and stays certifiable - but it still says
+#   nothing about trained weights.
+# The comparison is saved next to the results as `comparison.json`.
 _FP8_SEED_METRIC_KEYS = (
     'max_abs_pre_norm', 'max_abs_post_norm', 'mean_excess_kurtosis_pre_norm',
     'mean_overflow_rate_e4m3', 'max_overflow_rate_e4m3',
@@ -239,6 +250,15 @@ def _seed_metric_values(agg: dict, key: str) -> list:
     return [float(r[key]) for r in agg.get('per_seed', [])
             if isinstance(r.get(key), (int, float))]
 
+def _train_seed_metric_values(agg: dict, key: str) -> dict:
+    """Per-training-seed mean of `key` (averaged over that seed's checkpoints)."""
+    out = {}
+    for train_seed, metrics in (agg.get('per_train_seed') or {}).items():
+        value = metrics.get(key) if isinstance(metrics, dict) else None
+        if isinstance(value, (int, float)):
+            out[int(train_seed)] = float(value)
+    return out
+
 def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list, list]:
     """Per-seed values of `key` for the seeds both norms measured, paired by seed.
 
@@ -254,57 +274,106 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
                     and isinstance(b_by_seed[s], (int, float)))
     return shared, [float(a_by_seed[s]) for s in shared], [float(b_by_seed[s]) for s in shared]
 
-def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alpha: float=0.05) -> dict:
+def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alpha: float=0.05,
+                      trained: bool=False) -> dict:
     """Paired, Holm-adjusted significance of one norm's FP8 metrics vs another's.
 
-    For every metric and every unordered norm pair the test is the one-sided
-    paired Student-t `H1: mean(A - B) < 0`, so a negative `mean_delta` means A
-    is more FP8-stable on that metric. Pairs with fewer than 2 shared seeds
-    are reported without a p-value rather than silently tested unpaired.
-    p-values are Holm-adjusted across the whole metric x pair family, so
-    scanning six norms does not hand a "significant" win to the luckiest pair.
-    `main` writes this next to the results as `comparison.json`, mirroring the
-    ablation runner's `leave_one_out_comparison.json`.
+    The test family is the one-sided paired Student-t `H1: mean(A - B) < 0`,
+    so a negative `mean_delta` means A is more FP8-stable on that metric; pairs
+    with fewer than 2 shared samples are reported without a p-value rather
+    than silently tested unpaired. p-values are Holm-adjusted across the whole
+    metric x pair family, so scanning six norms does not hand a "significant"
+    win to the luckiest pair. `main` writes this next to the results as
+    `comparison.json`, mirroring the ablation runner's
+    `leave_one_out_comparison.json`.
+
+    What counts as a sample depends on how the check was run:
+
+    * `trained=True` (checkpoints were probed): the run-to-run unit is the
+      *training* seed, and a test is certifiable (`basis='train_seed_means'`)
+      only when both norms provide >= 2 checkpoints with shared training
+      seeds, i.e. when the Delta is observed across independent training runs.
+      With a single trained checkpoint per norm the paired test degenerates to
+      probe-noise pairing on one model each: it is still computed, but labeled
+      `basis='probe_paired_single_train_run'`, `certifiable=False`, and
+      `significant` stays False so the report cannot certify a cross-norm
+      winner from repeated probes of one run per arm.
+    * `trained=False` (fresh random init): each seed re-initializes the model
+      as well as the probe, so `basis='independent_random_inits'` pairs
+      independent (init, probe) draws and is certifiable - with the standing
+      caveat that a random init says nothing about trained weights.
     """
     labels = [str(r.get('norm') or r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
     tests = []
     for metric in metrics:
         for i in range(len(results)):
             for j in range(i + 1, len(results)):
+                a_train = _train_seed_metric_values(results[i], metric)
+                b_train = _train_seed_metric_values(results[j], metric)
+                shared_train = sorted(set(a_train) & set(b_train))
                 shared, av, bv = _shared_seed_samples(results[i], results[j], metric)
                 t = {'a': labels[i], 'b': labels[j], 'metric': metric,
-                     'n_shared_seeds': len(shared), 'shared_seeds': shared,
-                     'direction': f'negative mean_delta means A has lower {metric} (more FP8-stable)'}
-                if len(shared) < 2:
-                    t['mean_delta'] = (sum(av) - sum(bv)) / len(shared) if shared else None
-                    t['p_one_sided'] = None
-                    t['reason'] = 'need >= 2 seeds measured for both norms to pair a test'
+                     'direction': f'negative mean_delta means A has lower {metric} (more FP8-stable)',
+                     'a_train_seeds': sorted(a_train), 'b_train_seeds': sorted(b_train)}
+                if len(shared_train) >= 2:
+                    t['basis'] = 'train_seed_means'
+                    t['certifiable'] = True
+                    t['n_shared_train_seeds'] = len(shared_train)
+                    t['shared_train_seeds'] = shared_train
+                    t['n_shared_seeds'] = len(shared)
+                    t['shared_seeds'] = shared
+                    t.update(paired_t_one_sided([a_train[s] for s in shared_train],
+                                                [b_train[s] for s in shared_train], alpha=alpha))
                 else:
-                    t.update(paired_t_one_sided(av, bv, alpha=alpha))
+                    t['basis'] = ('probe_paired_single_train_run' if trained
+                                  else 'independent_random_inits')
+                    t['certifiable'] = not trained
+                    t['n_shared_train_seeds'] = len(shared_train)
+                    t['shared_train_seeds'] = shared_train
+                    t['n_shared_seeds'] = len(shared)
+                    t['shared_seeds'] = shared
+                    if len(shared) < 2:
+                        t['mean_delta'] = (sum(av) - sum(bv)) / len(shared) if shared else None
+                        t['p_one_sided'] = None
+                        t['reason'] = 'need >= 2 shared samples to pair a test'
+                    else:
+                        t.update(paired_t_one_sided(av, bv, alpha=alpha))
+                    if trained:
+                        t['reason'] = (f'only {len(shared_train)} shared training seed(s): a single run per '
+                                       'arm cannot separate the norm from run-to-run noise, so the probe-paired '
+                                       'test is descriptive only; provide >= 2 checkpoints (comma-separated in '
+                                       '--ckpt) with distinct training seeds per norm to certify')
                 tests.append(t)
     for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
         t['p_holm'] = p_adj
-        t['significant'] = bool(p_adj is not None and p_adj < alpha)
+        t['significant'] = bool(t.get('certifiable') and p_adj is not None and p_adj < alpha)
     ranking = {}
     for metric in metrics:
         rows = []
         for label, r in zip(labels, results):
             vals = _seed_metric_values(r, metric)
             stats = mean_std_stderr(vals)
+            train_vals = list(_train_seed_metric_values(r, metric).values())
+            train_stats = mean_std_stderr(train_vals)
             rows.append({'norm': label, 'n_seeds': len(vals),
+                         'n_train_seeds': len(train_vals),
                          'mean': stats['mean'] if stats else None,
-                         'std': stats['std'] if stats and stats['n'] >= 2 else None})
+                         'std': stats['std'] if stats and stats['n'] >= 2 else None,
+                         'mean_across_train_seeds': train_stats['mean'] if train_stats else None,
+                         'std_across_train_seeds': (train_stats['std']
+                                                    if train_stats and train_stats['n'] >= 2 else None)})
         rows.sort(key=lambda row: (row['mean'] is None, row['mean']))
         ranking[metric] = rows
-    return {'metrics': list(metrics), 'alpha': alpha,
-            'pairing': 'per-seed probe draws are identical across norms (and identical init seeds in random-init mode)',
+    return {'metrics': list(metrics), 'alpha': alpha, 'trained': trained,
+            'pairing': ('probe draws are paired across norms by probe seed and (when available) by training seed; '
+                        'certification requires >= 2 shared training seeds per arm and otherwise stays descriptive'),
             'ranking': ranking, 'tests': tests}
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--norms', nargs='+', default=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
     p.add_argument('--probe', default='markov', choices=['markov', 'random'], help="probe corpus. 'random' is uniform token ids: it has no next-token structure, so the activation magnitudes below describe embedding noise rather than a trained model's activations (kept only for parity)")
-    p.add_argument('--ckpt', nargs='+', default=None, help='one checkpoint per --norms entry; when given, the probe runs on the trained weights instead of a fresh random init')
+    p.add_argument('--ckpt', nargs='+', default=None, help='one entry per --norms entry; a plain checkpoint path probes the trained weights instead of a fresh random init. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-norm certification then pairs training seeds, so >= 2 shared training seeds across the compared norms are required for comparison.json to certify a winner')
     p.add_argument('--n-states', type=int, default=64, help="state count of the synthetic 'markov' probe")
     p.add_argument('--batch-size', type=int, default=2)
     p.add_argument('--seq-len', type=int, default=512)
@@ -329,35 +398,84 @@ def main():
             return torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
         x, _ = markov_batch(rng, cfg.ignore_index, args.batch_size, args.seq_len, device, n_states=args.n_states)
         return x
+    ckpt_groups = None
+    if args.ckpt:
+        ckpt_groups = [[path for path in str(entry).split(',') if path] for entry in args.ckpt]
+        if any(not group for group in ckpt_groups):
+            p.error('--ckpt entries must not be empty')
     results = []
     for i, norm in enumerate(args.norms):
-        if args.ckpt:
-            from scripts.eval_downstream import load_ckpt
-        else:
+        if not args.ckpt:
             print(f'[fp8] WARNING: {norm} probed at a fresh random init. layerscale_init=1e-5 leaves the residual stream at the embedding table, so every norm reports the same pre-norm statistics and this row says nothing about the layer. Pass --ckpt <path> (one per --norms entry) to measure trained weights.', file=sys.stderr)
+        else:
+            from scripts.eval_downstream import load_ckpt
+        per_ckpt = []
+        for ckpt_path in (ckpt_groups[i] if ckpt_groups else [None]):
+            train_seed = None
+            ckpt_model = None
+            if ckpt_path is not None:
+                ckpt_model, ckpt_args = load_ckpt(ckpt_path, device=device)
+                raw_seed = (ckpt_args or {}).get('seed')
+                train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
+            per_seed_ckpt = []
+            for seed in seeds:
+                set_all_seeds(seed)
+                rng = torch.Generator(device=device).manual_seed(seed)
+                if ckpt_model is not None:
+                    model = ckpt_model
+                else:
+                    model = build_gpt_124m(norm_name=norm).to(device)
+                    model.reset_parameters(seed)
+                model.eval()
+                x = make_probe(rng, model.cfg)
+                r = measure_fp8_divergence(model, x, norm)
+                r['seed'] = seed
+                per_seed_ckpt.append(r)
+            per_ckpt.append({'ckpt': ckpt_path, 'train_seed': train_seed,
+                             'per_seed': per_seed_ckpt})
+        # Norm-level probe records: each probe seed keeps one row whose metrics
+        # are the mean over this norm's checkpoints (probe seed is the shared
+        # draw; checkpoints are replicates of the arm).
         per_seed = []
-        for seed in seeds:
-            set_all_seeds(seed)
-            rng = torch.Generator(device=device).manual_seed(seed)
-            if args.ckpt:
-                model, _ = load_ckpt(args.ckpt[i], device=device)
-            else:
-                model = build_gpt_124m(norm_name=norm).to(device)
-                model.reset_parameters(seed)
-            model.eval()
-            x = make_probe(rng, model.cfg)
-            r = measure_fp8_divergence(model, x, norm)
-            r['seed'] = seed
-            per_seed.append(r)
+        for j, seed in enumerate(seeds):
+            record = {k: v for k, v in per_ckpt[0]['per_seed'][j].items() if not k.startswith('__')}
+            for key in _FP8_SEED_METRIC_KEYS:
+                vals = [c['per_seed'][j][key] for c in per_ckpt
+                        if isinstance(c['per_seed'][j].get(key), (int, float))]
+                if vals:
+                    record[key] = sum(vals) / len(vals)
+            record['seed'] = seed
+            record['n_checkpoints'] = len(per_ckpt)
+            per_seed.append(record)
         r = aggregate_fp8_seed_rows(norm, per_seed)
-        if args.ckpt:
-            r['ckpt'] = args.ckpt[i]
+        train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
+        r['train_seeds'] = train_seeds
+        r['n_train_seeds'] = len(train_seeds)
+        per_train_seed = {}
+        for c in per_ckpt:
+            if c['train_seed'] is None:
+                continue
+            bucket = per_train_seed.setdefault(c['train_seed'], {key: [] for key in _FP8_SEED_METRIC_KEYS})
+            for rec in c['per_seed']:
+                for key in _FP8_SEED_METRIC_KEYS:
+                    value = rec.get(key)
+                    if isinstance(value, (int, float)):
+                        bucket[key].append(float(value))
+        r['per_train_seed'] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
+                               for ts, bucket in per_train_seed.items()}
+        if ckpt_groups:
+            r['ckpt'] = list(ckpt_groups[i])
+            r['ckpts'] = list(ckpt_groups[i])
+            if ckpt_groups[i] != [None] and len(train_seeds) < 2:
+                print(f'[fp8][warn] {norm}: {len(ckpt_groups[i])} checkpoint(s) but {len(train_seeds)} distinct '
+                      'training seed(s); cross-norm certification needs >= 2 independent training runs per arm '
+                      '(pass comma-separated checkpoints with distinct training seeds)', file=sys.stderr)
         print(f'[fp8] {norm}: {r}')
         results.append(r)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
-    comparison = compare_fp8_norms(results, alpha=args.alpha)
+    comparison = compare_fp8_norms(results, alpha=args.alpha, trained=bool(args.ckpt))
     comparison_path = out_path.with_name('comparison.json')
     comparison_path.write_text(json.dumps(comparison, indent=2))
     for t in comparison['tests']:
@@ -365,7 +483,9 @@ def main():
             print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: {t['reason']}")
             continue
         verdict = 'A more stable' if t['significant'] and t['mean_delta'] < 0 else ('B more stable' if t['significant'] else 'inside the noise')
-        print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4g}, 95% CI [{t['ci_low']:+.4g}, {t['ci_high']:+.4g}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}) -> {verdict}")
+        if not t.get('certifiable'):
+            verdict = 'descriptive only (single training run per arm)'
+        print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4g}, 95% CI [{t['ci_low']:+.4g}, {t['ci_high']:+.4g}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}, basis={t['basis']}) -> {verdict}")
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
     manifest['seeds'] = seeds

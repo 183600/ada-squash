@@ -11,7 +11,12 @@ backbone, shape and device:
   torch's `FlopCounterMode` is available, the counter's measurement of the
   actual forward;
 * forward latency and full training-step latency per token (warmup + repeated
-  measurements, mean/std, on CUDA with events and synchronization);
+  measurements, mean/std, on CUDA with events and synchronization). A single
+  serial pass in fixed norm order lets a slow thermal/clock drift land on the
+  norms measured later, so the norms are interleaved round-robin over
+  `--rounds` passes (alternating forward and reverse order), each norm's
+  estimate is the mean of its per-round means, and the exact measurement
+  order is recorded in the report (`measurement_order`, `latency_by_round`);
 * peak CUDA memory for inference and for a training step (null on CPU: the
   process RSS cannot be attributed to one model).
 
@@ -154,6 +159,50 @@ def benchmark_norm(model_name: str, norm: str, args, device: str) -> dict:
     }
 
 
+_LATENCY_MEAN_KEYS = ('forward_latency_ms_per_token', 'training_latency_ms_per_token',
+                      'forward_tokens_per_second', 'training_tokens_per_second')
+
+
+def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
+    """One row per norm, latency estimates averaged over the interleaved rounds.
+
+    Each round measured the same norm in a different position of the order, so
+    the per-round means are (approximately) independent samples of the
+    position-dependent drift. Averaging them cancels a *linear* drift to first
+    order and keeps every norm's estimate resting on the same number of
+    iterations; `latency_by_round` is retained so the raw spread can be
+    audited instead of hidden behind the cross-round mean.
+    """
+    out = []
+    for norm in norms:
+        norm_rows = [r for r in rows if r['norm'] == norm]
+        base = dict(norm_rows[0])
+        for key in _LATENCY_MEAN_KEYS:
+            base[key] = sum(r[key] for r in norm_rows) / len(norm_rows)
+        base['forward_latency_ms'] = {
+            'mean_ms': sum(r['forward_latency_ms']['mean_ms'] for r in norm_rows) / len(norm_rows),
+            'median_ms': sum(r['forward_latency_ms']['median_ms'] for r in norm_rows) / len(norm_rows),
+            'std_ms': sum(r['forward_latency_ms']['std_ms'] for r in norm_rows) / len(norm_rows),
+            'n_iters': norm_rows[0]['forward_latency_ms']['n_iters'],
+            'n_rounds': len(norm_rows),
+        }
+        base['training_latency_ms'] = {
+            'mean_ms': sum(r['training_latency_ms']['mean_ms'] for r in norm_rows) / len(norm_rows),
+            'median_ms': sum(r['training_latency_ms']['median_ms'] for r in norm_rows) / len(norm_rows),
+            'std_ms': sum(r['training_latency_ms']['std_ms'] for r in norm_rows) / len(norm_rows),
+            'n_iters': norm_rows[0]['training_latency_ms']['n_iters'],
+            'n_rounds': len(norm_rows),
+        }
+        base['latency_by_round'] = [{'round': r['round'],
+                                     'forward_ms': r['forward_latency_ms'],
+                                     'training_ms': r['training_latency_ms']}
+                                    for r in norm_rows]
+        base['peak_inference_memory_mb'] = norm_rows[0]['peak_inference_memory_mb']
+        base['peak_training_memory_mb'] = norm_rows[0]['peak_training_memory_mb']
+        out.append(base)
+    return out
+
+
 def load_losses(summaries_path: str) -> dict:
     data = json.loads(Path(summaries_path).read_text())
     rows = data if isinstance(data, list) else (data.get('rows') or data.get('summaries') or [])
@@ -233,6 +282,7 @@ def main():
     p.add_argument('--batch-size', type=int, default=4)
     p.add_argument('--iters', type=int, default=10)
     p.add_argument('--warmup', type=int, default=3)
+    p.add_argument('--rounds', type=int, default=3, help='interleaved passes over the norms; each pass measures every norm once and alternates forward/reverse order, so a monotone thermal/clock drift is spread over all norms instead of loading onto the ones measured last. Each norm reports the mean of its per-round means (>= 1; more rounds = more drift cancellation)')
     p.add_argument('--lr', type=float, default=6e-4)
     p.add_argument('--include-optimizer', action='store_true', help='include the optimizer step in the training latency')
     p.add_argument('--bf16', action='store_true', help='run the timed passes under bf16 autocast (CUDA only)')
@@ -258,13 +308,25 @@ def main():
         print(f'[hypothesis] {args.hypothesis}')
     else:
         print('[hypothesis] none stated: pass --hypothesis "..." so this tradeoff verdict is auditable as a test of a claim, not a sweep')
-    results = []
-    for norm in args.norms:
-        r = benchmark_norm(args.model, norm, args, device)
-        results.append(r)
-        print(f"[bench] {norm:>8s}: params={r['n_params']} norm_share={100.0 * r['norm_share_of_total']:.4f}% "
+    rounds = max(1, int(args.rounds))
+    if rounds != args.rounds:
+        print(f'[bench][warn] --rounds={args.rounds} clamped to {rounds}')
+    measurement_order = []
+    raw_rows = []
+    for r_i in range(rounds):
+        order = list(args.norms) if r_i % 2 == 0 else list(reversed(args.norms))
+        measurement_order.append(order)
+        print(f'[bench] round {r_i + 1}/{rounds} order: {order}')
+        for norm in order:
+            row = benchmark_norm(args.model, norm, args, device)
+            row['round'] = r_i
+            raw_rows.append(row)
+    results = aggregate_benchmark_rounds(raw_rows, args.norms, rounds)
+    for r in results:
+        print(f"[bench] {r['norm']:>8s}: params={r['n_params']} norm_share={100.0 * r['norm_share_of_total']:.4f}% "
               f"fwd={r['forward_latency_ms_per_token']:.4f} ms/tok train={r['training_latency_ms_per_token']:.4f} ms/tok "
-              f"measured_flops={r['measured_forward_flops_per_token'] and round(r['measured_forward_flops_per_token'])}")
+              f"measured_flops={r['measured_forward_flops_per_token'] and round(r['measured_forward_flops_per_token'])} "
+              f"({r['forward_latency_ms']['n_rounds']} round(s) averaged)")
     print_table(results, args.reference)
 
     tradeoff = None
@@ -384,8 +446,13 @@ def main():
         'config': vars(args),
         'results': results,
         'tradeoff': tradeoff,
+        'rounds': rounds,
+        'measurement_order': measurement_order,
         'method': {
-            'latency': f"mean over {args.iters} timed iterations after {args.warmup} warmup; per token = per step / (batch*seq)",
+            'latency': (f"per norm, the mean of {rounds} interleaved round mean(s) over {args.iters} timed iterations "
+                        f"after {args.warmup} warmup each; rounds alternate forward/reverse norm order so drift is "
+                        f"not confounded with norm identity (raw per-round timings in latency_by_round); "
+                        f"per token = per step / (batch*seq)"),
             'flops': 'analytic = matmul FLOPs per token; measured = torch FlopCounterMode forward',
             'memory': 'peak CUDA allocated; null on CPU',
         },

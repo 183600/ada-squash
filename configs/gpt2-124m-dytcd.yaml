@@ -6,8 +6,22 @@ learnable_k: true
 p_init: 2.0
 learnable_p: true
 qk_norm: null
+# LayerScale on and layerscale_init set: intrinsic to the DyT-D depth axis
+# that DyT-CD bundles (docs/design_notes.md), so dytcd-vs-dytc changes the
+# depth mechanism *and* LayerScale. configs/gpt2-124m-dytcd-no-ls.yaml is the
+# LayerScale-controlled companion (same recipe, only use_layerscale differs);
+# configs/gpt2-124m-dytcd-tanh.yaml isolates the generalized-softsign
+# activation family instead.
 use_layerscale: true
 layerscale_init: 1.0e-5
+
+# Phase 1 statistics: each variant is replicated over these training seeds,
+# every seed a full independent run under <output_dir>/seed{N}/; the launcher
+# aggregates Mean +/- Std across seeds into <output_dir>/aggregate.json.
+# Seeds are the unit of replication (>= 3), because one run cannot separate
+# the normalization effect from run-to-run noise. Pass `--seeds <one>` for the
+# single-run layout in place, or the legacy `--seed N` shorthand.
+seeds: [42, 43, 44]
 
 dataset: HuggingFaceFW/fineweb-edu
 dataset_config: sample-10BT

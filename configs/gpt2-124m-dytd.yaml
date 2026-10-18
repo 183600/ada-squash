@@ -4,8 +4,22 @@ alpha_0: 0.9
 k_init: 1.0
 learnable_k: true
 qk_norm: null
+# LayerScale on and layerscale_init set: per docs/design_notes.md the DyT-D
+# depth axis *is* "depth-decaying alpha + LayerScale residual", so this is the
+# variant's intrinsic mechanism, not a controlled variable. Comparing this
+# row against dyt / dytc therefore changes the norm and LayerScale together;
+# configs/gpt2-124m-dytd-no-ls.yaml is the LayerScale-controlled companion
+# that isolates the depth-decay component.
 use_layerscale: true
 layerscale_init: 1.0e-5
+
+# Phase 1 statistics: each variant is replicated over these training seeds,
+# every seed a full independent run under <output_dir>/seed{N}/; the launcher
+# aggregates Mean +/- Std across seeds into <output_dir>/aggregate.json.
+# Seeds are the unit of replication (>= 3), because one run cannot separate
+# the normalization effect from run-to-run noise. Pass `--seeds <one>` for the
+# single-run layout in place, or the legacy `--seed N` shorthand.
+seeds: [42, 43, 44]
 
 dataset: HuggingFaceFW/fineweb-edu
 dataset_config: sample-10BT

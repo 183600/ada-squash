@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from contextlib import nullcontext
@@ -17,7 +18,7 @@ from adasquash import GPTConfig, GPT, count_parameters, ActivationStats, LossSpi
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
-from adasquash.metrics import mean_ci
+from adasquash.metrics import mean_ci, mean_std_stderr
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache
 from adasquash.norms import NORM_REGISTRY
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
@@ -245,6 +246,156 @@ def apply_explicit_optimizer_args(opt, sched, args, explicit: frozenset=frozense
             b0, b1 = group['betas']
             group['betas'] = (args.beta1 if 'beta1' in explicit else b0, args.beta2 if 'beta2' in explicit else b1)
 
+DEFAULT_SEED = 42
+
+def seed_run_dir(base: Path, seed: int) -> Path:
+    """Per-seed run directory: `<output-dir>/seed{N}/` in multi-seed mode."""
+    return base / f'seed{int(seed)}'
+
+def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
+    """Pool per-seed runs into one Mean +/- Std record (Phase 1 statistics).
+
+    The seed is the unit of replication: seed runs are independent draws of
+    the whole protocol (initialization, data order, batch sampling), while the
+    held-out batches inside one run are not. `final_val_loss` (the last
+    validation pass at the fixed step budget) is the number the variants are
+    compared on; `best_val_loss` travels next to it because it is the
+    checkpoint-selection statistic and is optimistically biased. Both are
+    pooled across seeds, and the sealed `test_loss` of every seed (when the
+    run evaluated it) is kept per seed so `scripts/compare_sealed_tests.py`
+    can pair two arms by their shared training seeds instead of by test
+    batches of a single run. Missing/invalid seeds are reported, never
+    silently dropped.
+    """
+    per_seed = []
+    for seed in seeds:
+        run_dir = seed_run_dir(base_dir, seed)
+        record = {
+            'seed': int(seed), 'run_dir': str(run_dir),
+            'final_val_loss': None, 'best_val_loss': None,
+            'final_val_step': None, 'best_val_step': None,
+            'n_params': None, 'n_layers': None, 'dim': None, 'n_heads': None,
+            'n_loss_spikes': None, 'n_nonfinite_losses': None,
+            'curve_classification': None, 'test_loss': None,
+        }
+        try:
+            manifest = json.loads((run_dir / 'run_manifest.json').read_text())
+            results = manifest.get('results') if isinstance(manifest, dict) else None
+            if isinstance(results, dict):
+                record['final_val_loss'] = results.get('final_val_loss')
+                record['best_val_loss'] = results.get('best_val_loss')
+                record['final_val_step'] = results.get('final_val_step')
+                record['best_val_step'] = results.get('best_val_step')
+                record['n_params'] = results.get('n_params')
+                record['n_layers'] = results.get('n_layers')
+                record['dim'] = results.get('dim')
+                record['n_heads'] = results.get('n_heads')
+                record['n_loss_spikes'] = results.get('n_loss_spikes')
+                record['n_nonfinite_losses'] = results.get('n_nonfinite_losses')
+                curve = results.get('curve_diagnosis') or {}
+                record['curve_classification'] = curve.get('classification')
+        except (OSError, json.JSONDecodeError):
+            pass
+        try:
+            test = json.loads((run_dir / 'test_results.json').read_text())
+            value = test.get('test_loss') if isinstance(test, dict) else None
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                record['test_loss'] = float(value)
+        except (OSError, json.JSONDecodeError):
+            pass
+        per_seed.append(record)
+
+    def _finite(value) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+    def _pool(key: str):
+        vals = [float(r[key]) for r in per_seed if _finite(r.get(key))]
+        return vals, (mean_std_stderr(vals) if vals else None)
+
+    final_vals, final_stats = _pool('final_val_loss')
+    best_vals, best_stats = _pool('best_val_loss')
+    test_vals, test_stats = _pool('test_loss')
+    missing = [r['seed'] for r in per_seed if not _finite(r['final_val_loss']) and not _finite(r['best_val_loss'])]
+    invalid = [r['seed'] for r in per_seed
+               if any(isinstance(r[k], float) and not math.isfinite(r[k]) for k in ('final_val_loss', 'best_val_loss'))]
+    return {
+        'model': model, 'norm': norm,
+        'seeds': [int(s) for s in seeds],
+        'n_seeds_requested': len(list(seeds)),
+        'n_seeds': len(final_vals),
+        'missing_seeds': missing,
+        'invalid_seeds': invalid,
+        'complete': not missing and not invalid,
+        'per_seed': per_seed,
+        'final_val_loss': None if final_stats is None else final_stats['mean'],
+        'final_val_loss_std': None if final_stats is None or len(final_vals) < 2 else final_stats['std'],
+        'final_val_loss_stderr': None if final_stats is None or len(final_vals) < 2 else final_stats['stderr'],
+        'final_val_loss_std_basis': 'seeds' if len(final_vals) >= 2 else 'single_run',
+        'best_val_loss': None if best_stats is None else best_stats['mean'],
+        'best_val_loss_std': None if best_stats is None or len(best_vals) < 2 else best_stats['std'],
+        'best_val_loss_std_basis': 'seeds' if len(best_vals) >= 2 else 'single_run',
+        'n_seeds_test': len(test_vals),
+        'test_loss': None if test_stats is None else test_stats['mean'],
+        'test_loss_std': None if test_stats is None or len(test_vals) < 2 else test_stats['std'],
+        'test_loss_by_seed': {r['seed']: r['test_loss'] for r in per_seed},
+        'aggregation': (
+            'Mean +/- Std across independent seed runs of the identical recipe (same optimizer, '
+            'schedule, data protocol and step budget). final_val_loss = last validation pass at the '
+            'fixed step budget (the comparable estimate); best_val_loss = min over validation passes '
+            '(checkpoint-selection statistic, optimistically biased as an estimate). A single-seed '
+            'std is not a run-to-run spread, so std is None there. missing_seeds/invalid_seeds are '
+            'reported but excluded from the mean; a comparison over an incomplete set is not clean.'),
+    }
+
+def launch_multi_seed(args, seeds) -> None:
+    """Run one full training child per seed, then aggregate Mean +/- Std.
+
+    Each child is the same command line with `--seeds <one>` and its own
+    `--output-dir <base>/seed{N}`: identical optimizer, schedule, data and
+    architecture, only the seed differs. Children run sequentially so the
+    replication does not change resource pressure per run; `PYTHONHASHSEED`
+    is pinned per child so interpreter-level hash randomization cannot leak
+    into the run.
+    """
+    base = Path(args.output_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    if len(seeds) < 3:
+        print(f'[seeds][warn] {len(seeds)} seed(s): a norm effect cannot be separated from '
+              f'run-to-run noise; use >= 3 independent seeds before interpreting deltas')
+    child_argv = list(sys.argv[1:])
+    script = str(Path(__file__).resolve())
+    for seed in seeds:
+        out_dir = seed_run_dir(base, seed)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f'[seeds] launching seed={seed} -> {out_dir}', flush=True)
+        env = dict(os.environ)
+        env['PYTHONHASHSEED'] = str(seed)
+        cmd = [sys.executable, script, *child_argv, '--seeds', str(seed), '--output-dir', str(out_dir)]
+        rc = subprocess.run(cmd, env=env).returncode
+        if rc != 0:
+            print(f'[seeds][warn] seed={seed} exited rc={rc}; its manifest may be missing and the '
+                  f'aggregate will flag it', flush=True)
+    agg = aggregate_seed_runs(base, seeds, args.model, args.norm)
+    (base / 'aggregate.json').write_text(json.dumps(agg, indent=2))
+    for label, mean_key, std_key in (('final_val_loss', 'final_val_loss', 'final_val_loss_std'),
+                                     ('best_val_loss', 'best_val_loss', 'best_val_loss_std'),
+                                     ('test_loss', 'test_loss', 'test_loss_std')):
+        mean = agg.get(mean_key)
+        if mean is None:
+            continue
+        std = agg.get(std_key)
+        std_str = '' if std is None else f' +/- {std:.4f}'
+        print(f'[seeds] {args.norm}: {label}={mean:.4f}{std_str} over {agg["n_seeds"]} seed(s)')
+    if agg['missing_seeds']:
+        print(f'[seeds][warn] missing/unfinished seed runs: {agg["missing_seeds"]}; the pooled mean '
+              f'covers {agg["n_seeds"]} of {agg["n_seeds_requested"]} requested seeds')
+    print(f'[seeds] per-seed aggregate -> {base / "aggregate.json"}')
+    manifest = collect_run_metadata(seed=seeds[0])
+    manifest['hyperparameters'] = vars(args)
+    manifest['seeds'] = [int(s) for s in seeds]
+    manifest['aggregate'] = agg
+    save_run_manifest(base / 'run_manifest.json', manifest)
+
 def main():
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=None)
@@ -301,7 +452,8 @@ def main():
     p.add_argument('--beta2', type=float, default=0.95)
     p.add_argument('--grad-clip', type=float, default=1.0)
     p.add_argument('--no-bf16', action='store_true', help='disable bf16 autocast')
-    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given (single-seed default: 42)')
+    p.add_argument('--seeds', nargs='+', type=int, default=None, help='independent replication seeds for Phase 1: each seed is a full training run under <output-dir>/seed{N}/ and Mean +/- Std across seeds is written to <output-dir>/aggregate.json (seeds are the unit of replication; >= 3 recommended, because a single run cannot separate a norm effect from run-to-run noise). One seed runs in place, exactly as before. Phase 1 configs ship seeds: [42, 43, 44].')
     p.add_argument('--compile', action='store_true', help='enable torch.compile')
     p.add_argument('--compile-mode', default='reduce-overhead', choices=['default', 'reduce-overhead', 'max-autotune'])
     p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check (scripts/sanity_overfit.py) before training and abort if it fails (default: on; a model that cannot overfit one batch has a gradient/loss bug and must not start a full run)')
@@ -316,6 +468,20 @@ def main():
     p.add_argument('--resume', default=None, help='checkpoint to resume from')
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
+    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [DEFAULT_SEED])
+    seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    if len(seeds) != len(raw_seeds):
+        print(f'[seeds][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
+              f'(a repeated seed is the same run, not an independent replication)')
+    if len(seeds) > 1:
+        if args.resume:
+            raise SystemExit(
+                '[seeds] --resume continues one run; combining it with multiple --seeds would '
+                'either resume the same step count into every seed directory or silently ignore '
+                'the requested replication. Resume a single seed with --seed N --resume <ckpt>.')
+        launch_multi_seed(args, seeds)
+        return
+    args.seed = seeds[0]
     explicit = frozenset((name for name in _SCHEDULE_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)))
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     resume_ckpt = None
@@ -767,6 +933,14 @@ def main():
         # by role and the analytic matmul FLOPs per token.
         'n_params': n_params,
         'n_trainable': n_trainable,
+        # Shape accounting: the depth sweep scales dim/heads with depth to hold
+        # parameters ~constant, so "depth" is really a depth+width trade-off
+        # there. Recording the shape next to the loss keeps that covariance
+        # visible in every aggregate instead of inferable only from launcher
+        # env vars.
+        'n_layers': int(model.cfg.n_layers),
+        'dim': int(model.cfg.dim),
+        'n_heads': int(model.cfg.n_heads),
         'parameter_breakdown': parameter_breakdown(model),
         'flops_per_token_forward': flops['forward_per_token'],
         'flops_per_token_training_est': flops['training_per_token'],
@@ -837,7 +1011,7 @@ def main():
             'exclude_hash_file': args.exclude_hash_file,
             'batch_size': args.batch_size, 'seq_len': args.seq_len,
         }
-        results = {'step': step, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
+        results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
         with open(out_path, 'w') as f:
             json.dump(results, f, indent=2)
         run_manifest['data']['split_reports'] = data_reports

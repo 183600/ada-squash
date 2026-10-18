@@ -3,11 +3,9 @@ from __future__ import annotations
 
 `train_gpt2.py --final-test-eval` opens the sealed test split exactly once per
 run and stores the per-batch losses it averaged (plus the data-protocol block
-that decides which documents form those batches). Two runs whose `pairing`
-blocks match were scored on the *same* sealed segments: the held-out loader
-never shuffles, so the per-batch losses are a paired sample and the noise
-separating two arms can be read off the per-batch deltas instead of guessed
-from two bare means.
+that decides which documents form those batches). A directory holding per-seed
+runs (`seed{N}/test_results.json`, the layout the Phase 1 multi-seed launcher
+writes) is one *arm* replicated over independent training seeds.
 
 This tool performs that comparison honestly:
 
@@ -15,23 +13,31 @@ This tool performs that comparison honestly:
   scored on the same held-out batches, so the comparison is not paired; the
   script reports the row as not comparable (and exits non-zero) instead of
   silently substituting a weaker unpaired test.
-* every candidate is compared one-sided against the same reference with the
-  paired Student-t test, and all raw p-values enter one `holm_adjust` family,
-  because a matrix of candidates against one baseline is a family of tests.
-* each row reports the minimum delta detectable at the requested power, so a
-  non-significant result is qualified by the resolution the comparison had
-  rather than read as evidence of equality.
+* **training seeds are the unit of replication.** The certification test is
+  the one-sided paired Student-t on the per-seed sealed losses of the arms'
+  *shared* training seeds (>= 2 required), and all raw p-values enter one
+  `holm_adjust` family. A single training run per arm - or a comparison in
+  which only one seed is shared - carries no run-to-run variance: the
+  per-batch paired test is reported for description only and can never set
+  `beats_reference_significantly`, because batch noise is not run-to-run
+  noise (the same rule `scripts/ablation.py` and
+  `scripts/train_llama_depth_sweep.py` enforce on validation losses).
+* each row reports the number of paired seeds and the minimum delta
+  detectable at the requested power, so a non-significant result is qualified
+  by the resolution the comparison had rather than read as evidence of
+  equality.
 """
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import holm_adjust, mean_ci, paired_t_one_sided, student_t_ppf
+from adasquash.metrics import holm_adjust, mean_ci, mean_std_stderr, paired_t_one_sided, student_t_ppf
 from adasquash.repro import collect_run_metadata, save_run_manifest
 
 PAIRING_KEYS = (
@@ -41,6 +47,13 @@ PAIRING_KEYS = (
     "dedup", "min_doc_chars", "max_doc_chars", "exclude_hash_file",
     "batch_size", "seq_len",
 )
+
+_SEED_DIR_RE = re.compile(r"seed(\d+)$")
+
+# A comparison is certifiable only when at least this many training seeds are
+# shared by both arms: with one seed the test would measure the noise of a
+# single run, not the run-to-run variance a significance claim is about.
+MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE = 2
 
 
 def load_result(path) -> dict:
@@ -88,10 +101,122 @@ def _mde(stderr: float, df: float, alpha: float, power: float) -> float:
     return (student_t_ppf(1.0 - alpha, df) + student_t_ppf(power, df)) * stderr
 
 
+def _discover_results(path: Path) -> list[Path]:
+    """One run per training seed under an arm directory, or the file itself."""
+    if not path.is_dir():
+        return [path]
+    seed_files = sorted(
+        path.glob("seed*/test_results.json"),
+        key=lambda p: int(_SEED_DIR_RE.search(p.parent.name).group(1)))
+    if seed_files:
+        return seed_files
+    direct = path / "test_results.json"
+    if direct.exists():
+        return [direct]
+    raise SystemExit(
+        f"[compare] {path} is a directory with neither seed*/test_results.json nor "
+        "test_results.json; point --reference / the candidate at the run directory or "
+        "at one test_results.json file")
+
+
+def _seed_of(run_path: Path, data: dict):
+    """Training seed recorded by the run (or encoded in its seedN/ directory)."""
+    value = data.get("seed")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    match = _SEED_DIR_RE.search(run_path.parent.name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def load_arm(path) -> dict:
+    """All runs of one arm: `{runs: [{seed, path, data, batch_losses}]}`."""
+    arm_path = Path(path)
+    runs = []
+    for run_path in _discover_results(arm_path):
+        data = load_result(run_path)
+        runs.append({
+            "path": str(run_path),
+            "seed": _seed_of(run_path, data),
+            "data": data,
+            "batch_losses": [float(v) for v in data["test_batch_losses"]],
+        })
+    seeds = [r["seed"] for r in runs if r["seed"] is not None]
+    if len(seeds) != len(set(seeds)):
+        raise SystemExit(
+            f"[compare] {arm_path}: two runs report the same training seed; a seed must "
+            "identify exactly one run, otherwise the pairing is ambiguous")
+    return {
+        "path": str(arm_path),
+        "runs": runs,
+        "n_runs": len(runs),
+        "seeds": seeds,
+        "unseeded_runs": [r["path"] for r in runs if r["seed"] is None],
+    }
+
+
+def _seed_means(arm: dict) -> dict:
+    """{training seed: sealed test loss} for the seeded runs of an arm."""
+    out = {}
+    for run in arm["runs"]:
+        if run["seed"] is None:
+            continue
+        out[int(run["seed"])] = sum(run["batch_losses"]) / len(run["batch_losses"])
+    return out
+
+
+def _arm_seed_stats(arm: dict) -> dict:
+    """Mean +/- Std of the per-seed sealed losses (None std for a single run)."""
+    vals = list(_seed_means(arm).values())
+    stats = mean_std_stderr(vals)
+    if stats is None:
+        return {"n_seeds": 0, "mean": None, "std": None, "stderr": None}
+    return {
+        "n_seeds": stats["n"],
+        "mean": stats["mean"],
+        "std": stats["std"] if stats["n"] >= 2 else None,
+        "stderr": stats["stderr"] if stats["n"] >= 2 else None,
+    }
+
+
+def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
+    """Reason the two arms cannot be treated as paired, or None."""
+    problems = []
+    for run in cand_arm["runs"]:
+        for ref_run in ref_arm["runs"]:
+            mismatches = pairing_mismatches(ref_run["data"], run["data"])
+            if mismatches:
+                problems.append(
+                    f"{ref_run['path']} vs {run['path']}: "
+                    + json.dumps(mismatches, sort_keys=True))
+    if problems:
+        return "pairing metadata differs: " + "; ".join(problems[:3])
+    counts = {len(r["batch_losses"]) for r in ref_arm["runs"] + cand_arm["runs"]}
+    if len(counts) != 1:
+        return (f"runs were scored on different numbers of sealed batches "
+                f"({sorted(counts)}); the arms did not share the same test pass")
+    return None
+
+
+def _describe_arm(label: str, arm: dict) -> str:
+    stats = _arm_seed_stats(arm)
+    if stats["n_seeds"] >= 2:
+        return (f"{label}: test_loss={stats['mean']:.4f} +/- {stats['std']:.4f} "
+                f"(std across {stats['n_seeds']} training seeds)")
+    if arm["runs"]:
+        batches = arm["runs"][0]["batch_losses"]
+        ci = mean_ci(batches)
+        return (f"{label}: test_loss={ci['mean']:.4f} +/- {ci['stderr']:.4f} "
+                f"(stderr over {ci['n']} batches of a single training run; "
+                f"no run-to-run spread available)")
+    return f"{label}: no runs"
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("candidates", nargs="+", help="test_results.json files to compare against the reference")
-    p.add_argument("--reference", required=True, help="test_results.json of the baseline arm")
+    p.add_argument("candidates", nargs="+", help="arm directories (holding seed*/test_results.json) or single test_results.json files to compare against the reference")
+    p.add_argument("--reference", required=True, help="arm directory (holding seed*/test_results.json) or test_results.json of the baseline arm")
     p.add_argument("--alpha", type=float, default=0.05, help="one-sided significance level (Holm-adjusted)")
     p.add_argument("--margin", type=float, default=0.0, help="practical margin: the candidate must be better by more than this")
     p.add_argument("--power", type=float, default=0.8, help="target power for the minimum-detectable-delta column")
@@ -99,77 +224,145 @@ def main():
     p.add_argument("--output", default=None, help="write the full comparison (rows + manifests) to this JSON file")
     args = p.parse_args()
     reference_path = Path(args.reference)
-    ref = load_result(reference_path)
-    ref_batches = [float(v) for v in ref["test_batch_losses"]]
-    ref_stats = mean_ci(ref_batches, alpha=args.alpha)
-    print(f"[compare] reference {reference_path}: test_loss={ref_stats['mean']:.4f} "
-          f"+/- {ref_stats['stderr']:.4f} (stderr, n={ref_stats['n']} batches)")
+    ref_arm = load_arm(reference_path)
+    ref_seed_means = _seed_means(ref_arm)
+    print(f"[compare] reference {_describe_arm(str(reference_path), ref_arm)}")
+    if ref_arm["n_runs"] < MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE:
+        print("[compare] reference arm has a single training run: any test below is descriptive "
+              "(batch noise is not run-to-run noise) and can never certify a significance claim. "
+              "Provide seed-replicated runs (>= 2, recommend 3-5) to certify.")
+    if ref_arm["unseeded_runs"]:
+        print(f"[compare] reference runs without a recorded training seed: {ref_arm['unseeded_runs']} "
+              "(they can only enter batch-level description)")
 
     rows = []
     for cand_path in args.candidates:
         cand_path = Path(cand_path)
         if cand_path.resolve() == reference_path.resolve():
             raise SystemExit("[compare] a candidate is the reference itself")
-        cand = load_result(cand_path)
-        mismatches = pairing_mismatches(ref, cand)
-        if mismatches:
+        cand_arm = load_arm(cand_path)
+        problem = _pairing_problem(ref_arm, cand_arm)
+        if problem:
             rows.append({
                 "candidate": str(cand_path),
                 "comparable": False,
-                "reason": "pairing metadata differs: " + json.dumps(mismatches, sort_keys=True),
+                "reason": problem,
+                "n_runs_candidate": cand_arm["n_runs"],
+                "n_runs_reference": ref_arm["n_runs"],
             })
             continue
-        cand_batches = [float(v) for v in cand["test_batch_losses"]]
-        if len(cand_batches) != len(ref_batches):
-            rows.append({
-                "candidate": str(cand_path),
-                "comparable": False,
-                "reason": (f"scored on {len(cand_batches)} sealed batches vs the reference's "
-                           f"{len(ref_batches)}; the runs did not share the same test pass"),
-            })
-            continue
-        stats = mean_ci(cand_batches, alpha=args.alpha)
-        test = paired_t_one_sided(cand_batches, ref_batches, margin=args.margin, alpha=args.alpha)
-        rows.append({
+
+        cand_seed_means = _seed_means(cand_arm)
+        common = sorted(set(cand_seed_means) & set(ref_seed_means))
+        cand_stats = _arm_seed_stats(cand_arm)
+        row = {
             "candidate": str(cand_path),
             "comparable": True,
-            "n_paired_batches": len(cand_batches),
-            "mean": stats["mean"],
-            "std": stats["std"],
-            "stderr": stats["stderr"],
-            "ci_level": stats["ci_level"],
-            "ci_low": stats["ci_low"],
-            "ci_high": stats["ci_high"],
-            "mean_delta": test["mean_delta"],
-            "delta_ci_low": test["ci_low"],
-            "delta_ci_high": test["ci_high"],
-            "t": test["t"],
-            "df": test["df"],
-            "p_one_sided": test["p_one_sided"],
-            "beats_reference": bool(test["mean_delta"] is not None and test["mean_delta"] < -args.margin),
-            "min_detectable_delta": _mde(stats["stderr"], test["df"], args.alpha, args.power),
-        })
+            "n_runs_candidate": cand_arm["n_runs"],
+            "n_runs_reference": ref_arm["n_runs"],
+            "n_seeds_candidate": len(cand_seed_means),
+            "n_seeds_reference": len(ref_seed_means),
+            "paired_seeds": common,
+            "n_paired_seeds": len(common),
+            "seed_means_candidate": {str(s): v for s, v in cand_seed_means.items()},
+            "seed_means_reference": {str(s): v for s, v in ref_seed_means.items()},
+            "mean": cand_stats["mean"],
+            "std": cand_stats["std"],
+            "stderr": cand_stats["stderr"],
+            "mean_delta": None,
+            "delta_ci_low": None,
+            "delta_ci_high": None,
+            "t": None,
+            "df": None,
+            "p_one_sided": None,
+            "p_one_sided_holm": None,
+            "beats_reference": False,
+            "beats_reference_significantly": False,
+            "basis": None,
+            "min_detectable_delta": None,
+        }
+        test = None
+        if len(common) >= MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE:
+            a = [cand_seed_means[s] for s in common]
+            b = [ref_seed_means[s] for s in common]
+            test = paired_t_one_sided(a, b, margin=args.margin, alpha=args.alpha)
+            row["basis"] = "seed_means"
+            deltas = [x - y for x, y in zip(a, b)]
+            delta_stats = mean_std_stderr(deltas)
+            row["min_detectable_delta"] = _mde(
+                delta_stats["stderr"], test["df"], args.alpha, args.power)
+        else:
+            # One shared training run (or only unseeded runs): a paired test
+            # over that run's batches describes the measurement noise on the
+            # shared sealed segments, nothing more.
+            pairs = None
+            if len(common) == 1:
+                seed = common[0]
+                cand_run = next(r for r in cand_arm["runs"] if r["seed"] == seed)
+                ref_run = next(r for r in ref_arm["runs"] if r["seed"] == seed)
+                pairs = (cand_run, ref_run)
+                row["basis"] = f"batch_single_seed{seed}"
+            elif cand_arm["n_runs"] == 1 and ref_arm["n_runs"] == 1:
+                pairs = (cand_arm["runs"][0], ref_arm["runs"][0])
+                row["basis"] = "batch_single_run"
+            if pairs is not None:
+                a, b = pairs[0]["batch_losses"], pairs[1]["batch_losses"]
+                if len(a) == len(b):
+                    test = paired_t_one_sided(a, b, margin=args.margin, alpha=args.alpha)
+                    stats = mean_ci(a, alpha=args.alpha)
+                    row["mean"], row["std"], row["stderr"] = stats["mean"], stats["std"], stats["stderr"]
+                    deltas = [x - y for x, y in zip(a, b)]
+                    delta_stats = mean_std_stderr(deltas)
+                    row["min_detectable_delta"] = _mde(
+                        delta_stats["stderr"], test["df"], args.alpha, args.power)
+        if test is not None and test["mean_delta"] is not None:
+            row["mean_delta"] = test["mean_delta"]
+            row["delta_ci_low"] = test["ci_low"]
+            row["delta_ci_high"] = test["ci_high"]
+            row["t"] = test["t"]
+            row["df"] = test["df"]
+            row["p_one_sided"] = test["p_one_sided"]
+            row["beats_reference"] = bool(test["mean_delta"] < -args.margin)
+        rows.append(row)
 
-    comparable = [r for r in rows if r["comparable"]]
-    adjusted = holm_adjust([r["p_one_sided"] for r in comparable])
-    for row, p_holm in zip(comparable, adjusted):
+    # Only >= 2-seed paired tests are admissible to the Holm family; a
+    # batch-level description is not a test of the run-to-run claim and must
+    # not influence the family-wise correction of the tests that are.
+    certifiable = [r for r in rows if r.get("basis") == "seed_means"]
+    adjusted = holm_adjust([r["p_one_sided"] for r in certifiable])
+    for row, p_holm in zip(certifiable, adjusted):
         row["p_one_sided_holm"] = p_holm
         row["beats_reference_significantly"] = bool(
             row["beats_reference"] and p_holm is not None and p_holm < args.alpha)
 
     print(f"[compare] paired one-sided t-test, margin={args.margin:g}, alpha={args.alpha:g}, "
-          f"Holm over {len(comparable)} comparable row(s)")
+          f"Holm over {len(certifiable)} seed-paired row(s)")
     for r in rows:
         if not r["comparable"]:
             print(f"[compare] {r['candidate']}: NOT COMPARABLE - {r['reason']}")
             continue
         p_str = "n/a" if r["p_one_sided_holm"] is None else f"{r['p_one_sided_holm']:.4g}"
-        verdict = ("significantly better" if r["beats_reference_significantly"]
-                   else ("better but not significant" if r["beats_reference"] else "not better"))
-        print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['stderr']:.4f} "
-              f"delta={r['mean_delta']:+.4f} (95% CI [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
-              f"t={r['t']:.3f} df={r['df']:.0f} p={r['p_one_sided']:.4g} p_holm={p_str} "
-              f"MDE80={r['min_detectable_delta']:.4f} -> {verdict}")
+        base = r.get("basis")
+        if r["mean_delta"] is None:
+            print(f"[compare] {r['candidate']}: no testable pairing "
+                  f"(basis={base}, {r['n_runs_candidate']} vs {r['n_runs_reference']} runs)")
+            continue
+        if base == "seed_means":
+            verdict = ("significantly better" if r["beats_reference_significantly"]
+                       else ("better but not significant" if r["beats_reference"] else "not better"))
+            print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['std']:.4f} "
+                  f"(seed std, n_seeds={r['n_paired_seeds']}) "
+                  f"delta={r['mean_delta']:+.4f} (95% CI [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
+                  f"t={r['t']:.3f} df={r['df']:.0f} p={r['p_one_sided']:.4g} p_holm={p_str} "
+                  f"MDE80={r['min_detectable_delta']:.4f} -> {verdict}")
+        else:
+            note = ("descriptive only: single training run, batch noise is not run-to-run noise - "
+                    "never certified as significant")
+            print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['stderr']:.4f} "
+                  f"(batch stderr) delta={r['mean_delta']:+.4f} "
+                  f"(95% CI [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
+                  f"t={r['t']:.3f} df={r['df']:.0f} p={r['p_one_sided']:.4g} "
+                  f"basis={base} -> {note}")
 
     if args.hypothesis:
         print(f"[hypothesis] {args.hypothesis}")
@@ -177,14 +370,24 @@ def main():
     if args.output:
         payload = {
             "reference": str(reference_path),
-            "reference_mean": ref_stats["mean"],
-            "reference_stderr": ref_stats["stderr"],
-            "reference_n_batches": ref_stats["n"],
+            "reference_n_runs": ref_arm["n_runs"],
+            "reference_n_seeds": len(ref_seed_means),
+            "reference_seed_means": {str(s): v for s, v in ref_seed_means.items()},
             "alpha": args.alpha,
             "margin": args.margin,
             "power": args.power,
             "hypothesis": args.hypothesis,
-            "holm_family_size": len(comparable),
+            "holm_family_size": len(certifiable),
+            "min_paired_seeds_for_significance": MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE,
+            "certification_basis": (
+                "only the one-sided paired Student-t on per-seed sealed losses over the arms' "
+                "shared training seeds (>= 2) can set beats_reference_significantly; single-run "
+                "batch-level tests are reported as description and never certified"),
+            "limitations": (
+                "batch-level intervals describe the measurement noise on the shared sealed "
+                "segments of one training run; they do not cover initialization / data-order "
+                "/ batch-sampling variance. Run each arm with >= 2 (recommend 3-5) seeds and "
+                "compare same-seed runs to make the delta a run-to-run statement."),
             "rows": rows,
         }
         save_run_manifest(args.output, {**collect_run_metadata(), "comparison": payload})
