@@ -567,7 +567,7 @@ def main():
             _handle_nonfinite(step, *nonfinite_batch)
             continue
         nonfinite_streak = 0
-        loss_val = float(loss_acc)
+        loss_val = micro_loss if args.grad_accum == 1 else float(loss_acc)
         last_train_loss = loss_val
         # Clipped every step; materialized below only when logging.
         grad_norm_t = None

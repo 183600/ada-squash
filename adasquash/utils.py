@@ -12,24 +12,31 @@ class MaxAbsMeter:
         self.reset()
 
     def reset(self):
-        self.value = -float('inf')
+        self._peak = None
         self.count = 0
+
+    @property
+    def value(self) -> float:
+        return -float('inf') if self._peak is None else float(self._peak)
 
     def update(self, x: torch.Tensor):
         with torch.no_grad():
             xd = x.detach().reshape(-1)
             n = xd.numel()
             if n == 0:
-                v = -float('inf')
+                v = None
             elif n <= self._chunk:
-                v = xd.abs().max().item()
+                v = xd.abs().amax()
             else:
-                peak = xd[:self._chunk].abs().amax()
+                v = xd[:self._chunk].abs().amax()
                 for start in range(self._chunk, n, self._chunk):
-                    torch.fmax(peak, xd[start:start + self._chunk].abs().amax(), out=peak)
-                v = peak.item()
-        if v > self.value:
-            self.value = v
+                    torch.fmax(v, xd[start:start + self._chunk].abs().amax(), out=v)
+            if v is not None:
+                if self._peak is None:
+                    self._peak = torch.full((), -float('inf'), dtype=v.dtype, device=v.device)
+                elif self._peak.dtype != v.dtype or self._peak.device != v.device:
+                    self._peak = self._peak.to(dtype=torch.promote_types(self._peak.dtype, v.dtype), device=v.device)
+                self._peak = torch.fmax(self._peak, v)
         self.count += 1
 
 class KurtosisMeter:
@@ -45,6 +52,8 @@ class KurtosisMeter:
         self.M2 = 0.0
         self.M4 = 0.0
         self._M3 = 0.0
+        self._pending_stats: list = []
+        self._pending_counts: list = []
 
     def update(self, x: torch.Tensor):
         xd = x.detach().reshape(-1)
@@ -66,8 +75,17 @@ class KurtosisMeter:
             xc2 = xc * xc
             parts.append(torch.stack([x_mean_t, x_var_t, torch.linalg.vecdot(xc, xc2), torch.linalg.vecdot(xc2, xc2)]))
             counts.append(count)
-        for stats, count in zip(torch.stack(parts).tolist(), counts):
+        self._pending_stats.append(torch.stack(parts))
+        self._pending_counts.extend(counts)
+
+    def _flush(self):
+        if not self._pending_stats:
+            return
+        pending = self._pending_stats[0] if len(self._pending_stats) == 1 else torch.cat(self._pending_stats, dim=0)
+        for stats, count in zip(pending.tolist(), self._pending_counts):
             self._merge(*stats, count)
+        self._pending_stats = []
+        self._pending_counts = []
 
     def _bulk_update(self, x: torch.Tensor):
         x_var_t, x_mean_t = torch.var_mean(x, unbiased=False)
@@ -105,6 +123,7 @@ class KurtosisMeter:
         self.n = n
 
     def result(self) -> float:
+        self._flush()
         if self.n < 2:
             return 0.0
         var = self.M2 / self.n
