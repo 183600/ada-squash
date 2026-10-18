@@ -36,6 +36,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -47,10 +49,55 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     lengths = []
-    tokens = Counter()
+    # Token ids are accumulated per document as numpy arrays and counted with
+    # one `np.bincount` at the end: the previous `Counter.update(list)` walked
+    # every token of every document in Python (millions of iterations on a full
+    # audit). Documents are tokenized in batches, with a per-document fallback
+    # so one bad document is still counted (and skipped) instead of losing the
+    # whole batch.
+    token_batches: list = []
+    text_batch: list = []
+    legacy_tokens: Counter = Counter()
     hashes: set = set()
     overlap = 0
     tokenizer_errors = 0
+
+    def _add_ids(ids) -> None:
+        try:
+            arr = np.asarray(ids, dtype=np.int64)
+        except (TypeError, ValueError):
+            legacy_tokens.update(ids)
+            return
+        if arr.size == 0:
+            return
+        if arr.min() < 0:
+            # np.bincount rejects negatives; keep the legacy path for a
+            # tokenizer that emits them (they still get flagged below).
+            legacy_tokens.update(arr.tolist())
+        else:
+            token_batches.append(arr)
+
+    def _flush_tokens() -> None:
+        nonlocal tokenizer_errors
+        if not text_batch:
+            return
+        try:
+            enc = tokenizer(text_batch, add_special_tokens=False)['input_ids']
+        except Exception:
+            enc = None
+        if enc is None:
+            for t in text_batch:
+                try:
+                    ids = tokenizer(t, add_special_tokens=False)['input_ids']
+                except Exception:
+                    tokenizer_errors += 1
+                    continue
+                _add_ids(ids)
+        else:
+            for ids in enc:
+                _add_ids(ids)
+        text_batch.clear()
+
     for example in stream:
         if n_docs and len(lengths) >= n_docs:
             break
@@ -64,10 +111,17 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         hashes.add(h)
         if known_hashes is not None and h in known_hashes:
             overlap += 1
-        try:
-            tokens.update(tokenizer(text, add_special_tokens=False)['input_ids'])
-        except Exception:
-            tokenizer_errors += 1
+        text_batch.append(text)
+        if len(text_batch) >= 256:
+            _flush_tokens()
+    _flush_tokens()
+    if token_batches:
+        ids = np.concatenate(token_batches) if len(token_batches) > 1 else token_batches[0]
+        counts = np.bincount(ids, minlength=int(getattr(tokenizer, 'vocab_size', 0) or 0) + 1)
+        tokens = Counter({int(t): int(c) for t, c in enumerate(counts) if c})
+    else:
+        tokens = Counter()
+    tokens.update(legacy_tokens)
     stats = cleaner.report()
     stats['documents_sampled'] = len(lengths)
     # Whether the counters cover the whole split (--n-docs 0) or a prefix: with
@@ -182,7 +236,13 @@ def main():
             if args.write_train_hash_file:
                 ledger = Path(args.write_train_hash_file)
                 ledger.parent.mkdir(parents=True, exist_ok=True)
-                ledger.write_text(json.dumps(sorted(h.hex() for h in hashes)))
+                # One hex digest per line, streamed: `json.dumps` on a full
+                # million-document ledger built a single multi-hundred-MB
+                # string. `load_hash_file` accepts this whitespace-separated
+                # form (and still reads the legacy JSON-list files).
+                with open(ledger, 'w', encoding='utf-8') as f:
+                    for h in sorted(hashes):
+                        f.write(h.hex() + '\n')
                 # With a bounded --n-docs sample the ledger only contains the
                 # prefix that was read; using it as `--exclude-hash-file` then
                 # removes duplicates of that prefix only. Say so loudly instead

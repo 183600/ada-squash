@@ -19,8 +19,23 @@ def _strip_compile_prefix(state):
         return state
     return {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state.items()}
 
+def _load_checkpoint_cpu(path: str) -> dict:
+    """Load a checkpoint on CPU, memory-mapped when the file format allows it.
+
+    Training checkpoints carry the optimizer state (AdamW keeps two fp32
+    moments per parameter, ~2x the model bytes); `map_location='cuda'` would
+    deserialize all of that straight into VRAM and keep it alive through the
+    returned dict even though the evaluation paths only read weights. The
+    file is mapped read-only and the optimizer/scheduler entries are dropped
+    as soon as `load_state_dict` has copied what is needed.
+    """
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
+    except (RuntimeError, ValueError):
+        return torch.load(path, map_location='cpu', weights_only=False)
+
 def load_ckpt(path: str, device: str='cuda'):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = _load_checkpoint_cpu(path)
     args = ckpt['args']
     model_cfg = dict(norm_name=args['norm'], qk_norm=args.get('qk_norm'), qk_alpha_init=args.get('qk_alpha_init', 1.0), use_layerscale=not args.get('no_layerscale', False), alpha_0=args.get('alpha_0', 0.9), k_init=args.get('k_init', 1.0), alpha_init=args.get('alpha_init', 0.5), p_init=args.get('p_init', 2.0), learnable_p=not args.get('no_learnable_p', False), learnable_k=not args.get('no_learnable_k', False), learnable_delta=not args.get('no_learnable_delta', False), beta=args.get('beta', True))
     if args.get('layerscale_init') is not None:
@@ -29,12 +44,16 @@ def load_ckpt(path: str, device: str='cuda'):
         model_cfg['tie_word_embeddings'] = args['tie_embeddings']
     elif 'no_tie_embeddings' in args:
         model_cfg['tie_word_embeddings'] = not args['no_tie_embeddings']
-    if args['model'] == 'gpt2-124m':
-        model = build_gpt_124m(**model_cfg)
-    elif args['model'] == 'gpt2-350m':
-        model = build_gpt_350m(**model_cfg)
-    else:
-        model = build_llama_tiny_1b(**model_cfg)
+    # The checkpoint's weights overwrite every parameter, and the model is
+    # built straight on the target device: the constructor's init pass and the
+    # full-model H2D copy are both skipped.
+    with torch.device(device):
+        if args['model'] == 'gpt2-124m':
+            model = build_gpt_124m(init=False, **model_cfg)
+        elif args['model'] == 'gpt2-350m':
+            model = build_gpt_350m(init=False, **model_cfg)
+        else:
+            model = build_llama_tiny_1b(init=False, **model_cfg)
     depth = args.get('_depth_override')
     dim = args.get('_dim_override')
     heads = args.get('_heads_override')
@@ -46,8 +65,14 @@ def load_ckpt(path: str, device: str='cuda'):
             cfg_dict['dim'] = dim
         if heads:
             cfg_dict['n_heads'] = heads
-        model = GPT(GPTConfig(**cfg_dict))
+        with torch.device(device):
+            model = GPT(GPTConfig(**cfg_dict), init=False)
     model.load_state_dict(_strip_compile_prefix(ckpt['model']))
+    # The backing file is released as soon as the heavyweight entries are
+    # dropped; only `args` travels back to the caller.
+    ckpt.pop('model', None)
+    ckpt.pop('optimizer', None)
+    ckpt.pop('scheduler', None)
     model.to(device)
     model.eval()
     # Evaluation switches between models in-process (per-task loops, sweeps),
@@ -159,9 +184,11 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
             n_rows = len(group)
             seq_len = len(group[0][1])
             buf = torch.empty((n_rows, seq_len + len(target_ids)), dtype=torch.long, device=device)
-            for i, (_, full) in enumerate(group):
-                buf[i, :seq_len] = torch.tensor(full, dtype=torch.long, device=device)
-            generated: list[list[int]] = [[] for _ in range(n_rows)]
+            # One host construction + one H2D for the whole decode batch
+            # instead of a per-row `torch.tensor(full, device=...)`.
+            host = torch.tensor([full for _, full in group], dtype=torch.long)
+            buf[:, :seq_len].copy_(host, non_blocking=True)
+            generated: list[list] = [[] for _ in range(n_rows)]
             failed = [False] * n_rows
             n = seq_len
             for want in target_ids:
@@ -172,9 +199,13 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                     step_logits, _ = model(ctx)
                     step_logits = step_logits[:, -1]
                 nxt = step_logits.argmax(-1)
-                nxt_list = nxt.tolist()
-                bad_rows = [i for i, v in enumerate(nxt_list) if v != want]
-                if bad_rows:
+                # Device-side comparison: the common all-correct step pays one
+                # tiny scalar sync and no int list round-trip; only the rows
+                # that actually diverged get materialized.
+                neq = nxt != want
+                if bool(neq.any().item()):
+                    bad_rows = neq.nonzero(as_tuple=True)[0].tolist()
+                    nxt_list = nxt.tolist()
                     for i in bad_rows:
                         if failed[i]:
                             continue
@@ -185,8 +216,9 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                         generated[i].append(nxt_i)
                         row_logits = step_logits[i]
                         probs = torch.softmax(row_logits.float(), dim=-1)
-                        rank = int((torch.argsort(row_logits, descending=True) == want)
-                                   .nonzero(as_tuple=True)[0][0].item())
+                        # O(V) rank: how many logits beat the expected token
+                        # (0-based); no full argsort of the 50k-way row.
+                        rank = int((row_logits > row_logits[want]).sum().item())
                         top_prob = float(probs[nxt_i].item())
                         in_context = bool((buf[i, :n] == nxt_i).any().item())
                         prefix_ok = len(generated[i]) - 1
@@ -208,7 +240,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                             'context_len': seq_len,
                             'failure_step': prefix_ok,
                             'n_target_tokens': len(target_ids),
-                            'generated_ids': list(generated[i]),
+                            'generated_ids': [int(v) for v in generated[i]],
                             'expected_id': int(want),
                             'predicted_id': nxt_i,
                             'expected_rank': rank,
@@ -221,9 +253,14 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                             'confidence': confidence,
                         })
                         failed[i] = True
-                for i in range(n_rows):
-                    if not failed[i]:
-                        generated[i].append(nxt_list[i])
+                    for i in range(n_rows):
+                        if not failed[i]:
+                            generated[i].append(nxt_list[i])
+                else:
+                    # All rows correct: keep the device scalars; they are only
+                    # read back if a later step fails.
+                    for i in range(n_rows):
+                        generated[i].append(nxt[i])
                 buf[:, n] = nxt
                 n += 1
                 if all(failed):

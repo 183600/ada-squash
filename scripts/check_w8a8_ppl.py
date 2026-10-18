@@ -33,7 +33,8 @@ _W8A8_SEED_METRIC_KEYS = ('ppl_fp', 'ppl_w8a8', 'ppl_drop', 'ppl_drop_pct',
                           'probe_token_coverage')
 
 def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
-    mx = w.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-06)
+    # `ord=inf` vector norm is max(|w|) without materializing the `abs` copy.
+    mx = torch.linalg.vector_norm(w, ord=float('inf'), dim=-1, keepdim=True).clamp_(min=1e-06)
     q_max = 2 ** (n_bits - 1) - 1
     scale = mx / q_max
     q = w / scale
@@ -43,7 +44,7 @@ def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
     return (q, scale)
 
 def quantize_activation_per_token(x: torch.Tensor, n_bits: int=8):
-    mx = x.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-06)
+    mx = torch.linalg.vector_norm(x, ord=float('inf'), dim=-1, keepdim=True).clamp_(min=1e-06)
     q_max = 2 ** (n_bits - 1) - 1
     scale = mx / q_max
     q = x / scale
@@ -53,9 +54,34 @@ def quantize_activation_per_token(x: torch.Tensor, n_bits: int=8):
     return q
 
 def _install_quantized_weight(linear: nn.Module, qw: torch.Tensor):
+    """Quantize `linear.weight` in place (one storage, no `_q_weight` twin).
+
+    The forward closures and the fused CE both read `weight`, so the parameter
+    storage itself holds the quantized values; `_q_weight` is a detached view
+    of that same storage for callers that want the quantized tensor.
+    """
     with torch.no_grad():
         linear.weight.copy_(qw)
-    linear._q_weight = qw
+    linear._q_weight = linear.weight.detach()
+    linear._w8a8_patched = True
+
+def _unwrap_w8a8(model: nn.Module) -> None:
+    """Undo the instance-level patches so the next pass starts from fp32.
+
+    `wrap_model_w8a8` quantizes weights in place and rebinds `forward` on the
+    module *instances*; reloading the fp32 state dict alone would leave the
+    quantized forward closures (and a duplicated norm hook) behind.
+    """
+    for m in model.modules():
+        if getattr(m, '_w8a8_patched', False):
+            m.forward = type(m).forward.__get__(m, type(m))
+            m._w8a8_patched = False
+        if '_q_weight' in vars(m):
+            delattr(m, '_q_weight')
+    handle = getattr(model, '_w8a8_act_hook', None)
+    if handle is not None:
+        handle.remove()
+        model._w8a8_act_hook = None
 
 def wrap_linear_w8a8(linear: nn.Linear):
     qw, _ = quantize_weight_per_channel(linear.weight.data)
@@ -63,7 +89,7 @@ def wrap_linear_w8a8(linear: nn.Linear):
 
     def quantized_forward(x):
         x_q = quantize_activation_per_token(x)
-        return torch.nn.functional.linear(x_q, qw, linear.bias)
+        return torch.nn.functional.linear(x_q, linear.weight, linear.bias)
     linear.forward = quantized_forward
     return linear
 
@@ -72,7 +98,8 @@ def wrap_swiglu_w8a8(mlp):
     for lin in (mlp.w1, mlp.w2, mlp.w3):
         qw, _ = quantize_weight_per_channel(lin.weight.data)
         _install_quantized_weight(lin, qw)
-        weights.append(qw)
+        # Keep the parameter storage (one copy), not the temporary `qw`.
+        weights.append(lin.weight)
     qa = quantize_activation_per_token
 
     def quantized_forward(x):
@@ -83,17 +110,21 @@ def wrap_swiglu_w8a8(mlp):
         h.mul_(b)
         return mlp.drop(F.linear(qa(h), weights[1]))
     mlp.forward = quantized_forward
+    mlp._w8a8_patched = True
     return mlp
 
 def wrap_embedding_w8a8(emb: nn.Embedding):
+    # The embedding is tied to `lm_head.weight`; quantizing the parameter in
+    # place keeps that tie intact and leaves a single quantized storage.
     qw, _ = quantize_weight_per_channel(emb.weight.data)
 
     def quantized_forward(idx):
-        return F.embedding(idx, qw)
+        return F.embedding(idx, emb.weight)
     with torch.no_grad():
         emb.weight.copy_(qw)
-    emb._q_weight = qw
+    emb._q_weight = emb.weight.detach()
     emb.forward = quantized_forward
+    emb._w8a8_patched = True
     return emb
 
 def wrap_model_w8a8(model: nn.Module):
@@ -112,23 +143,35 @@ def wrap_model_w8a8(model: nn.Module):
             wrap_linear_w8a8(m)
     norm_f = getattr(model, 'norm_f', None)
     if isinstance(norm_f, nn.Module) and isinstance(getattr(model, 'lm_head', None), nn.Module):
-        norm_f.register_forward_hook(lambda m, inp, out: quantize_activation_per_token(out))
+        # Register once: a repeated wrap would stack another quantizing hook
+        # and double-quantize the final norm output.
+        if getattr(model, '_w8a8_act_hook', None) is None:
+            model._w8a8_act_hook = norm_f.register_forward_hook(
+                lambda m, inp, out: quantize_activation_per_token(out))
     return model
 
 @torch.no_grad()
 def compute_ce_sum(model, batch, target, device='cuda'):
-    model.eval()
+    """`(sum of loss*N, N)` as device scalars; callers accumulate on device.
+
+    Keeping the pair on the device lets a whole probe run pay one `.item()`
+    at the end instead of two D2H syncs per batch; the loss is widened to
+    fp64 before the multiply so the accumulated total matches the historical
+    host fp64 accumulation. `model.eval()` is the caller's responsibility
+    (once per model, not once per batch).
+    """
     batch = batch.to(device)
     target = target.to(device)
-    n = (target != model.cfg.ignore_index).sum().item()
-    if n == 0:
-        raise ValueError('probe batch contains no valid target tokens')
+    n = (target != model.cfg.ignore_index).sum()
     loss = model(batch, target, return_logits=False)[1]
-    return (loss.item() * n, n)
+    return (loss.detach().double() * n.double(), n)
 
 def compute_ppl(model, batch, target, device='cuda'):
     ce, n = compute_ce_sum(model, batch, target, device=device)
-    return math.exp(ce / n)
+    n_val = int(n.item())
+    if n_val == 0:
+        raise ValueError('probe batch contains no valid target tokens')
+    return math.exp(float(ce) / n_val)
 
 def probe_token_coverage(batches) -> float:
     n_pos = 0
@@ -408,37 +451,48 @@ def main():
             dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision) if args.probe == 'dataset' else None
             raw_seed = ckpt_args.get('seed')
             train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
+            # One fp32 snapshot of the weights on the host: the in-place
+            # quantizer destroys the fp32 weights, and each seed needs them
+            # back, but re-reading the checkpoint + rebuilding the model
+            # n_seeds times is the expensive way to get them.
+            fp_state = {k: t.detach().cpu().clone() for k, t in model.state_dict().items()}
             per_seed = []
             for seed in seeds:
-                # A fresh copy per seed: `wrap_model_w8a8` quantizes the weights in
-                # place, so the next seed's fp32 reference needs its own unmodified
-                # model, and each seed is an independent probe draw.
-                model, _ = load_ckpt(ckpt_path, device=device)
+                _unwrap_w8a8(model)
+                model.load_state_dict(fp_state)
+                model.eval()
                 rng = torch.Generator(device=device).manual_seed(seed)
                 batches = []
                 for _ in range(max(1, args.n_batches)):
                     x = make_probe(rng, model.cfg, dataset_probe)
                     batches.append(x)
+                # The targets are a pure function of the probe; build them once
+                # and reuse them for the fp32 and the W8A8 pass.
+                pairs = []
+                for x in batches:
+                    y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
+                    y[:, :-1] = x[:, 1:]
+                    pairs.append((x, y))
                 coverage = probe_token_coverage(batches)
                 if coverage > args.max_probe_coverage:
                     raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
-                ce_fp = 0.0
-                n_tok = 0
-                for x in batches:
-                    y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
-                    y[:, :-1] = x[:, 1:]
+                ce_fp = torch.zeros((), dtype=torch.float64, device=device)
+                n_tok = torch.zeros((), dtype=torch.long, device=device)
+                for x, y in pairs:
                     a, n = compute_ce_sum(model, x, y, device=device)
                     ce_fp += a
                     n_tok += n
+                n_tok_val = int(n_tok.item())
+                if n_tok_val == 0:
+                    raise ValueError('probe batch contains no valid target tokens')
                 wrap_model_w8a8(model)
-                ce_q = 0.0
-                for x in batches:
-                    y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
-                    y[:, :-1] = x[:, 1:]
+                model.eval()
+                ce_q = torch.zeros((), dtype=torch.float64, device=device)
+                for x, y in pairs:
                     b, _ = compute_ce_sum(model, x, y, device=device)
                     ce_q += b
-                ppl_fp = math.exp(ce_fp / n_tok)
-                ppl_q = math.exp(ce_q / n_tok)
+                ppl_fp = math.exp(float(ce_fp) / n_tok_val)
+                ppl_q = math.exp(float(ce_q) / n_tok_val)
                 per_seed.append({'ckpt': ckpt_path, 'probe': args.probe, 'probe_split': args.probe_split if args.probe == 'dataset' else None, 'seed': seed, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage})
             r_ckpt = aggregate_w8a8_seed_rows(ckpt_path, per_seed)
             if args.probe == 'dataset' and args.probe_split != 'validation':

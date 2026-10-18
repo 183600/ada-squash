@@ -63,7 +63,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
-from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest
+from adasquash.repro import collect_run_metadata, save_run_manifest
 from scripts.ablation import run_one
 
 
@@ -95,7 +95,7 @@ def cached_trial_matches(summary: dict, arm: str, lr: float, args) -> bool:
     )
 
 
-def run_trial(arm: str, lr: float, seed: int, args, base: Path) -> dict:
+def run_trial(arm: str, lr: float, seed: int, args, base: Path, run_metadata: dict | None = None) -> dict:
     """One (arm, lr, seed) run, reusing the ablation runner verbatim."""
     trial_args = copy.copy(args)
     trial_args.lr = float(lr)
@@ -113,6 +113,7 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path) -> dict:
             pass
     summary = run_one(
         f'{arm}|lr={lr:g}|seed={seed}', {'norm_name': arm}, trial_args, run_dir, seed=seed,
+        run_metadata=run_metadata,
         hypothesis=(f'Compute-matched lr-sweep cell for arm {arm}: baselines and variants get the '
                     f'identical grid and compute, so the selected lr makes the later arm '
                     f'comparison a test against a tuned reference, not against a strawman.'),
@@ -138,12 +139,12 @@ def _trial_record(summary: dict, lr: float, seed: int) -> dict:
     }
 
 
-def tune_arm(arm: str, args, base: Path) -> dict:
+def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> dict:
     """Sweep the learning-rate grid for one arm over the selection seeds."""
     trials = []
     for lr in args.lrs:
         for seed in args.seeds:
-            summary = run_trial(arm, lr, seed, args, base)
+            summary = run_trial(arm, lr, seed, args, base, run_metadata=run_metadata)
             trials.append(_trial_record(summary, lr, seed))
     lr_grid = {}
     for lr in args.lrs:
@@ -164,14 +165,14 @@ def tune_arm(arm: str, args, base: Path) -> dict:
     return {'arm': arm, 'trials': trials, 'lr_grid': lr_grid, 'best': best}
 
 
-def add_confirm_trials(arm_result: dict, args, base: Path) -> dict:
+def add_confirm_trials(arm_result: dict, args, base: Path, run_metadata: dict | None = None) -> dict:
     """Score the selected learning rate on the held-back confirm seeds."""
     if arm_result.get('best') is None or not args.confirm_seeds:
         return arm_result
     lr = arm_result['best']['lr']
     confirm = []
     for seed in args.confirm_seeds:
-        summary = run_trial(arm_result['arm'], lr, seed, args, base)
+        summary = run_trial(arm_result['arm'], lr, seed, args, base, run_metadata=run_metadata)
         confirm.append(_trial_record(summary, lr, seed))
     arm_result['confirm_trials'] = confirm
     losses = [t['val_loss'] for t in confirm if isinstance(t['val_loss'], (int, float))]
@@ -460,10 +461,14 @@ def main():
               'selected on (winner\'s curse); treat the p-values as optimistic')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    # One metadata snapshot for the whole grid: every trial used to spawn its
+    # own git subprocesses and environment scan (81 trials -> 81x), and the
+    # snapshot does not change while the grid runs.
+    run_metadata = collect_run_metadata(seed=None)
     tuned = {}
     for arm in args.arms:
         print(f'\n[tune] arm={arm} lrs={args.lrs} seeds={args.seeds}')
-        tuned[arm] = tune_arm(arm, args, base)
+        tuned[arm] = tune_arm(arm, args, base, run_metadata=run_metadata)
         if tuned[arm]['best'] is not None:
             b = tuned[arm]['best']
             print(f"[tune] {arm}: best lr={b['lr']:g} val_loss={b['mean']:.4f} "
@@ -481,7 +486,7 @@ def main():
                       f"describes that regime (underfit/stalled/overfit/diverging), not "
                       f"just the norm; check the trial curves and the lr grid before "
                       f"quoting this arm's win")
-        tuned[arm] = add_confirm_trials(tuned[arm], args, base)
+        tuned[arm] = add_confirm_trials(tuned[arm], args, base, run_metadata=run_metadata)
         if tuned[arm].get('confirm'):
             c = tuned[arm]['confirm']
             stats = c['stats']
@@ -518,12 +523,12 @@ def main():
         },
         'arms': tuned,
         'comparison': comparison,
-        'run_metadata': collect_run_metadata(),
+        'run_metadata': run_metadata,
     }
     with open(base / 'tuning_summary.json', 'w') as f:
         json.dump(out, f, indent=2, default=str)
-    manifest = collect_run_metadata(seed=None)
-    manifest['git'] = git_revision()
+    manifest = dict(run_metadata)
+    manifest['seed'] = None
     manifest['hyperparameters'] = vars(args)
     manifest['arms'] = list(args.arms)
     save_run_manifest(base / 'run_manifest.json', manifest)

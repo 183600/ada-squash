@@ -131,9 +131,9 @@ def flatten_split(batches, remap: torch.Tensor, unknown: int, ignore_index: int=
     """
     xs, x2s, ys, x_raw, y_raw = ([], [], [], [], [])
     for x, y in batches:
+        # No per-batch `bool(mask.any())` sync: an all-ignored batch simply
+        # contributes zero rows, and the all-empty case is caught below.
         mask = y.ne(ignore_index)
-        if not bool(mask.any()):
-            continue
         xr = remap[x]
         prev = torch.empty_like(xr)
         prev[:, 0] = unknown
@@ -143,7 +143,7 @@ def flatten_split(batches, remap: torch.Tensor, unknown: int, ignore_index: int=
         ys.append(remap[y[mask]])
         x_raw.append(x[mask])
         y_raw.append(y[mask])
-    if not xs:
+    if not xs or not any(t.numel() for t in xs):
         raise ValueError('corpus stream produced no supervision tokens')
     return {'x': torch.cat(xs), 'x2': torch.cat(x2s), 'y': torch.cat(ys),
             'x_raw': torch.cat(x_raw), 'y_raw': torch.cat(y_raw)}
@@ -239,43 +239,55 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
     batches = list(batches)
     # The filter lives on the batch device: indexing with `rows`/`x`/`y`
     # (which come from the caller's batches) must not mix CPU and CUDA tensors.
-    transition = torch.zeros(n_states, n_states, dtype=torch.float64,
-                             device=batches[0][0].device)
+    # The (tiny) transition matrix is built on the CPU once and moved as a
+    # single tensor instead of ~200 per-element device assignments.
+    device = batches[0][0].device
+    transition = torch.zeros(n_states, n_states, dtype=torch.float64)
     for s in range(n_states):
         for j in range(int(max_jump)):
             transition[s, (s + j) % n_states] = 1.0 / int(max_jump)
-    ce_sum, n_tokens = (0.0, 0)
+    transition = transition.to(device)
+    # Device-side fp64 accumulator: one .item() at the very end instead of a
+    # D2H + stream sync inside every one of the T-1 filter steps.
+    ce_sum_t = torch.zeros((), dtype=torch.float64, device=device)
+    n_tokens = 0
     for x, y in batches:
         batch = x.shape[0]
         rows = torch.arange(batch, device=x.device)
         first = x[:, 0]
+        belief = torch.zeros(batch, n_states, dtype=torch.float64, device=x.device)
         if outlier_id is None:
-            belief = torch.zeros(batch, n_states, dtype=torch.float64, device=x.device)
             belief[rows, first] = 1.0
         else:
             is_oid = first.eq(int(outlier_id))
-            belief = torch.full((batch, n_states), 1.0 / n_states, dtype=torch.float64, device=x.device)
+            belief.fill_(1.0 / n_states)
             keep = (~is_oid).nonzero(as_tuple=True)[0]
             if keep.numel():
                 belief[keep] = 0.0
                 belief[keep, first[keep]] = 1.0
+        # Ping-pong buffers: the per-step posterior overwrites the previous
+        # prediction buffer instead of allocating a fresh (batch, n_states).
+        pred = torch.empty_like(belief)
         for t in range(x.shape[1] - 1):
-            pred = belief @ transition
-            ce_sum += float(-pred[rows, y[:, t]].log().sum())
+            torch.mm(belief, transition, out=pred)
+            ce_sum_t = ce_sum_t - pred[rows, y[:, t]].log().sum()
             n_tokens += batch
             obs = x[:, t + 1]
             if outlier_id is None:
-                belief = torch.zeros_like(pred)
-                belief[rows, obs] = 1.0
-                continue
-            is_oid = obs.eq(int(outlier_id))
-            belief = pred
-            keep = (~is_oid).nonzero(as_tuple=True)[0]
-            if keep.numel():
-                belief = pred.clone()
-                belief[keep] = 0.0
-                belief[keep, obs[keep]] = 1.0
-    return {'ce_nats': ce_sum / n_tokens, 'n_tokens': n_tokens}
+                pred.zero_()
+                pred[rows, obs] = 1.0
+            else:
+                is_oid = obs.eq(int(outlier_id))
+                keep = (~is_oid).nonzero(as_tuple=True)[0]
+                if keep.numel():
+                    pred[keep] = 0.0
+                    pred[keep, obs[keep]] = 1.0
+                # The outlier rows keep the posterior themselves; only the
+                # observed rows were overwritten with the delta.
+            belief, pred = pred, belief
+    if n_tokens == 0:
+        raise ValueError('hmm filter received no tokens (empty batches or seq_len < 2)')
+    return {'ce_nats': float(ce_sum_t) / n_tokens, 'n_tokens': n_tokens}
 
 def tune_smoothing(ce_fn, ks) -> dict:
     """Select the add-k smoothing constant on a held-out tuning stream.

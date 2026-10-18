@@ -72,7 +72,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 
 from adasquash import GPT, GPTConfig, NORM_REGISTRY, markov_batch
-from adasquash.metrics import binary_auc_report, macro_weighted_f1
+from adasquash.metrics import binary_auc_report, f1_from_counts
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 
 DEFAULT_THRESHOLDS = {
@@ -116,7 +116,9 @@ def build_model(args, cfg: GPTConfig):
         from scripts.train_moe_tiny import MoEGPT
 
         return MoEGPT(cfg, n_experts=args.n_experts)
-    return GPT(cfg)
+    # Callers reset with the run seed right after building; skip the
+    # constructor's init pass so the parameters are initialized exactly once.
+    return GPT(cfg, init=False)
 
 
 def make_batch(task: str, args, cfg: GPTConfig, device: str):
@@ -184,7 +186,14 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
     accuracy = float((pred == gold).float().mean().item())
     counts = torch.bincount(gold, minlength=vocab)
     majority = float(counts.max().item() / n_valid)
-    f1 = macro_weighted_f1(pred.tolist(), gold.tolist(), vocab)
+    # Count-based F1: the three confusion marginals come from device
+    # bincounts, so the |valid| predictions/targets are never round-tripped
+    # through Python lists (the metric is identical to `macro_weighted_f1`).
+    f1 = f1_from_counts(
+        counts.tolist(),
+        torch.bincount(pred, minlength=vocab).tolist(),
+        torch.bincount(gold[pred == gold], minlength=vocab).tolist(),
+    )
     k = max(1, min(int(topk), vocab))
     top = logits.topk(k, dim=-1).indices[mask]
     topk_accuracy = float((top == gold.unsqueeze(-1)).any(dim=-1).float().mean().item())
@@ -196,10 +205,16 @@ def next_token_metrics(model, x, y, topk: int = 3) -> dict:
     # it does not change the ranking; it keeps the scores comparable across
     # calls.
     present = torch.unique(gold).tolist()
-    # The softmax is row-wise, so selecting the scored rows first gives the
-    # identical scores.
-    probs = torch.softmax(logits[mask].float(), dim=-1)[:, present]
-    auc = binary_auc_report(probs.tolist(), gold.tolist(), present)
+    # Select the |present| score columns out of the flattened logits, then the
+    # valid rows: the old `logits[mask].float()` + full-vocabulary softmax
+    # materialized two (n_valid, 50304) fp32 blocks just to keep a few
+    # thousand columns. The rank metrics only need a monotone per-column
+    # score, so the raw logit column is used directly; the V-wide softmax
+    # blocks are gone.
+    present_t = torch.tensor(present, dtype=torch.long, device=logits.device)
+    sub = logits.reshape(-1, vocab)[:, present_t]
+    sub = sub.index_select(0, mask.reshape(-1).nonzero(as_tuple=True)[0])
+    auc = binary_auc_report(sub.tolist(), gold.tolist(), present)
     return {
         "accuracy": accuracy,
         "topk_accuracy": topk_accuracy,

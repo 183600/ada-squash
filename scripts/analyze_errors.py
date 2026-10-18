@@ -130,16 +130,17 @@ def _quantile(values, q):
     return ordered[idx]
 
 
-def _prev_majority(prev_gold_keys, vocab):
+def _prev_majority(prev_gold_counts, vocab):
     """Bigram statistics: (prev, gold) counts and the majority successor per `prev`.
 
     Kept model-independent and shared by the single-model and paired passes, so
-    both classify the same context-ambiguity evidence.
+    both classify the same context-ambiguity evidence. The input is the
+    device-side `(unique keys, counts)` histogram, materialized to the host in
+    one copy at the end of the scan.
     """
     prev_gold = Counter()
-    if prev_gold_keys:
-        keys = torch.cat(prev_gold_keys)
-        uniq, counts = torch.unique(keys, return_counts=True)
+    if prev_gold_counts is not None:
+        uniq, counts = prev_gold_counts
         for key, count in zip(uniq.tolist(), counts.tolist()):
             prev_gold[key] = count
     prev_majority = {}
@@ -254,21 +255,31 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             rng = random.Random(int(getattr(args, 'seed', 0)))
             tail = rng.sample(tail_pool, min(k - len(head), len(tail_pool)))
             auc_class_ids = sorted(head + tail)
-    prev_gold_keys = []          # encoded (prev_id * vocab + gold_id) over all tokens
-    n_tokens = n_correct = 0
+    # All scan counters are device tensors; the host syncs exactly once, after
+    # the pass. `prev_gold` is merged per batch with a device-side
+    # `unique(return_counts=True)` instead of piling every key on the host and
+    # sorting there.
+    dev = next(model.parameters()).device
+    prev_gold_uniq = None        # device (key, count) bigram histogram
+    prev_gold_counts = None
+    n_tokens_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_correct_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_errors_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_positional_t = torch.zeros((), dtype=torch.long, device=dev)
+    topk_hits_t = torch.zeros((), dtype=torch.long, device=dev)
+    gold_prob_sum_t = torch.zeros((), dtype=torch.float64, device=dev)
+    gold_rank_sum_t = torch.zeros((), dtype=torch.float64, device=dev)
+    target_counts_t = torch.zeros(vocab, dtype=torch.long, device=dev)
+    pred_counts_t = torch.zeros(vocab, dtype=torch.long, device=dev)
+    correct_counts_t = torch.zeros(vocab, dtype=torch.long, device=dev)
+    copy_input_correct_t = torch.zeros((), dtype=torch.long, device=dev)
     topk = max(1, int(args.topk))
     # A k above the number of classes cannot be measured: top-k with k >= V is
     # the whole distribution. Clamp to vocab - 1 so the report key names the
     # radius actually analyzed.
     analyzed_topk = min(topk, max(1, vocab - 1))
-    topk_hits = 0
-    gold_prob_sum = 0.0
-    gold_rank_sum = 0.0
-    n_errors = 0
     n_scanned = 0
     error_scan = []              # capped records, classified after the pass
-    copy_input_correct = 0
-    n_positional = 0
 
     if first_batch is not None:
         batches = itertools.chain([first_batch], batches)
@@ -277,12 +288,19 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         mask = y.ne(ignore)
         prev = x
         valid = mask
-        n_tokens += int(valid.sum().item())
-        target_counts += torch.bincount(y[valid].cpu(), minlength=vocab)
-        keys = (prev[valid].long().cpu() * vocab + y[valid].long().cpu())
-        prev_gold_keys.append(keys)
+        n_tokens_t += valid.sum()
+        target_counts_t += torch.bincount(y[valid].long(), minlength=vocab)
+        keys = prev[valid].long() * vocab + y[valid].long()
+        ku, kc = torch.unique(keys, return_counts=True)
+        if prev_gold_uniq is None:
+            prev_gold_uniq, prev_gold_counts = ku, kc
+        else:
+            uniq, inv = torch.unique(torch.cat([prev_gold_uniq, ku]), return_inverse=True)
+            counts = torch.zeros_like(uniq)
+            counts.index_add_(0, inv, torch.cat([prev_gold_counts, kc]))
+            prev_gold_uniq, prev_gold_counts = uniq, counts
         if tuple(x.shape) == tuple(y.shape):
-            copy_input_correct += int((x[valid] == y[valid]).sum().item())
+            copy_input_correct_t += (x[valid] == y[valid]).sum()
         B, T = x.shape
         chunk = max(1, int(args.eval_chunk))
         step = fwd_chunk if fwd_chunk > 0 else B
@@ -292,49 +310,58 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         # grouping changes with the block size).
         for b0 in range(0, B, step):
             b1 = min(B, b0 + step)
-            with torch.no_grad():
-                logits, _ = model(x[b0:b1], return_logits=True)
             mask_b = mask[b0:b1]
             y_b = y[b0:b1]
-            x_b = x[b0:b1]
+            # `norm_f` and `lm_head` are per-position, so the vocabulary
+            # projection runs one position chunk at a time: `--eval-chunk`
+            # now bounds the logits buffer instead of only the downstream
+            # statistics of a fully materialized `(rows, T, vocab)` block.
+            with torch.no_grad():
+                hidden = model.forward_hidden(x[b0:b1])
             for t0 in range(0, T, chunk):
                 t1 = min(T, t0 + chunk)
-                lc = logits[:, t0:t1].detach().float()
                 m = mask_b[:, t0:t1]
-                if not bool(m.any()):
+                v_idx = m.nonzero(as_tuple=False)
+                if v_idx.numel() == 0:
                     continue
-                probs = torch.softmax(lc, dim=-1)
-                gold = y_b[:, t0:t1]
+                with torch.no_grad():
+                    lc = model.lm_head(model.norm_f(hidden[:, t0:t1])).detach().float()
+                # Score only the valid rows: the softmax/rank/top-k work (and
+                # the full-size bool for the rank) used to include every
+                # ignore_index position too.
+                probs = torch.softmax(lc[m], dim=-1)
+                gold = y_b[:, t0:t1][m]
                 pred = probs.argmax(-1)
-                n_correct += int((pred[m] == gold[m]).sum().item())
-                pred_counts += torch.bincount(pred[m].long().cpu(), minlength=vocab)
-                correct_counts += torch.bincount(gold[m & (pred == gold)].long().cpu(), minlength=vocab)
+                n_correct_t += (pred == gold).sum()
+                pred_counts_t += torch.bincount(pred, minlength=vocab)
+                correct_counts_t += torch.bincount(gold[pred == gold], minlength=vocab)
                 gold_p = probs.gather(-1, gold.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-                gold_prob_sum += float(gold_p[m].sum().item())
+                gold_prob_sum_t += gold_p.sum().double()
                 k = analyzed_topk
                 top = probs.topk(k, dim=-1)
                 # 1-based rank; ties count above (>= counts the gold token
                 # itself, every strictly-larger probability and every tie, so
                 # a tie cannot flatter the model's ranking).
                 gold_rank = (probs >= gold_p.unsqueeze(-1)).sum(-1)
-                topk_hits += int((top.indices == gold.unsqueeze(-1)).any(-1)[m].sum().item())
-                gold_rank_sum += float(gold_rank[m].clamp(max=args.rank_clip).sum().item())
-                n_positional += int(m.sum().item())
-                wrong = m & (pred != gold)
-                n_errors += int(wrong.sum().item())
+                topk_hits_t += (top.indices == gold.unsqueeze(-1)).any(-1).sum()
+                gold_rank_sum_t += gold_rank.clamp(max=args.rank_clip).sum().double()
+                n_positional_t += pred.numel()
+                wrong = pred != gold
+                n_errors_t += wrong.sum()
                 if n_scanned < args.max_scan_errors:
-                    idx = wrong.nonzero(as_tuple=False)
-                    for b, tt in idx[: args.max_scan_errors - n_scanned].tolist():
+                    idx = wrong.nonzero(as_tuple=False).flatten()
+                    for vi in idx[: args.max_scan_errors - n_scanned].tolist():
                         n_scanned += 1
+                        b, tt = v_idx[vi].tolist()
                         error_scan.append({
                             'batch_row': b0 + b,
                             'position': t0 + tt,
-                            'gold': int(gold[b, tt]),
-                            'pred': int(pred[b, tt]),
-                            'gold_prob': float(gold_p[b, tt]),
-                            'pred_prob': float(probs[b, tt, pred[b, tt]].item()),
-                            'gold_rank': int(min(gold_rank[b, tt].item(), args.rank_clip)),
-                            'gold_in_topk': bool((top.indices[b, tt] == gold[b, tt]).any().item()),
+                            'gold': int(gold[vi]),
+                            'pred': int(pred[vi]),
+                            'gold_prob': float(gold_p[vi]),
+                            'pred_prob': float(probs[vi, pred[vi]]),
+                            'gold_rank': int(min(int(gold_rank[vi]), args.rank_clip)),
+                            'gold_in_topk': bool((top.indices[vi] == gold[vi]).any()),
                             'prev': int(prev[b0 + b, t0 + tt]),
                             'context': [int(v) for v in x[b0 + b, max(0, t0 + tt - args.context_tokens):t0 + tt + 1].tolist()],
                         })
@@ -342,21 +369,32 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
                     # `index_select` picks the scored columns directly.
                     sel = probs.index_select(
                         -1, torch.as_tensor(auc_class_ids, device=probs.device)
-                    )[m]
+                    )
                     take = int(sel.shape[0])
                     if auc_max_tokens > 0:
                         take = min(take, auc_max_tokens - auc_seen)
                     if take > 0:
                         auc_scores.append(sel[:take].detach().cpu())
-                        auc_labels.append(gold[m][:take].detach().cpu())
+                        auc_labels.append(gold[:take].detach().cpu())
                         auc_seen += take
                 del probs, top, lc
-            del logits
+            del hidden
 
+    n_tokens = int(n_tokens_t.item())
     if n_tokens == 0:
         raise SystemExit('[errors] no valid target tokens in the selected batches')
+    n_correct = int(n_correct_t.item())
+    n_errors = int(n_errors_t.item())
+    n_positional = int(n_positional_t.item())
+    topk_hits = int(topk_hits_t.item())
+    gold_prob_sum = float(gold_prob_sum_t.item())
+    gold_rank_sum = float(gold_rank_sum_t.item())
+    copy_input_correct = int(copy_input_correct_t.item())
+    target_counts = target_counts_t.cpu()
+    pred_counts = pred_counts_t.cpu()
+    correct_counts = correct_counts_t.cpu()
 
-    prev_gold, prev_majority = _prev_majority(prev_gold_keys, vocab)
+    prev_gold, prev_majority = _prev_majority((prev_gold_uniq, prev_gold_counts), vocab)
     rare_ids, rare_threshold = _rare_ids(target_counts, args.rare_quantile)
     categories, primary, examples = _classify_scan(
         error_scan, prev_gold, prev_majority, vocab, rare_ids, args.confidence)
@@ -432,20 +470,31 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     }
 
 
-def _chunk_stats(logits_chunk, gold, topk):
-    """Per-position prediction statistics of one chunk, for pairing two models."""
+def _chunk_stats(logits_chunk, gold, topk, mask):
+    """Per-position prediction statistics of one chunk, for pairing two models.
+
+    Rank and top-k membership are only evaluated on the `mask` (valid target)
+    positions: the former's `(P, V)` comparison tensor and the latter's top-k
+    values are the chunk's biggest temporaries and ignore_index positions
+    never contribute a statistic.
+    """
     probs = torch.softmax(logits_chunk.detach().float(), dim=-1)
     pred = probs.argmax(-1)
     gold_p = probs.gather(-1, gold.clamp(min=0).unsqueeze(-1)).squeeze(-1)
     pred_p = probs.gather(-1, pred.unsqueeze(-1)).squeeze(-1)
-    gold_rank = (probs >= gold_p.unsqueeze(-1)).sum(-1)
-    top = probs.topk(topk, dim=-1)
+    gold_rank = torch.zeros_like(gold)
+    gold_in_topk = torch.zeros_like(gold, dtype=torch.bool)
+    if bool(mask.any()):
+        probs_m = probs[mask]
+        gold_rank[mask] = (probs_m >= gold_p[mask].unsqueeze(-1)).sum(-1)
+        top = probs_m.topk(topk, dim=-1)
+        gold_in_topk[mask] = (top.indices == gold[mask].unsqueeze(-1)).any(-1)
     return {
         'pred': pred,
         'gold_prob': gold_p,
         'pred_prob': pred_p,
         'gold_rank': gold_rank,
-        'gold_in_topk': (top.indices == gold.unsqueeze(-1)).any(-1),
+        'gold_in_topk': gold_in_topk,
         'ok': pred == gold,
     }
 
@@ -523,24 +572,36 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     vocab = int(ref_cfg.vocab_size)
     topk = min(max(1, int(args.topk)), max(1, vocab - 1))
     max_scan = max(0, int(args.max_scan_errors))
-    target_counts = torch.zeros(vocab, dtype=torch.long)
-    prev_gold_keys = []
-    n_tokens = 0
-    n_both_right = n_fixed = n_broken = n_both_wrong = 0
-    copy_input_correct = 0
-    n_positional = 0
+    dev = next(reference_model.parameters()).device
+    prev_gold_uniq = None
+    prev_gold_counts = None
+    target_counts_t = torch.zeros(vocab, dtype=torch.long, device=dev)
+    n_tokens_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_both_right_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_fixed_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_broken_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_both_wrong_t = torch.zeros((), dtype=torch.long, device=dev)
+    copy_input_correct_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_positional_t = torch.zeros((), dtype=torch.long, device=dev)
     scans = {'fixed': [], 'broken': [], 'both_wrong': []}
     scanned = {'fixed': 0, 'broken': 0, 'both_wrong': 0}
     fwd_chunk = max(0, int(getattr(args, 'forward_batch_chunk', 0) or 0))
     for x, y in batches:
         mask = y.ne(ignore)
-        n_tok = int(mask.sum().item())
-        n_tokens += n_tok
-        target_counts += torch.bincount(y[mask].cpu(), minlength=vocab)
-        prev_gold_keys.append((x[mask].long().cpu() * vocab + y[mask].long().cpu()))
+        n_tokens_t += mask.sum()
+        target_counts_t += torch.bincount(y[mask].long(), minlength=vocab)
+        keys = x[mask].long() * vocab + y[mask].long()
+        ku, kc = torch.unique(keys, return_counts=True)
+        if prev_gold_uniq is None:
+            prev_gold_uniq, prev_gold_counts = ku, kc
+        else:
+            uniq, inv = torch.unique(torch.cat([prev_gold_uniq, ku]), return_inverse=True)
+            counts = torch.zeros_like(uniq)
+            counts.index_add_(0, inv, torch.cat([prev_gold_counts, kc]))
+            prev_gold_uniq, prev_gold_counts = uniq, counts
         if tuple(x.shape) == tuple(y.shape):
-            copy_input_correct += int((x[mask] == y[mask]).sum().item())
-        n_positional += n_tok
+            copy_input_correct_t += (x[mask] == y[mask]).sum()
+        n_positional_t += mask.sum()
         B, T = x.shape
         chunk = max(1, int(args.eval_chunk))
         step = fwd_chunk if fwd_chunk > 0 else B
@@ -549,19 +610,28 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
             x_b, y_b, mask_b = x[b0:b1], y[b0:b1], mask[b0:b1]
             bounds = [(t0, min(T, t0 + chunk)) for t0 in range(0, T, chunk)
                       if bool(mask_b[:, t0:min(T, t0 + chunk)].any())]
+            if not bounds:
+                continue
             # Reference and candidate never hold a full logits block at the
-            # same time: the reference's per-position statistics are small, so
-            # its logits are dropped before the candidate forward runs.
+            # same time: the vocabulary projection is done one position chunk
+            # at a time (on top of the block hidden states) and each chunk's
+            # logits are dropped before the next forward runs.
+            ref_stats = []
             with torch.no_grad():
-                logits_ref, _ = reference_model(x_b, return_logits=True)
-                ref_stats = [_chunk_stats(logits_ref[:, t0:t1], y_b[:, t0:t1], topk)
-                             for t0, t1 in bounds]
-            del logits_ref
+                h_ref = reference_model.forward_hidden(x_b)
+                for t0, t1 in bounds:
+                    logits_ref = reference_model.lm_head(reference_model.norm_f(h_ref[:, t0:t1]))
+                    ref_stats.append(_chunk_stats(logits_ref, y_b[:, t0:t1], topk, mask_b[:, t0:t1]))
+                    del logits_ref
+            del h_ref
+            cand_stats = []
             with torch.no_grad():
-                logits_cand, _ = candidate_model(x_b, return_logits=True)
-                cand_stats = [_chunk_stats(logits_cand[:, t0:t1], y_b[:, t0:t1], topk)
-                              for t0, t1 in bounds]
-            del logits_cand
+                h_cand = candidate_model.forward_hidden(x_b)
+                for t0, t1 in bounds:
+                    logits_cand = candidate_model.lm_head(candidate_model.norm_f(h_cand[:, t0:t1]))
+                    cand_stats.append(_chunk_stats(logits_cand, y_b[:, t0:t1], topk, mask_b[:, t0:t1]))
+                    del logits_cand
+            del h_cand
             for (t0, t1), stats_ref, stats_cand in zip(bounds, ref_stats, cand_stats):
                 m = mask_b[:, t0:t1]
                 gold = y_b[:, t0:t1]
@@ -570,10 +640,10 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
                     'broken': m & stats_ref['ok'] & ~stats_cand['ok'],
                     'both_wrong': m & ~stats_ref['ok'] & ~stats_cand['ok'],
                 }
-                n_both_right += int((m & stats_ref['ok'] & stats_cand['ok']).sum().item())
-                n_fixed += int(selectors['fixed'].sum().item())
-                n_broken += int(selectors['broken'].sum().item())
-                n_both_wrong += int(selectors['both_wrong'].sum().item())
+                n_both_right_t += (m & stats_ref['ok'] & stats_cand['ok']).sum()
+                n_fixed_t += selectors['fixed'].sum()
+                n_broken_t += selectors['broken'].sum()
+                n_both_wrong_t += selectors['both_wrong'].sum()
                 for status, selector in selectors.items():
                     remaining = max_scan - scanned[status]
                     if remaining <= 0:
@@ -592,10 +662,18 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
                         })
                 del stats_ref, stats_cand, selectors
 
+    n_tokens = int(n_tokens_t.item())
     if n_tokens == 0:
         raise SystemExit('[pair] no valid target tokens in the selected batches')
+    n_both_right = int(n_both_right_t.item())
+    n_fixed = int(n_fixed_t.item())
+    n_broken = int(n_broken_t.item())
+    n_both_wrong = int(n_both_wrong_t.item())
+    copy_input_correct = int(copy_input_correct_t.item())
+    n_positional = int(n_positional_t.item())
+    target_counts = target_counts_t.cpu()
 
-    prev_gold, prev_majority = _prev_majority(prev_gold_keys, vocab)
+    prev_gold, prev_majority = _prev_majority((prev_gold_uniq, prev_gold_counts), vocab)
     rare_ids, rare_threshold = _rare_ids(target_counts, args.rare_quantile)
     cause_summary: dict = {}
     reference_cause = Counter()

@@ -69,6 +69,19 @@ def _atomic_torch_save(obj, path: Path) -> None:
             except OSError:
                 pass
 
+def _load_checkpoint_cpu(path) -> dict:
+    """Load a checkpoint on CPU (memory-mapped when the format allows).
+
+    A training checkpoint holds model + AdamW state (~3x the model bytes).
+    Loading it with `map_location=device` puts all of it in VRAM before any of
+    it is needed; mapping the file read-only keeps the unused optimizer
+    moments off the GPU, and the caller drops the entries once copied.
+    """
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
+    except (RuntimeError, ValueError):
+        return torch.load(path, map_location='cpu', weights_only=False)
+
 _ADAMW_FUSED_CPU_SUPPORTED: bool | None = None
 
 def _adamw_fused_supported(device: torch.device) -> bool:
@@ -168,6 +181,7 @@ def open_data_split(split: str, args, seq_len: int | None = None):
         dataset_revision=getattr(args, 'dataset_revision', None),
         tokenizer_revision=getattr(args, 'tokenizer_revision', None),
         shuffle_buffer=args.train_shuffle_buffer if split == 'train' else 0,
+        num_workers=getattr(args, 'num_workers', 2),
         seed=args.seed,
     )
     return build_dataloader(args.dataset, args.dataset_config, seq_len or args.seq_len, args.batch_size, tokenizer=args.tokenizer)
@@ -183,10 +197,17 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     is untouched by `collect`, so the returned mean is bit-identical either
     way.
     """
-    model.eval()
+    # Module-mode toggling is a Dynamo guard: eval()/train() around every pass
+    # recompiles the whole graph (and under reduce-overhead keeps a second
+    # CUDA-graph pool resident). With dropout at its default 0 the switch
+    # changes no numerics, so skip it; inference_mode already blocks grads.
+    toggle_mode = float(getattr(getattr(model, 'cfg', None), 'dropout', 0.0)) > 0.0
+    if toggle_mode:
+        model.eval()
     it = state.get('iter')
     total = None
     n = 0
+    terms: list = [] if collect is not None else None
     with torch.inference_mode():
         for _ in range(max(1, int(n_batches))):
             if it is None:
@@ -209,11 +230,17 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
             # Accumulate in a device fp64 scalar; fp64 keeps the sequential
             # summation bit-identical to host float accumulation.
             term = loss.detach().double()
-            if collect is not None:
-                collect.append(float(term))
+            if terms is not None:
+                terms.append(term)
             total = term if total is None else total.add_(term)
             n += 1
-    model.train()
+    if toggle_mode:
+        model.train()
+    if collect is not None and terms:
+        # One batched D2H at the end instead of a blocking float() per batch;
+        # `.tolist()` yields the same Python doubles in the same batch order,
+        # so the returned mean and the collected series are unchanged.
+        collect.extend(torch.stack(terms).cpu().tolist())
     return float(total) / n if n else None
 
 def load_model_state_dict(model, state_dict) -> None:
@@ -439,6 +466,7 @@ def main():
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
     p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); held-out documents whose exact text also occurs in train are dropped from validation/test, never from train')
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation or test')
+    p.add_argument('--num-workers', type=int, default=2, help='DataLoader worker processes (0 = everything in the parent process); with dedup enabled each worker scans and hashes the whole stream, so raising this multiplies CPU work rather than throughput')
     p.add_argument('--seq-len', type=int, default=1024)
     p.add_argument('--batch-size', type=int, default=32, help='per-device micro batch')
     p.add_argument('--grad-accum', type=int, default=1)
@@ -487,7 +515,7 @@ def main():
     resume_ckpt = None
     run_args: dict = {}
     if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        resume_ckpt = _load_checkpoint_cpu(args.resume)
         run_args = resume_ckpt.get('args') or {}
         resume_kept = []
         for name in _RESUME_RUN_ARGS:
@@ -526,12 +554,16 @@ def main():
         model_cfg['layerscale_init'] = args.layerscale_init
     if args.tie_embeddings is not None:
         model_cfg['tie_word_embeddings'] = args.tie_embeddings
-    if args.model == 'gpt2-124m':
-        model = build_gpt_124m(**model_cfg)
-    elif args.model == 'gpt2-350m':
-        model = build_gpt_350m(**model_cfg)
-    else:
-        model = build_llama_tiny_1b(**model_cfg)
+    # Construct on the target device (no full-model H2D) with the
+    # constructor's init pass disabled: `reset_parameters(args.seed)` below is
+    # the run's single, seeded initialization.
+    with torch.device(device):
+        if args.model == 'gpt2-124m':
+            model = build_gpt_124m(init=False, **model_cfg)
+        elif args.model == 'gpt2-350m':
+            model = build_gpt_350m(init=False, **model_cfg)
+        else:
+            model = build_llama_tiny_1b(init=False, **model_cfg)
     depth_override = os.environ.get('ADASQUASH_DEPTH_OVERRIDE')
     dim_override = os.environ.get('ADASQUASH_DIM_OVERRIDE')
     heads_override = os.environ.get('ADASQUASH_HEADS_OVERRIDE')
@@ -547,7 +579,8 @@ def main():
             cfg_dict['n_heads'] = int(heads_override)
             args._heads_override = int(heads_override)
         print(f"[shape-override] L={cfg_dict['n_layers']} dim={cfg_dict['dim']} n_heads={cfg_dict['n_heads']} (was L={model.cfg.n_layers} dim={model.cfg.dim} n_heads={model.cfg.n_heads})")
-        model = GPT(GPTConfig(**cfg_dict))
+        with torch.device(device):
+            model = GPT(GPTConfig(**cfg_dict), init=False)
     model.reset_parameters(args.seed)
     model.to(device)
     if args.compile:
@@ -602,11 +635,18 @@ def main():
         best_path = Path(args.output_dir) / 'ckpt_best.pt'
         best_candidates = []
         if resume_ckpt.get('val_loss') is not None:
-            best_candidates.append(resume_ckpt)
+            best_candidates.append({'val_loss': float(resume_ckpt['val_loss']),
+                                    'step': int(resume_ckpt.get('step', 0))})
         if best_path.exists() and Path(args.resume).resolve() != best_path.resolve():
-            best_candidates.append(torch.load(best_path, map_location=device, weights_only=False))
+            # Only the two scalars drive the tracker; loading the whole best
+            # checkpoint (model + AdamW state) onto the GPU for them would
+            # keep another full training state alive for the rest of the run.
+            prior = _load_checkpoint_cpu(best_path)
+            best_candidates.append({'val_loss': float(prior['val_loss']),
+                                    'step': int(prior.get('step', 0))})
+            del prior
         if best_candidates:
-            prior_best = min(best_candidates, key=lambda c: float(c['val_loss']))
+            prior_best = min(best_candidates, key=lambda c: c['val_loss'])
             best_val_loss = float(prior_best['val_loss'])
             best_val_step = int(prior_best.get('step', 0))
             print(f'[resume] best-validation tracker seeded with val_loss={best_val_loss:.4f}@{best_val_step} from the previous best checkpoint')
@@ -619,6 +659,12 @@ def main():
         if 'scheduler' in resume_ckpt:
             sched.load_state_dict(resume_ckpt['scheduler'])
         apply_explicit_optimizer_args(opt, sched, args, explicit)
+        # Everything heavy has been copied into the live objects; the
+        # checkpoint's copies would otherwise sit in host/VRAM for the whole
+        # run. `val_loss` / `step` stay: they are scalars the tracker reads.
+        resume_ckpt.pop('model', None)
+        resume_ckpt.pop('optimizer', None)
+        resume_ckpt.pop('scheduler', None)
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter(rel_threshold=0.2, abs_threshold=0.05)
     if resume_ckpt is not None:
@@ -630,6 +676,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = Path(args.output_dir) / 'train.jsonl'
     log_path.touch()
+    # One line-buffered handle for the whole run: the previous per-event
+    # open/append/close re-opened the same file for every log row and every
+    # NaN-triage record. Line buffering keeps each written row visible to
+    # tail -f / crash inspection without a full flush per event.
+    log_file = open(log_path, 'a', buffering=1)
     manifest_path = Path(args.output_dir) / 'run_manifest.json'
     run_manifest = collect_run_metadata(seed=args.seed)
     run_manifest['hyperparameters'] = vars(args)
@@ -701,14 +752,14 @@ def main():
         for line in triage['recommendations']:
             print(f'[nan]   fix: {line}')
         opt.zero_grad(set_to_none=True)
-        with open(log_path, 'a') as f:
-            f.write(json.dumps({
-                'step': step + 1, 'event': 'nonfinite_loss', 'loss': bad_value,
-                'lr': lr_now, 'triage_stage': triage['stage'],
-                'triage_diagnosis': triage['diagnosis'],
-                'triage_evidence': triage['evidence'],
-                'n_nonfinite_losses': n_nonfinite_losses,
-            }, default=str) + '\n')
+        log_file.write(json.dumps({
+            'step': step + 1, 'event': 'nonfinite_loss', 'loss': bad_value,
+            'lr': lr_now, 'triage_stage': triage['stage'],
+            'triage_diagnosis': triage['diagnosis'],
+            'triage_evidence': triage['evidence'],
+            'n_nonfinite_losses': n_nonfinite_losses,
+        }, default=str) + '\n')
+        log_file.flush()
         if args.nonfinite_policy == 'abort' or nonfinite_streak >= 5:
             raise SystemExit(
                 f'[nan] aborting at step {step + 1}: loss is non-finite and the triage '
@@ -738,24 +789,35 @@ def main():
             y = y.to(device, non_blocking=True)
             with ctx:
                 loss = model(x, y, return_logits=False)[1]
-            micro_losses.append(loss.detach().clone())
+            # Keep the device scalar (no clone): the scaling below is
+            # out-of-place, so the recorded per-micro value is never mutated.
+            micro_losses.append(loss.detach())
             micro_xy.append((x, y))
             if args.grad_accum > 1:
-                # Scale in place: the CE autograd Function's backward does not
-                # need its output value. With accumulation 1 the division is
-                # the exact identity, so the op is skipped. The clone above
-                # keeps the recorded per-micro value unscaled, so the reported
-                # mean loss is the true mean and not mean/G.
-                loss.div_(args.grad_accum)
+                # Out-of-place: `loss` is still needed for the recorded
+                # per-micro value above. With accumulation 1 the op is
+                # skipped, so the reported loss is the raw CE value.
+                loss = loss / args.grad_accum
             loss.backward()
-        # The accumulation group is read back once per optimizer step. A
-        # non-finite loss cannot be detected before its own backward without
-        # inspecting each micro-batch separately, so a bad micro is
-        # backpropped and the step is discarded wholesale by _handle_nonfinite
-        # (which zeroes the gradients); the optimizer trajectory is unchanged.
-        micro_vals = torch.stack(micro_losses).tolist()
-        bad_idx = next((i for i, v in enumerate(micro_vals) if not math.isfinite(v)), None)
-        if bad_idx is not None:
+        # Device-side group reduction: the common path materializes one host
+        # scalar instead of the whole per-micro list. `mean` propagates
+        # NaN/Inf, so a finite group mean certifies every micro. A non-finite
+        # mean is the rare path and pays the `.tolist()` to locate the bad
+        # micro for triage. A non-finite loss cannot be detected before its
+        # own backward without inspecting each micro separately, so a bad
+        # micro is backpropped and the step is discarded wholesale by
+        # _handle_nonfinite (which zeroes the gradients); the optimizer
+        # trajectory is unchanged.
+        loss_vec = torch.stack(micro_losses)
+        loss_val = float(loss_vec.mean()) if args.grad_accum > 1 else float(loss_vec[0])
+        if not math.isfinite(loss_val):
+            micro_vals = loss_vec.tolist()
+            bad_idx = next((i for i, v in enumerate(micro_vals) if not math.isfinite(v)), None)
+            if bad_idx is None:
+                # The group mean is non-finite although every micro is finite
+                # (an overflowed sum): treat the first micro as the bad case.
+                bad_idx = 0
+                micro_vals[0] = loss_val
             nonfinite_batch = (micro_xy[bad_idx][0], micro_xy[bad_idx][1], micro_vals[bad_idx])
         if attach_stats:
             act_stats.detach()
@@ -764,7 +826,6 @@ def main():
             _handle_nonfinite(step, *nonfinite_batch)
             continue
         nonfinite_streak = 0
-        loss_val = micro_vals[0] if args.grad_accum == 1 else sum(micro_vals) / args.grad_accum
         last_train_loss = loss_val
         # Clipped every step; materialized below only when logging.
         grad_norm_t = None
@@ -773,7 +834,11 @@ def main():
         opt.step()
         sched.step()
         loss_spike.update(loss_val)
-        train_window.append(loss_val)
+        if args.val_every > 0:
+            # The window is only consumed by the validation block below; with
+            # --val-every 0 nothing ever resets it, so appending would grow it
+            # for the entire run.
+            train_window.append(loss_val)
         step += 1
         if args.val_every > 0 and step % args.val_every == 0:
             if val_loader is None:
@@ -863,8 +928,7 @@ def main():
                 row['curve_classification'] = last_diagnosis['classification']
                 row['curve_train_trend'] = last_diagnosis['train_trend']
                 row['curve_val_trend'] = last_diagnosis['val_trend']
-            with open(log_path, 'a') as f:
-                f.write(json.dumps(row) + '\n')
+            log_file.write(json.dumps(row) + '\n')
             if tb:
                 tb.add_scalar('train/loss', loss_val, step)
                 tb.add_scalar('train/lr', lr, step)
@@ -972,9 +1036,15 @@ def main():
             print(f'[data] test split: {rtest}')
         best_path = Path(args.output_dir) / 'ckpt_best.pt'
         if val_loader is not None and best_path.exists():
-            best = torch.load(best_path, map_location=device, weights_only=False)
+            best = _load_checkpoint_cpu(best_path)
             load_model_state_dict(model, best['model'])
-            print(f"[test] restored best-validation checkpoint (step {int(best.get('step', 0))}, val_loss={float(best.get('val_loss', float('nan'))):.4f}) before the one-shot test evaluation")
+            best_step = int(best.get('step', 0))
+            best_val = float(best.get('val_loss', float('nan')))
+            # The weights are copied; the optimizer state in the file must not
+            # occupy VRAM during the test pass (that is exactly where the
+            # memory budget is tightest).
+            del best
+            print(f"[test] restored best-validation checkpoint (step {best_step}, val_loss={best_val:.4f}) before the one-shot test evaluation")
         test_state = {'iter': iter(test_loader)}
         test_batch_losses: list = []
         test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device, collect=test_batch_losses)
@@ -1030,6 +1100,7 @@ def main():
     if args.wandb_project:
         import wandb
         wandb.finish()
+    log_file.close()
     # The shape-keyed CE scratch blocks are only useful while this model keeps
     # training; drop them so any embedding caller reusing this module starts
     # clean.

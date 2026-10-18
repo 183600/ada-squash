@@ -196,6 +196,7 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seeds[0])
     model, model_args = load_ckpt(args.ckpt, device=device)
+    model_max_seq_len = int(model.cfg.max_seq_len)
     trained_seq_len = model_args.get('seq_len')
     trained_seq_len = int(trained_seq_len) if isinstance(trained_seq_len, int) else None
     if trained_seq_len is None:
@@ -206,6 +207,12 @@ def main():
     results, skipped = evaluate_model(model, tok, args, device, seeds, trained_seq_len)
     comparison = None
     if args.compare_to:
+        # The candidate's results are plain Python records, so the model is
+        # released before the reference is loaded: two checkpoints resident at
+        # once would double the parameter footprint for no benefit.
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         ref_model, _ = load_ckpt(args.compare_to, device=device)
         ref_results, _ = evaluate_model(ref_model, tok, args, device, seeds, trained_seq_len)
         comparison = compare_needle(results, ref_results, alpha=0.05)
@@ -233,7 +240,7 @@ def main():
     # measured.
     payload = {
         'ckpt': args.ckpt,
-        'model_max_seq_len': int(model.cfg.max_seq_len),
+        'model_max_seq_len': model_max_seq_len,
         'trained_seq_len': trained_seq_len,
         'secret': args.secret,
         'trials': args.trials,

@@ -382,8 +382,18 @@ def first_nonfinite_module(model, run_forward, max_modules: int = 8) -> list[dic
     return found
 
 
+_GRAD_CENSUS_CHUNK = 1 << 22
+
+
 def gradient_health_report(model) -> dict:
-    """Non-finite/zero/huge gradient census over every parameter with a grad."""
+    """Non-finite/zero/huge gradient census over every parameter with a grad.
+
+    Each parameter is scanned in bounded chunks: the census runs while the
+    caller is already in a failure state (possibly near the memory ceiling),
+    so the per-parameter `abs` copy / `g.float().pow(2)` full-size temporaries
+    are replaced by chunked extrema (`max(g.max(), -g.min())`, no `abs` copy),
+    a chunked fp64 sum of squares, and a chunked finiteness reduction.
+    """
     missing, nonfinite, zero = [], [], []
     n_with_grad = 0
     names = []
@@ -399,10 +409,20 @@ def gradient_health_report(model) -> dict:
         g = p.grad.detach()
         n_with_grad += 1
         names.append(name)
-        finite_t.append(torch.isfinite(g).all())
-        abs_t.append(g.abs().amax().to(torch.float64) if g.numel()
-                    else torch.zeros((), dtype=torch.float64, device=g.device))
-        sq_t.append(g.float().pow(2).sum().to(torch.float64))
+        flat = g.reshape(-1)
+        n = flat.numel()
+        is_finite = torch.ones((), dtype=torch.bool, device=g.device)
+        g_abs = torch.zeros((), dtype=torch.float64, device=g.device)
+        g_sq = torch.zeros((), dtype=torch.float64, device=g.device)
+        for start in range(0, n, _GRAD_CENSUS_CHUNK):
+            blk = flat[start:start + _GRAD_CENSUS_CHUNK]
+            is_finite = is_finite & torch.isfinite(blk).all()
+            cur_abs = torch.maximum(blk.max(), -blk.min()).to(torch.float64)
+            g_abs = cur_abs if start == 0 else torch.maximum(g_abs, cur_abs)
+            g_sq = g_sq + torch.linalg.vector_norm(blk.double()).pow(2)
+        finite_t.append(is_finite)
+        abs_t.append(g_abs)
+        sq_t.append(g_sq)
     finite = torch.stack(finite_t).tolist() if finite_t else []
     abs_vals = torch.stack(abs_t).tolist() if abs_t else []
     sq_vals = torch.stack(sq_t).tolist() if sq_t else []
@@ -647,6 +667,26 @@ def triage_nonfinite(
             evidence["fp32_logits_finite"] = tensor_finite_report(logits)["finite"] if logits is not None else None
     except Exception as exc:  # diagnosis must never mask the original failure
         evidence["forward_error"] = repr(exc)
+
+    # The first stage that went bad already settles the diagnosis: the fp32
+    # forward is non-finite (or could not run at all). Stages 3-4 would only
+    # add two more full-model forward/backward passes - exactly the memory
+    # pressure that turns a diagnostic into an OOM - so record them as
+    # skipped instead.
+    stage2_bad = (
+        evidence.get("fp32_forward_finite") is False
+        or evidence.get("loss_denominator_positive") is False
+        or "forward_error" in evidence
+    )
+    if stage2_bad:
+        model.zero_grad(set_to_none=True)
+        if was_training:
+            model.train()
+        evidence["autocast_forward_finite"] = None
+        evidence["gradients_finite"] = None
+        evidence["post_stage2_skipped"] = ["mixed_precision", "gradients"]
+        verdict = classify_nan_stage(evidence)
+        return {"evidence": evidence, **verdict}
 
     # Stage 3: autocast forward (only meaningful where autocast is supported).
     evidence["autocast_forward_finite"] = None

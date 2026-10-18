@@ -42,6 +42,7 @@ honest:
 Everything is pure `math` (no scipy/sklearn), so the training scripts can run
 in a minimal environment.
 """
+import functools
 import math
 from typing import Optional, Sequence
 
@@ -267,10 +268,15 @@ def student_t_cdf(t: float, df: float) -> float:
     return 1.0 - tail if t > 0.0 else tail
 
 
+@functools.lru_cache(maxsize=512)
 def student_t_ppf(p: float, df: float) -> float:
     """Inverse Student-t CDF `t : P(T <= t) = p`, by bisection on a monotone CDF.
 
-    Used for confidence-interval critical values.
+    Used for confidence-interval critical values. The result is a pure
+    function of `(p, df)`, and the same critical values are requested once per
+    row/seed across a comparison report, so the expensive pure-Python
+    bisection is memoized. A 200-iteration bisection that always drains to
+    adjacent floats is the dominant cost of the report otherwise.
     """
     if not 0.0 < p < 1.0:
         raise ValueError("student_t_ppf needs 0 < p < 1")
@@ -748,18 +754,21 @@ def binary_auc_report(
     """
     classes = [int(c) for c in classes]
     gold = [int(g) for g in gold]
-    scores = [[float(v) for v in row] for row in scores]
-    if len(scores) != len(gold):
-        raise ValueError(f"score-row/gold length mismatch: {len(scores)} vs {len(gold)}")
-    if scores and len(scores[0]) != len(classes):
+    rows = list(scores)
+    if len(rows) != len(gold):
+        raise ValueError(f"score-row/gold length mismatch: {len(rows)} vs {len(gold)}")
+    # One C-level transpose instead of rebuilding the full N x K matrix and
+    # then copying a column out of it per class.
+    cols = list(zip(*rows)) if rows else []
+    if cols and len(cols) != len(classes):
         raise ValueError(
-            f"score matrix has {len(scores[0])} columns but {len(classes)} classes"
+            f"score matrix has {len(cols)} columns but {len(classes)} classes"
         )
     records = []
     skipped = []
     for k, cls in enumerate(classes):
-        col = [row[k] for row in scores]
-        labels = [1 if g == cls else 0 for g in gold]
+        col = [float(v) for v in cols[k]]
+        labels = [g == cls for g in gold]
         n_pos = sum(labels)
         n_neg = len(labels) - n_pos
         if n_pos == 0 or n_neg == 0:

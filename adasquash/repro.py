@@ -105,12 +105,33 @@ def _run_git(*args: str) -> str | None:
 
 
 def git_revision() -> dict:
-    """Code version: commit, branch and whether the tree has uncommitted changes."""
-    status = _run_git("status", "--porcelain")
+    """Code version: commit, branch and whether the tree has uncommitted changes.
+
+    The branch and dirty flag come from one `git status --porcelain=v1
+    --branch` call (the default porcelain is already v1; the branch header
+    line names the checked-out branch) instead of a separate `rev-parse
+    --abbrev-ref` spawn; only the commit hash needs its own call.
+    """
+    status = _run_git("status", "--porcelain=v1", "--branch")
+    branch = None
+    dirty = None
+    if status is not None:
+        lines = status.splitlines()
+        dirty = False
+        if lines and lines[0].startswith("## "):
+            header = lines[0][3:].strip()
+            name = header.split("...")[0].split(" ")[0]
+            branch = name or None
+            dirty = len(lines) > 1
+        else:
+            # No branch header (e.g. unborn repository): fall back to the
+            # tracked-only answer rather than dropping the fields.
+            branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
+            dirty = bool(status)
     return {
         "commit": _run_git("rev-parse", "HEAD"),
-        "branch": _run_git("rev-parse", "--abbrev-ref", "HEAD"),
-        "dirty": None if status is None else bool(status),
+        "branch": branch,
+        "dirty": dirty,
     }
 
 

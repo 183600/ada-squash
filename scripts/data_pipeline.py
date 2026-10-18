@@ -41,6 +41,7 @@ working.
 import hashlib
 import json
 import math
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -63,6 +64,13 @@ DEFAULT_DATA_OPTIONS = {
     "max_doc_chars": 0,          # length-outlier cap, 0 = no cap
     "shuffle_buffer": 0,         # train-split batch shuffle window, 0 = off
     "seed": 42,
+    # Loader parallelism: fixed at 2 workers before, which made the
+    # duplicate-hash sharding cost multiplicative and paid a worker
+    # respawn/tokenizer rebuild on every epoch. 0 keeps everything in the
+    # parent process (no cross-worker scan at all).
+    "num_workers": 2,
+    "prefetch_factor": 2,
+    "persistent_workers": True,
     # Data-version pins: HuggingFace datasets/tokenizers are mutable remote
     # artifacts, so a run that does not pin a revision cannot be reproduced
     # after the upstream branch moves. None keeps the historical "latest on
@@ -239,16 +247,26 @@ def load_hash_file(path) -> set:
     """Read a document-hash ledger written by `audit_data.py`.
 
     Accepts a JSON list of hex digests or whitespace/newline separated hex
-    digests and returns the set of raw digest bytes.
+    digests and returns the set of raw digest bytes. The line-oriented form
+    (what the writer now emits) is read incrementally so a million-document
+    ledger never materializes a single multi-hundred-MB string; the legacy
+    JSON-list form (which must be parsed in one piece) is still accepted.
     """
-    text = Path(path).read_text(encoding="utf-8")
-    try:
-        entries = json.loads(text)
-    except json.JSONDecodeError:
-        entries = None
-    if not isinstance(entries, list):
-        entries = text.split()
-    return {bytes.fromhex(str(entry).strip()) for entry in entries}
+    out: set = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.lstrip()
+            if not stripped:
+                continue
+            if stripped[0] == "[":
+                f.seek(0)
+                entries = json.loads(f.read())
+                if isinstance(entries, list):
+                    out.update(bytes.fromhex(str(entry).strip()) for entry in entries)
+                return out
+            for token in line.split():
+                out.add(bytes.fromhex(token))
+    return out
 
 
 class DocumentCleaner:
@@ -270,7 +288,15 @@ class DocumentCleaner:
         self.dedup_max = int(dedup_max)
         self.min_doc_chars = int(min_doc_chars)
         self.max_doc_chars = int(max_doc_chars)
-        self.exclude_hashes = set(exclude_hashes) if exclude_hashes else set()
+        # Held by reference: the ledger is read once and can be large (up to
+        # 1e6 digest bytes), so copying it here doubled the resident set. The
+        # caller must not mutate it after handing it over.
+        self.exclude_hashes = exclude_hashes if exclude_hashes is not None else set()
+        # `seen` stores the leading 64 bits of each digest as an int instead
+        # of boxed `bytes` objects: the bound is 1e6 entries, and the boxed
+        # form costs ~100MB+ per worker. Collisions only matter at a
+        # negligible 2^-64 scale and the full digest is still used for the
+        # cross-split ledger lookup.
         self.seen: set = set()
         self.stats: Counter = Counter()
 
@@ -307,11 +333,12 @@ class DocumentCleaner:
                 self.stats["dropped_cross_split_duplicate"] += 1
                 return None
             if self.dedup:
-                if h in self.seen:
+                key = int.from_bytes(h[:8], "little") if isinstance(h, (bytes, bytearray)) else h
+                if key in self.seen:
                     self.stats["dropped_duplicate"] += 1
                     return None
                 if len(self.seen) < self.dedup_max:
-                    self.seen.add(h)
+                    self.seen.add(key)
         self.stats["documents_kept"] += 1
         return text
 
@@ -336,7 +363,14 @@ class PackedStream(IterableDataset):
         self.cleaner = cleaner if cleaner is not None else DocumentCleaner()
         self.shuffle_buffer = int(shuffle_buffer or 0)
         self.seed = int(seed)
-        self.buf: list = []
+        # A one-dimensional long tensor plus integer offsets: the old Python
+        # list boxed every token and rebuilt each window element by element
+        # (`torch.tensor(list_slice)`) with an O(remaining) `del buf[:pos]`
+        # shift per refill. The tokenizer returns Python ints, so the tensor
+        # is filled by copying small per-document chunks; windows are cloned
+        # out of it with a memcpy.
+        self.buf: torch.Tensor | None = None
+        self.fill = 0
         self.pos = 0
 
     def __iter__(self):
@@ -367,23 +401,39 @@ class PackedStream(IterableDataset):
         yield from window
 
     def _pack(self, worker_id: int, n_workers: int):
-        buf = self.buf
-        pos = self.pos
         need = self.seq_len + 1
+        buf = self.buf
+        if buf is None:
+            buf = torch.empty(max(4 * need, 1 << 16), dtype=torch.long)
+        fill = self.fill
+        pos = self.pos
         texts: list = []
 
+        def reserve(extra: int) -> None:
+            nonlocal buf
+            if fill + extra <= buf.numel():
+                return
+            grown = torch.empty(max(buf.numel() * 2, fill + extra), dtype=torch.long)
+            grown[:fill].copy_(buf[:fill])
+            buf = grown
+
         def drain():
-            nonlocal pos
-            while len(buf) - pos >= need:
-                window = torch.tensor(buf[pos:pos + need], dtype=torch.long)
-                x = window[:-1]
-                y = window[1:]
+            nonlocal fill, pos
+            while fill - pos >= need:
+                # Owned clone: the ring is reused by later refills, so views
+                # into it must not escape (the shuffle buffer holds windows).
+                window = buf[pos:pos + need].clone()
+                yield window[:-1], window[1:]
                 pos += self.seq_len
-                yield (x, y)
-            del buf[:pos]
-            pos = 0
+            if pos:
+                remaining = fill - pos
+                if remaining:
+                    buf[:remaining].copy_(buf[pos:fill])
+                fill = remaining
+                pos = 0
 
         def extend(batch):
+            nonlocal fill
             try:
                 token_lists = self.tok(batch, add_special_tokens=False)["input_ids"]
             except Exception:
@@ -393,11 +443,16 @@ class PackedStream(IterableDataset):
                         token_lists.append(self.tok(text, add_special_tokens=False)["input_ids"])
                     except Exception:
                         self.cleaner.stats["dropped_tokenization_error"] += 1
+            eos = self.tok.eos_token_id
             for ids in token_lists:
                 if not ids:
                     continue
-                buf.extend(ids)
-                buf.append(self.tok.eos_token_id)
+                chunk = torch.tensor(ids, dtype=torch.long)
+                reserve(chunk.numel() + 1)
+                buf[fill:fill + chunk.numel()].copy_(chunk)
+                fill += chunk.numel()
+                buf[fill] = eos
+                fill += 1
 
         shard_by_hash = self.cleaner.dedup and n_workers > 1
         i = 0
@@ -423,7 +478,104 @@ class PackedStream(IterableDataset):
         if texts:
             extend(texts)
             yield from drain()
+        # Keep the partially filled ring (and its read cursor) across epochs
+        # of the same stream object.
+        self.buf = buf
+        self.fill = fill
         self.pos = pos
+
+
+class _JsonlDocumentStream(IterableDataset):
+    """Re-iterable raw-document stream backed by a materialized cache file."""
+
+    def __init__(self, path: Path):
+        self.path = str(path)
+
+    def __iter__(self):
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                yield json.loads(line)
+
+
+def _split_cache_dir() -> Path | None:
+    """Where materialized held-out slices are stored.
+
+    `ADASQUASH_DATA_CACHE` overrides the root; the values `0`/`off`/`none`
+    disable materialization entirely (the loader then re-plays the streaming
+    split on every build, which is the historical behaviour).
+    """
+    env = os.environ.get("ADASQUASH_DATA_CACHE")
+    if env is not None:
+        if env.strip().lower() in ("", "0", "off", "none", "false"):
+            return None
+        return Path(env)
+    try:
+        return Path.home() / ".cache" / "adasquash" / "splits"
+    except Exception:
+        return None
+
+
+def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, split: str,
+                               report: dict):
+    """Cache the held-out slice's raw documents once; serve later builds locally.
+
+    `select_stream_split` implements the chronological split with
+    `ds.skip(start)`, which iterates (and decodes/downloads) every preceding
+    document. For validation/test `start` is ~99% of the corpus, and each
+    DataLoader worker plus every rebuilt loader (per checkpoint, per sweep
+    cell) paid that scan again. Materializing the raw text of the slice on
+    first use keeps the exact same documents in the exact same order - the
+    cleaner still runs afterwards, so cleaning/dedup semantics are unchanged -
+    while subsequent builds read a local file. Returns `(stream, cache_path)`
+    or `(stream_ds, None)` when caching is disabled/unavailable.
+    """
+    start, count = report.get("start"), report.get("count")
+    if not start or not count:
+        # start == 0 means there is no prefix to skip; nothing to gain.
+        return stream_ds, None
+    root = _split_cache_dir()
+    if root is None:
+        return stream_ds, None
+    key = json.dumps(
+        {
+            "version": 1,
+            "dataset": dataset_name,
+            "dataset_config": dataset_config,
+            "split": split,
+            "dataset_revision": report.get("dataset_revision"),
+            "num_documents": report.get("num_documents"),
+            "val_frac": report.get("val_frac"),
+            "test_frac": report.get("test_frac"),
+            "start": start,
+            "count": count,
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+    safe_name = str(dataset_name).replace("/", "__")
+    cache_path = root / f"{safe_name}-{split}-{digest}.jsonl"
+    if cache_path.exists():
+        return _JsonlDocumentStream(cache_path), cache_path
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for example in stream_ds:
+                if isinstance(example, dict):
+                    # Only `text` is read downstream; typing is preserved
+                    # exactly (None / NaN / non-string included) so the
+                    # cleaner's drop counters stay identical.
+                    f.write(json.dumps({"text": example.get("text")}, ensure_ascii=False) + "\n")
+                else:
+                    f.write("null\n")
+        os.replace(tmp, cache_path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return _JsonlDocumentStream(cache_path), cache_path
 
 
 _TOKENIZER_CACHE: dict = {}
@@ -473,6 +625,11 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     stream_ds = load_dataset(dataset_name, dataset_config, split="train",
                              streaming=True, revision=opts.get("dataset_revision"))
     stream_ds, report = select_stream_split(stream_ds, opts["split"], opts)
+    if opts["split"] in ("validation", "test"):
+        stream_ds, cache_path = _materialized_split_stream(
+            stream_ds, dataset_name, dataset_config, opts["split"], report)
+        if cache_path is not None:
+            report["materialized_cache"] = str(cache_path)
     report["tokenizer"] = tokenizer
     report["shuffle_buffer"] = int(opts["shuffle_buffer"]) if opts["split"] == "train" else 0
     exclude_hashes: set = set()
@@ -504,9 +661,17 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     )
     generator = torch.Generator()
     generator.manual_seed(int(opts["seed"]))
-    loader = DataLoader(stream, batch_size=batch_size, num_workers=2,
+    num_workers = max(0, int(opts.get("num_workers", 2) or 0))
+    loader_kwargs: dict = {}
+    if num_workers > 0:
+        # Workers stay alive across epochs (no per-epoch tokenizer/cleaner
+        # rebuild) and fetch ahead independently of the parent's consumption.
+        loader_kwargs["persistent_workers"] = bool(opts.get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = max(1, int(opts.get("prefetch_factor", 2) or 2))
+    loader = DataLoader(stream, batch_size=batch_size, num_workers=num_workers,
                         pin_memory=torch.cuda.is_available(),
-                        worker_init_fn=seed_worker, generator=generator)
+                        worker_init_fn=seed_worker, generator=generator, **loader_kwargs)
+    report["num_workers"] = num_workers
     loader.split_report = report
     return loader
 

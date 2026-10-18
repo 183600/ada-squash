@@ -75,6 +75,43 @@ def clear_ce_scratch_cache() -> None:
     """Release the cached CE scratch buffers (model switch / run end)."""
     _CE_SCRATCH_CACHE.clear()
 
+# Autocast weight casts for the custom kernels. True autocast casts a weight
+# once per autocast context and caches it keyed by identity + version; these
+# kernels are invoked per micro-batch inside one autocast context, so without
+# a cache the same fp32 weight is recast (and held by save_for_backward) once
+# per micro. `_version` bumps on every in-place update, so an optimizer step
+# can never leave a stale cast behind.
+_CAST_WEIGHT_CACHE: dict[tuple, torch.Tensor] = {}
+_CAST_WEIGHT_CACHE_BYTES = 0
+_CAST_WEIGHT_CACHE_MAX_BYTES = 1 << 28
+
+def clear_cast_weight_cache() -> None:
+    """Release the cached autocast weight casts (model switch / run end)."""
+    global _CAST_WEIGHT_CACHE_BYTES
+    _CAST_WEIGHT_CACHE.clear()
+    _CAST_WEIGHT_CACHE_BYTES = 0
+
+def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
+    global _CAST_WEIGHT_CACHE_BYTES
+    if w.dtype == dt:
+        return w
+    key = (w.data_ptr(), w._version, dt, str(w.device))
+    got = _CAST_WEIGHT_CACHE.get(key)
+    if got is not None and got.shape == w.shape:
+        return got
+    nbytes = w.numel() * (torch.finfo(dt).bits // 8)
+    if nbytes > _CAST_WEIGHT_CACHE_MAX_BYTES:
+        # A single cast larger than the whole budget (e.g. the 1B CE weight):
+        # caching it would just crowd out everything else.
+        return w.to(dt)
+    if _CAST_WEIGHT_CACHE_BYTES + nbytes > _CAST_WEIGHT_CACHE_MAX_BYTES:
+        _CAST_WEIGHT_CACHE.clear()
+        _CAST_WEIGHT_CACHE_BYTES = 0
+    got = w.to(dt)
+    _CAST_WEIGHT_CACHE[key] = got
+    _CAST_WEIGHT_CACHE_BYTES += nbytes
+    return got
+
 def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=False) -> dict:
     kwargs: dict = {}
     is_dyt_family = cfg.norm_name in ('dyt', 'dytd', 'dytc', 'dytcd', 'dytcd_tanh')
@@ -172,7 +209,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
     def forward(ctx, hidden, weight, targets, ignore_index, chunk_rows):
         dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
         h = hidden.to(dt)
-        w = weight.to(dt)
+        w = _cast_weight_cached(weight, dt)
         acc = _loss_acc_dtype(dt)
         w_t = w.t()
         total = None
@@ -360,10 +397,11 @@ class _SwiGLU(torch.autograd.Function):
         if x2.dtype != dt:
             x2 = x2.to(dt)
         # The backward consumes the same cast weight copies as the forward
-        # GEMMs.
-        w1c = w1 if w1.dtype == dt else w1.to(dt)
-        w2c = w2 if w2.dtype == dt else w2.to(dt)
-        w3c = w3 if w3.dtype == dt else w3.to(dt)
+        # GEMMs; the version-keyed cache keeps the per-micro recast churn
+        # from repeating across the whole micro-batch loop.
+        w1c = _cast_weight_cached(w1, dt)
+        w2c = _cast_weight_cached(w2, dt)
+        w3c = _cast_weight_cached(w3, dt)
         a = F.linear(x2, w1c)
         b = F.linear(x2, w3c)
         h = F.silu(a, inplace=True)
@@ -449,13 +487,18 @@ class MLP(nn.Module):
 
 class GPT(nn.Module):
 
-    def __init__(self, cfg: GPTConfig):
+    def __init__(self, cfg: GPTConfig, init: bool=True):
         super().__init__()
         self.cfg = cfg
         # The constructor's own kaiming / normal passes are always overwritten
         # by the `apply(self._init_weights)` below, so every Linear / Embedding
         # is built with `skip_init` and the apply pass is the single
         # initialization (norm layers keep their own init untouched).
+        # `init=False` skips that pass for callers that immediately re-init
+        # (`reset_parameters(seed)`) or load a checkpoint into the module: the
+        # build-time pass would be a full second parameter initialization that
+        # is then overwritten (and, for loaders, the single biggest CPU-side
+        # cost of constructing a run).
         self.tok_emb = _skip_init(nn.Embedding, cfg.vocab_size, cfg.dim)
         self.pos_emb = _skip_init(nn.Embedding, cfg.max_seq_len, cfg.dim) if not cfg.rotary else None
         self.drop = nn.Dropout(cfg.dropout)
@@ -464,7 +507,8 @@ class GPT(nn.Module):
         self.lm_head = _skip_init(nn.Linear, cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
-        self.apply(self._init_weights)
+        if init:
+            self.apply(self._init_weights)
         if cfg.rotary:
             head_dim = cfg.dim // cfg.n_heads
             freqs = 1.0 / 10000 ** (torch.arange(0, head_dim, 2).float() / head_dim)
@@ -498,7 +542,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         return self
 
-    def forward(self, input_ids: torch.Tensor, targets: Optional[torch.Tensor]=None, return_stats: bool=False, last_position_only: bool=False, return_logits: bool=True):
+    def forward(self, input_ids: torch.Tensor, targets: Optional[torch.Tensor]=None, return_stats: bool=False, last_position_only: bool=False, return_logits: bool=True, return_hidden: bool=False):
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
@@ -523,6 +567,13 @@ class GPT(nn.Module):
                     all_logit_stats.append(ls)
         if last_position_only:
             x = x[:, -1:]
+        if return_hidden:
+            # Pre-`norm_f` block output; `norm_f` and `lm_head` are per-position,
+            # so callers can project the vocabulary dimension in position
+            # chunks instead of materializing `(rows, T, vocab)` at once.
+            if return_stats:
+                return (x, None, all_logit_stats)
+            return (x, None)
         x = self.norm_f(x)
         logits = None
         loss = None
@@ -539,6 +590,11 @@ class GPT(nn.Module):
         if not return_stats:
             return (logits, loss)
         return (logits, loss, all_logit_stats)
+
+    def forward_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Final block output (pre-`norm_f`) for chunked logits projection."""
+        out = self.forward(input_ids, targets=None, return_hidden=True)
+        return out[0]
 
     def last_position_logits(self, input_ids: torch.Tensor, return_stats: bool=False) -> torch.Tensor:
         out = self.forward(input_ids, targets=None, return_stats=return_stats, last_position_only=True)
@@ -564,17 +620,17 @@ class GPT(nn.Module):
                     out[cls] += p.numel()
         return out
 
-def build_gpt_124m(norm_name: str='dytcd', **over) -> GPT:
+def build_gpt_124m(norm_name: str='dytcd', init: bool=True, **over) -> GPT:
     cfg = GPTConfig(vocab_size=50304, dim=768, n_layers=12, n_heads=12, max_seq_len=1024, mlp_ratio=4.0, norm_name=norm_name, **over)
-    return GPT(cfg)
+    return GPT(cfg, init=init)
 
-def build_gpt_350m(norm_name: str='dytcd', **over) -> GPT:
+def build_gpt_350m(norm_name: str='dytcd', init: bool=True, **over) -> GPT:
     cfg = GPTConfig(vocab_size=50304, dim=1024, n_layers=24, n_heads=16, max_seq_len=1024, mlp_ratio=4.0, norm_name=norm_name, **over)
-    return GPT(cfg)
+    return GPT(cfg, init=init)
 
-def build_llama_tiny_1b(norm_name: str='dytcd', **over) -> GPT:
+def build_llama_tiny_1b(norm_name: str='dytcd', init: bool=True, **over) -> GPT:
     over.setdefault('tie_word_embeddings', False)
     over.setdefault('rotary', True)
     cfg = GPTConfig(vocab_size=32000, dim=2048, n_layers=24, n_heads=16, max_seq_len=2048, mlp_ratio=8.0 / 3.0, norm_name=norm_name, **over)
-    return GPT(cfg)
+    return GPT(cfg, init=init)
 __all__ = ['GPTConfig', 'LayerConfig', 'Block', 'MLP', 'GPT', 'build_norm_kwargs', 'cross_entropy_mean', 'fused_cross_entropy_mean', 'clear_ce_scratch_cache', 'build_gpt_124m', 'build_gpt_350m', 'build_llama_tiny_1b']

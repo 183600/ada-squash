@@ -50,7 +50,14 @@ from adasquash.efficiency import (
     efficiency_verdict,
     parameter_breakdown,
 )
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
+from adasquash.attention import clear_logit_scratch_cache
+from adasquash.model import (
+    build_gpt_124m,
+    build_gpt_350m,
+    build_llama_tiny_1b,
+    clear_cast_weight_cache,
+    clear_ce_scratch_cache,
+)
 from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
 
 _BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
@@ -66,15 +73,27 @@ def _sync(device: str) -> None:
 
 
 def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
+    n_iters = max(1, iters)
     for _ in range(max(0, warmup)):
         fn()
-    _sync(device)
-    times = []
-    for _ in range(max(1, iters)):
-        t0 = time.perf_counter()
-        fn()
+    if _is_cuda(device):
+        # Event burst: every iteration is enqueued back-to-back and the host
+        # syncs once at the end, instead of a full synchronize per iteration.
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
         _sync(device)
-        times.append((time.perf_counter() - t0) * 1000.0)
+        for i in range(n_iters):
+            starts[i].record()
+            fn()
+            ends[i].record()
+        _sync(device)
+        times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    else:
+        times = []
+        for _ in range(n_iters):
+            t0 = time.perf_counter()
+            fn()
+            times.append((time.perf_counter() - t0) * 1000.0)
     return {
         'mean_ms': statistics.fmean(times),
         'median_ms': statistics.median(times),
@@ -86,6 +105,12 @@ def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
 def measure_peak_memory(fn, device: str):
     if not _is_cuda(device):
         return None
+    # The fused-CE / logit scratch caches hold 100MB+ after the first forward;
+    # without dropping them first, the first measured norm looks cheaper than
+    # every later one (and the aggregate reports that first row).
+    clear_ce_scratch_cache()
+    clear_logit_scratch_cache()
+    clear_cast_weight_cache()
     torch.cuda.reset_peak_memory_stats(device)
     fn()
     _sync(device)
@@ -105,8 +130,11 @@ def measured_forward_flops(fn, tokens: int):
         return None
 
 
-def benchmark_norm(model_name: str, norm: str, args, device: str) -> dict:
-    model = _BUILDERS[model_name](norm_name=norm)
+def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy: bool=True) -> dict:
+    # Build on the benchmark device and skip the constructor init pass;
+    # `reset_parameters(args.seed)` below is the single seeded init.
+    with torch.device(device):
+        model = _BUILDERS[model_name](norm_name=norm, init=False)
     model.reset_parameters(args.seed)
     model.to(device)
     model.train()
@@ -135,12 +163,17 @@ def benchmark_norm(model_name: str, norm: str, args, device: str) -> dict:
     from scripts.train_gpt2 import build_optimizer
     opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     fwd_timing = measure_timed(forward, args.iters, args.warmup, device)
-    fwd_mem = measure_peak_memory(forward, device)
     train_timing = measure_timed(train_step, args.iters, args.warmup, device)
-    train_mem = measure_peak_memory(train_step, device)
+    # Memory and FlopCounterMode are the same for every round of the same
+    # norm; measuring them once keeps `--rounds 3` from paying for 3x.
+    if measure_heavy:
+        fwd_mem = measure_peak_memory(forward, device)
+        train_mem = measure_peak_memory(train_step, device)
+    else:
+        fwd_mem = train_mem = None
     model.zero_grad(set_to_none=True)
     flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
-    measured = measured_forward_flops(forward, tokens)
+    measured = measured_forward_flops(forward, tokens) if measure_heavy else None
     breakdown = parameter_breakdown(model)
     return {
         'norm': norm,
@@ -319,7 +352,7 @@ def main():
         measurement_order.append(order)
         print(f'[bench] round {r_i + 1}/{rounds} order: {order}')
         for norm in order:
-            row = benchmark_norm(args.model, norm, args, device)
+            row = benchmark_norm(args.model, norm, args, device, measure_heavy=(r_i == 0))
             row['round'] = r_i
             raw_rows.append(row)
     results = aggregate_benchmark_rounds(raw_rows, args.norms, rounds)

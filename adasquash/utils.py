@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Optional, Dict
 import torch
 import torch.nn as nn
@@ -19,6 +19,11 @@ class MaxAbsMeter:
     def value(self) -> float:
         return -float('inf') if self._peak is None else float(self._peak)
 
+    @staticmethod
+    def _abs_max(x: torch.Tensor) -> torch.Tensor:
+        """max(|x|) without materializing the elementwise `abs` copy."""
+        return torch.maximum(x.max(), -x.min())
+
     def update(self, x: torch.Tensor):
         with torch.no_grad():
             xd = x.detach().reshape(-1)
@@ -26,11 +31,11 @@ class MaxAbsMeter:
             if n == 0:
                 v = None
             elif n <= self._chunk:
-                v = xd.abs().amax()
+                v = self._abs_max(xd)
             else:
-                v = xd[:self._chunk].abs().amax()
+                v = self._abs_max(xd[:self._chunk])
                 for start in range(self._chunk, n, self._chunk):
-                    torch.fmax(v, xd[start:start + self._chunk].abs().amax(), out=v)
+                    torch.maximum(v, self._abs_max(xd[start:start + self._chunk]), out=v)
             if v is not None:
                 if self._peak is None:
                     self._peak = torch.full((), -float('inf'), dtype=v.dtype, device=v.device)
@@ -40,11 +45,28 @@ class MaxAbsMeter:
         self.count += 1
 
 class KurtosisMeter:
+    # The per-chunk workspace is bounded and reused across samples: each chunk
+    # needs two full-size temporaries (`xc`, `xc2`) for the third/fourth
+    # moments, and allocating them per sampled activation made the diagnostic
+    # hooks dominate the sampling step.
     _chunk = 1 << 22
     acc_dtype = torch.float32
 
     def __init__(self):
+        self._scratch: dict = {}
         self.reset()
+
+    def _workspace(self, name: str, like: torch.Tensor) -> torch.Tensor:
+        """A reusable buffer at least as large as `like` (a view is returned)."""
+        n = like.numel()
+        buf = self._scratch.get(name)
+        if (buf is None or buf.numel() < n or buf.dtype != like.dtype
+                or buf.device != like.device):
+            if len(self._scratch) >= 2:
+                self._scratch.clear()
+            buf = torch.empty(n, dtype=like.dtype, device=like.device)
+            self._scratch[name] = buf
+        return buf[:n].view(like.shape)
 
     def reset(self):
         self.n = 0
@@ -71,8 +93,8 @@ class KurtosisMeter:
             # list casts `torch.linalg.vecdot` to the active low-precision
             # dtype.
             x_var_t, x_mean_t = torch.var_mean(chunk, unbiased=False)
-            xc = chunk - x_mean_t
-            xc2 = xc * xc
+            xc = torch.sub(chunk, x_mean_t, out=self._workspace('xc', chunk))
+            xc2 = torch.mul(xc, xc, out=self._workspace('xc2', chunk))
             parts.append(torch.stack([x_mean_t, x_var_t, torch.linalg.vecdot(xc, xc2), torch.linalg.vecdot(xc2, xc2)]))
             counts.append(count)
         self._pending_stats.append(torch.stack(parts))
@@ -201,7 +223,11 @@ class LossSpikeCounter:
         self.abs_threshold = abs_threshold
         self.ema = None
         self.n_spikes = 0
-        self.history: list = []
+        # Recent (loss, ema, is_spike) triples for post-mortem inspection; the
+        # trainer updates this every step, so an unbounded list grew for the
+        # whole run even though nothing reads it back. A bounded deque keeps
+        # the last window (and stays indexable/appends the same way).
+        self.history: deque = deque(maxlen=4096)
 
     def update(self, loss_value: float) -> bool:
         is_spike = False
@@ -221,7 +247,7 @@ class LossSpikeCounter:
     def reset(self):
         self.ema = None
         self.n_spikes = 0
-        self.history = []
+        self.history = deque(maxlen=self.history.maxlen)
 
     def state_dict(self) -> dict:
         return {'ema': self.ema, 'n_spikes': self.n_spikes}

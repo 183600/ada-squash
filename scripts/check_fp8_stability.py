@@ -44,24 +44,51 @@ _FP8_SEED_METRIC_KEYS = (
 def fp8_min_normal(exp_bits: int) -> float:
     return 2.0 ** (1 - (2 ** (exp_bits - 1) - 1))
 
-def to_fp8_e4m3(x: torch.Tensor, axis: int=-1) -> torch.Tensor:
-    return simulate_fp8(x, max_val=448.0, exp_bits=4, mantissa_bits=3)
+def to_fp8_e4m3(x: torch.Tensor, axis: int=-1, inplace: bool=False) -> torch.Tensor:
+    return simulate_fp8(x, max_val=448.0, exp_bits=4, mantissa_bits=3, inplace=inplace)
 
-def to_fp8_e5m2(x: torch.Tensor) -> torch.Tensor:
-    return simulate_fp8(x, max_val=57344.0, exp_bits=5, mantissa_bits=2)
+def to_fp8_e5m2(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
+    return simulate_fp8(x, max_val=57344.0, exp_bits=5, mantissa_bits=2, inplace=inplace)
 
-def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: int) -> torch.Tensor:
+# Reusable frexp/mask scratch keyed by (shape, device): the fp8 simulator runs
+# on every wrapped linear, so a fresh set of full-size temporaries per call
+# dominated both allocator traffic and peak memory.
+_FP8_SCRATCH: dict = {}
+
+def _fp8_scratch(shape, device):
+    key = (tuple(shape), str(device))
+    got = _FP8_SCRATCH.get(key)
+    if got is None:
+        got = (torch.empty(shape, dtype=torch.float32, device=device),
+               torch.empty(shape, dtype=torch.int32, device=device),
+               torch.empty(shape, dtype=torch.bool, device=device))
+        _FP8_SCRATCH[key] = got
+    return got
+
+def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: int, inplace: bool=False) -> torch.Tensor:
+    """Round `x` to the fp8 grid (fp32 math throughout).
+
+    `inplace=True` means the caller hands over ownership of an fp32 `x` (e.g. a
+    fresh `F.linear` output) and gets the result written back into it; the
+    frexp/mantissa/compare scratch is always reused.
+    """
     in_dtype = x.dtype
-    x = x.float()
+    if inplace and in_dtype == torch.float32:
+        a = x
+    else:
+        a = x.float().clone()
     levels = float(2 ** mantissa_bits)
-    a = x.clamp(-max_val, max_val)
+    a.clamp_(-max_val, max_val)
     min_exp = 2 - (1 << exp_bits - 1) - mantissa_bits
-    mant, exp = torch.frexp(a)
+    mant, exp, low = _fp8_scratch(a.shape, a.device)
+    torch.frexp(a, out=(mant, exp))
     exp.sub_(1 + mantissa_bits)
     mant.mul_(2.0 * levels)
     mant.round_()
-    mant.masked_fill_(exp < min_exp, 0.0)
-    return torch.ldexp(mant, exp).to(in_dtype)
+    torch.lt(exp, min_exp, out=low)
+    mant.masked_fill_(low, 0.0)
+    torch.ldexp(mant, exp, out=a)
+    return a.to(in_dtype)
 
 class FP8LinearSim:
 
@@ -74,7 +101,8 @@ class FP8LinearSim:
 
         def fwd(x):
             y = F.linear(self.quant(x), self.qw, module.bias)
-            return self.quant(y)
+            # `y` is freshly allocated here, so the rounding can write into it.
+            return self.quant(y, inplace=True)
         module.forward = fwd
 
 class FP8SwiGLUSim:
@@ -91,11 +119,13 @@ class FP8SwiGLUSim:
         def fwd(x):
             q = self.quant
             x_q = q(x)
-            a = q(F.linear(x_q, self.qw1))
-            b = q(F.linear(x_q, self.qw3))
+            # Every other tensor here is owned by this closure, so the
+            # roundings can run in place after the producing op.
+            a = q(F.linear(x_q, self.qw1), inplace=True)
+            b = q(F.linear(x_q, self.qw3), inplace=True)
             h = F.silu(a)
             h.mul_(b)
-            return mlp.drop(q(F.linear(q(h), self.qw2)))
+            return mlp.drop(q(F.linear(q(h, inplace=True), self.qw2), inplace=True))
         mlp.forward = fwd
 
     @property
@@ -122,24 +152,37 @@ def measure_fp8_divergence(model, x, norm_name: str):
     ranges = []
     fp8_e4m3_min = fp8_min_normal(4)
 
-    def _zero_like_scalar(ref: torch.Tensor) -> torch.Tensor:
-        return torch.zeros((), dtype=ref.dtype, device=ref.device)
+    def _zero_scalar(device) -> torch.Tensor:
+        return torch.zeros((), dtype=torch.float64, device=device)
 
     def make_stat_hook():
 
         def hook(module, inp, out):
+            # Everything stays on the device here; the ~25 norm hooks are
+            # flattened with a single `.tolist()` after the forward (the old
+            # version synced once per hook and allocated `.float()` masks).
             x_in = inp[0] if isinstance(inp, tuple) and inp else None
             cls_name = module.__class__.__name__
             has_in = torch.is_tensor(x_in)
+            zero = _zero_scalar(out.device)
+            numel = out.numel()
             abs_out = out.abs()
-            abs_in = x_in.abs() if has_in else None
-            q = to_fp8_e4m3(out)
-            scalars = [abs_out.max(), abs_out.mean(), (abs_out > FP8_E4M3_MAX).float().mean(), (abs_out < fp8_e4m3_min).float().mean() if out.numel() else _zero_like_scalar(abs_out), q.sub_(out).abs_().mean(), abs_in.max() if has_in else _zero_like_scalar(abs_out), _excess_kurtosis(x_in) if has_in else _zero_like_scalar(abs_out)]
-            max_abs_out, mean_abs_out, overflow, underflow, err, max_abs_in, kurtosis_in = torch.stack([s.detach().reshape(()).double() for s in scalars]).tolist()
-            denom = mean_abs_out + 1e-06
-            ranges.append({'module': cls_name, 'max_abs_in': max_abs_in, 'max_abs_out': max_abs_out, 'kurtosis_in': kurtosis_in})
-            quant_errors.append({'module': cls_name, 'max_abs': max_abs_out, 'overflow_rate': overflow, 'underflow_rate': underflow, 'rel_err': err / denom})
+            max_abs_out = torch.maximum(out.max(), -out.min())
+            mean_abs_out = abs_out.mean()
+            if numel:
+                overflow = torch.count_nonzero(abs_out > FP8_E4M3_MAX).to(torch.float64) / numel
+                underflow = torch.count_nonzero(abs_out < fp8_e4m3_min).to(torch.float64) / numel
+            else:
+                overflow = underflow = zero
+            err = to_fp8_e4m3(out).sub_(out).abs_().mean()
+            max_abs_in = torch.maximum(x_in.max(), -x_in.min()) if has_in else zero
+            kurtosis_in = _excess_kurtosis(x_in) if has_in else zero
+            stat = torch.stack([max_abs_in.detach(), max_abs_out.detach(), mean_abs_out.detach(),
+                                overflow.detach(), underflow.detach(), err.detach(),
+                                kurtosis_in.detach()]).double()
+            pending_stats.append((cls_name, stat))
         return hook
+    pending_stats = []
     first_bad = []
     first_over = []
 
@@ -149,7 +192,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
             y = out[0] if isinstance(out, tuple) else out
             all_finite = torch.isfinite(y).all()
             first_bad.append((i, all_finite))
-            first_over.append((i, y.abs().amax()))
+            # max(|y|) without materializing a full-size `y.abs()`.
+            first_over.append((i, torch.maximum(y.max(), -y.min())))
         return hook
     with torch.no_grad():
         logits_fp32, _ = model(x)
@@ -164,14 +208,40 @@ def measure_fp8_divergence(model, x, norm_name: str):
         h.remove()
     for h in handles:
         h.remove()
+    if pending_stats:
+        stat_vals = torch.stack([s for _, s in pending_stats]).tolist()
+        for (cls_name, _), vals in zip(pending_stats, stat_vals):
+            max_abs_in, max_abs_out, mean_abs_out, overflow, underflow, err, kurtosis_in = vals
+            denom = mean_abs_out + 1e-06
+            ranges.append({'module': cls_name, 'max_abs_in': max_abs_in, 'max_abs_out': max_abs_out, 'kurtosis_in': kurtosis_in})
+            quant_errors.append({'module': cls_name, 'max_abs': max_abs_out, 'overflow_rate': overflow, 'underflow_rate': underflow, 'rel_err': err / denom})
     bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags) if not ok), None)
     first_over_idx = next((i for i, v in zip([i for i, _ in first_over], over_vals) if v > FP8_E4M3_MAX), None)
-    max_abs_fp32 = logits_fp32.abs().max()
-    finite = torch.isfinite(logits_fp8).all()
+    # Compare against the fp32 logits row-block by row-block and keep the fp32
+    # copy on the host only: the old path held both full logits on the GPU and
+    # built another full-size `abs()` temp for the max.
+    max_abs_fp32 = torch.maximum(logits_fp32.max(), -logits_fp32.min()).cpu()
+    logits_fp32_cpu = logits_fp32.detach().to('cpu')
+    del logits_fp32
+    rows = logits_fp8.shape[0]
+    row_bytes = max(1, int(logits_fp8[0].numel())) * 4
+    block_rows = max(1, (1 << 24) // row_bytes)
+    finite = True
+    max_diff = None
+    for b0 in range(0, rows, block_rows):
+        b1 = min(rows, b0 + block_rows)
+        blk = logits_fp8[b0:b1]
+        if not bool(torch.isfinite(blk).all()):
+            finite = False
+            break
+        diff = (blk.to('cpu') - logits_fp32_cpu[b0:b1]).abs().max()
+        max_diff = diff if max_diff is None else torch.maximum(max_diff, diff)
+    del logits_fp32_cpu
     if finite:
-        rel = (logits_fp8.sub_(logits_fp32).abs_().max() / max_abs_fp32.clamp(min=1e-12)).item()
+        # Same fp32 tensor division as the old one-shot path.
+        rel = float(max_diff / max_abs_fp32.clamp(min=1e-12))
         logit_nan = False
     else:
         rel = float('inf')
@@ -424,7 +494,7 @@ def main():
                 if ckpt_model is not None:
                     model = ckpt_model
                 else:
-                    model = build_gpt_124m(norm_name=norm).to(device)
+                    model = build_gpt_124m(norm_name=norm, init=False).to(device)
                     model.reset_parameters(seed)
                 model.eval()
                 x = make_probe(rng, model.cfg)

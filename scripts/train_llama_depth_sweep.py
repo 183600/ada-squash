@@ -673,6 +673,19 @@ def main():
                   f'its manifest may be missing, which flags the cell incomplete')
 
     max_parallel = max(1, int(args.max_parallel))
+    if max_parallel > 1:
+        if not gpus:
+            raise SystemExit(
+                '[sweep] --max-parallel > 1 requires --gpus: without it every '
+                'child inherits the ambient CUDA_VISIBLE_DEVICES and would train '
+                'on the same (default cuda:0) device at once, which OOMs the 1B '
+                'cells. Pass --gpus 0 1 ... or keep --max-parallel 1.'
+            )
+        if max_parallel > len(gpus):
+            print(f'[sweep][warn] --max-parallel {max_parallel} exceeds the '
+                  f'{len(gpus)} GPU id(s); clamping to {len(gpus)} so no two '
+                  f'cells share a device')
+            max_parallel = len(gpus)
     if args.sequential or max_parallel == 1:
         if args.sequential and int(args.max_parallel) > 1:
             print('[sweep][warn] --sequential overrides --max-parallel')

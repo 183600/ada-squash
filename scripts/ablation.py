@@ -150,7 +150,7 @@ LOO_SPEC = {
 def _effective_cfg(model_name: str, cfg_kwargs: dict) -> dict:
     """The full GPTConfig a matrix row builds, as a plain dict."""
     with torch.device('meta'):
-        cfg = _MODEL_BUILDERS[model_name](**cfg_kwargs).cfg
+        cfg = _MODEL_BUILDERS[model_name](init=False, **cfg_kwargs).cfg
     return dataclasses.asdict(cfg)
 
 def effective_config_key(model_name: str, cfg_kwargs: dict) -> str:
@@ -282,7 +282,11 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     output_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seed)
-    model = _MODEL_BUILDERS[args.model](**cfg_kwargs)
+    # Build directly on the target device (no full-model H2D) and skip the
+    # constructor's init pass: `reset_parameters(seed)` below is the run's
+    # single, seeded initialization.
+    with torch.device(device):
+        model = _MODEL_BUILDERS[args.model](init=False, **cfg_kwargs)
     model.reset_parameters(seed)
     model.to(device)
     n_params = count_parameters(model)
@@ -319,8 +323,10 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             act_stats.attach(reset=not stats_windowed)
             stats_windowed = True
         loss = model(x, y, return_logits=False)[1]
-        # `loss` is not touched by backward, so the pre-backward value is the
-        # value to record.
+        # Backward is enqueued first; `loss` is not mutated by it, so the
+        # host read below returns the same value while overlapping with the
+        # backward kernels instead of stalling in front of them.
+        loss.backward()
         loss_val = float(loss.detach())
         if not math.isfinite(loss_val):
             triage = triage_nonfinite(model, x, y, device_type=device,
@@ -330,7 +336,6 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                 f"(seed={seed}): triage stage='{triage['stage']}' "
                 f"({triage['diagnosis']}); fixes: " + ' | '.join(triage['recommendations'])
             )
-        loss.backward()
         if measure:
             act_stats.detach()
             clear_logit_scratch_cache()
@@ -354,7 +359,10 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                     for _ in range(curve_batches)
                 ])
             model.train()
-            held = held_t.to(torch.float64).tolist()
+            # One batched device->host transfer; `.tolist()` widens each fp32
+            # value to the same Python double the explicit fp64 cast produced,
+            # without the extra GPU cast and the doubled transfer bytes.
+            held = held_t.tolist()
             curve_train.append(train_point)
             curve_val.append(sum(held) / len(held))
             curve_steps.append(step + 1)
@@ -393,7 +401,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                                 args.seq_len, device, outlier_id=outlier_id),
                   return_logits=False)[1]
             for _ in range(n_val_batches)
-        ]).to(torch.float64).tolist()
+        ]).tolist()
     model.train()
     # `val_loss` is a sample mean over held-out batches; keep the per-batch
     # losses (and their standard error) so comparisons can be *paired* across
