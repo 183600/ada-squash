@@ -22,10 +22,9 @@ backbone, shape and device:
 
 With `--summaries runs/ablation/all_summaries.json` plus a reference and a
 candidate row, it joins the measured cost to the held-out loss and applies
-`efficiency_verdict`: a below-margin gain or an above-budget slowdown is
-reported as *not viable* (the "+0.5% at 10x compute" case), with the
-cost-per-loss-point printed explicitly. `--require-viable` turns that into a
-non-zero exit status for CI-style use.
+`efficiency_verdict`: a below-margin gain or an above-maximum slowdown is
+reported as *not viable*, with the cost-per-loss-point printed explicitly.
+`--require-viable` turns that into a non-zero exit status for CI-style use.
 
 The elementwise norm math is not a matmul, so FLOPs do not see it; the
 wall-clock latency does. Read the two together.
@@ -78,7 +77,7 @@ def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
         fn()
     if _is_cuda(device):
         # Event burst: every iteration is enqueued back-to-back and the host
-        # syncs once at the end, instead of a full synchronize per iteration.
+        # syncs once at the end.
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
         ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
         _sync(device)
@@ -105,9 +104,8 @@ def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
 def measure_peak_memory(fn, device: str):
     if not _is_cuda(device):
         return None
-    # The fused-CE / logit scratch caches hold 100MB+ after the first forward;
-    # without dropping them first, the first measured norm looks cheaper than
-    # every later one (and the aggregate reports that first row).
+    # Dropping the scratch caches first keeps the first measured norm
+    # comparable to the rest.
     clear_ce_scratch_cache()
     clear_logit_scratch_cache()
     clear_cast_weight_cache()
@@ -165,7 +163,7 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     fwd_timing = measure_timed(forward, args.iters, args.warmup, device)
     train_timing = measure_timed(train_step, args.iters, args.warmup, device)
     # Memory and FlopCounterMode are the same for every round of the same
-    # norm; measuring them once keeps `--rounds 3` from paying for 3x.
+    # norm; measuring them once is enough.
     if measure_heavy:
         fwd_mem = measure_peak_memory(forward, device)
         train_mem = measure_peak_memory(train_step, device)

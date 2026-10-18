@@ -64,10 +64,8 @@ DEFAULT_DATA_OPTIONS = {
     "max_doc_chars": 0,          # length-outlier cap, 0 = no cap
     "shuffle_buffer": 0,         # train-split batch shuffle window, 0 = off
     "seed": 42,
-    # Loader parallelism: fixed at 2 workers before, which made the
-    # duplicate-hash sharding cost multiplicative and paid a worker
-    # respawn/tokenizer rebuild on every epoch. 0 keeps everything in the
-    # parent process (no cross-worker scan at all).
+    # Loader parallelism: 0 keeps everything in the parent process (no
+    # cross-worker scan at all).
     "num_workers": 2,
     "prefetch_factor": 2,
     "persistent_workers": True,
@@ -322,15 +320,13 @@ class DocumentCleaner:
         self.dedup_max = int(dedup_max)
         self.min_doc_chars = int(min_doc_chars)
         self.max_doc_chars = int(max_doc_chars)
-        # Held by reference: the ledger is read once and can be large (up to
-        # 1e6 digest bytes), so copying it here doubled the resident set. The
+        # Held by reference: the ledger is read once and may be large, so the
         # caller must not mutate it after handing it over.
         self.exclude_hashes = exclude_hashes if exclude_hashes is not None else set()
         # `seen` stores the leading 64 bits of each digest as an int instead
-        # of boxed `bytes` objects: the bound is 1e6 entries, and the boxed
-        # form costs ~100MB+ per worker. Collisions only matter at a
-        # negligible 2^-64 scale and the full digest is still used for the
-        # cross-split ledger lookup.
+        # of boxed `bytes` objects; collisions only matter at a negligible
+        # 2^-64 scale and the full digest is still used for the cross-split
+        # ledger lookup.
         self.seen: set = set()
         self.stats: Counter = Counter()
 
@@ -555,13 +551,11 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
 
     `select_stream_split` implements the chronological split with
     `ds.skip(start)`, which iterates (and decodes/downloads) every preceding
-    document. For validation/test `start` is ~99% of the corpus, and each
-    DataLoader worker plus every rebuilt loader (per checkpoint, per sweep
-    cell) paid that scan again. Materializing the raw text of the slice on
-    first use keeps the exact same documents in the exact same order - the
-    cleaner still runs afterwards, so cleaning/dedup semantics are unchanged -
-    while subsequent builds read a local file. Returns `(stream, cache_path)`
-    or `(stream_ds, None)` when caching is disabled/unavailable.
+    document. Materializing the raw text of the slice on first use keeps the
+    exact same documents in the exact same order - the cleaner still runs
+    afterwards, so cleaning/dedup semantics are unchanged - while subsequent
+    builds read a local file. Returns `(stream, cache_path)` or
+    `(stream_ds, None)` when caching is disabled/unavailable.
 
     The cache key carries the *resolved* dataset revision (recorded in
     `report`), so a cache materialized from the default branch before it moved

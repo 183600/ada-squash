@@ -407,7 +407,7 @@ def main():
     p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='one independent probe draw per seed; every metric is reported as Mean +/- Std across seeds, and >= 3 seeds keeps a single lucky probe from deciding a comparison')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the paired cross-checkpoint tests in ppl_comparison.json (Holm-adjusted over the pairwise family)')
     p.add_argument('--output', default='runs/w8a8/results.json')
-    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this check tests (e.g. "DyT-CD loses less perplexity under W8A8 than RMSNorm at the same checkpoint budget"); recorded in the run manifest so the result can be audited against the claim it was meant to support')
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this check tests (e.g. "DyT-CD loses less perplexity under W8A8 than RMSNorm at the same checkpoint step count"); recorded in the run manifest so the result can be audited against the claim it was meant to support')
     args = p.parse_args()
     if args.probe == 'dataset' and args.probe_split == 'test' and (not args.allow_sealed_test):
         p.error("--probe-split test is sealed: comparing checkpoints or quantization "
@@ -453,8 +453,7 @@ def main():
             train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
             # One fp32 snapshot of the weights on the host: the in-place
             # quantizer destroys the fp32 weights, and each seed needs them
-            # back, but re-reading the checkpoint + rebuilding the model
-            # n_seeds times is the expensive way to get them.
+            # back.
             fp_state = {k: t.detach().cpu().clone() for k, t in model.state_dict().items()}
             per_seed = []
             for seed in seeds:

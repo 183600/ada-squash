@@ -461,9 +461,8 @@ def main():
               'selected on (winner\'s curse); treat the p-values as optimistic')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
-    # One metadata snapshot for the whole grid: every trial used to spawn its
-    # own git subprocesses and environment scan (81 trials -> 81x), and the
-    # snapshot does not change while the grid runs.
+    # One metadata snapshot for the whole grid: the snapshot does not change
+    # while the grid runs.
     run_metadata = collect_run_metadata(seed=None)
     tuned = {}
     for arm in args.arms:

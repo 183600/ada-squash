@@ -175,8 +175,8 @@ def git_revision() -> dict:
 
     The branch and dirty flag come from one `git status --porcelain=v1
     --branch` call (the default porcelain is already v1; the branch header
-    line names the checked-out branch) instead of a separate `rev-parse
-    --abbrev-ref` spawn; only the commit hash needs its own call.
+    line names the checked-out branch); only the commit hash needs its own
+    call.
     """
     status = _run_git("status", "--porcelain=v1", "--branch")
     branch = None
@@ -189,7 +189,7 @@ def git_revision() -> dict:
             if header.startswith("No commits yet"):
                 # Unborn repository: the header names the branch-to-be
                 # (`## No commits yet on master`) but no branch exists yet,
-                # so ask the same command the old implementation used.
+                # so ask `rev-parse --abbrev-ref HEAD`.
                 branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
             else:
                 name = header.split("...")[0].split(" ")[0]
@@ -271,8 +271,7 @@ def environment_info() -> dict:
             # What the interpreter actually started with (None = randomizing,
             # `hash_randomization` is then true) versus the value exported for
             # child processes. `set_all_seeds` overwrites the env var but
-            # cannot change this process's own hash seed, so recording only
-            # the exported value made the manifest look self-contradictory.
+            # cannot change this process's own hash seed.
             "pythonhashseed_at_process_start": _HASHSEED_AT_IMPORT,
             "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
             "hash_randomization": bool(sys.flags.hash_randomization),

@@ -314,7 +314,7 @@ def run_one(norm: str, args, device: str) -> dict:
     set_all_seeds(args.seed)
     # Mirror the training entrypoints' numeric format: TF32 matmuls are on for
     # every path that has them, and autocast runs whenever the run being
-    # checked would run under bf16. A bug that only shows up under the
+    # checked would run under bf16. A failure that only shows up under the
     # reduced-precision path must fail the preflight, not the full run.
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

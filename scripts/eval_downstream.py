@@ -199,9 +199,8 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                     step_logits, _ = model(ctx)
                     step_logits = step_logits[:, -1]
                 nxt = step_logits.argmax(-1)
-                # Device-side comparison: the common all-correct step pays one
-                # tiny scalar sync and no int list round-trip; only the rows
-                # that actually diverged get materialized.
+                # Device-side comparison: only the rows that actually diverged
+                # get materialized.
                 neq = nxt != want
                 if bool(neq.any().item()):
                     bad_rows = neq.nonzero(as_tuple=True)[0].tolist()

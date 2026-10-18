@@ -75,18 +75,13 @@ def clear_ce_scratch_cache() -> None:
     """Release the cached CE scratch buffers (model switch / run end)."""
     _CE_SCRATCH_CACHE.clear()
 
-# Autocast weight casts for the custom kernels. True autocast casts a weight
-# once per autocast context and caches it keyed by identity + version; these
-# kernels are invoked per micro-batch inside one autocast context, so without
-# a cache the same fp32 weight is recast (and held by save_for_backward) once
-# per micro. `_version` bumps on every in-place update, so an optimizer step
-# can never leave a stale cast behind. Each entry keeps a strong reference to
-# its source weight (the guard the RoPE table cache uses): the storage address
+# Autocast weight casts for the custom kernels, keyed by identity + version.
+# `_version` bumps on every in-place update, so an optimizer step can never
+# leave a stale cast behind. Each entry keeps a strong reference to its
+# source weight (the guard the RoPE table cache uses): the storage address
 # in the key can then never be recycled by a *different* model's parameter,
 # and the identity check rejects a same-address / same-version collision
-# outright. Otherwise a freed model's address could be reused by the next
-# model and silently serve that model's forward/backward with the previous
-# model's weights.
+# outright.
 _CAST_WEIGHT_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _CAST_WEIGHT_CACHE_BYTES = 0
 _CAST_WEIGHT_CACHE_MAX_BYTES = 1 << 28
@@ -114,8 +109,8 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
         # forward has to rebuild it (the key and the values are unchanged).
     nbytes = w.numel() * (torch.finfo(dt).bits // 8)
     if nbytes > _CAST_WEIGHT_CACHE_MAX_BYTES:
-        # A single cast larger than the whole budget (e.g. the 1B CE weight):
-        # caching it would just crowd out everything else.
+        # A single cast larger than the cache capacity (e.g. the 1B CE
+        # weight) is used directly instead of being cached.
         return w.to(dt)
     if entry is not None:
         # Stale same-key entry (collided identity or an inference cast):
@@ -414,8 +409,7 @@ class _SwiGLU(torch.autograd.Function):
         if x2.dtype != dt:
             x2 = x2.to(dt)
         # The backward consumes the same cast weight copies as the forward
-        # GEMMs; the version-keyed cache keeps the per-micro recast churn
-        # from repeating across the whole micro-batch loop.
+        # GEMMs (from the version-keyed cache).
         w1c = _cast_weight_cached(w1, dt)
         w2c = _cast_weight_cached(w2, dt)
         w3c = _cast_weight_cached(w3, dt)
@@ -514,8 +508,7 @@ class GPT(nn.Module):
         # `init=False` skips that pass for callers that immediately re-init
         # (`reset_parameters(seed)`) or load a checkpoint into the module: the
         # build-time pass would be a full second parameter initialization that
-        # is then overwritten (and, for loaders, the single biggest CPU-side
-        # cost of constructing a run).
+        # is then overwritten.
         self.tok_emb = _skip_init(nn.Embedding, cfg.vocab_size, cfg.dim)
         self.pos_emb = _skip_init(nn.Embedding, cfg.max_seq_len, cfg.dim) if not cfg.rotary else None
         self.drop = nn.Dropout(cfg.dropout)

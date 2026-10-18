@@ -171,8 +171,8 @@ def diagnose_train_val_curve(
             "is already the one the final test evaluation restores)",
             "add regularization (weight decay / dropout) or more unique data; "
             "verify the split with scripts/audit_data.py before trusting the gap",
-            "a 0.5% loss win bought with a much larger model is not automatically "
-            "a win: check params/flops/latency with scripts/benchmark_efficiency.py",
+            "a small loss win bought with a much larger model is not automatically "
+            "a win: compare the efficiency numbers before claiming the trade",
         ]
     elif train_trend == "falling" and val_trend == "falling":
         classification = "healthy"
@@ -187,8 +187,8 @@ def diagnose_train_val_curve(
             "and the train-validation gap is widening: the extra training "
             "capacity is fitting noise; use --early-stop-patience and add data "
             "or regularization",
-            "check params/flops/latency with scripts/benchmark_efficiency.py "
-            "before claiming the deeper/wider model is the better trade",
+            "compare the efficiency numbers before claiming the deeper/wider "
+            "model is the better trade",
         ]
     elif val_trend == "falling" and train_trend == "flat":
         classification = "healthy"
@@ -388,11 +388,9 @@ _GRAD_CENSUS_CHUNK = 1 << 22
 def gradient_health_report(model) -> dict:
     """Non-finite/zero/huge gradient census over every parameter with a grad.
 
-    Each parameter is scanned in bounded chunks: the census runs while the
-    caller is already in a failure state (possibly near the memory ceiling),
-    so the per-parameter `abs` copy / `g.float().pow(2)` full-size temporaries
-    are replaced by chunked extrema (`max(g.max(), -g.min())`, no `abs` copy),
-    a chunked fp64 sum of squares, and a chunked finiteness reduction.
+    Each parameter is scanned in bounded chunks: chunked extrema
+    (`max(g.max(), -g.min())`, no `abs` copy), a chunked fp64 sum of squares,
+    and a chunked finiteness reduction.
     """
     missing, nonfinite, zero = [], [], []
     n_with_grad = 0
@@ -453,13 +451,11 @@ def gradient_health_report(model) -> dict:
 def parameter_finite_report(model) -> dict:
     """NaN/Inf census over a model's parameters and floating buffers.
 
-    The evaluation-side counterpart of `gradient_health_report`: a diverged
-    run can still write a checkpoint, and every later evaluation of it (error
-    analysis, needle, perplexity) would then silently measure arithmetic on
-    NaN rather than the model. Before *reading* results out of a checkpoint,
-    confirm the weights themselves are finite; the first offenders are named
-    so the triage can start at the module that went bad. Integer buffers
-    (position ids, masks) are skipped: NaN/Inf are floating-point states.
+    The evaluation-side counterpart of `gradient_health_report`: before
+    *reading* results out of a checkpoint, confirm the weights themselves are
+    finite; the first offenders are named so the triage can start at the
+    module that went bad. Integer buffers (position ids, masks) are skipped:
+    NaN/Inf are floating-point states.
     """
     bad_params: list = []
     bad_buffers: list = []
@@ -669,10 +665,8 @@ def triage_nonfinite(
         evidence["forward_error"] = repr(exc)
 
     # The first stage that went bad already settles the diagnosis: the fp32
-    # forward is non-finite (or could not run at all). Stages 3-4 would only
-    # add two more full-model forward/backward passes - exactly the memory
-    # pressure that turns a diagnostic into an OOM - so record them as
-    # skipped instead.
+    # forward is non-finite (or could not run at all), so stages 3-4 are
+    # recorded as skipped instead.
     stage2_bad = (
         evidence.get("fp32_forward_finite") is False
         or evidence.get("loss_denominator_positive") is False

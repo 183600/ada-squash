@@ -13,7 +13,7 @@ picking whichever looks better:
 
 * `best_val_loss` (min over the validation passes) is the checkpoint-selection
   statistic; reporting it as the cell's loss is optimistically biased;
-* `final_val_loss` (last validation pass at the fixed step budget) is the
+* `final_val_loss` (last validation pass at the fixed step count) is the
   comparable fixed-step estimate used for depth/norm comparisons.
 
 Because every cell runs the same seeds, two cells at a depth are *paired*
@@ -55,7 +55,7 @@ def _finite(value) -> bool:
 
 # Both ratios are reported next to every comparison row; a cell pair outside
 # this band is not compute-matched, so its loss delta is not a depth/norm-only
-# effect and must be read against the cost difference.
+# effect and must be read against the compute difference.
 _COMPUTE_MATCH_TOL = 0.25
 _BASE_DEPTH = 24
 _BASE_DIM = 2048
@@ -94,7 +94,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
       quoted as the cell's generalization loss;
     * `final_val_loss` is the last held-out pass of the run. With early
       stopping off (the sweep default) every cell validates at the same
-      training-step budget, so it is the fixed-step estimate that makes
+      training-step count, so it is the fixed-step estimate that makes
       depth/norm cells comparable.
 
     Both are pooled over the per-seed independent runs of the identical
@@ -534,7 +534,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
         cmd += ['--compile-mode', args.compile_mode]
     # Every cell carries the hypothesis the sweep tests, recorded in the run
     # manifest: the reference cell establishes the bar, a candidate cell
-    # claims to clear it at the same depth and step budget.
+    # claims to clear it at the same depth and step count.
     if norm == args.reference_norm:
         hypothesis = (f'd{depth} reference cell: {norm} fixes the held-out final_val_loss '
                       f'every candidate norm must beat under the identical recipe (paired over '
@@ -542,7 +542,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
     else:
         hypothesis = (f'd{depth}: {norm} reaches a lower final_val_loss than the '
                       f'{args.reference_norm} reference at the same depth, recipe and step '
-                      f'budget, paired over the shared seeds.')
+                      f'count, paired over the shared seeds.')
     cmd += ['--hypothesis', hypothesis]
     env = _child_env(args, gpu, seed=seed)
     env['ADASQUASH_DEPTH_OVERRIDE'] = str(depth)

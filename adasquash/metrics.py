@@ -273,10 +273,7 @@ def student_t_ppf(p: float, df: float) -> float:
     """Inverse Student-t CDF `t : P(T <= t) = p`, by bisection on a monotone CDF.
 
     Used for confidence-interval critical values. The result is a pure
-    function of `(p, df)`, and the same critical values are requested once per
-    row/seed across a comparison report, so the expensive pure-Python
-    bisection is memoized. A 200-iteration bisection that always drains to
-    adjacent floats is the dominant cost of the report otherwise.
+    function of `(p, df)`, so it is memoized.
     """
     if not 0.0 < p < 1.0:
         raise ValueError("student_t_ppf needs 0 < p < 1")

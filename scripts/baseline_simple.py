@@ -77,8 +77,7 @@ DEFAULT_KS = (1e-06, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0)
 SIMPLE_PREDICTORS = ('unigram', 'bigram', 'trigram')
 # Mirrors the spike probability hardcoded in `adasquash.utils.markov_batch`
 # (`torch.rand(...) < 0.03`). The corpus is the data; this constant only
-# enters the closed-form memoryless floor, so a mismatch would be caught by
-# `rule_matches_memoryless_floor` instead of silently shifting the calibration.
+# enters the closed-form memoryless floor.
 MARKOV_SPIKE_PROB = 0.03
 
 def build_support(n_states: int, outlier_id):
@@ -131,8 +130,8 @@ def flatten_split(batches, remap: torch.Tensor, unknown: int, ignore_index: int=
     """
     xs, x2s, ys, x_raw, y_raw = ([], [], [], [], [])
     for x, y in batches:
-        # No per-batch `bool(mask.any())` sync: an all-ignored batch simply
-        # contributes zero rows, and the all-empty case is caught below.
+        # An all-ignored batch simply contributes zero rows, and the
+        # all-empty case is caught below.
         mask = y.ne(ignore_index)
         xr = remap[x]
         prev = torch.empty_like(xr)
@@ -240,15 +239,14 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
     # The filter lives on the batch device: indexing with `rows`/`x`/`y`
     # (which come from the caller's batches) must not mix CPU and CUDA tensors.
     # The (tiny) transition matrix is built on the CPU once and moved as a
-    # single tensor instead of ~200 per-element device assignments.
+    # single tensor.
     device = batches[0][0].device
     transition = torch.zeros(n_states, n_states, dtype=torch.float64)
     for s in range(n_states):
         for j in range(int(max_jump)):
             transition[s, (s + j) % n_states] = 1.0 / int(max_jump)
     transition = transition.to(device)
-    # Device-side fp64 accumulator: one .item() at the very end instead of a
-    # D2H + stream sync inside every one of the T-1 filter steps.
+    # Device-side fp64 accumulator: one .item() at the very end.
     ce_sum_t = torch.zeros((), dtype=torch.float64, device=device)
     n_tokens = 0
     for x, y in batches:
@@ -265,8 +263,7 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
             if keep.numel():
                 belief[keep] = 0.0
                 belief[keep, first[keep]] = 1.0
-        # Ping-pong buffers: the per-step posterior overwrites the previous
-        # prediction buffer instead of allocating a fresh (batch, n_states).
+        # Ping-pong buffers for the per-step posterior.
         pred = torch.empty_like(belief)
         for t in range(x.shape[1] - 1):
             torch.mm(belief, transition, out=pred)

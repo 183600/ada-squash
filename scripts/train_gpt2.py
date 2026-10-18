@@ -197,12 +197,10 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     is untouched by `collect`, so the returned mean is bit-identical either
     way.
     """
-    # Module-mode toggling is a Dynamo guard: eval()/train() around every pass
-    # recompiles the whole graph (and under reduce-overhead keeps a second
-    # CUDA-graph pool resident). With dropout at its default 0 the switch
-    # changes no numerics, so skip it; inference_mode already blocks grads.
-    # `training` does more than dropout, though: gradient checkpointing keys
-    # its recompute branch on it, so the switch must stay when that is on.
+    # With dropout at its default 0 the module-mode switch changes no
+    # numerics, so skip it; inference_mode already blocks grads. `training`
+    # does more than dropout, though: gradient checkpointing keys its
+    # recompute branch on it, so the switch must stay when that is on.
     cfg = getattr(model, 'cfg', None)
     toggle_mode = float(getattr(cfg, 'dropout', 0.0)) > 0.0 or bool(getattr(cfg, 'gradient_checkpointing', False))
     if toggle_mode:
@@ -240,7 +238,6 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     if toggle_mode:
         model.train()
     if collect is not None and terms:
-        # One batched D2H at the end instead of a blocking float() per batch;
         # `.tolist()` yields the same Python doubles in the same batch order,
         # so the returned mean and the collected series are unchanged.
         collect.extend(torch.stack(terms).cpu().tolist())
@@ -342,7 +339,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     The seed is the unit of replication: seed runs are independent draws of
     the whole protocol (initialization, data order, batch sampling), while the
     held-out batches inside one run are not. `final_val_loss` (the last
-    validation pass at the fixed step budget) is the number the variants are
+    validation pass at the fixed step count) is the number the variants are
     compared on; `best_val_loss` travels next to it because it is the
     checkpoint-selection statistic and is optimistically biased. Both are
     pooled across seeds, and the sealed `test_loss` of every seed (when the
@@ -424,8 +421,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'test_loss_by_seed': {r['seed']: r['test_loss'] for r in per_seed},
         'aggregation': (
             'Mean +/- Std across independent seed runs of the identical recipe (same optimizer, '
-            'schedule, data protocol and step budget). final_val_loss = last validation pass at the '
-            'fixed step budget (the comparable estimate); best_val_loss = min over validation passes '
+            'schedule, data protocol and step count). final_val_loss = last validation pass at the '
+            'fixed step count (the comparable estimate); best_val_loss = min over validation passes '
             '(checkpoint-selection statistic, optimistically biased as an estimate). A single-seed '
             'std is not a run-to-run spread, so std is None there. missing_seeds/invalid_seeds are '
             'reported but excluded from the mean; a comparison over an incomplete set is not clean.'),
@@ -592,9 +589,7 @@ def main():
     set_all_seeds(args.seed)
     # The depth sweep feeds its per-cell shape through these env vars (see
     # ADASQUASH_*_OVERRIDE below). Read them *before* the preflight so the
-    # check runs on the cell's real architecture rather than the default;
-    # previously they were only applied when the model was built, after the
-    # preflight had already verified a different model.
+    # check runs on the cell's real architecture rather than the default.
     depth_override = os.environ.get('ADASQUASH_DEPTH_OVERRIDE')
     dim_override = os.environ.get('ADASQUASH_DIM_OVERRIDE')
     heads_override = os.environ.get('ADASQUASH_HEADS_OVERRIDE')
@@ -724,9 +719,9 @@ def main():
         if 'scheduler' in resume_ckpt:
             sched.load_state_dict(resume_ckpt['scheduler'])
         apply_explicit_optimizer_args(opt, sched, args, explicit)
-        # Everything heavy has been copied into the live objects; the
-        # checkpoint's copies would otherwise sit in host/VRAM for the whole
-        # run. `val_loss` / `step` stay: they are scalars the tracker reads.
+        # Everything heavy has been copied into the live objects; drop the
+        # checkpoint's copies. `val_loss` / `step` stay: they are scalars the
+        # tracker reads.
         resume_ckpt.pop('model', None)
         resume_ckpt.pop('optimizer', None)
         resume_ckpt.pop('scheduler', None)
@@ -741,10 +736,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = Path(args.output_dir) / 'train.jsonl'
     log_path.touch()
-    # One line-buffered handle for the whole run: the previous per-event
-    # open/append/close re-opened the same file for every log row and every
-    # NaN-triage record. Line buffering keeps each written row visible to
-    # tail -f / crash inspection without a full flush per event.
+    # One line-buffered handle for the whole run: each written row stays
+    # visible to tail -f / crash inspection.
     log_file = open(log_path, 'a', buffering=1)
     manifest_path = Path(args.output_dir) / 'run_manifest.json'
     run_manifest: dict = {}
@@ -869,11 +862,10 @@ def main():
                     # skipped, so the reported loss is the raw CE value.
                     loss = loss / args.grad_accum
                 loss.backward()
-            # Device-side group reduction: the common path materializes one host
-            # scalar instead of the whole per-micro list. `mean` propagates
-            # NaN/Inf, so a finite group mean certifies every micro. A non-finite
-            # mean is the rare path and pays the `.tolist()` to locate the bad
-            # micro for triage. A non-finite loss cannot be detected before its
+            # Device-side group reduction: `mean` propagates NaN/Inf, so a
+            # finite group mean certifies every micro. A non-finite mean is the
+            # rare path and uses the `.tolist()` to locate the bad micro for
+            # triage. A non-finite loss cannot be detected before its
             # own backward without inspecting each micro separately, so a bad
             # micro is backpropped and the step is discarded wholesale by
             # _handle_nonfinite (which zeroes the gradients); the optimizer
@@ -1039,7 +1031,7 @@ def main():
             # checkpoint-selection statistic, so as a reported generalization
             # estimate it is optimistically biased (the minimum of noisy draws).
             # `final_val_loss` is the last held-out pass at the fixed training-step
-            # budget and is the number that makes two arms comparable.
+            # count and is the number that makes two arms comparable.
             'best_val_loss': best_val_loss if val_loader is not None else None,
             'best_val_step': best_val_step if val_loader is not None else None,
             'final_val_loss': last_val_loss if val_loader is not None else None,
@@ -1115,9 +1107,8 @@ def main():
                 load_model_state_dict(model, best['model'])
                 best_step = int(best.get('step', 0))
                 best_val = float(best.get('val_loss', float('nan')))
-                # The weights are copied; the optimizer state in the file must not
-                # occupy VRAM during the test pass (that is exactly where the
-                # memory budget is tightest).
+                # The weights are copied; the optimizer state in the file is
+                # not needed for the test pass.
                 del best
                 print(f"[test] restored best-validation checkpoint (step {best_step}, val_loss={best_val:.4f}) before the one-shot test evaluation")
             test_state = {'iter': iter(test_loader)}

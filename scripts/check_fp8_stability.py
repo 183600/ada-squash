@@ -50,9 +50,7 @@ def to_fp8_e4m3(x: torch.Tensor, axis: int=-1, inplace: bool=False) -> torch.Ten
 def to_fp8_e5m2(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
     return simulate_fp8(x, max_val=57344.0, exp_bits=5, mantissa_bits=2, inplace=inplace)
 
-# Reusable frexp/mask scratch keyed by (shape, device): the fp8 simulator runs
-# on every wrapped linear, so a fresh set of full-size temporaries per call
-# dominated both allocator traffic and peak memory.
+# Reusable frexp/mask scratch keyed by (shape, device).
 _FP8_SCRATCH: dict = {}
 
 def _fp8_scratch(shape, device):
@@ -158,9 +156,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
     def make_stat_hook():
 
         def hook(module, inp, out):
-            # Everything stays on the device here; the ~25 norm hooks are
-            # flattened with a single `.tolist()` after the forward (the old
-            # version synced once per hook and allocated `.float()` masks).
+            # Everything stays on the device here; the norm hooks are
+            # flattened with a single `.tolist()` after the forward.
             x_in = inp[0] if isinstance(inp, tuple) and inp else None
             cls_name = module.__class__.__name__
             has_in = torch.is_tensor(x_in)
@@ -219,9 +216,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags) if not ok), None)
     first_over_idx = next((i for i, v in zip([i for i, _ in first_over], over_vals) if v > FP8_E4M3_MAX), None)
-    # Compare against the fp32 logits row-block by row-block and keep the fp32
-    # copy on the host only: the old path held both full logits on the GPU and
-    # built another full-size `abs()` temp for the max.
+    # Compare against the fp32 logits row-block by row-block, keeping the
+    # fp32 copy on the host.
     max_abs_fp32 = torch.maximum(logits_fp32.max(), -logits_fp32.min()).cpu()
     logits_fp32_cpu = logits_fp32.detach().to('cpu')
     del logits_fp32

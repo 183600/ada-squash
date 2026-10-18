@@ -21,7 +21,7 @@ class MaxAbsMeter:
 
     @staticmethod
     def _abs_max(x: torch.Tensor) -> torch.Tensor:
-        """max(|x|) without materializing the elementwise `abs` copy."""
+        """max(|x|)."""
         return torch.maximum(x.max(), -x.min())
 
     def update(self, x: torch.Tensor):
@@ -45,10 +45,7 @@ class MaxAbsMeter:
         self.count += 1
 
 class KurtosisMeter:
-    # The per-chunk workspace is bounded and reused across samples: each chunk
-    # needs two full-size temporaries (`xc`, `xc2`) for the third/fourth
-    # moments, and allocating them per sampled activation made the diagnostic
-    # hooks dominate the sampling step.
+    # The per-chunk workspace is bounded and reused across samples.
     _chunk = 1 << 22
     acc_dtype = torch.float32
 
@@ -223,10 +220,8 @@ class LossSpikeCounter:
         self.abs_threshold = abs_threshold
         self.ema = None
         self.n_spikes = 0
-        # Recent (loss, ema, is_spike) triples for post-mortem inspection; the
-        # trainer updates this every step, so an unbounded list grew for the
-        # whole run even though nothing reads it back. A bounded deque keeps
-        # the last window (and stays indexable/appends the same way).
+        # Recent (loss, ema, is_spike) triples for post-mortem inspection,
+        # bounded to the last window.
         self.history: deque = deque(maxlen=4096)
 
     def update(self, loss_value: float) -> bool:

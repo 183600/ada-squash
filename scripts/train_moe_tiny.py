@@ -436,7 +436,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         finished = True
         return dict(run_manifest['results'], seed=seed, output_dir=str(output_dir))
     finally:
-        # The curve and the partial status must survive NaN aborts, OOMs and
+        # The curve and the partial status must survive NaN aborts and
         # external interrupts: the failure case is exactly when they are read.
         flush_history()
         if not finished:

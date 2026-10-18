@@ -255,10 +255,8 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             rng = random.Random(int(getattr(args, 'seed', 0)))
             tail = rng.sample(tail_pool, min(k - len(head), len(tail_pool)))
             auc_class_ids = sorted(head + tail)
-    # All scan counters are device tensors; the host syncs exactly once, after
-    # the pass. `prev_gold` is merged per batch with a device-side
-    # `unique(return_counts=True)` instead of piling every key on the host and
-    # sorting there.
+    # All scan counters are device tensors. `prev_gold` is merged per batch
+    # with a device-side `unique(return_counts=True)`.
     dev = next(model.parameters()).device
     prev_gold_uniq = None        # device (key, count) bigram histogram
     prev_gold_counts = None
@@ -326,9 +324,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
                     continue
                 with torch.no_grad():
                     lc = model.lm_head(model.norm_f(hidden[:, t0:t1])).detach().float()
-                # Score only the valid rows: the softmax/rank/top-k work (and
-                # the full-size bool for the rank) used to include every
-                # ignore_index position too.
+                # Score only the valid rows.
                 probs = torch.softmax(lc[m], dim=-1)
                 gold = y_b[:, t0:t1][m]
                 pred = probs.argmax(-1)
@@ -790,8 +786,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
                                    'a model-specific defect - that class is not fixable by either '
                                    'mechanism'),
             'mcnemar': 'exact paired test over the discordant (fixed/broken) tokens only',
-            'cost': ('parameters / analytic FLOPs of both checkpoints next to the error delta; '
-                     'wall-clock and memory come from scripts/benchmark_efficiency.py'),
+            'cost': ('parameters / analytic FLOPs of both checkpoints next to the error delta'),
         },
         'examples': shown,
         'rarest_target_threshold': rare_threshold,
@@ -858,8 +853,7 @@ def main():
         print(f"[pair] reference {args.reference_ckpt} | norm={reference_args['norm']}")
 
     # A checkpoint's weights themselves must be finite before any result is
-    # read out of it: a diverged run can still save, and every later metric
-    # would then silently be arithmetic on NaN.
+    # read out of it.
     checkpoint_health = {'candidate': parameter_finite_report(model)}
     if reference_model is not None:
         checkpoint_health['reference'] = parameter_finite_report(reference_model)

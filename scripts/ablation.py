@@ -324,8 +324,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             stats_windowed = True
         loss = model(x, y, return_logits=False)[1]
         # Backward is enqueued first; `loss` is not mutated by it, so the
-        # host read below returns the same value while overlapping with the
-        # backward kernels instead of stalling in front of them.
+        # host read below returns the same value.
         loss.backward()
         loss_val = float(loss.detach())
         if not math.isfinite(loss_val):
@@ -359,9 +358,8 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                     for _ in range(curve_batches)
                 ])
             model.train()
-            # One batched device->host transfer; `.tolist()` widens each fp32
-            # value to the same Python double the explicit fp64 cast produced,
-            # without the extra GPU cast and the doubled transfer bytes.
+            # `.tolist()` widens each fp32 value to the same Python double the
+            # explicit fp64 cast produced.
             held = held_t.tolist()
             curve_train.append(train_point)
             curve_val.append(sum(held) / len(held))
@@ -586,19 +584,19 @@ def partition_rows_by_protocol(rows: list, args) -> tuple[list, list]:
     they are kept out of the statistical comparisons.
     """
     expected = _protocol_signature(args)
-    budget = max(1, int(getattr(args, 'val_batches', 20)))
+    val_batch_count = max(1, int(getattr(args, 'val_batches', 20)))
     keep, stale = [], []
     for row in rows:
         signature = row_protocol_signature(row, args.model)
         recorded_batches = row.get('n_val_batches')
-        if signature == expected and recorded_batches == budget:
+        if signature == expected and recorded_batches == val_batch_count:
             keep.append(row)
         else:
             labels = ('model', 'lr', 'weight_decay', 'batch_size', 'seq_len', 'max_steps')
             if signature is None:
                 reason = 'no recorded controls'
             elif recorded_batches is None:
-                reason = 'no recorded validation budget'
+                reason = 'no recorded validation batch count'
             else:
                 reason = 'trained under a different protocol than this invocation'
             stale.append({
@@ -614,10 +612,10 @@ def cached_seed_matches(summary: dict, name: str, cfg_kwargs: dict, args, seed: 
 
     The path does not always encode the seed (a single-seed run writes its
     summary directly under the row directory), so the recorded seed is
-    compared too. The held-out validation budget is part of the recipe: a
-    cached row evaluated on a different number of batches is not the same
+    compared too. The held-out validation batch count is part of the recipe:
+    a cached row evaluated on a different number of batches is not the same
     selection metric, so it is re-trained (a cached summary without the
-    recorded budget counts as unknown, never as matching).
+    recorded count counts as unknown, never as matching).
     """
     if not (isinstance(summary, dict)
             and summary.get('name') == name
@@ -829,7 +827,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             # summaries): a delta measured while one arm is underfit or
             # overfitting is annotated, so it cannot be read as pure norm
             # effect. It does not alter the significance test - the regime is
-            # itself a property of the norm at the fixed step budget.
+            # itself a property of the norm at the fixed step count.
             'curve_classification_counts': row.get('curve_classification_counts'),
         }
         test, basis, common = _paired_row_test(row, reference, margin=margin)
