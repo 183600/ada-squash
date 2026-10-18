@@ -3,6 +3,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -228,7 +229,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         run_preflight(args.norm, seed, output_dir, model='moe', n_experts=args.n_experts,
                       arch_args=['--dim', str(args.dim), '--n-layers', str(args.n_layers),
                                  '--n-heads', str(args.n_heads), '--seq-len', str(args.seq_len),
-                                 '--batch-size', str(args.batch_size)])
+                                 '--batch-size', str(args.batch_size),
+                                 '--use-layerscale'])
         sanity_report_path = output_dir / 'sanity_overfit.json'
     cfg = GPTConfig(vocab_size=50304, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads, max_seq_len=args.seq_len, mlp_ratio=4.0, norm_name=args.norm)
     model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
@@ -259,6 +261,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         run_manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
     else:
         run_manifest['overfit_sanity_check'] = {'enabled': False}
+    run_manifest['status'] = 'running'
     save_run_manifest(manifest_path, run_manifest)
     print(f'[moe][track] run manifest -> {manifest_path}')
     rng = torch.Generator(device=device).manual_seed(seed)
@@ -292,125 +295,165 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         return (x.to(device, non_blocking=True), y.to(device, non_blocking=True))
     history = []
     stats_windowed = False
-    for step in range(args.max_steps):
-        x, y = next_batch()
-        # `next_batch` hands back a freshly built pair (probe generators or a
-        # freshly collated loader batch), so the next-token column can be
-        # masked in place.
-        y[:, -1] = cfg.ignore_index
-        if step % args.stats_every == 0:
-            act_stats.attach(reset=not stats_windowed)
-            stats_windowed = True
-        logits, loss, aux, tpe_list = model(x, y, return_aux=True, return_logits=False)
-        del logits
-        # `loss` is not touched by backward, so the pre-backward value is the
-        # value to record.
-        loss_val = float(loss.detach())
-        if not math.isfinite(loss_val):
-            triage = triage_nonfinite(model, x, y, device_type=device,
-                                      lr=opt.param_groups[0]['lr'], grad_clip=1.0)
-            raise SystemExit(
-                f"[moe][nan] non-finite loss at step {step}: triage stage="
-                f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
-                + ' | '.join(triage['recommendations'])
-            )
-        loss.backward()
-        if step % args.stats_every == 0:
-            act_stats.detach()
-            clear_logit_scratch_cache()
-        expert_cv = _expert_cv_per_block(tpe_list)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-        loss_spike.update(loss_val)
-        history.append({'step': step, 'loss': loss_val, 'aux_t': aux.detach(), 'expert_cv_t': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
-        if step % args.log_every == 0:
-            exp_cv = float(expert_cv[-1])
-            print(f'  [moe] step={step:4d} loss={loss_val:.4f} aux={float(aux.detach()):.4f} expert_cv={exp_cv:.3f}', flush=True)
-    for row in history:
-        row['aux'] = float(row.pop('aux_t'))
-        cv = row.pop('expert_cv_t').tolist()
-        row['expert_cv_per_block'] = cv
-        row['expert_cv'] = cv[-1]
-    with open(output_dir / 'history.json', 'w') as f:
-        json.dump(history, f)
-    # Held-out validation loss: real data comes from the chronological
-    # validation split; the synthetic corpus uses a generator (seed + 1) the
-    # optimizer never saw. No gradients flow from either.
-    val_loss = val_ce = val_aux = None
-    if args.val_batches > 0:
-        model.eval()
-        val_losses = []
-        val_ce_losses = []
-        val_auxes = []
-        with torch.inference_mode():
-            if args.dataset:
-                val_loader = open_data_split('validation', args)
-                rval = getattr(val_loader, 'split_report', None)
-                if rval:
-                    data_reports['validation'] = rval
-                    print(f'[moe][data] validation split: {rval}')
-                val_iter = iter(val_loader)
-            else:
-                val_iter = None
-            val_rng = torch.Generator(device=device).manual_seed(seed + 1)
-            for _ in range(args.val_batches):
-                if val_iter is not None:
-                    try:
-                        vx, vy = next(val_iter)
-                    except StopIteration:
-                        val_iter = iter(val_loader)
+
+    def _history_rows() -> list:
+        """Serializable view of the curve (device tensors -> Python floats)."""
+        rows = []
+        for row in history:
+            item = {k: v for k, v in row.items() if k not in ('aux_t', 'expert_cv_t')}
+            item['aux'] = float(row['aux_t'])
+            cv = row['expert_cv_t'].tolist()
+            item['expert_cv_per_block'] = cv
+            item['expert_cv'] = cv[-1]
+            rows.append(item)
+        return rows
+
+    def flush_history() -> None:
+        """Atomically persist the curve so far.
+
+        `history.json` used to be written only after a successful loop, so a
+        NaN abort, OOM or external kill lost the training curve exactly when
+        it matters most for diagnosis. Rewriting the (small) list every
+        `--log-every` steps keeps the file current; tmp+rename keeps readers
+        from ever seeing a partial write.
+        """
+        tmp = output_dir / 'history.json.tmp'
+        tmp.write_text(json.dumps(_history_rows(), indent=2), encoding='utf-8')
+        os.replace(tmp, output_dir / 'history.json')
+
+    finished = False
+    try:
+        for step in range(args.max_steps):
+            x, y = next_batch()
+            # `next_batch` hands back a freshly built pair (probe generators or a
+            # freshly collated loader batch), so the next-token column can be
+            # masked in place.
+            y[:, -1] = cfg.ignore_index
+            if step % args.stats_every == 0:
+                act_stats.attach(reset=not stats_windowed)
+                stats_windowed = True
+            logits, loss, aux, tpe_list = model(x, y, return_aux=True, return_logits=False)
+            del logits
+            # `loss` is not touched by backward, so the pre-backward value is the
+            # value to record.
+            loss_val = float(loss.detach())
+            if not math.isfinite(loss_val):
+                triage = triage_nonfinite(model, x, y, device_type=device,
+                                          lr=opt.param_groups[0]['lr'], grad_clip=1.0)
+                raise SystemExit(
+                    f"[moe][nan] non-finite loss at step {step}: triage stage="
+                    f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
+                    + ' | '.join(triage['recommendations'])
+                )
+            loss.backward()
+            if step % args.stats_every == 0:
+                act_stats.detach()
+                clear_logit_scratch_cache()
+            expert_cv = _expert_cv_per_block(tpe_list)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            loss_spike.update(loss_val)
+            history.append({'step': step, 'loss': loss_val, 'aux_t': aux.detach(), 'expert_cv_t': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
+            if step % args.log_every == 0:
+                exp_cv = float(expert_cv[-1])
+                print(f'  [moe] step={step:4d} loss={loss_val:.4f} aux={float(aux.detach()):.4f} expert_cv={exp_cv:.3f}', flush=True)
+                flush_history()
+        # Held-out validation loss: real data comes from the chronological
+        # validation split; the synthetic corpus uses a generator (seed + 1) the
+        # optimizer never saw. No gradients flow from either.
+        val_loss = val_ce = val_aux = None
+        if args.val_batches > 0:
+            model.eval()
+            val_losses = []
+            val_ce_losses = []
+            val_auxes = []
+            with torch.inference_mode():
+                if args.dataset:
+                    val_loader = open_data_split('validation', args)
+                    rval = getattr(val_loader, 'split_report', None)
+                    if rval:
+                        data_reports['validation'] = rval
+                        print(f'[moe][data] validation split: {rval}')
+                    val_iter = iter(val_loader)
+                else:
+                    val_iter = None
+                val_rng = torch.Generator(device=device).manual_seed(seed + 1)
+                for _ in range(args.val_batches):
+                    if val_iter is not None:
                         try:
                             vx, vy = next(val_iter)
                         except StopIteration:
-                            raise SystemExit(
-                                '[moe][val] the validation split produced no batches; '
-                                'refusing to report a run without a held-out signal. '
-                                'Check --num-documents / the dataset revision, then re-run.')
-                    vx = vx.to(device, non_blocking=True)
-                    vy = vy.to(device, non_blocking=True)
-                else:
-                    vx, vy = markov_batch(val_rng, cfg.ignore_index, args.batch_size, args.seq_len, device)
-                _, total, aux, _ = model(vx, vy, return_aux=True, return_logits=False)
-                total_val = float(total)
-                vaux = float(aux)
-                val_losses.append(total_val)
-                # The total loss the router regularizer rides on is not a
-                # language-modelling number: strip the aux term back out so
-                # `val_ce` compares only predictive quality.
-                val_ce_losses.append(total_val - model.AUX_LOSS_COEF * vaux)
-                val_auxes.append(vaux)
-        model.train()
-        val_loss = sum(val_losses) / len(val_losses)
-        val_ce = sum(val_ce_losses) / len(val_ce_losses)
-        val_aux = sum(val_auxes) / len(val_auxes)
-        print(f'[moe][val] held-out cross-entropy={val_ce:.4f} '
-              f'(combined loss={val_loss:.4f}, aux={val_aux:.4f} - the combined '
-              f'number is confounded with routing and is not the comparison metric)')
-    s = act_stats.summary()
-    if val_loss is not None:
-        s['val_loss'] = val_loss
-        s['val_ce'] = val_ce
-        s['val_aux'] = val_aux
-    with open(output_dir / 'stats.json', 'w') as f:
-        json.dump(s, f, indent=2, default=str)
-    run_manifest['data']['split_reports'] = data_reports
-    run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    run_manifest['results'] = {
-        'steps': args.max_steps,
-        'final_loss': history[-1]['loss'] if history else None,
-        'final_expert_cv': history[-1]['expert_cv'] if history else None,
-        'val_loss': val_loss,
-        'val_ce': val_ce,
-        'val_aux': val_aux,
-        'n_loss_spikes': loss_spike.n_spikes,
-    }
-    save_run_manifest(manifest_path, run_manifest)
-    print(f'[done] saved to {output_dir} | n_loss_spikes={loss_spike.n_spikes}')
-    # Training is over: release the shape-keyed CE scratch blocks instead of
-    # keeping them for the rest of the (possibly multi-run) process.
-    clear_ce_scratch_cache()
-    return dict(run_manifest['results'], seed=seed, output_dir=str(output_dir))
+                            val_iter = iter(val_loader)
+                            try:
+                                vx, vy = next(val_iter)
+                            except StopIteration:
+                                raise SystemExit(
+                                    '[moe][val] the validation split produced no batches; '
+                                    'refusing to report a run without a held-out signal. '
+                                    'Check --num-documents / the dataset revision, then re-run.')
+                        vx = vx.to(device, non_blocking=True)
+                        vy = vy.to(device, non_blocking=True)
+                    else:
+                        vx, vy = markov_batch(val_rng, cfg.ignore_index, args.batch_size, args.seq_len, device)
+                    _, total, aux, _ = model(vx, vy, return_aux=True, return_logits=False)
+                    total_val = float(total)
+                    vaux = float(aux)
+                    val_losses.append(total_val)
+                    # The total loss the router regularizer rides on is not a
+                    # language-modelling number: strip the aux term back out so
+                    # `val_ce` compares only predictive quality.
+                    val_ce_losses.append(total_val - model.AUX_LOSS_COEF * vaux)
+                    val_auxes.append(vaux)
+            model.train()
+            val_loss = sum(val_losses) / len(val_losses)
+            val_ce = sum(val_ce_losses) / len(val_ce_losses)
+            val_aux = sum(val_auxes) / len(val_auxes)
+            print(f'[moe][val] held-out cross-entropy={val_ce:.4f} '
+                  f'(combined loss={val_loss:.4f}, aux={val_aux:.4f} - the combined '
+                  f'number is confounded with routing and is not the comparison metric)')
+        s = act_stats.summary()
+        if val_loss is not None:
+            s['val_loss'] = val_loss
+            s['val_ce'] = val_ce
+            s['val_aux'] = val_aux
+        with open(output_dir / 'stats.json', 'w') as f:
+            json.dump(s, f, indent=2, default=str)
+        run_manifest['data']['split_reports'] = data_reports
+        run_manifest['status'] = 'finished'
+        run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        run_manifest['results'] = {
+            'steps': args.max_steps,
+            'final_loss': history[-1]['loss'] if history else None,
+            'final_expert_cv': float(history[-1]['expert_cv_t'][-1]) if history else None,
+            'val_loss': val_loss,
+            'val_ce': val_ce,
+            'val_aux': val_aux,
+            'n_loss_spikes': loss_spike.n_spikes,
+        }
+        save_run_manifest(manifest_path, run_manifest)
+        print(f'[done] saved to {output_dir} | n_loss_spikes={loss_spike.n_spikes}')
+        finished = True
+        return dict(run_manifest['results'], seed=seed, output_dir=str(output_dir))
+    finally:
+        # The curve and the partial status must survive NaN aborts, OOMs and
+        # external interrupts: the failure case is exactly when they are read.
+        flush_history()
+        if not finished:
+            run_manifest['status'] = 'failed'
+            run_manifest['failed_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            run_manifest['results_partial'] = {
+                'steps_completed': len(history),
+                'last_step': history[-1]['step'] if history else None,
+                'last_loss': history[-1]['loss'] if history else None,
+                'n_loss_spikes': loss_spike.n_spikes,
+            }
+            save_run_manifest(manifest_path, run_manifest)
+            print(f"[moe][track] run did not finish: partial curve in "
+                  f"{output_dir / 'history.json'}, manifest marked failed", flush=True)
+        # Training is over (or aborted): release the shape-keyed CE scratch
+        # blocks instead of keeping them for the rest of the process.
+        clear_ce_scratch_cache()
 
 def aggregate_moe_seed_results(results: list, seeds) -> dict:
     """Mean +/- Std of the MoE study over independent seeds.

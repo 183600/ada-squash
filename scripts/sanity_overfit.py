@@ -64,6 +64,7 @@ import math
 import sys
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -156,16 +157,18 @@ def make_batch(task: str, args, cfg: GPTConfig, device: str):
 
 
 @torch.no_grad()
-def next_token_metrics(model, x, y, topk: int = 3) -> dict:
+def next_token_metrics(model, x, y, topk: int = 3, ctx=None) -> dict:
     """Classification metrics for next-token prediction, with their baselines.
 
     All quantities are computed on the unmasked targets only. `micro_f1` is
     accuracy for a single-label argmax prediction; `macro_f1` averages over
     classes present (see `adasquash.metrics.macro_weighted_f1`). The trivial
     baselines are reported so a pass cannot hide behind class imbalance or a
-    degenerate label mapping.
+    degenerate label mapping. `ctx` is the run's autocast context (or None),
+    so the evaluation is scored under the same numeric format as training.
     """
-    logits, _ = model(x, return_logits=True)
+    with (ctx if ctx is not None else nullcontext()):
+        logits, _ = model(x, return_logits=True)
     mask = y.ne(model.cfg.ignore_index)
     vocab = int(logits.size(-1))
     n_valid = int(mask.sum().item())
@@ -309,15 +312,30 @@ def run_one(norm: str, args, device: str) -> dict:
             "--loss-threshold and --acc-threshold for the real batch"
         )
     set_all_seeds(args.seed)
+    # Mirror the training entrypoints' numeric format: TF32 matmuls are on for
+    # every path that has them, and autocast runs whenever the run being
+    # checked would run under bf16. A bug that only shows up under the
+    # reduced-precision path must fail the preflight, not the full run.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    use_bf16 = (not args.no_bf16) and device == "cuda"
+    dtype = torch.bfloat16 if use_bf16 else torch.float32
+    ctx = (torch.amp.autocast(device_type="cuda", dtype=dtype)
+           if use_bf16 else nullcontext())
     cfg = GPTConfig(
         vocab_size=vocab, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads,
         max_seq_len=args.seq_len, mlp_ratio=4.0, dropout=0.0, norm_name=norm,
-        qk_norm=None, qk_alpha_init=1.0, use_layerscale=args.use_layerscale,
+        qk_norm=args.qk_norm, qk_alpha_init=args.qk_alpha_init,
+        use_layerscale=args.use_layerscale, layerscale_init=args.layerscale_init,
         alpha_0=args.alpha_0, k_init=args.k_init, alpha_init=args.alpha_init,
         p_init=args.p_init, learnable_p=not args.no_learnable_p,
-        learnable_k=not args.no_learnable_k, beta=args.beta,
-        alpha_jitter=args.alpha_jitter, gradient_checkpointing=False,
+        learnable_k=not args.no_learnable_k,
+        learnable_delta=not args.no_learnable_delta, beta=args.beta,
+        alpha_jitter=args.alpha_jitter,
+        gradient_checkpointing=args.gradient_checkpointing, rotary=args.rotary,
     )
+    if args.tie_embeddings is not None:
+        cfg.tie_word_embeddings = args.tie_embeddings
     model = build_model(args, cfg)
     if hasattr(model, "reset_parameters"):
         model.reset_parameters(args.seed)
@@ -333,7 +351,7 @@ def run_one(norm: str, args, device: str) -> dict:
     b_ref = min(int(x.shape[0]), 2)
     t_ref = min(int(x.shape[1]), 64)
     x_ref, y_ref = x[:b_ref, :t_ref], y[:b_ref, :t_ref]
-    with torch.no_grad():
+    with torch.no_grad(), ctx:
         _, loss_ref = model(x_ref, y_ref, return_logits=True)
         loss_fused = model(x_ref, y_ref, return_logits=False)[1]
     loss_path_delta = abs(float(loss_fused.item()) - float(loss_ref.item()))
@@ -342,12 +360,13 @@ def run_one(norm: str, args, device: str) -> dict:
     history = []
     initial_loss = None
     final_loss = float("nan")
-    final_metrics = next_token_metrics(model, x, y)
+    final_metrics = next_token_metrics(model, x, y, ctx=ctx)
     grad_info = {}
     t0 = time.time()
     for step in range(1, args.max_steps + 1):
         opt.zero_grad(set_to_none=True)
-        loss = model(x, y, return_logits=False)[1]
+        with ctx:
+            loss = model(x, y, return_logits=False)[1]
         loss.backward()
         if step == 1:
             grad_info = gradient_report(model)
@@ -358,7 +377,7 @@ def run_one(norm: str, args, device: str) -> dict:
         if initial_loss is None:
             initial_loss = final_loss
         if step == 1 or step % args.log_every == 0 or step == args.max_steps:
-            final_metrics = next_token_metrics(model, x, y)
+            final_metrics = next_token_metrics(model, x, y, ctx=ctx)
             history.append({"step": step, "loss": final_loss,
                             "accuracy": final_metrics["accuracy"],
                             "macro_f1": final_metrics["macro_f1"]})
@@ -431,8 +450,23 @@ def main():
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--use-layerscale", action="store_true")
+    p.add_argument("--layerscale-init", type=float, default=1e-5)
+    p.add_argument("--qk-norm", default=None, choices=[None, "qknorm", "dytqk"],
+                   help="attention Q/K treatment of the run being checked (QKSquash etc.)")
+    p.add_argument("--qk-alpha-init", type=float, default=1.0, help="initial alpha_q / alpha_k for --qk-norm dytqk")
+    p.add_argument("--gradient-checkpointing", action="store_true",
+                   help="enable gradient checkpointing in the checked model")
     p.add_argument("--no-learnable-p", action="store_true")
     p.add_argument("--no-learnable-k", action="store_true")
+    p.add_argument("--no-learnable-delta", action="store_true",
+                   help="freeze the DyT-CD per-channel deviation at zero (controlled per-channel off)")
+    p.add_argument("--tie-embeddings", dest="tie_embeddings", action="store_true", default=None,
+                   help="tie input/output embeddings (default: the config's own default)")
+    p.add_argument("--no-tie-embeddings", dest="tie_embeddings", action="store_false")
+    p.add_argument("--no-bf16", action="store_true",
+                   help="disable bf16 autocast; by default the check mirrors the training runs and uses bf16 on CUDA")
+    p.add_argument("--rotary", action="store_true",
+                   help="RoPE positions (llama-style) instead of learned positional embeddings")
     p.add_argument("--no-beta", dest="beta", action="store_false")
     p.add_argument("--alpha-0", type=float, default=0.9)
     p.add_argument("--alpha-init", type=float, default=0.5)

@@ -122,6 +122,37 @@ def infer_num_documents(ds) -> int | None:
     return None
 
 
+_REVISION_CACHE: dict = {}
+
+
+def resolve_dataset_revision(dataset_name: str, revision=None) -> str | None:
+    """Resolve the requested dataset revision to the concrete upstream commit.
+
+    `revision=None` means "latest on the default branch", which can move
+    between runs; the request alone therefore cannot be reproduced after the
+    fact. Resolving it to the current Hub commit hash and recording that hash
+    in the split report / run manifest is what makes the trained-on data
+    version auditable (and, because it enters the materialized-cache key, a
+    moved upstream branch can no longer silently reuse the old cache). When
+    the Hub is unreachable the resolution degrades to the requested value (or
+    None) instead of failing the run.
+    """
+    if revision:
+        return str(revision)
+    key = ("revision", str(dataset_name))
+    if key in _REVISION_CACHE:
+        return _REVISION_CACHE[key]
+    resolved = None
+    try:
+        from huggingface_hub import HfApi
+
+        resolved = getattr(HfApi().dataset_info(dataset_name), "sha", None)
+    except Exception:
+        resolved = None
+    _REVISION_CACHE[key] = resolved
+    return resolved
+
+
 def split_document_boundaries(num_documents: int, val_frac: float, test_frac: float) -> dict:
     """Contiguous, chronological boundaries over `num_documents` documents.
 
@@ -209,7 +240,10 @@ def load_document_stream(dataset_name: str, dataset_config: str | None, split: s
         opts.update(options)
     ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True,
                       revision=opts.get("dataset_revision"))
-    return select_stream_split(ds, split, opts)
+    stream, report = select_stream_split(ds, split, opts)
+    report["dataset_revision_resolved"] = resolve_dataset_revision(
+        dataset_name, opts.get("dataset_revision"))
+    return stream, report
 
 
 def document_hash(text: str) -> bytes:
@@ -528,6 +562,13 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     cleaner still runs afterwards, so cleaning/dedup semantics are unchanged -
     while subsequent builds read a local file. Returns `(stream, cache_path)`
     or `(stream_ds, None)` when caching is disabled/unavailable.
+
+    The cache key carries the *resolved* dataset revision (recorded in
+    `report`), so a cache materialized from the default branch before it moved
+    is not silently reused afterwards. The written payload is fingerprinted
+    (sha256 + document count) into a `.meta.json` sidecar and echoed into
+    `report['materialized_cache_fingerprint']`, so a run manifest pins the
+    concrete cached content, not only its name.
     """
     start, count = report.get("start"), report.get("count")
     if not start or not count:
@@ -536,13 +577,15 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     root = _split_cache_dir()
     if root is None:
         return stream_ds, None
+    resolved_revision = report.get("dataset_revision_resolved")
     key = json.dumps(
         {
-            "version": 1,
+            "version": 2,
             "dataset": dataset_name,
             "dataset_config": dataset_config,
             "split": split,
             "dataset_revision": report.get("dataset_revision"),
+            "dataset_revision_resolved": resolved_revision,
             "num_documents": report.get("num_documents"),
             "val_frac": report.get("val_frac"),
             "test_frac": report.get("test_frac"),
@@ -554,10 +597,16 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
     safe_name = str(dataset_name).replace("/", "__")
     cache_path = root / f"{safe_name}-{split}-{digest}.jsonl"
+    meta_path = cache_path.with_name(cache_path.name + ".meta.json")
     if cache_path.exists():
+        fingerprint = _read_cache_fingerprint(meta_path)
+        if fingerprint is not None:
+            report["materialized_cache_fingerprint"] = fingerprint
         return _JsonlDocumentStream(cache_path), cache_path
     root.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
+    hasher = hashlib.sha256()
+    n_documents = 0
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             for example in stream_ds:
@@ -565,9 +614,12 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
                     # Only `text` is read downstream; typing is preserved
                     # exactly (None / NaN / non-string included) so the
                     # cleaner's drop counters stay identical.
-                    f.write(json.dumps({"text": example.get("text")}, ensure_ascii=False) + "\n")
+                    line = json.dumps({"text": example.get("text")}, ensure_ascii=False) + "\n"
                 else:
-                    f.write("null\n")
+                    line = "null\n"
+                f.write(line)
+                hasher.update(line.encode("utf-8"))
+                n_documents += 1
         os.replace(tmp, cache_path)
     finally:
         if tmp.exists():
@@ -575,7 +627,29 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
                 tmp.unlink()
             except OSError:
                 pass
+    fingerprint = {
+        "path": str(cache_path),
+        "version": 2,
+        "dataset": dataset_name,
+        "split": split,
+        "dataset_revision_resolved": resolved_revision,
+        "documents": n_documents,
+        "sha256": hasher.hexdigest(),
+        "bytes": cache_path.stat().st_size,
+    }
+    tmp_meta = meta_path.with_name(meta_path.name + ".tmp")
+    tmp_meta.write_text(json.dumps(fingerprint, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp_meta, meta_path)
+    report["materialized_cache_fingerprint"] = fingerprint
     return _JsonlDocumentStream(cache_path), cache_path
+
+
+def _read_cache_fingerprint(meta_path: Path):
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 _TOKENIZER_CACHE: dict = {}
@@ -612,8 +686,10 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     loader's base seed - and therefore every worker's RNG - a function of the
     configured seed alone, not of how much global RNG the caller happened to
     consume before building it. The optional `dataset_revision` /
-    `tokenizer_revision` options pin the mutable remote artifacts and are
-    copied into the split report (data-version tracking).
+    `tokenizer_revision` options pin the mutable remote artifacts; a missing
+    `dataset_revision` is resolved to the current upstream commit hash and
+    both the request and the resolved hash are copied into the split report
+    (data-version tracking), the latter also keying the held-out cache.
     """
     from datasets import load_dataset
     from torch.utils.data import DataLoader
@@ -625,6 +701,11 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     stream_ds = load_dataset(dataset_name, dataset_config, split="train",
                              streaming=True, revision=opts.get("dataset_revision"))
     stream_ds, report = select_stream_split(stream_ds, opts["split"], opts)
+    # Pin "latest" to a concrete upstream commit before anything is cached or
+    # trained on, and carry the hash into the split report (data-version
+    # tracking). Degrades to None when the Hub is unreachable.
+    report["dataset_revision_resolved"] = resolve_dataset_revision(
+        dataset_name, opts.get("dataset_revision"))
     if opts["split"] in ("validation", "test"):
         stream_ds, cache_path = _materialized_split_stream(
             stream_ds, dataset_name, dataset_config, opts["split"], report)
@@ -687,6 +768,7 @@ __all__ = [
     "infer_num_documents",
     "load_document_stream",
     "load_hash_file",
+    "resolve_dataset_revision",
     "select_stream_split",
     "split_document_boundaries",
 ]

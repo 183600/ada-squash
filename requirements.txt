@@ -1,24 +1,30 @@
 # DyT++ / AdaSquash - Python dependencies
-# Tested with Python 3.10+
+# Tested with Python 3.10+; the upper bounds are deliberate: each pinned
+# major version is verified by ci_gate.py, while an unbounded "latest" can
+# silently change numerics or APIs between two supposedly identical runs
+# (reproducibility contract), so every dependency declares the range it was
+# actually tested in.
+# CI reference environment: Python 3.12, torch 2.14.1, numpy 2.5.4, PyYAML
+# 6.0.1, pytest 9.1.1.
 
 # Core
-torch>=2.1.0
-numpy>=1.24
+torch>=2.1.0,<3.0
+numpy>=1.24,<3.0
 
 # Run configs (configs/*.yaml are read via --config)
-PyYAML>=6.0
+PyYAML>=6.0,<7.0
 
 # Data & tokenization
-datasets>=2.14
-transformers>=4.36
-tokenizers>=0.15
+datasets>=2.14,<5.0
+transformers>=4.36,<6.0
+tokenizers>=0.15,<1.0
 
 # Logging
-tensorboard>=2.14
-wandb>=0.16
+tensorboard>=2.14,<3.0
+wandb>=0.16,<1.0
 
 # Optional: downstream eval
-# lm-eval>=0.4
+# lm-eval>=0.4,<1.0
 
 # Testing
-pytest>=7.0
+pytest>=7.0,<10.0

@@ -1262,8 +1262,19 @@ def main():
     run_metadata = collect_run_metadata(seed=seeds[0], extra={'seeds': seeds})
     if args.sanity_check:
         from scripts.sanity_overfit import run_preflight
+        from scripts.train_gpt2 import _MODEL_SHAPES
         norms = sorted({ablations[name].get('norm_name', 'dytcd') for name in args.names if name in ablations})
-        run_preflight(norms or ['dytcd'], seeds[0], base)
+        # The rows are trained on the selected --model, so the preflight must
+        # exercise the same (n_layers, dim, n_heads) instead of
+        # sanity_overfit.py's 2-layer dim=64 default; the small preflight
+        # workload (steps/batch/context) is kept on purpose. Per-row knobs
+        # (p/k/layerscale variants) are not forwarded: the preflight only
+        # needs to catch wiring/NaN/gradient bugs, which are shape- and
+        # norm-related.
+        n_layers, dim, n_heads = _MODEL_SHAPES.get(args.model, _MODEL_SHAPES['gpt2-124m'])
+        arch = ['--dim', str(dim), '--n-layers', str(n_layers), '--n-heads', str(n_heads)]
+
+        run_preflight(norms or ['dytcd'], seeds[0], base, arch_args=arch)
     multi = len(seeds) > 1
     all_summaries = []
     trained: dict[str, str] = {}

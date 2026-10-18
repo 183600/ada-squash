@@ -459,17 +459,24 @@ def print_sweep_comparisons(comparison: dict) -> None:
               f"with missing seed runs; significance is withheld there: "
               f"{comparison['incomplete_cells']}")
 
-def _child_env(args, gpu=None) -> dict:
+def _child_env(args, gpu=None, seed=None) -> dict:
     """Environment for one training child.
 
     Each cell is pinned to one GPU (round-robin over --gpus) and its BLAS
     thread count is capped: without this every concurrent child lands on the
     same visible device and the host oversubscribes its cores, which makes
     the sweep unreproducible.
+
+    `PYTHONHASHSEED` is set per child from its seed: the child's own
+    `set_all_seeds` runs long after its interpreter picked the string-hash
+    seed, so the env var is the only point where the run seed can reach it
+    (the multi-seed launcher in train_gpt2.py does the same).
     """
     env = dict(os.environ)
     if gpu is not None:
         env['CUDA_VISIBLE_DEVICES'] = str(gpu)
+    if seed is not None:
+        env['PYTHONHASHSEED'] = str(int(seed) % (2 ** 32))
     threads = int(getattr(args, 'threads_per_run', 0) or 0)
     if threads > 0:
         for var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
@@ -537,7 +544,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
                       f'{args.reference_norm} reference at the same depth, recipe and step '
                       f'budget, paired over the shared seeds.')
     cmd += ['--hypothesis', hypothesis]
-    env = _child_env(args, gpu)
+    env = _child_env(args, gpu, seed=seed)
     env['ADASQUASH_DEPTH_OVERRIDE'] = str(depth)
     shape = ''
     if not args.no_dim_scaling:

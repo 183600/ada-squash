@@ -278,6 +278,60 @@ def apply_explicit_optimizer_args(opt, sched, args, explicit: frozenset=frozense
 
 DEFAULT_SEED = 42
 
+# Default (n_layers, dim, n_heads) of the model variants. The preflight uses
+# them - adjusted by the sweep's ADASQUASH_*_OVERRIDE env vars - so the
+# small-batch overfit check exercises the architecture this run will train
+# instead of sanity_overfit.py's 2-layer dim=64 default.
+_MODEL_SHAPES = {
+    'gpt2-124m': (12, 768, 12),
+    'gpt2-350m': (24, 1024, 16),
+    'llama-1b': (24, 2048, 16),
+}
+
+def preflight_arch_args(args, depth_override=None, dim_override=None, heads_override=None) -> list:
+    """CLI flags making the overfit preflight exercise this run's architecture.
+
+    The preflight keeps sanity_overfit.py's small batch/step workload (a
+    wiring bug is visible at any sequence length), but the shape and every
+    architecture / numeric-format flag match the run: norm, quantization of
+    Q/K, LayerScale, learnable parameters, gradient checkpointing, tied
+    embeddings, autocast format and RoPE - the paths a full run uses.
+    """
+    n_layers, dim, n_heads = _MODEL_SHAPES.get(args.model, _MODEL_SHAPES['gpt2-124m'])
+    if depth_override:
+        n_layers = int(depth_override)
+    if dim_override:
+        dim = int(dim_override)
+    if heads_override:
+        n_heads = int(heads_override)
+    arch = ['--dim', str(dim), '--n-layers', str(n_layers), '--n-heads', str(n_heads)]
+    if not args.no_layerscale:
+        arch.append('--use-layerscale')
+    arch += ['--layerscale-init',
+             str(args.layerscale_init if args.layerscale_init is not None else 1e-5)]
+    if args.qk_norm:
+        arch += ['--qk-norm', args.qk_norm, '--qk-alpha-init', str(args.qk_alpha_init)]
+    if args.no_learnable_p:
+        arch.append('--no-learnable-p')
+    if args.no_learnable_k:
+        arch.append('--no-learnable-k')
+    if args.no_learnable_delta:
+        arch.append('--no-learnable-delta')
+    if not args.beta:
+        arch.append('--no-beta')
+    arch += ['--alpha-0', str(args.alpha_0), '--alpha-init', str(args.alpha_init),
+             '--k-init', str(args.k_init), '--p-init', str(args.p_init),
+             '--alpha-jitter', str(args.alpha_jitter)]
+    if args.gradient_checkpointing:
+        arch.append('--gradient-checkpointing')
+    if args.tie_embeddings is not None:
+        arch.append('--tie-embeddings' if args.tie_embeddings else '--no-tie-embeddings')
+    if args.no_bf16:
+        arch.append('--no-bf16')
+    if args.model == 'llama-1b':
+        arch.append('--rotary')
+    return arch
+
 def seed_run_dir(base: Path, seed: int) -> Path:
     """Per-seed run directory: `<output-dir>/seed{N}/` in multi-seed mode."""
     return base / f'seed{int(seed)}'
@@ -536,6 +590,16 @@ def main():
                 os.environ[env_name] = str(run_args[arg_name])
     args.bf16 = not args.no_bf16
     set_all_seeds(args.seed)
+    # The depth sweep feeds its per-cell shape through these env vars (see
+    # ADASQUASH_*_OVERRIDE below). Read them *before* the preflight so the
+    # check runs on the cell's real architecture rather than the default;
+    # previously they were only applied when the model was built, after the
+    # preflight had already verified a different model.
+    depth_override = os.environ.get('ADASQUASH_DEPTH_OVERRIDE')
+    dim_override = os.environ.get('ADASQUASH_DIM_OVERRIDE')
+    heads_override = os.environ.get('ADASQUASH_HEADS_OVERRIDE')
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     sanity_report_path = None
     if args.sanity_check:
         # Fail fast: a model that cannot overfit one small batch has a
@@ -543,12 +607,13 @@ def main():
         # preflight subprocess writes its report into the output dir; the
         # manifest below fingerprints it. Seeding first also exports
         # PYTHONHASHSEED so the child interpreter starts with a fixed hash
-        # seed.
+        # seed. The architecture flags make the check exercise this run's
+        # model shape and numeric path, not the checker's tiny default.
         from scripts.sanity_overfit import run_preflight
-        run_preflight(args.norm, args.seed, args.output_dir)
+        run_preflight(args.norm, args.seed, args.output_dir,
+                      arch_args=preflight_arch_args(args, depth_override,
+                                                    dim_override, heads_override))
         sanity_report_path = Path(args.output_dir) / 'sanity_overfit.json'
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dtype = torch.bfloat16 if args.bf16 and device == 'cuda' else torch.float32
     ctx = torch.amp.autocast(device_type='cuda', dtype=dtype) if dtype != torch.float32 else nullcontext()
@@ -567,9 +632,6 @@ def main():
             model = build_gpt_350m(init=False, **model_cfg)
         else:
             model = build_llama_tiny_1b(init=False, **model_cfg)
-    depth_override = os.environ.get('ADASQUASH_DEPTH_OVERRIDE')
-    dim_override = os.environ.get('ADASQUASH_DIM_OVERRIDE')
-    heads_override = os.environ.get('ADASQUASH_HEADS_OVERRIDE')
     if depth_override or dim_override or heads_override:
         cfg_dict = {k: getattr(model.cfg, k) for k in vars(model.cfg)}
         if depth_override:
@@ -684,10 +746,14 @@ def main():
     # NaN-triage record. Line buffering keeps each written row visible to
     # tail -f / crash inspection without a full flush per event.
     log_file = open(log_path, 'a', buffering=1)
+    manifest_path = Path(args.output_dir) / 'run_manifest.json'
+    run_manifest: dict = {}
+    run_finished = False
+    step = 0
     try:
-        manifest_path = Path(args.output_dir) / 'run_manifest.json'
         run_manifest = collect_run_metadata(seed=args.seed)
         run_manifest['hyperparameters'] = vars(args)
+        run_manifest['status'] = 'running'
         if args.hypothesis:
             run_manifest['hypothesis'] = args.hypothesis
             print(f'[hypothesis] {args.hypothesis}')
@@ -962,6 +1028,7 @@ def main():
         _atomic_torch_save(ckpt, path)
         print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
         run_manifest['data']['split_reports'] = data_reports
+        run_manifest['status'] = 'finished'
         run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
         final_val_stats = mean_ci(last_val_batches) if last_val_batches else None
@@ -1016,6 +1083,10 @@ def main():
             print(f'[warn] {n_nonfinite_losses} non-finite loss step(s) were handled by '
                   f'--nonfinite-policy {args.nonfinite_policy}; see train.jsonl event rows')
         save_run_manifest(manifest_path, run_manifest)
+        # Training (and its manifest) is complete from here on: an optional
+        # sealed-test evaluation or a tensorboard close failure below must not
+        # make the manifest look like an interrupted training run.
+        run_finished = True
         if args.final_test_eval:
             # The test split is opened exactly once, after training is over, and
             # only the checkpoint selected on the validation split is scored.
@@ -1104,8 +1175,24 @@ def main():
         if args.wandb_project:
             import wandb
             wandb.finish()
+        run_finished = True
     finally:
         log_file.close()
+        if not run_finished and run_manifest:
+            # A crash / NaN abort / external kill must not leave a manifest
+            # that looks like a completed run: mark it and persist whatever
+            # was known at the time (the step-by-step curve is already in
+            # train.jsonl; these fields make the manifest point at it).
+            run_manifest['status'] = 'interrupted'
+            run_manifest['interrupted_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            run_manifest['last_step'] = int(step)
+            run_manifest['last_train_loss'] = last_train_loss
+            run_manifest['last_val_loss'] = last_val_loss
+            try:
+                save_run_manifest(manifest_path, run_manifest)
+                print(f'[track] run did not finish: manifest marked interrupted at step {step}', flush=True)
+            except OSError:
+                pass
     # The shape-keyed CE scratch blocks are only useful while this model keeps
     # training; drop them so any embedding caller reusing this module starts
     # clean.

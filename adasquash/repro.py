@@ -9,14 +9,25 @@ every experiment is traceable after the fact.
 
 The contract is same-machine reproducibility: bit-identical results across
 different hardware/frameworks are not promised, but a rerun on the same
-machine with the same manifest must reproduce its own curve and final
-metrics. `environment_info` therefore also records the *RNG/determinism
-configuration* the run actually used (cuDNN flags, TF32 flags, thread
-counts, hash seeds), so a manifest mismatch can be diagnosed from the
-record instead of from memory.
+machine with the same manifest should reproduce its own curve and final
+metrics. Some CUDA kernels (flash-attention backward, `index_add_`,
+scatter reductions) are nondeterministic by implementation, so bit-identity
+is only guaranteed once those are routed to deterministic kernels: set
+`ADASQUASH_DETERMINISTIC_ALGORITHMS=warn` (warn but keep running) or
+`=strict` (raise on a nondeterministic op) to request
+`torch.use_deterministic_algorithms`; `set_all_seeds` picks the mode up.
+The manifest records whether that opt-in was active, so a mismatch can be
+diagnosed from the record instead of from memory. `environment_info` also
+records the rest of the *RNG/determinism configuration* the run actually
+used (cuDNN flags, TF32 flags, thread counts, hash seeds).
 
 TensorFlow is not a dependency of this repository; the training stack is
 pure PyTorch, so no TF RNG is seeded here.
+
+`python3 -m adasquash.repro --self-test` runs the in-process regression
+check for this module (seed determinism across Python/NumPy/torch, worker
+seeding, DataLoader reproducibility, manifest round-trip, split-boundary
+invariants).
 """
 import hashlib
 import json
@@ -33,6 +44,55 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# `PYTHONHASHSEED` is only read by the interpreter at startup. Snapshotting
+# the environment here (import time, before `set_all_seeds` can overwrite it)
+# lets `environment_info` distinguish "this process really started with a
+# fixed hash seed" from "this process is randomizing and only exports a seed
+# for its children".
+_HASHSEED_AT_IMPORT = os.environ.get("PYTHONHASHSEED")
+_DETERMINISTIC_ALGO_ENV = "ADASQUASH_DETERMINISTIC_ALGORITHMS"
+
+
+def _requested_deterministic_algorithms() -> str | None:
+    """Parse `ADASQUASH_DETERMINISTIC_ALGORITHMS` into None / 'warn' / 'strict'."""
+    raw = os.environ.get(_DETERMINISTIC_ALGO_ENV)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in ("", "0", "false", "off", "none", "no"):
+        return None
+    if value in ("warn", "warn-only", "warn_only"):
+        return "warn"
+    if value in ("1", "true", "yes", "on", "strict"):
+        return "strict"
+    raise ValueError(
+        f"{_DETERMINISTIC_ALGO_ENV}={raw!r} is not understood; use 'warn' "
+        f"(warn on nondeterministic ops but keep running), 'strict' (raise), "
+        f"or '0' to leave torch's setting untouched"
+    )
+
+
+def apply_deterministic_algorithms(mode: str | None = None) -> str | None:
+    """Enable `torch.use_deterministic_algorithms` when the run asks for it.
+
+    The default (`mode=None` and no `ADASQUASH_DETERMINISTIC_ALGORITHMS`)
+    leaves torch's setting untouched: forcing the mode on would make known
+    nondeterministic kernels (flash-attention backward, `index_add_`) either
+    warn on every step or abort training on hardware where they are the only
+    implementation. When requested, 'warn' routes every op that has a
+    deterministic implementation to it and warns otherwise; 'strict' raises.
+    Returns the mode actually applied (None = not applied).
+    """
+    if mode is None:
+        mode = _requested_deterministic_algorithms()
+    if mode == "warn":
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    elif mode == "strict":
+        torch.use_deterministic_algorithms(True, warn_only=False)
+    elif mode is not None:
+        raise ValueError(f"unknown deterministic-algorithms mode {mode!r}")
+    return mode
+
 
 def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     """Seed the Python, NumPy, torch and CUDA RNGs from `seed`.
@@ -42,11 +102,16 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     (DataLoader, subprocess launches) inherit the seed through `seed_worker`
     / `PYTHONHASHSEED`.
 
+    When `ADASQUASH_DETERMINISTIC_ALGORITHMS` is set, the corresponding
+    `torch.use_deterministic_algorithms` mode is applied here as well, and
+    `environment_info` records it in the manifest.
+
     Note on `PYTHONHASHSEED`: it is exported here so child processes
     (DataLoader workers, subprocess launches) get a fixed string-hash seed
     from interpreter startup. The *current* process already picked its hash
-    seed at startup, so a launcher that spawns training subprocesses (e.g.
-    the depth sweep) should also put `PYTHONHASHSEED=<seed>` in the child
+    seed at startup (recorded as `pythonhashseed_at_process_start` in the
+    manifest), so a launcher that spawns training subprocesses (e.g. the
+    depth sweep) should also put `PYTHONHASHSEED=<seed>` in the child
     environment explicitly - that is the only point where it takes effect.
     """
     seed = int(seed)
@@ -68,6 +133,7 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
         # here keeps the environment reproducible without forcing the
         # deterministic-algorithm mode on.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        apply_deterministic_algorithms()
     os.environ["PYTHONHASHSEED"] = str(seed % (2 ** 32))
     return seed
 
@@ -201,6 +267,13 @@ def environment_info() -> dict:
             "deterministic_algorithms_warn_only": bool(
                 getattr(torch, "is_deterministic_algorithms_warn_only_enabled", lambda: False)()
             ),
+            "deterministic_algorithms_env": os.environ.get(_DETERMINISTIC_ALGO_ENV),
+            # What the interpreter actually started with (None = randomizing,
+            # `hash_randomization` is then true) versus the value exported for
+            # child processes. `set_all_seeds` overwrites the env var but
+            # cannot change this process's own hash seed, so recording only
+            # the exported value made the manifest look self-contradictory.
+            "pythonhashseed_at_process_start": _HASHSEED_AT_IMPORT,
             "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
             "hash_randomization": bool(sys.flags.hash_randomization),
             "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
@@ -236,13 +309,167 @@ def save_run_manifest(path, metadata: dict) -> Path:
     return path
 
 
+def _self_test_seed_determinism() -> bool:
+    import numpy as np
+
+    def draw():
+        return (
+            random.random(),
+            float(np.random.rand()),
+            float(torch.rand(3).sum()),
+            float(torch.randn(3).sum()),
+        )
+
+    set_all_seeds(1234)
+    first = draw()
+    set_all_seeds(1234)
+    return draw() == first
+
+
+def _self_test_worker_seeding() -> bool:
+    original_initial_seed = torch.initial_seed
+    try:
+        # Same base seed -> same worker stream.
+        torch.initial_seed = lambda: 7
+        seed_worker(0)
+        first = (random.random(), float(torch.rand(1)))
+        seed_worker(0)
+        second = (random.random(), float(torch.rand(1)))
+        # Different base seeds (what DataLoader hands worker i as
+        # base_seed + worker_id) must produce different streams: sharing one
+        # stream across workers would make the loader's worker count change
+        # the data.
+        torch.initial_seed = lambda: 8
+        seed_worker(1)
+        third = (random.random(), float(torch.rand(1)))
+    finally:
+        torch.initial_seed = original_initial_seed
+    return first == second and first != third
+
+
+def _self_test_dataloader_reproducibility() -> bool:
+    from torch.utils.data import DataLoader, TensorDataset
+
+    data = TensorDataset(torch.arange(64))
+    orders = []
+    for _ in range(2):
+        g = torch.Generator()
+        g.manual_seed(99)
+        loader = DataLoader(data, batch_size=8, shuffle=True, generator=g,
+                            worker_init_fn=seed_worker, num_workers=0)
+        orders.append([int(batch[0][0]) for batch in loader])
+    return orders[0] == orders[1]
+
+
+def _self_test_manifest_roundtrip() -> bool:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / 'nested' / 'run_manifest.json'
+        metadata = collect_run_metadata(seed=5)
+        save_run_manifest(path, metadata)
+        loaded = json.loads(path.read_text())
+        if not (path.exists() and loaded.get('seed') == 5):
+            return False
+        if (path.parent / (path.name + '.tmp')).exists():
+            return False
+        rng = loaded.get('environment', {}).get('rng_config', {})
+        required = (
+            'torch_num_threads', 'cudnn_deterministic', 'tf32_matmul_allowed',
+            'deterministic_algorithms', 'pythonhashseed_at_process_start',
+            'pythonhashseed', 'hash_randomization',
+        )
+        return all(key in rng for key in required)
+
+
+def _self_test_split_boundaries() -> bool:
+    from scripts.data_pipeline import split_document_boundaries
+
+    bounds = split_document_boundaries(1000, 0.005, 0.005)
+    train, val, test = bounds['train'], bounds['validation'], bounds['test']
+    contiguous = (train[0] == 0 and val[0] == train[0] + train[1]
+                  and test[0] == val[0] + val[1]
+                  and test[0] + test[1] == 1000)
+    nonempty = all(count > 0 for (_, count) in (train, val, test))
+    try:
+        split_document_boundaries(10, 0.6, 0.6)
+        rejects_impossible = False
+    except ValueError:
+        rejects_impossible = True
+    return bool(contiguous and nonempty and rejects_impossible)
+
+
+def _self_test_deterministic_algorithms_optin() -> bool:
+    if torch.are_deterministic_algorithms_enabled():
+        return True
+    previous_warn_only = bool(
+        getattr(torch, "is_deterministic_algorithms_warn_only_enabled", lambda: False)())
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    os.environ[_DETERMINISTIC_ALGO_ENV] = "warn"
+    try:
+        mode = apply_deterministic_algorithms()
+        ok = (mode == "warn" and torch.are_deterministic_algorithms_enabled()
+              and bool(getattr(torch, "is_deterministic_algorithms_warn_only_enabled",
+                               lambda: False)()))
+    finally:
+        del os.environ[_DETERMINISTIC_ALGO_ENV]
+        torch.use_deterministic_algorithms(was_enabled, warn_only=previous_warn_only)
+    return ok
+
+
+def self_test(verbose: bool = True) -> dict:
+    """Run the in-process reproducibility regression checks.
+
+    Covers the guarantees the experiments rely on: identical RNG streams for
+    a reused seed across Python/NumPy/torch, per-worker stream derivation,
+    deterministic DataLoader ordering under an explicit generator +
+    `seed_worker`, atomic manifest round-trip with the determinism fields,
+    the chronological/disjoint split boundaries, and the deterministic-
+    algorithms opt-in. Meant to be run from CI or by hand
+    (`python3 -m adasquash.repro --self-test`).
+    """
+    checks = {
+        'seed_determinism_python_numpy_torch': _self_test_seed_determinism(),
+        'worker_seeding_derived_and_distinct': _self_test_worker_seeding(),
+        'dataloader_reproducible': _self_test_dataloader_reproducibility(),
+        'manifest_atomic_roundtrip_with_determinism_fields': _self_test_manifest_roundtrip(),
+        'split_boundaries_chronological_and_disjoint': _self_test_split_boundaries(),
+        'deterministic_algorithms_optin': _self_test_deterministic_algorithms_optin(),
+    }
+    if verbose:
+        for name, ok in checks.items():
+            print(f"[repro-self-test] {'ok' if ok else 'FAIL'}: {name}")
+    checks['passed'] = all(v for v in checks.values())
+    return checks
+
+
+def _main(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--self-test', action='store_true',
+                        help='run the reproducibility-infrastructure regression checks')
+    args = parser.parse_args(argv)
+    if not args.self_test:
+        parser.print_help()
+        return 2
+    result = self_test()
+    print(f"[repro-self-test] {'PASS' if result['passed'] else 'FAIL'}")
+    return 0 if result['passed'] else 1
+
+
 __all__ = [
     "REPO_ROOT",
+    "apply_deterministic_algorithms",
     "collect_run_metadata",
     "environment_info",
     "file_fingerprint",
     "git_revision",
     "save_run_manifest",
     "seed_worker",
+    "self_test",
     "set_all_seeds",
 ]
+
+if __name__ == "__main__":
+    sys.exit(_main())
