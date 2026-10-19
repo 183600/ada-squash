@@ -117,7 +117,9 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False)
         s = u.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
     else:
         s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
-    out = lo.mul_(s).copysign_(xs)
+    # `s` is a private temporary (it aliases `t`/`u`), so the product is
+    # written back into it instead of allocating a fresh output buffer.
+    out = s.mul_(lo).copysign_(xs)
     if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
         out.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     return out
@@ -152,7 +154,11 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
             s.pow_(p).add_(1.0).pow_(-1.0 / p)
     phi = None
     if need_phi:
-        phi = lo.mul_(s).copysign_(xs)
+        if need_g:
+            phi = lo.mul_(s).copysign_(xs)
+        else:
+            # No `g = r * s` output is needed, so `s` can hold the product.
+            phi = s.mul_(lo).copysign_(xs)
         if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
             phi.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     if not need_g:

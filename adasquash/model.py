@@ -263,7 +263,18 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         acc = _loss_acc_dtype(dt)
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
+        hidden_dtype, weight_dtype = ctx.in_dtypes
+        chunk_rows = ctx.chunk_rows
         grad_h = torch.empty_like(h) if need_h else None
+        grad_h_tmp = None
+        if need_h and h.dtype != hidden_dtype:
+            # Under autocast the GEMM produces a low-precision tile while the
+            # caller needs the gradient in the input dtype. Allocating the
+            # full gradient in that dtype up front (and writing each chunk
+            # through a small scratch) avoids keeping a second full-size
+            # low-precision copy alive just to cast it at the end.
+            grad_h = torch.empty((targets.numel(), h.shape[1]), dtype=hidden_dtype, device=h.device)
+            grad_h_tmp = torch.empty((min(chunk_rows, targets.numel()), h.shape[1]), dtype=h.dtype, device=h.device)
         # The weight gradient accumulates into its final buffer from the first
         # chunk on: a low-precision weight keeps a low-precision accumulator,
         # while an fp32/fp64 weight (the autocast case `w = weight.to(bf16)`)
@@ -277,7 +288,6 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         # See `_ChunkedCrossEntropy.backward`: with no valid targets the
         # gradient must stay zero instead of 0 * inf = NaN.
         grad_scale = (grad_out / ctx.count).to(dt) if int(ctx.count) > 0 else grad_out.to(dt)
-        chunk_rows = ctx.chunk_rows
         w_t = w.t()
         first = True
         n = targets.numel()
@@ -311,7 +321,12 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             g = buf if acc == dt else cast.copy_(buf)
             del gold, keep, valid
             if need_h:
-                torch.mm(g, w, out=grad_h[start:end])
+                if grad_h_tmp is None:
+                    torch.mm(g, w, out=grad_h[start:end])
+                else:
+                    hgrad = grad_h_tmp[:rows]
+                    torch.mm(g, w, out=hgrad)
+                    grad_h[start:end].copy_(hgrad)
             if need_w:
                 if g.dtype == grad_w.dtype and hc.dtype == grad_w.dtype:
                     if first:
@@ -321,22 +336,23 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                 else:
                     # Mixed dtypes cannot write into `grad_w` directly
                     # (`torch.mm`'s out tensor must have the product's dtype),
-                    # so the product is reduced in vocab blocks.
+                    # so the product is reduced in vocab blocks. `buf` still
+                    # holds the same probabilities in the accumulator dtype
+                    # (before the low-precision `cast` copy), so the GEMM reads
+                    # it directly instead of casting the low-precision copy
+                    # back block by block.
                     hcf = hc.to(acc)
                     block = max(1, (_CROSSENTROPY_CHUNK_BYTES // 4)
                                 // max(1, hcf.shape[1] * hcf.element_size()))
                     for v0 in range(0, w.shape[0], block):
                         v1 = min(w.shape[0], v0 + block)
-                        part = torch.mm(g[:, v0:v1].to(acc).t(), hcf)
+                        part = torch.mm(buf[:, v0:v1].t(), hcf)
                         if first:
                             grad_w[v0:v1].copy_(part)
                         else:
                             grad_w[v0:v1].add_(part)
                     del hcf
             first = False
-        hidden_dtype, weight_dtype = ctx.in_dtypes
-        if need_h and grad_h.dtype != hidden_dtype:
-            grad_h = grad_h.to(hidden_dtype)
         if need_w and grad_w.dtype != weight_dtype:
             grad_w = grad_w.to(weight_dtype)
         return (grad_h, grad_w, None, None, None)
