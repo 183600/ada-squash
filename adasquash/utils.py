@@ -23,7 +23,8 @@ class MaxAbsMeter:
     def _abs_max(x: torch.Tensor) -> torch.Tensor:
         """max(|x|)."""
         lo, hi = torch.aminmax(x)
-        return torch.maximum(hi, -lo)
+        lo.neg_()
+        return torch.maximum(hi, lo, out=hi)
 
     def update(self, x: torch.Tensor):
         with torch.no_grad():
@@ -42,7 +43,7 @@ class MaxAbsMeter:
                     self._peak = torch.full((), -float('inf'), dtype=v.dtype, device=v.device)
                 elif self._peak.dtype != v.dtype or self._peak.device != v.device:
                     self._peak = self._peak.to(dtype=torch.promote_types(self._peak.dtype, v.dtype), device=v.device)
-                self._peak = torch.fmax(self._peak, v)
+                torch.fmax(self._peak, v, out=self._peak)
         self.count += 1
 
 # One workspace pair per (name, device, dtype), shared by every meter: the

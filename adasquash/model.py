@@ -486,8 +486,12 @@ class _SwiGLU(torch.autograd.Function):
             grad_b = grad_h
         del grad_h
         if do_w2:
-            grad_w2 = grad_out.t() @ h.mul_(b)
-        del a, b, h
+            h.mul_(b)
+            b = None
+            grad_w2 = grad_out.t() @ h
+        else:
+            b = None
+        del a, h
         if do_x:
             grad_x = grad_a @ w1
             grad_x.addmm_(grad_b, w3)
