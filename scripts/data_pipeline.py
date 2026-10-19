@@ -892,10 +892,18 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     both the request and the resolved hash are copied into the split report
     (data-version tracking), the latter also keying the held-out cache.
     """
+    opts = get_data_options()
+    if (opts.get("exclude_group_file") or opts.get("exclude_test_group_file")) and not opts.get("group_key"):
+        # Without the key the pipeline cannot extract a group value, so the
+        # supplied ledger would be silently ignored and the held-out splits
+        # would claim group hygiene they never applied.
+        raise ValueError(
+            "exclude_group_file/exclude_test_group_file require group_key: the "
+            "group hash ledger is keyed by the value at --group-key, and without "
+            "it no held-out document can be matched to a listed group")
     from datasets import load_dataset
     from torch.utils.data import DataLoader
 
-    opts = get_data_options()
     tok = _cached_tokenizer(tokenizer, opts.get("tokenizer_revision"))
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id
@@ -907,11 +915,39 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     # tracking). Degrades to None when the Hub is unreachable.
     report["dataset_revision_resolved"] = resolve_dataset_revision(
         dataset_name, opts.get("dataset_revision"))
+    # Group ledgers follow the same earlier-side-only rule: the training-group
+    # ledger is applied to both held-out splits, the validation-group ledger
+    # to the sealed test split only, and neither is ever applied to train.
+    report["group_key"] = opts.get("group_key") or None
+    applied_train_groups = opts.get("exclude_group_file") if opts["split"] != "train" else None
+    applied_test_groups = opts.get("exclude_test_group_file") if opts["split"] == "test" else None
+    group_files = [p for p in (applied_train_groups, applied_test_groups) if p]
+    group_exclusion_active = bool(opts.get("group_key") and group_files)
+    exclude_group_hashes: set = set()
+    for path in group_files:
+        exclude_group_hashes |= load_hash_file(path)
+    report["exclude_group_file"] = str(applied_train_groups) if applied_train_groups else None
+    report["exclude_test_group_file"] = str(applied_test_groups) if applied_test_groups else None
+    if group_files:
+        report["exclude_group_files"] = [str(p) for p in group_files]
+        report["exclude_groups"] = len(exclude_group_hashes)
     if opts["split"] in ("validation", "test"):
-        stream_ds, cache_path = _materialized_split_stream(
-            stream_ds, dataset_name, dataset_config, opts["split"], report)
-        if cache_path is not None:
-            report["materialized_cache"] = str(cache_path)
+        if group_exclusion_active:
+            # The materialized cache stores only `text`; the group field the
+            # exclusion decision needs is gone by the time the cleaner runs on
+            # a cached stream. Caching this split would therefore silently
+            # serve documents whose group is listed in an earlier-side ledger.
+            print(f"[data] {opts['split']} cache disabled: group exclusion on "
+                  f"'{opts.get('group_key')}' needs the raw group field, which the "
+                  f"text-only cache does not preserve", file=sys.stderr)
+            report["materialized_cache_disabled_reason"] = (
+                "group exclusion is active; the text-only cache cannot apply "
+                "the group ledger")
+        else:
+            stream_ds, cache_path = _materialized_split_stream(
+                stream_ds, dataset_name, dataset_config, opts["split"], report)
+            if cache_path is not None:
+                report["materialized_cache"] = str(cache_path)
     report["tokenizer"] = tokenizer
     report["tokenizer_revision"] = opts.get("tokenizer_revision")
     # The requested revision alone cannot pin a mutable upstream tokenizer:
@@ -935,21 +971,6 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     if exclude_files:
         report["exclude_hash_files"] = [str(p) for p in exclude_files]
         report["exclude_hashes"] = len(exclude_hashes)
-    # Group ledgers follow the same earlier-side-only rule: the training-group
-    # ledger is applied to both held-out splits, the validation-group ledger
-    # to the sealed test split only, and neither is ever applied to train.
-    report["group_key"] = opts.get("group_key") or None
-    applied_train_groups = opts.get("exclude_group_file") if opts["split"] != "train" else None
-    applied_test_groups = opts.get("exclude_test_group_file") if opts["split"] == "test" else None
-    group_files = [p for p in (applied_train_groups, applied_test_groups) if p]
-    exclude_group_hashes: set = set()
-    for path in group_files:
-        exclude_group_hashes |= load_hash_file(path)
-    report["exclude_group_file"] = str(applied_train_groups) if applied_train_groups else None
-    report["exclude_test_group_file"] = str(applied_test_groups) if applied_test_groups else None
-    if group_files:
-        report["exclude_group_files"] = [str(p) for p in group_files]
-        report["exclude_groups"] = len(exclude_group_hashes)
     cleaner = DocumentCleaner(
         dedup=opts["dedup"],
         dedup_max=opts["dedup_max"],

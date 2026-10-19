@@ -820,6 +820,17 @@ def main():
             best_val_loss = float(prior_best['val_loss'])
             best_val_step = int(prior_best.get('step', 0))
             print(f'[resume] best-validation tracker seeded with val_loss={best_val_loss:.4f}@{best_val_step} from the previous best checkpoint')
+        # The early-stop streak is run state like the best tracker: restarting
+        # it at 0 would hand a resumed run a fresh patience window, so it can
+        # train past the step an uninterrupted run would have stopped at.
+        # Checkpoints written after this field existed carry the exact streak;
+        # older ones restart at 0 (the previous behavior) with a note.
+        saved_no_improve = resume_ckpt.get('val_checks_without_improvement')
+        if saved_no_improve is not None:
+            val_checks_without_improvement = max(0, int(saved_no_improve))
+            print(f'[resume] restored early-stop counter: {val_checks_without_improvement} validation check(s) without improvement')
+        elif args.early_stop_patience > 0:
+            print('[resume] checkpoint predates early-stop-counter saving: the no-improvement streak restarts at 0, so a resumed run gets a full --early-stop-patience window')
     opt = build_optimizer(model, args.lr, args.weight_decay, args.beta1, args.beta2)
     sched = LambdaLR(opt, build_lr_lambda(args))
     if resume_ckpt is not None:
@@ -1057,7 +1068,7 @@ def main():
                     if tb:
                         tb.add_scalar('val/loss', val_loss, step)
                     if improved:
-                        ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
+                        ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
                         path = Path(args.output_dir) / 'ckpt_best.pt'
                         _atomic_torch_save(ckpt_best, path)
                         print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
@@ -1127,14 +1138,14 @@ def main():
                     for k, v in s.items():
                         tb.add_scalar(f'stats/{k}', v, step)
             if step % args.save_every == 0 and step > 0:
-                ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
+                ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
                 path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
                 _atomic_torch_save(ckpt, path)
                 print(f'[ckpt] saved {path}')
             if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
                 print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
                 break
-        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
+        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
         path = Path(args.output_dir) / 'ckpt_final.pt'
         _atomic_torch_save(ckpt, path)
         print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')

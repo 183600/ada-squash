@@ -209,7 +209,9 @@ def add_confirm_trials(arm_result: dict, args, base: Path, run_metadata: dict | 
         confirm.append(_trial_record(summary, lr, seed))
     arm_result['confirm_trials'] = confirm
     losses = [t['val_loss'] for t in confirm if _usable_loss(t['val_loss'])]
-    arm_result['confirm'] = {'lr': lr, 'stats': mean_std_stderr(losses)}
+    missing = sorted(t['seed'] for t in confirm if not _usable_loss(t['val_loss']))
+    arm_result['confirm'] = {'lr': lr, 'stats': mean_std_stderr(losses),
+                             'missing_seeds': missing, 'complete_coverage': not missing}
     return arm_result
 
 
@@ -250,11 +252,18 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     ref_arm = min(baselines, key=lambda a: baselines[a]['best']['mean'])
     ref = baselines[ref_arm]
     # The confirm split is only a valid basis when *every* compared arm has
-    # confirm statistics; a mixed basis would compare some arms on fresh seeds
-    # and others on the seeds their lr was selected on.
-    confirm_ready = {a for a, r in usable.items() if (r.get('confirm') or {}).get('stats')}
+    # complete confirm statistics; a mixed basis would compare some arms on
+    # fresh seeds and others on the seeds their lr was selected on. A
+    # survivor-only confirm mean (a diverged seed silently dropped) would let
+    # the arm that diverged look better, the same survivorship bias the lr
+    # grid excludes via `complete_coverage`.
+    confirm_ready = {a for a, r in usable.items()
+                     if ((r.get('confirm') or {}).get('stats')
+                         and not (r.get('confirm') or {}).get('missing_seeds'))}
     confirm_ran = {a for a, r in usable.items() if r.get('confirm_trials')}
     confirm_ignored = sorted(confirm_ran - confirm_ready)
+    confirm_ignored_missing_seeds = {
+        a: (usable[a].get('confirm') or {}).get('missing_seeds') for a in confirm_ignored}
     use_confirm = len(confirm_ready) == len(usable) and bool(usable)
     split = 'confirm_seeds' if use_confirm else 'selection_seeds'
     # Only a comparison on held-back seeds can certify: without --confirm-seeds
@@ -273,14 +282,15 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         'reference_split': split,
         'certify_requested': bool(certify),
         'confirm_ignored_arms': confirm_ignored,
+        'confirm_ignored_missing_seeds': confirm_ignored_missing_seeds,
         'certified': certified,
         'certification': (
             'confirm_seeds: significance tested on seeds held back from lr selection'
             if certified else
             ("none: --confirm-seeds was provided but unusable for "
-             f"{confirm_ignored or 'the compared arms'} (no usable confirm statistics), "
-             "so the comparison fell back to selection seeds and the p-values are "
-             "descriptive only (winner's curse)"
+             f"{confirm_ignored or 'the compared arms'} (incomplete or missing confirm "
+             "statistics), so the comparison fell back to selection seeds and the p-values "
+             "are descriptive only (winner's curse)"
              if certify else
              "none: no held-back --confirm-seeds, so the p-values are descriptive "
              "only and no arm is certified as significantly better (winner's curse)")),
@@ -383,9 +393,9 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             if certify:
                 entry['significance_basis'] = (
                     "descriptive only: --confirm-seeds was provided but unusable for "
-                    f"{confirm_ignored or 'the compared arms'} (no usable confirm statistics), "
-                    "so the comparison ran on the seeds the lr was selected on (winner's curse); "
-                    "the p-value is reported but not certified")
+                    f"{confirm_ignored or 'the compared arms'} (incomplete or missing confirm "
+                    "statistics), so the comparison ran on the seeds the lr was selected on "
+                    "(winner's curse); the p-value is reported but not certified")
             else:
                 entry['significance_basis'] = (
                     "descriptive only: no --confirm-seeds, so the comparison ran on the seeds "
@@ -428,9 +438,14 @@ def print_comparison(comparison: dict | None) -> None:
     if comparison.get('certified') is False:
         if comparison.get('certify_requested'):
             ignored = comparison.get('confirm_ignored_arms')
+            missing = comparison.get('confirm_ignored_missing_seeds') or {}
+            missing_str = (f' (missing seed(s) '
+                           f'{ {a: s for a, s in missing.items() if s} })'
+                           if any(missing.values()) else '')
             print("[tune][compare] NOT CERTIFIED: --confirm-seeds was provided but unusable"
-                  f"{f' for {ignored}' if ignored else ''} (no usable confirm statistics), so the "
-                  "comparison fell back to selection seeds (winner's curse); no arm is called significant")
+                  f"{f' for {ignored}' if ignored else ''} (incomplete or missing confirm "
+                  f"statistics){missing_str}, so the comparison fell back to selection seeds "
+                  "(winner's curse); no arm is called significant")
         else:
             print("[tune][compare] NOT CERTIFIED: no --confirm-seeds, so these p-values compare runs "
                   "that also selected the lr (winner's curse); no arm is called significant")
@@ -462,8 +477,9 @@ def print_comparison(comparison: dict | None) -> None:
         print(f"[tune][compare] NOTE: single-run batch-level tests (fewer than 2 shared seeds) "
               f"are described but never certified: {comparison['rows_tested_descriptively_only']}")
     if comparison.get('confirm_ignored_arms'):
-        print(f"[tune][compare] confirm runs ignored (missing confirm stats for "
-              f"{comparison['confirm_ignored_arms']}); comparison is on selection seeds")
+        print(f"[tune][compare] confirm runs ignored (incomplete confirm coverage for "
+              f"{comparison['confirm_ignored_arms']}, missing seeds "
+              f"{comparison.get('confirm_ignored_missing_seeds')}); comparison is on selection seeds")
     if comparison.get('rows_with_fewer_than_3_seeds'):
         print(f"[tune][compare] WARNING: <3 paired seeds for "
               f"{comparison['rows_with_fewer_than_3_seeds']}: "

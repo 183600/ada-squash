@@ -142,15 +142,19 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             continue
         lengths.append(len(text))
         h = document_hash(text)
+        ch = canonical_document_hash(text)
         if collect_hashes:
             # Both digests, so a held-out formatting variant of a training
             # document is caught by the ledger the same way the cleaner
             # catches it (and the hash itself is still found either way).
             hashes.add(h)
-            hashes.add(canonical_document_hash(text))
-        if known_hashes is not None and h in known_hashes:
+            hashes.add(ch)
+        # The ledger holds exact *and* canonical digests; checking only the
+        # exact one would undercount formatting-variant duplicates that the
+        # cleaner (and therefore the actual held-out split) does drop.
+        if known_hashes is not None and (h in known_hashes or ch in known_hashes):
             overlap += 1
-        if known_hashes_extra is not None and h in known_hashes_extra:
+        if known_hashes_extra is not None and (h in known_hashes_extra or ch in known_hashes_extra):
             overlap_extra += 1
         if group_key:
             value = extract_group_value(example, group_key)
