@@ -324,10 +324,14 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
                     t['reason'] = 'need >= 2 shared samples to pair a test'
                 else:
                     t.update(paired_t_one_sided(av, bv, alpha=alpha))
-                t['reason'] = (f'only {len(shared_train)} shared training seed(s): one run per arm cannot '
-                               'separate the checkpoint from run-to-run noise, so the probe-paired test is '
-                               'descriptive only; pass comma-separated checkpoints with distinct training '
-                               'seeds per arm to certify')
+                # Append, never replace: when there are too few shared probe
+                # samples *and* one training run per arm, both facts matter.
+                t['reason'] = '; '.join(filter(None, (
+                    t.get('reason'),
+                    f'only {len(shared_train)} shared training seed(s): one run per arm cannot '
+                    'separate the checkpoint from run-to-run noise, so the probe-paired test is '
+                    'descriptive only; pass comma-separated checkpoints with distinct training '
+                    'seeds per arm to certify')))
             tests.append(t)
     for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
         t['p_holm'] = p_adj
@@ -469,7 +473,10 @@ def main():
                 # and reuse them for the fp32 and the W8A8 pass.
                 pairs = []
                 for x in batches:
-                    y = torch.full((args.batch_size, args.seq_len), model.cfg.ignore_index, dtype=torch.long, device=device)
+                    # `x` is not always (batch_size, seq_len): the dataset
+                    # probe's loader keeps the final short batch, so derive
+                    # the target shape from the probe itself.
+                    y = torch.full_like(x, model.cfg.ignore_index)
                     y[:, :-1] = x[:, 1:]
                     pairs.append((x, y))
                 coverage = probe_token_coverage(batches)

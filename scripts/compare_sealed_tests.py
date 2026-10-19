@@ -105,8 +105,11 @@ def _discover_results(path: Path) -> list[Path]:
     """One run per training seed under an arm directory, or the file itself."""
     if not path.is_dir():
         return [path]
+    # Only `seed<digits>` directories name a training seed (`seed_backup`,
+    # `seed0_old`, ... are skipped, exactly like `_seed_of` does).
     seed_files = sorted(
-        path.glob("seed*/test_results.json"),
+        (p for p in path.glob("seed*/test_results.json")
+         if _SEED_DIR_RE.search(p.parent.name)),
         key=lambda p: int(_SEED_DIR_RE.search(p.parent.name).group(1)))
     if seed_files:
         return seed_files

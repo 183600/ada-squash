@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import time
@@ -50,6 +51,21 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
     if unknown:
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
 _TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
+
+def _snapshot_rng_state() -> dict:
+    """Every RNG whose stream a resumed run must continue.
+
+    torch CPU covers the model/init sampling, the CUDA generators cover
+    dropout and any device-side sampling, and Python's `random` covers the
+    data-shuffle buffer (`data_pipeline._shuffle`). Saving them with the
+    weights makes a resume continue the same stochastic run instead of
+    restarting the streams from `--seed`.
+    """
+    state = {'torch_cpu': torch.get_rng_state(), 'python': random.getstate()}
+    if torch.cuda.is_available():
+        state['torch_cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
 
 def _atomic_torch_save(obj, path: Path) -> None:
     """Serialize to a sibling `.tmp` file, then atomically replace `path`.
@@ -323,6 +339,11 @@ def preflight_arch_args(args, depth_override=None, dim_override=None, heads_over
         arch.append('--gradient-checkpointing')
     if args.tie_embeddings is not None:
         arch.append('--tie-embeddings' if args.tie_embeddings else '--no-tie-embeddings')
+    elif args.model == 'llama-1b':
+        # `build_llama_tiny_1b` is untied by default while sanity_overfit.py's
+        # config defaults to tied, so without an explicit flag the preflight
+        # would exercise a different model than this run trains.
+        arch.append('--no-tie-embeddings')
     if args.no_bf16:
         arch.append('--no-bf16')
     if args.model == 'llama-1b':
@@ -445,6 +466,7 @@ def launch_multi_seed(args, seeds) -> None:
               f'run-to-run noise; use >= 3 independent seeds before interpreting deltas')
     child_argv = list(sys.argv[1:])
     script = str(Path(__file__).resolve())
+    failed_seeds: list = []
     for seed in seeds:
         out_dir = seed_run_dir(base, seed)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -454,6 +476,7 @@ def launch_multi_seed(args, seeds) -> None:
         cmd = [sys.executable, script, *child_argv, '--seeds', str(seed), '--output-dir', str(out_dir)]
         rc = subprocess.run(cmd, env=env).returncode
         if rc != 0:
+            failed_seeds.append(seed)
             print(f'[seeds][warn] seed={seed} exited rc={rc}; its manifest may be missing and the '
                   f'aggregate will flag it', flush=True)
     agg = aggregate_seed_runs(base, seeds, args.model, args.norm)
@@ -476,6 +499,16 @@ def launch_multi_seed(args, seeds) -> None:
     manifest['seeds'] = [int(s) for s in seeds]
     manifest['aggregate'] = agg
     save_run_manifest(base / 'run_manifest.json', manifest)
+    if failed_seeds:
+        # A multi-seed invocation is a replication study: a failed child is
+        # not a valid draw, and exiting 0 would let CI/orchestration treat
+        # the pooled mean as a clean result while it silently covers fewer
+        # seeds than requested. The artifacts above are already on disk.
+        raise SystemExit(
+            f'[seeds] {len(failed_seeds)}/{len(seeds)} seed run(s) failed {failed_seeds}: the '
+            f'aggregate covers {agg["n_seeds"]} of {agg["n_seeds_requested"]} requested seeds, '
+            'so this invocation is not a clean replication. Fix the failures (each seed writes '
+            'its own run_manifest.json) and re-run before quoting the pooled numbers.')
 
 def main():
     pre = argparse.ArgumentParser(add_help=False)
@@ -548,6 +581,7 @@ def main():
     p.add_argument('--run-name', default=None)
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this run tests; recorded in the run manifest (and checkpoint args) so a result can be audited against the claim it was meant to support, the same contract the ablation matrix enforces per row')
     p.add_argument('--resume', default=None, help='checkpoint to resume from')
+    p.add_argument('--resume-skip-data', action='store_true', help='do NOT fast-forward the training dataloader past the batches the checkpoint already consumed (faster, but the resumed run replays training data)')
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [DEFAULT_SEED])
@@ -662,6 +696,7 @@ def main():
     data_reports: dict = {}
     loader = open_data_split('train', args)
     data_iter = iter(loader)
+    batches_consumed = 0
     report = getattr(loader, 'split_report', None)
     if report:
         data_reports['train'] = report
@@ -687,6 +722,41 @@ def main():
                 print(f'[resume] keeping your explicit override(s) {kept} - the resumed run therefore follows a different schedule than the one it continues')
         start_step = int(resume_ckpt.get('step', 0))
         print(f'[resume] {args.resume} -> step {start_step}')
+        # Restore the stochastic state before the first post-resume batch, so
+        # dropout and the Python-side shuffle buffer continue where the saved
+        # run stopped instead of restarting from --seed.
+        rng_state = resume_ckpt.get('rng_state')
+        if rng_state is not None:
+            torch.set_rng_state(rng_state.get('torch_cpu', torch.get_rng_state()))
+            if rng_state.get('torch_cuda') is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
+            if rng_state.get('python') is not None:
+                random.setstate(rng_state['python'])
+            print('[resume] restored RNG states (torch / cuda / python) - dropout and any stochastic step continues as if uninterrupted')
+        else:
+            print('[resume] checkpoint predates RNG-state saving: RNGs restart from --seed, so a run with dropout>0 will not bitwise-continue the original stream')
+        # The loader is a forward-only stream and does not persist its cursor:
+        # without skipping, a resumed run silently retrains on the corpus from
+        # the start. `data_position` counts every stream batch consumed (one
+        # per gradient-accumulation micro-step), including non-finite steps.
+        saved_position = resume_ckpt.get('data_position')
+        if saved_position is None:
+            print('[resume] checkpoint predates data-position tracking: the stream restarts from the beginning and REPLAYS training data - finish the run with this caveat, or restart from a newer checkpoint')
+        elif args.resume_skip_data:
+            print(f'[resume] --resume-skip-data: NOT skipping the {saved_position} batches the checkpoint already consumed - the resumed run replays training data (accepted)')
+        else:
+            print(f'[resume] fast-forwarding the dataloader past {saved_position} already-consumed batches (same streaming order, so the resumed run sees fresh data)...')
+            t_skip = time.time()
+            for i in range(int(saved_position)):
+                try:
+                    next(data_iter)
+                except StopIteration:
+                    data_iter = iter(loader)
+                    next(data_iter)
+                if (i + 1) % 1000 == 0:
+                    print(f'  [skip] {i + 1}/{saved_position} batches ({time.time() - t_skip:.0f}s)', flush=True)
+            batches_consumed = int(saved_position)
+            print(f'[resume] data position restored: the next batch is #{int(saved_position) + 1} in the stream')
         # The best-validation tracker is run state like the step counter and
         # the loss-spike baseline: restarting it at `inf` would let the first
         # post-resume validation unconditionally overwrite a possibly better
@@ -847,6 +917,10 @@ def main():
                 except StopIteration:
                     data_iter = iter(loader)
                     batch = next(data_iter)
+                # Count every consumed stream batch (including the ones of a
+                # step later discarded for a non-finite loss): resume must
+                # skip exactly these.
+                batches_consumed += 1
                 x, y = batch
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
@@ -939,7 +1013,7 @@ def main():
                     if tb:
                         tb.add_scalar('val/loss', val_loss, step)
                     if improved:
-                        ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'provenance': provenance}
+                        ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
                         path = Path(args.output_dir) / 'ckpt_best.pt'
                         _atomic_torch_save(ckpt_best, path)
                         print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
@@ -1009,14 +1083,14 @@ def main():
                     for k, v in s.items():
                         tb.add_scalar(f'stats/{k}', v, step)
             if step % args.save_every == 0 and step > 0:
-                ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
+                ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
                 path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
                 _atomic_torch_save(ckpt, path)
                 print(f'[ckpt] saved {path}')
             if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
                 print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
                 break
-        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'provenance': provenance}
+        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
         path = Path(args.output_dir) / 'ckpt_final.pt'
         _atomic_torch_save(ckpt, path)
         print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')

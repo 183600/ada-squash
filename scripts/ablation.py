@@ -52,6 +52,19 @@ from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, 
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
+
+
+def _finite_metric(value) -> bool:
+    """A loss may be pooled/tested only when it is a finite number.
+
+    `isinstance(value, (int, float))` alone admits NaN/Inf from a diverged
+    run; NaN then propagates through the seed mean (and the paired tests),
+    silently poisoning the row's pooled val_loss.
+    """
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
 # Every row must state *why* it is run (the scientific hypothesis it tests),
 # not just what it configures. `load_ablations_from_config` enforces this for
@@ -492,12 +505,12 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
             'curve_classification': s.get('curve_classification'),
             'curve_diagnosis': s.get('curve_diagnosis'),
         })
-    seed_losses = [p['val_loss'] for p in per_seed if isinstance(p['val_loss'], (int, float))]
+    seed_losses = [p['val_loss'] for p in per_seed if _finite_metric(p['val_loss'])]
     stats = mean_std_stderr(seed_losses) or {'mean': None, 'std': None, 'stderr': None, 'n': 0}
     multi = len(seed_losses) >= 2
 
     def _mean_of(key):
-        vals = [p[key] for p in per_seed if isinstance(p.get(key), (int, float))]
+        vals = [p[key] for p in per_seed if _finite_metric(p.get(key))]
         return sum(vals) / len(vals) if vals else None
 
     agg = dict(summaries[0]) if summaries else {}
@@ -658,12 +671,12 @@ def _seed_means(row) -> dict:
         for item in per:
             if not isinstance(item, dict) or item.get('seed') is None:
                 continue
-            if isinstance(item.get('val_loss'), (int, float)):
+            if _finite_metric(item.get('val_loss')):
                 out[int(item['seed'])] = float(item['val_loss'])
         return out
     seeds = row.get('seeds') if isinstance(row.get('seeds'), list) else []
     seeds = [s for s in seeds if s is not None] or ([row['seed']] if row.get('seed') is not None else [])
-    if isinstance(row.get('val_loss'), (int, float)):
+    if _finite_metric(row.get('val_loss')):
         for s in seeds:
             out[int(s)] = float(row['val_loss'])
     return out

@@ -500,7 +500,10 @@ class PackedStream(IterableDataset):
             if text is None:
                 continue
             texts.append(text)
-            if len(texts) < self.tokenize_batch and len(buf) - pos < need:
+            # Keep accumulating until the tokenizer batch is full or the ring
+            # already holds a drainable window (`fill - pos` is the number of
+            # *unread* tokens; `len(buf)` would be the tensor's capacity).
+            if len(texts) < self.tokenize_batch and fill - pos < need:
                 continue
             extend(texts)
             texts = []

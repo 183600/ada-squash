@@ -213,8 +213,14 @@ def main():
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        ref_model, _ = load_ckpt(args.compare_to, device=device)
-        ref_results, _ = evaluate_model(ref_model, tok, args, device, seeds, trained_seq_len)
+        ref_model, ref_args = load_ckpt(args.compare_to, device=device)
+        # The reference's own training context length decides which context
+        # lengths are in-distribution for it; reusing the candidate's would
+        # mislabel the reference's in/out-of-distribution slices.
+        ref_trained_seq_len = ref_args.get('seq_len')
+        ref_trained_seq_len = (int(ref_trained_seq_len)
+                               if isinstance(ref_trained_seq_len, int) else None)
+        ref_results, _ = evaluate_model(ref_model, tok, args, device, seeds, ref_trained_seq_len)
         comparison = compare_needle(results, ref_results, alpha=0.05)
         comparison['candidate'] = args.ckpt
         comparison['reference'] = args.compare_to

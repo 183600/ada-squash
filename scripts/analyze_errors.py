@@ -714,7 +714,11 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         rec['candidate_flags'] = cand_flags
         rec['reference_cause'] = ref_cause
         rec['candidate_cause'] = cand_cause
-        if min(rec['reference']['pred_prob'], rec['candidate']['pred_prob']) >= args.confidence:
+        if (int(rec['reference']['pred']) == int(rec['candidate']['pred'])
+                and min(rec['reference']['pred_prob'], rec['candidate']['pred_prob']) >= args.confidence):
+            # Both arms confident *and* agreeing on the same wrong token: the
+            # reading guide's label-noise class, not merely two different
+            # confident mistakes.
             n_both_wrong_confident += 1
         examples['shared_blind_spots'].append(rec)
 

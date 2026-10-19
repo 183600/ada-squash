@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import sys
 from collections import Counter
 from pathlib import Path
@@ -139,6 +140,17 @@ def _trial_record(summary: dict, lr: float, seed: int) -> dict:
     }
 
 
+def _usable_loss(value) -> bool:
+    """Whether a trial's val_loss may enter the lr-grid selection.
+
+    `isinstance(value, (int, float))` alone admits NaN/Inf: a diverged trial
+    would then poison the seed mean (NaN) or win the `min` (Inf), so selection
+    must happen on finite losses only.
+    """
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> dict:
     """Sweep the learning-rate grid for one arm over the selection seeds."""
     trials = []
@@ -149,7 +161,7 @@ def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> di
     lr_grid = {}
     for lr in args.lrs:
         cell = [t for t in trials if t['lr'] == lr]
-        losses = [t['val_loss'] for t in cell if isinstance(t['val_loss'], (int, float))]
+        losses = [t['val_loss'] for t in cell if _usable_loss(t['val_loss'])]
         stats = mean_std_stderr(losses)
         if stats is not None:
             stats = dict(stats)
@@ -175,7 +187,7 @@ def add_confirm_trials(arm_result: dict, args, base: Path, run_metadata: dict | 
         summary = run_trial(arm_result['arm'], lr, seed, args, base, run_metadata=run_metadata)
         confirm.append(_trial_record(summary, lr, seed))
     arm_result['confirm_trials'] = confirm
-    losses = [t['val_loss'] for t in confirm if isinstance(t['val_loss'], (int, float))]
+    losses = [t['val_loss'] for t in confirm if _usable_loss(t['val_loss'])]
     arm_result['confirm'] = {'lr': lr, 'stats': mean_std_stderr(losses)}
     return arm_result
 
@@ -253,14 +265,14 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
 
     ref_seed_losses = {
         t['seed']: t['val_loss'] for t in _split_trials(ref)
-        if t['lr'] == ref['best']['lr'] and isinstance(t['val_loss'], (int, float))
+        if t['lr'] == ref['best']['lr'] and _usable_loss(t['val_loss'])
     }
     for arm, r in usable.items():
         if arm in baselines:
             continue
         arm_seed_losses = {
             t['seed']: t['val_loss'] for t in _split_trials(r)
-            if t['lr'] == r['best']['lr'] and isinstance(t['val_loss'], (int, float))
+            if t['lr'] == r['best']['lr'] and _usable_loss(t['val_loss'])
         }
         common = sorted(set(arm_seed_losses) & set(ref_seed_losses))
         arm_vals = [arm_seed_losses[s] for s in common]

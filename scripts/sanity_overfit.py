@@ -494,6 +494,14 @@ def main():
     args = p.parse_args()
     if args.dim % args.n_heads:
         p.error(f"--dim {args.dim} is not divisible by --n-heads {args.n_heads}")
+    # Step 1 is the initial-loss reference of the whole check, so a run
+    # without at least one step has nothing to compare against (`checks
+    # ["loss_decreased"]` would compare against None).
+    if args.max_steps < 1:
+        p.error(f"--max-steps {args.max_steps} must be >= 1: the sanity check "
+                "needs at least one optimizer step")
+    if args.log_every < 1:
+        p.error(f"--log-every {args.log_every} must be >= 1")
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     results = []
     for norm in args.norms:

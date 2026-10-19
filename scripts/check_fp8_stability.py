@@ -405,10 +405,15 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                     else:
                         t.update(paired_t_one_sided(av, bv, alpha=alpha))
                     if trained:
-                        t['reason'] = (f'only {len(shared_train)} shared training seed(s): a single run per '
-                                       'arm cannot separate the norm from run-to-run noise, so the probe-paired '
-                                       'test is descriptive only; provide >= 2 checkpoints (comma-separated in '
-                                       '--ckpt) with distinct training seeds per norm to certify')
+                        # Append, never replace: with too few shared probe
+                        # samples *and* one training run per arm, both reasons
+                        # apply to this pair.
+                        t['reason'] = '; '.join(filter(None, (
+                            t.get('reason'),
+                            f'only {len(shared_train)} shared training seed(s): a single run per '
+                            'arm cannot separate the norm from run-to-run noise, so the probe-paired '
+                            'test is descriptive only; provide >= 2 checkpoints (comma-separated in '
+                            '--ckpt) with distinct training seeds per norm to certify')))
                 tests.append(t)
     for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
         t['p_holm'] = p_adj

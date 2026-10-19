@@ -86,17 +86,33 @@ def build_support(n_states: int, outlier_id):
         support.append(int(outlier_id))
     return support
 
+def wrapped_jump_probs(n_states: int, max_jump: int) -> list[float]:
+    """Successor distribution of `markov_batch`'s uniform jump, after wrapping.
+
+    `markov_batch` draws `j` uniformly from `{0..max_jump-1}` and takes
+    `s_next = (s + j) mod n_states`. When `max_jump > n_states` several jumps
+    land on the same successor, so the distribution is no longer uniform and
+    the closed-form floor is its entropy, not `ln(max_jump)`.
+    """
+    n_states = int(n_states)
+    max_jump = int(max_jump)
+    counts = [0] * n_states
+    for j in range(max_jump):
+        counts[j % n_states] += 1
+    return [c / max_jump for c in counts]
+
 def memoryless_bayes_floor_nats(n_states: int, max_jump: int, spike_prob: float=0.0) -> float:
     """Closed-form CE of the best predictor that sees only the current token.
 
     With the outlier channel off, the next state given the current state is
-    uniform over `max_jump` successors, so the floor is ln(max_jump). With the
-    channel on, a `spike_prob` fraction of inputs is the outlier id, which
-    carries no information about the hidden state, so given the outlier the
-    next token is uniform over all `n_states`. This is NOT the ceiling for a
-    full-context model (`hmm_bayes_stats` computes that one).
+    the wrapped uniform jump distribution, so the floor is its entropy
+    (`ln(max_jump)` whenever all jumps stay distinct, i.e. `max_jump <=
+    n_states`). With the channel on, a `spike_prob` fraction of inputs is the
+    outlier id, which carries no information about the hidden state, so given
+    the outlier the next token is uniform over all `n_states`. This is NOT the
+    ceiling for a full-context model (`hmm_bayes_stats` computes that one).
     """
-    floor = math.log(int(max_jump))
+    floor = -sum(p * math.log(p) for p in wrapped_jump_probs(n_states, max_jump) if p > 0.0)
     if spike_prob > 0.0:
         floor = (1.0 - float(spike_prob)) * floor + float(spike_prob) * math.log(int(n_states))
     return floor
@@ -212,11 +228,13 @@ def walk_rule_stats(split: dict, n_states: int, max_jump: int, outlier_id) -> di
         is_outlier = torch.zeros_like(x_raw, dtype=torch.bool)
     else:
         is_outlier = x_raw.eq(int(outlier_id))
-    p = torch.where(is_outlier,
-                    torch.full_like(x_raw, 1.0 / int(n_states), dtype=torch.float64),
-                    torch.full_like(x_raw, 1.0 / int(max_jump), dtype=torch.float64))
+    jump_p = torch.tensor(wrapped_jump_probs(n_states, max_jump), dtype=torch.float64,
+                          device=x_raw.device)
     step = (y_raw - x_raw).remainder(int(n_states))
-    mismatches = int((~is_outlier & (step >= int(max_jump))).sum())
+    p = torch.where(is_outlier,
+                    torch.full_like(jump_p[step], 1.0 / int(n_states)),
+                    jump_p[step])
+    mismatches = int((~is_outlier & (jump_p[step] == 0)).sum())
     return {'ce_nats': float(-p.log().mean()),
             'rule_target_mismatches': mismatches,
             'outlier_input_fraction': float(is_outlier.to(torch.float64).mean())}
@@ -244,7 +262,7 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
     transition = torch.zeros(n_states, n_states, dtype=torch.float64)
     for s in range(n_states):
         for j in range(int(max_jump)):
-            transition[s, (s + j) % n_states] = 1.0 / int(max_jump)
+            transition[s, (s + j) % n_states] += 1.0 / int(max_jump)
     transition = transition.to(device)
     # Device-side fp64 accumulator: one .item() at the very end.
     ce_sum_t = torch.zeros((), dtype=torch.float64, device=device)
@@ -501,9 +519,9 @@ def main():
         'bayes_limits': {
             'memoryless_nats': memoryless_floor,
             'memoryless_perplexity': math.exp(memoryless_floor),
-            'memoryless_formula': ('ln(max_jump)' if not args.outlier_channel else
-                                   '(1 - spike_prob) * ln(max_jump) + spike_prob * ln(n_states)'),
-            'without_outlier_nats': math.log(args.max_jump),
+            'memoryless_formula': ('H(wrapped jump)' if not args.outlier_channel else
+                                   '(1 - spike_prob) * H(wrapped jump) + spike_prob * ln(n_states)'),
+            'without_outlier_nats': memoryless_bayes_floor_nats(args.n_states, args.max_jump, 0.0),
             'full_context_nats': ceiling,
             'full_context_stderr_nats': None if not full_context else full_context['stderr_ce_nats'],
             'full_context_definition': ('exact forward filtering of the observation-hidden Markov walk; the '

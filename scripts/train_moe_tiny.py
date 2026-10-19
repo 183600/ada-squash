@@ -183,7 +183,9 @@ class MoEGPT(nn.Module):
         pe = self.pos_emb.weight[:T]
         z.add_(pe if pe.dtype == z.dtype else pe.to(z.dtype))
         z = self.drop(z)
-        aux_total = 0.0
+        # A tensor even when `blocks` is empty (`--n-layers 0`): the caller
+        # reads `.detach()` off the aux term every step.
+        aux_total = z.new_zeros(())
         tpe_list = []
         for blk in self.blocks:
             z, aux, tpe = blk(z)
@@ -204,7 +206,7 @@ class MoEGPT(nn.Module):
         return (logits, loss)
 
 DEFAULT_SEEDS = (42, 43, 44)
-_MOE_SEED_METRIC_KEYS = ('val_ce', 'val_loss', 'final_loss', 'final_expert_cv')
+_MOE_SEED_METRIC_KEYS = ('val_ce', 'val_loss', 'val_aux', 'final_loss', 'final_expert_cv')
 
 def run_one(args, seed: int, output_dir: Path) -> dict:
     """One complete MoE training run on `seed`, writing its own artifacts."""
@@ -303,7 +305,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         item['aux'] = float(row['aux_t'])
         cv = row['expert_cv_t'].tolist()
         item['expert_cv_per_block'] = cv
-        item['expert_cv'] = cv[-1]
+        item['expert_cv'] = cv[-1] if cv else None
         return item
 
     def flush_history() -> None:
@@ -360,7 +362,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             loss_spike.update(loss_val)
             history.append({'step': step, 'loss': loss_val, 'aux_t': aux.detach(), 'expert_cv_t': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
             if step % args.log_every == 0:
-                exp_cv = float(expert_cv[-1])
+                exp_cv = float(expert_cv[-1]) if expert_cv.numel() else 0.0
                 print(f'  [moe] step={step:4d} loss={loss_val:.4f} aux={float(aux.detach()):.4f} expert_cv={exp_cv:.3f}', flush=True)
                 flush_history()
         # Held-out validation loss: real data comes from the chronological
@@ -429,7 +431,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         run_manifest['results'] = {
             'steps': args.max_steps,
             'final_loss': history[-1]['loss'] if history else None,
-            'final_expert_cv': float(history[-1]['expert_cv_t'][-1]) if history else None,
+            'final_expert_cv': (float(history[-1]['expert_cv_t'][-1])
+                                if history and history[-1]['expert_cv_t'].numel() else None),
             'val_loss': val_loss,
             'val_ce': val_ce,
             'val_aux': val_aux,

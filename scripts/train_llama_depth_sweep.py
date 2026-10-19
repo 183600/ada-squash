@@ -680,7 +680,7 @@ def main():
                   f'its manifest may be missing, which flags the cell incomplete')
 
     max_parallel = max(1, int(args.max_parallel))
-    if max_parallel > 1:
+    if max_parallel > 1 and not args.sequential:
         if not gpus:
             raise SystemExit(
                 '[sweep] --max-parallel > 1 requires --gpus: without it every '
