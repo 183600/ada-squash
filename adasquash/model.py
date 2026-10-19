@@ -56,6 +56,19 @@ def _cross_entropy_chunk_rows(vocab_size: int) -> int:
         _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
     return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
 
+def _fused_linear_chunk_rows(chunk_rows: int, vocab: int, dt: torch.dtype, acc: torch.dtype) -> int:
+    """Cap a fused-CE chunk so *all* its row-block scratch fits the budget.
+
+    The fused loss can hold the low-precision logits plus their accumulator
+    image at the same time; sizing the chunk from one fp32 image (as the
+    logits-only path does) would make the real peak 1.5x the budget.
+    """
+    element_bytes = torch.finfo(acc).bits // 8
+    if dt != acc:
+        element_bytes += torch.finfo(dt).bits // 8
+    cap = max(1, _CROSSENTROPY_CHUNK_BYTES // max(1, vocab * element_bytes))
+    return min(chunk_rows, cap)
+
 def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tensor:
     """Reusable ``(rows, vocab)`` logit scratch for the chunked losses.
 
@@ -219,6 +232,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
         w = _cast_weight_cached(weight, dt)
         acc = _loss_acc_dtype(dt)
+        chunk_rows = _fused_linear_chunk_rows(chunk_rows, w.shape[0], dt, acc)
         w_t = w.t()
         total = None
         n = targets.numel()

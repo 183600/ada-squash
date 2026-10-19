@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 
 class MaxAbsMeter:
-    _chunk = 1 << 22
 
     def __init__(self):
         self.reset()
@@ -29,15 +28,10 @@ class MaxAbsMeter:
     def update(self, x: torch.Tensor):
         with torch.no_grad():
             xd = x.detach().reshape(-1)
-            n = xd.numel()
-            if n == 0:
-                v = None
-            elif n <= self._chunk:
-                v = self._abs_max(xd)
-            else:
-                v = self._abs_max(xd[:self._chunk])
-                for start in range(self._chunk, n, self._chunk):
-                    torch.maximum(v, self._abs_max(xd[start:start + self._chunk]), out=v)
+            # `_abs_max` is a pure reduction that allocates only its scalar
+            # outputs, so chunking the input cannot lower peak memory; one
+            # reduction avoids the per-chunk kernel and scalar churn.
+            v = self._abs_max(xd) if xd.numel() else None
             if v is not None:
                 if self._peak is None:
                     self._peak = torch.full((), -float('inf'), dtype=v.dtype, device=v.device)

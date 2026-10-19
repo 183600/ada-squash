@@ -163,12 +163,19 @@ class CausalSelfAttention(nn.Module):
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
         B, H = (q.shape[0], q.shape[1])
-        budget_rows = max(1, self._LOGITS_CHUNK_BYTES // max(1, B * H * T * q.element_size()))
+        reduce_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+        # The sweep can need two row-block images (the q-dtype matmul output and
+        # its reduce-dtype copy). Budget both together so the stats window never
+        # holds 1.5x the advertised scratch just because autocast halves the
+        # logit element size.
+        row_bytes = q.element_size()
+        if reduce_dtype != q.dtype:
+            row_bytes += torch.finfo(reduce_dtype).bits // 8
+        budget_rows = max(1, self._LOGITS_CHUNK_BYTES // max(1, B * H * T * row_bytes))
         rows = min(T, self._LOGITS_BLOCK_ROWS, budget_rows)
         n_valid = B * H * (T * (T + 1) // 2)
         if n_valid <= 1:
             return {'logit_abs_mean': 0.0, 'logit_abs_max': 0.0, 'logit_std': 0.0}
-        reduce_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
         acc_abs = torch.zeros((), dtype=torch.float64, device=device)
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)

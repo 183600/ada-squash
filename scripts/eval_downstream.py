@@ -185,9 +185,15 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
             buf[:, :seq_len].copy_(host, non_blocking=True)
             generated: list[list] = [[] for _ in range(n_rows)]
             failed = [False] * n_rows
+            # Once a trial's whole secret has diverged its remaining decode
+            # steps cannot change the score, so only the still-active rows are
+            # fed through the (expensive) long-context forward.
+            active = list(range(n_rows))
             n = seq_len
             for want in target_ids:
-                ctx = buf[:, :n]
+                if not active:
+                    break
+                ctx = buf[:, :n] if len(active) == n_rows else buf[active, :n]
                 if last_logits is not None:
                     step_logits = last_logits(ctx)
                 else:
@@ -199,15 +205,14 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                 if bool(neq.any().item()):
                     bad_rows = neq.nonzero(as_tuple=True)[0].tolist()
                     nxt_list = nxt.tolist()
-                    for i in bad_rows:
-                        if failed[i]:
-                            continue
+                    for pos in bad_rows:
+                        i = active[pos]
                         # Bad-case record: enough statistics to say *how* the
                         # decode failed, without decoding any token id to text
                         # (tokenizer mocks in tests have no decode method).
-                        nxt_i = nxt_list[i]
+                        nxt_i = nxt_list[pos]
                         generated[i].append(nxt_i)
-                        row_logits = step_logits[i]
+                        row_logits = step_logits[pos]
                         probs = torch.softmax(row_logits.float(), dim=-1)
                         # Rank (0-based): how many logits beat the expected
                         # token.
@@ -246,18 +251,22 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                             'confidence': confidence,
                         })
                         failed[i] = True
-                    for i in range(n_rows):
+                    for pos, i in enumerate(active):
                         if not failed[i]:
-                            generated[i].append(nxt_list[i])
+                            generated[i].append(nxt_list[pos])
                 else:
                     # All rows correct: keep the device scalars; they are only
                     # read back if a later step fails.
-                    for i in range(n_rows):
-                        generated[i].append(nxt[i])
-                buf[:, n] = nxt
+                    for pos, i in enumerate(active):
+                        generated[i].append(nxt[pos])
+                if len(active) == n_rows:
+                    buf[:, n] = nxt
+                else:
+                    for pos, i in enumerate(active):
+                        if not failed[i]:
+                            buf[i, n] = nxt[pos]
+                active = [i for i in active if not failed[i]]
                 n += 1
-                if all(failed):
-                    break
             n_correct += sum(not f for f in failed)
             trial_correct.extend(not f for f in failed)
     if n_run == 0:

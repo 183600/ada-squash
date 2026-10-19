@@ -446,11 +446,14 @@ def gradient_health_report(model) -> dict:
         g_sq = torch.zeros((), dtype=torch.float64, device=g.device)
         for start in range(0, n, _GRAD_CENSUS_CHUNK):
             blk = flat[start:start + _GRAD_CENSUS_CHUNK]
-            is_finite = is_finite & torch.isfinite(blk).all()
             lo, hi = torch.aminmax(blk)
-            cur_abs = torch.maximum(hi, -lo).to(torch.float64)
+            # NaN propagates into both extrema and a non-finite value lands in
+            # one of them, so the two scalars certify the whole chunk without
+            # materializing an isfinite mask.
+            is_finite = is_finite & torch.isfinite(lo) & torch.isfinite(hi)
+            cur_abs = torch.maximum(hi, lo.neg_()).to(torch.float64)
             g_abs = cur_abs if start == 0 else torch.maximum(g_abs, cur_abs)
-            g_sq = g_sq + torch.linalg.vector_norm(blk.double()).pow(2)
+            g_sq = g_sq + blk.to(torch.float64).square().sum()
         finite_t.append(is_finite)
         abs_t.append(g_abs)
         sq_t.append(g_sq)

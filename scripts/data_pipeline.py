@@ -608,15 +608,18 @@ class PackedStream(IterableDataset):
                     except Exception:
                         self.cleaner.stats["dropped_tokenization_error"] += 1
             eos = self.tok.eos_token_id
+            flat_ids: list = []
             for ids in token_lists:
                 if not ids:
                     continue
-                chunk = torch.tensor(ids, dtype=torch.long)
-                reserve(chunk.numel() + 1)
-                buf[fill:fill + chunk.numel()].copy_(chunk)
-                fill += chunk.numel()
-                buf[fill] = eos
-                fill += 1
+                flat_ids.extend(ids)
+                flat_ids.append(eos)
+            if not flat_ids:
+                return
+            reserve(len(flat_ids))
+            chunk = torch.tensor(flat_ids, dtype=torch.long)
+            buf[fill:fill + chunk.numel()].copy_(chunk)
+            fill += chunk.numel()
 
         shard_by_hash = self.cleaner.dedup and n_workers > 1
         i = 0

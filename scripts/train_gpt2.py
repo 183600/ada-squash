@@ -1136,10 +1136,14 @@ def main():
             # micro is backpropped and the step is discarded wholesale by
             # _handle_nonfinite (which zeroes the gradients); the optimizer
             # trajectory is unchanged.
-            loss_vec = torch.stack(micro_losses)
-            loss_val = float(loss_vec.mean()) if args.grad_accum > 1 else float(loss_vec[0])
+            if args.grad_accum > 1:
+                loss_vec = torch.stack(micro_losses)
+                loss_val = float(loss_vec.mean())
+            else:
+                loss_vec = None
+                loss_val = float(micro_losses[0])
             if not math.isfinite(loss_val):
-                micro_vals = loss_vec.tolist()
+                micro_vals = loss_vec.tolist() if loss_vec is not None else [loss_val]
                 bad_idx = next((i for i, v in enumerate(micro_vals) if not math.isfinite(v)), None)
                 if bad_idx is None:
                     # The group mean is non-finite although every micro is finite
