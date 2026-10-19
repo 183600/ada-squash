@@ -32,6 +32,7 @@ wall-clock latency does. Read the two together.
 import argparse
 import dataclasses
 import json
+import math
 import statistics
 import sys
 import time
@@ -244,7 +245,9 @@ def load_losses(summaries_path: str) -> dict:
     rows = data if isinstance(data, list) else (data.get('rows') or data.get('summaries') or [])
     out = {}
     for row in rows:
-        if isinstance(row, dict) and row.get('name') is not None and isinstance(row.get('val_loss'), (int, float)):
+        if (isinstance(row, dict) and row.get('name') is not None
+                and isinstance(row.get('val_loss'), (int, float))
+                and math.isfinite(float(row['val_loss']))):
             out[row['name']] = float(row['val_loss'])
     return out
 

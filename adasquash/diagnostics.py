@@ -536,13 +536,20 @@ def classify_nan_stage(evidence: dict) -> dict:
                 "pipeline in scripts/data_pipeline.py",
             ],
         )
-    if evidence.get("fp32_forward_finite") is False or evidence.get("loss_denominator_positive") is False:
+    if (evidence.get("fp32_forward_finite") is False
+            or evidence.get("loss_denominator_positive") is False
+            or evidence.get("forward_error")):
         first = evidence.get("first_nonfinite_modules") or []
         where = ", ".join(f"{m['module']}({m['class']})" for m in first) or "unknown module"
+        if evidence.get("forward_error"):
+            diagnosis = ("the fp32 forward raised before a finite loss could be measured "
+                         f"({evidence['forward_error']})")
+        else:
+            diagnosis = ("the fp32 forward is already non-finite (softmax/log/division "
+                         f"pathology), first bad module(s): {where}")
         return stage(
             "fp32_math",
-            "the fp32 forward is already non-finite (softmax/log/division pathology), "
-            f"first bad module(s): {where}",
+            diagnosis,
             [
                 "if the named module computes log/softmax/division, check its "
                 "denominator: log(0) -> -inf, x/0 -> inf; a fully masked batch "

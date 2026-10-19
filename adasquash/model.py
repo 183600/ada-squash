@@ -276,6 +276,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         # while an fp32/fp64 weight (the autocast case `w = weight.to(bf16)`)
         # accumulates directly in `acc`.
         grad_w_dtype = None
+        grad_w_tmp = None
+        grad_w = None
         if need_w:
             weight_dtype = ctx.in_dtypes[1]
             low_precision = weight_dtype in (torch.bfloat16, torch.float16)
@@ -339,11 +341,23 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                                 // max(1, hcf.shape[1] * hcf.element_size()))
                     for v0 in range(0, w.shape[0], block):
                         v1 = min(w.shape[0], v0 + block)
-                        if first:
-                            torch.mm(buf[:, v0:v1].t(), hcf,
-                                     out=grad_w[v0:v1])
+                        if grad_w.dtype == acc:
+                            if first:
+                                torch.mm(buf[:, v0:v1].t(), hcf,
+                                         out=grad_w[v0:v1])
+                            else:
+                                grad_w[v0:v1].addmm_(buf[:, v0:v1].t(), hcf)
                         else:
-                            grad_w[v0:v1].addmm_(buf[:, v0:v1].t(), hcf)
+                            if grad_w_tmp is None or grad_w_tmp.size(0) < v1 - v0:
+                                grad_w_tmp = torch.empty(
+                                    (min(block, w.shape[0]), hcf.shape[1]),
+                                    dtype=acc, device=w.device)
+                            tmp = grad_w_tmp[:v1 - v0]
+                            torch.mm(buf[:, v0:v1].t(), hcf, out=tmp)
+                            if first:
+                                grad_w[v0:v1].copy_(tmp)
+                            else:
+                                grad_w[v0:v1].add_(tmp)
                     del hcf
             first = False
         if need_w and grad_w.dtype != weight_dtype:
@@ -360,6 +374,11 @@ def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets
     # chunk; an explicit small `chunk_rows` still selects the fused node.
     fast_rows = max(1, _CROSS_ENTROPY_FAST_PATH_BYTES // max(1, weight.size(0) * hidden.element_size()))
     if n <= min(fast_rows, chunk_rows):
+        dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
+        if hidden.dtype != dt:
+            hidden = hidden.to(dt)
+        if weight.dtype != dt:
+            weight = weight.to(dt)
         return F.cross_entropy(F.linear(hidden, weight), targets, ignore_index=ignore_index)
     return _FusedLinearCrossEntropy.apply(hidden, weight, targets, int(ignore_index), int(chunk_rows))
 
