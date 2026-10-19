@@ -175,19 +175,20 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         grad_logits = torch.empty_like(logits)
         grad_scale = (grad_out / ctx.count.clamp(min=1)).to(logits.dtype)
         chunk_rows = ctx.chunk_rows
+        # The row mask and the scatter source only depend on the targets, so
+        # they are built once instead of once per chunk.
+        valid = targets.ne(ctx.ignore_index)
+        gold = targets.masked_fill(~valid, 0).unsqueeze(-1)
+        keep = valid.unsqueeze(-1).to(logits.dtype)
+        neg_keep = keep.neg()
+        keep.mul_(grad_scale)
+        neg_keep.mul_(grad_scale)
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
-            chunk_targets = targets[start:end]
             probs = grad_logits[start:end]
             torch.softmax(logits[start:end], dim=-1, out=probs)
-            valid = chunk_targets.ne(ctx.ignore_index)
-            gold = chunk_targets.masked_fill(~valid, 0).unsqueeze(-1)
-            keep = valid.unsqueeze(-1).to(probs.dtype)
-            # Negate the mask copy for the scatter, then restore it below.
-            keep.neg_()
-            probs.scatter_add_(-1, gold, keep)
-            keep.neg_()
-            probs.mul_(keep.mul_(grad_scale))
+            probs.mul_(keep[start:end])
+            probs.scatter_add_(-1, gold[start:end], neg_keep[start:end])
         return (grad_logits, None, None, None)
 
 def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int=-100, chunk_rows: Optional[int]=None) -> torch.Tensor:
@@ -290,13 +291,19 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         buf_rows = min(chunk_rows, n)
         probs = None
         cast_buf = None
+        # Target-only row mask and scatter source, built once for all chunks.
+        valid = targets.ne(ctx.ignore_index)
+        gold = targets.masked_fill(~valid, 0).unsqueeze(-1)
+        keep = valid.unsqueeze(-1).to(acc)
+        neg_keep = keep.neg()
+        keep.mul_(grad_scale)
+        neg_keep.mul_(grad_scale)
         for start in range(0, n, chunk_rows):
             end = min(start + chunk_rows, n)
             rows = end - start
             hc = h[start:end]
             if hc.dtype != dt:
                 hc = hc.to(dt)
-            tc = targets[start:end]
             if probs is None or probs.size(0) < rows:
                 probs = _ce_scratch(buf_rows, w.shape[0], acc, h.device)
                 cast_buf = None if acc == dt else _ce_scratch(buf_rows, w.shape[0], dt, h.device)
@@ -308,17 +315,10 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                 cast = cast_buf[:rows]
                 torch.mm(hc, w_t, out=cast)
                 torch.softmax(cast, -1, dtype=acc, out=buf)
-            valid = tc.ne(ctx.ignore_index)
-            gold = tc.masked_fill(~valid, 0).unsqueeze(-1)
-            keep = valid.unsqueeze(-1).to(buf.dtype)
-            # Negate the mask copy for the scatter, then restore it below.
-            keep.neg_()
-            buf.scatter_add_(-1, gold, keep)
-            keep.neg_()
-            buf.mul_(keep.mul_(grad_scale))
-            g = buf if acc == dt else cast.copy_(buf)
-            del gold, keep, valid
+            buf.mul_(keep[start:end])
+            buf.scatter_add_(-1, gold[start:end], neg_keep[start:end])
             if need_h:
+                g = buf if acc == dt else cast.copy_(buf)
                 if grad_h_tmp is None:
                     torch.mm(g, w, out=grad_h[start:end])
                 else:
@@ -326,38 +326,45 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                     torch.mm(g, w, out=hgrad)
                     grad_h[start:end].copy_(hgrad)
             if need_w:
-                if g.dtype == grad_w.dtype and hc.dtype == grad_w.dtype:
+                # An fp32 weight takes the accumulator-dtype probabilities in
+                # `buf`, even under autocast. A low-precision weight can reuse
+                # the low-precision `g` already built for the input gradient
+                # (when that gradient is requested) instead of casting `buf`.
+                w_probs = g if (need_h and acc != dt) else buf
+                if w_probs.dtype == grad_w.dtype and hc.dtype == grad_w.dtype:
                     if first:
-                        torch.mm(g.t(), hc, out=grad_w)
+                        torch.mm(w_probs.t(), hc, out=grad_w)
                     else:
-                        grad_w.addmm_(g.t(), hc)
+                        grad_w.addmm_(w_probs.t(), hc)
+                elif grad_w.dtype == acc:
+                    # Mixed input dtypes cannot feed a single GEMM, but both
+                    # operands share the accumulator dtype after casting `hc`;
+                    # the full vocab gradient fits the output buffer, so one
+                    # GEMM per chunk is enough.
+                    hcf = hc.to(acc)
+                    if first:
+                        torch.mm(buf.t(), hcf, out=grad_w)
+                    else:
+                        grad_w.addmm_(buf.t(), hcf)
+                    del hcf
                 else:
-                    # Mixed dtypes cannot write into `grad_w` directly
-                    # (`torch.mm`'s out tensor must have the product's dtype),
-                    # so the product is reduced in vocab blocks from `buf`,
-                    # which holds the accumulator-dtype probabilities.
+                    # A low-precision weight gradient needs a temporary
+                    # product for each vocab block and a converted `hc`.
                     hcf = hc.to(acc)
                     block = max(1, (_CROSSENTROPY_CHUNK_BYTES // 4)
                                 // max(1, hcf.shape[1] * hcf.element_size()))
                     for v0 in range(0, w.shape[0], block):
                         v1 = min(w.shape[0], v0 + block)
-                        if grad_w.dtype == acc:
-                            if first:
-                                torch.mm(buf[:, v0:v1].t(), hcf,
-                                         out=grad_w[v0:v1])
-                            else:
-                                grad_w[v0:v1].addmm_(buf[:, v0:v1].t(), hcf)
+                        if grad_w_tmp is None or grad_w_tmp.size(0) < v1 - v0:
+                            grad_w_tmp = torch.empty(
+                                (min(block, w.shape[0]), hcf.shape[1]),
+                                dtype=acc, device=w.device)
+                        tmp = grad_w_tmp[:v1 - v0]
+                        torch.mm(buf[:, v0:v1].t(), hcf, out=tmp)
+                        if first:
+                            grad_w[v0:v1].copy_(tmp)
                         else:
-                            if grad_w_tmp is None or grad_w_tmp.size(0) < v1 - v0:
-                                grad_w_tmp = torch.empty(
-                                    (min(block, w.shape[0]), hcf.shape[1]),
-                                    dtype=acc, device=w.device)
-                            tmp = grad_w_tmp[:v1 - v0]
-                            torch.mm(buf[:, v0:v1].t(), hcf, out=tmp)
-                            if first:
-                                grad_w[v0:v1].copy_(tmp)
-                            else:
-                                grad_w[v0:v1].add_(tmp)
+                            grad_w[v0:v1].add_(tmp)
                     del hcf
             first = False
         if need_w and grad_w.dtype != weight_dtype:
