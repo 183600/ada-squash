@@ -22,7 +22,7 @@ layerscale_init: 1.0e-5
 
 dataset: HuggingFaceFW/fineweb-edu
 dataset_config: sample-10BT
-tokenizer: HuggingFaceFW/fineweb-edu/llama-tokenizer
+tokenizer: huggyllama/llama-7b
 seq_len: 2048
 batch_size: 8
 grad_accum: 8

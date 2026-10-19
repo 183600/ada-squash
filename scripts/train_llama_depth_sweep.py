@@ -600,7 +600,7 @@ def main():
     p.add_argument('--exclude-group-file', default=None, help='training-group hash ledger shared by every row (scripts/audit_data.py --write-train-group-file --group-key K); no group straddles train<->held-out')
     p.add_argument('--exclude-test-group-file', default=None, help='validation-group hash ledger shared by every row (scripts/audit_data.py --write-val-group-file --group-key K); no group straddles validation<->test')
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='packed training-batch shuffle window (0 = off)')
-    p.add_argument('--tokenizer', default='HuggingFaceFW/fineweb-edu/llama-tokenizer')
+    p.add_argument('--tokenizer', default='huggyllama/llama-7b')
     p.add_argument('--seq-len', type=int, default=2048)
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--grad-accum', type=int, default=8)
