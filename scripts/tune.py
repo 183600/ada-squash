@@ -233,6 +233,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     # and others on the seeds their lr was selected on.
     confirm_ready = {a for a, r in usable.items() if (r.get('confirm') or {}).get('stats')}
     confirm_ran = {a for a, r in usable.items() if r.get('confirm_trials')}
+    confirm_ignored = sorted(confirm_ran - confirm_ready)
     use_confirm = len(confirm_ready) == len(usable) and bool(usable)
     split = 'confirm_seeds' if use_confirm else 'selection_seeds'
     # Only a comparison on held-back seeds can certify: without --confirm-seeds
@@ -249,13 +250,19 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         'reference_selection_val_loss': ref['best']['mean'],
         'reference_curve_classification_counts': ref['best'].get('curve_classification_counts'),
         'reference_split': split,
-        'confirm_ignored_arms': sorted(confirm_ran - confirm_ready),
+        'certify_requested': bool(certify),
+        'confirm_ignored_arms': confirm_ignored,
         'certified': certified,
         'certification': (
             'confirm_seeds: significance tested on seeds held back from lr selection'
             if certified else
-            "none: no held-back --confirm-seeds, so the p-values are descriptive "
-            "only and no arm is certified as significantly better (winner's curse)"),
+            ("none: --confirm-seeds was provided but unusable for "
+             f"{confirm_ignored or 'the compared arms'} (no usable confirm statistics), "
+             "so the comparison fell back to selection seeds and the p-values are "
+             "descriptive only (winner's curse)"
+             if certify else
+             "none: no held-back --confirm-seeds, so the p-values are descriptive "
+             "only and no arm is certified as significantly better (winner's curse)")),
         'margin': margin,
         'alpha': alpha,
         'rows': [],
@@ -352,9 +359,16 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             certified and entry['beats_reference'] and p_holm is not None and p_holm < alpha
         )
         if not certified:
-            entry['significance_basis'] = (
-                "descriptive only: no --confirm-seeds, so the comparison ran on the seeds "
-                "the lr was selected on (winner's curse); the p-value is reported but not certified")
+            if certify:
+                entry['significance_basis'] = (
+                    "descriptive only: --confirm-seeds was provided but unusable for "
+                    f"{confirm_ignored or 'the compared arms'} (no usable confirm statistics), "
+                    "so the comparison ran on the seeds the lr was selected on (winner's curse); "
+                    "the p-value is reported but not certified")
+            else:
+                entry['significance_basis'] = (
+                    "descriptive only: no --confirm-seeds, so the comparison ran on the seeds "
+                    "the lr was selected on (winner's curse); the p-value is reported but not certified")
     out['rows_tested_descriptively_only'] = [e['arm'] for e in out['rows']
                                              if e['test'] is not None and not e['replicated_across_seeds']]
     out['multiple_comparison'] = (
@@ -391,8 +405,14 @@ def print_comparison(comparison: dict | None) -> None:
           f"(split={comparison['reference_split']}; "
           f"selection-seed mean={comparison['reference_selection_val_loss']:.4f}){ref_note}")
     if comparison.get('certified') is False:
-        print("[tune][compare] NOT CERTIFIED: no --confirm-seeds, so these p-values compare runs "
-              "that also selected the lr (winner's curse); no arm is called significant")
+        if comparison.get('certify_requested'):
+            ignored = comparison.get('confirm_ignored_arms')
+            print("[tune][compare] NOT CERTIFIED: --confirm-seeds was provided but unusable"
+                  f"{f' for {ignored}' if ignored else ''} (no usable confirm statistics), so the "
+                  "comparison fell back to selection seeds (winner's curse); no arm is called significant")
+        else:
+            print("[tune][compare] NOT CERTIFIED: no --confirm-seeds, so these p-values compare runs "
+                  "that also selected the lr (winner's curse); no arm is called significant")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_holm = entry.get('p_one_sided_holm')

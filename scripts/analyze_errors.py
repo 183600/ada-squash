@@ -572,6 +572,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     n_fixed_t = torch.zeros((), dtype=torch.long, device=dev)
     n_broken_t = torch.zeros((), dtype=torch.long, device=dev)
     n_both_wrong_t = torch.zeros((), dtype=torch.long, device=dev)
+    n_both_wrong_confident_t = torch.zeros((), dtype=torch.long, device=dev)
     copy_input_correct_t = torch.zeros((), dtype=torch.long, device=dev)
     n_positional_t = torch.zeros((), dtype=torch.long, device=dev)
     scans = {'fixed': [], 'broken': [], 'both_wrong': []}
@@ -628,6 +629,13 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
                 n_fixed_t += selectors['fixed'].sum()
                 n_broken_t += selectors['broken'].sum()
                 n_both_wrong_t += selectors['both_wrong'].sum()
+                # Exact over every token, not only the capped scan sample: both
+                # arms confident *and* agreeing on the same wrong token.
+                n_both_wrong_confident_t += (
+                    selectors['both_wrong']
+                    & (stats_ref['pred'] == stats_cand['pred'])
+                    & (torch.minimum(stats_ref['pred_prob'], stats_cand['pred_prob'])
+                       >= args.confidence)).sum()
                 for status, selector in selectors.items():
                     remaining = max_scan - scanned[status]
                     if remaining <= 0:
@@ -653,6 +661,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     n_fixed = int(n_fixed_t.item())
     n_broken = int(n_broken_t.item())
     n_both_wrong = int(n_both_wrong_t.item())
+    n_both_wrong_confident = int(n_both_wrong_confident_t.item())
     copy_input_correct = int(copy_input_correct_t.item())
     n_positional = int(n_positional_t.item())
     target_counts = target_counts_t.cpu()
@@ -695,7 +704,6 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         rec['candidate_flags'] = flags
         rec['candidate_cause'] = cause
         examples['broken'].append(rec)
-    n_both_wrong_confident = 0
     for rec in scans['both_wrong']:
         ref_flags, ref_cause = _classify_one(rec, 'reference')
         cand_flags, cand_cause = _classify_one(rec, 'candidate')
@@ -705,12 +713,6 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         rec['candidate_flags'] = cand_flags
         rec['reference_cause'] = ref_cause
         rec['candidate_cause'] = cand_cause
-        if (int(rec['reference']['pred']) == int(rec['candidate']['pred'])
-                and min(rec['reference']['pred_prob'], rec['candidate']['pred_prob']) >= args.confidence):
-            # Both arms confident *and* agreeing on the same wrong token: the
-            # reading guide's label-noise class, not merely two different
-            # confident mistakes.
-            n_both_wrong_confident += 1
         examples['shared_blind_spots'].append(rec)
 
     examples['fixed'].sort(key=lambda r: (-r['reference']['pred_prob'], r['reference']['gold_rank']))
@@ -836,6 +838,8 @@ def main():
     p.add_argument('--exclude-hash-file', default=None)
     args = p.parse_args()
     args.topk = max(1, int(args.topk))
+    if args.n_batches < 1:
+        p.error(f'--n-batches {args.n_batches} must be >= 1')
     if args.corpus == 'dataset' and args.split == 'test':
         print("[errors] WARNING: --corpus dataset --split test inspects the sealed test split; "
               "reading its error cases and iterating turns test into an implicit validation "

@@ -787,7 +787,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     """
     baseline_names = set(baseline_names)
     usable = [r for r in summaries
-              if isinstance(r, dict) and 'name' in r and isinstance(r.get('val_loss'), (int, float))]
+              if isinstance(r, dict) and 'name' in r and _finite_metric(r.get('val_loss'))]
     baselines = [r for r in usable if r['name'] in baseline_names]
     if not baselines:
         return None
@@ -795,11 +795,14 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
                  if isinstance(r, dict) and 'name' in r and isinstance(r.get('reused_from'), str)}
     reference = min(baselines, key=lambda r: r['val_loss'])
     ref_seeds = _seed_means(reference)
+    ref_stderr = reference.get('val_loss_seed_stderr')
+    if ref_stderr is None:
+        ref_stderr = reference.get('val_loss_stderr')
     out = {
         'reference': reference['name'],
         'reference_val_loss': reference['val_loss'],
         'reference_val_loss_std': _row_std(reference),
-        'reference_val_loss_stderr': reference.get('val_loss_seed_stderr', reference.get('val_loss_stderr')),
+        'reference_val_loss_stderr': ref_stderr,
         'reference_n_seeds': reference.get('n_seeds', 1),
         'reference_seeds': sorted(ref_seeds),
         'baseline_rows': {r['name']: r['val_loss'] for r in baselines},
@@ -863,7 +866,8 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     # Alias rows (identical effective config, `reused_from`) are the *same*
     # run under a second name: they are reported, but a run must not be
     # counted twice as independent evidence nor inflate the Holm family size.
-    by_identity: dict[str, str] = {}
+    by_identity: dict[str, str] = {
+        _run_identity(row, parent_of): row['name'] for row in baselines}
     for entry in out['rows']:
         identity = entry.get('run_identity') or entry['name']
         canonical = by_identity.get(identity)
@@ -1053,7 +1057,7 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
     """
     spec = LOO_SPEC if spec is None else spec
     usable = {r['name']: r for r in summaries
-              if isinstance(r, dict) and 'name' in r and isinstance(r.get('val_loss'), (int, float))}
+              if isinstance(r, dict) and 'name' in r and _finite_metric(r.get('val_loss'))}
     parent_of = {r['name']: r['reused_from'] for r in summaries
                  if isinstance(r, dict) and 'name' in r and isinstance(r.get('reused_from'), str)}
     rows: list = []

@@ -668,7 +668,7 @@ def main():
                 (out_dir / 'depth.txt').write_text(str(depth))
                 jobs.append((depth, norm, out_dir, seed))
             cells.append((depth, norm, cell_dir))
-    gpus = list(args.gpus) if args.gpus else []
+    gpus = list(dict.fromkeys(str(g) for g in args.gpus)) if args.gpus else []
 
     def _gpu_for(idx: int):
         return gpus[idx % len(gpus)] if gpus else None
@@ -702,22 +702,31 @@ def main():
             print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
     else:
         # A bounded launch queue: at most `max_parallel` training children
-        # alive at once, each pinned to one GPU.
+        # alive at once, each pinned to a currently free GPU. The launch index
+        # is not a device index: a finished job returns its device to the pool
+        # instead of letting a later launch collide with a still-running cell.
         running: list = []
+        busy_gpus: set = set()
         next_job = 0
         while next_job < len(jobs) or running:
             while next_job < len(jobs) and len(running) < max_parallel:
+                free = [gpu for gpu in gpus if gpu not in busy_gpus]
+                if not free:
+                    break
+                gpu = free[0]
                 depth, norm, out_dir, seed = jobs[next_job]
-                proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(next_job))
+                proc = launch_one(args, depth, norm, out_dir, seed, gpu=gpu)
                 next_job += 1
-                running.append((proc, depth, norm, seed))
+                busy_gpus.add(gpu)
+                running.append((proc, depth, norm, seed, gpu))
             done = [entry for entry in running if entry[0].poll() is not None]
             if not done:
                 time.sleep(0.5)
                 continue
             for entry in done:
                 running.remove(entry)
-                _reap(*entry)
+                busy_gpus.discard(entry[4])
+                _reap(*entry[:4])
     aggs_by_depth: dict = {}
     for depth, norm, cell_dir in cells:
         agg = aggregate_sweep_cell(cell_dir, seeds, multi)

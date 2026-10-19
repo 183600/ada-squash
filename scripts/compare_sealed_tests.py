@@ -42,7 +42,8 @@ from adasquash.repro import collect_run_metadata, finish_metadata, save_run_mani
 
 PAIRING_KEYS = (
     "dataset", "dataset_config", "dataset_revision",
-    "tokenizer", "tokenizer_revision",
+    "dataset_revision_resolved", "num_workers",
+    "tokenizer", "tokenizer_revision", "tokenizer_revision_resolved",
     "num_documents", "val_frac", "test_frac",
     "dedup", "min_doc_chars", "max_doc_chars", "exclude_hash_file",
     "batch_size", "seq_len",
@@ -289,6 +290,15 @@ def main():
             b = [ref_seed_means[s] for s in common]
             test = paired_t_one_sided(a, b, margin=args.margin, alpha=args.alpha)
             row["basis"] = "seed_means"
+            # The headline mean/std must describe the same seeds the delta
+            # pairs, not every seed the candidate happened to run.
+            paired_stats = mean_std_stderr(a)
+            row["mean"] = paired_stats["mean"]
+            row["std"] = paired_stats["std"] if paired_stats["n"] >= 2 else None
+            row["stderr"] = paired_stats["stderr"] if paired_stats["n"] >= 2 else None
+            row["mean_all_candidate_seeds"] = cand_stats["mean"]
+            row["std_all_candidate_seeds"] = cand_stats["std"]
+            row["stderr_all_candidate_seeds"] = cand_stats["stderr"]
             deltas = [x - y for x, y in zip(a, b)]
             delta_stats = mean_std_stderr(deltas)
             row["min_detectable_delta"] = _mde(
@@ -338,6 +348,8 @@ def main():
         row["beats_reference_significantly"] = bool(
             row["beats_reference"] and p_holm is not None and p_holm < args.alpha)
 
+    ci_label = f"{100 * (1 - args.alpha):g}% CI"
+    mde_label = f"MDE{100 * args.power:g}"
     print(f"[compare] paired one-sided t-test, margin={args.margin:g}, alpha={args.alpha:g}, "
           f"Holm over {len(certifiable)} seed-paired row(s)")
     for r in rows:
@@ -355,9 +367,9 @@ def main():
                        else ("better but not significant" if r["beats_reference"] else "not better"))
             print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['std']:.4f} "
                   f"(seed std, n_seeds={r['n_paired_seeds']}) "
-                  f"delta={r['mean_delta']:+.4f} (95% CI [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
+                  f"delta={r['mean_delta']:+.4f} ({ci_label} [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
                   f"t={r['t']:.3f} df={r['df']:.0f} p={r['p_one_sided']:.4g} p_holm={p_str} "
-                  f"MDE80={r['min_detectable_delta']:.4f} -> {verdict}")
+                  f"{mde_label}={r['min_detectable_delta']:.4f} -> {verdict}")
         else:
             note = ("descriptive only: single training run, batch noise is not run-to-run noise - "
                     "never certified as significant")
@@ -369,7 +381,7 @@ def main():
             else:
                 print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['stderr']:.4f} "
                       f"(batch stderr) delta={r['mean_delta']:+.4f} "
-                      f"(95% CI [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
+                      f"({ci_label} [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
                       f"t={r['t']:.3f} df={r['df']:.0f} p={r['p_one_sided']:.4g} "
                       f"basis={base} -> {note}")
 

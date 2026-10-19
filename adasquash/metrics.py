@@ -754,16 +754,17 @@ def binary_auc_report(
     rows = list(scores)
     if len(rows) != len(gold):
         raise ValueError(f"score-row/gold length mismatch: {len(rows)} vs {len(gold)}")
-    # One column per class.
-    cols = list(zip(*rows)) if rows else []
-    if cols and len(cols) != len(classes):
+    # One column per class; every row must carry exactly one score per class.
+    bad_width = next((len(r) for r in rows if len(r) != len(classes)), None)
+    if bad_width is not None:
         raise ValueError(
-            f"score matrix has {len(cols)} columns but {len(classes)} classes"
+            f"score matrix has row(s) with {bad_width} columns but {len(classes)} classes"
         )
+    cols = list(zip(*rows)) if rows else []
     records = []
     skipped = []
     for k, cls in enumerate(classes):
-        col = [float(v) for v in cols[k]]
+        col = [float(v) for v in cols[k]] if cols else []
         labels = [g == cls for g in gold]
         n_pos = sum(labels)
         n_neg = len(labels) - n_pos

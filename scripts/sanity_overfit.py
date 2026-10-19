@@ -318,7 +318,7 @@ def run_one(norm: str, args, device: str) -> dict:
     # reduced-precision path must fail the preflight, not the full run.
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    use_bf16 = (not args.no_bf16) and device == "cuda"
+    use_bf16 = (not args.no_bf16) and torch.device(device).type == "cuda"
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     ctx = (torch.amp.autocast(device_type="cuda", dtype=dtype)
            if use_bf16 else nullcontext())
@@ -359,7 +359,6 @@ def run_one(norm: str, args, device: str) -> dict:
 
     history = []
     initial_loss = None
-    final_loss = float("nan")
     final_metrics = next_token_metrics(model, x, y, ctx=ctx)
     grad_info = {}
     t0 = time.time()
@@ -367,22 +366,25 @@ def run_one(norm: str, args, device: str) -> dict:
         opt.zero_grad(set_to_none=True)
         with ctx:
             loss = model(x, y, return_logits=False)[1]
+        loss_val = float(loss.detach().item())
+        if initial_loss is None:
+            initial_loss = loss_val
         loss.backward()
         if step == 1:
             grad_info = gradient_report(model)
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
-        # `loss` is only read for the initial value and the logged rows, and
-        # the log condition already covers step 1 and the last step.
         if step == 1 or step % args.log_every == 0 or step == args.max_steps:
-            final_loss = float(loss.detach().item())
-            if initial_loss is None:
-                initial_loss = final_loss
             final_metrics = next_token_metrics(model, x, y, ctx=ctx)
-            history.append({"step": step, "loss": final_loss,
+            history.append({"step": step, "loss": loss_val,
                             "accuracy": final_metrics["accuracy"],
                             "macro_f1": final_metrics["macro_f1"]})
+    # `final_loss` must describe the same (post-step) parameters as
+    # `final_metrics`; the value logged inside the loop is the pre-step loss.
+    with torch.no_grad(), ctx:
+        final_loss = float(model(x, y, return_logits=False)[1].detach().item())
+    final_metrics = next_token_metrics(model, x, y, ctx=ctx)
     elapsed = time.time() - t0
     final_acc = final_metrics["accuracy"]
 

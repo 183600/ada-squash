@@ -133,7 +133,9 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         tokens = Counter()
     tokens.update(legacy_tokens)
     stats = cleaner.report()
-    stats['documents_sampled'] = len(lengths)
+    # Documents actually read from the stream, including the ones the cleaner
+    # dropped; `len(lengths)` would always equal `documents_kept`.
+    stats['documents_sampled'] = int(stats.get('documents_read', len(lengths)))
     # Whether the counters cover the whole split (--n-docs 0) or a prefix: with
     # a bounded sample, `duplicate_overlap_with_train = 0` is a lower bound on
     # the true overlap, not evidence that the splits are disjoint.

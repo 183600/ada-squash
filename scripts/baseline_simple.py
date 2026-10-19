@@ -451,6 +451,10 @@ def main():
     p.add_argument('--ablation-summaries', default=None, help='ablation all_summaries.json to annotate with the limits; defaults to the sibling of --output')
     p.add_argument('--output', default='runs/ablation/simple_baselines.json')
     args = p.parse_args()
+    if args.n_states < 1:
+        p.error(f'--n-states {args.n_states} must be >= 1')
+    if args.max_jump < 1:
+        p.error(f'--max-jump {args.max_jump} must be >= 1')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(args.seeds[0])
     outlier_id = args.vocab_size - 1 if args.outlier_channel else None

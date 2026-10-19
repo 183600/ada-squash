@@ -205,7 +205,7 @@ def open_data_split(split: str, args, seq_len: int | None = None):
     )
     return build_dataloader(args.dataset, args.dataset_config, seq_len or args.seq_len, args.batch_size, tokenizer=args.tokenizer)
 
-def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, collect: list | None = None) -> float | None:
+def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, collect: list | None = None, cycle: bool = True) -> float | None:
     """Mean loss over held-out batches; `state['iter']` carries the position.
 
     Runs under `inference_mode` and eval mode, so no gradient ever flows from
@@ -214,7 +214,9 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     noisy the held-out estimate is, nor whether two arms were scored on the
     same held-out segments (the pairing a paired test needs). The accumulator
     is untouched by `collect`, so the returned mean is bit-identical either
-    way.
+    way. `cycle` restarts a validation loader that has fewer batches than
+    requested; the one-shot sealed-test pass disables it so the same batch is
+    never counted twice.
     """
     # With dropout at its default 0 the module-mode switch changes no
     # numerics, so skip it; inference_mode already blocks grads. `training`
@@ -236,6 +238,8 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
             try:
                 batch = next(it)
             except StopIteration:
+                if not cycle:
+                    break
                 it = iter(loader)
                 state['iter'] = it
                 try:
@@ -1224,7 +1228,7 @@ def main():
                 print(f"[test] restored best-validation checkpoint (step {best_step}, val_loss={best_val:.4f}) before the one-shot test evaluation")
             test_state = {'iter': iter(test_loader)}
             test_batch_losses: list = []
-            test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device, collect=test_batch_losses)
+            test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device, collect=test_batch_losses, cycle=False)
             if test_loss is None:
                 # Writing test_results.json now would consume the one-shot seal
                 # without any measurement: the next run would refuse to evaluate
@@ -1249,12 +1253,18 @@ def main():
             pairing = {
                 'dataset': args.dataset, 'dataset_config': args.dataset_config,
                 'dataset_revision': args.dataset_revision,
+                'dataset_revision_resolved': (rtest or {}).get('dataset_revision_resolved'),
                 'tokenizer': args.tokenizer, 'tokenizer_revision': args.tokenizer_revision,
+                'tokenizer_revision_resolved': (rtest or {}).get('tokenizer_revision_resolved'),
                 'num_documents': args.num_documents,
                 'val_frac': args.val_frac, 'test_frac': args.test_frac,
                 'dedup': args.dedup,
                 'min_doc_chars': args.min_doc_chars, 'max_doc_chars': args.max_doc_chars,
                 'exclude_hash_file': args.exclude_hash_file,
+                # Worker count is part of the sealed-batch identity: a
+                # streaming loader shards documents across workers, so a
+                # different count can change the batch composition.
+                'num_workers': (rtest or {}).get('num_workers', getattr(args, 'num_workers', None)),
                 'batch_size': args.batch_size, 'seq_len': args.seq_len,
             }
             results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}

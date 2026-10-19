@@ -705,6 +705,11 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
         if cache_path is not None:
             report["materialized_cache"] = str(cache_path)
     report["tokenizer"] = tokenizer
+    report["tokenizer_revision"] = opts.get("tokenizer_revision")
+    # The requested revision alone cannot pin a mutable upstream tokenizer:
+    # record the concrete commit the load resolved to (None for a local path).
+    report["tokenizer_revision_resolved"] = (
+        getattr(tok, "_commit_hash", None) or opts.get("tokenizer_revision"))
     report["shuffle_buffer"] = int(opts["shuffle_buffer"]) if opts["split"] == "train" else 0
     exclude_hashes: set = set()
     exclude_file = opts.get("exclude_hash_file")

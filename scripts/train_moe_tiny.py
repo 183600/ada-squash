@@ -123,7 +123,8 @@ class MoEBlock(nn.Module):
         self.attn = CausalSelfAttention(cfg.dim, cfg.n_heads, qk_norm=cfg.qk_norm, alpha_init=cfg.qk_alpha_init, dropout=cfg.dropout)
         self.norm2 = build_norm(cfg.norm_name, cfg.dim, **norm_kwargs)
         hidden = int(cfg.dim * cfg.mlp_ratio)
-        self.moe = MoELayer(cfg.dim, hidden, n_experts=n_experts, top_k=2, dropout=cfg.dropout)
+        self.moe = MoELayer(cfg.dim, hidden, n_experts=n_experts,
+                            top_k=min(2, n_experts), dropout=cfg.dropout)
         self.use_layerscale = cfg.use_layerscale
         if self.use_layerscale:
             self.ls1 = nn.Parameter(torch.full((cfg.dim,), cfg.layerscale_init))
@@ -232,7 +233,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                       arch_args=['--dim', str(args.dim), '--n-layers', str(args.n_layers),
                                  '--n-heads', str(args.n_heads), '--seq-len', str(args.seq_len),
                                  '--batch-size', str(args.batch_size),
-                                 '--use-layerscale'])
+                                 '--use-layerscale', '--no-bf16'])
         sanity_report_path = output_dir / 'sanity_overfit.json'
     cfg = GPTConfig(vocab_size=50304, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads, max_seq_len=args.seq_len, mlp_ratio=4.0, norm_name=args.norm)
     model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
@@ -325,10 +326,6 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     try:
         for step in range(args.max_steps):
             x, y = next_batch()
-            # `next_batch` hands back a freshly built pair (probe generators or a
-            # freshly collated loader batch), so the next-token column can be
-            # masked in place.
-            y[:, -1] = cfg.ignore_index
             if step % args.stats_every == 0:
                 act_stats.attach(reset=not stats_windowed)
                 stats_windowed = True
@@ -542,6 +539,14 @@ def main():
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. offline runs where the preflight cannot be spawned)')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this study tests (e.g. "DyT-CD keeps expert load balanced and matches ln/RMSNorm val_ce at this scale"); recorded in the per-seed and aggregate run manifests so the result can be audited against the claim it was meant to support')
     args = p.parse_args()
+    if args.n_experts < 1:
+        p.error(f'--n-experts {args.n_experts} must be >= 1')
+    if args.log_every < 1:
+        p.error(f'--log-every {args.log_every} must be >= 1')
+    if args.stats_every < 1:
+        p.error(f'--stats-every {args.stats_every} must be >= 1')
+    if args.val_batches < 0:
+        p.error(f'--val-batches {args.val_batches} must be >= 0')
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds)
     if not raw_seeds:
         p.error('--seeds must not be empty')

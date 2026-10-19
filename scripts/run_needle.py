@@ -23,6 +23,12 @@ from scripts.eval_downstream import load_ckpt, needle_decode_overhead, needle_in
 # overlap.
 DEFAULT_SEED = 0
 
+def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
+    """The tokenizer identity the checkpoint was trained with, else the CLI default."""
+    name = ckpt_args.get('tokenizer') or fallback_name
+    revision = ckpt_args.get('tokenizer_revision')
+    return name, revision
+
 def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
     """One checkpoint's needle sweep over `args.ctx_lens` x placement seeds."""
     results = []
@@ -160,6 +166,10 @@ def compare_needle(results, reference_results, alpha=0.05):
              'unpaired_seeds': unpaired,
              'candidate_acc': cand['acc'], 'reference_acc': ref['acc'],
              'mcnemar': mcnemar_test(n_fixed, n_broke)}
+        if not paired_accs:
+            # Always carry a reason: consumers print it for non-testable rows.
+            t['reason'] = ('no shared placement seeds with matching trial vectors '
+                           'between candidate and reference')
         if paired_accs:
             ref_accs = [a for a, _ in paired_accs]
             cand_accs = [b for _, b in paired_accs]
@@ -190,6 +200,12 @@ def main():
     seeds = [args.seed] if args.seed is not None else (list(args.seeds) if args.seeds else [DEFAULT_SEED])
     if not seeds:
         p.error('--seeds must not be empty')
+    raw_seeds = seeds
+    seeds = list(dict.fromkeys(int(s) for s in seeds))
+    if len(seeds) != len(raw_seeds):
+        print(f'[needle][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
+              '(a repeated seed reruns the identical placement draw, it is not '
+              'an independent replication)', file=sys.stderr)
     if len(seeds) < 3:
         print(f'[needle][warn] {len(seeds)} placement seed(s): one placement draw is one sample; pass >= 3 seeds '
               'so one lucky needle position cannot decide the result', file=sys.stderr)
@@ -203,7 +219,8 @@ def main():
         print('[needle][warn] checkpoint args carry no seq_len: whether a context length was inside '
               'the training distribution cannot be checked')
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(args.tokenizer)
+    tok_name, tok_revision = _checkpoint_tokenizer(model_args, args.tokenizer)
+    tok = AutoTokenizer.from_pretrained(tok_name, revision=tok_revision)
     results, skipped = evaluate_model(model, tok, args, device, seeds, trained_seq_len)
     comparison = None
     if args.compare_to:
@@ -219,13 +236,21 @@ def main():
         ref_trained_seq_len = ref_args.get('seq_len')
         ref_trained_seq_len = (int(ref_trained_seq_len)
                                if isinstance(ref_trained_seq_len, int) else None)
+        ref_tok_name, ref_tok_revision = _checkpoint_tokenizer(ref_args, args.tokenizer)
+        if (ref_tok_name, ref_tok_revision) != (tok_name, tok_revision):
+            raise SystemExit(
+                f'[needle] tokenizer mismatch: candidate uses {tok_name!r}@{tok_revision!r}, '
+                f'reference uses {ref_tok_name!r}@{ref_tok_revision!r}. Paired placement '
+                'comparisons require identical tokenization; re-train with one tokenizer '
+                'or evaluate the checkpoints separately.')
         ref_results, _ = evaluate_model(ref_model, tok, args, device, seeds, ref_trained_seq_len)
         comparison = compare_needle(results, ref_results, alpha=0.05)
         comparison['candidate'] = args.ckpt
         comparison['reference'] = args.compare_to
         for t in comparison['tests']:
             if not t.get('testable'):
-                print(f"[needle][compare] L={t['ctx_len']}: not testable ({t['reason']})")
+                print(f"[needle][compare] L={t['ctx_len']}: not testable "
+                      f"({t.get('reason', 'no reason recorded')})")
                 continue
             m = t['mcnemar']
             verdict = m['favors']
@@ -250,6 +275,8 @@ def main():
         'ckpt': args.ckpt,
         'model_max_seq_len': model_max_seq_len,
         'trained_seq_len': trained_seq_len,
+        'tokenizer': tok_name,
+        'tokenizer_revision': tok_revision,
         'secret': args.secret,
         'trials': args.trials,
         'placement_seeds': list(seeds),
@@ -263,6 +290,8 @@ def main():
     }
     if comparison is not None:
         payload['compare_to'] = args.compare_to
+        payload['reference_tokenizer'] = ref_tok_name
+        payload['reference_tokenizer_revision'] = ref_tok_revision
         payload['comparison'] = comparison
     Path(out).write_text(json.dumps(payload, indent=2))
     manifest = collect_run_metadata(seed=seeds[0])
