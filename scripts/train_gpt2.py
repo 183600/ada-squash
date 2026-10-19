@@ -233,7 +233,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
             term = loss.detach().double()
             if terms is not None:
                 terms.append(term)
-            total = term if total is None else total.add_(term)
+            total = term.clone() if total is None else total.add_(term)
             n += 1
     if toggle_mode:
         model.train()

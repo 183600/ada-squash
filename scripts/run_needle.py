@@ -226,12 +226,15 @@ def main():
             verdict = m['favors']
             if m['p_one_sided'] is None:
                 verdict = 'no discordant trials - no evidence either way'
-            print(f"[needle][compare] L={t['ctx_len']}: candidate {t['candidate_acc']:.3f} vs reference "
-                  f"{t['reference_acc']:.3f}; McNemar fixed={m['n_fixed']} broke={m['n_broke']} "
-                  f"p={m['p_one_sided'] if m['p_one_sided'] is None else round(m['p_one_sided'], 4)} "
-                  f"(favors {verdict}); paired t delta={t['mean_delta']:+.4f} "
-                  f"95% CI [{t['ci_low']:+.4f}, {t['ci_high']:+.4f}] p={t['p_one_sided']:.4f} "
-                  f"(n_seeds={t['n']})")
+            head = (f"[needle][compare] L={t['ctx_len']}: candidate {t['candidate_acc']:.3f} vs reference "
+                    f"{t['reference_acc']:.3f}; McNemar fixed={m['n_fixed']} broke={m['n_broke']} "
+                    f"p={m['p_one_sided'] if m['p_one_sided'] is None else round(m['p_one_sided'], 4)} "
+                    f"(favors {verdict}); paired t delta={t['mean_delta']:+.4f}")
+            if t['p_one_sided'] is None:
+                print(f"{head} (n_seeds={t['n']}: one paired seed, no t interval)")
+            else:
+                print(f"{head} 95% CI [{t['ci_low']:+.4f}, {t['ci_high']:+.4f}] "
+                      f"p={t['p_one_sided']:.4f} (n_seeds={t['n']})")
     out = args.output or Path(args.ckpt).parent / 'needle_results.json'
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     # Skipped context lengths are part of the result, not a console aside: a

@@ -313,8 +313,9 @@ def main():
                     row["mean"], row["std"], row["stderr"] = stats["mean"], stats["std"], stats["stderr"]
                     deltas = [x - y for x, y in zip(a, b)]
                     delta_stats = mean_std_stderr(deltas)
-                    row["min_detectable_delta"] = _mde(
-                        delta_stats["stderr"], test["df"], args.alpha, args.power)
+                    if test["df"] is not None:
+                        row["min_detectable_delta"] = _mde(
+                            delta_stats["stderr"], test["df"], args.alpha, args.power)
         if test is not None and test["mean_delta"] is not None:
             row["mean_delta"] = test["mean_delta"]
             row["delta_ci_low"] = test["ci_low"]
@@ -358,11 +359,17 @@ def main():
         else:
             note = ("descriptive only: single training run, batch noise is not run-to-run noise - "
                     "never certified as significant")
-            print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['stderr']:.4f} "
-                  f"(batch stderr) delta={r['mean_delta']:+.4f} "
-                  f"(95% CI [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
-                  f"t={r['t']:.3f} df={r['df']:.0f} p={r['p_one_sided']:.4g} "
-                  f"basis={base} -> {note}")
+            if r["t"] is None:
+                print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['stderr']:.4f} "
+                      f"(batch stderr) delta={r['mean_delta']:+.4f} "
+                      f"(single sealed batch: no interval or test) "
+                      f"basis={base} -> {note}")
+            else:
+                print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['stderr']:.4f} "
+                      f"(batch stderr) delta={r['mean_delta']:+.4f} "
+                      f"(95% CI [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
+                      f"t={r['t']:.3f} df={r['df']:.0f} p={r['p_one_sided']:.4g} "
+                      f"basis={base} -> {note}")
 
     if args.hypothesis:
         print(f"[hypothesis] {args.hypothesis}")

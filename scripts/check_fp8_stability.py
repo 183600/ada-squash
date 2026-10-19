@@ -510,6 +510,14 @@ def main():
                         if isinstance(c['per_seed'][j].get(key), (int, float))]
                 if vals:
                     record[key] = sum(vals) / len(vals)
+            flags = [c['per_seed'][j] for c in per_ckpt]
+            nonfinite = [f['first_nonfinite_layer'] for f in flags
+                         if isinstance(f.get('first_nonfinite_layer'), int)]
+            overflowing = [f['first_overflow_layer'] for f in flags
+                           if isinstance(f.get('first_overflow_layer'), int)]
+            record['first_nonfinite_layer'] = min(nonfinite) if nonfinite else None
+            record['first_overflow_layer'] = min(overflowing) if overflowing else None
+            record['logit_nan_under_fp8'] = any(bool(f.get('logit_nan_under_fp8')) for f in flags)
             record['seed'] = seed
             record['n_checkpoints'] = len(per_ckpt)
             per_seed.append(record)

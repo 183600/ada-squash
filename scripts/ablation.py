@@ -1243,7 +1243,11 @@ def main():
     p.add_argument('--force', action='store_true')
     apply_config_to_parser(p, known.config)
     args = p.parse_args()
-    seeds = [args.seed] if args.seed is not None else list(args.seeds or DEFAULT_SEEDS)
+    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or DEFAULT_SEEDS)
+    seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    if len(seeds) != len(raw_seeds):
+        print(f'[warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
+              f'(a repeated seed is the same run, not an independent replication)')
     if len(seeds) < 3:
         print(f'[warn] {len(seeds)} seed(s) selected: with <3 independent runs a difference cannot be separated from run-to-run noise; report error bars and treat significance as provisional')
     try:
