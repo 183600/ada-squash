@@ -149,13 +149,13 @@ class CausalSelfAttention(nn.Module):
     # triangle in row blocks of at most this many rows.
     _LOGITS_BLOCK_ROWS = 128
 
-    def _logit_scratch(self, B: int, H: int, R: int, T: int, q: torch.Tensor) -> torch.Tensor:
-        key = (B, H, R, T, q.dtype, q.device)
+    def _logit_scratch(self, B: int, H: int, R: int, T: int, dtype: torch.dtype, device) -> torch.Tensor:
+        key = (B, H, R, T, dtype, device)
         buf = _LOGIT_SCRATCH_CACHE.get(key)
         if buf is None:
             # Flat scratch for the whole sweep; each row block views a
             # contiguous prefix of the shape it needs.
-            buf = torch.empty(B * H * R * T, dtype=q.dtype, device=q.device)
+            buf = torch.empty(B * H * R * T, dtype=dtype, device=device)
             if len(_LOGIT_SCRATCH_CACHE) >= _LOGIT_SCRATCH_MAX_ENTRIES:
                 _LOGIT_SCRATCH_CACHE.clear()
             _LOGIT_SCRATCH_CACHE[key] = buf
@@ -178,7 +178,12 @@ class CausalSelfAttention(nn.Module):
         peak = torch.zeros((), dtype=reduce_dtype, device=device)
         drop = self._tril_mask(T, device)
         k_t = k.transpose(-1, -2)
-        buf = self._logit_scratch(B, H, min(rows, T), T, q)
+        buf = self._logit_scratch(B, H, min(rows, T), T, q.dtype, q.device)
+        # `block.sum(dtype=reduce_dtype)` on a low-precision block materializes
+        # a full fp32 copy of the block per call (three per row block). One
+        # exact fp32 image of the block is taken instead and every reduction
+        # runs on it, so the transient churn is a single reusable buffer.
+        work = buf if reduce_dtype == q.dtype else self._logit_scratch(B, H, min(rows, T), T, reduce_dtype, device)
         # The logit scale is a fixed positive scalar, so it is folded into the
         # scalar accumulators instead of being applied to every block: the
         # scaled statistics are `s*sum(x)`, `s*sum|x|`, `s*max|x|` and
@@ -198,12 +203,17 @@ class CausalSelfAttention(nn.Module):
             # masked: every earlier column is below the diagonal for all rows
             # of this block. The kept logits are unchanged.
             block[:, :, :, start:end].masked_fill_(drop[start:end, start:end], 0.0)
-            acc_x.add_(block.sum(dtype=reduce_dtype).mul_(scale))
-            block.abs_()
-            acc_abs.add_(block.sum(dtype=reduce_dtype).mul_(scale))
-            torch.maximum(peak, block.amax().mul_(scale).to(reduce_dtype), out=peak)
-            block.square_()
-            acc_sq.add_(block.sum(dtype=reduce_dtype).mul_(scale_sq))
+            if work is buf:
+                blockf = block
+            else:
+                blockf = work[:B * H * (end - start) * end].view(B, H, end - start, end)
+                blockf.copy_(block)
+            acc_x.add_(blockf.sum().mul_(scale))
+            blockf.abs_()
+            acc_abs.add_(blockf.sum().mul_(scale))
+            torch.maximum(peak, blockf.amax().mul_(scale).to(reduce_dtype), out=peak)
+            blockf.square_()
+            acc_sq.add_(blockf.sum().mul_(scale_sq))
         del k_t, block
         total = float(acc_abs)
         signed = float(acc_x)
