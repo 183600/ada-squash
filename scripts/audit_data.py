@@ -33,6 +33,7 @@ import argparse
 import json
 import math
 import sys
+from array import array
 from collections import Counter
 from pathlib import Path
 
@@ -45,10 +46,13 @@ from adasquash.repro import collect_run_metadata, save_run_manifest
 from scripts.data_pipeline import DocumentCleaner, document_hash, load_document_stream
 
 
-def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None):
+def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, collect_hashes=True):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
-    lengths = []
+    # One machine-word int per document instead of a boxed Python int (~28
+    # bytes): an exhaustive audit streams millions of documents and the
+    # length list is live for the whole split.
+    lengths = array('q')
     # Token ids are counted in a fixed `vocab_size + 1` numpy array, one
     # `np.bincount` per tokenized document, so a full audit (--n-docs 0) never
     # retains the token stream (the old list-of-arrays + single concatenate
@@ -119,7 +123,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             continue
         lengths.append(len(text))
         h = document_hash(text)
-        hashes.add(h)
+        if collect_hashes:
+            hashes.add(h)
         if known_hashes is not None and h in known_hashes:
             overlap += 1
         text_batch.append(text)
@@ -233,10 +238,14 @@ def main():
     train_hashes = None
     ledger_info = None
     for name in ('train', 'validation', 'test'):
+        # Only the train split's hash set is ever read (the `--exclude-hash-file`
+        # ledger and the held-out overlap reference), so the val/test digests
+        # are not accumulated: the overlap probe compares against `train_hashes`
+        # without needing a set of its own.
         stats, tok_counter, report, hashes = _collect_split(
             name, args.dataset, args.dataset_config, tokenizer, options,
             args.n_docs, args.min_doc_chars, args.max_doc_chars, args.dedup,
-            known_hashes=train_hashes)
+            known_hashes=train_hashes, collect_hashes=(name == 'train'))
         splits[name] = stats
         tokens[name] = tok_counter
         reports[name] = report

@@ -454,7 +454,7 @@ def main():
             # One fp32 snapshot of the weights on the host: the in-place
             # quantizer destroys the fp32 weights, and each seed needs them
             # back.
-            fp_state = {k: t.detach().cpu().clone() for k, t in model.state_dict().items()}
+            fp_state = {k: t.detach().to('cpu', copy=True) for k, t in model.state_dict().items()}
             per_seed = []
             for seed in seeds:
                 _unwrap_w8a8(model)

@@ -255,11 +255,15 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             rng = random.Random(int(getattr(args, 'seed', 0)))
             tail = rng.sample(tail_pool, min(k - len(head), len(tail_pool)))
             auc_class_ids = sorted(head + tail)
-    # All scan counters are device tensors. `prev_gold` is merged per batch
-    # with a device-side `unique(return_counts=True)`.
+    # All scan counters are device tensors. Each batch's `(key, count)` bigram
+    # histogram is kept whole and merged once after the pass: re-running
+    # `unique` over the growing accumulated histogram every batch was O(n^2)
+    # in the number of scanned keys.
     dev = next(model.parameters()).device
-    prev_gold_uniq = None        # device (key, count) bigram histogram
-    prev_gold_counts = None
+    prev_gold_parts: list = []   # per-batch (unique keys, counts)
+    # The fixed AUC class columns are materialized once on the model's device
+    # instead of rebuilt per position chunk.
+    auc_ids_t = torch.as_tensor(auc_class_ids, device=dev) if auc_class_ids else None
     n_tokens_t = torch.zeros((), dtype=torch.long, device=dev)
     n_correct_t = torch.zeros((), dtype=torch.long, device=dev)
     n_errors_t = torch.zeros((), dtype=torch.long, device=dev)
@@ -289,14 +293,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         n_tokens_t += valid.sum()
         target_counts_t += torch.bincount(y[valid].long(), minlength=vocab)
         keys = prev[valid].long() * vocab + y[valid].long()
-        ku, kc = torch.unique(keys, return_counts=True)
-        if prev_gold_uniq is None:
-            prev_gold_uniq, prev_gold_counts = ku, kc
-        else:
-            uniq, inv = torch.unique(torch.cat([prev_gold_uniq, ku]), return_inverse=True)
-            counts = torch.zeros_like(uniq)
-            counts.index_add_(0, inv, torch.cat([prev_gold_counts, kc]))
-            prev_gold_uniq, prev_gold_counts = uniq, counts
+        prev_gold_parts.append(torch.unique(keys, return_counts=True))
         if tuple(x.shape) == tuple(y.shape):
             copy_input_correct_t += (x[valid] == y[valid]).sum()
         B, T = x.shape
@@ -361,11 +358,9 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
                             'prev': int(prev[b0 + b, t0 + tt]),
                             'context': [int(v) for v in x[b0 + b, max(0, t0 + tt - args.context_tokens):t0 + tt + 1].tolist()],
                         })
-                if auc_class_ids:
+                if auc_ids_t is not None:
                     # `index_select` picks the scored columns directly.
-                    sel = probs.index_select(
-                        -1, torch.as_tensor(auc_class_ids, device=probs.device)
-                    )
+                    sel = probs.index_select(-1, auc_ids_t)
                     take = int(sel.shape[0])
                     if auc_max_tokens > 0:
                         take = min(take, auc_max_tokens - auc_seen)
@@ -390,7 +385,17 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     pred_counts = pred_counts_t.cpu()
     correct_counts = correct_counts_t.cpu()
 
-    prev_gold, prev_majority = _prev_majority((prev_gold_uniq, prev_gold_counts), vocab)
+    # One merge of the per-batch bigram histograms (integer counts, exact).
+    prev_gold_hist = None
+    if prev_gold_parts:
+        merged_keys = torch.cat([p[0] for p in prev_gold_parts])
+        merged_counts = torch.cat([p[1] for p in prev_gold_parts])
+        uniq, inv = torch.unique(merged_keys, return_inverse=True)
+        counts = torch.zeros_like(uniq)
+        counts.index_add_(0, inv, merged_counts)
+        prev_gold_hist = (uniq, counts)
+        del merged_keys, merged_counts, inv, counts, prev_gold_parts
+    prev_gold, prev_majority = _prev_majority(prev_gold_hist, vocab)
     rare_ids, rare_threshold = _rare_ids(target_counts, args.rare_quantile)
     categories, primary, examples = _classify_scan(
         error_scan, prev_gold, prev_majority, vocab, rare_ids, args.confidence)
@@ -569,8 +574,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     topk = min(max(1, int(args.topk)), max(1, vocab - 1))
     max_scan = max(0, int(args.max_scan_errors))
     dev = next(reference_model.parameters()).device
-    prev_gold_uniq = None
-    prev_gold_counts = None
+    prev_gold_parts: list = []   # per-batch (unique keys, counts), merged once
     target_counts_t = torch.zeros(vocab, dtype=torch.long, device=dev)
     n_tokens_t = torch.zeros((), dtype=torch.long, device=dev)
     n_both_right_t = torch.zeros((), dtype=torch.long, device=dev)
@@ -587,14 +591,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         n_tokens_t += mask.sum()
         target_counts_t += torch.bincount(y[mask].long(), minlength=vocab)
         keys = x[mask].long() * vocab + y[mask].long()
-        ku, kc = torch.unique(keys, return_counts=True)
-        if prev_gold_uniq is None:
-            prev_gold_uniq, prev_gold_counts = ku, kc
-        else:
-            uniq, inv = torch.unique(torch.cat([prev_gold_uniq, ku]), return_inverse=True)
-            counts = torch.zeros_like(uniq)
-            counts.index_add_(0, inv, torch.cat([prev_gold_counts, kc]))
-            prev_gold_uniq, prev_gold_counts = uniq, counts
+        prev_gold_parts.append(torch.unique(keys, return_counts=True))
         if tuple(x.shape) == tuple(y.shape):
             copy_input_correct_t += (x[mask] == y[mask]).sum()
         n_positional_t += mask.sum()
@@ -669,7 +666,17 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     n_positional = int(n_positional_t.item())
     target_counts = target_counts_t.cpu()
 
-    prev_gold, prev_majority = _prev_majority((prev_gold_uniq, prev_gold_counts), vocab)
+    # One merge of the per-batch bigram histograms (integer counts, exact).
+    prev_gold_hist = None
+    if prev_gold_parts:
+        merged_keys = torch.cat([p[0] for p in prev_gold_parts])
+        merged_counts = torch.cat([p[1] for p in prev_gold_parts])
+        uniq, inv = torch.unique(merged_keys, return_inverse=True)
+        counts = torch.zeros_like(uniq)
+        counts.index_add_(0, inv, merged_counts)
+        prev_gold_hist = (uniq, counts)
+        del merged_keys, merged_counts, inv, counts, prev_gold_parts
+    prev_gold, prev_majority = _prev_majority(prev_gold_hist, vocab)
     rare_ids, rare_threshold = _rare_ids(target_counts, args.rare_quantile)
     cause_summary: dict = {}
     reference_cause = Counter()

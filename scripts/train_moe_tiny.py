@@ -294,19 +294,17 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             x, y = next(data_iter)
         return (x.to(device, non_blocking=True), y.to(device, non_blocking=True))
     history = []
+    history_rows: list = []      # serialized mirror of `history`, same indices
     stats_windowed = False
 
-    def _history_rows() -> list:
-        """Serializable view of the curve (device tensors -> Python floats)."""
-        rows = []
-        for row in history:
-            item = {k: v for k, v in row.items() if k not in ('aux_t', 'expert_cv_t')}
-            item['aux'] = float(row['aux_t'])
-            cv = row['expert_cv_t'].tolist()
-            item['expert_cv_per_block'] = cv
-            item['expert_cv'] = cv[-1]
-            rows.append(item)
-        return rows
+    def _serialize_row(row: dict) -> dict:
+        """One history row with its device tensors materialized to Python floats."""
+        item = {k: v for k, v in row.items() if k not in ('aux_t', 'expert_cv_t')}
+        item['aux'] = float(row['aux_t'])
+        cv = row['expert_cv_t'].tolist()
+        item['expert_cv_per_block'] = cv
+        item['expert_cv'] = cv[-1]
+        return item
 
     def flush_history() -> None:
         """Atomically persist the curve so far.
@@ -315,10 +313,15 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         NaN abort, OOM or external kill lost the training curve exactly when
         it matters most for diagnosis. Rewriting the (small) list every
         `--log-every` steps keeps the file current; tmp+rename keeps readers
-        from ever seeing a partial write.
+        from ever seeing a partial write. Each row is materialized exactly
+        once (its device tensors are converted when first flushed): re-reading
+        the whole curve every flush would re-sync every past row, O(n^2) in
+        the step count.
         """
+        while len(history_rows) < len(history):
+            history_rows.append(_serialize_row(history[len(history_rows)]))
         tmp = output_dir / 'history.json.tmp'
-        tmp.write_text(json.dumps(_history_rows(), indent=2), encoding='utf-8')
+        tmp.write_text(json.dumps(history_rows, indent=2), encoding='utf-8')
         os.replace(tmp, output_dir / 'history.json')
 
     finished = False
