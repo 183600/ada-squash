@@ -33,7 +33,11 @@ This driver therefore:
   the seed-replicated p-values are a family and are Holm-Bonferroni adjusted
   before an arm is called significantly better.
   The default selection set is three seeds: with fewer, the lr-grid means
-  are too noisy for a small delta to mean anything.
+  are too noisy for a small delta to mean anything. An lr cell whose diverged
+  seeds were dropped (NaN/Inf val_loss) has a mean over a *subset* of the
+  seeds, so it never wins selection against a cell with full seed coverage
+  (`selection_pool = complete_coverage`); survivor-only cells are listed in
+  `missing_seeds` and warned about instead.
 
 Selection bias: picking the best learning rate on `--seeds` and then quoting
 that same run overstates the effect (winner's curse). Pass `--confirm-seeds`
@@ -158,6 +162,7 @@ def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> di
         for seed in args.seeds:
             summary = run_trial(arm, lr, seed, args, base, run_metadata=run_metadata)
             trials.append(_trial_record(summary, lr, seed))
+    n_selection_seeds = len(args.seeds) or 1
     lr_grid = {}
     for lr in args.lrs:
         cell = [t for t in trials if t['lr'] == lr]
@@ -165,6 +170,14 @@ def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> di
         stats = mean_std_stderr(losses)
         if stats is not None:
             stats = dict(stats)
+            # A cell whose diverged seeds were dropped has a mean over a
+            # *subset* of the seeds; letting it win against a cell with full
+            # coverage is survivorship bias (the unstable lr looks good
+            # because its failures are not in its own mean).
+            stats['missing_seeds'] = sorted(
+                t['seed'] for t in cell if not _usable_loss(t['val_loss']))
+            stats['complete_coverage'] = not stats['missing_seeds']
+            stats['n_selection_seeds'] = n_selection_seeds
             stats['curve_classification_counts'] = dict(Counter(
                 t['curve_classification'] for t in cell if t.get('curve_classification')))
             stats['curve_classifications_by_seed'] = {
@@ -172,8 +185,16 @@ def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> di
             lr_grid[f'{lr:g}'] = stats
     if not lr_grid:
         return {'arm': arm, 'trials': trials, 'lr_grid': {}, 'best': None}
-    best_lr_str = min(lr_grid, key=lambda k: lr_grid[k]['mean'])
-    best = {'lr': float(best_lr_str), **lr_grid[best_lr_str]}
+    complete = {k: v for k, v in lr_grid.items() if v['complete_coverage']}
+    pool, pool_name = (complete, 'complete_coverage') if complete else (lr_grid, 'partial_coverage')
+    if complete and len(complete) < len(lr_grid):
+        print(f"[tune][warn] {arm}: lr cell(s) "
+              f"{sorted(set(lr_grid) - set(complete))} lack a usable val_loss for every "
+              f"selection seed ({n_selection_seeds} required); they are excluded from lr "
+              f"selection rather than winning on a survivor-only mean. Rerun with --force "
+              f"or add seeds to fill them in.")
+    best_lr_str = min(pool, key=lambda k: pool[k]['mean'])
+    best = {'lr': float(best_lr_str), **lr_grid[best_lr_str], 'selection_pool': pool_name}
     return {'arm': arm, 'trials': trials, 'lr_grid': lr_grid, 'best': best}
 
 

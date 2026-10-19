@@ -530,6 +530,7 @@ def main():
     p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap); applied identically to train and validation')
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
     p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); validation documents duplicated in train are dropped, never training documents')
+    p.add_argument('--exclude-test-hash-file', default=None, help='validation-document hash ledger (scripts/audit_data.py --write-val-hash-file); applied to the sealed test split only, so test documents duplicated in validation are dropped (ignored by the train/validation loaders)')
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation')
     p.add_argument('--val-batches', type=int, default=10, help='held-out validation batches at the end of training (0 disables)')
     p.add_argument('--tokenizer', default='gpt2')

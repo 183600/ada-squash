@@ -31,7 +31,11 @@ Principles enforced here
    --write-train-hash-file`) is supplied, any held-out document whose exact
    text is in that ledger is dropped from that held-out split - never from
    train itself (the ledger is derived from train, so excluding it there would
-   throw the whole split away).
+   throw the whole split away).  A validation-document ledger
+   (`--exclude-test-hash-file`, written by `audit_data.py
+   --write-val-hash-file`) is applied to the test split only, so a document
+   cannot sit on both sides of the selection/final boundary either; it is
+   ignored elsewhere.
 
 `build_dataloader` deliberately keeps its historical 5-argument call
 signature (the split / cleaning knobs travel through
@@ -42,6 +46,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -79,6 +84,10 @@ DEFAULT_DATA_OPTIONS = {
     # Optional ledger of training-document hashes: when set, held-out splits
     # drop exact duplicates of training documents (never applied to train).
     "exclude_hash_file": None,
+    # Optional ledger of validation-document hashes: when set, the *test*
+    # split additionally drops exact duplicates of validation documents, so
+    # the selection split and the sealed final split stay disjoint.
+    "exclude_test_hash_file": None,
 }
 
 _active_data_options = dict(DEFAULT_DATA_OPTIONS)
@@ -308,8 +317,11 @@ class DocumentCleaner:
     documents, degenerate short documents, length outliers, exact
     duplicates (within the split), and exact duplicates of documents listed
     in `exclude_hashes` (the training-document ledger used by held-out
-    splits).  The duplicate set is bounded at `dedup_max` entries; beyond
-    that the cleaner keeps dropping documents but stops recording new hashes.
+    splits).  The duplicate set is bounded at `dedup_max` entries; once the
+    set is full, unseen documents are kept without being recorded and
+    `dedup_cap_reached` is set in the report, so the silent degradation of
+    the in-split dedup guarantee is visible (the cross-split ledger lookup is
+    a set membership test and stays exact regardless).
     """
 
     def __init__(self, dedup: bool = True, dedup_max: int = 1_000_000,
@@ -368,6 +380,14 @@ class DocumentCleaner:
                     return None
                 if len(self.seen) < self.dedup_max:
                     self.seen.add(key)
+                else:
+                    # The seen-hash set is full: from here on the split keeps
+                    # every document and later duplicates of unseen documents
+                    # are no longer removed. The flag makes the silent
+                    # degradation of the dedup guarantee visible in the split
+                    # report (the cross-split ledger lookup is a set
+                    # membership test and stays exact regardless).
+                    self.stats["dedup_cap_reached"] = 1
         self.stats["documents_kept"] += 1
         return text
 
@@ -526,6 +546,47 @@ class _JsonlDocumentStream(IterableDataset):
                 yield json.loads(line)
 
 
+_VERIFIED_CACHES: dict = {}
+
+
+def _cache_matches(cache_path: Path, fingerprint: dict) -> bool:
+    """Verify a materialized held-out cache against its own `.meta.json`.
+
+    A cache is reused only when its byte size and sha256 still match the
+    fingerprint written at materialization time: a truncated/partially written
+    or edited file would otherwise silently feed different documents into
+    validation/test while the run manifest claims the pinned fingerprint. The
+    sha256 is computed once per (path, size, mtime) per process, so repeated
+    loader builds in one run (checkpoint sweeps) do not re-hash the file.
+    """
+    expected_bytes = fingerprint.get("bytes")
+    sha = fingerprint.get("sha256")
+    try:
+        st = cache_path.stat()
+    except OSError:
+        return False
+    if expected_bytes is not None and st.st_size != int(expected_bytes):
+        return False
+    if not sha:
+        return expected_bytes is not None
+    stamp = (sha, st.st_size, st.st_mtime_ns)
+    if _VERIFIED_CACHES.get(str(cache_path)) == stamp:
+        return True
+    hasher = hashlib.sha256()
+    try:
+        with open(cache_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                hasher.update(chunk)
+    except OSError:
+        return False
+    if hasher.hexdigest() != sha:
+        return False
+    if len(_VERIFIED_CACHES) >= 8:
+        _VERIFIED_CACHES.clear()
+    _VERIFIED_CACHES[str(cache_path)] = stamp
+    return True
+
+
 def _split_cache_dir() -> Path | None:
     """Where materialized held-out slices are stored.
 
@@ -561,7 +622,9 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     is not silently reused afterwards. The written payload is fingerprinted
     (sha256 + document count) into a `.meta.json` sidecar and echoed into
     `report['materialized_cache_fingerprint']`, so a run manifest pins the
-    concrete cached content, not only its name.
+    concrete cached content, not only its name; before any reuse the payload
+    is verified against that fingerprint, and a cache that fails the check is
+    rebuilt instead of silently serving different held-out documents.
     """
     start, count = report.get("start"), report.get("count")
     if not start or not count:
@@ -593,9 +656,17 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     meta_path = cache_path.with_name(cache_path.name + ".meta.json")
     if cache_path.exists():
         fingerprint = _read_cache_fingerprint(meta_path)
-        if fingerprint is not None:
+        if fingerprint is not None and _cache_matches(cache_path, fingerprint):
             report["materialized_cache_fingerprint"] = fingerprint
-        return _JsonlDocumentStream(cache_path), cache_path
+            return _JsonlDocumentStream(cache_path), cache_path
+        # A cache without a matching sidecar cannot be trusted (truncated or
+        # edited payload, or a foreign file under the same key): rebuild it
+        # from the upstream stream rather than silently changing the held-out
+        # documents behind the manifest's fingerprint.
+        print(f"[data] held-out cache {cache_path} failed its fingerprint check "
+              f"(missing/foreign .meta.json or changed content); rebuilding it",
+              file=sys.stderr)
+        report["materialized_cache_rebuilt"] = True
     root.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
     hasher = hashlib.sha256()
@@ -633,6 +704,13 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     tmp_meta = meta_path.with_name(meta_path.name + ".tmp")
     tmp_meta.write_text(json.dumps(fingerprint, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp_meta, meta_path)
+    try:
+        st = cache_path.stat()
+        if len(_VERIFIED_CACHES) >= 8:
+            _VERIFIED_CACHES.clear()
+        _VERIFIED_CACHES[str(cache_path)] = (fingerprint["sha256"], st.st_size, st.st_mtime_ns)
+    except OSError:
+        pass
     report["materialized_cache_fingerprint"] = fingerprint
     return _JsonlDocumentStream(cache_path), cache_path
 
@@ -711,18 +789,22 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     report["tokenizer_revision_resolved"] = (
         getattr(tok, "_commit_hash", None) or opts.get("tokenizer_revision"))
     report["shuffle_buffer"] = int(opts["shuffle_buffer"]) if opts["split"] == "train" else 0
+    # The train-document ledger is consumed by both held-out splits; the
+    # validation-document ledger is consumed by the sealed test split only, so
+    # a document cannot sit on both sides of the selection/final boundary
+    # either.  Both are never applied to train (they are derived from earlier
+    # splits; excluding them there would throw the split away).
+    applied_train_ledger = opts.get("exclude_hash_file") if opts["split"] != "train" else None
+    applied_test_ledger = opts.get("exclude_test_hash_file") if opts["split"] == "test" else None
+    exclude_files = [p for p in (applied_train_ledger, applied_test_ledger) if p]
     exclude_hashes: set = set()
-    exclude_file = opts.get("exclude_hash_file")
-    if exclude_file:
-        if opts["split"] == "train":
-            # The ledger is the set of training-document hashes; applying it
-            # to the train split would drop every document.  Stay silent on
-            # train and let validation/test consume it.
-            report["exclude_hash_file"] = None
-        else:
-            exclude_hashes = load_hash_file(exclude_file)
-            report["exclude_hash_file"] = str(exclude_file)
-            report["exclude_hashes"] = len(exclude_hashes)
+    for path in exclude_files:
+        exclude_hashes |= load_hash_file(path)
+    report["exclude_hash_file"] = str(applied_train_ledger) if applied_train_ledger else None
+    report["exclude_test_hash_file"] = str(applied_test_ledger) if applied_test_ledger else None
+    if exclude_files:
+        report["exclude_hash_files"] = [str(p) for p in exclude_files]
+        report["exclude_hashes"] = len(exclude_hashes)
     cleaner = DocumentCleaner(
         dedup=opts["dedup"],
         dedup_max=opts["dedup_max"],

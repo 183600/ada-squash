@@ -172,7 +172,8 @@ def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()
 # upstream branch would continue on different data under the same manifest.
 _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer_revision',
               'val_frac', 'test_frac', 'num_documents',
-              'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file')
+              'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file',
+              'exclude_test_hash_file')
 
 def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
     changed = []
@@ -197,6 +198,7 @@ def open_data_split(split: str, args, seq_len: int | None = None):
         min_doc_chars=args.min_doc_chars,
         max_doc_chars=args.max_doc_chars,
         exclude_hash_file=getattr(args, 'exclude_hash_file', None),
+        exclude_test_hash_file=getattr(args, 'exclude_test_hash_file', None),
         dataset_revision=getattr(args, 'dataset_revision', None),
         tokenizer_revision=getattr(args, 'tokenizer_revision', None),
         shuffle_buffer=args.train_shuffle_buffer if split == 'train' else 0,
@@ -575,6 +577,7 @@ def main():
     p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap)')
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
     p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); held-out documents whose exact text also occurs in train are dropped from validation/test, never from train')
+    p.add_argument('--exclude-test-hash-file', default=None, help='validation-document hash ledger (scripts/audit_data.py --write-val-hash-file); the sealed test split drops documents whose exact text also occurs in validation, so the selection split and the final split are disjoint (ignored for train/validation)')
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation or test')
     p.add_argument('--num-workers', type=int, default=2, help='DataLoader worker processes (0 = everything in the parent process); with dedup enabled each worker scans and hashes the whole stream, so raising this multiplies CPU work rather than throughput')
     p.add_argument('--seq-len', type=int, default=1024)
@@ -858,6 +861,7 @@ def main():
             'tokenizer_revision': args.tokenizer_revision,
             'split_reports': data_reports,
             'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if args.exclude_hash_file else None,
+            'exclude_test_hash_file': file_fingerprint(args.exclude_test_hash_file) if args.exclude_test_hash_file else None,
             'config_file': file_fingerprint(args.config) if args.config else None,
         }
         if sanity_report_path is not None:
@@ -1211,6 +1215,19 @@ def main():
                 print('[test] WARNING: --val-every 0 disables validation-based selection; '
                       'the sealed test split reports the final model only and must never be '
                       'used to pick hyperparameters.', file=sys.stderr)
+            if args.dataset and args.val_frac > 0 and args.test_frac > 0:
+                missing_ledgers = []
+                if not args.exclude_hash_file:
+                    missing_ledgers.append('--exclude-hash-file (train<->held-out exact duplicates)')
+                if not args.exclude_test_hash_file:
+                    missing_ledgers.append('--exclude-test-hash-file (validation<->test exact duplicates)')
+                if missing_ledgers:
+                    print('[test] WARNING: no cross-split duplicate ledger supplied, so '
+                          + ' and '.join(missing_ledgers) +
+                          ' are not dropped; the held-out splits may not be disjoint. Build the '
+                          'ledgers with scripts/audit_data.py --write-train-hash-file / '
+                          '--write-val-hash-file (use --n-docs 0 for full coverage) and pass them '
+                          'to the run.', file=sys.stderr)
             test_loader = open_data_split('test', args)
             rtest = getattr(test_loader, 'split_report', None)
             if rtest:
@@ -1261,13 +1278,14 @@ def main():
                 'dedup': args.dedup,
                 'min_doc_chars': args.min_doc_chars, 'max_doc_chars': args.max_doc_chars,
                 'exclude_hash_file': args.exclude_hash_file,
+                'exclude_test_hash_file': args.exclude_test_hash_file,
                 # Worker count is part of the sealed-batch identity: a
                 # streaming loader shards documents across workers, so a
                 # different count can change the batch composition.
                 'num_workers': (rtest or {}).get('num_workers', getattr(args, 'num_workers', None)),
                 'batch_size': args.batch_size, 'seq_len': args.seq_len,
             }
-            results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
+            results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file, 'exclude_test_hash_file': args.exclude_test_hash_file}
             with open(out_path, 'w') as f:
                 json.dump(results, f, indent=2)
             run_manifest.setdefault('artifacts', {})['test_results'] = file_fingerprint(out_path)

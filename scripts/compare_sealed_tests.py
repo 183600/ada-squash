@@ -45,7 +45,7 @@ PAIRING_KEYS = (
     "dataset_revision_resolved", "num_workers",
     "tokenizer", "tokenizer_revision", "tokenizer_revision_resolved",
     "num_documents", "val_frac", "test_frac",
-    "dedup", "min_doc_chars", "max_doc_chars", "exclude_hash_file",
+    "dedup", "min_doc_chars", "max_doc_chars", "exclude_hash_file", "exclude_test_hash_file",
     "batch_size", "seq_len",
 )
 

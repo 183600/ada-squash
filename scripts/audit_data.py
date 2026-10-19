@@ -10,9 +10,10 @@ Reads a bounded sample of the train / validation / test splits produced by
   tokenizer failures;
 * value sanity: token ids out of the tokenizer's range, non-finite length
   statistics (NaN / Inf), duplicate rates per split;
-* split hygiene: exact duplicate documents shared between train and the
-  held-out splits (a duplicate in two splits is a leak no matter how the
-  split was drawn);
+* split hygiene: exact duplicate documents shared between any two splits -
+  train vs held-out *and* validation vs test (a duplicate in two splits is a
+  leak no matter how the split was drawn, and a val/test duplicate makes the
+  selection split peek at the sealed final split);
 * chronology: train/validation/test must be contiguous slices of the upstream
   order, so no document can sit on two sides and no future document can
   precede the training slice;
@@ -22,10 +23,12 @@ Reads a bounded sample of the train / validation / test splits produced by
 
 `--write-train-hash-file` emits the training-document hash ledger consumed by
 `--exclude-hash-file` in the trainers, so held-out splits drop any document
-whose exact text also occurs in train. A full ledger requires `--n-docs 0`;
-with a bounded sample the file covers only the sampled prefix, and the run
-records `train_hash_ledger.exhaustive = false` and warns instead of implying
-full coverage.
+whose exact text also occurs in train; `--write-val-hash-file` emits the
+validation ledger consumed by `--exclude-test-hash-file`, so the sealed test
+also drops documents duplicated in the selection split. A full ledger requires
+`--n-docs 0`; with a bounded sample the file covers only the sampled prefix,
+and the run records `*.exhaustive = false` and warns instead of implying full
+coverage.
 
 This script only *reads* data; it never trains or writes to a split.
 """
@@ -46,7 +49,7 @@ from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metad
 from scripts.data_pipeline import DocumentCleaner, document_hash, load_document_stream
 
 
-def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, collect_hashes=True):
+def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, collect_hashes=True):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     # One machine-word int per document.
@@ -61,6 +64,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     legacy_tokens: Counter = Counter()
     hashes: set = set()
     overlap = 0
+    overlap_extra = 0
     tokenizer_errors = 0
     vocab_size = int(getattr(tokenizer, 'vocab_size', 0) or 0)
 
@@ -123,6 +127,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             hashes.add(h)
         if known_hashes is not None and h in known_hashes:
             overlap += 1
+        if known_hashes_extra is not None and h in known_hashes_extra:
+            overlap_extra += 1
         text_batch.append(text)
         if len(text_batch) >= 256:
             _flush_tokens()
@@ -141,7 +147,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     # the true overlap, not evidence that the splits are disjoint.
     stats['exhaustive'] = not n_docs
     stats['duplicate_overlap_with_train'] = overlap if known_hashes is not None else None
-    stats['duplicate_overlap_is_lower_bound'] = bool(n_docs) if known_hashes is not None else None
+    stats['duplicate_overlap_with_validation'] = overlap_extra if known_hashes_extra is not None else None
+    stats['duplicate_overlap_is_lower_bound'] = bool(n_docs) if (known_hashes is not None or known_hashes_extra is not None) else None
     if lengths:
         stats['doc_chars_mean'] = sum(lengths) / len(lengths)
         stats['doc_chars_min'] = min(lengths)
@@ -184,6 +191,39 @@ def _chronology_problems(reports: dict) -> list:
     return []
 
 
+def _write_hash_ledger(path, hashes: set, n_docs: int, split_name: str):
+    """Write a sorted one-digest-per-line ledger and describe its coverage.
+
+    `load_hash_file` accepts this whitespace-separated form (and also reads
+    JSON-list files). With a bounded `--n-docs` sample the ledger only covers
+    the prefix that was read; the returned info records `exhaustive=false` and
+    the caller warns, instead of implying full coverage.
+    """
+    if not path:
+        return None
+    ledger = Path(path)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with open(ledger, 'w', encoding='utf-8') as f:
+        for h in sorted(hashes):
+            f.write(h.hex() + '\n')
+    exhaustive = not n_docs
+    info = {
+        'path': str(ledger),
+        'split': split_name,
+        'n_hashes': len(hashes),
+        'exhaustive': exhaustive,
+        'n_docs_limit': n_docs,
+    }
+    print(f'[audit] wrote {len(hashes)} {split_name}-document hashes to {ledger}'
+          f'{" (exhaustive)" if exhaustive else " (SAMPLED PREFIX ONLY)"}')
+    if not exhaustive:
+        print(f'[audit] WARNING: the ledger covers at most the first {n_docs} '
+              f'{split_name} documents; consumed as a cross-split exclude ledger it '
+              f'only drops duplicates of that prefix. Re-run with --n-docs 0 for a full ledger.',
+              file=sys.stderr)
+    return info
+
+
 def _total_variation(a: Counter, b: Counter) -> float:
     total_a, total_b = sum(a.values()), sum(b.values())
     if not total_a or not total_b:
@@ -216,8 +256,10 @@ def main():
     p.add_argument('--max-doc-chars', type=int, default=0)
     p.add_argument('--no-dedup', dest='dedup', action='store_false')
     p.add_argument('--write-train-hash-file', default=None, help='write the hashes of the sampled training documents here; feed the file to train_gpt2.py --exclude-hash-file so validation/test drop exact duplicates of training documents (use --n-docs 0 for a full ledger)')
+    p.add_argument('--write-val-hash-file', default=None, help='write the hashes of the sampled validation documents here; feed the file to train_gpt2.py --exclude-test-hash-file so the sealed test drops exact duplicates of validation documents (a val/test duplicate makes the selection split and the final split non-disjoint; use --n-docs 0 for a full ledger)')
     p.add_argument('--max-tvd', type=float, default=None, help="fail (exit 1) when train-vs-validation token total-variation distance exceeds this")
     p.add_argument('--max-test-tvd', type=float, default=None, help="fail (exit 1) when train-vs-test token total-variation distance exceeds this; the test split backs the final reported number, so unchecked drift there changes what that number measures")
+    p.add_argument('--max-val-test-tvd', type=float, default=None, help="fail (exit 1) when validation-vs-test token total-variation distance exceeds this; the model is selected on validation and reported on test, so drift between the two held-out slices makes the selected checkpoint a poorer fit for the number finally reported")
     p.add_argument('--output', default='runs/data_audit.json')
     args = p.parse_args()
     try:
@@ -234,50 +276,36 @@ def main():
     tokens = {}
     reports = {}
     train_hashes = None
-    ledger_info = None
+    val_hashes = None
+    train_ledger_info = None
+    val_ledger_info = None
     for name in ('train', 'validation', 'test'):
-        # Only the train split's hash set is read (the `--exclude-hash-file`
-        # ledger and the held-out overlap reference); the overlap probe
-        # compares against `train_hashes`.
+        # Train/validation hash sets are kept (the exclude ledgers and the
+        # overlap reference); test only needs to be compared against them.
+        # Test is checked against train *and* validation: a val/test duplicate
+        # makes the selection split and the final split non-disjoint.
         stats, tok_counter, report, hashes = _collect_split(
             name, args.dataset, args.dataset_config, tokenizer, options,
             args.n_docs, args.min_doc_chars, args.max_doc_chars, args.dedup,
-            known_hashes=train_hashes, collect_hashes=(name == 'train'))
+            known_hashes=train_hashes,
+            known_hashes_extra=(val_hashes if name == 'test' else None),
+            collect_hashes=(name in ('train', 'validation')))
         splits[name] = stats
         tokens[name] = tok_counter
         reports[name] = report
         if name == 'train':
             train_hashes = hashes
-            if args.write_train_hash_file:
-                ledger = Path(args.write_train_hash_file)
-                ledger.parent.mkdir(parents=True, exist_ok=True)
-                # One hex digest per line. `load_hash_file` accepts this
-                # whitespace-separated form (and also reads JSON-list files).
-                with open(ledger, 'w', encoding='utf-8') as f:
-                    for h in sorted(hashes):
-                        f.write(h.hex() + '\n')
-                # With a bounded --n-docs sample the ledger only contains the
-                # prefix that was read; using it as `--exclude-hash-file` then
-                # removes duplicates of that prefix only. Say so loudly instead
-                # of implying full coverage.
-                exhaustive = not args.n_docs
-                ledger_info = {
-                    'path': str(ledger),
-                    'n_hashes': len(hashes),
-                    'exhaustive': exhaustive,
-                    'n_docs_limit': args.n_docs,
-                }
-                print(f'[audit] wrote {len(hashes)} training-document hashes to {ledger}'
-                      f'{" (exhaustive)" if exhaustive else " (SAMPLED PREFIX ONLY)"}')
-                if not exhaustive:
-                    print(f'[audit] WARNING: the ledger covers at most the first {args.n_docs} '
-                          f'training documents; fed to --exclude-hash-file it only drops '
-                          f'duplicates of that prefix. Re-run with --n-docs 0 for a full ledger.',
-                          file=sys.stderr)
+            train_ledger_info = _write_hash_ledger(
+                args.write_train_hash_file, hashes, args.n_docs, 'train')
+        elif name == 'validation':
+            val_hashes = hashes
+            val_ledger_info = _write_hash_ledger(
+                args.write_val_hash_file, hashes, args.n_docs, 'validation')
     chronology = _chronology_problems(reports)
     shift = {
         'train_vs_validation_tvd': _total_variation(tokens['train'], tokens['validation']),
         'train_vs_test_tvd': _total_variation(tokens['train'], tokens['test']),
+        'validation_vs_test_tvd': _total_variation(tokens['validation'], tokens['test']),
         'top_shifted_train_vs_validation': _top_shifted(tokens['train'], tokens['validation']),
         'doc_chars_mean_delta_train_validation': (
             None if splits['train']['doc_chars_mean'] is None or splits['validation']['doc_chars_mean'] is None
@@ -286,15 +314,18 @@ def main():
     out = {'options': vars(args), 'run_metadata': collect_run_metadata(),
            'split_reports': reports, 'split_chronology_problems': chronology,
            'cleaning_and_sanity': splits, 'distribution_shift': shift,
-           'train_hash_ledger': ledger_info}
+           'train_hash_ledger': train_ledger_info,
+           'validation_hash_ledger': val_ledger_info}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(out, indent=2, default=str))
     for name, stats in splits.items():
         print(f"[audit] {name}: sampled={stats['documents_sampled']} kept={stats.get('documents_kept', 0)} "
               f"dropped_empty={stats.get('dropped_empty', 0)} dropped_missing={stats.get('dropped_missing_text', 0)} "
-              f"dropped_duplicate={stats.get('dropped_duplicate', 0)} overlap_with_train={stats['duplicate_overlap_with_train']}")
+              f"dropped_duplicate={stats.get('dropped_duplicate', 0)} overlap_with_train={stats['duplicate_overlap_with_train']} "
+              f"overlap_with_validation={stats['duplicate_overlap_with_validation']}")
     print(f"[audit] token TVD train-vs-val={shift['train_vs_validation_tvd']:.4f} "
-          f"train-vs-test={shift['train_vs_test_tvd']:.4f}")
+          f"train-vs-test={shift['train_vs_test_tvd']:.4f} "
+          f"val-vs-test={shift['validation_vs_test_tvd']:.4f}")
     print(f"[audit] saved to {args.output}")
     problems = list(chronology)
     for name in ('train', 'validation', 'test'):
@@ -303,6 +334,10 @@ def main():
             print(f"[audit] NOTE: {name}: {stats['length_outliers_3iqr']} length outliers beyond the 3xIQR fence "
                   f"(q1={stats['doc_chars_q1']}, q3={stats['doc_chars_q3']}, max={stats['doc_chars_max']}); "
                   "use --min-doc-chars/--max-doc-chars in the training run to drop them")
+        if stats.get('dedup_cap_reached'):
+            print(f"[audit] NOTE: {name}: the in-split duplicate hash set reached dedup_max during the "
+                  f"sample, so later complete-duplicate documents in this split were kept; the "
+                  "guarantee degrades silently at that point (the cross-split ledger is unaffected)")
     # Every split is audited, test included: the final numbers come from test,
     # so corruption there must fail the audit just like corruption in train.
     non_finite = [name for name in ('train', 'validation', 'test')
@@ -311,6 +346,8 @@ def main():
         problems.append(f"non-finite document-length statistics (NaN/Inf in the data) in: {', '.join(non_finite)}")
     if (splits['validation']['duplicate_overlap_with_train'] or 0) > 0 or (splits['test']['duplicate_overlap_with_train'] or 0) > 0:
         problems.append('exact duplicate documents appear in both train and a held-out split (group/duplicate leakage)')
+    if (splits['test']['duplicate_overlap_with_validation'] or 0) > 0:
+        problems.append('exact duplicate documents appear in both validation and test (the selection split and the sealed final split are not disjoint)')
     out_of_range = [name for name in ('train', 'validation', 'test')
                     if splits[name]['token_ids_out_of_range']]
     if out_of_range:
@@ -319,6 +356,8 @@ def main():
         problems.append(f"train-vs-validation distribution shift TVD={shift['train_vs_validation_tvd']:.4f} > max-tvd={args.max_tvd}")
     if args.max_test_tvd is not None and shift['train_vs_test_tvd'] > args.max_test_tvd:
         problems.append(f"train-vs-test distribution shift TVD={shift['train_vs_test_tvd']:.4f} > max-test-tvd={args.max_test_tvd}")
+    if args.max_val_test_tvd is not None and shift['validation_vs_test_tvd'] > args.max_val_test_tvd:
+        problems.append(f"validation-vs-test distribution shift TVD={shift['validation_vs_test_tvd']:.4f} > max-val-test-tvd={args.max_val_test_tvd}")
     manifest = {
         'run_metadata': out['run_metadata'],
         'dataset': args.dataset,
@@ -326,7 +365,8 @@ def main():
         'tokenizer': args.tokenizer,
         'options': vars(args),
         'split_reports': reports,
-        'train_hash_ledger': ledger_info,
+        'train_hash_ledger': train_ledger_info,
+        'validation_hash_ledger': val_ledger_info,
         'problems': problems,
     }
     if problems:

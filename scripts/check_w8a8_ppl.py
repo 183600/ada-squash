@@ -187,7 +187,7 @@ def _probe_markov(rng, batch_size, seq_len, device, n_states=64):
     x, _ = markov_batch(rng, -100, batch_size, seq_len, device, n_states=n_states)
     return x
 
-def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None, dataset_revision=None, tokenizer_revision=None):
+def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None, exclude_test_hash_file=None, dataset_revision=None, tokenizer_revision=None):
     # Scoring a checkpoint on the documents it trained on understates the
     # quantization damage; the probe must come from a held-out split. The
     # default is the chronological validation slice, and the cleaning policy
@@ -201,6 +201,7 @@ def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, 
                            num_documents=num_documents, dedup=dedup,
                            min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars,
                            exclude_hash_file=exclude_hash_file,
+                           exclude_test_hash_file=exclude_test_hash_file,
                            dataset_revision=dataset_revision,
                            tokenizer_revision=tokenizer_revision)
     loader = build_dataloader(dataset, dataset_config, seq_len, batch_size, tokenizer=tokenizer)
@@ -450,7 +451,7 @@ def main():
             # the revision the checkpoint recorded, else upstream default branch.
             dataset_revision = args.dataset_revision if args.dataset_revision is not None else ckpt_args.get('dataset_revision')
             tokenizer_revision = args.tokenizer_revision if args.tokenizer_revision is not None else ckpt_args.get('tokenizer_revision')
-            dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision) if args.probe == 'dataset' else None
+            dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), exclude_test_hash_file=ckpt_args.get('exclude_test_hash_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision) if args.probe == 'dataset' else None
             raw_seed = ckpt_args.get('seed')
             train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
             # One fp32 snapshot of the weights on the host: the in-place

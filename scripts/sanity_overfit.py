@@ -129,6 +129,7 @@ def make_batch(task: str, args, cfg: GPTConfig, device: str):
         data_args = argparse.Namespace(
             val_frac=0.005, test_frac=0.005, num_documents=args.num_documents,
             dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None,
+            exclude_test_hash_file=None,
             train_shuffle_buffer=0, seed=args.seed,
             dataset=args.dataset, dataset_config=args.dataset_config,
             tokenizer=args.tokenizer, seq_len=args.seq_len,

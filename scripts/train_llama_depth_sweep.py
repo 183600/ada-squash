@@ -519,6 +519,8 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
         cmd.append('--no-dedup')
     if args.exclude_hash_file:
         cmd += ['--exclude-hash-file', str(args.exclude_hash_file)]
+    if args.exclude_test_hash_file:
+        cmd += ['--exclude-test-hash-file', str(args.exclude_test_hash_file)]
     if args.dataset_revision:
         cmd += ['--dataset-revision', str(args.dataset_revision)]
     if args.tokenizer_revision:
@@ -587,6 +589,7 @@ def main():
     p.add_argument('--max-doc-chars', type=int, default=0)
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
     p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger shared by every depth/norm row (build it once with scripts/audit_data.py --write-train-hash-file)')
+    p.add_argument('--exclude-test-hash-file', default=None, help='validation-document hash ledger shared by every depth/norm row (build it once with scripts/audit_data.py --write-val-hash-file); keeps the sealed test disjoint from the validation used for checkpoint selection')
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='packed training-batch shuffle window (0 = off)')
     p.add_argument('--tokenizer', default='HuggingFaceFW/fineweb-edu/llama-tokenizer')
     p.add_argument('--seq-len', type=int, default=2048)

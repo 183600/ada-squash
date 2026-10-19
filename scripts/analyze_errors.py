@@ -101,7 +101,8 @@ def _dataset_batches(args, model, device):
         dataset=args.dataset, dataset_config=args.dataset_config, tokenizer=args.tokenizer,
         val_frac=args.val_frac, test_frac=args.test_frac, num_documents=args.num_documents,
         dedup=not args.no_dedup, min_doc_chars=args.min_doc_chars, max_doc_chars=args.max_doc_chars,
-        exclude_hash_file=args.exclude_hash_file, train_shuffle_buffer=0,
+        exclude_hash_file=args.exclude_hash_file,
+        exclude_test_hash_file=args.exclude_test_hash_file, train_shuffle_buffer=0,
         seed=args.seed, seq_len=args.seq_len, batch_size=args.batch_size,
     )
     loader = open_data_split(args.split, namespace)
@@ -836,15 +837,19 @@ def main():
     p.add_argument('--max-doc-chars', type=int, default=0)
     p.add_argument('--no-dedup', action='store_true')
     p.add_argument('--exclude-hash-file', default=None)
+    p.add_argument('--exclude-test-hash-file', default=None)
+    p.add_argument('--allow-sealed-test', action='store_true', help="permit inspecting the sealed test split; reading its error cases and iterating turns test into an implicit validation set, so use --split validation unless this is the single final diagnosis")
     args = p.parse_args()
     args.topk = max(1, int(args.topk))
     if args.n_batches < 1:
         p.error(f'--n-batches {args.n_batches} must be >= 1')
+    if args.corpus == 'dataset' and args.split == 'test' and (not args.allow_sealed_test):
+        p.error("--corpus dataset --split test inspects the sealed test split; reading its "
+                "error cases and iterating turns test into an implicit validation set. Use "
+                "--split validation, or pass --allow-sealed-test for the single final diagnosis.")
     if args.corpus == 'dataset' and args.split == 'test':
-        print("[errors] WARNING: --corpus dataset --split test inspects the sealed test split; "
-              "reading its error cases and iterating turns test into an implicit validation "
-              "set. Use --split validation unless this is the single final diagnosis.",
-              file=sys.stderr)
+        print("[errors] WARNING: inspecting the sealed test split (--allow-sealed-test); "
+              "this must remain the single final diagnosis.", file=sys.stderr)
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     set_all_seeds(args.seed)
     model, model_args = load_ckpt(args.ckpt, device=device)
