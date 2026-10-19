@@ -344,10 +344,10 @@ def run_one(norm: str, args, device: str) -> dict:
     from scripts.train_gpt2 import build_optimizer
     opt = build_optimizer(model, args.lr, 0.0, 0.9, 0.95)
 
-    # The logits path necessarily materializes a (rows, vocab) block, so the
-    # equality check between the two loss paths runs on a bounded prefix
-    # slice: causal attention makes every kept position's logits independent
-    # of the dropped suffix, so the comparison is exact.
+    # The logits path computes full logits, so the equality check between the
+    # two loss paths runs on a bounded prefix slice: causal attention makes
+    # every kept position's logits independent of the dropped suffix, so the
+    # comparison is exact.
     b_ref = min(int(x.shape[0]), 2)
     t_ref = min(int(x.shape[1]), 64)
     x_ref, y_ref = x[:b_ref, :t_ref], y[:b_ref, :t_ref]
@@ -374,10 +374,7 @@ def run_one(norm: str, args, device: str) -> dict:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
         # `loss` is only read for the initial value and the logged rows, and
-        # the log condition already covers step 1 and the last step. Reading
-        # it inside the branch keeps every reported value bit-identical while
-        # dropping the per-step `.item()`, which forced a device sync and
-        # stopped the host from running ahead of the device between steps.
+        # the log condition already covers step 1 and the last step.
         if step == 1 or step % args.log_every == 0 or step == args.max_steps:
             final_loss = float(loss.detach().item())
             if initial_loss is None:

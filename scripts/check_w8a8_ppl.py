@@ -33,7 +33,7 @@ _W8A8_SEED_METRIC_KEYS = ('ppl_fp', 'ppl_w8a8', 'ppl_drop', 'ppl_drop_pct',
                           'probe_token_coverage')
 
 def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
-    # `ord=inf` vector norm is max(|w|) without materializing the `abs` copy.
+    # `ord=inf` vector norm is max(|w|).
     mx = torch.linalg.vector_norm(w, ord=float('inf'), dim=-1, keepdim=True).clamp_(min=1e-06)
     q_max = 2 ** (n_bits - 1) - 1
     scale = mx / q_max
@@ -98,7 +98,7 @@ def wrap_swiglu_w8a8(mlp):
     for lin in (mlp.w1, mlp.w2, mlp.w3):
         qw, _ = quantize_weight_per_channel(lin.weight.data)
         _install_quantized_weight(lin, qw)
-        # Keep the parameter storage (one copy), not the temporary `qw`.
+        # The wrapped forward reads the parameter storage.
         weights.append(lin.weight)
     qa = quantize_activation_per_token
 
@@ -154,11 +154,9 @@ def wrap_model_w8a8(model: nn.Module):
 def compute_ce_sum(model, batch, target, device='cuda'):
     """`(sum of loss*N, N)` as device scalars; callers accumulate on device.
 
-    Keeping the pair on the device lets a whole probe run pay one `.item()`
-    at the end instead of two D2H syncs per batch; the loss is widened to
-    fp64 before the multiply so the accumulated total matches the historical
-    host fp64 accumulation. `model.eval()` is the caller's responsibility
-    (once per model, not once per batch).
+    The pair stays on the device; the loss is widened to fp64 before the
+    multiply so the accumulated total is fp64. `model.eval()` is the caller's
+    responsibility (once per model, not once per batch).
     """
     batch = batch.to(device)
     target = target.to(device)

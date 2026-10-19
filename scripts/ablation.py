@@ -470,8 +470,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                        f"(train {last_curve['train_trend']}, val {last_curve['val_trend']}, gap={gap_str})")
     print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} "
           f"max_abs_pre_norm={summary['max_abs_pre_norm']}{final_curve}")
-    # Rows run back-to-back in one process, so the shape-keyed CE scratch
-    # cache is dropped when this row finishes.
+    # Drop the per-row scratch caches.
     clear_ce_scratch_cache()
     return summary
 
@@ -662,8 +661,8 @@ def _seed_means(row) -> dict:
     """{seed: val_loss} for every row shape.
 
     Aggregates carry a `per_seed` list; a single-run summary (no `per_seed`)
-    still identifies its seed, so a legacy single-seed row can pair with the
-    same seed inside a newer aggregate.
+    still identifies its seed, so it can pair with the same seed inside an
+    aggregate.
     """
     per = row.get('per_seed')
     out = {}

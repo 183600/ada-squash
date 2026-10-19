@@ -179,17 +179,10 @@ class CausalSelfAttention(nn.Module):
         drop = self._tril_mask(T, device)
         k_t = k.transpose(-1, -2)
         buf = self._logit_scratch(B, H, min(rows, T), T, q.dtype, q.device)
-        # `block.sum(dtype=reduce_dtype)` on a low-precision block materializes
-        # a full fp32 copy of the block per call (three per row block). One
-        # exact fp32 image of the block is taken instead and every reduction
-        # runs on it, so the transient churn is a single reusable buffer.
+        # Reductions run on a matching-precision image of the block.
         work = buf if reduce_dtype == q.dtype else self._logit_scratch(B, H, min(rows, T), T, reduce_dtype, device)
-        # The logit scale is a fixed positive scalar, so it is folded into the
-        # scalar accumulators instead of being applied to every block: the
-        # scaled statistics are `s*sum(x)`, `s*sum|x|`, `s*max|x|` and
-        # `s^2*sum(x^2)`. The accumulators are float64, so re-associating the
-        # factor there is far below their precision, and one full read/write
-        # pass over the causal sweep disappears.
+        # Scaled statistics: `s*sum(x)`, `s*sum|x|`, `s*max|x|`, `s^2*sum(x^2)`,
+        # accumulated in float64.
         scale_sq = scale * scale
         block = None
         for start in range(0, T, rows):

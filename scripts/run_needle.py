@@ -178,12 +178,12 @@ def main():
     p.add_argument('--compare-to', default=None, help='reference checkpoint to compare against with the same placement seeds; adds paired McNemar + per-seed paired t to the payload (the comparison --ckpt vs --compare-to)')
     p.add_argument('--ctx-lens', nargs='+', type=int, default=[512, 1024, 2048, 4096])
     p.add_argument('--trials', type=int, default=20, help='independent placements per seed; the Wilson interval covers these trials only, the cross-seed Mean +/- Std covers placement draws')
-    p.add_argument('--decode-batch', type=int, default=8, help='independent trials decoded per forward pass (bounds peak memory; the per-trial prefix is still recomputed every step)')
+    p.add_argument('--decode-batch', type=int, default=8, help='independent trials decoded per forward pass (the per-trial prefix is still recomputed every step)')
     p.add_argument('--tokenizer', default='gpt2')
     p.add_argument('--secret', default='The magic number is 98765.')
     p.add_argument('--output', default=None)
     p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; when given it overrides --seeds (one placement draw - the Wilson interval then says nothing about placement variability)')
-    p.add_argument('--seeds', nargs='+', type=int, default=None, help='placement seeds; the whole evaluation is repeated once per seed and reported as cross-seed Mean +/- Std with a t interval over the seed means (default: [0], the legacy single draw)')
+    p.add_argument('--seeds', nargs='+', type=int, default=None, help='placement seeds; the whole evaluation is repeated once per seed and reported as cross-seed Mean +/- Std with a t interval over the seed means (default: a single placement draw)')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests (e.g. "DyT-CD retains needle accuracy at 4k tokens"); recorded in the manifest so a pass/fail is auditable as a test rather than a fishing trip')
     p.add_argument('--max-failure-examples', type=int, default=3, help='bad-case samples to print per context length (all failures are kept in the JSON)')
     args = p.parse_args()
@@ -208,8 +208,7 @@ def main():
     comparison = None
     if args.compare_to:
         # The candidate's results are plain Python records, so the model is
-        # released before the reference is loaded: two checkpoints resident at
-        # once would double the parameter footprint for no benefit.
+        # released before the reference is loaded.
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

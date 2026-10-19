@@ -8,7 +8,7 @@ use_layerscale: false
 # aggregates Mean +/- Std across seeds into <output_dir>/aggregate.json.
 # Seeds are the unit of replication (>= 3), because one run cannot separate
 # the normalization effect from run-to-run noise. Pass `--seeds <one>` for the
-# single-run layout in place, or the legacy `--seed N` shorthand.
+# single-run layout in place, or the `--seed N` shorthand.
 seeds: [42, 43, 44]
 
 dataset: HuggingFaceFW/fineweb-edu

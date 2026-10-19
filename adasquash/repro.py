@@ -237,11 +237,9 @@ def file_fingerprint(path) -> dict:
 def artifact_record(path) -> dict:
     """Cheap pointer to a run artifact: path, existence, size and mtime.
 
-    Manifests reference files whose sha256 is not affordable per run (training
-    checkpoints are multi-GB) or not useful (a log that is still growing);
-    size+mtime detects a changed/replaced artifact without reading it. Use
-    `file_fingerprint` when a content hash of a small file (ledger, report) is
-    what pins the version.
+    Size+mtime detects a changed/replaced artifact without reading it; use
+    `file_fingerprint` when a content hash of a small file (ledger, report)
+    is what pins the version.
     """
     p = Path(path)
     if not p.exists():

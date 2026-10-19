@@ -311,14 +311,9 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     def flush_history() -> None:
         """Atomically persist the curve so far.
 
-        `history.json` used to be written only after a successful loop, so a
-        NaN abort, OOM or external kill lost the training curve exactly when
-        it matters most for diagnosis. Rewriting the (small) list every
-        `--log-every` steps keeps the file current; tmp+rename keeps readers
-        from ever seeing a partial write. Each row is materialized exactly
-        once (its device tensors are converted when first flushed): re-reading
-        the whole curve every flush would re-sync every past row, O(n^2) in
-        the step count.
+        Rewriting the (small) list every `--log-every` steps keeps the file
+        current; tmp+rename keeps readers from ever seeing a partial write.
+        Each row is serialized exactly once.
         """
         while len(history_rows) < len(history):
             history_rows.append(_serialize_row(history[len(history_rows)]))
@@ -468,8 +463,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             save_run_manifest(manifest_path, run_manifest)
             print(f"[moe][track] run did not finish: partial curve in "
                   f"{output_dir / 'history.json'}, manifest marked failed", flush=True)
-        # Training is over (or aborted): release the shape-keyed CE scratch
-        # blocks instead of keeping them for the rest of the process.
+        # Training is over (or aborted): drop the per-run scratch caches.
         clear_ce_scratch_cache()
 
 def aggregate_moe_seed_results(results: list, seeds) -> dict:

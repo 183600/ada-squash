@@ -76,8 +76,7 @@ def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
     for _ in range(max(0, warmup)):
         fn()
     if _is_cuda(device):
-        # Event burst: every iteration is enqueued back-to-back and the host
-        # syncs once at the end.
+    # CUDA events around each iteration; one sync at the end.
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
         ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
         _sync(device)
@@ -104,8 +103,7 @@ def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
 def measure_peak_memory(fn, device: str):
     if not _is_cuda(device):
         return None
-    # Dropping the scratch caches first keeps the first measured norm
-    # comparable to the rest.
+    # Drop the scratch caches so every norm is measured from the same state.
     clear_ce_scratch_cache()
     clear_logit_scratch_cache()
     clear_cast_weight_cache()
@@ -129,8 +127,7 @@ def measured_forward_flops(fn, tokens: int):
 
 
 def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy: bool=True) -> dict:
-    # Drop the previous norm's autocast casts before its replacement is built:
-    # the cache pins the old model's weights until the next forward re-casts.
+    # Drop the previous norm's autocast casts before the next model is built.
     clear_cast_weight_cache()
     # Build on the benchmark device and skip the constructor init pass;
     # `reset_parameters(args.seed)` below is the single seeded init.
@@ -140,10 +137,9 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     model.to(device)
     model.train()
     vocab = int(model.cfg.vocab_size)
-    # Common random numbers: every norm is measured on the *same* tokens. A
-    # per-norm draw from the global RNG would depend on how much RNG the norm's
-    # init consumed (parameter counts differ), so the timed steps would not be
-    # input-comparable across norms.
+    # Common random numbers: every norm is measured on the *same* tokens (a
+    # per-norm draw from the global RNG would not be input-comparable across
+    # norms).
     gen = torch.Generator(device=device)
     gen.manual_seed(args.seed)
     x = torch.randint(0, vocab, (args.batch_size, args.seq_len), generator=gen, device=device)
@@ -171,8 +167,7 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     fwd_timing = measure_timed(forward, args.iters, args.warmup, device)
     train_timing = measure_timed(train_step, args.iters, args.warmup, device)
-    # Memory and FlopCounterMode are the same for every round of the same
-    # norm; measuring them once is enough.
+    # Memory and FlopCounterMode are recorded once per norm.
     if measure_heavy:
         fwd_mem = measure_peak_memory(forward, device)
         train_mem = measure_peak_memory(train_step, device)
@@ -496,8 +491,8 @@ def main():
                         f"per token = per step / (batch*seq)"),
             'flops': 'analytic = matmul FLOPs per token; measured = torch FlopCounterMode forward',
             'memory': 'peak CUDA allocated; null on CPU',
-            'inputs': ('common random numbers: one Generator seeded with --seed draws the '
-                       'timed x/y for every norm, so a slower step is not a different input'),
+            'inputs': ('common random numbers: one Generator seeded with --seed '
+                       'draws the x/y for every norm'),
         },
         'run_metadata': collect_run_metadata(seed=args.seed),
     }

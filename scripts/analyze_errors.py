@@ -135,8 +135,7 @@ def _prev_majority(prev_gold_counts, vocab):
 
     Kept model-independent and shared by the single-model and paired passes, so
     both classify the same context-ambiguity evidence. The input is the
-    device-side `(unique keys, counts)` histogram, materialized to the host in
-    one copy at the end of the scan.
+    device-side `(unique keys, counts)` histogram.
     """
     prev_gold = Counter()
     if prev_gold_counts is not None:
@@ -227,8 +226,8 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     ignore = int(cfg.ignore_index)
     vocab = int(cfg.vocab_size)
     target_counts = torch.zeros(vocab, dtype=torch.long)
-    # Confusion-matrix marginals for the named F1 report: the three per-class
-    # counts are accumulated instead of the full pred/gold lists.
+    # Confusion-matrix marginals for the named F1 report: per-class
+    # predict/gold/correct counts.
     pred_counts = torch.zeros(vocab, dtype=torch.long)
     correct_counts = torch.zeros(vocab, dtype=torch.long)
     # Ranking-metric diagnostics: the class set is fixed from the first batch
@@ -256,13 +255,10 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             tail = rng.sample(tail_pool, min(k - len(head), len(tail_pool)))
             auc_class_ids = sorted(head + tail)
     # All scan counters are device tensors. Each batch's `(key, count)` bigram
-    # histogram is kept whole and merged once after the pass: re-running
-    # `unique` over the growing accumulated histogram every batch was O(n^2)
-    # in the number of scanned keys.
+    # histogram is kept whole and merged once after the pass.
     dev = next(model.parameters()).device
     prev_gold_parts: list = []   # per-batch (unique keys, counts)
-    # The fixed AUC class columns are materialized once on the model's device
-    # instead of rebuilt per position chunk.
+    # The fixed AUC class columns live on the model's device.
     auc_ids_t = torch.as_tensor(auc_class_ids, device=dev) if auc_class_ids else None
     n_tokens_t = torch.zeros((), dtype=torch.long, device=dev)
     n_correct_t = torch.zeros((), dtype=torch.long, device=dev)
@@ -309,8 +305,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             y_b = y[b0:b1]
             # `norm_f` and `lm_head` are per-position, so the vocabulary
             # projection runs one position chunk at a time: `--eval-chunk`
-            # now bounds the logits buffer instead of only the downstream
-            # statistics of a fully materialized `(rows, T, vocab)` block.
+            # bounds the logits buffer.
             with torch.no_grad():
                 hidden = model.forward_hidden(x[b0:b1])
             for t0 in range(0, T, chunk):
@@ -475,9 +470,7 @@ def _chunk_stats(logits_chunk, gold, topk, mask):
     """Per-position prediction statistics of one chunk, for pairing two models.
 
     Rank and top-k membership are only evaluated on the `mask` (valid target)
-    positions: the former's `(P, V)` comparison tensor and the latter's top-k
-    values are the chunk's biggest temporaries and ignore_index positions
-    never contribute a statistic.
+    positions; ignore_index positions never contribute a statistic.
     """
     probs = torch.softmax(logits_chunk.detach().float(), dim=-1)
     pred = probs.argmax(-1)
@@ -552,12 +545,10 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
       property of either model's mechanism;
     * the cost side (parameters, analytic FLOPs) of both checkpoints travels
       in the same report, so a fixed-minus-broken count is read next to what
-      the candidate costs (wall-clock latency and memory are measured by
-      `scripts/benchmark_efficiency.py`, not guessed here).
+      the candidate costs.
 
-    The AUC block is deliberately not duplicated here: it is a single-model
-    ranking diagnostic, and running it for two models would double the
-    softmax cost of the error scan without sharpening the pairing.
+    The AUC block is not duplicated here: it is a single-model ranking
+    diagnostic, and it would not sharpen the pairing.
     """
     ref_cfg, cand_cfg = reference_model.cfg, candidate_model.cfg
     if int(ref_cfg.vocab_size) != int(cand_cfg.vocab_size):
@@ -752,8 +743,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     cost['params_ratio_candidate_over_reference'] = (cand_params / ref_params) if ref_params else None
     cost['flops_ratio_candidate_over_reference'] = (cand_flops / ref_flops) if ref_flops else None
     cost['note'] = ('parameters and analytic matmul FLOPs at the analysis seq_len; norm layers '
-                    'are elementwise so they barely move FLOPs - measure wall-clock latency and '
-                    'memory with scripts/benchmark_efficiency.py before calling a win viable')
+                    'are elementwise so they barely move FLOPs')
 
     bigram_correct = sum(count for _, count in prev_majority.values())
     mcnemar = mcnemar_test(n_fixed, n_broken)
@@ -931,8 +921,7 @@ def main():
               f"(x{cost['params_ratio_candidate_over_reference']:.4f}), "
               f"flops/token={cost['reference']['flops_per_token_forward']:.4g} -> "
               f"{cost['candidate']['flops_per_token_forward']:.4g} "
-              f"(x{cost['flops_ratio_candidate_over_reference']:.4f}); "
-              "latency/memory via scripts/benchmark_efficiency.py")
+              f"(x{cost['flops_ratio_candidate_over_reference']:.4f})")
         print(f"[pair] reference causes (scanned reference errors): "
               f"{report['reference_cause_distribution']}")
         print(f"[pair] candidate causes (scanned candidate errors): "

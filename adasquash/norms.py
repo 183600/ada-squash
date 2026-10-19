@@ -41,8 +41,7 @@ def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
     """Whether the compensating `±1` multiply has to run.
 
     Multiplying by `+1.0` is exact, so when no `scale` entry is negative the
-    full-tensor correction is a no-op. The `signbit().any()` probe is a
-    `[dim]` reduction; non-CPU tensors keep the multiply unconditionally.
+    correction is a no-op; non-CPU tensors keep the multiply unconditionally.
     `signbit` (rather than `< 0`) is what makes `-0.0` count as negative.
     """
     if scale.device.type != 'cpu':

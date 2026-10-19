@@ -76,9 +76,8 @@ def _snapshot_rng_state() -> dict:
 def _atomic_torch_save(obj, path: Path) -> None:
     """Serialize to a sibling `.tmp` file, then atomically replace `path`.
 
-    A checkpoint (model + optimizer + scheduler) can be ~1.5GB; writing it
-    straight to the target means a crash or full disk leaves a truncated file
-    where the previous usable best/periodic checkpoint used to be.
+    Writing straight to the target means a crash or full disk leaves a
+    truncated file where a usable checkpoint used to be.
     """
     tmp = path.with_name(path.name + '.tmp')
     try:
@@ -94,10 +93,8 @@ def _atomic_torch_save(obj, path: Path) -> None:
 def _load_checkpoint_cpu(path) -> dict:
     """Load a checkpoint on CPU (memory-mapped when the format allows).
 
-    A training checkpoint holds model + AdamW state (~3x the model bytes).
-    Loading it with `map_location=device` puts all of it in VRAM before any of
-    it is needed; mapping the file read-only keeps the unused optimizer
-    moments off the GPU, and the caller drops the entries once copied.
+    The caller drops the optimizer/scheduler entries once the weights have
+    been copied.
     """
     try:
         return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
@@ -603,7 +600,7 @@ def main():
     p.add_argument('--run-name', default=None)
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this run tests; recorded in the run manifest (and checkpoint args) so a result can be audited against the claim it was meant to support, the same contract the ablation matrix enforces per row')
     p.add_argument('--resume', default=None, help='checkpoint to resume from')
-    p.add_argument('--resume-skip-data', action='store_true', help='do NOT fast-forward the training dataloader past the batches the checkpoint already consumed (faster, but the resumed run replays training data)')
+    p.add_argument('--resume-skip-data', action='store_true', help='do NOT fast-forward the training dataloader past the batches the checkpoint already consumed (the resumed run then replays training data)')
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [DEFAULT_SEED])
@@ -992,7 +989,7 @@ def main():
                 continue
             nonfinite_streak = 0
             last_train_loss = loss_val
-            # Clipped every step; materialized below only when logging.
+            # Grad-norm clipping; the value is read only when logging.
             grad_norm_t = None
             if args.grad_clip > 0:
                 grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -1176,9 +1173,8 @@ def main():
             'flops_per_token_training_est': flops['training_per_token'],
         }
         # Point the manifest at the files this run actually produced: the log
-        # (content hash, it is small) plus the checkpoints (size+mtime; hashing
-        # multi-GB files per run is not affordable). A result is then
-        # traceable to the exact curve/weights behind it.
+        # (content hash, it is small) plus the checkpoints (size+mtime). A
+        # result is then traceable to the exact curve/weights behind it.
         run_manifest['artifacts'] = {
             'train_jsonl': file_fingerprint(log_path),
             'checkpoint_final': artifact_record(Path(args.output_dir) / 'ckpt_final.pt'),
@@ -1303,9 +1299,7 @@ def main():
                 print(f'[track] run did not finish: manifest marked interrupted at step {step}', flush=True)
             except OSError:
                 pass
-    # The shape-keyed CE scratch blocks are only useful while this model keeps
-    # training; drop them so any embedding caller reusing this module starts
-    # clean.
+    # Drop the per-run scratch caches.
     clear_ce_scratch_cache()
 if __name__ == '__main__':
     main()

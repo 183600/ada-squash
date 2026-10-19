@@ -507,9 +507,9 @@ def f1_from_counts(
     The three vectors are the class marginals of the confusion matrix:
     `gold_counts[c]` support of class `c`, `pred_counts[c]` how often class
     `c` was predicted, `correct_counts[c]` their overlap (the diagonal).
-    Streaming evaluations (a 50k-token vocabulary over millions of tokens)
-    accumulate these vectors instead of the full `pred`/`gold` lists; the
-    semantics are identical to `macro_weighted_f1`, which delegates here.
+    Streaming evaluations accumulate these vectors instead of the full
+    `pred`/`gold` lists; the semantics are identical to `macro_weighted_f1`,
+    which delegates here.
 
     * `macro_f1`: unweighted mean of per-class F1 over classes occurring in
       `gold` or `pred`. Every class counts once, so rare classes are not
@@ -754,8 +754,7 @@ def binary_auc_report(
     rows = list(scores)
     if len(rows) != len(gold):
         raise ValueError(f"score-row/gold length mismatch: {len(rows)} vs {len(gold)}")
-    # One C-level transpose instead of rebuilding the full N x K matrix and
-    # then copying a column out of it per class.
+    # One column per class.
     cols = list(zip(*rows)) if rows else []
     if cols and len(cols) != len(classes):
         raise ValueError(

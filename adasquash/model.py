@@ -578,9 +578,8 @@ class GPT(nn.Module):
         if last_position_only:
             x = x[:, -1:]
         if return_hidden:
-            # Pre-`norm_f` block output; `norm_f` and `lm_head` are per-position,
-            # so callers can project the vocabulary dimension in position
-            # chunks instead of materializing `(rows, T, vocab)` at once.
+            # Pre-`norm_f` block output; `norm_f` and `lm_head` are
+            # per-position, so callers can project position chunks.
             if return_stats:
                 return (x, None, all_logit_stats)
             return (x, None)

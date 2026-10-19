@@ -80,7 +80,7 @@ def shape_for_depth(depth: int, base_dim: int, base_heads: int):
 
 def seed_dir(cell_dir: Path, seed: int, multi: bool) -> Path:
     """Per-seed run directory: `seed{N}/` once replicated, the cell dir itself
-    for the legacy single-seed layout."""
+    for a single-seed layout."""
     return cell_dir / f'seed{seed}' if multi else cell_dir
 
 def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
@@ -685,8 +685,8 @@ def main():
             raise SystemExit(
                 '[sweep] --max-parallel > 1 requires --gpus: without it every '
                 'child inherits the ambient CUDA_VISIBLE_DEVICES and would train '
-                'on the same (default cuda:0) device at once, which OOMs the 1B '
-                'cells. Pass --gpus 0 1 ... or keep --max-parallel 1.'
+                'on the same (default cuda:0) device at once. Pass --gpus 0 1 ... '
+                'or keep --max-parallel 1.'
             )
         if max_parallel > len(gpus):
             print(f'[sweep][warn] --max-parallel {max_parallel} exceeds the '
@@ -737,7 +737,7 @@ def main():
                 line += (f"; final_val_loss={final_mean:.4f}{final_std_str} "
                          f"over {agg['n_seeds_final']} seed(s) [fixed-step estimate]")
             else:
-                line += '; final_val_loss missing (legacy manifest) - cannot compare cells on the fixed-step estimate'
+                line += '; final_val_loss missing from the manifest - cannot compare cells on the fixed-step estimate'
             print(line)
         else:
             print(f"[sweep] d{depth}-{norm}: no usable best_val_loss in the run manifests")
@@ -755,7 +755,7 @@ def main():
                       f"{off}: the pooled val_loss describes that regime as much as the norm; "
                       f"read the per-seed curves before attributing depth/norm effects")
         else:
-            print(f"[sweep] d{depth}-{norm}: no curve diagnosis in the run manifests (legacy run)")
+            print(f"[sweep] d{depth}-{norm}: no curve diagnosis in the run manifests")
         if agg.get('n_params') is not None:
             eff = f"[sweep] d{depth}-{norm}: n_params={agg['n_params'] / 1e6:.2f}M"
             if agg.get('dim') is not None:

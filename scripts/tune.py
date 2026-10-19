@@ -450,7 +450,7 @@ def main():
     p.add_argument('--margin', type=float, default=0.0, help='minimum val_loss improvement over the tuned baseline to count as a win')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided test')
     p.add_argument('--output-dir', default='runs/tune')
-    p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check once per swept norm before the grid (default: on; a broken gradient/loss path would otherwise burn the whole lr x seed grid)')
+    p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check once per swept norm before the grid (default: on; a broken gradient/loss path is caught before the grid runs)')
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check')
     p.add_argument('--force', action='store_true', help='rerun trials even if a summary already exists')
     args = p.parse_args()
@@ -479,9 +479,9 @@ def main():
     if args.sanity_check:
         # One preflight for the grid: `run_one` trains every arm through the
         # same model/loss plumbing, so a single per-norm overfit check catches
-        # a broken gradient/loss path before thousands of trial steps are
-        # spent. The architecture comes from the same table the ablation rows
-        # use, so the check exercises this model shape.
+        # a broken gradient/loss path before the grid runs. The architecture
+        # comes from the same table the ablation rows use, so the check
+        # exercises this model shape.
         from scripts.sanity_overfit import run_preflight
         from scripts.train_gpt2 import _MODEL_SHAPES
         n_layers, dim, n_heads = _MODEL_SHAPES.get(args.model, _MODEL_SHAPES['gpt2-124m'])

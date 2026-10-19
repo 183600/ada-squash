@@ -45,8 +45,7 @@ class MaxAbsMeter:
         self.count += 1
 
 # One workspace pair per (name, device, dtype), shared by every meter: the
-# sampling hooks run one at a time, so a single pair serves all norms instead
-# of each meter pinning its own buffers for the rest of the run.
+# sampling hooks run one at a time, so a single pair serves all norms.
 _KURTOSIS_WORKSPACES: dict = {}
 _KURTOSIS_WORKSPACES_MAX_ENTRIES = 8
 
@@ -191,8 +190,7 @@ class ActivationStats:
         for h in self.handles:
             h.remove()
         self.handles = []
-        # The accumulators stay (pooling across windows), the scratch does
-        # not: it is rebuilt lazily by the next sampled activation.
+        # The accumulators stay (pooling across windows).
         release_kurtosis_workspaces()
 
     def summary(self) -> dict:

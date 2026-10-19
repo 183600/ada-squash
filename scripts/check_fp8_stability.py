@@ -67,8 +67,7 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
     """Round `x` to the fp8 grid (fp32 math throughout).
 
     `inplace=True` means the caller hands over ownership of an fp32 `x` (e.g. a
-    fresh `F.linear` output) and gets the result written back into it; the
-    frexp/mantissa/compare scratch is always reused.
+    fresh `F.linear` output) and gets the result written back into it.
     """
     in_dtype = x.dtype
     if inplace and in_dtype == torch.float32:
@@ -189,7 +188,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
             y = out[0] if isinstance(out, tuple) else out
             all_finite = torch.isfinite(y).all()
             first_bad.append((i, all_finite))
-            # max(|y|) without materializing a full-size `y.abs()`.
+            # max(|y|).
             first_over.append((i, torch.maximum(y.max(), -y.min())))
         return hook
     with torch.no_grad():
@@ -216,8 +215,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags) if not ok), None)
     first_over_idx = next((i for i, v in zip([i for i, _ in first_over], over_vals) if v > FP8_E4M3_MAX), None)
-    # Compare against the fp32 logits row-block by row-block, keeping the
-    # fp32 copy on the host.
+    # Compare against the fp32 logits row-block by row-block.
     max_abs_fp32 = torch.maximum(logits_fp32.max(), -logits_fp32.min()).cpu()
     logits_fp32_cpu = logits_fp32.detach().to('cpu')
     del logits_fp32
@@ -236,7 +234,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
         max_diff = diff if max_diff is None else torch.maximum(max_diff, diff)
     del logits_fp32_cpu
     if finite:
-        # Same fp32 tensor division as the old one-shot path.
+        # Division in fp32.
         rel = float(max_diff / max_abs_fp32.clamp(min=1e-12))
         logit_nan = False
     else:

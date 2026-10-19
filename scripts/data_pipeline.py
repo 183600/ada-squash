@@ -131,7 +131,7 @@ def resolve_dataset_revision(dataset_name: str, revision=None) -> str | None:
     fact. Resolving it to the current Hub commit hash and recording that hash
     in the split report / run manifest is what makes the trained-on data
     version auditable (and, because it enters the materialized-cache key, a
-    moved upstream branch can no longer silently reuse the old cache). When
+    moved upstream branch cannot silently reuse a stale cache). When
     the Hub is unreachable the resolution degrades to the requested value (or
     None) instead of failing the run.
     """
@@ -280,9 +280,8 @@ def load_hash_file(path) -> set:
 
     Accepts a JSON list of hex digests or whitespace/newline separated hex
     digests and returns the set of raw digest bytes. The line-oriented form
-    (what the writer now emits) is read incrementally so a million-document
-    ledger never materializes a single multi-hundred-MB string; the legacy
-    JSON-list form (which must be parsed in one piece) is still accepted.
+    (what the writer emits) is read incrementally; the JSON-list form (which
+    must be parsed in one piece) is accepted as well.
     """
     out: set = set()
     with open(path, "r", encoding="utf-8") as f:
@@ -393,12 +392,9 @@ class PackedStream(IterableDataset):
         self.cleaner = cleaner if cleaner is not None else DocumentCleaner()
         self.shuffle_buffer = int(shuffle_buffer or 0)
         self.seed = int(seed)
-        # A one-dimensional long tensor plus integer offsets: the old Python
-        # list boxed every token and rebuilt each window element by element
-        # (`torch.tensor(list_slice)`) with an O(remaining) `del buf[:pos]`
-        # shift per refill. The tokenizer returns Python ints, so the tensor
-        # is filled by copying small per-document chunks; windows are cloned
-        # out of it with a memcpy.
+        # A one-dimensional long tensor plus integer offsets. The tokenizer
+        # returns Python ints, so the tensor is filled by copying small
+        # per-document chunks; windows are cloned out of it.
         self.buf: torch.Tensor | None = None
         self.fill = 0
         self.pos = 0

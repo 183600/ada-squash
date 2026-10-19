@@ -22,12 +22,9 @@ def _strip_compile_prefix(state):
 def _load_checkpoint_cpu(path: str) -> dict:
     """Load a checkpoint on CPU, memory-mapped when the file format allows it.
 
-    Training checkpoints carry the optimizer state (AdamW keeps two fp32
-    moments per parameter, ~2x the model bytes); `map_location='cuda'` would
-    deserialize all of that straight into VRAM and keep it alive through the
-    returned dict even though the evaluation paths only read weights. The
-    file is mapped read-only and the optimizer/scheduler entries are dropped
-    as soon as `load_state_dict` has copied what is needed.
+    Training checkpoints carry optimizer/scheduler entries that evaluation
+    does not need; they are dropped as soon as `load_state_dict` has copied
+    the weights, and only `args` travels back to the caller.
     """
     try:
         return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
@@ -44,9 +41,8 @@ def load_ckpt(path: str, device: str='cuda'):
         model_cfg['tie_word_embeddings'] = args['tie_embeddings']
     elif 'no_tie_embeddings' in args:
         model_cfg['tie_word_embeddings'] = not args['no_tie_embeddings']
-    # The checkpoint's weights overwrite every parameter, and the model is
-    # built straight on the target device: the constructor's init pass and the
-    # full-model H2D copy are both skipped.
+    # The checkpoint's weights overwrite every parameter, so the model is
+    # built with `init=False` straight on the target device.
     with torch.device(device):
         if args['model'] == 'gpt2-124m':
             model = build_gpt_124m(init=False, **model_cfg)
@@ -68,16 +64,15 @@ def load_ckpt(path: str, device: str='cuda'):
         with torch.device(device):
             model = GPT(GPTConfig(**cfg_dict), init=False)
     model.load_state_dict(_strip_compile_prefix(ckpt['model']))
-    # The backing file is released as soon as the heavyweight entries are
-    # dropped; only `args` travels back to the caller.
+    # Drop the heavyweight entries; only `args` travels back to the caller.
     ckpt.pop('model', None)
     ckpt.pop('optimizer', None)
     ckpt.pop('scheduler', None)
     model.to(device)
     model.eval()
     # Evaluation switches between models in-process (per-task loops, sweeps),
-    # so the shape-keyed CE scratch cache and the autocast weight casts are
-    # dropped between models; nothing downstream depends on cache residency.
+    # so the per-model scratch caches are dropped between models; nothing
+    # downstream depends on cache residency.
     clear_ce_scratch_cache()
     clear_cast_weight_cache()
     return (model, args)
@@ -185,8 +180,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
             n_rows = len(group)
             seq_len = len(group[0][1])
             buf = torch.empty((n_rows, seq_len + len(target_ids)), dtype=torch.long, device=device)
-            # One host construction + one H2D for the whole decode batch
-            # instead of a per-row `torch.tensor(full, device=...)`.
+            # Host construction for the whole decode batch.
             host = torch.tensor([full for _, full in group], dtype=torch.long)
             buf[:, :seq_len].copy_(host, non_blocking=True)
             generated: list[list] = [[] for _ in range(n_rows)]
@@ -200,8 +194,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                     step_logits, _ = model(ctx)
                     step_logits = step_logits[:, -1]
                 nxt = step_logits.argmax(-1)
-                # Device-side comparison: only the rows that actually diverged
-                # get materialized.
+                # Only rows that diverged are examined individually.
                 neq = nxt != want
                 if bool(neq.any().item()):
                     bad_rows = neq.nonzero(as_tuple=True)[0].tolist()
@@ -216,8 +209,8 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                         generated[i].append(nxt_i)
                         row_logits = step_logits[i]
                         probs = torch.softmax(row_logits.float(), dim=-1)
-                        # O(V) rank: how many logits beat the expected token
-                        # (0-based); no full argsort of the 50k-way row.
+                        # Rank (0-based): how many logits beat the expected
+                        # token.
                         rank = int((row_logits > row_logits[want]).sum().item())
                         top_prob = float(probs[nxt_i].item())
                         in_context = bool((buf[i, :n] == nxt_i).any().item())
@@ -288,7 +281,7 @@ def main():
     p.add_argument('--needle-test', action='store_true', help='also run needle-in-haystack')
     p.add_argument('--needle-context-len', type=int, default=None, help="needle context length (default: the checkpoint's trained seq_len, or its max_seq_len minus the positions the secret's decode needs when the checkpoint records no seq_len - so a model trained short is not silently evaluated at an extrapolated length; asking for more than max_seq_len raises)")
     p.add_argument('--tokenizer', default='gpt2')
-    p.add_argument('--decode-batch', type=int, default=8, help='independent needle trials decoded per forward pass (bounds peak memory; each step still recomputes the whole prefix)')
+    p.add_argument('--decode-batch', type=int, default=8, help='independent needle trials decoded per forward pass (each step still recomputes the whole prefix)')
     p.add_argument('--seed', type=int, default=0, help='seed for the needle-position and generation RNGs')
     p.add_argument('--output', default=None)
     args = p.parse_args()

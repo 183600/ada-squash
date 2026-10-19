@@ -49,17 +49,13 @@ from scripts.data_pipeline import DocumentCleaner, document_hash, load_document_
 def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, collect_hashes=True):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
-    # One machine-word int per document instead of a boxed Python int (~28
-    # bytes): an exhaustive audit streams millions of documents and the
-    # length list is live for the whole split.
+    # One machine-word int per document.
     lengths = array('q')
     # Token ids are counted in a fixed `vocab_size + 1` numpy array, one
-    # `np.bincount` per tokenized document, so a full audit (--n-docs 0) never
-    # retains the token stream (the old list-of-arrays + single concatenate
-    # held, and then doubled, every id of the split). Documents are tokenized
-    # in batches, with a per-document fallback so one bad document is still
-    # counted (and skipped) instead of losing the whole batch. Ids that cannot
-    # go through bincount (negative) keep the legacy Python-counter path.
+    # `np.bincount` per tokenized document. Documents are tokenized in
+    # batches, with a per-document fallback so one bad document is still
+    # counted (and skipped) instead of losing the whole batch. Ids that
+    # cannot go through bincount (negative) use the Python-counter path.
     counts = None
     text_batch: list = []
     legacy_tokens: Counter = Counter()
@@ -78,8 +74,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         if arr.size == 0:
             return
         if arr.min() < 0:
-            # np.bincount rejects negatives; keep the legacy path for a
-            # tokenizer that emits them (they still get flagged below).
+            # np.bincount rejects negatives; a tokenizer that emits them
+            # still gets counted here (and flagged below).
             legacy_tokens.update(arr.tolist())
             return
         bc = np.bincount(arr)
@@ -238,10 +234,9 @@ def main():
     train_hashes = None
     ledger_info = None
     for name in ('train', 'validation', 'test'):
-        # Only the train split's hash set is ever read (the `--exclude-hash-file`
-        # ledger and the held-out overlap reference), so the val/test digests
-        # are not accumulated: the overlap probe compares against `train_hashes`
-        # without needing a set of its own.
+        # Only the train split's hash set is read (the `--exclude-hash-file`
+        # ledger and the held-out overlap reference); the overlap probe
+        # compares against `train_hashes`.
         stats, tok_counter, report, hashes = _collect_split(
             name, args.dataset, args.dataset_config, tokenizer, options,
             args.n_docs, args.min_doc_chars, args.max_doc_chars, args.dedup,
@@ -254,10 +249,8 @@ def main():
             if args.write_train_hash_file:
                 ledger = Path(args.write_train_hash_file)
                 ledger.parent.mkdir(parents=True, exist_ok=True)
-                # One hex digest per line, streamed: `json.dumps` on a full
-                # million-document ledger built a single multi-hundred-MB
-                # string. `load_hash_file` accepts this whitespace-separated
-                # form (and still reads the legacy JSON-list files).
+                # One hex digest per line. `load_hash_file` accepts this
+                # whitespace-separated form (and also reads JSON-list files).
                 with open(ledger, 'w', encoding='utf-8') as f:
                     for h in sorted(hashes):
                         f.write(h.hex() + '\n')
