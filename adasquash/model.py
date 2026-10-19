@@ -175,8 +175,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         grad_logits = torch.empty_like(logits)
         grad_scale = (grad_out / ctx.count.clamp(min=1)).to(logits.dtype)
         chunk_rows = ctx.chunk_rows
-        # The row mask and the scatter source only depend on the targets, so
-        # they are built once instead of once per chunk.
+        # The row mask and the scatter source depend only on the targets.
         valid = targets.ne(ctx.ignore_index)
         gold = targets.masked_fill(~valid, 0).unsqueeze(-1)
         keep = valid.unsqueeze(-1).to(logits.dtype)
@@ -291,7 +290,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         buf_rows = min(chunk_rows, n)
         probs = None
         cast_buf = None
-        # Target-only row mask and scatter source, built once for all chunks.
+        # Target-only row mask and scatter source.
         valid = targets.ne(ctx.ignore_index)
         gold = targets.masked_fill(~valid, 0).unsqueeze(-1)
         keep = valid.unsqueeze(-1).to(acc)
@@ -327,9 +326,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                     grad_h[start:end].copy_(hgrad)
             if need_w:
                 # An fp32 weight takes the accumulator-dtype probabilities in
-                # `buf`, even under autocast. A low-precision weight can reuse
-                # the low-precision `g` already built for the input gradient
-                # (when that gradient is requested) instead of casting `buf`.
+                # `buf`, even under autocast. A low-precision weight uses the
+                # low-precision `g` when the input gradient is requested.
                 w_probs = g if (need_h and acc != dt) else buf
                 if w_probs.dtype == grad_w.dtype and hc.dtype == grad_w.dtype:
                     if first:
@@ -337,10 +335,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                     else:
                         grad_w.addmm_(w_probs.t(), hc)
                 elif grad_w.dtype == acc:
-                    # Mixed input dtypes cannot feed a single GEMM, but both
-                    # operands share the accumulator dtype after casting `hc`;
-                    # the full vocab gradient fits the output buffer, so one
-                    # GEMM per chunk is enough.
+                    # Mixed input dtypes cannot feed a single GEMM; cast `hc`
+                    # so both operands share the accumulator dtype.
                     hcf = hc.to(acc)
                     if first:
                         torch.mm(buf.t(), hcf, out=grad_w)

@@ -168,7 +168,7 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     fwd_timing = measure_timed(forward, args.iters, args.warmup, device)
     train_timing = measure_timed(train_step, args.iters, args.warmup, device)
-    # Memory and FlopCounterMode are recorded once per norm.
+    # Measure both quantities once per norm.
     if measure_heavy:
         fwd_mem = measure_peak_memory(forward, device)
         train_mem = measure_peak_memory(train_step, device)
@@ -328,7 +328,7 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', default=None)
     p.add_argument('--reference', default='ln', help='reference norm for the cost ratios')
-    # cost-adjusted accuracy comparison (optional)
+    # ratio-adjusted accuracy comparison (optional)
     p.add_argument('--summaries', default=None, help='ablation all_summaries.json to join held-out losses with the measured cost')
     p.add_argument('--comparison', default=None, help='baseline_comparison.json for significance gates; defaults to the sibling of --summaries')
     p.add_argument('--reference-name', default='ln_baseline', help='baseline row in --summaries')
@@ -384,12 +384,12 @@ def main():
         significance = load_significance(comparison_path)
         if significance:
             print(f"[tradeoff] significance gate -> {comparison_path}")
-        # The candidate cost is measured here for the same model/norm; the
-        # reference cost is the --reference norm's measurement. The benchmark
+        # The candidate measurement is taken here for the same model/norm;
+        # the reference measurement is the --reference norm's. The benchmark
         # only builds the base norm, so a row whose trained architecture
         # differs beyond that base (qk_norm / activation / parameterization
-        # variants) gets a proxy cost: flagged per row instead of silently
-        # substituting the model.
+        # variants) gets a proxy measurement: flagged per row instead of
+        # silently substituting the model.
         by_norm = {r['norm']: r for r in results}
         cand_cfgs = load_row_cfgs(args.summaries)
         rows = []
@@ -426,10 +426,8 @@ def main():
                     return None
                 return float(a) / float(b)
 
-            # The prompt's trade-off is multi-dimensional: a gain must not buy
-            # a 10x parameter/FLOP/memory blow-up just because the primary
-            # latency ratio stayed small. All measured axes travel into the
-            # verdict; an unmeasured axis is None, never silently "passing".
+            # Every measured axis is part of the verdict; an unmeasured axis
+            # is None, never silently "passing".
             components = {
                 'params': _ratio('n_params'),
                 'analytic_flops_forward_per_token': (

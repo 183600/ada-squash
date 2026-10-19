@@ -923,8 +923,7 @@ def main():
         # The early-stop streak is run state like the best tracker: restarting
         # it at 0 would hand a resumed run a fresh patience window, so it can
         # train past the step an uninterrupted run would have stopped at.
-        # Checkpoints written after this field existed carry the exact streak;
-        # older ones restart at 0 (the previous behavior) with a note.
+        # Older checkpoints do not carry the streak and restart at 0.
         saved_no_improve = resume_ckpt.get('val_checks_without_improvement')
         if saved_no_improve is not None:
             val_checks_without_improvement = max(0, int(saved_no_improve))
@@ -1347,8 +1346,7 @@ def main():
             'curve_steps': curve_steps,
             'curve_diagnosis': last_diagnosis,
             'curve_diagnosis_history': diagnosis_history,
-            # Efficiency accounting travels with the accuracy numbers: parameters
-            # by role and the analytic matmul FLOPs per token.
+            # Model accounting travels with the accuracy numbers.
             'n_params': n_params,
             'n_trainable': n_trainable,
             # Shape accounting: the depth sweep scales dim/heads with depth to hold

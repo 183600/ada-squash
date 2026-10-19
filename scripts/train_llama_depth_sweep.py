@@ -174,9 +174,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
             curve_counts[p['curve_classification']] = curve_counts.get(p['curve_classification'], 0) + 1
     gaps = [p['curve_generalization_gap'] for p in per_seed
             if _finite(p.get('curve_generalization_gap'))]
-    # Efficiency accounting pooled next to the losses: the shared recipe
-    # (same dim/heads per depth) makes n_params and FLOPs/token identical
-    # across a cell's seeds, so any cross-seed spread here is a red flag.
+    # Model accounting pooled next to the losses: the shared recipe
+    # (same dim/heads per depth) makes these quantities identical across a
+    # cell's seeds, so any cross-seed spread here is a red flag.
     params = [p['n_params'] for p in per_seed if _finite(p.get('n_params'))]
     layers = [p['n_layers'] for p in per_seed if _finite(p.get('n_layers'))]
     dims = [p['dim'] for p in per_seed if _finite(p.get('dim'))]

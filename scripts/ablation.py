@@ -470,11 +470,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         'seed': seed,
     }
     summary = {'name': name, 'hypothesis': hypothesis, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'seed': seed, 'seeds': [seed], 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'val_losses': val_losses, 'val_loss_std': val_stats['std'], 'val_loss_stderr': val_stats['stderr'], 'val_loss_std_basis': 'val_batches', 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'controls': controls, 'elapsed_s': time.time() - t0}
-    # Efficiency accounting travels with every row, not only with the
-    # separate benchmark run: parameters by role and analytic matmul FLOPs
-    # per token make each row's loss a costed result (the norm math itself is
-    # elementwise, so the FLOPs expose backbone-level differences; wall-clock
-    # latency is measured by scripts/benchmark_efficiency.py).
+    # Per-row model accounting is stored next to the loss.
     summary['parameter_breakdown'] = param_breakdown
     summary['flops_per_token_forward'] = flops['forward_per_token']
     summary['flops_per_token_training_est'] = flops['training_per_token']
