@@ -381,8 +381,7 @@ def run_one(norm: str, args, device: str) -> dict:
             history.append({"step": step, "loss": loss_val,
                             "accuracy": final_metrics["accuracy"],
                             "macro_f1": final_metrics["macro_f1"]})
-    # `final_loss` must describe the same (post-step) parameters as
-    # `final_metrics`; the value logged inside the loop is the pre-step loss.
+    # Final loss and metrics are measured on the final parameters.
     with torch.no_grad(), ctx:
         final_loss = float(model(x, y, return_logits=False)[1].detach().item())
     final_metrics = next_token_metrics(model, x, y, ctx=ctx)

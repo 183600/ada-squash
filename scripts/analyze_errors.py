@@ -630,8 +630,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
                 n_fixed_t += selectors['fixed'].sum()
                 n_broken_t += selectors['broken'].sum()
                 n_both_wrong_t += selectors['both_wrong'].sum()
-                # Exact over every token, not only the capped scan sample: both
-                # arms confident *and* agreeing on the same wrong token.
+                # Both arms confident and agreeing on the same wrong token.
                 n_both_wrong_confident_t += (
                     selectors['both_wrong']
                     & (stats_ref['pred'] == stats_cand['pred'])

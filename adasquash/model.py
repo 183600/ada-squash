@@ -268,11 +268,9 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         grad_h = torch.empty_like(h) if need_h else None
         grad_h_tmp = None
         if need_h and h.dtype != hidden_dtype:
-            # Under autocast the GEMM produces a low-precision tile while the
-            # caller needs the gradient in the input dtype. Allocating the
-            # full gradient in that dtype up front (and writing each chunk
-            # through a small scratch) avoids keeping a second full-size
-            # low-precision copy alive just to cast it at the end.
+            # The GEMM produces a low-precision tile while the caller needs
+            # the gradient in the input dtype; each chunk is written through
+            # a small temporary in the GEMM dtype.
             grad_h = torch.empty((targets.numel(), h.shape[1]), dtype=hidden_dtype, device=h.device)
             grad_h_tmp = torch.empty((min(chunk_rows, targets.numel()), h.shape[1]), dtype=h.dtype, device=h.device)
         # The weight gradient accumulates into its final buffer from the first
@@ -336,11 +334,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                 else:
                     # Mixed dtypes cannot write into `grad_w` directly
                     # (`torch.mm`'s out tensor must have the product's dtype),
-                    # so the product is reduced in vocab blocks. `buf` still
-                    # holds the same probabilities in the accumulator dtype
-                    # (before the low-precision `cast` copy), so the GEMM reads
-                    # it directly instead of casting the low-precision copy
-                    # back block by block.
+                    # so the product is reduced in vocab blocks from `buf`,
+                    # which holds the accumulator-dtype probabilities.
                     hcf = hc.to(acc)
                     block = max(1, (_CROSSENTROPY_CHUNK_BYTES // 4)
                                 // max(1, hcf.shape[1] * hcf.element_size()))

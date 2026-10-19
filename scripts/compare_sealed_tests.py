@@ -290,8 +290,7 @@ def main():
             b = [ref_seed_means[s] for s in common]
             test = paired_t_one_sided(a, b, margin=args.margin, alpha=args.alpha)
             row["basis"] = "seed_means"
-            # The headline mean/std must describe the same seeds the delta
-            # pairs, not every seed the candidate happened to run.
+            # Headline mean/std over the seeds used by the paired test.
             paired_stats = mean_std_stderr(a)
             row["mean"] = paired_stats["mean"]
             row["std"] = paired_stats["std"] if paired_stats["n"] >= 2 else None

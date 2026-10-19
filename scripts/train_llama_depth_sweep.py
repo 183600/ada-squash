@@ -705,9 +705,7 @@ def main():
             print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
     else:
         # A bounded launch queue: at most `max_parallel` training children
-        # alive at once, each pinned to a currently free GPU. The launch index
-        # is not a device index: a finished job returns its device to the pool
-        # instead of letting a later launch collide with a still-running cell.
+        # alive at once, each pinned to a currently free GPU.
         running: list = []
         busy_gpus: set = set()
         next_job = 0
