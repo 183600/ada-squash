@@ -335,6 +335,9 @@ def main():
     p.add_argument('--candidate', nargs='+', default=[], help='candidate row names in --summaries to judge against the reference')
     p.add_argument('--min-loss-gain', type=float, default=DEFAULT_MIN_LOSS_GAIN)
     p.add_argument('--max-cost-ratio', type=float, default=DEFAULT_MAX_COST_RATIO)
+    p.add_argument('--max-component-ratio', type=float, default=None,
+                   help='allowed candidate/reference ratio for each secondary cost axis '
+                        '(params, FLOPs, forward latency, peak memory); defaults to --max-cost-ratio')
     p.add_argument('--require-viable', action='store_true', help='exit 1 when a candidate is not viable at the given margins')
     p.add_argument('--output', default='runs/efficiency/efficiency.json')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this benchmark tests (e.g. "DyT-CD reaches a lower loss per point of training cost than RMSNorm at the same lr"); recorded in the report and manifest so the tradeoff verdict is auditable against a claim')
@@ -416,10 +419,36 @@ def main():
                           f"(proxy cost)")
             loss_improvement = losses[args.reference_name] - cand_loss
             cost_ratio = cand_bench['training_latency_ms_per_token'] / ref_bench['training_latency_ms_per_token']
+
+            def _ratio(key):
+                a, b = cand_bench.get(key), ref_bench.get(key)
+                if a is None or b is None or float(b) == 0.0:
+                    return None
+                return float(a) / float(b)
+
+            # The prompt's trade-off is multi-dimensional: a gain must not buy
+            # a 10x parameter/FLOP/memory blow-up just because the primary
+            # latency ratio stayed small. All measured axes travel into the
+            # verdict; an unmeasured axis is None, never silently "passing".
+            components = {
+                'params': _ratio('n_params'),
+                'analytic_flops_forward_per_token': (
+                    (cand_bench.get('analytic_flops') or {}).get('forward_per_token')
+                    / (ref_bench.get('analytic_flops') or {}).get('forward_per_token')
+                    if (cand_bench.get('analytic_flops') and ref_bench.get('analytic_flops')
+                        and (ref_bench.get('analytic_flops') or {}).get('forward_per_token'))
+                    else None),
+                'forward_latency': _ratio('forward_latency_ms_per_token'),
+                'training_latency': cost_ratio,
+                'peak_inference_memory': _ratio('peak_inference_memory_mb'),
+                'peak_training_memory': _ratio('peak_training_memory_mb'),
+            }
             verdict = efficiency_verdict(loss_improvement, cost_ratio,
                                          min_loss_gain=args.min_loss_gain,
                                          max_cost_ratio=args.max_cost_ratio,
-                                         cost_name='training_latency')
+                                         cost_name='training_latency',
+                                         cost_components=components,
+                                         max_component_ratio=args.max_component_ratio)
             # A gain the seed-level ablation could not call significant is
             # weak evidence: block viability until a longer/multi-seed run
             # clears the significance bar.

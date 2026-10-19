@@ -211,6 +211,74 @@ def open_data_split(split: str, args, seq_len: int | None = None):
     )
     return build_dataloader(args.dataset, args.dataset_config, seq_len or args.seq_len, args.batch_size, tokenizer=args.tokenizer)
 
+def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
+    """Run the bad-case analysis as a reproducible post-training step.
+
+    A final loss says *how often* the model is wrong; the error taxonomy and
+    printed examples say *why*, which is where the next hypothesis comes from.
+    The data flags (including pinned revisions/ledgers) are forwarded exactly
+    as the run used them, so the analyzed held-out documents are the ones the
+    checkpoint was selected on. Failure is reported in the manifest, not
+    raised: the training result is already complete and must remain readable.
+    """
+    out_path = output_dir / 'error_analysis_validation.json'
+    if not args.dataset or not args.tokenizer:
+        reason = ('the run has no --dataset/--tokenizer to reproduce the held-out '
+                  'documents from; run scripts/analyze_errors.py manually with the '
+                  'matching data flags if this was intentional')
+        print(f'[errors][warn] skipping bad-case analysis: {reason}', file=sys.stderr)
+        return {'ran': False, 'returncode': None, 'checkpoint': str(ckpt_path),
+                'split': 'validation', 'artifact': None, 'reason': reason}
+    if not Path(ckpt_path).exists():
+        reason = f'checkpoint {ckpt_path} does not exist'
+        print(f'[errors][warn] skipping bad-case analysis: {reason}', file=sys.stderr)
+        return {'ran': False, 'returncode': None, 'checkpoint': str(ckpt_path),
+                'split': 'validation', 'artifact': None, 'reason': reason}
+    cmd = [
+        sys.executable, str(ROOT / 'scripts' / 'analyze_errors.py'),
+        '--ckpt', str(ckpt_path), '--corpus', 'dataset', '--split', 'validation',
+        '--dataset', str(args.dataset),
+        '--tokenizer', str(args.tokenizer),
+        '--val-frac', str(args.val_frac), '--test-frac', str(args.test_frac),
+        '--min-doc-chars', str(args.min_doc_chars),
+        '--max-doc-chars', str(args.max_doc_chars),
+        '--num-workers', str(args.num_workers),
+        '--seq-len', str(args.seq_len),
+        '--n-batches', str(args.error_analysis_batches),
+        '--max-examples', str(args.error_analysis_examples),
+        '--confidence', str(args.error_analysis_confidence),
+        '--seed', str(args.seed), '--output', str(out_path),
+    ]
+    for flag, value in (
+        ('--dataset-config', args.dataset_config),
+        ('--dataset-revision', args.dataset_revision),
+        ('--tokenizer-revision', args.tokenizer_revision),
+        ('--num-documents', args.num_documents),
+        ('--exclude-hash-file', args.exclude_hash_file),
+        ('--exclude-test-hash-file', args.exclude_test_hash_file),
+        ('--group-key', args.group_key),
+        ('--exclude-group-file', args.exclude_group_file),
+        ('--exclude-test-group-file', args.exclude_test_group_file),
+    ):
+        if value is not None:
+            cmd += [flag, str(value)]
+    if not args.dedup:
+        cmd.append('--no-dedup')
+    print(f'[errors] bad-case analysis on {ckpt_path.name} over the validation split '
+          f'({args.error_analysis_batches} batches) -> {out_path}', flush=True)
+    rc = subprocess.run(cmd, cwd=str(ROOT)).returncode
+    if rc != 0:
+        print(f'[errors][warn] analyze_errors.py exited rc={rc}; no error_analysis '
+              f'artifact was recorded', file=sys.stderr)
+    return {
+        'ran': rc == 0,
+        'returncode': rc,
+        'checkpoint': str(ckpt_path),
+        'split': 'validation',
+        'artifact': file_fingerprint(out_path) if out_path.exists() else None,
+        'command': cmd,
+    }
+
 def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, collect: list | None = None, cycle: bool = True) -> float | None:
     """Mean loss over held-out batches; `state['iter']` carries the position.
 
@@ -236,6 +304,8 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     total = None
     n = 0
     terms: list = [] if collect is not None else None
+    # A previous non-finite hold must not be attributed to this pass.
+    state.pop('nonfinite_batch', None)
     with torch.inference_mode():
         for _ in range(max(1, int(n_batches))):
             if it is None:
@@ -260,6 +330,11 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
             # Accumulate in a device fp64 scalar; fp64 keeps the sequential
             # summation bit-identical to host float accumulation.
             term = loss.detach().double()
+            if not bool(torch.isfinite(term).item()) and 'nonfinite_batch' not in state:
+                # Keep the first offending batch/point so the caller can run
+                # the ordered data -> math -> precision -> gradients triage
+                # on the *held-out* input instead of only seeing a NaN mean.
+                state['nonfinite_batch'] = (x, y, float(term))
             if terms is not None:
                 terms.append(term)
             total = term.clone() if total is None else total.add_(term)
@@ -391,6 +466,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             'final_val_step': None, 'best_val_step': None,
             'n_params': None, 'n_layers': None, 'dim': None, 'n_heads': None,
             'n_loss_spikes': None, 'n_nonfinite_losses': None,
+            'n_nonfinite_gradients': None, 'n_nonfinite_val_losses': None,
             'curve_classification': None, 'test_loss': None,
         }
         try:
@@ -407,6 +483,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                 record['n_heads'] = results.get('n_heads')
                 record['n_loss_spikes'] = results.get('n_loss_spikes')
                 record['n_nonfinite_losses'] = results.get('n_nonfinite_losses')
+                record['n_nonfinite_gradients'] = results.get('n_nonfinite_gradients')
+                record['n_nonfinite_val_losses'] = results.get('n_nonfinite_val_losses')
                 curve = results.get('curve_diagnosis') or {}
                 record['curve_classification'] = curve.get('classification')
         except (OSError, json.JSONDecodeError):
@@ -453,6 +531,15 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'test_loss': None if test_stats is None else test_stats['mean'],
         'test_loss_std': None if test_stats is None or len(test_vals) < 2 else test_stats['std'],
         'test_loss_by_seed': {r['seed']: r['test_loss'] for r in per_seed},
+        # Numerical-health counters pooled across seeds: an arm whose mean
+        # covers triaged NaN gradient/validation events is not a clean
+        # replication of an arm with none.
+        'n_nonfinite_losses': sum(r['n_nonfinite_losses'] or 0 for r in per_seed
+                                  if isinstance(r.get('n_nonfinite_losses'), (int, float))),
+        'n_nonfinite_gradients': sum(r['n_nonfinite_gradients'] or 0 for r in per_seed
+                                     if isinstance(r.get('n_nonfinite_gradients'), (int, float))),
+        'n_nonfinite_val_losses': sum(r['n_nonfinite_val_losses'] or 0 for r in per_seed
+                                      if isinstance(r.get('n_nonfinite_val_losses'), (int, float))),
         'aggregation': (
             'Mean +/- Std across independent seed runs of the identical recipe (same optimizer, '
             'schedule, data protocol and step count). final_val_loss = last validation pass at the '
@@ -506,6 +593,15 @@ def launch_multi_seed(args, seeds) -> None:
     if agg['missing_seeds']:
         print(f'[seeds][warn] missing/unfinished seed runs: {agg["missing_seeds"]}; the pooled mean '
               f'covers {agg["n_seeds"]} of {agg["n_seeds_requested"]} requested seeds')
+    for label, key in (('training losses', 'n_nonfinite_losses'),
+                       ('gradient events', 'n_nonfinite_gradients'),
+                       ('validation losses', 'n_nonfinite_val_losses')):
+        n_bad = agg.get(key) or 0
+        if n_bad:
+            per_seed_hits = {r['seed']: r.get(key) for r in agg['per_seed'] if r.get(key)}
+            print(f'[seeds][warn] {n_bad} non-finite {label} across seeds {per_seed_hits}: '
+                  f'the pooled mean mixes triaged numerical failures into the arm; '
+                  f'read each seed manifest\'s triage evidence before comparing')
     print(f'[seeds] per-seed aggregate -> {base / "aggregate.json"}')
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
@@ -577,6 +673,10 @@ def main():
     p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first); per-batch losses and the data-pairing block are stored in test_results.json so scripts/compare_sealed_tests.py can test two arms on the shared sealed batches')
     p.add_argument('--allow-test-rerun', action='store_true', help='permit a second one-shot evaluation of the sealed test split in the same output dir (breaks the seal: the test set becomes an implicit validation set)')
     p.add_argument('--test-batches', type=int, default=20, help='batches for the one-shot final test evaluation')
+    p.add_argument('--error-analysis', action='store_true', help='after training, run scripts/analyze_errors.py on the best-validation checkpoint over the validation split: prints the mispredicted samples with their cause taxonomy (the main source of the next hypothesis) and records error_analysis_validation.json in the manifest')
+    p.add_argument('--error-analysis-batches', type=int, default=8, help='held-out batches scanned by --error-analysis')
+    p.add_argument('--error-analysis-examples', type=int, default=20, help='misclassified examples printed per cause bucket by --error-analysis')
+    p.add_argument('--error-analysis-confidence', type=float, default=0.8, help='pred_prob at/above which a wrong token is a confident blind spot in --error-analysis')
     p.add_argument('--min-doc-chars', type=int, default=0, help='drop documents shorter than this many characters (0 = keep all non-empty)')
     p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap)')
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable duplicate document removal (exact and canonical text)')
@@ -922,40 +1022,78 @@ def main():
         diagnosis_history: list = []
         last_diagnosis = None
         n_nonfinite_losses = 0
+        n_nonfinite_gradients = 0
+        n_nonfinite_val_losses = 0
         nonfinite_streak = 0
 
-        def _handle_nonfinite(step: int, x_bad, y_bad, bad_value: float) -> None:
-            """Ordered NaN triage: data -> fp32 math -> precision -> gradients."""
-            nonlocal n_nonfinite_losses, nonfinite_streak
-            n_nonfinite_losses += 1
+        def _triage_nonfinite(kind: str, step: int, x_bad, y_bad, bad_value: float,
+                              extra: dict | None = None, eval_mode: bool = False) -> dict:
+            """Ordered NaN triage + policy: data -> fp32 math -> precision -> gradients.
+
+            `kind` names which quantity first went non-finite (loss, gradient,
+            validation/test loss) but the probe order is always the same. The
+            policy is shared: `abort` stops, `skip` discards the offending
+            step/point, and 5 consecutive events stop regardless.
+            """
+            nonlocal n_nonfinite_losses, n_nonfinite_gradients
+            nonlocal n_nonfinite_val_losses, nonfinite_streak
+            if kind == 'loss':
+                n_nonfinite_losses += 1
+            elif kind == 'gradient':
+                n_nonfinite_gradients += 1
+            else:
+                n_nonfinite_val_losses += 1
             nonfinite_streak += 1
             lr_now = opt.param_groups[0]['lr']
-            triage = triage_nonfinite(
-                model, x_bad, y_bad,
-                autocast_dtype=dtype if (args.bf16 and device == 'cuda') else None,
-                device_type=device,
-                lr=lr_now, grad_clip=args.grad_clip,
-            )
-            print(f'[nan] step={step + 1} loss={bad_value} -> triage stage={triage["stage"]}: {triage["diagnosis"]}', flush=True)
+            was_training = model.training
+            if eval_mode:
+                # A held-out point was measured without dropout; re-running the
+                # probe in train mode could fail to reproduce it for a reason
+                # that has nothing to do with the failure.
+                model.eval()
+            try:
+                triage = triage_nonfinite(
+                    model, x_bad, y_bad,
+                    autocast_dtype=dtype if (args.bf16 and device == 'cuda') else None,
+                    device_type=device,
+                    lr=lr_now, grad_clip=args.grad_clip,
+                )
+            finally:
+                if eval_mode:
+                    model.train(was_training)
+            print(f'[nan] step={step + 1} {kind}={bad_value} -> triage stage={triage["stage"]}: {triage["diagnosis"]}', flush=True)
             for line in triage['recommendations']:
                 print(f'[nan]   fix: {line}')
             opt.zero_grad(set_to_none=True)
-            log_file.write(json.dumps({
-                'step': step + 1, 'event': 'nonfinite_loss', 'loss': bad_value,
+            event = {
+                'step': step + 1, 'event': f'nonfinite_{kind}', 'value': bad_value,
                 'lr': lr_now, 'triage_stage': triage['stage'],
                 'triage_diagnosis': triage['diagnosis'],
                 'triage_evidence': triage['evidence'],
                 'n_nonfinite_losses': n_nonfinite_losses,
-            }, default=str) + '\n')
+                'n_nonfinite_gradients': n_nonfinite_gradients,
+                'n_nonfinite_val_losses': n_nonfinite_val_losses,
+            }
+            if extra:
+                event.update(extra)
+            log_file.write(json.dumps(event, default=str) + '\n')
             log_file.flush()
             if args.nonfinite_policy == 'abort' or nonfinite_streak >= 5:
+                where = {
+                    'loss': 'the training loss',
+                    'gradient': 'the gradients after the backward pass',
+                    'validation_loss': 'a held-out validation loss',
+                    'test_loss': 'the sealed test loss',
+                }.get(kind, kind)
                 raise SystemExit(
-                    f'[nan] aborting at step {step + 1}: loss is non-finite and the triage '
+                    f'[nan] aborting at step {step + 1}: {where} is non-finite and the triage '
                     f'localized the first failure to stage "{triage["stage"]}". '
                     f'Fix it (or raise --grad-clip / lower --lr) before resuming from the '
                     f'last checkpoint; see the [nan] recommendations above.'
                 )
-            print(f'[nan] policy=skip: discarding step {step + 1} without an optimizer step', flush=True)
+            what = 'step' if kind in ('loss', 'gradient') else 'held-out point'
+            print(f'[nan] policy=skip: discarding this {what} (no metric/optimizer update)', flush=True)
+            return triage
 
         while step < args.max_steps:
             opt.zero_grad(set_to_none=True)
@@ -1014,15 +1152,25 @@ def main():
                 act_stats.detach()
                 clear_logit_scratch_cache()
             if nonfinite_batch is not None:
-                _handle_nonfinite(step, *nonfinite_batch)
+                _triage_nonfinite('loss', step, *nonfinite_batch)
                 continue
-            nonfinite_streak = 0
             last_train_loss = loss_val
-            # Grad-norm clipping; the value is read only when logging.
+            # Grad-norm clipping; the value is read only when logging. A
+            # non-finite return means the accumulated gradients already
+            # contain NaN/Inf: stepping now would write them into the weights
+            # and only surface as a NaN *loss* one step later, so the step is
+            # discarded through the same ordered triage instead.
             grad_norm_t = None
             if args.grad_clip > 0:
                 grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                grad_norm_check = float(grad_norm_t)
+                if not math.isfinite(grad_norm_check):
+                    opt.zero_grad(set_to_none=True)
+                    _triage_nonfinite('gradient', step, x, y, loss_val,
+                                      extra={'grad_norm_pre_clip': grad_norm_check})
+                    continue
             opt.step()
+            nonfinite_streak = 0
             sched.step()
             clear_cast_weight_cache()
             loss_spike.update(loss_val)
@@ -1053,6 +1201,18 @@ def main():
                         f'chronological boundary points past its end), the dataset/tokenizer revision '
                         f'changed, or the split fractions leave validation empty. Verify the split '
                         f'layout with scripts/audit_data.py before re-running.')
+                if val_loss is not None and not math.isfinite(val_loss):
+                    # A NaN/Inf held-out mean is a result-analysis failure,
+                    # not a number to plot: triage the actual validation
+                    # batch through the same ordered path as a training NaN.
+                    bad_val = val_state.get('nonfinite_batch')
+                    if bad_val is None:
+                        raise SystemExit(
+                            f'[val] step={step} held-out loss is non-finite ({val_loss}) but the '
+                            'offending batch was not captured; refuse to select a checkpoint '
+                            'or extend the curve with a corrupted number.')
+                    _triage_nonfinite('validation_loss', step, *bad_val, eval_mode=True)
+                    val_loss = None
                 if val_loss is not None:
                     last_val_loss = val_loss
                     last_val_step = step
@@ -1177,6 +1337,8 @@ def main():
             'final_val_loss_ci_high': final_val_stats['ci_high'] if final_val_stats else None,
             'n_loss_spikes': loss_spike.n_spikes,
             'n_nonfinite_losses': n_nonfinite_losses,
+            'n_nonfinite_gradients': n_nonfinite_gradients,
+            'n_nonfinite_val_losses': n_nonfinite_val_losses,
             'elapsed_s': time.time() - t0,
             # Curve monitoring: the full (train window, val) pairs and the latest
             # classification, so a reviewer can read the regime, not just the end.
@@ -1211,9 +1373,11 @@ def main():
         best_ckpt_path = Path(args.output_dir) / 'ckpt_best.pt'
         if best_ckpt_path.exists():
             run_manifest['artifacts']['checkpoint_best'] = artifact_record(best_ckpt_path)
-        if n_nonfinite_losses:
-            print(f'[warn] {n_nonfinite_losses} non-finite loss step(s) were handled by '
-                  f'--nonfinite-policy {args.nonfinite_policy}; see train.jsonl event rows')
+        if n_nonfinite_losses or n_nonfinite_gradients or n_nonfinite_val_losses:
+            print(f'[warn] non-finite events handled by --nonfinite-policy '
+                  f'{args.nonfinite_policy}: losses={n_nonfinite_losses}, '
+                  f'gradients={n_nonfinite_gradients}, '
+                  f'validation_losses={n_nonfinite_val_losses}; see train.jsonl event rows')
         save_run_manifest(manifest_path, run_manifest)
         # Training (and its manifest) is complete from here on: an optional
         # sealed-test evaluation or a tensorboard close failure below must not
@@ -1273,6 +1437,21 @@ def main():
             test_state = {'iter': iter(test_loader)}
             test_batch_losses: list = []
             test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device, collect=test_batch_losses, cycle=False)
+            if test_loss is not None and not math.isfinite(test_loss):
+                bad_test = test_state.get('nonfinite_batch')
+                if bad_test is None:
+                    raise SystemExit(
+                        '[test] the sealed test loss is non-finite but the offending batch was '
+                        'not captured; refusing to write test_results.json so the one-shot seal '
+                        'is not consumed by a corrupted measurement.')
+                _triage_nonfinite('test_loss', step, *bad_test, eval_mode=True)
+                # Even under --nonfinite-policy skip there is no valid number
+                # to write: consuming the seal with NaN would make the final
+                # evaluation unusable and block a clean re-run.
+                raise SystemExit(
+                    '[test] the sealed test loss is non-finite; test_results.json was not '
+                    'written, so the one-shot seal is still intact. Fix the failure localized '
+                    'by the [nan] triage and re-run the final evaluation.')
             if test_loss is None:
                 # Writing test_results.json now would consume the one-shot seal
                 # without any measurement: the next run would refuse to evaluate
@@ -1331,6 +1510,16 @@ def main():
                   else f"{100 * test_stats['ci_level']:.0f}% CI [{test_stats['ci_low']:.4f}, {test_stats['ci_high']:.4f}]")
             print(f'[test] sealed test split evaluated once: test_loss={test_loss:.4f} '
                   f'(n={len(test_batch_losses)} batches, stderr={test_stats["stderr"]:.4f}, {ci}) -> {out_path}')
+        if args.error_analysis:
+            best_path = Path(args.output_dir) / 'ckpt_best.pt'
+            analysis_ckpt = (best_path if val_loader is not None and best_path.exists()
+                             else Path(args.output_dir) / 'ckpt_final.pt')
+            error_analysis = run_error_analysis(args, analysis_ckpt, Path(args.output_dir))
+            run_manifest['results']['error_analysis'] = error_analysis
+            if error_analysis.get('artifact'):
+                run_manifest.setdefault('artifacts', {})[
+                    'error_analysis_validation'] = error_analysis['artifact']
+            save_run_manifest(manifest_path, run_manifest)
         if tb:
             tb.close()
         if args.wandb_project:

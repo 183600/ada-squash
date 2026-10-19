@@ -153,17 +153,29 @@ def mcnemar_test(n_fixed: int, n_broke: int) -> dict:
 
 
 def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
-    """Sample mean, sample std (ddof=1) and standard error of the mean."""
-    vals = [float(v) for v in values]
+    """Sample mean, sample std (ddof=1) and standard error of the mean.
+
+    Non-finite entries (NaN/Inf) are excluded from the statistics and counted
+    in ``n_nonfinite``; a single corrupted batch must not turn the whole
+    summary into `nan` (the caller can then see that the mean rests on fewer
+    points instead of silently quoting a poisoned number). If no finite value
+    remains, `None` is returned so the caller cannot mistake "no measurement"
+    for a result.
+    """
+    raw = [float(v) for v in values if v is not None]
+    vals = [v for v in raw if math.isfinite(v)]
+    n_nonfinite = len(raw) - len(vals)
     n = len(vals)
     if n == 0:
         return None
     mean = sum(vals) / n
     if n < 2:
-        return {"mean": mean, "std": 0.0, "stderr": 0.0, "n": n}
+        return {"mean": mean, "std": 0.0, "stderr": 0.0, "n": n,
+                "n_input": len(raw), "n_nonfinite": n_nonfinite}
     var = sum((v - mean) ** 2 for v in vals) / (n - 1)
     std = math.sqrt(var)
-    return {"mean": mean, "std": std, "stderr": std / math.sqrt(n), "n": n}
+    return {"mean": mean, "std": std, "stderr": std / math.sqrt(n), "n": n,
+            "n_input": len(raw), "n_nonfinite": n_nonfinite}
 
 
 def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:

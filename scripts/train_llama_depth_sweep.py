@@ -114,6 +114,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         flops_train = None
         spikes = None
         nonfinite = None
+        nonfinite_grad = None
+        nonfinite_val = None
         n_layers = None
         dim = None
         n_heads = None
@@ -138,6 +140,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
                 flops_train = results.get('flops_per_token_training_est')
                 spikes = results.get('n_loss_spikes')
                 nonfinite = results.get('n_nonfinite_losses')
+                nonfinite_grad = results.get('n_nonfinite_gradients')
+                nonfinite_val = results.get('n_nonfinite_val_losses')
         except (OSError, json.JSONDecodeError):
             pass
         per_seed.append({
@@ -153,6 +157,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
             'flops_per_token_training_est': flops_train,
             'n_loss_spikes': spikes,
             'n_nonfinite_losses': nonfinite,
+            'n_nonfinite_gradients': nonfinite_grad,
+            'n_nonfinite_val_losses': nonfinite_val,
         })
 
     def _pool(key: str):
@@ -238,6 +244,10 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
                              if isinstance(p.get('n_loss_spikes'), (int, float))),
         'n_nonfinite_losses': sum(p['n_nonfinite_losses'] or 0 for p in per_seed
                                   if isinstance(p.get('n_nonfinite_losses'), (int, float))),
+        'n_nonfinite_gradients': sum(p['n_nonfinite_gradients'] or 0 for p in per_seed
+                                     if isinstance(p.get('n_nonfinite_gradients'), (int, float))),
+        'n_nonfinite_val_losses': sum(p['n_nonfinite_val_losses'] or 0 for p in per_seed
+                                      if isinstance(p.get('n_nonfinite_val_losses'), (int, float))),
         'aggregation': ('Mean +/- Std across seeds (each seed is an independent run of the identical recipe). '
                         'best_val_loss = min over validation passes (checkpoint-selection statistic, optimistically biased); '
                         'final_val_loss = last validation pass (fixed-step estimate, comparable across cells when early stopping is off). '
@@ -251,7 +261,10 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
                         'the same depth is not affected. '
                         'missing_seeds = failed/unfinished runs, invalid_seeds = runs whose manifest reports '
                         'NaN/Inf; both are excluded from the mean but never from the report, because a cell with '
-                        'missing/invalid seeds is not a clean replication.'),
+                        'missing/invalid seeds is not a clean replication. '
+                        'n_nonfinite_losses / n_nonfinite_gradients / n_nonfinite_val_losses count triaged '
+                        'numerical events across the cell: > 0 means the pooled mean mixes explicitly handled '
+                        'failures into the arm and the triage evidence must be read before comparing.'),
     }
 
 def _cell_seed_metric(cell: dict, metric: str) -> dict:
@@ -790,9 +803,16 @@ def main():
             if train is not None:
                 eff += f" train_est={train / 1e6:.2f}M"
             print(eff)
-        if agg.get('n_nonfinite_losses'):
-            print(f"[sweep] WARNING: d{depth}-{norm}: {agg['n_nonfinite_losses']} non-finite "
-                  f"loss step(s) across seeds; triage with adasquash.diagnostics.triage_nonfinite")
+        bad_events = {label: agg.get(key) or 0 for label, key in (
+            ('loss step(s)', 'n_nonfinite_losses'),
+            ('gradient event(s)', 'n_nonfinite_gradients'),
+            ('validation loss(es)', 'n_nonfinite_val_losses'))}
+        if any(bad_events.values()):
+            summary = ', '.join(f"{v} {k}" for k, v in bad_events.items() if v)
+            print(f"[sweep] WARNING: d{depth}-{norm}: {summary} across seeds were handled by "
+                  f"the ordered triage; read the per-seed triage evidence before comparing "
+                  f"this cell (a cell with explicitly handled numerical failures is not a "
+                  f"clean replication)")
         if agg.get('missing_seeds'):
             print(f"[sweep] WARNING: d{depth}-{norm}: missing/unfinished runs for seeds "
                   f"{agg['missing_seeds']}; the pooled mean covers {agg['n_seeds']} of "

@@ -94,22 +94,29 @@ def _markov_batches(args, cfg, device):
         yield x, y
 
 
-def _dataset_batches(args, model, device):
+def _dataset_batches(args, model, device, report_sink: dict | None = None):
     from scripts.train_gpt2 import open_data_split
 
     namespace = argparse.Namespace(
         dataset=args.dataset, dataset_config=args.dataset_config, tokenizer=args.tokenizer,
+        dataset_revision=args.dataset_revision, tokenizer_revision=args.tokenizer_revision,
         val_frac=args.val_frac, test_frac=args.test_frac, num_documents=args.num_documents,
         dedup=not args.no_dedup, min_doc_chars=args.min_doc_chars, max_doc_chars=args.max_doc_chars,
         exclude_hash_file=args.exclude_hash_file,
         exclude_test_hash_file=args.exclude_test_hash_file,
         group_key=args.group_key, exclude_group_file=args.exclude_group_file,
         exclude_test_group_file=args.exclude_test_group_file, train_shuffle_buffer=0,
+        num_workers=getattr(args, 'num_workers', 2),
         seed=args.seed, seq_len=args.seq_len, batch_size=args.batch_size,
     )
     loader = open_data_split(args.split, namespace)
     report = getattr(loader, 'split_report', None)
     if report:
+        if report_sink is not None:
+            # Keep the resolved revisions/boundaries in the bad-case report:
+            # otherwise the analyzed documents cannot be audited against the
+            # checkpoint's training protocol after the fact.
+            report_sink['split_report'] = dict(report)
         print(f'[errors] data split report: {report}')
     n = 0
     for x, y in loader:
@@ -119,10 +126,40 @@ def _dataset_batches(args, model, device):
             break
 
 
-def _decode(ids, tokenizer):
-    if tokenizer is None:
-        return '#' + ' #'.join(str(int(i)) for i in ids)
-    return tokenizer.decode(ids, skip_special_tokens=False)
+def data_protocol_mismatches(args, model_args: dict) -> dict:
+    """Training-vs-analysis data-protocol differences that would invalidate pairing.
+
+    A bad-case report is only about the trained run if it reads the same
+    documents. The checkpoint's `args` records the split-defining flags, so
+    the analysis can compare its own settings with them instead of silently
+    sampling a different revision/fraction/ledger. Missing keys in old
+    checkpoints are treated as unknown, never as a match.
+    """
+    current = {
+        'dataset': args.dataset,
+        'dataset_config': args.dataset_config,
+        'dataset_revision': args.dataset_revision,
+        'tokenizer': args.tokenizer,
+        'tokenizer_revision': args.tokenizer_revision,
+        'val_frac': args.val_frac,
+        'test_frac': args.test_frac,
+        'num_documents': args.num_documents,
+        'dedup': not args.no_dedup,
+        'min_doc_chars': args.min_doc_chars,
+        'max_doc_chars': args.max_doc_chars,
+        'exclude_hash_file': args.exclude_hash_file,
+        'exclude_test_hash_file': args.exclude_test_hash_file,
+        'group_key': args.group_key,
+        'exclude_group_file': args.exclude_group_file,
+        'exclude_test_group_file': args.exclude_test_group_file,
+    }
+    out = {}
+    for key, value in current.items():
+        if key not in model_args:
+            continue
+        if model_args[key] != value:
+            out[key] = {'checkpoint': model_args[key], 'analysis': value}
+    return out
 
 
 def _quantile(values, q):
@@ -830,7 +867,10 @@ def main():
     # dataset-corpus options (must match the trained run's split protocol)
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
+    p.add_argument('--dataset-revision', default=None, help='pin the dataset revision (commit hash) exactly as the trained run did; without it the analysis can read a different upstream snapshot')
     p.add_argument('--tokenizer', default='gpt2')
+    p.add_argument('--tokenizer-revision', default=None, help='pin the tokenizer revision (commit hash) exactly as the trained run did')
+    p.add_argument('--num-workers', type=int, default=2)
     p.add_argument('--val-frac', type=float, default=0.005)
     p.add_argument('--test-frac', type=float, default=0.005)
     p.add_argument('--num-documents', type=int, default=None)
@@ -861,6 +901,19 @@ def main():
     # the printed/`config`-recorded topk names the key that is in the summary.
     args.topk = max(1, min(int(args.topk), max(1, int(model.cfg.vocab_size) - 1)))
     print(f"[errors] loaded {args.ckpt} | norm={model_args['norm']} | corpus={args.corpus} | device={device}")
+    protocol_mismatches = ({}
+                           if args.corpus != 'dataset'
+                           else data_protocol_mismatches(args, model_args))
+    if protocol_mismatches:
+        print('[errors] WARNING: the analysis data protocol differs from the checkpoint\'s '
+              'training protocol; the samples are not the ones the model was selected on:',
+              file=sys.stderr)
+        for key, diff in protocol_mismatches.items():
+            print(f"[errors]   {key}: checkpoint={diff['checkpoint']!r} "
+                  f"analysis={diff['analysis']!r}", file=sys.stderr)
+        print('[errors] pass the checkpoint\'s data flags (including --dataset-revision / '
+              '--tokenizer-revision) so the bad cases come from the same held-out documents.',
+              file=sys.stderr)
     reference_model = reference_args = None
     if args.reference_ckpt:
         reference_model, reference_args = load_ckpt(args.reference_ckpt, device=device)
@@ -882,14 +935,16 @@ def main():
         print(f"[errors] {label} checkpoint weights finite ({health['n_parameters']} tensors checked)")
 
     tokenizer = None
+    data_split: dict = {}
     if args.corpus == 'markov':
         batches = _markov_batches(args, model.cfg, device)
     else:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer,
+                                                  revision=args.tokenizer_revision)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
-        batches = _dataset_batches(args, model, device)
+        batches = _dataset_batches(args, model, device, report_sink=data_split)
 
     if reference_model is not None:
         report = analyze_pair(reference_model, model, batches, args,
@@ -905,6 +960,12 @@ def main():
                                 if isinstance(v, (str, int, float, bool, type(None)))}
         out = args.output or str(Path(args.ckpt).parent / f'error_analysis_{args.corpus}.json')
     report['config'] = vars(args)
+    # Resolved data identity of the batches the taxonomy was computed on
+    # (revisions, boundary points, hashes), captured from the loader while the
+    # batches were consumed - a bad-case report without it cannot be paired
+    # with the trained run it is meant to explain.
+    report['data_split'] = data_split.get('split_report')
+    report['data_protocol_mismatches'] = protocol_mismatches
     report['checkpoint_health'] = checkpoint_health
     report['run_metadata'] = collect_run_metadata(seed=args.seed)
 

@@ -347,7 +347,19 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                 act_stats.detach()
                 clear_logit_scratch_cache()
             expert_cv = _expert_cv_per_block(tpe_list)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if not math.isfinite(float(grad_norm)):
+                # Finite loss but non-finite gradients: stepping would write
+                # NaN/Inf into the weights and only surface one step later as
+                # a NaN loss. Run the ordered triage (stage=gradients) now.
+                triage = triage_nonfinite(model, x, y, device_type=device,
+                                          lr=opt.param_groups[0]['lr'], grad_clip=1.0)
+                raise SystemExit(
+                    f"[moe][nan] non-finite gradient at step {step} "
+                    f"(pre-clip norm={float(grad_norm)}): triage stage="
+                    f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
+                    + ' | '.join(triage['recommendations'])
+                )
             opt.step()
             opt.zero_grad(set_to_none=True)
             clear_cast_weight_cache()
@@ -397,6 +409,18 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                     _, total, aux, _ = model(vx, vy, return_aux=True, return_logits=False)
                     total_val = float(total)
                     vaux = float(aux)
+                    if not (math.isfinite(total_val) and math.isfinite(vaux)):
+                        # The validation pass is also a forward path; a NaN
+                        # here must be triaged on the exact batch instead of
+                        # being written into val_ce as a selection metric.
+                        triage = triage_nonfinite(model, vx, vy, device_type=device,
+                                                  lr=args.lr, grad_clip=args.grad_clip)
+                        raise SystemExit(
+                            f"[moe][nan] held-out batch is non-finite "
+                            f"(total={total_val}, aux={vaux}): triage stage="
+                            f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
+                            + ' | '.join(triage['recommendations'])
+                        )
                     val_losses.append(total_val)
                     # The total loss the router regularizer rides on is not a
                     # language-modelling number: strip the aux term back out so

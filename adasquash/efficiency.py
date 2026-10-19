@@ -139,6 +139,8 @@ def efficiency_verdict(
     min_loss_gain: float = DEFAULT_MIN_LOSS_GAIN,
     max_cost_ratio: float = DEFAULT_MAX_COST_RATIO,
     cost_name: str = "compute",
+    cost_components: Optional[dict] = None,
+    max_component_ratio: Optional[float] = None,
 ) -> dict:
     """Is `loss_improvement` worth `cost_ratio` times the baseline cost?
 
@@ -148,6 +150,13 @@ def efficiency_verdict(
     when the gain clears `min_loss_gain` **and** the cost ratio stays within
     `max_cost_ratio`. `cost_per_loss_point` (cost_ratio per unit of gain) makes
     the exchange rate explicit.
+
+    `cost_components` is an optional ``{name: candidate/reference}`` mapping
+    for the other cost axes (parameters, FLOPs, forward latency, peak memory).
+    Every present component must stay within `max_component_ratio`
+    (default: `max_cost_ratio`), so a win cannot hide a 10x memory or
+    parameter blow-up behind one cheap primary cost. Components are reported
+    individually; a missing component is never treated as passing.
     """
     verdict = {
         "loss_improvement": loss_improvement,
@@ -155,6 +164,10 @@ def efficiency_verdict(
         "cost_name": cost_name,
         "min_loss_gain": float(min_loss_gain),
         "max_cost_ratio": float(max_cost_ratio),
+        "max_component_ratio": (float(max_cost_ratio) if max_component_ratio is None
+                                else float(max_component_ratio)),
+        "component_costs": {},
+        "component_failures": [],
         "gain_meaningful": None,
         "cost_acceptable": None,
         "viable": None,
@@ -166,8 +179,22 @@ def efficiency_verdict(
         return verdict
     gain = float(loss_improvement)
     cost = float(cost_ratio)
+    component_limit = verdict["max_component_ratio"]
+    for name, ratio in (cost_components or {}).items():
+        if ratio is None:
+            continue
+        ratio = float(ratio)
+        acceptable = ratio <= component_limit
+        verdict["component_costs"][str(name)] = {
+            "ratio": ratio,
+            "acceptable": bool(acceptable),
+        }
+        if not acceptable:
+            verdict["component_failures"].append(
+                f"{name} ratio {ratio:.3f}x exceeds {component_limit:.3f}x")
     verdict["gain_meaningful"] = gain >= float(min_loss_gain)
-    verdict["cost_acceptable"] = cost <= float(max_cost_ratio)
+    verdict["cost_acceptable"] = bool(
+        cost <= float(max_cost_ratio) and not verdict["component_failures"])
     verdict["viable"] = bool(verdict["gain_meaningful"] and verdict["cost_acceptable"])
     if gain > 0:
         verdict["cost_per_loss_point"] = cost / gain
@@ -176,11 +203,16 @@ def efficiency_verdict(
         reasons.append(
             f"loss gain {gain:+.4f} is below the practical margin {min_loss_gain:g}"
         )
-    if not verdict["cost_acceptable"]:
+    primary_ok = cost <= float(max_cost_ratio)
+    if not primary_ok:
         reasons.append(
             f"cost ratio {cost:.3f}x exceeds the allowed maximum {max_cost_ratio:.3f}x"
         )
+    reasons.extend(verdict["component_failures"])
     verdict["reason"] = "; ".join(reasons) if reasons else (
-        f"gain {gain:+.4f} clears {min_loss_gain:g} at cost {cost:.3f}x within {max_cost_ratio:.3f}x"
+        f"gain {gain:+.4f} clears {min_loss_gain:g} at cost {cost:.3f}x within "
+        f"{max_cost_ratio:.3f}x"
+        + (f" (all {len(verdict['component_costs'])} component ratios within "
+           f"{component_limit:.3f}x)" if verdict["component_costs"] else "")
     )
     return verdict

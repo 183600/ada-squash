@@ -48,6 +48,7 @@ import torch
 from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
+from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
@@ -303,6 +304,8 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     model.reset_parameters(seed)
     model.to(device)
     n_params = count_parameters(model)
+    param_breakdown = parameter_breakdown(model)
+    flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
     opt = build_optimizer(model, args.lr, args.weight_decay, 0.9, 0.95)
     rng = torch.Generator(device=device).manual_seed(seed)
     act_stats = ActivationStats(model)
@@ -351,7 +354,16 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         if measure:
             act_stats.detach()
             clear_logit_scratch_cache()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if not math.isfinite(float(grad_norm)):
+            triage = triage_nonfinite(model, x, y, device_type=device,
+                                      lr=args.lr, grad_clip=1.0)
+            raise SystemExit(
+                f"[abl][nan] '{name}' produced a non-finite gradient at step {step} "
+                f"(pre-clip norm={float(grad_norm)}, seed={seed}): triage stage="
+                f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
+                + ' | '.join(triage['recommendations'])
+            )
         opt.step()
         opt.zero_grad(set_to_none=True)
         clear_cast_weight_cache()
@@ -406,14 +418,28 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     # comparisons must use this - the training loss above is fitted data.
     n_val_batches = max(1, getattr(args, 'val_batches', 20))
     val_rng = torch.Generator(device=device).manual_seed(seed + 1)
+    # Batches are materialized so a non-finite held-out loss can be triaged on
+    # the exact batch that produced it (the generator state advances, so
+    # regenerating the batch later would not be the same input).
+    val_batches = [markov_batch(val_rng, model.cfg.ignore_index, args.batch_size,
+                                args.seq_len, device, outlier_id=outlier_id)
+                   for _ in range(n_val_batches)]
     model.eval()
     with torch.inference_mode():
-        val_losses = torch.stack([
-            model(*markov_batch(val_rng, model.cfg.ignore_index, args.batch_size,
-                                args.seq_len, device, outlier_id=outlier_id),
-                  return_logits=False)[1]
-            for _ in range(n_val_batches)
-        ]).tolist()
+        val_losses = [model(x, y, return_logits=False)[1] for x, y in val_batches]
+    bad_val = [(i, float(v)) for i, v in enumerate(val_losses) if not math.isfinite(float(v))]
+    if bad_val:
+        i_bad, v_bad = bad_val[0]
+        triage = triage_nonfinite(model, val_batches[i_bad][0], val_batches[i_bad][1],
+                                  device_type=device)
+        model.train()
+        raise SystemExit(
+            f"[abl][nan] '{name}' held-out loss is non-finite on {len(bad_val)}/{n_val_batches} "
+            f"val batch(es) (first index={i_bad}, value={v_bad}, seed={seed}): triage stage="
+            f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
+            + ' | '.join(triage['recommendations'])
+        )
+    val_losses = [float(v) for v in val_losses]
     model.train()
     # `val_loss` is a sample mean over held-out batches; keep the per-batch
     # losses (and their standard error) so comparisons can be *paired* across
@@ -444,6 +470,14 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         'seed': seed,
     }
     summary = {'name': name, 'hypothesis': hypothesis, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'seed': seed, 'seeds': [seed], 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'val_losses': val_losses, 'val_loss_std': val_stats['std'], 'val_loss_stderr': val_stats['stderr'], 'val_loss_std_basis': 'val_batches', 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'controls': controls, 'elapsed_s': time.time() - t0}
+    # Efficiency accounting travels with every row, not only with the
+    # separate benchmark run: parameters by role and analytic matmul FLOPs
+    # per token make each row's loss a costed result (the norm math itself is
+    # elementwise, so the FLOPs expose backbone-level differences; wall-clock
+    # latency is measured by scripts/benchmark_efficiency.py).
+    summary['parameter_breakdown'] = param_breakdown
+    summary['flops_per_token_forward'] = flops['forward_per_token']
+    summary['flops_per_token_training_est'] = flops['training_per_token']
     if run_metadata is None:
         run_metadata = collect_run_metadata(seed=seed)
     else:

@@ -62,9 +62,12 @@ def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]
     """(last - first) / max(|first|, eps) over the trailing `window` points.
 
     Relative instead of absolute so the same threshold means the same thing
-    at loss 10 (random init) and loss 2 (late training).
+    at loss 10 (random init) and loss 2 (late training). Non-finite points are
+    excluded here as a last-resort guard; `diagnose_train_val_curve` reports
+    them explicitly before this helper is reached.
     """
-    tail = [float(v) for v in values][-max(2, int(window)) :]
+    tail = [float(v) for v in values
+            if v is not None and math.isfinite(float(v))][-max(2, int(window)) :]
     if len(tail) < 2:
         return None
     first, last = tail[0], tail[-1]
@@ -117,8 +120,16 @@ def diagnose_train_val_curve(
     worsen = float(thresholds["worsen_rel_tolerance"])
     gap_widen = float(thresholds["gap_widen_rel"])
 
-    train_losses = [float(v) for v in train_losses if v is not None]
-    val_losses = [float(v) for v in val_losses if v is not None]
+    raw_train = [float(v) for v in train_losses if v is not None]
+    raw_val = [float(v) for v in val_losses if v is not None]
+    # Indices are into the caller's arrays (counting any None entries), so the
+    # report points at the curve position the reader can look up.
+    bad_train = [i for i, v in enumerate(train_losses)
+                 if v is not None and not math.isfinite(float(v))]
+    bad_val = [i for i, v in enumerate(val_losses)
+               if v is not None and not math.isfinite(float(v))]
+    train_losses = [v for v in raw_train if math.isfinite(v)]
+    val_losses = [v for v in raw_val if math.isfinite(v)]
     train_steps = list(train_steps) if train_steps is not None else []
     val_steps = list(val_steps) if val_steps is not None else []
 
@@ -135,12 +146,33 @@ def diagnose_train_val_curve(
             "read; keep --val-every small enough to get them"
         ],
         "evidence": {
-            "n_train_points": len(train_losses),
-            "n_val_points": len(val_losses),
+            "n_train_points": len(raw_train),
+            "n_val_points": len(raw_val),
             "window": window,
             "thresholds": dict(thresholds),
+            "n_nonfinite_train_points": len(bad_train),
+            "n_nonfinite_val_points": len(bad_val),
+            "nonfinite_train_indices": bad_train,
+            "nonfinite_val_indices": bad_val,
         },
     }
+    if bad_train or bad_val:
+        # A NaN/Inf on either curve is a numerical failure, not a trend.
+        # Returning "flat"/"underfitting" here would send the reader to the
+        # wrong remedy (lr/data) when the answer is the ordered NaN triage.
+        out.update(
+            classification="nonfinite_loss",
+            recommendations=[
+                "a train or validation loss on this curve is NaN/Inf: run the "
+                "ordered triage (data -> fp32 math -> mixed precision -> "
+                "gradients) on the first non-finite point; adasquash.diagnostics."
+                "triage_nonfinite is the same path the trainer uses",
+                "do not compare or checkpoint from this curve until the "
+                "non-finite point is explained; a finite later value does not "
+                "make the earlier corruption harmless",
+            ],
+        )
+        return out
     if len(train_losses) < 2 or len(val_losses) < 2:
         return out
 
