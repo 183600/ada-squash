@@ -373,10 +373,15 @@ def run_one(norm: str, args, device: str) -> dict:
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
-        final_loss = float(loss.detach().item())
-        if initial_loss is None:
-            initial_loss = final_loss
+        # `loss` is only read for the initial value and the logged rows, and
+        # the log condition already covers step 1 and the last step. Reading
+        # it inside the branch keeps every reported value bit-identical while
+        # dropping the per-step `.item()`, which forced a device sync and
+        # stopped the host from running ahead of the device between steps.
         if step == 1 or step % args.log_every == 0 or step == args.max_steps:
+            final_loss = float(loss.detach().item())
+            if initial_loss is None:
+                initial_loss = final_loss
             final_metrics = next_token_metrics(model, x, y, ctx=ctx)
             history.append({"step": step, "loss": final_loss,
                             "accuracy": final_metrics["accuracy"],

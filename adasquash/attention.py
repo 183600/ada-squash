@@ -179,6 +179,13 @@ class CausalSelfAttention(nn.Module):
         drop = self._tril_mask(T, device)
         k_t = k.transpose(-1, -2)
         buf = self._logit_scratch(B, H, min(rows, T), T, q)
+        # The logit scale is a fixed positive scalar, so it is folded into the
+        # scalar accumulators instead of being applied to every block: the
+        # scaled statistics are `s*sum(x)`, `s*sum|x|`, `s*max|x|` and
+        # `s^2*sum(x^2)`. The accumulators are float64, so re-associating the
+        # factor there is far below their precision, and one full read/write
+        # pass over the causal sweep disappears.
+        scale_sq = scale * scale
         block = None
         for start in range(0, T, rows):
             end = min(start + rows, T)
@@ -187,17 +194,16 @@ class CausalSelfAttention(nn.Module):
             # (each column is the same reduction over D).
             block = torch.matmul(q[:, :, start:end], k_t[..., :end],
                                  out=buf[:B * H * (end - start) * end].view(B, H, end - start, end))
-            block.mul_(scale)
             # Only the square [start:end) part of the row block can be causally
             # masked: every earlier column is below the diagonal for all rows
             # of this block. The kept logits are unchanged.
             block[:, :, :, start:end].masked_fill_(drop[start:end, start:end], 0.0)
-            acc_x.add_(block.sum(dtype=reduce_dtype))
+            acc_x.add_(block.sum(dtype=reduce_dtype).mul_(scale))
             block.abs_()
-            acc_abs.add_(block.sum(dtype=reduce_dtype))
-            torch.maximum(peak, block.amax().to(reduce_dtype), out=peak)
+            acc_abs.add_(block.sum(dtype=reduce_dtype).mul_(scale))
+            torch.maximum(peak, block.amax().mul_(scale).to(reduce_dtype), out=peak)
             block.square_()
-            acc_sq.add_(block.sum(dtype=reduce_dtype))
+            acc_sq.add_(block.sum(dtype=reduce_dtype).mul_(scale_sq))
         del k_t, block
         total = float(acc_abs)
         signed = float(acc_x)
