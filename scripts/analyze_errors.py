@@ -102,7 +102,9 @@ def _dataset_batches(args, model, device):
         val_frac=args.val_frac, test_frac=args.test_frac, num_documents=args.num_documents,
         dedup=not args.no_dedup, min_doc_chars=args.min_doc_chars, max_doc_chars=args.max_doc_chars,
         exclude_hash_file=args.exclude_hash_file,
-        exclude_test_hash_file=args.exclude_test_hash_file, train_shuffle_buffer=0,
+        exclude_test_hash_file=args.exclude_test_hash_file,
+        group_key=args.group_key, exclude_group_file=args.exclude_group_file,
+        exclude_test_group_file=args.exclude_test_group_file, train_shuffle_buffer=0,
         seed=args.seed, seq_len=args.seq_len, batch_size=args.batch_size,
     )
     loader = open_data_split(args.split, namespace)
@@ -837,6 +839,9 @@ def main():
     p.add_argument('--no-dedup', action='store_true')
     p.add_argument('--exclude-hash-file', default=None)
     p.add_argument('--exclude-test-hash-file', default=None)
+    p.add_argument('--group-key', default=None, help='grouping-unit field of the trained run (see train_gpt2.py --group-key)')
+    p.add_argument('--exclude-group-file', default=None)
+    p.add_argument('--exclude-test-group-file', default=None)
     p.add_argument('--allow-sealed-test', action='store_true', help="permit inspecting the sealed test split; reading its error cases and iterating turns test into an implicit validation set, so use --split validation unless this is the single final diagnosis")
     args = p.parse_args()
     args.topk = max(1, int(args.topk))

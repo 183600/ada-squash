@@ -18,24 +18,36 @@ Principles enforced here
    its own documents only, so one document can never straddle two sides of a
    train/val/test boundary.
 4. **Identical cleaning on every split.**  Missing / non-string / empty
-   texts, degenerate length outliers, exact duplicates and tokenizer
-   failures are dropped by the same code on train, validation and test -
-   always *after* the split.
+    texts, degenerate length outliers, duplicates and tokenizer failures are
+    dropped by the same code on train, validation and test - always *after*
+    the split.  Duplicates are detected both on the exact text and on a
+    canonical form (Unicode NFKC + collapsed whitespace), so a document that
+    only differs from a training document by formatting cannot leak into a
+    held-out split either.
 5. **Train statistics only.**  Nothing here estimates a statistic (mean,
    variance, vocabulary, length) on validation or test data and feeds it back
    into training; the held-out splits are read-only for evaluation.
 6. **Cross-split duplicates are dropped from the held-out side.**  Per-split
    dedup cannot see a document that occurs once in train and once in
-   validation/test.  When an `exclude_hash_file` ledger (the hashes of the
-   training documents, written by `scripts/audit_data.py
-   --write-train-hash-file`) is supplied, any held-out document whose exact
-   text is in that ledger is dropped from that held-out split - never from
-   train itself (the ledger is derived from train, so excluding it there would
-   throw the whole split away).  A validation-document ledger
-   (`--exclude-test-hash-file`, written by `audit_data.py
-   --write-val-hash-file`) is applied to the test split only, so a document
-   cannot sit on both sides of the selection/final boundary either; it is
-   ignored elsewhere.
+   validation/test.  When an `exclude_hash_file` ledger (the exact *and*
+   canonical hashes of the training documents, written by
+   `scripts/audit_data.py --write-train-hash-file`) is supplied, any held-out
+   document whose exact or canonical text is in that ledger is dropped from
+   that held-out split - never from train itself (the ledger is derived from
+   train, so excluding it there would throw the whole split away).  A
+   validation-document ledger (`--exclude-test-hash-file`, written by
+   `audit_data.py --write-val-hash-file`) is applied to the test split only,
+   so a document cannot sit on both sides of the selection/final boundary
+   either; it is ignored elsewhere.
+7. **Groups stay whole across splits.**  A document is the default grouping
+   unit, but some corpora contain several rows produced by the same source
+   (same user, same item, same page).  With an optional `group_key` and a
+   train-group-hash ledger (`--exclude-group-file`, written by
+   `audit_data.py --write-train-group-file --group-key <path>`), a held-out
+   document whose group occurs in the training ledger is dropped, so the
+   group lies wholly on the training side; a validation-group ledger
+   (`--exclude-test-group-file`) is likewise applied to the test split only,
+   so no group straddles the selection/final boundary either.
 
 `build_dataloader` deliberately keeps its historical 5-argument call
 signature (the split / cleaning knobs travel through
@@ -47,6 +59,7 @@ import json
 import math
 import os
 import sys
+import unicodedata
 from collections import Counter
 from pathlib import Path
 
@@ -88,6 +101,17 @@ DEFAULT_DATA_OPTIONS = {
     # split additionally drops exact duplicates of validation documents, so
     # the selection split and the sealed final split stay disjoint.
     "exclude_test_hash_file": None,
+    # Optional grouping key (a top-level example field name or a dotted path
+    # such as "meta.url").  Rows sharing a group value are one grouping unit;
+    # with a group-hash ledger the held-out splits drop every document whose
+    # group was seen on an earlier side, so a group never straddles a split.
+    "group_key": None,
+    # Optional ledger of training-group hashes (audit_data.py
+    # --write-train-group-file); applied to validation/test, never to train.
+    "exclude_group_file": None,
+    # Optional ledger of validation-group hashes; applied to the sealed test
+    # split only, so no group straddles the selection/final boundary.
+    "exclude_test_group_file": None,
 }
 
 _active_data_options = dict(DEFAULT_DATA_OPTIONS)
@@ -257,12 +281,79 @@ def document_hash(text: str) -> bytes:
     return hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).digest()
 
 
+def canonical_text(text: str) -> str:
+    """Formatting-insensitive form of a document used for near-duplicate checks.
+
+    Unicode NFKC normalization plus whitespace collapsing: two documents that
+    differ only in line breaks, repeated spaces or compatibility characters
+    carry the same content and must not sit on two sides of a split.  The
+    transformation is deliberately conservative (no case folding): it only
+    removes formatting differences, never information.
+    """
+    return " ".join(unicodedata.normalize("NFKC", text).split())
+
+
+def canonical_document_hash(text: str) -> bytes:
+    return hashlib.blake2b(canonical_text(text).encode("utf-8", "replace"), digest_size=16).digest()
+
+
+def document_digests(text: str) -> tuple[bytes, bytes]:
+    """`(exact, canonical)` digests of one document text."""
+    return document_hash(text), canonical_document_hash(text)
+
+
+def group_hash(value) -> bytes:
+    """Stable digest of a grouping-unit identifier (user / item / source page).
+
+    Filesystem- and memory-friendly replacement for storing raw group values
+    in a ledger.  Scalars are hashed by their string form; list/tuple/set
+    groups by their sorted element strings, so a document that belongs to
+    several groups gets one deterministic digest per group set.
+    """
+    if isinstance(value, (list, tuple, set)):
+        payload = json.dumps(sorted(str(v) for v in value), ensure_ascii=False)
+    elif isinstance(value, str):
+        payload = value
+    else:
+        payload = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.blake2b(payload.encode("utf-8", "replace"), digest_size=16).digest()
+
+
+def extract_group_value(example, group_key: str):
+    """Grouping-unit value of an example, or None when it has none.
+
+    `group_key` is a top-level field name or a dotted path (``"meta.url"``).
+    None / NaN / blank values count as "no group" and are never used for
+    exclusion decisions.
+    """
+    if not group_key or not isinstance(example, dict):
+        return None
+    if group_key in example:
+        value = example[group_key]
+    else:
+        value = example
+        for part in group_key.split("."):
+            if not isinstance(value, dict) or part not in value:
+                return None
+            value = value[part]
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def _dedup_hash(example) -> bytes | None:
-    """Digest of the stripped document text, or None when the example has none."""
+    """Canonical digest of the stripped document text, or None when there is none.
+
+    Dedup keys on the *canonical* form so formatting variants of the same
+    document are removed as duplicates; the ledger lookup additionally tests
+    the exact digest (see `DocumentCleaner`).
+    """
     raw = example.get("text") if isinstance(example, dict) else None
     if not isinstance(raw, str):
         return None
-    return document_hash(raw.strip())
+    return canonical_document_hash(raw.strip())
 
 
 def _dedup_shard_owner(example, n_workers: int, hashed: bytes | None = None) -> int:
@@ -270,9 +361,10 @@ def _dedup_shard_owner(example, n_workers: int, hashed: bytes | None = None) -> 
 
     Worker-local `seen` sets cannot see duplicates that the round-robin
     document shard handed to another worker, so with several loader workers
-    identical documents are routed by their cleaned-text hash instead: every
-    copy lands in the same worker and the per-worker set then drops all but
-    the first occurrence, matching the single-process cleaner the audit uses.
+    duplicate documents are routed by their canonical-text hash instead: every
+    formatting-equivalent copy lands in the same worker and the per-worker set
+    then drops all but the first occurrence, matching the single-process
+    cleaner the audit uses.
 
     `hashed` lets a caller that already hashed the stripped text pass the
     digest in.
@@ -314,19 +406,24 @@ class DocumentCleaner:
 
     Drops (with counters, so a run can report what was removed):
     missing / non-string text (NaN or None from the upstream table), empty
-    documents, degenerate short documents, length outliers, exact
-    duplicates (within the split), and exact duplicates of documents listed
-    in `exclude_hashes` (the training-document ledger used by held-out
-    splits).  The duplicate set is bounded at `dedup_max` entries; once the
-    set is full, unseen documents are kept without being recorded and
-    `dedup_cap_reached` is set in the report, so the silent degradation of
-    the in-split dedup guarantee is visible (the cross-split ledger lookup is
-    a set membership test and stays exact regardless).
+    documents, degenerate short documents, length outliers, duplicates
+    (within the split, detected on the exact *and* canonical text), exact or
+    canonical duplicates of documents listed in `exclude_hashes` (the
+    training-document ledger used by held-out splits), and documents whose
+    grouping unit is listed in `exclude_group_hashes` (the training-group
+    ledger, so a group never straddles a split boundary).  The duplicate set
+    is bounded at `dedup_max` entries; once the set is full, unseen documents
+    are kept without being recorded and `dedup_cap_reached` is set in the
+    report, so the silent degradation of the in-split dedup guarantee is
+    visible (the cross-split ledger lookup is a set membership test and stays
+    exact regardless).
     """
 
     def __init__(self, dedup: bool = True, dedup_max: int = 1_000_000,
                  min_doc_chars: int = 0, max_doc_chars: int = 0,
-                 exclude_hashes: set | None = None):
+                 exclude_hashes: set | None = None,
+                 group_key: str | None = None,
+                 exclude_group_hashes: set | None = None):
         self.dedup = bool(dedup)
         self.dedup_max = int(dedup_max)
         self.min_doc_chars = int(min_doc_chars)
@@ -334,16 +431,31 @@ class DocumentCleaner:
         # Held by reference: the ledger is read once and may be large, so the
         # caller must not mutate it after handing it over.
         self.exclude_hashes = exclude_hashes if exclude_hashes is not None else set()
-        # `seen` stores the leading 64 bits of each digest as an int instead
-        # of boxed `bytes` objects; collisions only matter at a negligible
-        # 2^-64 scale and the full digest is still used for the cross-split
-        # ledger lookup.
+        self.group_key = group_key or None
+        self.exclude_group_hashes = (exclude_group_hashes if exclude_group_hashes is not None
+                                     else set())
+        # `seen` stores the leading 64 bits of each canonical digest as an int
+        # instead of boxed `bytes` objects; collisions only matter at a
+        # negligible 2^-64 scale and the full digests are still used for the
+        # cross-split ledger lookup.
         self.seen: set = set()
         self.stats: Counter = Counter()
 
+    def _group_excluded(self, example) -> bool:
+        if not (self.group_key and self.exclude_group_hashes):
+            return False
+        value = extract_group_value(example, self.group_key)
+        if value is None:
+            self.stats["group_value_missing"] += 1
+            return False
+        if group_hash(value) in self.exclude_group_hashes:
+            self.stats["dropped_cross_split_group"] += 1
+            return True
+        return False
+
     def __call__(self, example, precomputed_hash: bytes | None = None):
         """Clean one example; `precomputed_hash`, when given, must be the
-        digest of the stripped text."""
+        *canonical* digest of the stripped text."""
         self.stats["documents_read"] += 1
         if not isinstance(example, dict):
             self.stats["dropped_unreadable"] += 1
@@ -365,16 +477,24 @@ class DocumentCleaner:
         if self.max_doc_chars and len(text) > self.max_doc_chars:
             self.stats["dropped_too_long"] += 1
             return None
+        if self._group_excluded(example):
+            # This document's grouping unit was already seen on an earlier
+            # side of a split boundary; keeping it would leak the group.
+            return None
         if self.dedup or self.exclude_hashes:
-            h = precomputed_hash if precomputed_hash is not None else document_hash(text)
-            if h in self.exclude_hashes:
-                # Exact duplicate of a training document: keeping it in a
-                # held-out split would leak that document across the split
-                # boundary.
-                self.stats["dropped_cross_split_duplicate"] += 1
-                return None
+            canonical = (precomputed_hash if precomputed_hash is not None
+                         else canonical_document_hash(text))
+            if self.exclude_hashes:
+                exact = document_hash(text)
+                if exact in self.exclude_hashes or canonical in self.exclude_hashes:
+                    # Exact or formatting-equivalent duplicate of an earlier
+                    # split's document: keeping it would leak that document
+                    # across the split boundary.
+                    self.stats["dropped_cross_split_duplicate"] += 1
+                    return None
             if self.dedup:
-                key = int.from_bytes(h[:8], "little") if isinstance(h, (bytes, bytearray)) else h
+                key = (int.from_bytes(canonical[:8], "little")
+                       if isinstance(canonical, (bytes, bytearray)) else canonical)
                 if key in self.seen:
                     self.stats["dropped_duplicate"] += 1
                     return None
@@ -619,7 +739,11 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
 
     The cache key carries the *resolved* dataset revision (recorded in
     `report`), so a cache materialized from the default branch before it moved
-    is not silently reused afterwards. The written payload is fingerprinted
+    is not silently reused afterwards.  When the revision is neither pinned
+    nor resolvable (offline Hub lookup), no cache is read or written at all:
+    the cached documents and the current training stream could then come from
+    different upstream commits, and a stale held-out slice could silently
+    overlap what training now sees. The written payload is fingerprinted
     (sha256 + document count) into a `.meta.json` sidecar and echoed into
     `report['materialized_cache_fingerprint']`, so a run manifest pins the
     concrete cached content, not only its name; before any reuse the payload
@@ -634,6 +758,16 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     if root is None:
         return stream_ds, None
     resolved_revision = report.get("dataset_revision_resolved")
+    if not resolved_revision:
+        # The cache key would be revision-less, so a cache written before the
+        # upstream branch moved could be served as the new held-out slice and
+        # overlap the documents training now sees. Correctness first: replay
+        # the streaming split instead of reading/writing a revision-less cache.
+        print(f"[data] {split} cache disabled: the dataset revision is neither pinned "
+              f"nor resolvable, so a cached slice could silently come from a different "
+              f"upstream commit than the training stream", file=sys.stderr)
+        report["materialized_cache_disabled_reason"] = "dataset revision unresolved"
+        return stream_ds, None
     key = json.dumps(
         {
             "version": 2,
@@ -805,12 +939,29 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     if exclude_files:
         report["exclude_hash_files"] = [str(p) for p in exclude_files]
         report["exclude_hashes"] = len(exclude_hashes)
+    # Group ledgers follow the same earlier-side-only rule: the training-group
+    # ledger is applied to both held-out splits, the validation-group ledger
+    # to the sealed test split only, and neither is ever applied to train.
+    report["group_key"] = opts.get("group_key") or None
+    applied_train_groups = opts.get("exclude_group_file") if opts["split"] != "train" else None
+    applied_test_groups = opts.get("exclude_test_group_file") if opts["split"] == "test" else None
+    group_files = [p for p in (applied_train_groups, applied_test_groups) if p]
+    exclude_group_hashes: set = set()
+    for path in group_files:
+        exclude_group_hashes |= load_hash_file(path)
+    report["exclude_group_file"] = str(applied_train_groups) if applied_train_groups else None
+    report["exclude_test_group_file"] = str(applied_test_groups) if applied_test_groups else None
+    if group_files:
+        report["exclude_group_files"] = [str(p) for p in group_files]
+        report["exclude_groups"] = len(exclude_group_hashes)
     cleaner = DocumentCleaner(
         dedup=opts["dedup"],
         dedup_max=opts["dedup_max"],
         min_doc_chars=opts["min_doc_chars"],
         max_doc_chars=opts["max_doc_chars"],
         exclude_hashes=exclude_hashes,
+        group_key=opts.get("group_key"),
+        exclude_group_hashes=exclude_group_hashes,
     )
     stream = PackedStream(
         stream_ds,
@@ -842,9 +993,14 @@ __all__ = [
     "DocumentCleaner",
     "PackedStream",
     "build_dataloader",
+    "canonical_document_hash",
+    "canonical_text",
     "configure_data_options",
+    "document_digests",
     "document_hash",
+    "extract_group_value",
     "get_data_options",
+    "group_hash",
     "infer_num_documents",
     "load_document_stream",
     "load_hash_file",

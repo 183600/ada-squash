@@ -46,6 +46,7 @@ PAIRING_KEYS = (
     "tokenizer", "tokenizer_revision", "tokenizer_revision_resolved",
     "num_documents", "val_frac", "test_frac",
     "dedup", "min_doc_chars", "max_doc_chars", "exclude_hash_file", "exclude_test_hash_file",
+    "group_key", "exclude_group_file", "exclude_test_group_file",
     "batch_size", "seq_len",
 )
 

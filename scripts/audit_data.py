@@ -6,26 +6,38 @@ Reads a bounded sample of the train / validation / test splits produced by
 
 * cleaning coverage: how many documents were dropped (and why) by the exact
   same cleaner the trainer uses - missing / NaN text, empty documents,
-  degenerate short documents, length outliers, exact duplicates and
-  tokenizer failures;
+  degenerate short documents, length outliers, duplicates (exact and
+  canonical) and tokenizer failures;
 * value sanity: token ids out of the tokenizer's range, non-finite length
   statistics (NaN / Inf), duplicate rates per split;
-* split hygiene: exact duplicate documents shared between any two splits -
-  train vs held-out *and* validation vs test (a duplicate in two splits is a
-  leak no matter how the split was drawn, and a val/test duplicate makes the
-  selection split peek at the sealed final split);
+* split hygiene: duplicate documents shared between any two splits - train vs
+  held-out *and* validation vs test (a duplicate in two splits is a leak no
+  matter how the split was drawn, and a val/test duplicate makes the
+  selection split peek at the sealed final split). Duplicates are detected on
+  the exact text *and* on a canonical form (Unicode NFKC + collapsed
+  whitespace), so formatting variants are caught too;
+* group hygiene (`--group-key`): documents sharing a grouping unit (same
+  user / item / source page) must not straddle any split boundary. The audit
+  counts held-out documents whose group occurs in an earlier split and fails
+  the run when it finds any;
 * chronology: train/validation/test must be contiguous slices of the upstream
   order, so no document can sit on two sides and no future document can
   precede the training slice;
 * distribution shift: total-variation distance between token frequency
   distributions of train vs validation / test, plus document-length means and
-  3xIQR length-outlier counts.
+  3xIQR length-outlier counts. Outliers are also counted under the fence
+  derived from the *training* lengths only, so a held-out slice is never
+  trimmed with statistics it contributed to.
 
-`--write-train-hash-file` emits the training-document hash ledger consumed by
-`--exclude-hash-file` in the trainers, so held-out splits drop any document
-whose exact text also occurs in train; `--write-val-hash-file` emits the
-validation ledger consumed by `--exclude-test-hash-file`, so the sealed test
-also drops documents duplicated in the selection split. A full ledger requires
+`--write-train-hash-file` emits the training-document hash ledger (exact and
+canonical digests) consumed by `--exclude-hash-file` in the trainers, so
+held-out splits drop any document whose text also occurs in train;
+`--write-val-hash-file` emits the validation ledger consumed by
+`--exclude-test-hash-file`, so the sealed test also drops documents duplicated
+in the selection split. With `--group-key`, `--write-train-group-file` /
+`--write-val-group-file` emit the corresponding grouping-unit ledgers consumed
+by `--exclude-group-file` / `--exclude-test-group-file`, so a group lying on
+an earlier side is dropped whole from the later sides. A full ledger requires
 `--n-docs 0`; with a bounded sample the file covers only the sampled prefix,
 and the run records `*.exhaustive = false` and warns instead of implying full
 coverage.
@@ -46,10 +58,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
-from scripts.data_pipeline import DocumentCleaner, document_hash, load_document_stream
+from scripts.data_pipeline import (DocumentCleaner, canonical_document_hash, document_hash,
+                                   extract_group_value, group_hash, load_document_stream)
 
 
-def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, collect_hashes=True):
+def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, collect_groups=True):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     # One machine-word int per document.
@@ -63,8 +76,14 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     text_batch: list = []
     legacy_tokens: Counter = Counter()
     hashes: set = set()
+    groups: set = set()
     overlap = 0
     overlap_extra = 0
+    group_overlap = 0
+    group_overlap_extra = 0
+    group_overlap_groups: set = set()
+    group_overlap_extra_groups: set = set()
+    group_value_missing = 0
     tokenizer_errors = 0
     vocab_size = int(getattr(tokenizer, 'vocab_size', 0) or 0)
 
@@ -124,11 +143,29 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         lengths.append(len(text))
         h = document_hash(text)
         if collect_hashes:
+            # Both digests, so a held-out formatting variant of a training
+            # document is caught by the ledger the same way the cleaner
+            # catches it (and the hash itself is still found either way).
             hashes.add(h)
+            hashes.add(canonical_document_hash(text))
         if known_hashes is not None and h in known_hashes:
             overlap += 1
         if known_hashes_extra is not None and h in known_hashes_extra:
             overlap_extra += 1
+        if group_key:
+            value = extract_group_value(example, group_key)
+            if value is None:
+                group_value_missing += 1
+            else:
+                gh = group_hash(value)
+                if collect_groups:
+                    groups.add(gh)
+                if known_groups is not None and gh in known_groups:
+                    group_overlap += 1
+                    group_overlap_groups.add(gh)
+                if known_groups_extra is not None and gh in known_groups_extra:
+                    group_overlap_extra += 1
+                    group_overlap_extra_groups.add(gh)
         text_batch.append(text)
         if len(text_batch) >= 256:
             _flush_tokens()
@@ -148,20 +185,30 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stats['duplicate_overlap_with_train'] = overlap if known_hashes is not None else None
     stats['duplicate_overlap_with_validation'] = overlap_extra if known_hashes_extra is not None else None
     stats['duplicate_overlap_is_lower_bound'] = bool(n_docs) if (known_hashes is not None or known_hashes_extra is not None) else None
+    stats['group_key'] = group_key
+    if group_key:
+        stats['group_value_missing'] = group_value_missing
+        stats['groups_sampled'] = len(groups) if collect_groups else None
+        stats['group_overlap_with_train'] = group_overlap if known_groups is not None else None
+        stats['group_overlap_with_train_groups'] = (len(group_overlap_groups)
+                                                    if known_groups is not None else None)
+        stats['group_overlap_with_validation'] = (group_overlap_extra
+                                                  if known_groups_extra is not None else None)
+        stats['group_overlap_with_validation_groups'] = (len(group_overlap_extra_groups)
+                                                         if known_groups_extra is not None else None)
+        stats['group_overlap_is_lower_bound'] = (
+            bool(n_docs) if (known_groups is not None or known_groups_extra is not None) else None)
     if lengths:
         stats['doc_chars_mean'] = sum(lengths) / len(lengths)
         stats['doc_chars_min'] = min(lengths)
         stats['doc_chars_max'] = max(lengths)
         # Length outliers by the 3 x IQR fence (only a report; the pipeline's
         # min/max_doc_chars knobs are the actual cleaning policy).
-        ordered = sorted(lengths)
-        q1 = ordered[len(ordered) // 4]
-        q3 = ordered[(3 * len(ordered)) // 4]
-        iqr = q3 - q1
-        lower, upper = max(0, q1 - 3 * iqr), q3 + 3 * iqr
-        stats['doc_chars_q1'] = q1
-        stats['doc_chars_q3'] = q3
-        stats['length_outliers_3iqr'] = sum(1 for v in lengths if v < lower or v > upper)
+        fence = length_fence(lengths)
+        stats['doc_chars_q1'] = fence['q1']
+        stats['doc_chars_q3'] = fence['q3']
+        stats['length_outliers_3iqr'] = sum(
+            1 for v in lengths if v < fence['lower'] or v > fence['upper'])
     else:
         stats['doc_chars_mean'] = stats['doc_chars_min'] = stats['doc_chars_max'] = None
         stats['doc_chars_q1'] = stats['doc_chars_q3'] = None
@@ -170,7 +217,16 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stats['token_ids_out_of_range'] = sum(c for t, c in tokens.items() if not 0 <= t < getattr(tokenizer, 'vocab_size', 2 ** 31))
     stats['distinct_token_ids'] = len(tokens)
     stats['finite_lengths'] = bool(all(math.isfinite(v) for v in (stats['doc_chars_mean'] or 0.0, stats['doc_chars_min'] or 0.0, stats['doc_chars_max'] or 0.0)))
-    return stats, tokens, report, hashes
+    return stats, tokens, report, hashes, lengths, groups
+
+
+def length_fence(lengths) -> dict:
+    """3 x IQR fence (q1, q3, lower, upper) of a length sample."""
+    ordered = sorted(lengths)
+    q1 = ordered[len(ordered) // 4]
+    q3 = ordered[(3 * len(ordered)) // 4]
+    iqr = q3 - q1
+    return {'q1': q1, 'q3': q3, 'lower': max(0, q1 - 3 * iqr), 'upper': q3 + 3 * iqr}
 
 
 def _chronology_problems(reports: dict) -> list:
@@ -213,7 +269,7 @@ def _write_hash_ledger(path, hashes: set, n_docs: int, split_name: str):
         'exhaustive': exhaustive,
         'n_docs_limit': n_docs,
     }
-    print(f'[audit] wrote {len(hashes)} {split_name}-document hashes to {ledger}'
+    print(f'[audit] wrote {len(hashes)} {split_name} hashes to {ledger}'
           f'{" (exhaustive)" if exhaustive else " (SAMPLED PREFIX ONLY)"}')
     if not exhaustive:
         print(f'[audit] WARNING: the ledger covers at most the first {n_docs} '
@@ -256,11 +312,16 @@ def main():
     p.add_argument('--no-dedup', dest='dedup', action='store_false')
     p.add_argument('--write-train-hash-file', default=None, help='write the hashes of the sampled training documents here; feed the file to train_gpt2.py --exclude-hash-file so validation/test drop exact duplicates of training documents (use --n-docs 0 for a full ledger)')
     p.add_argument('--write-val-hash-file', default=None, help='write the hashes of the sampled validation documents here; feed the file to train_gpt2.py --exclude-test-hash-file so the sealed test drops exact duplicates of validation documents (a val/test duplicate makes the selection split and the final split non-disjoint; use --n-docs 0 for a full ledger)')
+    p.add_argument('--group-key', default=None, help='optional grouping-unit field (top-level name or dotted path such as "meta.url"); held-out documents whose group occurs in an earlier split are counted as leakage (same semantics as train_gpt2.py --group-key)')
+    p.add_argument('--write-train-group-file', default=None, help='write the grouping-unit hashes of the sampled training documents here; feed the file to train_gpt2.py --exclude-group-file so validation/test drop every document whose group was seen in train (requires --group-key; use --n-docs 0 for a full ledger)')
+    p.add_argument('--write-val-group-file', default=None, help='write the grouping-unit hashes of the sampled validation documents here; feed the file to train_gpt2.py --exclude-test-group-file so the sealed test drops every document whose group was seen in validation (requires --group-key; use --n-docs 0 for a full ledger)')
     p.add_argument('--max-tvd', type=float, default=None, help="fail (exit 1) when train-vs-validation token total-variation distance exceeds this")
     p.add_argument('--max-test-tvd', type=float, default=None, help="fail (exit 1) when train-vs-test token total-variation distance exceeds this; the test split backs the final reported number, so unchecked drift there changes what that number measures")
     p.add_argument('--max-val-test-tvd', type=float, default=None, help="fail (exit 1) when validation-vs-test token total-variation distance exceeds this; the model is selected on validation and reported on test, so drift between the two held-out slices makes the selected checkpoint a poorer fit for the number finally reported")
     p.add_argument('--output', default='runs/data_audit.json')
     args = p.parse_args()
+    if (args.write_train_group_file or args.write_val_group_file) and not args.group_key:
+        raise SystemExit('--write-*-group-file requires --group-key')
     try:
         from transformers import AutoTokenizer
     except ImportError as e:
@@ -274,32 +335,64 @@ def main():
     splits = {}
     tokens = {}
     reports = {}
+    lengths = {}
     train_hashes = None
     val_hashes = None
+    train_groups = None
+    val_groups = None
     train_ledger_info = None
     val_ledger_info = None
+    train_group_ledger_info = None
+    val_group_ledger_info = None
     for name in ('train', 'validation', 'test'):
-        # Train/validation hash sets are kept (the exclude ledgers and the
-        # overlap reference); test only needs to be compared against them.
-        # Test is checked against train *and* validation: a val/test duplicate
-        # makes the selection split and the final split non-disjoint.
-        stats, tok_counter, report, hashes = _collect_split(
+        # Train/validation hash and group sets are kept (the exclude ledgers
+        # and the overlap reference); test only needs to be compared against
+        # them.  Test is checked against train *and* validation: a val/test
+        # duplicate makes the selection split and the final split non-disjoint.
+        stats, tok_counter, report, hashes, split_lengths, groups = _collect_split(
             name, args.dataset, args.dataset_config, tokenizer, options,
             args.n_docs, args.min_doc_chars, args.max_doc_chars, args.dedup,
             known_hashes=train_hashes,
             known_hashes_extra=(val_hashes if name == 'test' else None),
-            collect_hashes=(name in ('train', 'validation')))
+            collect_hashes=(name in ('train', 'validation')),
+            group_key=args.group_key,
+            known_groups=train_groups,
+            known_groups_extra=(val_groups if name == 'test' else None),
+            collect_groups=(name in ('train', 'validation')))
         splits[name] = stats
         tokens[name] = tok_counter
         reports[name] = report
+        lengths[name] = split_lengths
         if name == 'train':
             train_hashes = hashes
+            train_groups = groups
             train_ledger_info = _write_hash_ledger(
-                args.write_train_hash_file, hashes, args.n_docs, 'train')
+                args.write_train_hash_file, hashes, args.n_docs, 'train-document')
+            train_group_ledger_info = _write_hash_ledger(
+                args.write_train_group_file, groups, args.n_docs, 'train-group')
         elif name == 'validation':
             val_hashes = hashes
+            val_groups = groups
             val_ledger_info = _write_hash_ledger(
-                args.write_val_hash_file, hashes, args.n_docs, 'validation')
+                args.write_val_hash_file, hashes, args.n_docs, 'validation-document')
+            val_group_ledger_info = _write_hash_ledger(
+                args.write_val_group_file, groups, args.n_docs, 'validation-group')
+    # Held-out length outliers are also counted under the fence derived from
+    # the *training* lengths alone.  Outliers only ever get dropped by
+    # --min/max-doc-chars in the pipeline, i.e. by a fixed policy; keeping the
+    # train-derived counts here lets a reviewer read the held-out slices
+    # against statistics they did not contribute to (no test-set tuning).
+    train_fence = length_fence(lengths['train']) if lengths['train'] else None
+    for name in ('validation', 'test'):
+        if train_fence is not None and lengths[name]:
+            splits[name]['length_outliers_train_fence'] = sum(
+                1 for v in lengths[name]
+                if v < train_fence['lower'] or v > train_fence['upper'])
+            splits[name]['length_outliers_train_fence_fraction'] = (
+                splits[name]['length_outliers_train_fence'] / len(lengths[name]))
+        else:
+            splits[name]['length_outliers_train_fence'] = None
+            splits[name]['length_outliers_train_fence_fraction'] = None
     chronology = _chronology_problems(reports)
     shift = {
         'train_vs_validation_tvd': _total_variation(tokens['train'], tokens['validation']),
@@ -314,14 +407,27 @@ def main():
            'split_reports': reports, 'split_chronology_problems': chronology,
            'cleaning_and_sanity': splits, 'distribution_shift': shift,
            'train_hash_ledger': train_ledger_info,
-           'validation_hash_ledger': val_ledger_info}
+           'validation_hash_ledger': val_ledger_info,
+           'train_group_ledger': train_group_ledger_info,
+           'validation_group_ledger': val_group_ledger_info,
+           'train_length_fence': train_fence}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(out, indent=2, default=str))
     for name, stats in splits.items():
-        print(f"[audit] {name}: sampled={stats['documents_sampled']} kept={stats.get('documents_kept', 0)} "
-              f"dropped_empty={stats.get('dropped_empty', 0)} dropped_missing={stats.get('dropped_missing_text', 0)} "
-              f"dropped_duplicate={stats.get('dropped_duplicate', 0)} overlap_with_train={stats['duplicate_overlap_with_train']} "
-              f"overlap_with_validation={stats['duplicate_overlap_with_validation']}")
+        line = (f"[audit] {name}: sampled={stats['documents_sampled']} kept={stats.get('documents_kept', 0)} "
+                f"dropped_empty={stats.get('dropped_empty', 0)} dropped_missing={stats.get('dropped_missing_text', 0)} "
+                f"dropped_duplicate={stats.get('dropped_duplicate', 0)} overlap_with_train={stats['duplicate_overlap_with_train']} "
+                f"overlap_with_validation={stats['duplicate_overlap_with_validation']}")
+        if args.group_key:
+            line += (f" group_overlap_with_train={stats.get('group_overlap_with_train')} "
+                     f"group_overlap_with_validation={stats.get('group_overlap_with_validation')}")
+        print(line)
+    if args.group_key:
+        missing_groups = sum(int(splits[name].get('group_value_missing') or 0)
+                             for name in ('train', 'validation', 'test'))
+        if missing_groups:
+            print(f"[audit] NOTE: {missing_groups} sampled documents have no '{args.group_key}' value; "
+                  "they cannot be tied to a group and are checked for document duplicates only")
     print(f"[audit] token TVD train-vs-val={shift['train_vs_validation_tvd']:.4f} "
           f"train-vs-test={shift['train_vs_test_tvd']:.4f} "
           f"val-vs-test={shift['validation_vs_test_tvd']:.4f}")
@@ -337,6 +443,11 @@ def main():
             print(f"[audit] NOTE: {name}: the in-split duplicate hash set reached dedup_max during the "
                   f"sample, so later complete-duplicate documents in this split were kept; the "
                   "guarantee degrades silently at that point (the cross-split ledger is unaffected)")
+        train_fence_outliers = stats.get('length_outliers_train_fence')
+        if train_fence_outliers:
+            print(f"[audit] NOTE: {name}: {train_fence_outliers} documents "
+                  f"({stats['length_outliers_train_fence_fraction']:.4%}) fall outside the 3xIQR fence "
+                  f"[{train_fence['lower']}, {train_fence['upper']}] derived from the training lengths alone")
     # Every split is audited, test included: the final numbers come from test,
     # so corruption there must fail the audit just like corruption in train.
     non_finite = [name for name in ('train', 'validation', 'test')
@@ -344,9 +455,20 @@ def main():
     if non_finite:
         problems.append(f"non-finite document-length statistics (NaN/Inf in the data) in: {', '.join(non_finite)}")
     if (splits['validation']['duplicate_overlap_with_train'] or 0) > 0 or (splits['test']['duplicate_overlap_with_train'] or 0) > 0:
-        problems.append('exact duplicate documents appear in both train and a held-out split (group/duplicate leakage)')
+        problems.append('duplicate documents (exact or canonical text) appear in both train and a held-out split (duplicate leakage)')
     if (splits['test']['duplicate_overlap_with_validation'] or 0) > 0:
-        problems.append('exact duplicate documents appear in both validation and test (the selection split and the sealed final split are not disjoint)')
+        problems.append('duplicate documents (exact or canonical text) appear in both validation and test (the selection split and the sealed final split are not disjoint)')
+    if args.group_key:
+        straddling = []
+        for name in ('validation', 'test'):
+            n_groups = splits[name].get('group_overlap_with_train_groups') or 0
+            if n_groups:
+                straddling.append(f"{name} shares {n_groups} group(s) with train")
+        n_groups = splits['test'].get('group_overlap_with_validation_groups') or 0
+        if n_groups:
+            straddling.append(f"test shares {n_groups} group(s) with validation")
+        if straddling:
+            problems.append(f"grouping unit '{args.group_key}' straddles a split boundary: " + '; '.join(straddling) + ' (group leakage)')
     out_of_range = [name for name in ('train', 'validation', 'test')
                     if splits[name]['token_ids_out_of_range']]
     if out_of_range:
@@ -366,6 +488,9 @@ def main():
         'split_reports': reports,
         'train_hash_ledger': train_ledger_info,
         'validation_hash_ledger': val_ledger_info,
+        'train_group_ledger': train_group_ledger_info,
+        'validation_group_ledger': val_group_ledger_info,
+        'train_length_fence': train_fence,
         'problems': problems,
     }
     if problems:
