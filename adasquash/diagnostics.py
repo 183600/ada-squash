@@ -415,7 +415,8 @@ def gradient_health_report(model) -> dict:
         for start in range(0, n, _GRAD_CENSUS_CHUNK):
             blk = flat[start:start + _GRAD_CENSUS_CHUNK]
             is_finite = is_finite & torch.isfinite(blk).all()
-            cur_abs = torch.maximum(blk.max(), -blk.min()).to(torch.float64)
+            lo, hi = torch.aminmax(blk)
+            cur_abs = torch.maximum(hi, -lo).to(torch.float64)
             g_abs = cur_abs if start == 0 else torch.maximum(g_abs, cur_abs)
             g_sq = g_sq + torch.linalg.vector_norm(blk.double()).pow(2)
         finite_t.append(is_finite)

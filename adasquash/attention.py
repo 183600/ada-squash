@@ -208,11 +208,11 @@ class CausalSelfAttention(nn.Module):
             blockf.square_()
             acc_sq.add_(blockf.sum().mul_(scale_sq))
         del k_t, block
-        total = float(acc_abs)
-        signed = float(acc_x)
+        total, signed, sq, peak_v = torch.stack(
+            (acc_abs, acc_x, acc_sq, peak.to(torch.float64))).tolist()
         mean_abs = total / n_valid
-        var = (float(acc_sq) - signed * signed / n_valid) / (n_valid - 1)
-        return {'logit_abs_mean': mean_abs, 'logit_abs_max': float(peak), 'logit_std': math.sqrt(var) if var > 0.0 else 0.0}
+        var = (sq - signed * signed / n_valid) / (n_valid - 1)
+        return {'logit_abs_mean': mean_abs, 'logit_abs_max': peak_v, 'logit_std': math.sqrt(var) if var > 0.0 else 0.0}
 
     def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)

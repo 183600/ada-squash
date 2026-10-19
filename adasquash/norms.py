@@ -442,11 +442,12 @@ class _DyTDForward(torch.autograd.Function):
         del phi
         torch.sub(grad_out, w, out=w)
         w.mul_(gamma)
-        grad_a = _dot_all(w, x)
+        need_schedule = ctx.needs_input_grad[1] or ctx.needs_input_grad[2]
+        grad_a = _dot_all(w, x) if need_schedule else None
         w.mul_(a)
         grad_x = w
-        grad_alpha_0 = grad_a * exp_kdr
-        grad_k = -grad_a * a * depth_ratio
+        grad_alpha_0 = grad_a * exp_kdr if ctx.needs_input_grad[1] else None
+        grad_k = -grad_a * a * depth_ratio if ctx.needs_input_grad[2] else None
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[4]:
             grad_beta = _sum_leading_dims(grad_out)
@@ -488,7 +489,7 @@ class _DyTForward(torch.autograd.Function):
         del phi
         torch.sub(grad_out, w, out=w)
         w.mul_(gamma)
-        grad_alpha = _dot_all(w, x)
+        grad_alpha = _dot_all(w, x) if ctx.needs_input_grad[1] else None
         w.mul_(alpha)
         grad_x = w
         grad_beta = None

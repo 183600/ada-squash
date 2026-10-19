@@ -100,7 +100,7 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     global _CAST_WEIGHT_CACHE_BYTES
     if w.dtype == dt:
         return w
-    key = (w.data_ptr(), w._version, dt, str(w.device))
+    key = (w.data_ptr(), w._version, dt, w.device)
     entry = _CAST_WEIGHT_CACHE.get(key)
     if entry is not None and entry[0] is w and entry[1].shape == w.shape:
         if not (entry[1].is_inference() and (not torch.is_inference_mode_enabled())):
@@ -173,10 +173,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_out):
         logits, targets = ctx.saved_tensors
         grad_logits = torch.empty_like(logits)
-        # With no valid targets the reference loss divides by nothing: the
-        # leading `total / count` is already NaN, and scaling the (all-zero)
-        # mask by 1 / 0 would turn the gradient into 0 * inf = NaN.
-        grad_scale = (grad_out / ctx.count).to(logits.dtype) if int(ctx.count) > 0 else grad_out.to(logits.dtype)
+        grad_scale = (grad_out / ctx.count.clamp(min=1)).to(logits.dtype)
         chunk_rows = ctx.chunk_rows
         for start in range(0, targets.numel(), chunk_rows):
             end = min(start + chunk_rows, targets.numel())
@@ -220,7 +217,6 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, targets, ignore_index, chunk_rows):
         dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
-        h = hidden.to(dt)
         w = _cast_weight_cached(weight, dt)
         acc = _loss_acc_dtype(dt)
         w_t = w.t()
@@ -233,22 +229,25 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             end = min(start + chunk_rows, n)
             rows = end - start
             if logits is None or logits.size(0) < rows:
-                logits = _ce_scratch(buf_rows, w.shape[0], acc, h.device)
-                cast_buf = None if acc == dt else _ce_scratch(buf_rows, w.shape[0], dt, h.device)
+                logits = _ce_scratch(buf_rows, w.shape[0], acc, hidden.device)
+                cast_buf = None if acc == dt else _ce_scratch(buf_rows, w.shape[0], dt, hidden.device)
             buf = logits[:rows]
+            hc = hidden[start:end]
+            if hc.dtype != dt:
+                hc = hc.to(dt)
             if cast_buf is None:
-                torch.mm(h[start:end], w_t, out=buf)
+                torch.mm(hc, w_t, out=buf)
                 torch.log_softmax(buf, -1, out=buf)
             else:
                 cast = cast_buf[:rows]
-                torch.mm(h[start:end], w_t, out=cast)
+                torch.mm(hc, w_t, out=cast)
                 torch.log_softmax(cast, -1, dtype=acc, out=buf)
             chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk if total is None else total.add_(chunk)
         count = targets.ne(ignore_index).sum()
         # Backward consumes the same cast weight the forward GEMMs use; the
         # original dtype is kept in `in_dtypes` for the returned gradient.
-        ctx.save_for_backward(h, w, targets)
+        ctx.save_for_backward(hidden, w, targets)
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
         ctx.count = count
@@ -263,16 +262,15 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         acc = _loss_acc_dtype(dt)
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
-        hidden_dtype, weight_dtype = ctx.in_dtypes
+        _, weight_dtype = ctx.in_dtypes
         chunk_rows = ctx.chunk_rows
         grad_h = torch.empty_like(h) if need_h else None
         grad_h_tmp = None
-        if need_h and h.dtype != hidden_dtype:
+        if need_h and h.dtype != dt:
             # The GEMM produces a low-precision tile while the caller needs
             # the gradient in the input dtype; each chunk is written through
             # a small temporary in the GEMM dtype.
-            grad_h = torch.empty((targets.numel(), h.shape[1]), dtype=hidden_dtype, device=h.device)
-            grad_h_tmp = torch.empty((min(chunk_rows, targets.numel()), h.shape[1]), dtype=h.dtype, device=h.device)
+            grad_h_tmp = torch.empty((min(chunk_rows, targets.numel()), h.shape[1]), dtype=dt, device=h.device)
         # The weight gradient accumulates into its final buffer from the first
         # chunk on: a low-precision weight keeps a low-precision accumulator,
         # while an fp32/fp64 weight (the autocast case `w = weight.to(bf16)`)
@@ -283,9 +281,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             low_precision = weight_dtype in (torch.bfloat16, torch.float16)
             grad_w_dtype = weight_dtype if low_precision else acc
             grad_w = torch.empty_like(w, dtype=grad_w_dtype)
-        # See `_ChunkedCrossEntropy.backward`: with no valid targets the
-        # gradient must stay zero instead of 0 * inf = NaN.
-        grad_scale = (grad_out / ctx.count).to(dt) if int(ctx.count) > 0 else grad_out.to(dt)
+        grad_scale = (grad_out / ctx.count.clamp(min=1)).to(dt)
         w_t = w.t()
         first = True
         n = targets.numel()
@@ -296,6 +292,8 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             end = min(start + chunk_rows, n)
             rows = end - start
             hc = h[start:end]
+            if hc.dtype != dt:
+                hc = hc.to(dt)
             tc = targets[start:end]
             if probs is None or probs.size(0) < rows:
                 probs = _ce_scratch(buf_rows, w.shape[0], acc, h.device)
@@ -341,11 +339,11 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                                 // max(1, hcf.shape[1] * hcf.element_size()))
                     for v0 in range(0, w.shape[0], block):
                         v1 = min(w.shape[0], v0 + block)
-                        part = torch.mm(buf[:, v0:v1].t(), hcf)
                         if first:
-                            grad_w[v0:v1].copy_(part)
+                            torch.mm(buf[:, v0:v1].t(), hcf,
+                                     out=grad_w[v0:v1])
                         else:
-                            grad_w[v0:v1].add_(part)
+                            grad_w[v0:v1].addmm_(buf[:, v0:v1].t(), hcf)
                     del hcf
             first = False
         if need_w and grad_w.dtype != weight_dtype:
@@ -375,7 +373,8 @@ class _LayerScaleResidual(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         residual, scale = ctx.saved_tensors
-        grad_scale = _reduce_products(grad_out, residual)
+        grad_scale = (_reduce_products(grad_out, residual)
+                      if ctx.needs_input_grad[2] else None)
         grad_residual = grad_out.mul(scale)
         return (grad_out, grad_residual, grad_scale)
 
@@ -475,8 +474,10 @@ class _SwiGLU(torch.autograd.Function):
             grad_x.addmm_(grad_b, w3)
         if do_w1:
             grad_w1 = grad_a.t() @ x
+            del grad_a
         if do_w3:
             grad_w3 = grad_b.t() @ x
+            del grad_b
         xd, w1d, w2d, w3d = ctx.in_dtypes
         if grad_x is not None:
             if grad_x.dtype != xd:

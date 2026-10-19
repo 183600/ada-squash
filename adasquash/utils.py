@@ -21,8 +21,9 @@ class MaxAbsMeter:
 
     @staticmethod
     def _abs_max(x: torch.Tensor) -> torch.Tensor:
-        """max(|x|)."""
-        return torch.maximum(x.max(), -x.min())
+        """max(|x|), from one fused min/max reduction."""
+        lo, hi = torch.aminmax(x)
+        return torch.maximum(hi, -lo)
 
     def update(self, x: torch.Tensor):
         with torch.no_grad():
