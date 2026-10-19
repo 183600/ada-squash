@@ -49,20 +49,23 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     lengths = []
-    # Token ids are accumulated per document as numpy arrays and counted with
-    # one `np.bincount` at the end: the previous `Counter.update(list)` walked
-    # every token of every document in Python (millions of iterations on a full
-    # audit). Documents are tokenized in batches, with a per-document fallback
-    # so one bad document is still counted (and skipped) instead of losing the
-    # whole batch.
-    token_batches: list = []
+    # Token ids are counted in a fixed `vocab_size + 1` numpy array, one
+    # `np.bincount` per tokenized document, so a full audit (--n-docs 0) never
+    # retains the token stream (the old list-of-arrays + single concatenate
+    # held, and then doubled, every id of the split). Documents are tokenized
+    # in batches, with a per-document fallback so one bad document is still
+    # counted (and skipped) instead of losing the whole batch. Ids that cannot
+    # go through bincount (negative) keep the legacy Python-counter path.
+    counts = None
     text_batch: list = []
     legacy_tokens: Counter = Counter()
     hashes: set = set()
     overlap = 0
     tokenizer_errors = 0
+    vocab_size = int(getattr(tokenizer, 'vocab_size', 0) or 0)
 
     def _add_ids(ids) -> None:
+        nonlocal counts
         try:
             arr = np.asarray(ids, dtype=np.int64)
         except (TypeError, ValueError):
@@ -74,8 +77,16 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             # np.bincount rejects negatives; keep the legacy path for a
             # tokenizer that emits them (they still get flagged below).
             legacy_tokens.update(arr.tolist())
-        else:
-            token_batches.append(arr)
+            return
+        bc = np.bincount(arr)
+        if counts is None:
+            counts = np.zeros(max(bc.shape[0], vocab_size + 1), dtype=np.int64)
+        elif bc.shape[0] > counts.shape[0]:
+            # Grow on first sight of an out-of-vocabulary id so it can still
+            # be reported by `token_ids_out_of_range`.
+            counts = np.concatenate(
+                [counts, np.zeros(bc.shape[0] - counts.shape[0], dtype=np.int64)])
+        counts[:bc.shape[0]] += bc
 
     def _flush_tokens() -> None:
         nonlocal tokenizer_errors
@@ -115,9 +126,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         if len(text_batch) >= 256:
             _flush_tokens()
     _flush_tokens()
-    if token_batches:
-        ids = np.concatenate(token_batches) if len(token_batches) > 1 else token_batches[0]
-        counts = np.bincount(ids, minlength=int(getattr(tokenizer, 'vocab_size', 0) or 0) + 1)
+    if counts is not None:
         tokens = Counter({int(t): int(c) for t, c in enumerate(counts) if c})
     else:
         tokens = Counter()

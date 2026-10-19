@@ -129,6 +129,9 @@ def measured_forward_flops(fn, tokens: int):
 
 
 def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy: bool=True) -> dict:
+    # Drop the previous norm's autocast casts before its replacement is built:
+    # the cache pins the old model's weights until the next forward re-casts.
+    clear_cast_weight_cache()
     # Build on the benchmark device and skip the constructor init pass;
     # `reset_parameters(args.seed)` below is the single seeded init.
     with torch.device(device):

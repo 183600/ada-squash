@@ -44,25 +44,34 @@ class MaxAbsMeter:
                 self._peak = torch.fmax(self._peak, v)
         self.count += 1
 
+# One workspace pair per (name, device, dtype), shared by every meter: the
+# sampling hooks run one at a time, so a single pair serves all norms instead
+# of each meter pinning its own buffers for the rest of the run.
+_KURTOSIS_WORKSPACES: dict = {}
+_KURTOSIS_WORKSPACES_MAX_ENTRIES = 8
+
+def release_kurtosis_workspaces() -> None:
+    """Release the shared KurtosisMeter scratch buffers (window / run end)."""
+    _KURTOSIS_WORKSPACES.clear()
+
 class KurtosisMeter:
     # The per-chunk workspace is bounded and reused across samples.
     _chunk = 1 << 22
     acc_dtype = torch.float32
 
     def __init__(self):
-        self._scratch: dict = {}
         self.reset()
 
     def _workspace(self, name: str, like: torch.Tensor) -> torch.Tensor:
         """A reusable buffer at least as large as `like` (a view is returned)."""
         n = like.numel()
-        buf = self._scratch.get(name)
-        if (buf is None or buf.numel() < n or buf.dtype != like.dtype
-                or buf.device != like.device):
-            if len(self._scratch) >= 2:
-                self._scratch.clear()
+        key = (name, like.device, like.dtype)
+        buf = _KURTOSIS_WORKSPACES.get(key)
+        if buf is None or buf.numel() < n:
             buf = torch.empty(n, dtype=like.dtype, device=like.device)
-            self._scratch[name] = buf
+            if len(_KURTOSIS_WORKSPACES) >= _KURTOSIS_WORKSPACES_MAX_ENTRIES:
+                _KURTOSIS_WORKSPACES.clear()
+            _KURTOSIS_WORKSPACES[key] = buf
         return buf[:n].view(like.shape)
 
     def reset(self):
@@ -182,6 +191,9 @@ class ActivationStats:
         for h in self.handles:
             h.remove()
         self.handles = []
+        # The accumulators stay (pooling across windows), the scratch does
+        # not: it is rebuilt lazily by the next sampled activation.
+        release_kurtosis_workspaces()
 
     def summary(self) -> dict:
         out = {}
@@ -270,4 +282,4 @@ def measure_activation_stats(model: nn.Module, batch: torch.Tensor) -> dict:
 
 def count_parameters(model: nn.Module, trainable_only: bool=False) -> int:
     return sum((p.numel() for p in model.parameters() if not trainable_only or p.requires_grad))
-__all__ = ['ActivationStats', 'LossSpikeCounter', 'KurtosisMeter', 'MaxAbsMeter', 'measure_activation_stats', 'markov_batch', 'count_parameters']
+__all__ = ['ActivationStats', 'LossSpikeCounter', 'KurtosisMeter', 'MaxAbsMeter', 'measure_activation_stats', 'markov_batch', 'count_parameters', 'release_kurtosis_workspaces']

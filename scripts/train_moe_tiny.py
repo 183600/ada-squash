@@ -16,7 +16,7 @@ from adasquash import build_norm, markov_batch
 from adasquash.diagnostics import triage_nonfinite
 from adasquash.attention import CausalSelfAttention, clear_logit_scratch_cache
 from adasquash.metrics import mean_std_stderr
-from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, _LayerScaleResidual
+from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, clear_cast_weight_cache, _LayerScaleResidual
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 _FLAT_TOKEN_CACHE: dict = {}
@@ -353,6 +353,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             opt.zero_grad(set_to_none=True)
+            clear_cast_weight_cache()
             loss_spike.update(loss_val)
             history.append({'step': step, 'loss': loss_val, 'aux_t': aux.detach(), 'expert_cv_t': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
             if step % args.log_every == 0:

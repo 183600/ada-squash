@@ -19,7 +19,7 @@ from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import mean_ci, mean_std_stderr
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache
+from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.norms import NORM_REGISTRY
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 from scripts.data_pipeline import build_dataloader, configure_data_options
@@ -895,6 +895,7 @@ def main():
                 grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             sched.step()
+            clear_cast_weight_cache()
             loss_spike.update(loss_val)
             if args.val_every > 0:
                 # The window is only consumed by the validation block below; with

@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT
 from adasquash.metrics import wilson_interval
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache
+from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
 
 def _strip_compile_prefix(state):
@@ -76,9 +76,10 @@ def load_ckpt(path: str, device: str='cuda'):
     model.to(device)
     model.eval()
     # Evaluation switches between models in-process (per-task loops, sweeps),
-    # so the shape-keyed CE scratch cache is dropped between models; nothing
-    # downstream depends on cache residency.
+    # so the shape-keyed CE scratch cache and the autocast weight casts are
+    # dropped between models; nothing downstream depends on cache residency.
     clear_ce_scratch_cache()
+    clear_cast_weight_cache()
     return (model, args)
 
 def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16, tokenizer: str | None=None):
