@@ -298,6 +298,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     # recompute branch on it, so the switch must stay when that is on.
     cfg = getattr(model, 'cfg', None)
     toggle_mode = float(getattr(cfg, 'dropout', 0.0)) > 0.0 or bool(getattr(cfg, 'gradient_checkpointing', False))
+    was_training = model.training
     if toggle_mode:
         model.eval()
     it = state.get('iter')
@@ -340,7 +341,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
             total = term.clone() if total is None else total.add_(term)
             n += 1
     if toggle_mode:
-        model.train()
+        model.train(was_training)
     if collect is not None and terms:
         # `.tolist()` yields the same Python doubles in the same batch order,
         # so the returned mean and the collected series are unchanged.
