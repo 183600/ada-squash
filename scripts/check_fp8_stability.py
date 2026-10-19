@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.model import MLP, build_gpt_124m
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import KurtosisMeter, markov_batch
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
@@ -575,6 +575,10 @@ def main():
         print('[hypothesis] none stated: pass --hypothesis "..." so this check is auditable as a test of a claim, not a sweep')
     manifest['results_file'] = str(out_path)
     manifest['comparison_file'] = str(comparison_path)
+    manifest = finish_metadata(manifest, artifacts={
+        'results': file_fingerprint(out_path),
+        'comparison': file_fingerprint(comparison_path),
+    })
     save_run_manifest(out_path.with_name('run_manifest.json'), manifest)
     print(f'[done] saved to {out_path}')
 if __name__ == '__main__':

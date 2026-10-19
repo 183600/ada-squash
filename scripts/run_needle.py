@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
 from adasquash.metrics import mcnemar_test, mean_ci, paired_t_one_sided, wilson_interval
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from scripts.eval_downstream import load_ckpt, needle_decode_overhead, needle_in_haystack
 
 # One placement draw is one run-level sample: a single seed's Wilson interval
@@ -280,6 +280,12 @@ def main():
     manifest['evaluated_ctx_lens'] = [r['ctx_len'] for r in results]
     if args.compare_to:
         manifest['compare_to'] = args.compare_to
+    if results:
+        manifest = finish_metadata(manifest, artifacts={'results': file_fingerprint(out)})
+    else:
+        # The SystemExit below reports that nothing was measured; the manifest
+        # must not claim a finished evaluation.
+        manifest['status'] = 'failed'
     save_run_manifest(Path(out).with_name('needle_manifest.json'), manifest)
     print(f'[done] saved to {out} ({len(results)} context length(s) evaluated, '
           f'{len(skipped)} skipped: {[s["ctx_len"] for s in skipped]})')

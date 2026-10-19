@@ -234,6 +234,45 @@ def file_fingerprint(path) -> dict:
     }
 
 
+def artifact_record(path) -> dict:
+    """Cheap pointer to a run artifact: path, existence, size and mtime.
+
+    Manifests reference files whose sha256 is not affordable per run (training
+    checkpoints are multi-GB) or not useful (a log that is still growing);
+    size+mtime detects a changed/replaced artifact without reading it. Use
+    `file_fingerprint` when a content hash of a small file (ledger, report) is
+    what pins the version.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "exists": False}
+    st = p.stat()
+    return {
+        "path": str(p),
+        "exists": True,
+        "bytes": st.st_size,
+        "mtime": st.st_mtime,
+    }
+
+
+def finish_metadata(metadata: dict, results: dict | None = None,
+                    artifacts: dict | None = None) -> dict:
+    """Return a copy of `metadata` marked as a finished run.
+
+    One place for the `status` / `finished_utc` contract every report
+    manifest carries, so a reader can tell a completed experiment from an
+    interrupted one without re-deriving it from the artifact timestamps.
+    """
+    finished = dict(metadata)
+    finished["status"] = "finished"
+    finished["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if results is not None:
+        finished["results"] = results
+    if artifacts is not None:
+        finished["artifacts"] = artifacts
+    return finished
+
+
 def environment_info() -> dict:
     """Software/hardware fingerprint of the process that produced a run.
 
@@ -398,6 +437,55 @@ def _self_test_split_boundaries() -> bool:
     return bool(contiguous and nonempty and rejects_impossible)
 
 
+def _self_test_worker_numpy_seeding() -> bool:
+    import numpy as np
+
+    original_initial_seed = torch.initial_seed
+    try:
+        torch.initial_seed = lambda: 11
+        seed_worker(0)
+        first = float(np.random.rand())
+        seed_worker(0)
+        second = float(np.random.rand())
+    finally:
+        torch.initial_seed = original_initial_seed
+    return first == second
+
+
+def _self_test_seed_contract_flags() -> bool:
+    """`set_all_seeds` must also pin the flags/manifest inputs, not only streams."""
+    import numpy as np
+
+    previous = (
+        bool(torch.backends.cudnn.deterministic),
+        bool(torch.backends.cudnn.benchmark),
+        os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        os.environ.get("PYTHONHASHSEED"),
+    )
+    try:
+        set_all_seeds(21)
+        first = float(np.random.rand())
+        set_all_seeds(21)
+        np_ok = float(np.random.rand()) == first
+        return bool(
+            torch.backends.cudnn.deterministic
+            and not torch.backends.cudnn.benchmark
+            and os.environ.get("CUBLAS_WORKSPACE_CONFIG") == ":4096:8"
+            and os.environ.get("PYTHONHASHSEED") == str(21)
+            and np_ok
+        )
+    finally:
+        torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = previous[0], previous[1]
+        if previous[2] is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = previous[2]
+        if previous[3] is None:
+            os.environ.pop("PYTHONHASHSEED", None)
+        else:
+            os.environ["PYTHONHASHSEED"] = previous[3]
+
+
 def _self_test_deterministic_algorithms_optin() -> bool:
     if torch.are_deterministic_algorithms_enabled():
         return True
@@ -430,6 +518,8 @@ def self_test(verbose: bool = True) -> dict:
     checks = {
         'seed_determinism_python_numpy_torch': _self_test_seed_determinism(),
         'worker_seeding_derived_and_distinct': _self_test_worker_seeding(),
+        'worker_numpy_seeding': _self_test_worker_numpy_seeding(),
+        'seed_contract_flags_and_hashseed': _self_test_seed_contract_flags(),
         'dataloader_reproducible': _self_test_dataloader_reproducibility(),
         'manifest_atomic_roundtrip_with_determinism_fields': _self_test_manifest_roundtrip(),
         'split_boundaries_chronological_and_disjoint': _self_test_split_boundaries(),
@@ -460,9 +550,11 @@ def _main(argv=None) -> int:
 __all__ = [
     "REPO_ROOT",
     "apply_deterministic_algorithms",
+    "artifact_record",
     "collect_run_metadata",
     "environment_info",
     "file_fingerprint",
+    "finish_metadata",
     "git_revision",
     "save_run_manifest",
     "seed_worker",

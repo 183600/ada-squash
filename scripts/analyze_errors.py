@@ -81,7 +81,7 @@ import torch
 from adasquash.diagnostics import parameter_finite_report
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import binary_auc_report, f1_from_counts, imbalance_report, mcnemar_test
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import markov_batch
 from scripts.eval_downstream import load_ckpt
 
@@ -985,6 +985,7 @@ def main():
     }
     if args.reference_ckpt:
         manifest['reference_ckpt'] = args.reference_ckpt
+    manifest = finish_metadata(manifest, artifacts={'report': file_fingerprint(out)})
     save_run_manifest(Path(out).with_name('error_analysis_manifest.json'), manifest)
     print(f'[errors] report -> {out}')
 

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from adasquash import markov_batch
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.model import MLP
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from scripts.eval_downstream import load_ckpt
 DEFAULT_SEEDS = (42, 43, 44)
 # One probe draw is one sample: the PPL drop is aggregated as Mean +/- Std
@@ -577,6 +577,10 @@ def main():
         print('[hypothesis] none stated: pass --hypothesis "..." so this check is auditable as a test of a claim, not a sweep')
     manifest['results_file'] = str(out_path)
     manifest['comparison_file'] = str(comparison_path)
+    manifest = finish_metadata(manifest, artifacts={
+        'results': file_fingerprint(out_path),
+        'comparison': file_fingerprint(comparison_path),
+    })
     save_run_manifest(out_path.with_name('run_manifest.json'), manifest)
     print(f'[done] saved to {out_path}')
 if __name__ == '__main__':

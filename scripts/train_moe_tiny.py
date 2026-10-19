@@ -425,7 +425,14 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             s['val_aux'] = val_aux
         with open(output_dir / 'stats.json', 'w') as f:
             json.dump(s, f, indent=2, default=str)
+        # Persist the final curve rows before hashing the artifact, so the
+        # manifest fingerprint covers the complete history, not a partial flush.
+        flush_history()
         run_manifest['data']['split_reports'] = data_reports
+        run_manifest['artifacts'] = {
+            'history_json': file_fingerprint(output_dir / 'history.json'),
+            'stats_json': file_fingerprint(output_dir / 'stats.json'),
+        }
         run_manifest['status'] = 'finished'
         run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         run_manifest['results'] = {
@@ -449,6 +456,9 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         if not finished:
             run_manifest['status'] = 'failed'
             run_manifest['failed_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            # The flushed curve is what a failed run is diagnosed from.
+            run_manifest.setdefault('artifacts', {})['history_json'] = file_fingerprint(
+                output_dir / 'history.json')
             run_manifest['results_partial'] = {
                 'steps_completed': len(history),
                 'last_step': history[-1]['step'] if history else None,

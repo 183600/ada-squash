@@ -64,7 +64,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
-from adasquash.repro import collect_run_metadata, save_run_manifest
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.ablation import run_one
 
 
@@ -450,6 +450,8 @@ def main():
     p.add_argument('--margin', type=float, default=0.0, help='minimum val_loss improvement over the tuned baseline to count as a win')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided test')
     p.add_argument('--output-dir', default='runs/tune')
+    p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check once per swept norm before the grid (default: on; a broken gradient/loss path would otherwise burn the whole lr x seed grid)')
+    p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check')
     p.add_argument('--force', action='store_true', help='rerun trials even if a summary already exists')
     args = p.parse_args()
     if not args.lrs:
@@ -473,6 +475,20 @@ def main():
               'selected on (winner\'s curse); treat the p-values as optimistic')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    sanity_report_path = None
+    if args.sanity_check:
+        # One preflight for the grid: `run_one` trains every arm through the
+        # same model/loss plumbing, so a single per-norm overfit check catches
+        # a broken gradient/loss path before thousands of trial steps are
+        # spent. The architecture comes from the same table the ablation rows
+        # use, so the check exercises this model shape.
+        from scripts.sanity_overfit import run_preflight
+        from scripts.train_gpt2 import _MODEL_SHAPES
+        n_layers, dim, n_heads = _MODEL_SHAPES.get(args.model, _MODEL_SHAPES['gpt2-124m'])
+        run_preflight(sorted(set(args.arms)) or ['dytcd'], args.seeds[0], base,
+                      arch_args=['--dim', str(dim), '--n-layers', str(n_layers),
+                                 '--n-heads', str(n_heads)])
+        sanity_report_path = base / 'sanity_overfit.json'
     # One metadata snapshot for the whole grid: the snapshot does not change
     # while the grid runs.
     run_metadata = collect_run_metadata(seed=None)
@@ -542,6 +558,27 @@ def main():
     manifest['seed'] = None
     manifest['hyperparameters'] = vars(args)
     manifest['arms'] = list(args.arms)
+    manifest['seeds'] = list(args.seeds)
+    manifest['confirm_seeds'] = list(args.confirm_seeds)
+    manifest['certified'] = bool(comparison and comparison.get('certified'))
+    manifest['reference_arm'] = comparison.get('reference_arm') if comparison else None
+    # Compact per-arm outcome next to the full summary file: which lr was
+    # selected and what it scored, so a completed grid is readable from the
+    # manifest without parsing every trial record.
+    manifest['selected_lr_by_arm'] = {
+        arm: ({'lr': r['best']['lr'], 'val_loss': r['best']['mean'],
+               'stderr': r['best']['stderr'], 'n': r['best']['n']}
+              if r.get('best') else None)
+        for arm, r in tuned.items()
+    }
+    manifest = finish_metadata(
+        manifest,
+        artifacts={
+            'tuning_summary': file_fingerprint(base / 'tuning_summary.json'),
+            'sanity_report': (file_fingerprint(sanity_report_path) if sanity_report_path
+                              else {'enabled': False}),
+        },
+    )
     save_run_manifest(base / 'run_manifest.json', manifest)
     print(f'\n[tune][done] saved to {base / "tuning_summary.json"}')
 

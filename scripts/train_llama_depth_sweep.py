@@ -36,7 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided
-from adasquash.repro import collect_run_metadata, save_run_manifest
+from adasquash.repro import artifact_record, collect_run_metadata, finish_metadata, save_run_manifest
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
     if step < warmup:
@@ -793,6 +793,34 @@ def main():
     with open(comp_path, 'w') as f:
         json.dump(comparison, f, indent=2)
     print(f'[compare] comparisons -> {comp_path}')
+    # The manifest was written before the children launched; finalize it now
+    # with the outcome, otherwise a completed sweep is indistinguishable from a
+    # launcher that died silently after writing the (pre-run) manifest.
+    sweep_manifest['cells'] = {
+        f'd{depth}-{norm}': {
+            'n_seeds': agg.get('n_seeds'),
+            'n_seeds_final': agg.get('n_seeds_final'),
+            'best_val_loss': agg.get('best_val_loss'),
+            'best_val_loss_std': agg.get('best_val_loss_std'),
+            'final_val_loss': agg.get('final_val_loss'),
+            'final_val_loss_std': agg.get('final_val_loss_std'),
+            'missing_seeds': agg.get('missing_seeds'),
+            'invalid_seeds': agg.get('invalid_seeds'),
+            'curve_classification_counts': agg.get('curve_classification_counts'),
+        }
+        for depth, norm, cell_dir in cells
+        for agg in [aggs_by_depth.get(depth, {}).get(norm, {})]
+    }
+    sweep_manifest = finish_metadata(
+        sweep_manifest,
+        results={
+            'n_cells': len(cells),
+            'n_jobs': len(jobs),
+            'incomplete_cells': comparison.get('incomplete_cells') if isinstance(comparison, dict) else None,
+        },
+        artifacts={'sweep_comparisons': artifact_record(comp_path)},
+    )
+    save_run_manifest(base / 'run_manifest.json', sweep_manifest)
     print('[sweep] done')
 if __name__ == '__main__':
     main()

@@ -74,7 +74,7 @@ import torch
 
 from adasquash import GPT, GPTConfig, NORM_REGISTRY, markov_batch
 from adasquash.metrics import binary_auc_report, f1_from_counts
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, finish_metadata, save_run_manifest, set_all_seeds
 
 DEFAULT_THRESHOLDS = {
     "copy": {"loss": 0.05, "acc": 0.99},
@@ -564,6 +564,7 @@ def main():
         "config": vars(args),
         "results": results,
     }
+    report = finish_metadata(report)
     out_path = save_run_manifest(args.output, report)
     print(f"[sanity] report -> {out_path}")
     if not report["passed"]:

@@ -57,7 +57,7 @@ from adasquash.model import (
     clear_cast_weight_cache,
     clear_ce_scratch_cache,
 )
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 
 _BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
 
@@ -140,8 +140,14 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     model.to(device)
     model.train()
     vocab = int(model.cfg.vocab_size)
-    x = torch.randint(0, vocab, (args.batch_size, args.seq_len), device=device)
-    y = torch.randint(0, vocab, (args.batch_size, args.seq_len), device=device)
+    # Common random numbers: every norm is measured on the *same* tokens. A
+    # per-norm draw from the global RNG would depend on how much RNG the norm's
+    # init consumed (parameter counts differ), so the timed steps would not be
+    # input-comparable across norms.
+    gen = torch.Generator(device=device)
+    gen.manual_seed(args.seed)
+    x = torch.randint(0, vocab, (args.batch_size, args.seq_len), generator=gen, device=device)
+    y = torch.randint(0, vocab, (args.batch_size, args.seq_len), generator=gen, device=device)
     tokens = args.batch_size * args.seq_len
 
     autocast_ctx = (
@@ -490,16 +496,18 @@ def main():
                         f"per token = per step / (batch*seq)"),
             'flops': 'analytic = matmul FLOPs per token; measured = torch FlopCounterMode forward',
             'memory': 'peak CUDA allocated; null on CPU',
+            'inputs': ('common random numbers: one Generator seeded with --seed draws the '
+                       'timed x/y for every norm, so a slower step is not a different input'),
         },
         'run_metadata': collect_run_metadata(seed=args.seed),
     }
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, default=str))
-    save_run_manifest(out.with_name('efficiency_manifest.json'), {
+    save_run_manifest(out.with_name('efficiency_manifest.json'), finish_metadata({
         'run_metadata': report['run_metadata'], 'hypothesis': args.hypothesis,
         'config': vars(args), 'results': results, 'tradeoff': tradeoff,
-    })
+    }, artifacts={'efficiency_report': file_fingerprint(out)}))
     print(f'[bench] report -> {out}')
 
 

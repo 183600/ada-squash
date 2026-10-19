@@ -70,7 +70,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
 from adasquash.metrics import mean_std_stderr
-from adasquash.repro import collect_run_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import markov_batch
 DEFAULT_SEEDS = (42, 43, 44)
 DEFAULT_KS = (1e-06, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0)
@@ -544,6 +544,7 @@ def main():
     manifest['report_file'] = str(out_path)
     manifest['bayes_limits'] = report['bayes_limits']
     manifest['tuned_count_baseline'] = tuned_baseline
+    manifest = finish_metadata(manifest, artifacts={'report': file_fingerprint(out_path)})
     save_run_manifest(out_path.with_name('simple_baselines_manifest.json'), manifest)
     print(f'[done] saved to {out_path}')
 

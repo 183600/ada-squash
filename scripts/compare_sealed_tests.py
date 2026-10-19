@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import holm_adjust, mean_ci, mean_std_stderr, paired_t_one_sided, student_t_ppf
-from adasquash.repro import collect_run_metadata, save_run_manifest
+from adasquash.repro import collect_run_metadata, finish_metadata, save_run_manifest
 
 PAIRING_KEYS = (
     "dataset", "dataset_config", "dataset_revision",
@@ -400,7 +400,15 @@ def main():
                 "compare same-seed runs to make the delta a run-to-run statement."),
             "rows": rows,
         }
-        save_run_manifest(args.output, {**collect_run_metadata(), "comparison": payload})
+        manifest = {**collect_run_metadata(), "comparison": payload}
+        if not_comparable:
+            # The SystemExit below reports rows that produced no paired test;
+            # the manifest must not claim a complete comparison.
+            manifest['status'] = 'failed'
+            manifest['not_comparable_rows'] = list(not_comparable)
+        else:
+            manifest = finish_metadata(manifest)
+        save_run_manifest(args.output, manifest)
         print(f"[compare] full comparison -> {args.output}")
     if not_comparable:
         print(f"[compare] ERROR: {len(not_comparable)} row(s) were not comparable; "

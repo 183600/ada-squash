@@ -22,7 +22,7 @@ from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import mean_ci, mean_std_stderr
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.norms import NORM_REGISTRY
-from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
+from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from scripts.data_pipeline import build_dataloader, configure_data_options
 
 def load_yaml_config(path: str) -> dict:
@@ -62,6 +62,12 @@ def _snapshot_rng_state() -> dict:
     restarting the streams from `--seed`.
     """
     state = {'torch_cpu': torch.get_rng_state(), 'python': random.getstate()}
+    try:
+        import numpy as _np
+    except ImportError:
+        pass
+    else:
+        state['numpy'] = _np.random.get_state()
     if torch.cuda.is_available():
         state['torch_cuda'] = torch.cuda.get_rng_state_all()
     return state
@@ -498,6 +504,22 @@ def launch_multi_seed(args, seeds) -> None:
     manifest['hyperparameters'] = vars(args)
     manifest['seeds'] = [int(s) for s in seeds]
     manifest['aggregate'] = agg
+    # The replication manifest points at the pooled result and at every child
+    # manifest, so a Phase-1 statistic can be audited down to the per-seed run
+    # that produced it.
+    manifest = finish_metadata(
+        manifest,
+        artifacts={
+            'aggregate': artifact_record(base / 'aggregate.json'),
+            'per_seed_manifests': {
+                str(int(seed)): artifact_record(seed_run_dir(base, seed) / 'run_manifest.json')
+                for seed in seeds
+            },
+        },
+    )
+    if failed_seeds:
+        manifest['status'] = 'failed'
+        manifest['failed_seeds'] = [int(s) for s in failed_seeds]
     save_run_manifest(base / 'run_manifest.json', manifest)
     if failed_seeds:
         # A multi-seed invocation is a replication study: a failed child is
@@ -732,7 +754,14 @@ def main():
                 torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
             if rng_state.get('python') is not None:
                 random.setstate(rng_state['python'])
-            print('[resume] restored RNG states (torch / cuda / python) - dropout and any stochastic step continues as if uninterrupted')
+            if rng_state.get('numpy') is not None:
+                try:
+                    import numpy as _np
+                except ImportError:
+                    pass
+                else:
+                    _np.random.set_state(rng_state['numpy'])
+            print('[resume] restored RNG states (torch / cuda / python / numpy) - dropout and any stochastic step continues as if uninterrupted')
         else:
             print('[resume] checkpoint predates RNG-state saving: RNGs restart from --seed, so a run with dropout>0 will not bitwise-continue the original stream')
         # The loader is a forward-only stream and does not persist its cursor:
@@ -1146,6 +1175,17 @@ def main():
             'flops_per_token_forward': flops['forward_per_token'],
             'flops_per_token_training_est': flops['training_per_token'],
         }
+        # Point the manifest at the files this run actually produced: the log
+        # (content hash, it is small) plus the checkpoints (size+mtime; hashing
+        # multi-GB files per run is not affordable). A result is then
+        # traceable to the exact curve/weights behind it.
+        run_manifest['artifacts'] = {
+            'train_jsonl': file_fingerprint(log_path),
+            'checkpoint_final': artifact_record(Path(args.output_dir) / 'ckpt_final.pt'),
+        }
+        best_ckpt_path = Path(args.output_dir) / 'ckpt_best.pt'
+        if best_ckpt_path.exists():
+            run_manifest['artifacts']['checkpoint_best'] = artifact_record(best_ckpt_path)
         if n_nonfinite_losses:
             print(f'[warn] {n_nonfinite_losses} non-finite loss step(s) were handled by '
                   f'--nonfinite-policy {args.nonfinite_policy}; see train.jsonl event rows')
@@ -1224,6 +1264,7 @@ def main():
             results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file}
             with open(out_path, 'w') as f:
                 json.dump(results, f, indent=2)
+            run_manifest.setdefault('artifacts', {})['test_results'] = file_fingerprint(out_path)
             run_manifest['data']['split_reports'] = data_reports
             run_manifest['results']['test_loss'] = test_loss
             run_manifest['results']['test_loss_n_batches'] = len(test_batch_losses)
@@ -1254,6 +1295,9 @@ def main():
             run_manifest['last_step'] = int(step)
             run_manifest['last_train_loss'] = last_train_loss
             run_manifest['last_val_loss'] = last_val_loss
+            # The curve is the artifact a reader needs for an interrupted run;
+            # fingerprint whatever made it to disk.
+            run_manifest.setdefault('artifacts', {})['train_jsonl'] = file_fingerprint(log_path)
             try:
                 save_run_manifest(manifest_path, run_manifest)
                 print(f'[track] run did not finish: manifest marked interrupted at step {step}', flush=True)

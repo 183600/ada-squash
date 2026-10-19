@@ -42,7 +42,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.repro import collect_run_metadata, save_run_manifest
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.data_pipeline import DocumentCleaner, document_hash, load_document_stream
 
 
@@ -294,15 +294,6 @@ def main():
            'train_hash_ledger': ledger_info}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(out, indent=2, default=str))
-    save_run_manifest(Path(args.output).with_name('data_manifest.json'), {
-        'run_metadata': out['run_metadata'],
-        'dataset': args.dataset,
-        'dataset_config': args.dataset_config,
-        'tokenizer': args.tokenizer,
-        'options': vars(args),
-        'split_reports': reports,
-        'train_hash_ledger': ledger_info,
-    })
     for name, stats in splits.items():
         print(f"[audit] {name}: sampled={stats['documents_sampled']} kept={stats.get('documents_kept', 0)} "
               f"dropped_empty={stats.get('dropped_empty', 0)} dropped_missing={stats.get('dropped_missing_text', 0)} "
@@ -333,6 +324,23 @@ def main():
         problems.append(f"train-vs-validation distribution shift TVD={shift['train_vs_validation_tvd']:.4f} > max-tvd={args.max_tvd}")
     if args.max_test_tvd is not None and shift['train_vs_test_tvd'] > args.max_test_tvd:
         problems.append(f"train-vs-test distribution shift TVD={shift['train_vs_test_tvd']:.4f} > max-test-tvd={args.max_test_tvd}")
+    manifest = {
+        'run_metadata': out['run_metadata'],
+        'dataset': args.dataset,
+        'dataset_config': args.dataset_config,
+        'tokenizer': args.tokenizer,
+        'options': vars(args),
+        'split_reports': reports,
+        'train_hash_ledger': ledger_info,
+        'problems': problems,
+    }
+    if problems:
+        # The SystemExit below reports leakage/sanity problems; the manifest
+        # must not claim a clean, finished audit.
+        manifest['status'] = 'failed'
+    else:
+        manifest = finish_metadata(manifest, artifacts={'audit_report': file_fingerprint(args.output)})
+    save_run_manifest(Path(args.output).with_name('data_manifest.json'), manifest)
     if problems:
         for problem in problems:
             print(f'[audit] PROBLEM: {problem}', file=sys.stderr)

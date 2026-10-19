@@ -50,7 +50,7 @@ from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
-from adasquash.repro import collect_run_metadata, git_revision, save_run_manifest, set_all_seeds
+from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
 
 
@@ -1250,7 +1250,8 @@ def main():
     p.add_argument('--simple-baselines', default=None, help='Bayes-limit calibration JSON from scripts/baseline_simple.py; when omitted, auto-detected at <output-dir>/simple_baselines.json. Adds the tuned simple baseline and the memoryless-Bayes-floor / full-context-ceiling gaps to baseline_comparison.json')
     p.add_argument('--baseline-margin', type=float, default=0.0, help='minimum val_loss improvement over the best baseline to count as a win')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired z-test vs the best baseline')
-    p.add_argument('--sanity-check', action='store_true', help='run the small-batch overfit sanity check for every norm in the selected rows before training them')
+    p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check for every norm in the selected rows before training them (default: on; a row that cannot overfit one batch has a gradient/loss bug and must not be launched)')
+    p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. an offline host)')
     p.add_argument('--check-matrix', action='store_true', help='validate controlled knobs, stated hypotheses and leave-one-out coverage of the matrix, then exit without training')
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
@@ -1291,6 +1292,9 @@ def main():
         arch = ['--dim', str(dim), '--n-layers', str(n_layers), '--n-heads', str(n_heads)]
 
         run_preflight(norms or ['dytcd'], seeds[0], base, arch_args=arch)
+        sanity_report_path = base / 'sanity_overfit.json'
+    else:
+        sanity_report_path = None
     multi = len(seeds) > 1
     all_summaries = []
     trained: dict[str, str] = {}
@@ -1418,6 +1422,19 @@ def main():
     }
     manifest['baseline_comparison'] = comparison
     manifest['leave_one_out_comparison'] = loo_comparison
+    if sanity_report_path is not None:
+        manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
+    else:
+        manifest['overfit_sanity_check'] = {'enabled': False}
+    # Durable artifacts, so the manifest says which files the comparison above
+    # was computed from. `all_summaries.json` can carry every per-step curve
+    # and is recorded by size+mtime instead of a full re-hash.
+    manifest = finish_metadata(manifest, artifacts={
+        'all_summaries': artifact_record(base / 'all_summaries.json'),
+        'baseline_comparison': artifact_record(base / 'baseline_comparison.json'),
+        'leave_one_out_comparison': artifact_record(base / 'leave_one_out_comparison.json'),
+        'sanity_report': file_fingerprint(sanity_report_path) if sanity_report_path else {'enabled': False},
+    })
     save_run_manifest(base / 'run_manifest.json', manifest)
     print(f'\n[done] {len(ordered)} ablations saved to {base} '
           f'({len(seeds)} seed(s): {seeds}; row val_loss = mean +/- std across seeds)')

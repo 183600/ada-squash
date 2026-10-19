@@ -11,7 +11,7 @@ import torch
 from adasquash import GPTConfig, GPT
 from adasquash.metrics import wilson_interval
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
-from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 
 def _strip_compile_prefix(state):
     prefix = '_orig_mod.'
@@ -362,6 +362,13 @@ def main():
     manifest['summary'] = {k: results[k] for k in
                            ('norm', 'tasks_ran', 'needle_acc', 'needle_ctx_len',
                             'needle_ctx_source', 'needle_trained_seq_len') if k in results}
+    if args.tasks and not results.get('tasks_ran', False):
+        # A requested benchmark that did not run is an incomplete evaluation;
+        # the manifest must not claim completion (the SystemExit below says
+        # the same thing to the caller).
+        manifest['status'] = 'failed'
+    else:
+        manifest = finish_metadata(manifest)
     save_run_manifest(Path(out).with_name('eval_manifest.json'), manifest)
     print(f'[eval] results saved to {out}')
     if args.tasks and not results.get('tasks_ran', False):
