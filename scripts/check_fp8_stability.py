@@ -116,8 +116,7 @@ class FP8SwiGLUSim:
         def fwd(x):
             q = self.quant
             x_q = q(x)
-            # Every other tensor here is owned by this closure, so the
-            # roundings can run in place after the producing op.
+            # Every other tensor here is owned by this closure.
             a = q(F.linear(x_q, self.qw1), inplace=True)
             b = q(F.linear(x_q, self.qw3), inplace=True)
             h = F.silu(a)

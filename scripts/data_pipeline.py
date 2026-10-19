@@ -434,10 +434,8 @@ class DocumentCleaner:
         self.group_key = group_key or None
         self.exclude_group_hashes = (exclude_group_hashes if exclude_group_hashes is not None
                                      else set())
-        # `seen` stores the leading 64 bits of each canonical digest as an int
-        # instead of boxed `bytes` objects; collisions only matter at a
-        # negligible 2^-64 scale and the full digests are still used for the
-        # cross-split ledger lookup.
+        # `seen` stores the leading 64 bits of each canonical digest as an
+        # int; the full digests are used for the cross-split ledger lookup.
         self.seen: set = set()
         self.stats: Counter = Counter()
 
@@ -759,10 +757,8 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
         return stream_ds, None
     resolved_revision = report.get("dataset_revision_resolved")
     if not resolved_revision:
-        # The cache key would be revision-less, so a cache written before the
-        # upstream branch moved could be served as the new held-out slice and
-        # overlap the documents training now sees. Correctness first: replay
-        # the streaming split instead of reading/writing a revision-less cache.
+        # Without a resolved revision the cache key would not pin the upstream
+        # commit, so this split is streamed directly and no cache is used.
         print(f"[data] {split} cache disabled: the dataset revision is neither pinned "
               f"nor resolvable, so a cached slice could silently come from a different "
               f"upstream commit than the training stream", file=sys.stderr)

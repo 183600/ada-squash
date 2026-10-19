@@ -54,7 +54,7 @@ def quantize_activation_per_token(x: torch.Tensor, n_bits: int=8):
     return q
 
 def _install_quantized_weight(linear: nn.Module, qw: torch.Tensor):
-    """Quantize `linear.weight` in place (one storage, no `_q_weight` twin).
+    """Quantize `linear.weight` in place.
 
     The forward closures and the fused CE both read `weight`, so the parameter
     storage itself holds the quantized values; `_q_weight` is a detached view
