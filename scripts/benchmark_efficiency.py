@@ -406,17 +406,21 @@ def main():
                 rows.append({'candidate': cand, 'error': f'missing benchmark for norm {cand_norm!r} or reference {args.reference!r}'})
                 continue
             cand_cfg = cand_cfgs.get(cand)
-            cost_is_proxy = None
             if isinstance(cand_cfg, dict):
                 try:
                     cost_is_proxy = (_cfg_key(args.model, cand_cfg)
                                      != _cfg_key(args.model, {'norm_name': cand_norm}))
                 except Exception:
                     cost_is_proxy = bool(set(cand_cfg) - {'norm_name'})
-                if cost_is_proxy:
-                    print(f"[tradeoff][warn] {cand}: the benchmark has no row for its exact "
-                          f"architecture; cost is measured on the base '{cand_norm}' model "
-                          f"(proxy cost)")
+            else:
+                # Without the row's cfg the benchmark cannot prove that the
+                # base-norm measurement matches the trained architecture. An
+                # unknown config must not be treated as a match.
+                cost_is_proxy = True
+            if cost_is_proxy:
+                print(f"[tradeoff][warn] {cand}: the benchmark has no row for its exact "
+                      f"architecture; cost is measured on the base '{cand_norm}' model "
+                      f"(proxy cost)")
             loss_improvement = losses[args.reference_name] - cand_loss
             cost_ratio = cand_bench['training_latency_ms_per_token'] / ref_bench['training_latency_ms_per_token']
 
@@ -483,7 +487,7 @@ def main():
             'cost_model': ("each candidate's cost is measured on the base norm taken "
                            "from its row name; rows whose trained architecture differs "
                            "beyond that base (e.g. qk_norm or activation variants) record "
-                           "cost_is_proxy=true and their cost ratio is a proxy"),
+                           "cost_is_proxy=true (including rows whose cfg is unavailable) and their cost ratio is a proxy"),
         }
         for row in rows:
             if row.get('error'):
