@@ -463,6 +463,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     curve_rng = torch.Generator(device=device).manual_seed(seed + 2)
     curve_train: list = []
     curve_val: list = []
+    curve_val_stderr: list = []
     curve_steps: list = []
     curve_diagnoses: list = []
     curve_window_start = 0
@@ -522,12 +523,17 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             # `.tolist()` widens each fp32 value to the same Python double the
             # explicit fp64 cast produced.
             held = held_t.tolist()
+            held_stats = mean_std_stderr(held)
+            held_stderr = (held_stats['stderr']
+                           if held_stats and held_stats['n'] >= 2 else None)
             curve_train.append(train_point)
-            curve_val.append(sum(held) / len(held))
+            curve_val.append(held_stats['mean'])
+            curve_val_stderr.append(held_stderr)
             curve_steps.append(step + 1)
             diagnosis = diagnose_train_val_curve(
                 curve_train, curve_val, train_steps=curve_steps, val_steps=curve_steps,
                 log_vocab_size=math.log(model.cfg.vocab_size),
+                val_stderr=curve_val_stderr,
             )
             curve_diagnoses.append({
                 'step': step + 1,
@@ -536,6 +542,9 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                 'val_trend': diagnosis['val_trend'],
                 'train_window_loss': train_point,
                 'val_loss': curve_val[-1],
+                'val_stderr': held_stderr,
+                'val_noise_threshold': diagnosis['evidence'].get('val_noise_threshold'),
+                'val_change_within_noise': diagnosis['evidence'].get('val_change_within_noise'),
                 'generalization_gap': diagnosis['generalization_gap'],
                 'recommendations': diagnosis['recommendations'],
             })
@@ -620,6 +629,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     # at each point, so a row is read as a training curve, not a final number.
     summary['curve_train_window_loss'] = curve_train
     summary['curve_val_loss'] = curve_val
+    summary['curve_val_stderr'] = curve_val_stderr
     summary['curve_steps'] = curve_steps
     summary['curve_diagnosis'] = curve_diagnoses[-1] if curve_diagnoses else None
     summary['curve_diagnosis_history'] = curve_diagnoses
@@ -632,8 +642,11 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         last_curve = curve_diagnoses[-1]
         gap = last_curve['generalization_gap']
         gap_str = 'n/a' if gap is None else f'{gap:+.4f}'
+        noise = last_curve.get('val_stderr')
+        noise_str = '' if noise is None else f', val_se={noise:.4f}'
         final_curve = (f" curve={last_curve['classification']} "
-                       f"(train {last_curve['train_trend']}, val {last_curve['val_trend']}, gap={gap_str})")
+                       f"(train {last_curve['train_trend']}, val {last_curve['val_trend']}, "
+                       f"gap={gap_str}{noise_str})")
     print(f"  [done] final_loss={summary['final_loss']:.4f} val_loss={val_loss:.4f} "
           f"max_abs_pre_norm={summary['max_abs_pre_norm']}{final_curve}")
     # Drop the per-row scratch caches.
