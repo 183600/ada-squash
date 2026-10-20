@@ -468,8 +468,13 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     curve_diagnoses: list = []
     curve_window_start = 0
     t0 = time.time()
+    tokens_processed = 0
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+    peak_device_memory_mb = None
     for step in range(args.max_steps):
         x, y = markov_batch(rng, model.cfg.ignore_index, args.batch_size, args.seq_len, device, outlier_id=outlier_id)
+        tokens_processed += int(x.numel())
         measure = step % args.stats_every == 0
         if measure:
             act_stats.attach(reset=not stats_windowed)
@@ -545,6 +550,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
                 'val_stderr': held_stderr,
                 'val_noise_threshold': diagnosis['evidence'].get('val_noise_threshold'),
                 'val_change_within_noise': diagnosis['evidence'].get('val_change_within_noise'),
+                'gap_change_within_noise': diagnosis['evidence'].get('gap_change_within_noise'),
                 'generalization_gap': diagnosis['generalization_gap'],
                 'recommendations': diagnosis['recommendations'],
             })
@@ -614,7 +620,11 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         'train_steps': args.max_steps,
         'seed': seed,
     }
-    summary = {'name': name, 'hypothesis': hypothesis, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'seed': seed, 'seeds': [seed], 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'val_losses': val_losses, 'val_loss_std': val_stats['std'], 'val_loss_stderr': val_stats['stderr'], 'val_loss_std_basis': 'val_batches', 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'controls': controls, 'elapsed_s': time.time() - t0}
+    elapsed_s = time.time() - t0
+    if device == 'cuda':
+        peak_device_memory_mb = float(
+            torch.cuda.max_memory_allocated(device)) / (1024 ** 2)
+    summary = {'name': name, 'hypothesis': hypothesis, 'cfg': cfg_kwargs, 'model': args.model, 'n_params': n_params, 'seed': seed, 'seeds': [seed], 'final_loss': losses[-1], 'mean_last_100_loss': sum(losses[-100:]) / max(1, len(losses[-100:])), 'val_loss': val_loss, 'val_losses': val_losses, 'val_loss_std': val_stats['std'], 'val_loss_stderr': val_stats['stderr'], 'val_loss_std_basis': 'val_batches', 'n_val_batches': n_val_batches, 'selection_metric': 'val_loss', 'n_loss_spikes': loss_spike.n_spikes, 'loss_curve': losses, 'act_stats': stats, 'max_abs_pre_norm': stats.get('__summary__', {}).get('max_abs_pre_norm'), 'mean_max_abs_pre_norm': stats.get('__summary__', {}).get('mean_max_abs'), 'mean_excess_kurtosis_pre_norm': stats.get('__summary__', {}).get('mean_excess_kurtosis_pre_norm'), 'controls': controls, 'elapsed_s': elapsed_s, 'tokens_processed': tokens_processed, 'tokens_per_second': (tokens_processed / elapsed_s) if elapsed_s > 0 else None, 'peak_device_memory_mb': peak_device_memory_mb}
     # Per-row model accounting is stored next to the loss.
     summary['parameter_breakdown'] = param_breakdown
     summary['flops_per_token_forward'] = flops['forward_per_token']
@@ -678,6 +688,9 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
             'mean_last_100_loss': s.get('mean_last_100_loss'),
             'n_loss_spikes': s.get('n_loss_spikes'),
             'elapsed_s': s.get('elapsed_s'),
+            'tokens_processed': s.get('tokens_processed'),
+            'tokens_per_second': s.get('tokens_per_second'),
+            'peak_device_memory_mb': s.get('peak_device_memory_mb'),
             # The final curve verdict of this run (None for summaries written
             # before curve monitoring existed, or for very short runs).
             'curve_classification': s.get('curve_classification'),
@@ -690,6 +703,10 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
     def _mean_of(key):
         vals = [p[key] for p in per_seed if _finite_metric(p.get(key))]
         return sum(vals) / len(vals) if vals else None
+
+    tps_vals = [p['tokens_per_second'] for p in per_seed
+                if _finite_metric(p.get('tokens_per_second'))]
+    tps_stats = mean_std_stderr(tps_vals)
 
     agg = dict(summaries[0]) if summaries else {}
     pooled: list = []
@@ -719,6 +736,13 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
                              if isinstance(p.get('n_loss_spikes'), (int, float))),
         'elapsed_s': sum(p['elapsed_s'] or 0.0 for p in per_seed
                          if isinstance(p.get('elapsed_s'), (int, float))),
+        # Measured cost of the arm, carried next to the loss delta.
+        'tokens_processed': sum(p['tokens_processed'] for p in per_seed
+                                if isinstance(p.get('tokens_processed'), int)),
+        'tokens_per_second': None if tps_stats is None else tps_stats['mean'],
+        'tokens_per_second_seed_std': (tps_stats['std'] if tps_stats and len(tps_vals) >= 2 else None),
+        'peak_device_memory_mb': _mean_of('peak_device_memory_mb'),
+        'cost_basis': 'tokens_per_second / peak_device_memory_mb are measured this run; memory is null on CPU',
         # Curve regimes across the row's seeds: a seed whose run was still
         # underfit/stalled or already overfitting/diverging makes its
         # val_loss a statement about that regime as much as about the norm,

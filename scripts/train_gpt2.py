@@ -1323,6 +1323,7 @@ def main():
                         'val_stderr': val_stderr,
                         'val_noise_threshold': last_diagnosis['evidence'].get('val_noise_threshold'),
                         'val_change_within_noise': last_diagnosis['evidence'].get('val_change_within_noise'),
+                        'gap_change_within_noise': last_diagnosis['evidence'].get('gap_change_within_noise'),
                         'recommendations': last_diagnosis['recommendations'],
                     })
                     print(f"[curve] step={step} train_window={train_point:.4f} val={val_loss:.4f}{noise_str} "

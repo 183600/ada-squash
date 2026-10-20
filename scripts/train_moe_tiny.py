@@ -208,7 +208,8 @@ class MoEGPT(nn.Module):
         return (logits, loss)
 
 DEFAULT_SEEDS = (42, 43, 44)
-_MOE_SEED_METRIC_KEYS = ('val_ce', 'val_loss', 'val_aux', 'final_loss', 'final_expert_cv')
+_MOE_SEED_METRIC_KEYS = ('val_ce', 'val_loss', 'val_aux', 'final_loss',
+                         'final_expert_cv', 'tokens_per_second')
 
 def run_one(args, seed: int, output_dir: Path) -> dict:
     """One complete MoE training run on `seed`, writing its own artifacts."""
@@ -387,9 +388,15 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         return vx.to(device, non_blocking=True), vy.to(device, non_blocking=True)
 
     finished = False
+    t0 = time.time()
+    tokens_processed = 0
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+    peak_device_memory_mb = None
     try:
         for step in range(args.max_steps):
             x, y = next_batch()
+            tokens_processed += int(x.numel())
             if step % args.stats_every == 0:
                 act_stats.attach(reset=not stats_windowed)
                 stats_windowed = True
@@ -492,6 +499,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                         'val_aux': sum(held_aux) / len(held_aux),
                         'val_noise_threshold': diagnosis['evidence'].get('val_noise_threshold'),
                         'val_change_within_noise': diagnosis['evidence'].get('val_change_within_noise'),
+                        'gap_change_within_noise': diagnosis['evidence'].get('gap_change_within_noise'),
                         'generalization_gap': diagnosis['generalization_gap'],
                         'recommendations': diagnosis['recommendations'],
                     })
@@ -595,8 +603,17 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         }
         run_manifest['status'] = 'finished'
         run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        elapsed_s = time.time() - t0
+        if device == 'cuda':
+            peak_device_memory_mb = float(
+                torch.cuda.max_memory_allocated(device)) / (1024 ** 2)
         run_manifest['results'] = {
             'steps': args.max_steps,
+            # Measured cost, not only the analytic parameter/FLOP estimate.
+            'tokens_processed': tokens_processed,
+            'tokens_per_second': (tokens_processed / elapsed_s) if elapsed_s > 0 else None,
+            'elapsed_s': elapsed_s,
+            'peak_device_memory_mb': peak_device_memory_mb,
             'final_loss': history[-1]['loss'] if history else None,
             'final_expert_cv': (float(history[-1]['expert_cv_t'][-1])
                                 if history and history[-1]['expert_cv_t'].numel() else None),
@@ -668,6 +685,14 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
             continue
         agg[key] = stats['mean']
         agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
+    mem_vals = [r['peak_device_memory_mb'] for r in results
+                if _usable(r.get('peak_device_memory_mb'))]
+    mem_stats = mean_std_stderr(mem_vals)
+    agg['peak_device_memory_mb'] = None if mem_stats is None else mem_stats['mean']
+    agg['peak_device_memory_mb_std'] = (mem_stats['std']
+                                        if mem_stats and mem_stats['n'] >= 2 else None)
+    agg['cost_basis'] = ('tokens_per_second / peak_device_memory_mb are measured '
+                         'this run; memory is null on CPU')
     # A readable manifest can still report NaN/Inf (a diverged validation
     # pass); it is not a usable replication and is listed rather than silently
     # pooled into the mean.
@@ -773,6 +798,8 @@ def main():
                 'val_ce': agg.get('val_ce'),
                 'val_ce_std': agg.get('val_ce_std'),
                 'invalid_seeds': agg.get('invalid_seeds'),
+                'tokens_per_second': agg.get('tokens_per_second'),
+                'peak_device_memory_mb': agg.get('peak_device_memory_mb'),
             },
             artifacts={'seeds_summary': file_fingerprint(summary_path)},
         )
@@ -787,6 +814,13 @@ def main():
                   f"over {agg['n_seeds']} seeds -> {summary_path}")
         else:
             print(f'[moe][done] no usable val_ce across seeds -> {summary_path}')
+        if agg.get('tokens_per_second') is not None:
+            tps_std = agg.get('tokens_per_second_std')
+            tps_str = '' if tps_std is None else f' +/- {tps_std:.1f}'
+            peak = agg.get('peak_device_memory_mb')
+            peak_str = '' if peak is None else f', peak={peak:.1f} MB'
+            print(f'[moe][done] measured cost={agg["tokens_per_second"]:.1f}'
+                  f'{tps_str} tok/s{peak_str}')
         regimes = agg.get('curve_classification_counts')
         if regimes:
             print(f"[moe][curve] per-seed regimes: {regimes}; read the held-out curve "
