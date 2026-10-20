@@ -122,18 +122,31 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
         pass
     else:
         np.random.seed(seed % (2 ** 32))
+    # TensorFlow is an optional dependency of the training stack; seed it when
+    # it is importable so a run that mixes torch and tf code (or a downstream
+    # eval that does) reproduces. Failures to import are expected and ignored.
+    try:
+        import tensorflow as tf
+    except ImportError:
+        pass
+    else:
+        try:
+            tf.random.set_seed(seed)
+        except Exception:
+            pass
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        # cuBLAS needs a fixed workspace to run deterministic reductions once
-        # `torch.use_deterministic_algorithms(True)` is enabled; pinning it
-        # here keeps the environment reproducible without forcing the
-        # deterministic-algorithm mode on.
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         apply_deterministic_algorithms()
+    # cuBLAS needs a fixed workspace configuration for deterministic
+    # reductions to be available at all; pinning it unconditionally (rather
+    # than only under the deterministic flag) keeps the environment
+    # reproducible even when cuDNN determinism is left off, and is a no-op
+    # when the variable was already set by the launcher.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     os.environ["PYTHONHASHSEED"] = str(seed % (2 ** 32))
     return seed
 
@@ -151,12 +164,23 @@ def seed_worker(worker_id: int) -> None:
     seed = torch.initial_seed() % (2 ** 32)
     random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     try:
         import numpy as np
     except ImportError:
         pass
     else:
         np.random.seed(seed)
+    try:
+        import tensorflow as tf
+    except ImportError:
+        pass
+    else:
+        try:
+            tf.random.set_seed(seed)
+        except Exception:
+            pass
 
 
 def _run_git(*args: str) -> str | None:
@@ -325,6 +349,7 @@ def environment_info() -> dict:
         "hostname": socket.gethostname(),
         "torch": _module_version("torch"),
         "numpy": _module_version("numpy"),
+        "tensorflow": _module_version("tensorflow"),
         "transformers": _module_version("transformers"),
         "datasets": _module_version("datasets"),
         "pyyaml": _module_version("yaml"),
@@ -361,14 +386,33 @@ def environment_info() -> dict:
     return info
 
 
-def collect_run_metadata(seed: int | None = None, extra: dict | None = None) -> dict:
-    """Metadata block attached to every run manifest."""
+def collect_run_metadata(seed: int | None = None, extra: dict | None = None,
+                        hyperparameters: dict | None = None,
+                        data_version=None, training_curves=None,
+                        results: dict | None = None) -> dict:
+    """Metadata block attached to every run manifest.
+
+    `hyperparameters`, `data_version`, `training_curves` and `results` are
+    optional convenience fields so a caller can record the full experiment
+    (code version, hyperparameters, seed, data version, training curves and
+    final results) in one call instead of mutating the dict by hand. They are
+    merged into the metadata under the same keys the manifests already use,
+    and `extra` (if given) is applied last, so callers can still override.
+    """
     metadata = {
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "seed": None if seed is None else int(seed),
         "git": git_revision(),
         "environment": environment_info(),
     }
+    if hyperparameters is not None:
+        metadata["hyperparameters"] = hyperparameters
+    if data_version is not None:
+        metadata["data_version"] = data_version
+    if training_curves is not None:
+        metadata["training_curves"] = training_curves
+    if results is not None:
+        metadata["results"] = results
     if extra:
         metadata.update(extra)
     return metadata
