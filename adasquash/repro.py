@@ -140,7 +140,10 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        apply_deterministic_algorithms()
+    # Honor an explicit ADASQUASH_DETERMINISTIC_ALGORITHMS request regardless
+    # of the cuDNN flag, so a caller can opt into deterministic kernels
+    # without forcing cuDNN determinism (and vice versa).
+    apply_deterministic_algorithms()
     # cuBLAS needs a fixed workspace configuration for deterministic
     # reductions to be available at all; pinning it unconditionally (rather
     # than only under the deterministic flag) keeps the environment
