@@ -516,7 +516,7 @@ def main():
                 "run-to-run statement."),
             "rows": rows,
         }
-        manifest = {**collect_run_metadata(), "comparison": payload}
+        manifest = {**collect_run_metadata(hyperparameters=vars(args)), "comparison": payload}
         if not_comparable:
             # The SystemExit below reports rows that produced no paired test;
             # the manifest must not claim a complete comparison.
