@@ -509,9 +509,13 @@ def main():
     args = p.parse_args()
     if args.ckpt and len(args.ckpt) != len(args.norms):
         p.error(f'--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}')
-    seeds = [args.seed] if args.seed is not None else list(args.seeds)
-    if not seeds:
+    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds)
+    if not raw_seeds:
         p.error('--seeds must not be empty')
+    seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    if len(seeds) != len(raw_seeds):
+        print(f'[fp8][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
+              f'(a repeated seed reruns the identical probe, not an independent sample)')
     if len(seeds) < 3:
         print(f'[fp8][warn] {len(seeds)} seed(s): one probe draw is one sample; use >= 3 independent probes before treating a metric difference as real')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

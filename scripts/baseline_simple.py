@@ -449,6 +449,13 @@ def main():
     p.add_argument('--ablation-summaries', default=None, help='ablation all_summaries.json to annotate with the limits; defaults to the sibling of --output')
     p.add_argument('--output', default='runs/ablation/simple_baselines.json')
     args = p.parse_args()
+    raw_seeds = list(args.seeds)
+    if not raw_seeds:
+        p.error('--seeds must not be empty')
+    args.seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    if len(args.seeds) != len(raw_seeds):
+        print(f'[baseline][warn] duplicate seeds removed: {raw_seeds} -> {args.seeds} '
+              '(a repeated seed reruns the identical fit, not an independent sample)')
     if args.n_states < 1:
         p.error(f'--n-states {args.n_states} must be >= 1')
     if args.max_jump < 1:

@@ -481,9 +481,13 @@ def main():
         p.error("--probe-split test is sealed: comparing checkpoints or quantization "
                 "settings on it would tune on the test set. Use 'validation' (default), "
                 "or pass --allow-sealed-test for the single final check.")
-    seeds = [args.seed] if args.seed is not None else list(args.seeds)
-    if not seeds:
+    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds)
+    if not raw_seeds:
         p.error('--seeds must not be empty')
+    seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    if len(seeds) != len(raw_seeds):
+        print(f'[w8a8][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
+              f'(a repeated seed reruns the identical probe, not an independent sample)')
     if len(seeds) < 3:
         print(f'[w8a8][warn] {len(seeds)} seed(s): one probe draw is one sample; use >= 3 independent probes before treating a PPL-drop difference as real')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
