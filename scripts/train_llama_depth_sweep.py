@@ -142,9 +142,11 @@ def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
             # `train_gpt2` replaces the requested revision (a branch, tag or
             # "latest") with the concrete commit it resolved before writing
             # the manifest; that is the stronger pin, not a recipe mismatch.
-            # A requested full commit, however, must be the commit recorded:
-            # a different hash is a real protocol mismatch.
-            if not _is_commit_revision(wanted):
+            # Only a *recorded* full commit may stand in for a non-commit
+            # request: a different branch/tag means the child did not train on
+            # the requested snapshot, and a requested full commit must be the
+            # commit recorded. Either is a real protocol mismatch.
+            if _is_commit_revision(actual) and not _is_commit_revision(wanted):
                 continue
         if actual != wanted:
             mismatches[key] = [wanted, actual]
