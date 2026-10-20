@@ -459,9 +459,8 @@ def main():
             dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), exclude_test_hash_file=ckpt_args.get('exclude_test_hash_file'), group_key=ckpt_args.get('group_key'), exclude_group_file=ckpt_args.get('exclude_group_file'), exclude_test_group_file=ckpt_args.get('exclude_test_group_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision) if args.probe == 'dataset' else None
             raw_seed = ckpt_args.get('seed')
             train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
-            # One fp32 snapshot of the weights on the host: the in-place
-            # quantizer destroys the fp32 weights, and each seed needs them
-            # back.
+            # Snapshot the fp32 weights on the host before the in-place
+            # quantizer runs; each seed needs them back.
             fp_state = {k: t.detach().to('cpu', copy=True) for k, t in model.state_dict().items()}
             per_seed = []
             for seed in seeds:

@@ -67,10 +67,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     # One machine-word int per document.
     lengths = array('q')
-    # Token ids are counted in a fixed `vocab_size + 1` numpy array, one
-    # `np.bincount` per tokenized document. Documents are tokenized in
-    # batches, with a per-document fallback so one bad document is still
-    # counted (and skipped) instead of losing the whole batch. Ids that
+    # Token ids are counted per document with `np.bincount`; a per-document
+    # fallback keeps one bad document from losing the whole batch. Ids that
     # cannot go through bincount (negative) use the Python-counter path.
     counts = None
     text_batch: list = []

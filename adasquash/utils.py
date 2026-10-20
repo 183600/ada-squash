@@ -28,9 +28,6 @@ class MaxAbsMeter:
     def update(self, x: torch.Tensor):
         with torch.no_grad():
             xd = x.detach().reshape(-1)
-            # `_abs_max` is a pure reduction that allocates only its scalar
-            # outputs, so chunking the input cannot lower peak memory; one
-            # reduction avoids the per-chunk kernel and scalar churn.
             v = self._abs_max(xd) if xd.numel() else None
             if v is not None:
                 if self._peak is None:

@@ -509,8 +509,7 @@ def gradient_health_report(model) -> dict:
             blk = flat[start:start + _GRAD_CENSUS_CHUNK]
             lo, hi = torch.aminmax(blk)
             # NaN propagates into both extrema and a non-finite value lands in
-            # one of them, so the two scalars certify the whole chunk without
-            # materializing an isfinite mask.
+            # one of them, so the two scalars certify the whole chunk.
             is_finite = is_finite & torch.isfinite(lo) & torch.isfinite(hi)
             cur_abs = torch.maximum(hi, lo.neg_()).to(torch.float64)
             g_abs = cur_abs if start == 0 else torch.maximum(g_abs, cur_abs)

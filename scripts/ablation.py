@@ -300,9 +300,9 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     output_dir.mkdir(parents=True, exist_ok=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seed)
-    # Build directly on the target device (no full-model H2D) and skip the
-    # constructor's init pass: `reset_parameters(seed)` below is the run's
-    # single, seeded initialization.
+    # Build with the constructor's init pass disabled:
+    # `reset_parameters(seed)` below is the run's single, seeded
+    # initialization.
     with torch.device(device):
         model = _MODEL_BUILDERS[args.model](init=False, **cfg_kwargs)
     model.reset_parameters(seed)

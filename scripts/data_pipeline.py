@@ -428,8 +428,8 @@ class DocumentCleaner:
         self.dedup_max = int(dedup_max)
         self.min_doc_chars = int(min_doc_chars)
         self.max_doc_chars = int(max_doc_chars)
-        # Held by reference: the ledger is read once and may be large, so the
-        # caller must not mutate it after handing it over.
+        # Held by reference: the ledger is shared with the caller, who must not
+        # mutate it after handing it over.
         self.exclude_hashes = exclude_hashes if exclude_hashes is not None else set()
         self.group_key = group_key or None
         self.exclude_group_hashes = (exclude_group_hashes if exclude_group_hashes is not None
@@ -500,11 +500,10 @@ class DocumentCleaner:
                     self.seen.add(key)
                 else:
                     # The seen-hash set is full: from here on the split keeps
-                    # every document and later duplicates of unseen documents
-                    # are no longer removed. The flag makes the silent
-                    # degradation of the dedup guarantee visible in the split
-                    # report (the cross-split ledger lookup is a set
-                    # membership test and stays exact regardless).
+                    # every document. The flag makes the degradation of the
+                    # dedup guarantee visible in the split report (the
+                    # cross-split ledger lookup is a set membership test and
+                    # stays exact regardless).
                     self.stats["dedup_cap_reached"] = 1
         self.stats["documents_kept"] += 1
         return text
@@ -753,7 +752,7 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     """
     start, count = report.get("start"), report.get("count")
     if not start or not count:
-        # start == 0 means there is no prefix to skip; nothing to gain.
+        # No prefix to skip.
         return stream_ds, None
     root = _split_cache_dir()
     if root is None:

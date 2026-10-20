@@ -256,8 +256,6 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
     batches = list(batches)
     # The filter lives on the batch device: indexing with `rows`/`x`/`y`
     # (which come from the caller's batches) must not mix CPU and CUDA tensors.
-    # The (tiny) transition matrix is built on the CPU once and moved as a
-    # single tensor.
     device = batches[0][0].device
     transition = torch.zeros(n_states, n_states, dtype=torch.float64)
     for s in range(n_states):

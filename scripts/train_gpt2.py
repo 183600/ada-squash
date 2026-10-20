@@ -789,9 +789,9 @@ def main():
         model_cfg['layerscale_init'] = args.layerscale_init
     if args.tie_embeddings is not None:
         model_cfg['tie_word_embeddings'] = args.tie_embeddings
-    # Construct on the target device (no full-model H2D) with the
-    # constructor's init pass disabled: `reset_parameters(args.seed)` below is
-    # the run's single, seeded initialization.
+    # Construct with the constructor's init pass disabled:
+    # `reset_parameters(args.seed)` below is the run's single, seeded
+    # initialization.
     with torch.device(device):
         if args.model == 'gpt2-124m':
             model = build_gpt_124m(init=False, **model_cfg)
@@ -913,9 +913,7 @@ def main():
             best_candidates.append({'val_loss': float(resume_ckpt['val_loss']),
                                     'step': int(resume_ckpt.get('step', 0))})
         if best_path.exists() and Path(args.resume).resolve() != best_path.resolve():
-            # Only the two scalars drive the tracker; loading the whole best
-            # checkpoint (model + AdamW state) onto the GPU for them would
-            # keep another full training state alive for the rest of the run.
+            # Only the two scalars drive the tracker.
             prior = _load_checkpoint_cpu(best_path)
             best_candidates.append({'val_loss': float(prior['val_loss']),
                                     'step': int(prior.get('step', 0))})

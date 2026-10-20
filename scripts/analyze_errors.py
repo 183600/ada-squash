@@ -309,7 +309,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
             tail = rng.sample(tail_pool, min(k - len(head), len(tail_pool)))
             auc_class_ids = sorted(head + tail)
     # All scan counters are device tensors. Each batch's `(key, count)` bigram
-    # histogram is kept whole and merged once after the pass.
+    # histogram is merged after the pass.
     dev = next(model.parameters()).device
     prev_gold_parts: list = []   # per-batch (unique keys, counts)
     # The fixed AUC class columns live on the model's device.

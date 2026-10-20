@@ -99,7 +99,7 @@ class FP8LinearSim:
 
         def fwd(x):
             y = F.linear(self.quant(x), self.qw, module.bias)
-            # `y` is freshly allocated here, so the rounding can write into it.
+            # The rounding writes into the freshly allocated output.
             return self.quant(y, inplace=True)
         module.forward = fwd
 
@@ -155,8 +155,8 @@ def measure_fp8_divergence(model, x, norm_name: str):
     def make_stat_hook():
 
         def hook(module, inp, out):
-            # Everything stays on the device here; the norm hooks are
-            # flattened with a single `.tolist()` after the forward.
+            # The norm hooks collect tensors on the device; they are converted
+            # after the forward.
             x_in = inp[0] if isinstance(inp, tuple) and inp else None
             cls_name = module.__class__.__name__
             has_in = torch.is_tensor(x_in)

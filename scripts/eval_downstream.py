@@ -70,9 +70,8 @@ def load_ckpt(path: str, device: str='cuda'):
     ckpt.pop('scheduler', None)
     model.to(device)
     model.eval()
-    # Evaluation switches between models in-process (per-task loops, sweeps),
-    # so the per-model scratch caches are dropped between models; nothing
-    # downstream depends on cache residency.
+    # Evaluation switches between models in-process (per-task loops, sweeps);
+    # drop the per-model scratch caches between models.
     clear_ce_scratch_cache()
     clear_cast_weight_cache()
     return (model, args)
@@ -105,8 +104,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     full forward over the whole prefix, so the flops are
     ``O(n_trials * len(target_ids) * prompt_len)``. There is no KV cache (the
     SDPA baseline path is fixed, see docs/design_notes.md D1); `decode_batch`
-    only batches independent trials together so the shared part of the prefix
-    is forwarded in one pass instead of `n_trials` sequential passes.
+    only batches independent trials together.
 
     A trial is pass/fail, so the point estimate alone hides its resolution:
     with `return_counts=True` the result is
@@ -185,9 +183,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
             buf[:, :seq_len].copy_(host, non_blocking=True)
             generated: list[list] = [[] for _ in range(n_rows)]
             failed = [False] * n_rows
-            # Once a trial's whole secret has diverged its remaining decode
-            # steps cannot change the score, so only the still-active rows are
-            # fed through the (expensive) long-context forward.
+            # Only trials that have not failed need further decode steps.
             active = list(range(n_rows))
             n = seq_len
             for want in target_ids:

@@ -57,11 +57,10 @@ def _cross_entropy_chunk_rows(vocab_size: int) -> int:
     return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
 
 def _fused_linear_chunk_rows(chunk_rows: int, vocab: int, dt: torch.dtype, acc: torch.dtype) -> int:
-    """Cap a fused-CE chunk so *all* its row-block scratch fits the budget.
+    """Cap a fused-CE chunk at the row-block size.
 
     The fused loss can hold the low-precision logits plus their accumulator
-    image at the same time; sizing the chunk from one fp32 image (as the
-    logits-only path does) would make the real peak 1.5x the budget.
+    image at the same time, so the chunk accounts for both.
     """
     element_bytes = torch.finfo(acc).bits // 8
     if dt != acc:
