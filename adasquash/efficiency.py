@@ -141,6 +141,7 @@ def efficiency_verdict(
     cost_name: str = "compute",
     cost_components: Optional[dict] = None,
     max_component_ratio: Optional[float] = None,
+    statistically_significant: Optional[bool] = None,
 ) -> dict:
     """Is `loss_improvement` worth `cost_ratio` times the baseline cost?
 
@@ -166,6 +167,7 @@ def efficiency_verdict(
         "max_cost_ratio": float(max_cost_ratio),
         "max_component_ratio": (float(max_cost_ratio) if max_component_ratio is None
                                 else float(max_component_ratio)),
+        "statistically_significant": statistically_significant,
         "component_costs": {},
         "component_failures": [],
         "gain_meaningful": None,
@@ -201,7 +203,16 @@ def efficiency_verdict(
     verdict["gain_meaningful"] = gain >= float(min_loss_gain)
     verdict["cost_acceptable"] = bool(
         cost <= float(max_cost_ratio) and not verdict["component_failures"])
-    verdict["viable"] = bool(verdict["gain_meaningful"] and verdict["cost_acceptable"])
+    # A gain that the seed-level comparison could not call significant is weak
+    # evidence: a micro point estimate is not a win on its own, so it cannot be
+    # certified as viable regardless of how cheap it is.
+    if statistically_significant is False:
+        verdict["component_failures"] = list(verdict["component_failures"]) + [
+            "gain is not statistically significant; a micro point estimate is "
+            "not convincing evidence of an improvement"]
+    verdict["viable"] = bool(
+        verdict["gain_meaningful"] and verdict["cost_acceptable"]
+        and statistically_significant is not False)
     if gain > 0:
         verdict["cost_per_loss_point"] = cost / gain
     reasons = []
@@ -215,6 +226,8 @@ def efficiency_verdict(
             f"cost ratio {cost:.3f}x exceeds the allowed maximum {max_cost_ratio:.3f}x"
         )
     reasons.extend(verdict["component_failures"])
+    if statistically_significant is False and "gain is not statistically significant; a micro point estimate is not convincing evidence of an improvement" not in reasons:
+        reasons.append("gain is not statistically significant")
     verdict["reason"] = "; ".join(reasons) if reasons else (
         f"gain {gain:+.4f} clears {min_loss_gain:g} at cost {cost:.3f}x within "
         f"{max_cost_ratio:.3f}x"
