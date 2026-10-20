@@ -527,7 +527,12 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     gap_vals, gap_stats = _pool('curve_generalization_gap')
     curve_counts = dict(Counter(
         r['curve_classification'] for r in per_seed if r.get('curve_classification')))
-    missing = [r['seed'] for r in per_seed if not _finite(r['final_val_loss']) and not _finite(r['best_val_loss'])]
+    # `n_seeds` and the pooled final estimate are built from final validation
+    # passes, so completeness means every requested seed has a finite final
+    # value. A finite `best_val_loss` alone is not a substitute: it is the
+    # selection statistic (the minimum over passes), not the fixed-step
+    # estimate the cross-arm comparison uses.
+    missing = [r['seed'] for r in per_seed if not _finite(r['final_val_loss'])]
     invalid = [r['seed'] for r in per_seed
                if any(isinstance(r[k], float) and not math.isfinite(r[k]) for k in ('final_val_loss', 'best_val_loss'))]
     return {
