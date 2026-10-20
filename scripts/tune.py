@@ -70,7 +70,7 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
                                paired_t_one_sided, student_t_ppf, welch_t_one_sided)
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from scripts.ablation import run_one
 
 
@@ -634,6 +634,8 @@ def main():
     if not args.confirm_seeds:
         print('[tune][warn] no --confirm-seeds: the comparison quotes the same runs the lr was '
               'selected on (winner\'s curse); treat the p-values as optimistic')
+    if args.seeds:
+        set_all_seeds(args.seeds[0])
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
     sanity_report_path = None
