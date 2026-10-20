@@ -670,7 +670,27 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         save_run_manifest(manifest_path, run_manifest)
         print(f'[done] saved to {output_dir} | n_loss_spikes={loss_spike.n_spikes}')
         finished = True
-        return dict(run_manifest['results'], seed=seed, output_dir=str(output_dir))
+        train_report = data_reports.get('train') or {}
+        val_report = data_reports.get('validation') or {}
+        result = dict(run_manifest['results'], seed=seed, output_dir=str(output_dir))
+        # Keep a compact copy of the resolved data/tokenizer identity in the
+        # returned per-seed record. The aggregate manifest otherwise only had
+        # losses and cost, so `seeds_summary.json` could not prove that all
+        # seeds in the mean were trained on the same upstream snapshot.
+        result['data_provenance'] = {
+            'dataset': getattr(args, 'dataset', None),
+            'dataset_config': getattr(args, 'dataset_config', None),
+            'dataset_revision': getattr(args, 'dataset_revision', None),
+            'dataset_revision_resolved': (
+                train_report.get('dataset_revision_resolved')
+                or val_report.get('dataset_revision_resolved')),
+            'tokenizer': getattr(args, 'tokenizer', None),
+            'tokenizer_revision': getattr(args, 'tokenizer_revision', None),
+            'tokenizer_revision_resolved': (
+                train_report.get('tokenizer_revision_resolved')
+                or val_report.get('tokenizer_revision_resolved')),
+        }
+        return result
     finally:
         # The curve and the partial status must survive NaN aborts and
         # external interrupts: the failure case is exactly when they are read.
@@ -710,6 +730,27 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
                 and math.isfinite(value))
 
     agg = {'seeds': [int(s) for s in seeds], 'n_seeds': len(results), 'per_seed': results}
+    provenance_by_seed = {
+        int(r['seed']): r.get('data_provenance') for r in results
+        if isinstance(r.get('seed'), int)}
+    versions_by_seed = {
+        seed: (None if not isinstance(prov, dict) else {
+            'dataset_revision_resolved': prov.get('dataset_revision_resolved'),
+            'tokenizer_revision_resolved': prov.get('tokenizer_revision_resolved'),
+        })
+        for seed, prov in provenance_by_seed.items()}
+    known_versions = {
+        json.dumps(v, sort_keys=True) for v in versions_by_seed.values()
+        if v is not None and any(value is not None for value in v.values())}
+    unknown_version_seeds = [
+        seed for seed, version in versions_by_seed.items()
+        if version is None or not any(value is not None for value in version.values())]
+    agg['data_provenance_by_seed'] = provenance_by_seed
+    agg['data_versions_by_seed'] = versions_by_seed
+    agg['unknown_data_version_seeds'] = sorted(unknown_version_seeds)
+    agg['data_versions_complete'] = bool(versions_by_seed) and not unknown_version_seeds
+    agg['data_versions_consistent'] = (agg['data_versions_complete']
+                                       and len(known_versions) <= 1)
     for key in _MOE_SEED_METRIC_KEYS:
         vals = [r[key] for r in results if _usable(r.get(key))]
         stats = mean_std_stderr(vals)
@@ -825,6 +866,13 @@ def main():
         if args.hypothesis:
             manifest['hypothesis'] = args.hypothesis
         manifest['aggregate'] = agg
+        manifest['data'] = {
+            'per_seed': agg['data_provenance_by_seed'],
+            'data_versions_by_seed': agg['data_versions_by_seed'],
+            'unknown_data_version_seeds': agg['unknown_data_version_seeds'],
+            'data_versions_complete': agg['data_versions_complete'],
+            'data_versions_consistent': agg['data_versions_consistent'],
+        }
         manifest = finish_metadata(
             manifest,
             results={
