@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -13,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import build_norm, markov_batch
-from adasquash.diagnostics import triage_nonfinite
+from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.attention import CausalSelfAttention, clear_logit_scratch_cache
 from adasquash.metrics import mean_std_stderr
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, clear_cast_weight_cache, _LayerScaleResidual
@@ -326,6 +327,65 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         tmp.write_text(json.dumps(history_rows, indent=2), encoding='utf-8')
         os.replace(tmp, output_dir / 'history.json')
 
+    # Periodic held-out curve monitoring. Synthetic mode uses its own
+    # generator (seed + 2); dataset mode skips the prefix the final validation
+    # pass (seed + 1) will consume, so the two held-out samples are disjoint
+    # and the final number stays comparable across rows. The curve tracks
+    # held-out *cross-entropy* (the selection metric) against the training CE
+    # window, not the aux-penalized total: routing regularization moves the
+    # total for reasons unrelated to predictive quality.
+    curve_every = int(getattr(args, 'curve_every', 0) or 0)
+    if curve_every == 0:
+        curve_every = max(1, int(args.max_steps) // 5)
+    elif curve_every < 0:
+        curve_every = 0
+    curve_batches = max(1, int(getattr(args, 'curve_batches', 5) or 5))
+    curve_rng = torch.Generator(device=device).manual_seed(seed + 2)
+    curve_loader = None
+    curve_iter = None
+    curve_train: list = []
+    curve_val: list = []
+    curve_val_stderr: list = []
+    curve_steps: list = []
+    curve_diagnoses: list = []
+    train_ce_window: list = []
+
+    def next_curve_batch():
+        nonlocal curve_loader, curve_iter
+        if not args.dataset:
+            if args.probe == 'random':
+                return random_probe_batch(curve_rng)
+            return markov_batch(curve_rng, cfg.ignore_index, args.batch_size,
+                                args.seq_len, device)
+        if curve_loader is None:
+            curve_loader = open_data_split('validation', args)
+            rcurve = getattr(curve_loader, 'split_report', None)
+            if rcurve:
+                data_reports['validation_curve'] = rcurve
+                print(f'[moe][data] validation curve split: {rcurve}')
+            curve_iter = iter(curve_loader)
+            # The final validation pass reads the first `--val-batches`
+            # windows of the same split; skip them here so curve points and
+            # the final estimate are disjoint samples.
+            for _ in range(max(0, int(args.val_batches))):
+                try:
+                    next(curve_iter)
+                except StopIteration:
+                    curve_iter = iter(curve_loader)
+                    break
+        try:
+            vx, vy = next(curve_iter)
+        except StopIteration:
+            curve_iter = iter(curve_loader)
+            try:
+                vx, vy = next(curve_iter)
+            except StopIteration:
+                raise SystemExit(
+                    '[moe][val] the validation split produced no curve batches; '
+                    'refusing to report a run without a held-out curve. Check '
+                    '--num-documents / the dataset revision, then re-run.')
+        return vx.to(device, non_blocking=True), vy.to(device, non_blocking=True)
+
     finished = False
     try:
         for step in range(args.max_steps):
@@ -338,14 +398,18 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             # `loss` is not touched by backward, so the pre-backward value is the
             # value to record.
             loss_val = float(loss.detach())
-            if not math.isfinite(loss_val):
+            aux_val = float(aux.detach())
+            if not (math.isfinite(loss_val) and math.isfinite(aux_val)):
                 triage = triage_nonfinite(model, x, y, device_type=device,
                                           lr=opt.param_groups[0]['lr'], grad_clip=1.0)
                 raise SystemExit(
-                    f"[moe][nan] non-finite loss at step {step}: triage stage="
-                    f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
+                    f"[moe][nan] non-finite loss/aux at step {step}: "
+                    f"triage stage='{triage['stage']}' ({triage['diagnosis']}); fixes: "
                     + ' | '.join(triage['recommendations'])
                 )
+            # Predictive quality without the router's aux penalty. This is the
+            # quantity the held-out curve and the final val_ce are compared on.
+            ce_val = loss_val - model.AUX_LOSS_COEF * aux_val
             loss.backward()
             if step % args.stats_every == 0:
                 act_stats.detach()
@@ -368,7 +432,77 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             opt.zero_grad(set_to_none=True)
             clear_cast_weight_cache()
             loss_spike.update(loss_val)
-            history.append({'step': step, 'loss': loss_val, 'aux_t': aux.detach(), 'expert_cv_t': expert_cv, 'n_loss_spikes': loss_spike.n_spikes})
+            history.append({'step': step, 'loss': loss_val, 'loss_ce': ce_val,
+                            'aux_t': aux.detach(), 'expert_cv_t': expert_cv,
+                            'n_loss_spikes': loss_spike.n_spikes})
+            if curve_every > 0:
+                train_ce_window.append(ce_val)
+                # Always land a point on the final step, otherwise a max_steps
+                # not divisible by curve_every leaves the diagnosis one window
+                # behind the weights that are actually reported.
+                if (step + 1) % curve_every == 0 or step + 1 == args.max_steps:
+                    train_point = sum(train_ce_window) / len(train_ce_window)
+                    train_ce_window = []
+                    held_total: list = []
+                    held_ce: list = []
+                    held_aux: list = []
+                    model.eval()
+                    with torch.inference_mode():
+                        for _ in range(curve_batches):
+                            vx, vy = next_curve_batch()
+                            _, total, vaux, _ = model(vx, vy, return_aux=True,
+                                                      return_logits=False)
+                            total_val = float(total)
+                            vaux_val = float(vaux)
+                            if not (math.isfinite(total_val) and math.isfinite(vaux_val)):
+                                triage = triage_nonfinite(model, vx, vy, device_type=device,
+                                                          lr=args.lr, grad_clip=1.0)
+                                raise SystemExit(
+                                    f"[moe][nan] held-out curve batch is non-finite "
+                                    f"(total={total_val}, aux={vaux_val}): triage stage="
+                                    f"'{triage['stage']}' ({triage['diagnosis']}); fixes: "
+                                    + ' | '.join(triage['recommendations'])
+                                )
+                            held_total.append(total_val)
+                            held_aux.append(vaux_val)
+                            held_ce.append(total_val - model.AUX_LOSS_COEF * vaux_val)
+                    model.train()
+                    held_stats = mean_std_stderr(held_ce)
+                    held_stderr = (held_stats['stderr']
+                                   if held_stats and held_stats['n'] >= 2 else None)
+                    curve_train.append(train_point)
+                    curve_val.append(held_stats['mean'])
+                    curve_val_stderr.append(held_stderr)
+                    curve_steps.append(step + 1)
+                    diagnosis = diagnose_train_val_curve(
+                        curve_train, curve_val, train_steps=curve_steps,
+                        val_steps=curve_steps,
+                        log_vocab_size=math.log(cfg.vocab_size),
+                        val_stderr=curve_val_stderr,
+                    )
+                    curve_diagnoses.append({
+                        'step': step + 1,
+                        'classification': diagnosis['classification'],
+                        'train_trend': diagnosis['train_trend'],
+                        'val_trend': diagnosis['val_trend'],
+                        'train_window_ce': train_point,
+                        'val_ce': curve_val[-1],
+                        'val_ce_stderr': held_stderr,
+                        'val_total': sum(held_total) / len(held_total),
+                        'val_aux': sum(held_aux) / len(held_aux),
+                        'val_noise_threshold': diagnosis['evidence'].get('val_noise_threshold'),
+                        'val_change_within_noise': diagnosis['evidence'].get('val_change_within_noise'),
+                        'generalization_gap': diagnosis['generalization_gap'],
+                        'recommendations': diagnosis['recommendations'],
+                    })
+                    noise_str = '' if held_stderr is None else f' +/- {held_stderr:.4f}'
+                    print(f"[moe][curve] step={step + 1} train_ce={train_point:.4f} "
+                          f"val_ce={curve_val[-1]:.4f}{noise_str} -> "
+                          f"{diagnosis['classification']} (train {diagnosis['train_trend']}, "
+                          f"val {diagnosis['val_trend']})", flush=True)
+                    if diagnosis['classification'] not in ('healthy', 'insufficient_data'):
+                        for line in diagnosis['recommendations']:
+                            print(f'[moe][curve]   action: {line}')
             if step % args.log_every == 0:
                 exp_cv = float(expert_cv[-1]) if expert_cv.numel() else 0.0
                 print(f'  [moe] step={step:4d} loss={loss_val:.4f} aux={float(aux.detach()):.4f} expert_cv={exp_cv:.3f}', flush=True)
@@ -376,7 +510,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         # Held-out validation loss: real data comes from the chronological
         # validation split; the synthetic corpus uses a generator (seed + 1) the
         # optimizer never saw. No gradients flow from either.
-        val_loss = val_ce = val_aux = None
+        val_loss = val_ce = val_aux = val_ce_stderr = None
         if args.val_batches > 0:
             model.eval()
             val_losses = []
@@ -437,7 +571,11 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             val_loss = sum(val_losses) / len(val_losses)
             val_ce = sum(val_ce_losses) / len(val_ce_losses)
             val_aux = sum(val_auxes) / len(val_auxes)
-            print(f'[moe][val] held-out cross-entropy={val_ce:.4f} '
+            val_ce_stats = mean_std_stderr(val_ce_losses)
+            val_ce_stderr = (val_ce_stats['stderr']
+                             if val_ce_stats and val_ce_stats['n'] >= 2 else None)
+            noise_str = '' if val_ce_stderr is None else f' +/- {val_ce_stderr:.4f}'
+            print(f'[moe][val] held-out cross-entropy={val_ce:.4f}{noise_str} '
                   f'(combined loss={val_loss:.4f}, aux={val_aux:.4f} - the combined '
                   f'number is confounded with routing and is not the comparison metric)')
         s = act_stats.summary()
@@ -464,8 +602,19 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                                 if history and history[-1]['expert_cv_t'].numel() else None),
             'val_loss': val_loss,
             'val_ce': val_ce,
+            'val_ce_stderr': val_ce_stderr,
             'val_aux': val_aux,
             'n_loss_spikes': loss_spike.n_spikes,
+            # The training curve is not the result: keep the held-out curve
+            # points and the regime verdicts next to the final number.
+            'curve_train_window_ce': curve_train,
+            'curve_val_ce': curve_val,
+            'curve_val_ce_stderr': curve_val_stderr,
+            'curve_steps': curve_steps,
+            'curve_diagnosis': curve_diagnoses[-1] if curve_diagnoses else None,
+            'curve_diagnosis_history': curve_diagnoses,
+            'curve_classification': (curve_diagnoses[-1]['classification']
+                                     if curve_diagnoses else None),
         }
         save_run_manifest(manifest_path, run_manifest)
         print(f'[done] saved to {output_dir} | n_loss_spikes={loss_spike.n_spikes}')
@@ -529,6 +678,12 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
                 for k in _MOE_SEED_METRIC_KEYS)})
     agg['n_loss_spikes_total'] = sum(r['n_loss_spikes'] or 0 for r in results
                                      if isinstance(r.get('n_loss_spikes'), (int, float)))
+    # The pooled val_ce can hide that a seed was still over/underfitting at the
+    # fixed step count. Surface the per-seed curve regimes next to the mean.
+    agg['curve_classification_counts'] = dict(Counter(
+        r['curve_classification'] for r in results if r.get('curve_classification')))
+    agg['curve_classifications_by_seed'] = {
+        str(r.get('seed')): r.get('curve_classification') for r in results}
     agg['aggregation'] = ('Mean +/- Std across independent seeds; the unit of '
                           'replication is the seed, not the step. NaN/Inf seed '
                           'values are excluded and listed in invalid_seeds.')
@@ -566,6 +721,8 @@ def main():
     p.add_argument('--exclude-test-group-file', default=None, help='validation-group hash ledger (scripts/audit_data.py --write-val-group-file --group-key K); the sealed test split drops every document whose group occurs in validation')
     p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation')
     p.add_argument('--val-batches', type=int, default=10, help='held-out validation batches at the end of training (0 disables)')
+    p.add_argument('--curve-every', type=int, default=0, help='periodic held-out curve-monitoring period in steps (0 = auto: max_steps//5; negative = disabled). Curve batches use a separate generator (seed+2) / validation loader, so the final validation pass (seed+1) stays a disjoint sample')
+    p.add_argument('--curve-batches', type=int, default=5, help='held-out batches per curve-monitoring point')
     p.add_argument('--tokenizer', default='gpt2')
     p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) to pin; recorded in the run manifest so the trained-on data version is auditable (None = upstream default branch, which can move)')
     p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) to pin; recorded in the run manifest (None = upstream default branch)')
@@ -630,6 +787,10 @@ def main():
                   f"over {agg['n_seeds']} seeds -> {summary_path}")
         else:
             print(f'[moe][done] no usable val_ce across seeds -> {summary_path}')
+        regimes = agg.get('curve_classification_counts')
+        if regimes:
+            print(f"[moe][curve] per-seed regimes: {regimes}; read the held-out curve "
+                  f"before attributing a val_ce delta to the norm")
         if agg.get('invalid_seeds'):
             print(f"[moe][warn] seeds {agg['invalid_seeds']} produced NaN/Inf metrics; "
                   f"they are excluded from the pooled mean, not treated as clean replications")
