@@ -532,7 +532,9 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             held_stderr = (held_stats['stderr']
                            if held_stats and held_stats['n'] >= 2 else None)
             curve_train.append(train_point)
-            curve_val.append(held_stats['mean'])
+            curve_val.append(held_stats['mean']
+                           if held_stats and held_stats['n'] == len(held)
+                           else float('nan'))
             curve_val_stderr.append(held_stderr)
             curve_steps.append(step + 1)
             diagnosis = diagnose_train_val_curve(
