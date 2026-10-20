@@ -7,6 +7,7 @@ import random
 import subprocess
 import sys
 import time
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
@@ -474,7 +475,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             'n_params': None, 'n_layers': None, 'dim': None, 'n_heads': None,
             'n_loss_spikes': None, 'n_nonfinite_losses': None,
             'n_nonfinite_gradients': None, 'n_nonfinite_val_losses': None,
-            'curve_classification': None, 'test_loss': None,
+            'curve_classification': None, 'curve_generalization_gap': None,
+            'test_loss': None,
             'tokens_per_second': None, 'peak_device_memory_mb': None,
         }
         try:
@@ -497,6 +499,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                 record['peak_device_memory_mb'] = results.get('peak_device_memory_mb')
                 curve = results.get('curve_diagnosis') or {}
                 record['curve_classification'] = curve.get('classification')
+                record['curve_generalization_gap'] = curve.get('generalization_gap')
         except (OSError, json.JSONDecodeError):
             pass
         try:
@@ -520,6 +523,9 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     test_vals, test_stats = _pool('test_loss')
     tps_vals, tps_stats = _pool('tokens_per_second')
     mem_vals, mem_stats = _pool('peak_device_memory_mb')
+    gap_vals, gap_stats = _pool('curve_generalization_gap')
+    curve_counts = dict(Counter(
+        r['curve_classification'] for r in per_seed if r.get('curve_classification')))
     missing = [r['seed'] for r in per_seed if not _finite(r['final_val_loss']) and not _finite(r['best_val_loss'])]
     invalid = [r['seed'] for r in per_seed
                if any(isinstance(r[k], float) and not math.isfinite(r[k]) for k in ('final_val_loss', 'best_val_loss'))]
@@ -549,6 +555,13 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'peak_device_memory_mb': None if mem_stats is None else mem_stats['mean'],
         'peak_device_memory_mb_std': None if mem_stats is None or len(mem_vals) < 2 else mem_stats['std'],
         'cost_basis': 'tokens_per_second / peak_device_memory_mb are measured this run; memory is null on CPU',
+        # The pooled loss can hide that one seed ended in a different regime.
+        # Keep the per-seed verdicts next to the mean, as the ablation and MoE
+        # studies do, so a delta from an underfit/overfit seed is visible.
+        'curve_classification_counts': curve_counts,
+        'curve_classifications_by_seed': {
+            int(r['seed']): r.get('curve_classification') for r in per_seed},
+        'curve_generalization_gap': None if gap_stats is None else gap_stats['mean'],
         # Numerical-health counters pooled across seeds: an arm whose mean
         # covers triaged NaN gradient/validation events is not a clean
         # replication of an arm with none.
@@ -614,6 +627,15 @@ def launch_multi_seed(args, seeds) -> None:
         print(f'[seeds] {args.norm}: measured cost={agg["tokens_per_second"]:.1f}{tps_str} tok/s'
               + ('' if agg.get('peak_device_memory_mb') is None
                  else f', peak={agg["peak_device_memory_mb"]:.1f} MB'))
+    regimes = agg.get('curve_classification_counts') or {}
+    if regimes:
+        print(f'[seeds] {args.norm}: per-seed curve regimes={regimes}')
+        off = {k: v for k, v in regimes.items()
+               if k not in ('healthy', 'insufficient_data')}
+        if off:
+            print(f'[seeds][warn] {sum(off.values())} seed(s) ended in {off}: the pooled '
+                  'loss describes that regime as much as the norm; read the per-seed '
+                  'curves before attributing the mean delta to the change')
     if agg['missing_seeds']:
         print(f'[seeds][warn] missing/unfinished seed runs: {agg["missing_seeds"]}; the pooled mean '
               f'covers {agg["n_seeds"]} of {agg["n_seeds_requested"]} requested seeds')
