@@ -155,6 +155,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
     fields at `None` with `n_seeds_final = 0` instead of silently mixing the
     two statistics.
     """
+    seeds = [int(s) for s in seeds]
     per_seed = []
     rejected = []
     for seed in seeds:
@@ -254,7 +255,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
 
     best_vals, best_stats = _pool('best_val_loss')
     final_vals, final_stats = _pool('final_val_loss')
-    seed_list = [int(s) for s in seeds]
+    seed_list = seeds
     curve_counts: dict = {}
     for p in per_seed:
         if p.get('curve_classification'):

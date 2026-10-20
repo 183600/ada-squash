@@ -465,6 +465,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     batches of a single run. Missing/invalid seeds are reported, never
     silently dropped.
     """
+    seeds = [int(s) for s in seeds]
     per_seed = []
     for seed in seeds:
         run_dir = seed_run_dir(base_dir, seed)
@@ -531,8 +532,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                if any(isinstance(r[k], float) and not math.isfinite(r[k]) for k in ('final_val_loss', 'best_val_loss'))]
     return {
         'model': model, 'norm': norm,
-        'seeds': [int(s) for s in seeds],
-        'n_seeds_requested': len(list(seeds)),
+        'seeds': seeds,
+        'n_seeds_requested': len(seeds),
         'n_seeds': len(final_vals),
         'missing_seeds': missing,
         'invalid_seeds': invalid,
