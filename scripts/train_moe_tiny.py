@@ -351,6 +351,20 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     curve_diagnoses: list = []
     train_ce_window: list = []
 
+    def skip_curve_prefix():
+        # The final validation pass reads the first `--val-batches` windows of
+        # the same split; skip them on every pass through the loader so curve
+        # points and the final estimate stay disjoint, even after a wrap.
+        for _ in range(max(0, int(args.val_batches))):
+            try:
+                next(curve_iter)
+            except StopIteration:
+                raise SystemExit(
+                    '[moe][val] the validation split has no batches after the '
+                    'final-validation prefix; refusing to draw a curve sample '
+                    'that overlaps the final estimate. Reduce --val-batches or '
+                    'provide more validation data.')
+
     def next_curve_batch():
         nonlocal curve_loader, curve_iter
         if not args.dataset:
@@ -365,19 +379,12 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                 data_reports['validation_curve'] = rcurve
                 print(f'[moe][data] validation curve split: {rcurve}')
             curve_iter = iter(curve_loader)
-            # The final validation pass reads the first `--val-batches`
-            # windows of the same split; skip them here so curve points and
-            # the final estimate are disjoint samples.
-            for _ in range(max(0, int(args.val_batches))):
-                try:
-                    next(curve_iter)
-                except StopIteration:
-                    curve_iter = iter(curve_loader)
-                    break
+            skip_curve_prefix()
         try:
             vx, vy = next(curve_iter)
         except StopIteration:
             curve_iter = iter(curve_loader)
+            skip_curve_prefix()
             try:
                 vx, vy = next(curve_iter)
             except StopIteration:
