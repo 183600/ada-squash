@@ -227,6 +227,17 @@ def diagnose_train_val_curve(
         None if val_noise_threshold is None or val_change is None
         else abs(val_change) <= val_noise_threshold
     )
+    # A widening gap is `val_change - train_change`. The train mean is much
+    # tighter than a small held-out pass, so the gap change carries roughly
+    # the validation-difference noise. Without this check a flat val curve
+    # with a wide stderr can produce an "overfitting" verdict from a gap move
+    # the held-out sample cannot resolve.
+    gap_change_abs = (gap_points[-1] - gap_points[-tail_len]
+                      if tail_len >= 2 and len(gap_points) >= tail_len else None)
+    gap_change_within_noise = (
+        None if val_noise_threshold is None or gap_change_abs is None
+        else abs(gap_change_abs) <= val_noise_threshold
+    )
 
     recommendations: list[str] = []
     if val_trend == "rising" and val_change_within_noise:
@@ -268,15 +279,30 @@ def diagnose_train_val_curve(
             "recipe as the comparison point for the next change",
         ]
     elif train_trend == "falling" and val_trend == "flat" and gap_change is not None and gap_change > gap_widen:
-        classification = "overfitting"
-        recommendations = [
-            "training keeps improving while the validation curve has gone flat "
-            "and the train-validation gap is widening: the extra training "
-            "capacity is fitting noise; use --early-stop-patience and add data "
-            "or regularization",
-            "compare the efficiency numbers before claiming the deeper/wider "
-            "model is the better trade",
-        ]
+        if gap_change_within_noise:
+            # The gap widened by less than the held-out mean's resolution.
+            # Calling this overfitting would spend regularization/data on a
+            # difference the measurement cannot resolve.
+            classification = "noise_limited"
+            recommendations = [
+                f"the train-validation gap widened by {gap_change_abs:+.4f}, "
+                f"within {noise_z:g} standard errors ({val_noise_threshold:.4f}) "
+                "of the held-out mean; the curve cannot yet distinguish "
+                "overfitting from held-out noise",
+                "keep training and read the next validation passes; increase "
+                "--val-batches if the interval stays wider than the effect you "
+                "need to detect",
+            ]
+        else:
+            classification = "overfitting"
+            recommendations = [
+                "training keeps improving while the validation curve has gone flat "
+                "and the train-validation gap is widening: the extra training "
+                "capacity is fitting noise; use --early-stop-patience and add data "
+                "or regularization",
+                "compare the efficiency numbers before claiming the deeper/wider "
+                "model is the better trade",
+            ]
     elif val_trend == "falling" and train_trend == "flat":
         classification = "healthy"
         recommendations = [
@@ -345,6 +371,8 @@ def diagnose_train_val_curve(
             "val_noise_se": val_noise,
             "val_noise_threshold": val_noise_threshold,
             "val_change_within_noise": val_change_within_noise,
+            "gap_change_abs": gap_change_abs,
+            "gap_change_within_noise": gap_change_within_noise,
         }
     )
     return out
