@@ -124,6 +124,13 @@ def expected_child_protocol(args, depth: int, norm: str, seed: int) -> dict:
 _REVISION_PROTOCOL_KEYS = ('dataset_revision', 'tokenizer_revision')
 
 
+def _is_commit_revision(value) -> bool:
+    """Whether `value` looks like a full Hub commit hash (not a branch/tag)."""
+    if not isinstance(value, str) or len(value) != 40:
+        return False
+    return all(c in '0123456789abcdefABCDEF' for c in value)
+
+
 def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
     """Fields where a child manifest disagrees with this sweep invocation."""
     recorded = manifest.get('hyperparameters') or {}
@@ -131,11 +138,14 @@ def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
     mismatches = {}
     for key, wanted in expected['hyperparameters'].items():
         actual = recorded.get(key)
-        if key in _REVISION_PROTOCOL_KEYS and wanted is None and actual is not None:
-            # `train_gpt2` replaces the requested "latest" revision with the
-            # commit it resolved before writing the manifest; that is the
-            # stronger pin, not a recipe mismatch.
-            continue
+        if key in _REVISION_PROTOCOL_KEYS and actual is not None and actual != wanted:
+            # `train_gpt2` replaces the requested revision (a branch, tag or
+            # "latest") with the concrete commit it resolved before writing
+            # the manifest; that is the stronger pin, not a recipe mismatch.
+            # A requested full commit, however, must be the commit recorded:
+            # a different hash is a real protocol mismatch.
+            if not _is_commit_revision(wanted):
+                continue
         if actual != wanted:
             mismatches[key] = [wanted, actual]
     for key, wanted in expected['shape'].items():
@@ -152,12 +162,14 @@ def _manifest_data_version(manifest: dict) -> dict | None:
     reports = data.get('split_reports') or {}
     train = reports.get('train') if isinstance(reports, dict) else None
     train = train if isinstance(train, dict) else {}
+    # Only the explicit `*_resolved` fields prove what the loader used. The
+    # manifest's `dataset_revision`/`tokenizer_revision` may still be the
+    # requested branch or tag when the Hub was unreachable; treating that as
+    # the resolved version would silently certify a mutable snapshot as pinned.
     dataset_resolved = (train.get('dataset_revision_resolved')
-                        or data.get('dataset_revision_resolved')
-                        or data.get('dataset_revision'))
+                        or data.get('dataset_revision_resolved'))
     tokenizer_resolved = (train.get('tokenizer_revision_resolved')
-                          or data.get('tokenizer_revision_resolved')
-                          or data.get('tokenizer_revision'))
+                          or data.get('tokenizer_revision_resolved'))
     if dataset_resolved is None and tokenizer_resolved is None:
         return None
     return {
@@ -289,10 +301,14 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         })
 
     versions_by_seed = {
-        p['seed']: p['data_version'] for p in per_seed if p.get('data_version')}
+        p['seed']: p['data_version'] for p in per_seed}
     known_versions = {
-        json.dumps(v, sort_keys=True) for v in versions_by_seed.values()}
+        json.dumps(v, sort_keys=True) for v in versions_by_seed.values()
+        if v is not None}
+    unknown_version_seeds = [p['seed'] for p in per_seed
+                             if p.get('data_version') is None]
     data_version_mismatch = len(known_versions) > 1
+    data_versions_complete = bool(versions_by_seed) and not unknown_version_seeds
 
     def _pool(key: str):
         vals = [p[key] for p in per_seed if _finite(p[key])]
@@ -349,15 +365,21 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         'invalid_seeds': invalid_seeds,
         'seeds_without_final_val_loss': seeds_without_final,
         'complete': (len(missing_seeds) == 0 and len(invalid_seeds) == 0
-                     and not rejected and not data_version_mismatch),
+                     and not rejected and data_versions_complete
+                     and not data_version_mismatch),
         'manifest_rejections': rejected,
         'protocol_verified_by_launch_id': launch_id is not None,
         # A cell is only one data version: if the resolved upstream commits
         # differ across its seeds, the pooled delta mixes snapshots and cannot
-        # be certified as a depth/norm effect.
+        # be certified as a depth/norm effect. A seed without resolved
+        # provenance is not evidence of consistency either: the cell cannot be
+        # certified until every seed records the commit it trained on.
         'data_versions_by_seed': versions_by_seed,
+        'unknown_data_version_seeds': unknown_version_seeds,
+        'data_versions_complete': data_versions_complete,
         'data_version': (json.loads(next(iter(known_versions)))
-                         if len(known_versions) == 1 else None),
+                         if len(known_versions) == 1 and not unknown_version_seeds
+                         else None),
         'data_version_mismatch': data_version_mismatch,
         'per_seed': per_seed,
         'n_seeds': len(best_vals),
@@ -1066,6 +1088,10 @@ def main():
             print(f"[sweep] WARNING: d{depth}-{norm}: seeds were trained on different resolved "
                   f"data versions {agg['data_versions_by_seed']}; the cell is incomplete and "
                   f"its delta cannot be certified")
+        if agg.get('unknown_data_version_seeds'):
+            print(f"[sweep] WARNING: d{depth}-{norm}: seeds "
+                  f"{agg['unknown_data_version_seeds']} do not record the resolved data "
+                  f"version; the cell is incomplete because its snapshot cannot be audited")
     # Cross-cell version audit: a cell can be internally consistent while a
     # later cell resolved a moved upstream branch. Comparisons across such
     # cells would be confounded with the data snapshot, so mark every cell
@@ -1074,13 +1100,17 @@ def main():
         f'd{depth}-{norm}': agg.get('data_version')
         for depth, norm, _ in cells
         for agg in [aggs_by_depth.get(depth, {}).get(norm, {})]
-        if agg.get('data_version') is not None
     }
     unique_cell_versions = {
-        json.dumps(v, sort_keys=True) for v in cell_data_versions.values()}
-    data_versions_consistent = len(unique_cell_versions) <= 1
+        json.dumps(v, sort_keys=True) for v in cell_data_versions.values()
+        if v is not None}
+    unknown_cells = [name for name, version in cell_data_versions.items()
+                     if version is None]
+    data_versions_consistent = (bool(cell_data_versions)
+                                and not unknown_cells
+                                and len(unique_cell_versions) <= 1)
     if not data_versions_consistent:
-        print('[sweep] WARNING: cells resolved different data revisions '
+        print('[sweep] WARNING: cells resolved different or unknown data revisions '
               f'{cell_data_versions}; every cell is marked incomplete and no '
               'cross-cell delta is certifiable')
         for by_norm in aggs_by_depth.values():
