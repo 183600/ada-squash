@@ -55,6 +55,10 @@ DEFAULT_CURVE_THRESHOLDS = {
     "gap_widen_rel": 0.01,
     # Number of trailing validation points the verdict rests on.
     "window": 3,
+    # A validation move is only called a trend when it exceeds this many
+    # standard errors of the difference. Two validation passes are independent
+    # sample means, so their difference has se = sqrt(se_first^2 + se_last^2).
+    "noise_z": 2.0,
 }
 
 
@@ -91,6 +95,7 @@ def diagnose_train_val_curve(
     val_steps: Optional[Sequence[int]] = None,
     thresholds: Optional[dict] = None,
     log_vocab_size: Optional[float] = None,
+    val_stderr: Optional[Sequence[float]] = None,
 ) -> dict:
     """Classify the current train/val regime from the recent points.
 
@@ -111,6 +116,14 @@ def diagnose_train_val_curve(
     `log_vocab_size` (ln of the vocabulary) is optional context: a flat
     curve far below ``ln(V)`` may simply be the corpus entropy floor rather
     than underfitting, so the flat verdict text says which case it may be.
+
+    `val_stderr` (same length as `val_losses`) is the per-pass standard error
+    of the held-out mean. The validation curve is itself an estimate: a rise
+    smaller than `noise_z * sqrt(se_first^2 + se_last^2)` is reported as
+    ``noise_limited`` rather than ``overfitting``/``diverging``, because the
+    measured change cannot support the stronger claim. Without stderr the
+    classification is unchanged (the caller did not measure the noise).
+
     Returns a JSON-serializable dict; every number the verdict used is kept
     under ``evidence``.
     """
@@ -119,6 +132,7 @@ def diagnose_train_val_curve(
     min_imp = float(thresholds["min_rel_improvement"])
     worsen = float(thresholds["worsen_rel_tolerance"])
     gap_widen = float(thresholds["gap_widen_rel"])
+    noise_z = float(thresholds["noise_z"])
 
     raw_train = [float(v) for v in train_losses if v is not None]
     raw_val = [float(v) for v in val_losses if v is not None]
@@ -132,6 +146,15 @@ def diagnose_train_val_curve(
     val_losses = [v for v in raw_val if math.isfinite(v)]
     train_steps = list(train_steps) if train_steps is not None else []
     val_steps = list(val_steps) if val_steps is not None else []
+    val_stderr_series = None
+    if val_stderr is not None:
+        if len(val_stderr) != len(val_losses):
+            raise ValueError("val_stderr must be parallel to val_losses")
+        val_stderr_series = [
+            None if se is None else float(se)
+            for v, se in zip(raw_val, val_stderr)
+            if math.isfinite(v)
+        ]
 
     out = {
         "classification": "insufficient_data",
@@ -184,8 +207,36 @@ def diagnose_train_val_curve(
     train_trend = _trend(train_rel, min_imp, worsen)
     val_trend = _trend(val_rel, min_imp, worsen)
 
+    tail_len = min(window, len(val_losses))
+    val_change = (val_losses[-1] - val_losses[-tail_len]) if tail_len >= 2 else None
+    val_noise = None
+    if (val_stderr_series is not None and tail_len >= 2
+            and val_stderr_series[-1] is not None
+            and val_stderr_series[-tail_len] is not None):
+        se_last = val_stderr_series[-1]
+        se_first = val_stderr_series[-tail_len]
+        if (math.isfinite(se_last) and math.isfinite(se_first)
+                and se_last >= 0.0 and se_first >= 0.0):
+            val_noise = math.hypot(se_first, se_last)
+    val_noise_threshold = (noise_z * val_noise) if val_noise is not None else None
+    val_change_within_noise = (
+        None if val_noise_threshold is None or val_change is None
+        else abs(val_change) <= val_noise_threshold
+    )
+
     recommendations: list[str] = []
-    if train_trend == "rising" and val_trend == "rising":
+    if val_trend == "rising" and val_change_within_noise:
+        classification = "noise_limited"
+        recommendations = [
+            f"the validation change {val_change:+.4f} is within {noise_z:g} "
+            f"standard errors ({val_noise_threshold:.4f}) of the held-out "
+            "sample mean, so it cannot support an overfitting/divergence "
+            "verdict yet",
+            "keep training and read the next validation passes; increase "
+            "--val-batches if the interval stays wider than the effect you "
+            "need to detect",
+        ]
+    elif train_trend == "rising" and val_trend == "rising":
         classification = "diverging"
         recommendations = [
             "both curves are rising: suspect a learning rate that is too large "
@@ -284,6 +335,12 @@ def diagnose_train_val_curve(
             "train_losses_tail": train_losses[-window:],
             "val_losses_tail": val_losses[-window:],
             "log_vocab_size": log_vocab_size,
+            "val_change": val_change,
+            "val_stderr_tail": (None if val_stderr_series is None
+                                else val_stderr_series[-tail_len:]),
+            "val_noise_se": val_noise,
+            "val_noise_threshold": val_noise_threshold,
+            "val_change_within_noise": val_change_within_noise,
         }
     )
     return out

@@ -86,6 +86,20 @@ from adasquash.utils import markov_batch
 from scripts.eval_downstream import load_ckpt
 
 
+def _decode(token_ids, tokenizer) -> str:
+    ids = [int(i) for i in token_ids]
+    if tokenizer is None:
+        return " ".join(str(i) for i in ids)
+    try:
+        return tokenizer.decode(
+            ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
+    except TypeError:
+        return tokenizer.decode(ids, skip_special_tokens=False)
+    except Exception:
+        return " ".join(str(i) for i in ids)
+
+
 def _markov_batches(args, cfg, device):
     rng = torch.Generator(device=device).manual_seed(args.seed)
     n_states = max(2, min(int(cfg.vocab_size), 64))
