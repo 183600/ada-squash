@@ -170,10 +170,12 @@ def data_protocol_mismatches(args, model_args: dict) -> dict:
     }
     out = {}
     for key, value in current.items():
-        if key not in model_args:
-            continue
-        if model_args[key] != value:
-            out[key] = {'checkpoint': model_args[key], 'analysis': value}
+        # An old checkpoint may predate a split-defining flag. Absence is
+        # unknown, not agreement: silently skipping it would pair an analysis
+        # on one data protocol with a checkpoint trained on another.
+        checkpoint_value = model_args[key] if key in model_args else '<missing>'
+        if checkpoint_value != value:
+            out[key] = {'checkpoint': checkpoint_value, 'analysis': value}
     return out
 
 
@@ -1012,20 +1014,28 @@ def main():
     protocol_mismatches = ({}
                            if args.corpus != 'dataset'
                            else data_protocol_mismatches(args, model_args))
-    if protocol_mismatches:
-        print('[errors] WARNING: the analysis data protocol differs from the checkpoint\'s '
+    reference_model = reference_args = None
+    reference_protocol_mismatches = {}
+    if args.reference_ckpt:
+        reference_model, reference_args = load_ckpt(args.reference_ckpt, device=device)
+        print(f"[pair] reference {args.reference_ckpt} | norm={reference_args['norm']}")
+        if args.corpus == 'dataset':
+            reference_protocol_mismatches = data_protocol_mismatches(args, reference_args)
+    protocol_checks = [('checkpoint', protocol_mismatches)]
+    if reference_model is not None:
+        protocol_checks.append(('reference checkpoint', reference_protocol_mismatches))
+    for label, mismatches in protocol_checks:
+        if not mismatches:
+            continue
+        print(f'[errors] WARNING: the analysis data protocol differs from the {label}\'s '
               'training protocol; the samples are not the ones the model was selected on:',
               file=sys.stderr)
-        for key, diff in protocol_mismatches.items():
+        for key, diff in mismatches.items():
             print(f"[errors]   {key}: checkpoint={diff['checkpoint']!r} "
                   f"analysis={diff['analysis']!r}", file=sys.stderr)
         print('[errors] pass the checkpoint\'s data flags (including --dataset-revision / '
               '--tokenizer-revision) so the bad cases come from the same held-out documents.',
               file=sys.stderr)
-    reference_model = reference_args = None
-    if args.reference_ckpt:
-        reference_model, reference_args = load_ckpt(args.reference_ckpt, device=device)
-        print(f"[pair] reference {args.reference_ckpt} | norm={reference_args['norm']}")
 
     # A checkpoint's weights themselves must be finite before any result is
     # read out of it.
@@ -1074,6 +1084,8 @@ def main():
     # with the trained run it is meant to explain.
     report['data_split'] = data_split.get('split_report')
     report['data_protocol_mismatches'] = protocol_mismatches
+    if reference_model is not None:
+        report['reference_data_protocol_mismatches'] = reference_protocol_mismatches
     report['checkpoint_health'] = checkpoint_health
     report['run_metadata'] = collect_run_metadata(seed=args.seed)
 
