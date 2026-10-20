@@ -130,8 +130,10 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
                 _add_ids(ids)
         text_batch.clear()
 
+    capped = False
     for example in stream:
         if n_docs and len(lengths) >= n_docs:
+            capped = True
             break
         text = cleaner(example)
         if text is None:
@@ -180,13 +182,15 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stats = cleaner.report()
     # Count every document read from the stream, including dropped ones.
     stats['documents_sampled'] = int(stats.get('documents_read', len(lengths)))
-    # Whether the counters cover the whole split (--n-docs 0) or a prefix: with
-    # a bounded sample, `duplicate_overlap_with_train = 0` is a lower bound on
-    # the true overlap, not evidence that the splits are disjoint.
-    stats['exhaustive'] = not n_docs
+    # Whether the counters cover the whole split or only a prefix. A stream
+    # that ends naturally before --n-docs is fully read even though n_docs is
+    # nonzero, so the cap is tracked by whether the loop actually broke. With
+    # a truncated sample, `duplicate_overlap_with_train = 0` is a lower bound
+    # on the true overlap, not evidence that the splits are disjoint.
+    stats['exhaustive'] = not capped
     stats['duplicate_overlap_with_train'] = overlap if known_hashes is not None else None
     stats['duplicate_overlap_with_validation'] = overlap_extra if known_hashes_extra is not None else None
-    stats['duplicate_overlap_is_lower_bound'] = bool(n_docs) if (known_hashes is not None or known_hashes_extra is not None) else None
+    stats['duplicate_overlap_is_lower_bound'] = bool(capped) if (known_hashes is not None or known_hashes_extra is not None) else None
     stats['group_key'] = group_key
     if group_key:
         stats['group_value_missing'] = group_value_missing
@@ -199,7 +203,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         stats['group_overlap_with_validation_groups'] = (len(group_overlap_extra_groups)
                                                          if known_groups_extra is not None else None)
         stats['group_overlap_is_lower_bound'] = (
-            bool(n_docs) if (known_groups is not None or known_groups_extra is not None) else None)
+            bool(capped) if (known_groups is not None or known_groups_extra is not None) else None)
     if lengths:
         stats['doc_chars_mean'] = sum(lengths) / len(lengths)
         stats['doc_chars_min'] = min(lengths)
@@ -248,13 +252,16 @@ def _chronology_problems(reports: dict) -> list:
     return []
 
 
-def _write_hash_ledger(path, hashes: set, n_docs: int, split_name: str):
+def _write_hash_ledger(path, hashes: set, n_docs: int, split_name: str,
+                       exhaustive: bool | None=None):
     """Write a sorted one-digest-per-line ledger and describe its coverage.
 
     `load_hash_file` accepts this whitespace-separated form (and also reads
     JSON-list files). With a bounded `--n-docs` sample the ledger only covers
     the prefix that was read; the returned info records `exhaustive=false` and
-    the caller warns, instead of implying full coverage.
+    the caller warns, instead of implying full coverage. `exhaustive` comes
+    from the collector because a split shorter than `n_docs` is fully read even
+    though the cap is nonzero; when omitted, fall back to the old n_docs rule.
     """
     if not path:
         return None
@@ -263,7 +270,8 @@ def _write_hash_ledger(path, hashes: set, n_docs: int, split_name: str):
     with open(ledger, 'w', encoding='utf-8') as f:
         for h in sorted(hashes):
             f.write(h.hex() + '\n')
-    exhaustive = not n_docs
+    if exhaustive is None:
+        exhaustive = not n_docs
     info = {
         'path': str(ledger),
         'split': split_name,
@@ -369,16 +377,20 @@ def main():
             train_hashes = hashes
             train_groups = groups
             train_ledger_info = _write_hash_ledger(
-                args.write_train_hash_file, hashes, args.n_docs, 'train-document')
+                args.write_train_hash_file, hashes, args.n_docs, 'train-document',
+                exhaustive=stats['exhaustive'])
             train_group_ledger_info = _write_hash_ledger(
-                args.write_train_group_file, groups, args.n_docs, 'train-group')
+                args.write_train_group_file, groups, args.n_docs, 'train-group',
+                exhaustive=stats['exhaustive'])
         elif name == 'validation':
             val_hashes = hashes
             val_groups = groups
             val_ledger_info = _write_hash_ledger(
-                args.write_val_hash_file, hashes, args.n_docs, 'validation-document')
+                args.write_val_hash_file, hashes, args.n_docs, 'validation-document',
+                exhaustive=stats['exhaustive'])
             val_group_ledger_info = _write_hash_ledger(
-                args.write_val_group_file, groups, args.n_docs, 'validation-group')
+                args.write_val_group_file, groups, args.n_docs, 'validation-group',
+                exhaustive=stats['exhaustive'])
     # Held-out length outliers are also counted under the fence derived from
     # the *training* lengths alone.  Outliers only ever get dropped by
     # --min/max-doc-chars in the pipeline, i.e. by a fixed policy; keeping the
