@@ -189,7 +189,7 @@ def _probe_markov(rng, batch_size, seq_len, device, n_states=64):
     x, _ = markov_batch(rng, -100, batch_size, seq_len, device, n_states=n_states)
     return x
 
-def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None, exclude_test_hash_file=None, group_key=None, exclude_group_file=None, exclude_test_group_file=None, dataset_revision=None, tokenizer_revision=None):
+def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None, exclude_test_hash_file=None, group_key=None, exclude_group_file=None, exclude_test_group_file=None, dataset_revision=None, tokenizer_revision=None, seed=42, num_workers=2):
     # Scoring a checkpoint on the documents it trained on understates the
     # quantization damage; the probe must come from a held-out split. The
     # default is the chronological validation slice, and the cleaning policy
@@ -209,12 +209,12 @@ def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, 
                            exclude_group_file=exclude_group_file,
                            exclude_test_group_file=exclude_test_group_file,
                            dataset_revision=dataset_revision,
-                           tokenizer_revision=tokenizer_revision)
+                           tokenizer_revision=tokenizer_revision,
+                           seed=seed, num_workers=num_workers)
     loader = build_dataloader(dataset, dataset_config, seq_len, batch_size, tokenizer=tokenizer)
-    if split != 'train':
-        report = getattr(loader, 'split_report', None)
-        if report:
-            print(f'[w8a8] dataset probe split: {report}', file=sys.stderr)
+    report = getattr(loader, 'split_report', None)
+    if split != 'train' and report:
+        print(f'[w8a8] dataset probe split: {report}', file=sys.stderr)
     it = iter(loader)
 
     def _next():
@@ -224,6 +224,10 @@ def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, 
         except StopIteration:
             it = iter(loader)
             return next(it)[0]
+    # Keep the split report on the callable so the manifest can pin the data
+    # version (boundary, resolved dataset/tokenizer commits, cleaning policy)
+    # of the exact probe that produced the reported PPL.
+    _next.split_report = report
     return _next
 
 def aggregate_w8a8_seed_rows(ckpt_path: str, per_seed: list) -> dict:
@@ -466,6 +470,7 @@ def main():
     p.add_argument('--batch-size', type=int, default=4)
     p.add_argument('--seq-len', type=int, default=512)
     p.add_argument('--n-batches', type=int, default=20)
+    p.add_argument('--num-workers', type=int, default=2, help='DataLoader workers for --probe dataset; recorded in the manifest')
     p.add_argument('--seed', type=int, default=None, help='deprecated single-probe shorthand; overrides --seeds when given')
     p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='one independent probe draw per seed; every metric is reported as Mean +/- Std across seeds, and >= 3 seeds keeps a single lucky probe from deciding a comparison')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the paired cross-checkpoint tests in ppl_comparison.json (Holm-adjusted over the pairwise family)')
@@ -494,6 +499,7 @@ def main():
     if any(not group for group in ckpt_groups):
         p.error('--ckpts entries must not be empty')
     results = []
+    dataset_probe_reports = []
     for group in ckpt_groups:
         label = group[0] if len(group) == 1 else f'{group[0]} (+{len(group) - 1} more)'
         per_ckpt = []
@@ -511,7 +517,14 @@ def main():
             # the revision the checkpoint recorded, else upstream default branch.
             dataset_revision = args.dataset_revision if args.dataset_revision is not None else ckpt_args.get('dataset_revision')
             tokenizer_revision = args.tokenizer_revision if args.tokenizer_revision is not None else ckpt_args.get('tokenizer_revision')
-            dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), exclude_test_hash_file=ckpt_args.get('exclude_test_hash_file'), group_key=ckpt_args.get('group_key'), exclude_group_file=ckpt_args.get('exclude_group_file'), exclude_test_group_file=ckpt_args.get('exclude_test_group_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision) if args.probe == 'dataset' else None
+            dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), exclude_test_hash_file=ckpt_args.get('exclude_test_hash_file'), group_key=ckpt_args.get('group_key'), exclude_group_file=ckpt_args.get('exclude_group_file'), exclude_test_group_file=ckpt_args.get('exclude_test_group_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision, seed=seeds[0], num_workers=args.num_workers) if args.probe == 'dataset' else None
+            if dataset_probe is not None:
+                dataset_probe_reports.append({
+                    'ckpt': ckpt_path,
+                    'dataset_revision': dataset_revision,
+                    'tokenizer_revision': tokenizer_revision,
+                    'split_report': getattr(dataset_probe, 'split_report', None),
+                })
             raw_seed = ckpt_args.get('seed')
             train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
             # Snapshot the fp32 weights on the host before the in-place
@@ -648,6 +661,13 @@ def main():
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
     manifest['seeds'] = seeds
+    manifest['data'] = {
+        'probe': args.probe,
+        'probe_split': args.probe_split if args.probe == 'dataset' else None,
+        'probe_loader_seed': seeds[0],
+        'num_workers': args.num_workers,
+        'split_reports': dataset_probe_reports,
+    }
     if args.hypothesis:
         manifest['hypothesis'] = args.hypothesis
         print(f'[hypothesis] {args.hypothesis}')
