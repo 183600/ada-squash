@@ -263,6 +263,7 @@ def main():
     from transformers import AutoTokenizer
     tok_name, tok_revision = _checkpoint_tokenizer(model_args, args.tokenizer)
     tok = AutoTokenizer.from_pretrained(tok_name, revision=tok_revision)
+    tok_revision_resolved = getattr(tok, '_commit_hash', None) or tok_revision
     results, skipped = evaluate_model(model, tok, args, device, seeds, trained_seq_len)
     comparison = None
     if args.compare_to:
@@ -328,6 +329,7 @@ def main():
         'trained_seq_len': trained_seq_len,
         'tokenizer': tok_name,
         'tokenizer_revision': tok_revision,
+        'tokenizer_revision_resolved': tok_revision_resolved,
         'secret': args.secret,
         'trials': args.trials,
         'placement_seeds': list(seeds),
@@ -349,6 +351,9 @@ def main():
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
     manifest['placement_seeds'] = list(seeds)
+    manifest['tokenizer'] = tok_name
+    manifest['tokenizer_revision'] = tok_revision
+    manifest['tokenizer_revision_resolved'] = tok_revision_resolved
     if args.hypothesis:
         manifest['hypothesis'] = args.hypothesis
         print(f'[hypothesis] {args.hypothesis}')
