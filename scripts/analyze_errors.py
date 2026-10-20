@@ -1154,6 +1154,10 @@ def main():
                   f"prefer_pr_auc={s['prefer_pr_auc']}")
         print(f"[errors] cause distribution (over {s['errors_scanned']} scanned errors): "
               f"{report['cause_distribution']}")
+        print(f"[errors] suspected label-noise / context-ambiguity cases: "
+              f"{report['flag_counts'].get('prev_context_ambiguous', 0)}; "
+              f"confident blind spots: "
+              f"{report['flag_counts'].get('high_confidence_wrong', 0)}")
         for rec in report['examples']:
             flags = ','.join(k for k, v in rec['flags'].items() if v) or 'none'
             print(f"[errors] pos={rec['position']:>5d} gold={rec['gold_text']!r}(p={rec['gold_prob']:.3f}, rank={rec['gold_rank']}) "
