@@ -844,6 +844,19 @@ def main():
     report = getattr(loader, 'split_report', None)
     if report:
         data_reports['train'] = report
+        # Pin the run - and the checkpoints it writes - to the resolved
+        # upstream commits, not the mutable revision strings the user typed:
+        # a resume after the branch moved must continue on the same documents
+        # and the same tokenizer that produced the checkpoint. The split
+        # report always carries the resolved values when the Hub was reachable.
+        resolved_revision = report.get('dataset_revision_resolved')
+        if resolved_revision and resolved_revision != args.dataset_revision:
+            print(f'[data] dataset revision pinned: {args.dataset_revision!r} -> {resolved_revision}')
+            args.dataset_revision = resolved_revision
+        resolved_tokenizer = report.get('tokenizer_revision_resolved')
+        if resolved_tokenizer and resolved_tokenizer != args.tokenizer_revision:
+            print(f'[data] tokenizer revision pinned: {args.tokenizer_revision!r} -> {resolved_tokenizer}')
+            args.tokenizer_revision = resolved_tokenizer
         print(f'[data] train split: {report}')
     val_loader = None
     val_state: dict = {'iter': None}
