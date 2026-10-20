@@ -116,18 +116,54 @@ def expected_child_protocol(args, depth: int, norm: str, seed: int) -> dict:
         'shape': {'n_layers': int(depth), 'dim': int(dim), 'n_heads': int(heads)},
     }
 
+# Revisions are recorded in the child manifest as the concrete commit the
+# loader resolved, not necessarily the string the sweep requested (`None` means
+# "latest on the default branch"). The launch spec already pins the request;
+# the manifest check must accept the resolved hash instead of rejecting every
+# unpinned sweep.
+_REVISION_PROTOCOL_KEYS = ('dataset_revision', 'tokenizer_revision')
+
+
 def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
     """Fields where a child manifest disagrees with this sweep invocation."""
     recorded = manifest.get('hyperparameters') or {}
     results = manifest.get('results') or {}
     mismatches = {}
     for key, wanted in expected['hyperparameters'].items():
-        if recorded.get(key) != wanted:
-            mismatches[key] = [wanted, recorded.get(key)]
+        actual = recorded.get(key)
+        if key in _REVISION_PROTOCOL_KEYS and wanted is None and actual is not None:
+            # `train_gpt2` replaces the requested "latest" revision with the
+            # commit it resolved before writing the manifest; that is the
+            # stronger pin, not a recipe mismatch.
+            continue
+        if actual != wanted:
+            mismatches[key] = [wanted, actual]
     for key, wanted in expected['shape'].items():
         if results.get(key) != wanted:
             mismatches[f'results.{key}'] = [wanted, results.get(key)]
     return mismatches
+
+
+def _manifest_data_version(manifest: dict) -> dict | None:
+    """Concrete data version a child actually trained on, when recorded."""
+    data = manifest.get('data') if isinstance(manifest, dict) else None
+    if not isinstance(data, dict):
+        return None
+    reports = data.get('split_reports') or {}
+    train = reports.get('train') if isinstance(reports, dict) else None
+    train = train if isinstance(train, dict) else {}
+    dataset_resolved = (train.get('dataset_revision_resolved')
+                        or data.get('dataset_revision_resolved')
+                        or data.get('dataset_revision'))
+    tokenizer_resolved = (train.get('tokenizer_revision_resolved')
+                          or data.get('tokenizer_revision_resolved')
+                          or data.get('tokenizer_revision'))
+    if dataset_resolved is None and tokenizer_resolved is None:
+        return None
+    return {
+        'dataset_revision_resolved': dataset_resolved,
+        'tokenizer_revision_resolved': tokenizer_resolved,
+    }
 
 def _load_launch_spec(path: Path):
     try:
@@ -173,6 +209,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         nonfinite_val = None
         tokens_per_second = None
         peak_device_memory_mb = None
+        data_version = None
         n_layers = None
         dim = None
         n_heads = None
@@ -208,6 +245,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
             rejected.append({'seed': int(seed), 'path': str(path),
                              'reason': reject_reason})
         elif isinstance(manifest, dict):
+            data_version = _manifest_data_version(manifest)
             results = manifest.get('results') or {}
             best = results.get('best_val_loss')
             final = results.get('final_val_loss')
@@ -247,7 +285,14 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
             'n_nonfinite_losses': nonfinite,
             'n_nonfinite_gradients': nonfinite_grad,
             'n_nonfinite_val_losses': nonfinite_val,
+            'data_version': data_version,
         })
+
+    versions_by_seed = {
+        p['seed']: p['data_version'] for p in per_seed if p.get('data_version')}
+    known_versions = {
+        json.dumps(v, sort_keys=True) for v in versions_by_seed.values()}
+    data_version_mismatch = len(known_versions) > 1
 
     def _pool(key: str):
         vals = [p[key] for p in per_seed if _finite(p[key])]
@@ -303,9 +348,17 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         'missing_seeds': missing_seeds,
         'invalid_seeds': invalid_seeds,
         'seeds_without_final_val_loss': seeds_without_final,
-        'complete': len(missing_seeds) == 0 and len(invalid_seeds) == 0 and not rejected,
+        'complete': (len(missing_seeds) == 0 and len(invalid_seeds) == 0
+                     and not rejected and not data_version_mismatch),
         'manifest_rejections': rejected,
         'protocol_verified_by_launch_id': launch_id is not None,
+        # A cell is only one data version: if the resolved upstream commits
+        # differ across its seeds, the pooled delta mixes snapshots and cannot
+        # be certified as a depth/norm effect.
+        'data_versions_by_seed': versions_by_seed,
+        'data_version': (json.loads(next(iter(known_versions)))
+                         if len(known_versions) == 1 else None),
+        'data_version_mismatch': data_version_mismatch,
         'per_seed': per_seed,
         'n_seeds': len(best_vals),
         'best_val_loss': None if best_stats is None else best_stats['mean'],
@@ -476,7 +529,11 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
             requested = sorted(set(ref.get('seeds') or []) | set(by_norm[norm].get('seeds') or []))
             entry['candidate_missing_seeds'] = [s for s in requested if s not in cand_seeds]
             entry['reference_missing_seeds'] = [s for s in requested if s not in ref_seeds]
-            entry['complete'] = not entry['candidate_missing_seeds'] and not entry['reference_missing_seeds']
+            entry['complete'] = (
+                not entry['candidate_missing_seeds']
+                and not entry['reference_missing_seeds']
+                and ref.get('complete', True)
+                and by_norm[norm].get('complete', True))
             if len(common) >= 2:
                 a = [cand_seeds[s] for s in common]
                 b = [ref_seeds[s] for s in common]
@@ -1005,6 +1062,31 @@ def main():
             print(f"[sweep] WARNING: d{depth}-{norm}: seeds {agg['invalid_seeds']} report "
                   f"NaN/Inf losses; they are excluded from the pooled mean exactly like "
                   f"missing runs (a diverged run is not a clean replication)")
+        if agg.get('data_version_mismatch'):
+            print(f"[sweep] WARNING: d{depth}-{norm}: seeds were trained on different resolved "
+                  f"data versions {agg['data_versions_by_seed']}; the cell is incomplete and "
+                  f"its delta cannot be certified")
+    # Cross-cell version audit: a cell can be internally consistent while a
+    # later cell resolved a moved upstream branch. Comparisons across such
+    # cells would be confounded with the data snapshot, so mark every cell
+    # incomplete rather than certifying them against each other.
+    cell_data_versions = {
+        f'd{depth}-{norm}': agg.get('data_version')
+        for depth, norm, _ in cells
+        for agg in [aggs_by_depth.get(depth, {}).get(norm, {})]
+        if agg.get('data_version') is not None
+    }
+    unique_cell_versions = {
+        json.dumps(v, sort_keys=True) for v in cell_data_versions.values()}
+    data_versions_consistent = len(unique_cell_versions) <= 1
+    if not data_versions_consistent:
+        print('[sweep] WARNING: cells resolved different data revisions '
+              f'{cell_data_versions}; every cell is marked incomplete and no '
+              'cross-cell delta is certifiable')
+        for by_norm in aggs_by_depth.values():
+            for agg in by_norm.values():
+                agg['complete'] = False
+                agg['data_version_mismatch_across_cells'] = True
     print('[sweep][note] shape covariates: under the equal-parameter scaling dim and n_heads move with '
           'depth by construction, so a cross-depth loss delta confounds depth with width/head count and '
           'must not be read as a pure depth effect (same-depth cross-norm deltas are unaffected); every '
@@ -1018,6 +1100,8 @@ def main():
     # The manifest was written before the children launched; finalize it now
     # with the outcome, otherwise a completed sweep is indistinguishable from a
     # launcher that died silently after writing the (pre-run) manifest.
+    sweep_manifest['data_versions_by_cell'] = cell_data_versions
+    sweep_manifest['data_versions_consistent'] = data_versions_consistent
     sweep_manifest['cells'] = {
         f'd{depth}-{norm}': {
             'n_seeds': agg.get('n_seeds'),
