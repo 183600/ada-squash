@@ -66,6 +66,7 @@ Corpora
   run.
 """
 import argparse
+import heapq
 import itertools
 import json
 import random
@@ -332,6 +333,14 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     analyzed_topk = min(topk, max(1, vocab - 1))
     n_scanned = 0
     error_scan = []              # capped records, classified after the pass
+    # Printed examples are selected across the *whole* pass, not just its first
+    # `--max-scan-errors` mistakes: a confident blind spot that appears after
+    # the scan cap is exactly the case this analysis exists to surface. The
+    # heap keeps the most confident records seen so far; the bounded taxonomy
+    # sample above stays sequential so its cause distribution is representative.
+    example_limit = max(0, int(args.max_examples))
+    example_heap: list = []
+    example_counter = 0
 
     if first_batch is not None:
         batches = itertools.chain([first_batch], batches)
@@ -390,23 +399,42 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
                 n_positional_t += pred.numel()
                 wrong = pred != gold
                 n_errors_t += wrong.sum()
-                if n_scanned < args.max_scan_errors:
+
+                def _error_record(vi: int) -> dict:
+                    b, tt = v_idx[vi].tolist()
+                    return {
+                        'batch_row': b0 + b,
+                        'position': t0 + tt,
+                        'gold': int(gold[vi]),
+                        'pred': int(pred[vi]),
+                        'gold_prob': float(gold_p[vi]),
+                        'pred_prob': float(probs[vi, pred[vi]]),
+                        'gold_rank': int(min(int(gold_rank[vi]), args.rank_clip)),
+                        'gold_in_topk': bool((top.indices[vi] == gold[vi]).any()),
+                        'prev': int(prev[b0 + b, t0 + tt]),
+                        'context': [int(v) for v in x[b0 + b, max(0, t0 + tt - args.context_tokens):t0 + tt + 1].tolist()],
+                    }
+
+                if n_scanned < args.max_scan_errors or example_limit > 0:
                     idx = wrong.nonzero(as_tuple=False).flatten()
-                    for vi in idx[: args.max_scan_errors - n_scanned].tolist():
-                        n_scanned += 1
-                        b, tt = v_idx[vi].tolist()
-                        error_scan.append({
-                            'batch_row': b0 + b,
-                            'position': t0 + tt,
-                            'gold': int(gold[vi]),
-                            'pred': int(pred[vi]),
-                            'gold_prob': float(gold_p[vi]),
-                            'pred_prob': float(probs[vi, pred[vi]]),
-                            'gold_rank': int(min(int(gold_rank[vi]), args.rank_clip)),
-                            'gold_in_topk': bool((top.indices[vi] == gold[vi]).any()),
-                            'prev': int(prev[b0 + b, t0 + tt]),
-                            'context': [int(v) for v in x[b0 + b, max(0, t0 + tt - args.context_tokens):t0 + tt + 1].tolist()],
-                        })
+                    if n_scanned < args.max_scan_errors:
+                        for vi in idx[: args.max_scan_errors - n_scanned].tolist():
+                            n_scanned += 1
+                            error_scan.append(_error_record(vi))
+                    if example_limit > 0 and idx.numel():
+                        # Keep the `example_limit` most confident mistakes over
+                        # the full pass (a min-heap pops the weakest).
+                        wrong_pred_prob = probs.gather(
+                            -1, pred.unsqueeze(-1)).squeeze(-1)[wrong]
+                        take = min(example_limit, int(wrong_pred_prob.numel()))
+                        for pos in torch.topk(wrong_pred_prob, take).indices.tolist():
+                            record = _error_record(int(idx[pos]))
+                            heapq.heappush(
+                                example_heap,
+                                (record['pred_prob'], example_counter, record))
+                            example_counter += 1
+                            if len(example_heap) > example_limit:
+                                heapq.heappop(example_heap)
                 if auc_ids_t is not None:
                     # `index_select` picks the scored columns directly.
                     sel = probs.index_select(-1, auc_ids_t)
@@ -446,11 +474,14 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         del merged_keys, merged_counts, inv, counts, prev_gold_parts
     prev_gold, prev_majority = _prev_majority(prev_gold_hist, vocab)
     rare_ids, rare_threshold = _rare_ids(target_counts, args.rare_quantile)
-    categories, primary, examples = _classify_scan(
+    categories, primary, _ = _classify_scan(
         error_scan, prev_gold, prev_majority, vocab, rare_ids, args.confidence)
+    _, _, example_records = _classify_scan(
+        [record for _, _, record in example_heap], prev_gold, prev_majority,
+        vocab, rare_ids, args.confidence)
 
-    examples.sort(key=lambda r: (-r['pred_prob'], r['gold_rank']))
-    shown = examples[: args.max_examples]
+    example_records.sort(key=lambda r: (-r['pred_prob'], r['gold_rank']))
+    shown = example_records[:example_limit]
     for rec in shown:
         rec['context_text'] = _decode(rec['context'], tokenizer)
         rec['gold_text'] = _decode([rec['gold']], tokenizer)
@@ -515,7 +546,10 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
         'examples': shown,
         'note': (
             f'causes are disjoint per error and reported over the first {args.max_scan_errors} '
-            'scanned errors; flag_counts overlap because one error can carry several flags'
+            'scanned errors; flag_counts overlap because one error can carry several flags. '
+            f'Printed examples are the {example_limit} most confident errors over the whole '
+            'pass, not the first ones, so a late confident blind spot is not hidden by the '
+            'taxonomy scan cap'
         ),
     }
 
