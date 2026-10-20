@@ -655,12 +655,17 @@ def classify_nan_stage(evidence: dict) -> dict:
                 "value is truly non-finite and not a dtype artifact",
             ],
         )
-    if evidence.get("autocast_forward_finite") is False:
+    if evidence.get("autocast_forward_finite") is False or evidence.get("autocast_error"):
         dtype = evidence.get("autocast_dtype")
+        if evidence.get("autocast_error"):
+            diagnosis = (f"the fp32 forward is finite but the {dtype} autocast forward "
+                         f"raised ({evidence['autocast_error']})")
+        else:
+            diagnosis = (f"the fp32 forward is finite but the {dtype} autocast forward "
+                         "overflows the low-precision range")
         return stage(
             "mixed_precision",
-            f"the fp32 forward is finite but the {dtype} autocast forward overflows "
-            "the low-precision range",
+            diagnosis,
             [
                 "keep the optimizer step in fp32 and reduce the activation scale "
                 "(lower lr / stronger warmup), or run without autocast "
