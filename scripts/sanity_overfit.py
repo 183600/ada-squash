@@ -122,7 +122,7 @@ def build_model(args, cfg: GPTConfig):
     return GPT(cfg, init=False)
 
 
-def make_batch(task: str, args, cfg: GPTConfig, device: str):
+def make_batch(task: str, args, cfg: GPTConfig, device: str, report_sink=None):
     if task == "dataset":
         from scripts.train_gpt2 import open_data_split
 
@@ -131,6 +131,7 @@ def make_batch(task: str, args, cfg: GPTConfig, device: str):
             dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None,
             exclude_test_hash_file=None,
             train_shuffle_buffer=0, seed=args.seed,
+            num_workers=getattr(args, "num_workers", 2),
             dataset=args.dataset, dataset_config=args.dataset_config,
             tokenizer=args.tokenizer, seq_len=args.seq_len,
             batch_size=args.batch_size,
@@ -138,6 +139,8 @@ def make_batch(task: str, args, cfg: GPTConfig, device: str):
             tokenizer_revision=args.tokenizer_revision,
         )
         loader = open_data_split("train", data_args)
+        if report_sink is not None:
+            report_sink["split_report"] = getattr(loader, "split_report", None)
         x, y = next(iter(loader))
         x = x.to(device)
         y = y.to(device)
@@ -341,7 +344,8 @@ def run_one(norm: str, args, device: str) -> dict:
     if hasattr(model, "reset_parameters"):
         model.reset_parameters(args.seed)
     model.to(device)
-    x, y = make_batch(args.task, args, cfg, device)
+    data_split = {}
+    x, y = make_batch(args.task, args, cfg, device, report_sink=data_split)
     from scripts.train_gpt2 import build_optimizer
     opt = build_optimizer(model, args.lr, 0.0, 0.9, 0.95)
 
@@ -427,6 +431,10 @@ def run_one(norm: str, args, device: str) -> dict:
         "final_accuracy": final_acc,
         "final_macro_f1": final_metrics["macro_f1"],
         "final_metrics": final_metrics,
+        # The dataset task scores one real held-out batch: record the split
+        # policy and resolved upstream revisions so the overfit verdict is
+        # traceable to the data version that produced it.
+        "data_split": data_split.get("split_report"),
         "loss_path_delta": loss_path_delta,
         "loss_path_tol": loss_path_tol,
         "gradients": grad_info,
@@ -488,6 +496,8 @@ def main():
     p.add_argument("--tokenizer", default="gpt2")
     p.add_argument("--tokenizer-revision", default=None, help="tokenizer commit/revision to pin (recorded in the report; None = upstream default branch)")
     p.add_argument("--num-documents", type=int, default=None)
+    p.add_argument("--num-workers", type=int, default=2,
+                   help="DataLoader workers for the dataset task (0 keeps the check in-process)")
     p.add_argument("--device", default=None)
     p.add_argument("--output", default="runs/sanity_overfit.json")
     args = p.parse_args()
