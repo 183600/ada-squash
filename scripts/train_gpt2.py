@@ -176,6 +176,12 @@ _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tok
               'exclude_test_hash_file', 'group_key', 'exclude_group_file',
               'exclude_test_group_file')
 
+def _ledger_identity(path):
+    if not path:
+        return None
+    fingerprint = file_fingerprint(path)
+    return {key: fingerprint.get(key) for key in ('path', 'exists', 'sha256', 'bytes')}
+
 def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
     changed = []
     for name in _DATA_ARGS:
@@ -1495,6 +1501,12 @@ def main():
                 'group_key': args.group_key,
                 'exclude_group_file': args.exclude_group_file,
                 'exclude_test_group_file': args.exclude_test_group_file,
+                'ledger_fingerprints': {
+                    'exclude_hash_file': _ledger_identity(args.exclude_hash_file),
+                    'exclude_test_hash_file': _ledger_identity(args.exclude_test_hash_file),
+                    'exclude_group_file': _ledger_identity(args.exclude_group_file),
+                    'exclude_test_group_file': _ledger_identity(args.exclude_test_group_file),
+                },
                 # Worker count is part of the sealed-batch identity: a
                 # streaming loader shards documents across workers, so a
                 # different count can change the batch composition.

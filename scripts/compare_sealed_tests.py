@@ -49,7 +49,12 @@ PAIRING_KEYS = (
     "num_documents", "val_frac", "test_frac",
     "dedup", "min_doc_chars", "max_doc_chars", "exclude_hash_file", "exclude_test_hash_file",
     "group_key", "exclude_group_file", "exclude_test_group_file",
-    "batch_size", "seq_len",
+    "ledger_fingerprints", "batch_size", "seq_len",
+)
+
+_LEDGER_MANIFEST_KEYS = (
+    "exclude_hash_file", "exclude_test_hash_file",
+    "exclude_group_file", "exclude_test_group_file",
 )
 
 _SEED_DIR_RE = re.compile(r"seed(\d+)$")
@@ -104,6 +109,30 @@ def _shape_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     return {f"results.{key}": [a.get(key), b.get(key)]
             for key in ("n_layers", "dim", "n_heads")
             if a.get(key) != b.get(key)}
+
+def _manifest_ledger_content(manifest: dict):
+    data = manifest.get("data") if isinstance(manifest, dict) else None
+    if not isinstance(data, dict):
+        return None
+    out = {}
+    for key in _LEDGER_MANIFEST_KEYS:
+        fingerprint = data.get(key)
+        if isinstance(fingerprint, dict):
+            out[key] = {"exists": fingerprint.get("exists"),
+                        "sha256": fingerprint.get("sha256")}
+        else:
+            out[key] = fingerprint
+    return out
+
+def _ledger_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
+    a = _manifest_ledger_content(ref_manifest)
+    b = _manifest_ledger_content(other_manifest)
+    if a is None and b is None:
+        return {}
+    if a is None or b is None:
+        return {"data": ["missing in one run_manifest", "missing in the other"]}
+    return {f"data.{key}": [a[key], b[key]]
+            for key in _LEDGER_MANIFEST_KEYS if a[key] != b[key]}
 
 def pairing_mismatches(ref: dict, other: dict) -> dict:
     """Keys whose values differ between the two runs' data-protocol blocks."""
@@ -230,6 +259,7 @@ def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
         return ("training recipe cannot be verified: missing/unfinished run_manifest.json "
                 "for " + "; ".join(unverified[:3]))
     recipe_problems = []
+    ledger_problems = []
     for run in cand_arm["runs"]:
         for ref_run in ref_arm["runs"]:
             ref_manifest = ref_run["manifest"]
@@ -241,6 +271,14 @@ def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
                 recipe_problems.append(
                     f"{ref_run['path']} vs {run['path']}: "
                     + json.dumps(mismatches, sort_keys=True))
+            ledger_mismatches = _ledger_mismatches(ref_manifest, manifest)
+            if ledger_mismatches:
+                ledger_problems.append(
+                    f"{ref_run['path']} vs {run['path']}: "
+                    + json.dumps(ledger_mismatches, sort_keys=True))
+    if ledger_problems:
+        return ("cross-split ledger contents differ, so the arms were not scored on the "
+                "same held-out documents: " + "; ".join(ledger_problems[:3]))
     if recipe_problems:
         return ("training recipe/model shape differs, so the arms are not a controlled "
                 "comparison: " + "; ".join(recipe_problems[:3]))
