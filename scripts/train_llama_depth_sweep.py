@@ -35,7 +35,8 @@ import time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
+                               paired_t_one_sided, student_t_ppf)
 from adasquash.repro import artifact_record, collect_run_metadata, finish_metadata, save_run_manifest
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
@@ -323,6 +324,7 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 't': None,
                 'df': None,
                 'delta_ci_95': None,
+                'minimum_detectable_delta_95_power80': None,
                 'candidate_missing_seeds': None,
                 'reference_missing_seeds': None,
                 'complete': True,
@@ -379,6 +381,14 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 entry['p_one_sided'] = test['p_one_sided']
                 entry['n_seeds_favoring'] = sum(1 for x, y in zip(a, b) if x < y)
                 entry['n_seeds_tied'] = sum(1 for x, y in zip(a, b) if x == y)
+                half = (test['ci_high'] - test['ci_low']) / 2.0
+                critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
+                if critical > 0.0:
+                    stderr = half / critical
+                    entry['minimum_detectable_delta_95_power80'] = (
+                        student_t_ppf(1.0 - alpha, float(test['df']))
+                        + student_t_ppf(0.8, float(test['df']))
+                    ) * stderr
             elif common:
                 entry['mean_delta'] = cand_seeds[common[0]] - ref_seeds[common[0]]
             entry['certifiable'] = bool(
@@ -420,7 +430,10 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
         'reading_guide': ('paired Student-t on the shared seeds; `mean_delta` < 0 favors the candidate. '
                           'At 3 seeds (df = 2) the one-sided 5% critical value is t = 2.92: read '
                           '`n_seeds_favoring`/3 and the `delta_ci_95` range next to the p-value before '
-                          'treating a delta as real. Only cells with >= 3 shared seeds and complete '
+                          'treating a delta as real. `minimum_detectable_delta_95_power80` is the '
+                          'smallest true delta this seed count could detect at 80% power; a '
+                          'non-significant row whose MDE exceeds the expected effect is underpowered, '
+                          'not evidence of no effect. Only cells with >= 3 shared seeds and complete '
                           'coverage enter the Holm family and can be certified; a cell with `missing_seeds` '
                           '(`incomplete_cells`) is never certified as significantly better because which '
                           'runs survived is itself a selection effect; a row with '
@@ -455,6 +468,8 @@ def print_sweep_comparisons(comparison: dict) -> None:
         p_str = 'n/a' if p_holm is None else f'{p_holm:.4g}'
         ci = r.get('delta_ci_95')
         ci_str = '' if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        mde = r.get('minimum_detectable_delta_95_power80')
+        mde_str = '' if mde is None else f" mde80={mde:.4f}"
         miss = ''
         if not r.get('complete', True):
             miss = (f" INCOMPLETE(candidate missing {r['candidate_missing_seeds']}, "
@@ -488,7 +503,7 @@ def print_sweep_comparisons(comparison: dict) -> None:
         note = ''
         if r.get('significance_basis'):
             note = f" [{r['significance_basis']}]"
-        print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{ci_str}{sign} "
+        print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{ci_str}{sign}{mde_str} "
               f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}{cost}{shape}{regime}{note}")
     if comparison.get('incomplete_cells'):
         print(f"[compare] WARNING: {len(comparison['incomplete_cells'])} comparison(s) involve a cell "

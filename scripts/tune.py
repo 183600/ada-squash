@@ -68,7 +68,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
+                               paired_t_one_sided, student_t_ppf, welch_t_one_sided)
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.ablation import run_one
 
@@ -234,6 +235,46 @@ def _split_basis(r: dict, use_confirm: bool):
     return r['best']['mean'], r['best'].get('std'), r['best'].get('n')
 
 
+def _describe_paired_effect(entry: dict, arm_vals, ref_vals, common, test,
+                            alpha: float, power: float=0.8) -> None:
+    """Add seed-direction and resolution without changing certification.
+
+    Sign counts expose an effect carried by one or two seeds, and the MDE
+    states the smallest loss difference this seed count could detect at 80%
+    power. Both are descriptive: `beats_reference_significantly` still needs
+    the confirm split and the Holm-adjusted p-value.
+    """
+    entry.update({
+        'n_seeds_favoring': None,
+        'n_seeds_tied': None,
+        'n_seeds_against': None,
+        'per_seed_delta': None,
+        'paired_delta_std': None,
+        'minimum_detectable_delta_95_power80': None,
+    })
+    if len(common) < 2 or len(arm_vals) != len(ref_vals):
+        return
+    deltas = [a - b for a, b in zip(arm_vals, ref_vals)]
+    stats = mean_std_stderr(deltas)
+    entry.update({
+        'n_seeds_favoring': sum(value < 0.0 for value in deltas),
+        'n_seeds_tied': sum(value == 0.0 for value in deltas),
+        'n_seeds_against': sum(value > 0.0 for value in deltas),
+        'per_seed_delta': {str(seed): value for seed, value in zip(common, deltas)},
+        'paired_delta_std': None if stats is None else stats['std'],
+    })
+    if test is None or not test.get('df') or test.get('ci_low') is None:
+        return
+    half = (test['ci_high'] - test['ci_low']) / 2.0
+    critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
+    if critical > 0.0:
+        stderr = half / critical
+        entry['minimum_detectable_delta_95_power80'] = (
+            student_t_ppf(1.0 - alpha, float(test['df']))
+            + student_t_ppf(power, float(test['df']))
+        ) * stderr
+
+
 def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bool = True) -> dict | None:
     """Best variant trials vs the best tuned baseline, paired where possible.
 
@@ -251,8 +292,6 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     baselines = {arm: r for arm, r in usable.items() if arm in set(baseline_arms)}
     if not baselines:
         return None
-    ref_arm = min(baselines, key=lambda a: baselines[a]['best']['mean'])
-    ref = baselines[ref_arm]
     # The confirm split is only a valid basis when *every* compared arm has
     # complete confirm statistics; a mixed basis would compare some arms on
     # fresh seeds and others on the seeds their lr was selected on. A
@@ -268,6 +307,14 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         a: (usable[a].get('confirm') or {}).get('missing_seeds') for a in confirm_ignored}
     use_confirm = len(confirm_ready) == len(usable) and bool(usable)
     split = 'confirm_seeds' if use_confirm else 'selection_seeds'
+    # Prefer a baseline that actually reached the confirm split. Choosing the
+    # lowest selection mean regardless of confirm coverage can crown a
+    # single-split baseline and silently make every certification impossible.
+    confirm_baselines = [arm for arm in baselines if arm in confirm_ready]
+    reference_pool = confirm_baselines if (certify and confirm_baselines) else list(baselines)
+    ref_arm = min(reference_pool, key=lambda a: baselines[a]['best']['mean'])
+    point_best_arm = min(baselines, key=lambda a: baselines[a]['best']['mean'])
+    ref = baselines[ref_arm]
     # Only a comparison on held-back seeds can certify: without --confirm-seeds
     # the same runs selected the lr and then "proved" it, which is the
     # winner's curse regardless of how small the p-value looks.
@@ -282,6 +329,20 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         'reference_selection_val_loss': ref['best']['mean'],
         'reference_curve_classification_counts': ref['best'].get('curve_classification_counts'),
         'reference_split': split,
+        'reference_selection': {
+            'rule': ('lowest selection mean among confirm-ready baselines'
+                     if (certify and confirm_baselines)
+                     else 'lowest selection mean (no confirm-ready baseline to prefer)'),
+            'confirm_ready_baselines': sorted(confirm_baselines),
+            'unconfirmed_baselines': sorted(set(baselines) - set(confirm_baselines)),
+            'reference_can_certify': ref_arm in confirm_ready,
+            'reference_is_point_estimate_best': ref_arm == point_best_arm,
+        },
+        'point_estimate_best_baseline': {
+            'arm': point_best_arm,
+            'lr': baselines[point_best_arm]['best']['lr'],
+            'selection_val_loss': baselines[point_best_arm]['best']['mean'],
+        },
         'certify_requested': bool(certify),
         'confirm_ignored_arms': confirm_ignored,
         'confirm_ignored_missing_seeds': confirm_ignored_missing_seeds,
@@ -341,6 +402,12 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             't': None,
             'df': None,
             'delta_ci_95': None,
+            'n_seeds_favoring': None,
+            'n_seeds_tied': None,
+            'n_seeds_against': None,
+            'per_seed_delta': None,
+            'paired_delta_std': None,
+            'minimum_detectable_delta_95_power80': None,
         }
         test = None
         if len(common) >= 2:
@@ -379,6 +446,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             entry['df'] = test['df']
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
+        _describe_paired_effect(entry, arm_vals, ref_vals, common, test, alpha)
         if (entry['test'] is not None and not entry['replicated_across_seeds']
                 and entry['significance_basis'] is None):
             entry['significance_basis'] = (
@@ -442,6 +510,11 @@ def print_comparison(comparison: dict | None) -> None:
           f"n_seeds={comparison.get('reference_n_seeds')} "
           f"(split={comparison['reference_split']}; "
           f"selection-seed mean={comparison['reference_selection_val_loss']:.4f}){ref_note}")
+    selection = comparison.get('reference_selection') or {}
+    if selection:
+        print(f"[tune][compare] reference selection: {selection.get('rule')}; "
+              f"point-estimate best={comparison.get('point_estimate_best_baseline')}; "
+              f"reference can certify={selection.get('reference_can_certify')}")
     if comparison.get('certified') is False:
         if comparison.get('certify_requested'):
             ignored = comparison.get('confirm_ignored_arms')
@@ -469,6 +542,13 @@ def print_comparison(comparison: dict | None) -> None:
         delta_str = 'n/a' if delta is None else f'{delta:+.4f}'
         basis = entry.get('test_basis') or '-'
         note = ' [descriptive only, not certified]' if entry.get('significance_basis') else ''
+        direction = ''
+        if entry.get('n_seeds_favoring') is not None:
+            direction = f" seeds_favoring={entry['n_seeds_favoring']}/{entry['n_paired_seeds']}"
+            if entry.get('n_seeds_tied'):
+                direction += f" tied={entry['n_seeds_tied']}"
+        mde = entry.get('minimum_detectable_delta_95_power80')
+        mde_str = '' if mde is None else f" mde80={mde:.4f}"
         off = _off_regime(entry.get('curve_classification_counts'))
         if off:
             note += (f" [curve regimes {off}: the arm's best lr was picked in a non-healthy "
@@ -476,8 +556,8 @@ def print_comparison(comparison: dict | None) -> None:
         print(f"[tune][compare] {entry['arm']:>12s} lr={entry['best_lr']:g} "
               f"val_loss={entry['val_loss']:.4f}{std_str} "
               f"delta={delta_str}{ci_str} p(one-sided)={p_str} "
-              f"p(holm)={p_holm_str} paired_seeds={entry['n_paired_seeds']} "
-              f"test={entry.get('test') or '-'}@{basis} "
+              f"p(holm)={p_holm_str} paired_seeds={entry['n_paired_seeds']}{direction} "
+              f"test={entry.get('test') or '-'}@{basis}{mde_str} "
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}{note}")
     if comparison.get('rows_tested_descriptively_only'):

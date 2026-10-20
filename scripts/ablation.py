@@ -22,7 +22,10 @@ Comparison protocol (what the runner guarantees, and checks)
   QK-Norm alternative as a comparator.
   `leave_one_out_comparison` then runs the paired Full-vs-Full-minus-X test
   (Holm-adjusted over mechanisms), so "each axis helps" is a tested claim
-  rather than an eyeballed delta.
+  rather than an eyeballed delta. `check_factorial` additionally verifies the
+  four tanh cells of `FACTORIAL_SPEC`, and `factorial_comparison` reports the
+  two main effects and their interaction, so a synergy claim is tested rather
+  than inferred from Full's point estimate.
 * **Statistical reliability.** Every row is replicated over >= 3 seeds by
   default and reported as mean +/- std across seeds; the row-vs-baseline
   significance test is a one-sided paired Student-t test on the per-seed
@@ -31,7 +34,10 @@ Comparison protocol (what the runner guarantees, and checks)
   description only and are never certified (df = 1); a single shared run is
   tested at the batch level for description only (batch noise is not
   run-to-run noise). Alias rows that reuse a summary are counted once, and
-  each delta carries a 95% confidence interval.
+  each delta carries a 95% confidence interval, per-seed direction counts and
+  a power-based minimum detectable delta. The reference baseline is the best
+  *replicated* baseline (with the point-estimate best recorded alongside), so
+  a lucky single-seed row cannot make certification impossible.
 """
 import argparse
 import dataclasses
@@ -49,7 +55,8 @@ from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpi
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
-from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
+                               paired_t_one_sided, student_t_ppf, welch_t_one_sided)
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
@@ -64,6 +71,53 @@ def _finite_metric(value) -> bool:
     """
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value))
+
+
+def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict | None=None,
+                           alpha: float=0.05, power: float=0.8) -> dict:
+    """Seed-level direction and resolution for one comparison.
+
+    A p-value alone hides two things a reader needs: how many independent
+    seeds moved in the claimed direction (with three seeds a 2/3 split can
+    still produce a small t p-value) and the smallest delta the test could
+    have detected at the requested power. The latter is what separates "no
+    evidence of a difference" from "the design could not have seen one".
+    Both are descriptive: they never change `beats_*_significantly`.
+    """
+    out = {
+        'n_seeds_favoring': None,
+        'n_seeds_tied': None,
+        'n_seeds_against': None,
+        'per_seed_delta': None,
+        'paired_delta_std': None,
+        'minimum_detectable_delta_95_power80': None,
+    }
+    common = list(common_seeds or [])
+    if len(common) >= 2:
+        row_seeds = _seed_means(row)
+        ref_seeds = _seed_means(reference)
+        deltas = {int(seed): float(row_seeds[seed] - ref_seeds[seed])
+                  for seed in common if seed in row_seeds and seed in ref_seeds}
+        if deltas:
+            values = list(deltas.values())
+            stats = mean_std_stderr(values)
+            out.update({
+                'n_seeds_favoring': sum(v < 0.0 for v in values),
+                'n_seeds_tied': sum(v == 0.0 for v in values),
+                'n_seeds_against': sum(v > 0.0 for v in values),
+                'per_seed_delta': {str(seed): value for seed, value in deltas.items()},
+                'paired_delta_std': None if stats is None else stats['std'],
+            })
+    if test is not None and test.get('df') and isinstance(test.get('ci_low'), (int, float)):
+        half = (test['ci_high'] - test['ci_low']) / 2.0
+        critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
+        if critical > 0.0:
+            stderr = half / critical
+            out['minimum_detectable_delta_95_power80'] = (
+                student_t_ppf(1.0 - alpha, float(test['df']))
+                + student_t_ppf(power, float(test['df']))
+            ) * stderr
+    return out
 
 
 ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel_tanh_k0': dict(norm_name='dytcd_tanh', k_init=0.0, learnable_k=False), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
@@ -165,6 +219,37 @@ LOO_SPEC = {
     },
 }
 
+# A complete 2x2 factorial for the two axes the main proposal combines. The
+# four cells all use tanh, the same LayerScale residual and the same scalar
+# initialization context, so the only moving parts are the per-channel factor
+# and the depth schedule. Leave-one-out proves each axis helps from Full;
+# this design additionally identifies a *positive interaction* (synergy)
+# rather than assuming it from Full's point estimate. `check_factorial`
+# verifies that switching a factor changes exactly its declared knobs in both
+# arms of the other factor, so a confounded cell is rejected before training.
+FACTORIAL_SPEC = {
+    'per_channel_x_depth_tanh': {
+        'context': ('tanh activation family, LayerScale on, same gamma/beta and '
+                    'same alpha/k initialization context across the four cells'),
+        'cells': {
+            'neither': 'dytd_k0_no_depth_schedule',
+            'per_channel': 'dytc_perchannel_tanh_k0',
+            'depth': 'dytd_full',
+            'both': 'dytcd_no_softsign',
+        },
+        'factors': {
+            'per_channel': {
+                'diff': ('norm_name',),
+                'pairs': (('neither', 'per_channel'), ('depth', 'both')),
+            },
+            'depth': {
+                'diff': ('k_init', 'learnable_k'),
+                'pairs': (('neither', 'depth'), ('per_channel', 'both')),
+            },
+        },
+    },
+}
+
 def _effective_cfg(model_name: str, cfg_kwargs: dict) -> dict:
     """The full GPTConfig a matrix row builds, as a plain dict."""
     with torch.device('meta'):
@@ -231,6 +316,51 @@ def check_leave_one_out(rows: dict, model_name: str, spec: dict | None=None) -> 
         raise ValueError('leave-one-out coverage is incomplete: ' + '; '.join(problems))
     return report
 
+def check_factorial(rows: dict, model_name: str, spec: dict | None=None) -> dict:
+    """Verify every declared 2x2 factorial is a clean, complete design.
+
+    Each factor is switched on/off in *both* arms of the other factor (e.g.
+    per-channel must be the only difference both with depth off and with
+    depth on). A factor that changes different extra knobs in the two arms
+    would make the interaction term a mixture of effects, so this is rejected
+    before any run starts rather than discovered after the matrix finishes.
+    """
+    spec = FACTORIAL_SPEC if spec is None else spec
+    problems: list[str] = []
+    report: dict = {}
+    for design_name, design in spec.items():
+        cells = design['cells']
+        missing = [name for name in cells.values() if name not in rows]
+        if missing:
+            problems.append(
+                f"factorial '{design_name}' is missing cell row(s) {sorted(missing)}")
+            continue
+        cfgs = {cell: _effective_cfg(model_name, rows[row])
+                for cell, row in cells.items()}
+        report[design_name] = {'cells': dict(cells), 'factors': {}}
+        for factor, info in design['factors'].items():
+            declared = set(info['diff'])
+            clean = True
+            for off_cell, on_cell in info['pairs']:
+                off_cfg, on_cfg = cfgs[off_cell], cfgs[on_cell]
+                actual = {key for key in off_cfg if off_cfg[key] != on_cfg[key]}
+                actual |= {key for key in on_cfg if key not in off_cfg}
+                if actual != declared:
+                    problems.append(
+                        f"factorial '{design_name}', factor '{factor}': "
+                        f"{cells[on_cell]} vs {cells[off_cell]} differ in "
+                        f"{sorted(actual)}, expected exactly {sorted(declared)}")
+                    clean = False
+                    break
+            if clean:
+                report[design_name]['factors'][factor] = {
+                    'diff': sorted(declared),
+                    'pairs': [list(pair) for pair in info['pairs']],
+                }
+    if problems:
+        raise ValueError('factorial coverage is incomplete: ' + '; '.join(problems))
+    return report
+
 def validate_matrix(rows: dict, hypotheses: dict, model_name: str) -> dict:
     """Every static check the matrix must pass before any training starts."""
     missing = []
@@ -242,7 +372,8 @@ def validate_matrix(rows: dict, hypotheses: dict, model_name: str) -> dict:
         raise ValueError(
             f"ablation rows without a stated scientific hypothesis: {sorted(missing)}")
     return {'rows': sorted(rows),
-            'leave_one_out': check_leave_one_out(rows, model_name)}
+            'leave_one_out': check_leave_one_out(rows, model_name),
+            'factorial': check_factorial(rows, model_name)}
 
 def install_outlier_channel(model, scale: float=25.0) -> int:
     with torch.no_grad():
@@ -800,9 +931,13 @@ def _run_identity(row: dict, parent_of: dict) -> str:
 def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alpha: float=0.05) -> dict | None:
     """Every row's held-out val_loss against the best reference baseline.
 
-    The reference is the *best* (lowest val_loss) row among `baseline_names`,
-    so a variant is only credited with a win if it beats the strongest simple
-    baseline on the identical protocol. Significance uses the one-sided paired
+    The reference is the best (lowest val_loss) *replicated* row among
+    `baseline_names` when one exists: a lucky single-seed baseline must not
+    become the bar, because no comparison against it could ever be certified
+    and its point estimate is the noisiest. The point-estimate best among all
+    baselines is still recorded (`point_estimate_best_baseline`), so the
+    selection cannot hide a lower unreplicated reference. Significance uses
+    the one-sided paired
     Student-t test on the per-seed means whenever both rows share >= 2 seeds,
     but only >= 3 shared seeds can certify significance (2 seeds have df = 1).
     With exactly one shared seed the same run's held-out batches are tested
@@ -829,7 +964,11 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         return None
     parent_of = {r['name']: r['reused_from'] for r in summaries
                  if isinstance(r, dict) and 'name' in r and isinstance(r.get('reused_from'), str)}
-    reference = min(baselines, key=lambda r: r['val_loss'])
+    replicated_baselines = [r for r in baselines
+                            if len(_seed_means(r)) >= MIN_SEEDS_FOR_SIGNIFICANCE]
+    selection_pool = replicated_baselines or baselines
+    reference = min(selection_pool, key=lambda r: r['val_loss'])
+    point_best = min(baselines, key=lambda r: r['val_loss'])
     ref_seeds = _seed_means(reference)
     ref_stderr = reference.get('val_loss_seed_stderr')
     if ref_stderr is None:
@@ -841,6 +980,24 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         'reference_val_loss_stderr': ref_stderr,
         'reference_n_seeds': reference.get('n_seeds', 1),
         'reference_seeds': sorted(ref_seeds),
+        'reference_selection': {
+            'rule': ('lowest val_loss among baselines with >= '
+                     f'{MIN_SEEDS_FOR_SIGNIFICANCE} seeds'
+                     if replicated_baselines else
+                     'lowest val_loss (no baseline reaches '
+                     f'{MIN_SEEDS_FOR_SIGNIFICANCE} seeds; certification unavailable)'),
+            'replicated_baselines': sorted(r['name'] for r in replicated_baselines),
+            'unreplicated_baselines': sorted(r['name'] for r in baselines
+                                             if r not in replicated_baselines),
+            'reference_can_certify': len(ref_seeds) >= MIN_SEEDS_FOR_SIGNIFICANCE,
+            'reference_is_point_estimate_best': reference['name'] == point_best['name'],
+        },
+        'point_estimate_best_baseline': {
+            'name': point_best['name'],
+            'val_loss': point_best['val_loss'],
+            'n_seeds': point_best.get('n_seeds', 1),
+            'seeds': sorted(_seed_means(point_best)),
+        },
         'baseline_rows': {r['name']: r['val_loss'] for r in baselines},
         'margin': margin,
         'alpha': alpha,
@@ -875,6 +1032,12 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             't': None,
             'df': None,
             'delta_ci_95': None,
+            'n_seeds_favoring': None,
+            'n_seeds_tied': None,
+            'n_seeds_against': None,
+            'per_seed_delta': None,
+            'paired_delta_std': None,
+            'minimum_detectable_delta_95_power80': None,
             # Curve regimes of the row's seeds (None for pre-monitoring
             # summaries): a delta measured while one arm is underfit or
             # overfitting is annotated, so it cannot be read as pure norm
@@ -893,6 +1056,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             entry['df'] = test['df']
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
+        entry.update(_paired_effect_summary(row, reference, common, test, alpha=alpha))
         if entry['test'] is not None and not entry['replicated_across_seeds']:
             entry['significance_basis'] = (
                 f'descriptive only: {len(common)} shared seed(s), fewer than the required '
@@ -948,6 +1112,11 @@ def print_baseline_comparison(comparison: dict | None) -> None:
           f"val_loss={comparison['reference_val_loss']:.4f}{ref_std_str} "
           f"(seeds={comparison.get('reference_seeds')}; "
           f"all baselines: { {k: round(v, 4) for k, v in comparison['baseline_rows'].items()} })")
+    selection = comparison.get('reference_selection') or {}
+    if selection:
+        print(f"[compare] reference selection: {selection.get('rule')}; "
+              f"point-estimate best={comparison.get('point_estimate_best_baseline')}; "
+              f"reference can certify={selection.get('reference_can_certify')}")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_holm = entry.get('p_one_sided_holm')
@@ -963,6 +1132,13 @@ def print_baseline_comparison(comparison: dict | None) -> None:
             note = f" [{entry['excluded_from_family']}]"
         elif entry.get('significance_basis'):
             note = ' [descriptive only, not certified]'
+        direction = ''
+        if entry.get('n_seeds_favoring') is not None:
+            direction = (f" seeds_favoring={entry['n_seeds_favoring']}/{len(entry.get('paired_seeds') or [])}")
+            if entry.get('n_seeds_tied'):
+                direction += f" tied={entry['n_seeds_tied']}"
+        mde = entry.get('minimum_detectable_delta_95_power80')
+        mde_str = '' if mde is None else f" mde80={mde:.4f}"
         regimes = entry.get('curve_classification_counts')
         regime_note = ''
         if regimes:
@@ -973,7 +1149,7 @@ def print_baseline_comparison(comparison: dict | None) -> None:
                                f"in a healthy falling-falling regime - read the curve block]")
         print(f"[compare] {entry['name']:>32s} val_loss={entry['val_loss']:.4f}{std_str} "
               f"delta={entry['delta_vs_reference']:+.4f}{ci_str} p(one-sided)={p_str} p(holm)={p_holm_str} "
-              f"test={entry.get('test') or '-'}@{basis} "
+              f"test={entry.get('test') or '-'}@{basis}{direction}{mde_str} "
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}{note}{regime_note}")
     if comparison.get('rows_tested_descriptively_only'):
@@ -1131,6 +1307,12 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 't': None,
                 'df': None,
                 'delta_ci_95': None,
+                'n_seeds_favoring': None,
+                'n_seeds_tied': None,
+                'n_seeds_against': None,
+                'per_seed_delta': None,
+                'paired_delta_std': None,
+                'minimum_detectable_delta_95_power80': None,
             }
             if full is None:
                 entry['skipped'] = f"full row '{full_name}' has no usable val_loss"
@@ -1158,6 +1340,7 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['df'] = test['df']
                 entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
                 entry['n'] = test['n']
+            entry.update(_paired_effect_summary(full, ref, common, test, alpha=alpha))
             if entry['test'] is not None and not entry['replicated_across_seeds']:
                 entry['significance_basis'] = (
                     f'descriptive only: {len(common)} shared seed(s), fewer than the required '
@@ -1231,6 +1414,13 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
             note = f" [{entry['excluded_from_family']}]"
         elif entry.get('significance_basis'):
             note = ' [descriptive only, not certified]'
+        direction = ''
+        if entry.get('n_seeds_favoring') is not None:
+            direction = (f" seeds_favoring={entry['n_seeds_favoring']}/{len(entry.get('paired_seeds') or [])}")
+            if entry.get('n_seeds_tied'):
+                direction += f" tied={entry['n_seeds_tied']}"
+        mde = entry.get('minimum_detectable_delta_95_power80')
+        mde_str = '' if mde is None else f" mde80={mde:.4f}"
         regime_note = ''
         for label, key in (('full', 'full_curve_classification_counts'),
                            ('ref', 'reference_curve_classification_counts')):
@@ -1244,7 +1434,7 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
               f"{entry['reference_row']} val_loss={entry['reference_val_loss']:.4f}{ref_std_str} "
               f"delta(full-ref)={entry['delta_full_minus_reference']:+.4f} {ci_str}"
               f"p(one-sided)={p_str} p(holm)={p_holm_str} "
-              f"test={entry.get('test') or '-'}@{entry.get('test_basis') or '-'} "
+              f"test={entry.get('test') or '-'}@{entry.get('test_basis') or '-'}{direction}{mde_str} "
               f"removing_hurts={entry['mechanism_helps']} "
               f"significant={entry['mechanism_helps_significantly']}{note}{regime_note}")
     if comparison.get('rows_tested_descriptively_only'):
@@ -1253,6 +1443,171 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
     if comparison.get('rows_with_fewer_than_3_seeds'):
         print(f"[loo] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
               f"{comparison['rows_with_fewer_than_3_seeds']}")
+
+def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=0.0,
+                         alpha: float=0.05) -> dict | None:
+    """Paired main effects and interaction for each declared 2x2 factorial.
+
+    The interaction is the difference of the factor's effect in the two arms
+    of the other factor, computed per seed:
+    ``(both - depth) - (per_channel - neither)``. A negative interaction means
+    the two mechanisms together lower loss by more than the sum of their
+    separate effects (synergy); a positive one means they overlap or interfere.
+    Testing the interaction is what lets the report distinguish "Full wins
+    because either axis helps" from "the combination is special". Every term
+    uses the same shared seed set across all four cells and the same
+    small-sample paired t-test as the other comparisons; only >= 3 shared
+    seeds enter the Holm family. Returns None when no design has all cells.
+    """
+    spec = FACTORIAL_SPEC if spec is None else spec
+    usable = {r['name']: r for r in summaries
+              if isinstance(r, dict) and 'name' in r and _finite_metric(r.get('val_loss'))}
+    rows: list = []
+    for design_name, design in spec.items():
+        cells = design['cells']
+        factor_names = list(design['factors'])
+        missing = [row for row in cells.values() if row not in usable]
+        base_entry = {
+            'design': design_name,
+            'cells': dict(cells),
+            'context': design.get('context'),
+            'shared_seeds': [],
+        }
+        if missing:
+            entry = dict(base_entry, effect=None, kind='design', skipped=(
+                f"cell row(s) {sorted(missing)} have no usable val_loss"))
+            rows.append(entry)
+            continue
+        seed_values = {cell: _seed_means(usable[row]) for cell, row in cells.items()}
+        common = sorted(set.intersection(*(set(values) for values in seed_values.values())))
+        if len(common) < 2:
+            entry = dict(base_entry, effect=None, kind='design', shared_seeds=common,
+                         skipped=(f"only {len(common)} seed(s) are shared by all four "
+                                  f"cells; a paired effect needs at least 2"))
+            rows.append(entry)
+            continue
+        effects = {}
+        for factor in factor_names:
+            arm_values = {}
+            for off_cell, on_cell in design['factors'][factor]['pairs']:
+                arm_values[f'{off_cell}->{on_cell}'] = [
+                    seed_values[on_cell][seed] - seed_values[off_cell][seed]
+                    for seed in common
+                ]
+            arm_means = [sum(values) / len(values) for values in arm_values.values()]
+            main_values = [sum(vals) / len(vals) for vals in zip(*arm_values.values())]
+            effects[factor] = {
+                'kind': 'main_effect',
+                'formula': 'mean over both arms of the other factor: on - off',
+                'arm_effects': {name: {'mean_delta': sum(vals) / len(vals),
+                                       'per_seed_delta': dict(zip(map(str, common), vals))}
+                                for name, vals in arm_values.items()},
+                'per_seed_values': dict(zip(map(str, common), main_values)),
+                'mean_arm_deltas': arm_means,
+                'delta_seed_mean': sum(main_values) / len(main_values),
+                'per_seed_delta': dict(zip(map(str, common), main_values)),
+            }
+        if len(factor_names) == 2:
+            first, second = factor_names
+            first_arms = list(effects[first]['arm_effects'].items())
+            interaction_values = [
+                on - off for off, on in zip(
+                    first_arms[0][1]['per_seed_delta'].values(),
+                    first_arms[1][1]['per_seed_delta'].values())
+            ]
+            effects[f'{first}_x_{second}'] = {
+                'kind': 'interaction',
+                'formula': (f'effect of {first} with {second} on minus effect of {first} '
+                            f'with {second} off; negative = synergy'),
+                'per_seed_values': dict(zip(map(str, common), interaction_values)),
+                'delta_seed_mean': sum(interaction_values) / len(interaction_values),
+                'per_seed_delta': dict(zip(map(str, common), interaction_values)),
+            }
+        for effect_name, effect in effects.items():
+            values = list(effect['per_seed_values'].values())
+            test = paired_t_one_sided(values, [0.0] * len(values), margin=margin, alpha=alpha)
+            replicated = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
+            entry = dict(base_entry, effect=effect_name, kind=effect['kind'],
+                         formula=effect['formula'], shared_seeds=common,
+                         n_seeds=len(common),
+                         delta_seed_mean=effect['delta_seed_mean'],
+                         per_seed_delta=effect['per_seed_delta'],
+                         n_seeds_favoring=sum(value < 0.0 for value in values),
+                         n_seeds_tied=sum(value == 0.0 for value in values),
+                         n_seeds_against=sum(value > 0.0 for value in values),
+                         effect_helps=bool(effect['delta_seed_mean'] < -margin),
+                         effect_helps_significantly=False,
+                         test=test['test'],
+                         test_basis=('seed_means' if replicated
+                                     else f'seed_means_{len(common)}_descriptive'),
+                         replicated_across_seeds=replicated,
+                         p_one_sided=test['p_one_sided'],
+                         p_one_sided_holm=None,
+                         t=test['t'],
+                         df=test['df'],
+                         delta_ci_95=[test['ci_low'], test['ci_high']],
+                         n=test['n'])
+            effect_row = {'per_seed': [{'seed': int(seed), 'val_loss': value}
+                                       for seed, value in effect['per_seed_values'].items()]}
+            zero_row = {'per_seed': [{'seed': int(seed), 'val_loss': 0.0}
+                                     for seed in effect['per_seed_values']]}
+            entry.update(_paired_effect_summary(effect_row, zero_row, common, test, alpha=alpha))
+            if 'arm_effects' in effect:
+                entry['arm_effects'] = effect['arm_effects']
+            rows.append(entry)
+    if not rows:
+        return None
+    family = [entry for entry in rows
+              if entry.get('replicated_across_seeds') and not entry.get('skipped')]
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['effect_helps_significantly'] = bool(
+            entry['effect_helps'] and p_holm is not None and p_holm < alpha)
+    tested_descriptively = [entry['effect'] for entry in rows
+                            if entry.get('p_one_sided') is not None
+                            and not entry.get('replicated_across_seeds')]
+    return {
+        'protocol': ('2x2 factorial per_seed paired terms on the seeds shared by all '
+                     'four cells; only tests with >= '
+                     f'{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are certified, and all '
+                     'main effects and interactions form one Holm family'),
+        'margin': margin,
+        'alpha': alpha,
+        'multiple_comparison': (f'Holm-Bonferroni over {len(family)} seed-replicated '
+                                'factorial term(s); `effect_helps_significantly` uses the '
+                                'adjusted p-value'),
+        'designs': spec,
+        'rows': rows,
+        'rows_tested_descriptively_only': tested_descriptively,
+    }
+
+def print_factorial_comparison(comparison: dict | None) -> None:
+    if comparison is None:
+        print('[factorial] no 2x2 factorial design declared; interaction test skipped')
+        return
+    for entry in comparison['rows']:
+        if entry.get('skipped'):
+            print(f"[factorial] {entry['design']}: SKIPPED ({entry['skipped']})")
+            continue
+        p_str = 'n/a' if entry['p_one_sided'] is None else f"{entry['p_one_sided']:.3g}"
+        p_holm_str = ('n/a' if entry['p_one_sided_holm'] is None
+                      else f"{entry['p_one_sided_holm']:.3g}")
+        ci = entry.get('delta_ci_95')
+        ci_str = '' if ci is None else f"ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}] "
+        mde = entry.get('minimum_detectable_delta_95_power80')
+        mde_str = '' if mde is None else f"mde80={mde:.4f} "
+        note = '' if entry['replicated_across_seeds'] else ' [descriptive only, not certified]'
+        print(f"[factorial] {entry['design']} {entry['kind']} {entry['effect']}: "
+              f"delta={entry['delta_seed_mean']:+.4f} {ci_str}"
+              f"seeds_favoring={entry['n_seeds_favoring']}/{entry['n_seeds']} "
+              f"p(one-sided)={p_str} p(holm)={p_holm_str} {mde_str}"
+              f"helps={entry['effect_helps']} "
+              f"significant={entry['effect_helps_significantly']}{note}")
+    if comparison.get('rows_tested_descriptively_only'):
+        print(f"[factorial] NOTE: terms with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared "
+              f"seeds are described but never certified: "
+              f"{comparison['rows_tested_descriptively_only']}")
 
 def main():
     pre = argparse.ArgumentParser(add_help=False)
@@ -1444,6 +1799,15 @@ def main():
         with open(base / 'leave_one_out_comparison.json', 'w') as f:
             json.dump(loo_comparison, f, indent=2)
     print_leave_one_out_comparison(loo_comparison)
+    # The third half of the contract: Full combines two axes, so report the
+    # 2x2 main effects and their interaction rather than inferring synergy
+    # from Full's point estimate alone.
+    factorial = factorial_comparison(comparable, margin=args.baseline_margin, alpha=args.alpha)
+    if factorial is not None:
+        factorial['rows_excluded_protocol_mismatch'] = stale_rows
+        with open(base / 'factorial_comparison.json', 'w') as f:
+            json.dump(factorial, f, indent=2)
+    print_factorial_comparison(factorial)
     manifest = dict(run_metadata)
     manifest['git'] = git_revision()
     manifest['hyperparameters'] = vars(args)
@@ -1461,6 +1825,7 @@ def main():
     }
     manifest['baseline_comparison'] = comparison
     manifest['leave_one_out_comparison'] = loo_comparison
+    manifest['factorial_comparison'] = factorial
     if sanity_report_path is not None:
         manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
     else:
@@ -1472,6 +1837,7 @@ def main():
         'all_summaries': artifact_record(base / 'all_summaries.json'),
         'baseline_comparison': artifact_record(base / 'baseline_comparison.json'),
         'leave_one_out_comparison': artifact_record(base / 'leave_one_out_comparison.json'),
+        'factorial_comparison': artifact_record(base / 'factorial_comparison.json'),
         'sanity_report': file_fingerprint(sanity_report_path) if sanity_report_path else {'enabled': False},
     })
     save_run_manifest(base / 'run_manifest.json', manifest)
