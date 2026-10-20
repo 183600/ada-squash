@@ -393,11 +393,14 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 entry['mean_delta'] = cand_seeds[common[0]] - ref_seeds[common[0]]
             entry['certifiable'] = bool(
                 entry['complete'] and len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
-                and entry['cost_matched_within_25pct'] is not False)
+                and entry['cost_matched_within_25pct'] is True)
             if entry['p_one_sided'] is not None and not entry['certifiable']:
                 if entry['cost_matched_within_25pct'] is False:
                     reason = ('the params/FLOPs ratio exceeds the 25% match tolerance, so the '
                               'delta is confounded with cost')
+                elif entry['cost_matched_within_25pct'] is None:
+                    reason = ('the params/FLOPs ratios are unavailable, so the compute-matched '
+                              'premise cannot be verified')
                 else:
                     reason = (f'{len(common)} shared seed(s), fewer than the required '
                               f'{MIN_SEEDS_FOR_SIGNIFICANCE}, or an incomplete cell')

@@ -182,6 +182,12 @@ def efficiency_verdict(
     component_limit = verdict["max_component_ratio"]
     for name, ratio in (cost_components or {}).items():
         if ratio is None:
+            verdict["component_costs"][str(name)] = {
+                "ratio": None,
+                "acceptable": False,
+            }
+            verdict["component_failures"].append(
+                f"{name} is unmeasured; cannot certify it stays within {component_limit:.3f}x")
             continue
         ratio = float(ratio)
         acceptable = ratio <= component_limit

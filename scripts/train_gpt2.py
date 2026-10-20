@@ -170,7 +170,7 @@ def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()
 # changes which documents are trained on and which are held out. The dataset /
 # tokenizer revisions are the data *version*: resuming a run against a moved
 # upstream branch would continue on different data under the same manifest.
-_DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer_revision',
+_DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tokenizer_revision',
               'val_frac', 'test_frac', 'num_documents',
               'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file',
               'exclude_test_hash_file', 'group_key', 'exclude_group_file',
@@ -1169,12 +1169,14 @@ def main():
             grad_norm_t = None
             if args.grad_clip > 0:
                 grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                grad_norm_check = float(grad_norm_t)
-                if not math.isfinite(grad_norm_check):
-                    opt.zero_grad(set_to_none=True)
-                    _triage_nonfinite('gradient', step, x, y, loss_val,
-                                      extra={'grad_norm_pre_clip': grad_norm_check})
-                    continue
+            grad_norm_check = float(
+                grad_norm_t if grad_norm_t is not None
+                else torch.nn.utils.get_total_norm(model.parameters()))
+            if not math.isfinite(grad_norm_check):
+                opt.zero_grad(set_to_none=True)
+                _triage_nonfinite('gradient', step, x, y, loss_val,
+                                  extra={'grad_norm_pre_clip': grad_norm_check})
+                continue
             opt.step()
             nonfinite_streak = 0
             sched.step()

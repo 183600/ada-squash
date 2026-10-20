@@ -17,7 +17,7 @@ from adasquash.diagnostics import triage_nonfinite
 from adasquash.attention import CausalSelfAttention, clear_logit_scratch_cache
 from adasquash.metrics import mean_std_stderr
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, clear_cast_weight_cache, _LayerScaleResidual
-from adasquash.repro import collect_run_metadata, file_fingerprint, save_run_manifest, set_all_seeds
+from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 _FLAT_TOKEN_CACHE: dict = {}
 _FLAT_TOKEN_CACHE_MAX_ENTRIES = 8
@@ -281,14 +281,18 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             print(f'[moe][data] train split: {report}')
         data_iter = iter(loader)
 
+    def random_probe_batch(generator):
+        x = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len),
+                          generator=generator, device=device)
+        y = torch.full_like(x, cfg.ignore_index)
+        y[:, :-1] = x[:, 1:]
+        return (x, y)
+
     def next_batch():
         nonlocal data_iter
         if data_iter is None:
             if args.probe == 'random':
-                x = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
-                y = torch.full_like(x, cfg.ignore_index)
-                y[:, :-1] = x[:, 1:]
-                return (x, y)
+                return random_probe_batch(rng)
             return markov_batch(rng, cfg.ignore_index, args.batch_size, args.seq_len, device)
         try:
             x, y = next(data_iter)
@@ -404,6 +408,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                                     'Check --num-documents / the dataset revision, then re-run.')
                         vx = vx.to(device, non_blocking=True)
                         vy = vy.to(device, non_blocking=True)
+                    elif args.probe == 'random':
+                        vx, vy = random_probe_batch(val_rng)
                     else:
                         vx, vy = markov_batch(val_rng, cfg.ignore_index, args.batch_size, args.seq_len, device)
                     _, total, aux, _ = model(vx, vy, return_aux=True, return_logits=False)
@@ -414,7 +420,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                         # here must be triaged on the exact batch instead of
                         # being written into val_ce as a selection metric.
                         triage = triage_nonfinite(model, vx, vy, device_type=device,
-                                                  lr=args.lr, grad_clip=args.grad_clip)
+                                                  lr=args.lr, grad_clip=1.0)
                         raise SystemExit(
                             f"[moe][nan] held-out batch is non-finite "
                             f"(total={total_val}, aux={vaux}): triage stage="
@@ -603,6 +609,16 @@ def main():
         if args.hypothesis:
             manifest['hypothesis'] = args.hypothesis
         manifest['aggregate'] = agg
+        manifest = finish_metadata(
+            manifest,
+            results={
+                'n_seeds': agg['n_seeds'],
+                'val_ce': agg.get('val_ce'),
+                'val_ce_std': agg.get('val_ce_std'),
+                'invalid_seeds': agg.get('invalid_seeds'),
+            },
+            artifacts={'seeds_summary': file_fingerprint(summary_path)},
+        )
         save_run_manifest(base / 'run_manifest.json', manifest)
         val = agg.get('val_ce')
         val_std = agg.get('val_ce_std')
@@ -619,7 +635,7 @@ def main():
                   f"they are excluded from the pooled mean, not treated as clean replications")
 
 def _expert_cv(tpe) -> float:
-    if not isinstance(tpe, torch.Tensor):
+    if not isinstance(tpe, torch.Tensor) or tpe.numel() < 2:
         return 0.0
     return (tpe.std() / (tpe.mean() + 1e-06)).item()
 
@@ -633,7 +649,9 @@ def _expert_cv_per_block(tpe_list) -> torch.Tensor:
     if not any(t is not None for t in present):
         return torch.zeros(n)
     stacked = torch.cat([t for t in present if t is not None], dim=0)
-    vals = stacked.std(dim=-1) / (stacked.mean(dim=-1) + 1e-06)
+    std = (torch.zeros(stacked.size(0), dtype=stacked.dtype, device=stacked.device)
+           if stacked.size(-1) < 2 else stacked.std(dim=-1))
+    vals = std / (stacked.mean(dim=-1) + 1e-06)
     if n == vals.numel():
         return vals
     out = torch.zeros(n, dtype=vals.dtype, device=vals.device)
