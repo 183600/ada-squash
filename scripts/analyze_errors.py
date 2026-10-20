@@ -665,6 +665,12 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     n_positional_t = torch.zeros((), dtype=torch.long, device=dev)
     scans = {'fixed': [], 'broken': [], 'both_wrong': []}
     scanned = {'fixed': 0, 'broken': 0, 'both_wrong': 0}
+    # The printed examples are the most confident records over the *whole*
+    # paired pass, not just the first `--max-scan-errors` per bucket. The
+    # bounded `scans` above still define the cause taxonomies.
+    example_limit = max(0, int(args.max_examples))
+    example_heaps = {'fixed': [], 'broken': [], 'both_wrong': []}
+    example_counters = {'fixed': 0, 'broken': 0, 'both_wrong': 0}
     fwd_chunk = max(0, int(getattr(args, 'forward_batch_chunk', 0) or 0))
     for x, y in batches:
         mask = y.ne(ignore)
@@ -723,22 +729,50 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
                     & (stats_ref['pred'] == stats_cand['pred'])
                     & (torch.minimum(stats_ref['pred_prob'], stats_cand['pred_prob'])
                        >= args.confidence)).sum()
+                def _pair_record(b: int, tt: int) -> dict:
+                    pos = t0 + tt
+                    return {
+                        'batch_row': b0 + b,
+                        'position': pos,
+                        'gold': int(gold[b, tt]),
+                        'prev': int(x_b[b, pos]),
+                        'context': [int(v) for v in x_b[b, max(0, pos - args.context_tokens):pos + 1].tolist()],
+                        'reference': _side_record(stats_ref, b, tt, args.rank_clip),
+                        'candidate': _side_record(stats_cand, b, tt, args.rank_clip),
+                    }
+
                 for status, selector in selectors.items():
-                    remaining = max_scan - scanned[status]
-                    if remaining <= 0:
-                        continue
-                    for b, tt in selector.nonzero(as_tuple=False)[:remaining].tolist():
-                        scanned[status] += 1
-                        pos = t0 + tt
-                        scans[status].append({
-                            'batch_row': b0 + b,
-                            'position': pos,
-                            'gold': int(gold[b, tt]),
-                            'prev': int(x_b[b, pos]),
-                            'context': [int(v) for v in x_b[b, max(0, pos - args.context_tokens):pos + 1].tolist()],
-                            'reference': _side_record(stats_ref, b, tt, args.rank_clip),
-                            'candidate': _side_record(stats_cand, b, tt, args.rank_clip),
-                        })
+                    if max_scan > scanned[status]:
+                        remaining = max_scan - scanned[status]
+                        for b, tt in selector.nonzero(as_tuple=False)[:remaining].tolist():
+                            scanned[status] += 1
+                            scans[status].append(_pair_record(b, tt))
+                    if example_limit > 0 and bool(selector.any()):
+                        # Confidence of the side whose error the bucket is
+                        # about. For shared blind spots use the weaker of the
+                        # two, so both models are confidently wrong.
+                        if status == 'fixed':
+                            metric = stats_ref['pred_prob']
+                        elif status == 'broken':
+                            metric = stats_cand['pred_prob']
+                        else:
+                            metric = torch.minimum(
+                                stats_ref['pred_prob'], stats_cand['pred_prob'])
+                        flat_selector = selector.reshape(-1)
+                        flat_metric = metric.reshape(-1).masked_fill(
+                            ~flat_selector, float('-inf'))
+                        take = min(example_limit, int(flat_metric.numel()))
+                        for flat in torch.topk(flat_metric, take).indices.tolist():
+                            if not bool(flat_selector[flat]):
+                                continue
+                            b, tt = divmod(flat, selector.shape[1])
+                            record = _pair_record(b, tt)
+                            heapq.heappush(
+                                example_heaps[status],
+                                (float(metric[b, tt]), example_counters[status], record))
+                            example_counters[status] += 1
+                            if len(example_heaps[status]) > example_limit:
+                                heapq.heappop(example_heaps[status])
                 del stats_ref, stats_cand, selectors
 
     n_tokens = int(n_tokens_t.item())
@@ -802,12 +836,35 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         rec['candidate_cause'] = cand_cause
         examples['shared_blind_spots'].append(rec)
 
+    # Printed examples come from the full-pass confidence heaps. Records that
+    # were already in the bounded taxonomy scan keep their flags; the rest are
+    # classified here without touching the cause counts.
+    for status, heap in example_heaps.items():
+        records = [record for _, _, record in heap]
+        for rec in records:
+            if status in ('fixed', 'broken'):
+                side = 'reference' if status == 'fixed' else 'candidate'
+                if f'{side}_cause' not in rec:
+                    flags, cause = _classify_one(rec, side)
+                    rec[f'{side}_flags'] = flags
+                    rec[f'{side}_cause'] = cause
+            else:
+                if 'reference_cause' not in rec:
+                    flags, cause = _classify_one(rec, 'reference')
+                    rec['reference_flags'] = flags
+                    rec['reference_cause'] = cause
+                if 'candidate_cause' not in rec:
+                    flags, cause = _classify_one(rec, 'candidate')
+                    rec['candidate_flags'] = flags
+                    rec['candidate_cause'] = cause
+        examples[status if status != 'both_wrong' else 'shared_blind_spots'] = records
+
     examples['fixed'].sort(key=lambda r: (-r['reference']['pred_prob'], r['reference']['gold_rank']))
     examples['broken'].sort(key=lambda r: (-r['candidate']['pred_prob'], r['candidate']['gold_rank']))
     examples['shared_blind_spots'].sort(
         key=lambda r: (-min(r['reference']['pred_prob'], r['candidate']['pred_prob']),
                        r['reference']['gold_rank']))
-    shown = {status: records[: args.max_examples] for status, records in examples.items()}
+    shown = {status: records[:example_limit] for status, records in examples.items()}
     for records in shown.values():
         for rec in records:
             rec['context_text'] = _decode(rec['context'], tokenizer)
@@ -884,7 +941,10 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
             f'discordant counts (fixed/broken) are exact over all {n_tokens} scored tokens; '
             f'the taxonomy covers the first {max_scan} scanned records per bucket '
             f'(fixed={scanned["fixed"]}, broken={scanned["broken"]}, '
-            f'both_wrong={scanned["both_wrong"]}). The AUC block is not run in pair mode.'
+            f'both_wrong={scanned["both_wrong"]}); printed examples are the '
+            f'{example_limit} most confident records per bucket over the whole pass, '
+            'so a late confident blind spot is not hidden by the scan cap. '
+            'The AUC block is not run in pair mode.'
         ),
     }
 
