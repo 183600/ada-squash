@@ -74,6 +74,16 @@ from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metad
 from scripts.ablation import run_one
 
 
+def _lr_key(lr: float) -> str:
+    """Exact, filename-safe identity for a learning rate in the grid.
+
+    ``format(lr, 'g')`` rounds to 6 significant digits: two distinct lrs can
+    share a cache directory / grid key, and the selected rounded value no
+    longer matches the trial records. ``repr`` round-trips the float exactly.
+    """
+    return repr(float(lr))
+
+
 def cached_trial_matches(summary: dict, arm: str, lr: float, args) -> bool:
     """Whether a cached trial ran under the *same protocol* as this invocation.
 
@@ -107,7 +117,7 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path, run_metadata: di
     trial_args = copy.copy(args)
     trial_args.lr = float(lr)
     trial_args.seed = int(seed)
-    run_dir = base / 'trials' / arm / f'lr{lr:g}' / f'seed{seed}'
+    run_dir = base / 'trials' / arm / f'lr{_lr_key(lr)}' / f'seed{seed}'
     if (run_dir / 'summary.json').exists() and (not args.force):
         try:
             cached = json.loads((run_dir / 'summary.json').read_text())
@@ -184,7 +194,8 @@ def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> di
                 t['curve_classification'] for t in cell if t.get('curve_classification')))
             stats['curve_classifications_by_seed'] = {
                 t['seed']: t.get('curve_classification') for t in cell}
-            lr_grid[f'{lr:g}'] = stats
+            stats['lr'] = float(lr)
+            lr_grid[_lr_key(lr)] = stats
     if not lr_grid:
         return {'arm': arm, 'trials': trials, 'lr_grid': {}, 'best': None}
     complete = {k: v for k, v in lr_grid.items() if v['complete_coverage']}
@@ -195,8 +206,8 @@ def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> di
               f"selection seed ({n_selection_seeds} required); they are excluded from lr "
               f"selection rather than winning on a survivor-only mean. Rerun with --force "
               f"or add seeds to fill them in.")
-    best_lr_str = min(pool, key=lambda k: pool[k]['mean'])
-    best = {'lr': float(best_lr_str), **lr_grid[best_lr_str], 'selection_pool': pool_name}
+    best_lr_key = min(pool, key=lambda k: pool[k]['mean'])
+    best = {**pool[best_lr_key], 'selection_pool': pool_name}
     return {'arm': arm, 'trials': trials, 'lr_grid': lr_grid, 'best': best}
 
 
@@ -601,6 +612,11 @@ def main():
     args = p.parse_args()
     if not args.lrs:
         p.error('--lrs must not be empty')
+    if any(not math.isfinite(lr) or lr <= 0.0 for lr in args.lrs):
+        p.error(f'--lrs must be finite and positive, got {args.lrs}')
+    if len(set(args.lrs)) != len(args.lrs):
+        p.error(f'--lrs contains duplicates: {args.lrs}; a repeated lr reruns the identical '
+                f'cells, so it inflates n and fakes replication (std would collapse toward 0)')
     if not args.seeds:
         p.error('--seeds must not be empty')
     if len(set(args.seeds)) != len(args.seeds):
