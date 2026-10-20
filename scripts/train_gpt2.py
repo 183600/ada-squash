@@ -475,6 +475,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             'n_loss_spikes': None, 'n_nonfinite_losses': None,
             'n_nonfinite_gradients': None, 'n_nonfinite_val_losses': None,
             'curve_classification': None, 'test_loss': None,
+            'tokens_per_second': None, 'peak_device_memory_mb': None,
         }
         try:
             manifest = json.loads((run_dir / 'run_manifest.json').read_text())
@@ -492,6 +493,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                 record['n_nonfinite_losses'] = results.get('n_nonfinite_losses')
                 record['n_nonfinite_gradients'] = results.get('n_nonfinite_gradients')
                 record['n_nonfinite_val_losses'] = results.get('n_nonfinite_val_losses')
+                record['tokens_per_second'] = results.get('tokens_per_second')
+                record['peak_device_memory_mb'] = results.get('peak_device_memory_mb')
                 curve = results.get('curve_diagnosis') or {}
                 record['curve_classification'] = curve.get('classification')
         except (OSError, json.JSONDecodeError):
@@ -515,6 +518,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     final_vals, final_stats = _pool('final_val_loss')
     best_vals, best_stats = _pool('best_val_loss')
     test_vals, test_stats = _pool('test_loss')
+    tps_vals, tps_stats = _pool('tokens_per_second')
+    mem_vals, mem_stats = _pool('peak_device_memory_mb')
     missing = [r['seed'] for r in per_seed if not _finite(r['final_val_loss']) and not _finite(r['best_val_loss'])]
     invalid = [r['seed'] for r in per_seed
                if any(isinstance(r[k], float) and not math.isfinite(r[k]) for k in ('final_val_loss', 'best_val_loss'))]
@@ -538,6 +543,12 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'test_loss': None if test_stats is None else test_stats['mean'],
         'test_loss_std': None if test_stats is None or len(test_vals) < 2 else test_stats['std'],
         'test_loss_by_seed': {r['seed']: r['test_loss'] for r in per_seed},
+        # Measured cost of the arm (not an analytic estimate).
+        'tokens_per_second': None if tps_stats is None else tps_stats['mean'],
+        'tokens_per_second_std': None if tps_stats is None or len(tps_vals) < 2 else tps_stats['std'],
+        'peak_device_memory_mb': None if mem_stats is None else mem_stats['mean'],
+        'peak_device_memory_mb_std': None if mem_stats is None or len(mem_vals) < 2 else mem_stats['std'],
+        'cost_basis': 'tokens_per_second / peak_device_memory_mb are measured this run; memory is null on CPU',
         # Numerical-health counters pooled across seeds: an arm whose mean
         # covers triaged NaN gradient/validation events is not a clean
         # replication of an arm with none.
@@ -597,6 +608,12 @@ def launch_multi_seed(args, seeds) -> None:
         std = agg.get(std_key)
         std_str = '' if std is None else f' +/- {std:.4f}'
         print(f'[seeds] {args.norm}: {label}={mean:.4f}{std_str} over {agg["n_seeds"]} seed(s)')
+    if agg.get('tokens_per_second') is not None:
+        tps_std = agg.get('tokens_per_second_std')
+        tps_str = '' if tps_std is None else f' +/- {tps_std:.1f}'
+        print(f'[seeds] {args.norm}: measured cost={agg["tokens_per_second"]:.1f}{tps_str} tok/s'
+              + ('' if agg.get('peak_device_memory_mb') is None
+                 else f', peak={agg["peak_device_memory_mb"]:.1f} MB'))
     if agg['missing_seeds']:
         print(f'[seeds][warn] missing/unfinished seed runs: {agg["missing_seeds"]}; the pooled mean '
               f'covers {agg["n_seeds"]} of {agg["n_seeds_requested"]} requested seeds')
@@ -865,6 +882,7 @@ def main():
     val_checks_without_improvement = 0
     last_val_loss = None
     last_val_step = None
+    last_val_stderr = None
     last_val_batches: list = []
     last_train_loss = None
     start_step = 0
@@ -1031,6 +1049,11 @@ def main():
             wandb.init(project=args.wandb_project, name=args.run_name or args.norm, config=vars(args))
         step = start_step
         t0 = time.time()
+        tokens_processed = 0
+        if device == 'cuda':
+            # Measure this run's own training footprint, not the preflight's.
+            torch.cuda.reset_peak_memory_stats(device)
+        peak_device_memory_mb = None
         stats_windowed = False
         # Curve-monitoring state: `train_window` is the mean training loss over the
         # step interval since the last validation pass; together with the held-out
@@ -1039,6 +1062,7 @@ def main():
         train_window: list = []
         curve_train: list = []
         curve_val: list = []
+        curve_val_stderr: list = []
         curve_steps: list = []
         diagnosis_history: list = []
         last_diagnosis = None
@@ -1138,6 +1162,7 @@ def main():
                 x, y = batch
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
+                tokens_processed += int(x.numel())
                 with ctx:
                     loss = model(x, y, return_logits=False)[1]
                 # Keep the device scalar (no clone): the scaling below is
@@ -1244,6 +1269,16 @@ def main():
                     last_val_loss = val_loss
                     last_val_step = step
                     last_val_batches = val_batch_losses
+                    # The held-out pass is a sample mean over batches, and the
+                    # curve diagnosis must know its resolution: a val move
+                    # smaller than its standard error cannot support an
+                    # overfitting/divergence verdict. A one-batch pass has no
+                    # noise estimate at all, so its stderr stays None rather
+                    # than a falsely confident 0.
+                    val_batch_stats = mean_std_stderr(val_batch_losses)
+                    val_stderr = (val_batch_stats['stderr']
+                                  if val_batch_stats and val_batch_stats['n'] >= 2 else None)
+                    last_val_stderr = val_stderr
                     improved = val_loss < best_val_loss
                     if improved:
                         best_val_loss = val_loss
@@ -1251,9 +1286,12 @@ def main():
                         val_checks_without_improvement = 0
                     else:
                         val_checks_without_improvement += 1
-                    print(f'[val] step={step} val_loss={val_loss:.4f} best={best_val_loss:.4f}@{best_val_step} (no improvement x{val_checks_without_improvement})', flush=True)
+                    noise_str = '' if val_stderr is None else f' +/- {val_stderr:.4f}'
+                    print(f'[val] step={step} val_loss={val_loss:.4f}{noise_str} best={best_val_loss:.4f}@{best_val_step} (no improvement x{val_checks_without_improvement})', flush=True)
                     if tb:
                         tb.add_scalar('val/loss', val_loss, step)
+                        if val_stderr is not None:
+                            tb.add_scalar('val/stderr', val_stderr, step)
                     if improved:
                         ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
                         path = Path(args.output_dir) / 'ckpt_best.pt'
@@ -1267,10 +1305,12 @@ def main():
                     train_window = []
                     curve_train.append(train_point)
                     curve_val.append(val_loss)
+                    curve_val_stderr.append(val_stderr)
                     curve_steps.append(step)
                     last_diagnosis = diagnose_train_val_curve(
                         curve_train, curve_val, train_steps=curve_steps, val_steps=curve_steps,
                         log_vocab_size=math.log(model.cfg.vocab_size),
+                        val_stderr=curve_val_stderr,
                     )
                     diagnosis_history.append({
                         'step': step,
@@ -1280,9 +1320,12 @@ def main():
                         'train_relative_change': last_diagnosis['train_relative_change'],
                         'val_relative_change': last_diagnosis['val_relative_change'],
                         'generalization_gap': last_diagnosis['generalization_gap'],
+                        'val_stderr': val_stderr,
+                        'val_noise_threshold': last_diagnosis['evidence'].get('val_noise_threshold'),
+                        'val_change_within_noise': last_diagnosis['evidence'].get('val_change_within_noise'),
                         'recommendations': last_diagnosis['recommendations'],
                     })
-                    print(f"[curve] step={step} train_window={train_point:.4f} val={val_loss:.4f} "
+                    print(f"[curve] step={step} train_window={train_point:.4f} val={val_loss:.4f}{noise_str} "
                           f"-> {last_diagnosis['classification']} "
                           f"(train {last_diagnosis['train_trend']}, val {last_diagnosis['val_trend']})", flush=True)
                     if last_diagnosis['classification'] not in ('healthy', 'insufficient_data'):
@@ -1291,6 +1334,8 @@ def main():
                     if tb:
                         tb.add_scalar('curve/train_window_loss', train_point, step)
                         tb.add_scalar('curve/generalization_gap', last_diagnosis['generalization_gap'] or 0.0, step)
+                        if val_stderr is not None:
+                            tb.add_scalar('curve/val_stderr', val_stderr, step)
             if step % args.log_every == 0:
                 lr = opt.param_groups[0]['lr']
                 grad_norm = float(grad_norm_t) if grad_norm_t is not None else None
@@ -1303,6 +1348,8 @@ def main():
                     row['grad_norm'] = grad_norm
                 if last_val_loss is not None:
                     row['val_loss'] = last_val_loss
+                    if last_val_stderr is not None:
+                        row['val_stderr'] = last_val_stderr
                 if last_diagnosis is not None:
                     row['curve_classification'] = last_diagnosis['classification']
                     row['curve_train_trend'] = last_diagnosis['train_trend']
@@ -1341,6 +1388,10 @@ def main():
         run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
         final_val_stats = mean_ci(last_val_batches) if last_val_batches else None
+        elapsed_s = time.time() - t0
+        if device == 'cuda':
+            peak_device_memory_mb = float(
+                torch.cuda.max_memory_allocated(device)) / (1024 ** 2)
         run_manifest['results'] = {
             'final_step': step,
             'last_train_loss': last_train_loss,
@@ -1366,11 +1417,18 @@ def main():
             'n_nonfinite_losses': n_nonfinite_losses,
             'n_nonfinite_gradients': n_nonfinite_gradients,
             'n_nonfinite_val_losses': n_nonfinite_val_losses,
-            'elapsed_s': time.time() - t0,
+            'elapsed_s': elapsed_s,
+            # Measured cost travels with the accuracy numbers: a loss delta is
+            # not interpretable without the throughput / memory it bought.
+            'tokens_processed_this_run': tokens_processed,
+            'tokens_consumed_total': int(batches_consumed) * int(args.batch_size) * int(args.seq_len),
+            'tokens_per_second': (tokens_processed / elapsed_s) if elapsed_s > 0 else None,
+            'peak_device_memory_mb': peak_device_memory_mb,
             # Curve monitoring: the full (train window, val) pairs and the latest
             # classification, so a reviewer can read the regime, not just the end.
             'curve_train_window_loss': curve_train,
             'curve_val_loss': curve_val,
+            'curve_val_stderr': curve_val_stderr,
             'curve_steps': curve_steps,
             'curve_diagnosis': last_diagnosis,
             'curve_diagnosis_history': diagnosis_history,
