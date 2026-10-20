@@ -1436,6 +1436,17 @@ def main():
         if device == 'cuda':
             peak_device_memory_mb = float(
                 torch.cuda.max_memory_allocated(device)) / (1024 ** 2)
+        if (last_val_loss is None and resume_ckpt is not None
+                and step == start_step and start_step >= args.max_steps):
+            # A no-op resume from `ckpt_best.pt` (same --max-steps) performs
+            # no update and opens no validation loader, but the checkpoint's
+            # weights are exactly the ones validated at this step. Keep that
+            # known held-out number instead of reporting final_val_loss=None.
+            resumed_val = resume_ckpt.get('val_loss')
+            if isinstance(resumed_val, (int, float)) and math.isfinite(float(resumed_val)):
+                last_val_loss = float(resumed_val)
+                last_val_step = step
+        has_best_val = math.isfinite(best_val_loss)
         run_manifest['results'] = {
             'final_step': step,
             'last_train_loss': last_train_loss,
@@ -1444,10 +1455,16 @@ def main():
             # estimate it is optimistically biased (the minimum of noisy draws).
             # `final_val_loss` is the last held-out pass at the fixed training-step
             # count and is the number that makes two arms comparable.
-            'best_val_loss': best_val_loss if val_loader is not None else None,
-            'best_val_step': best_val_step if val_loader is not None else None,
-            'final_val_loss': last_val_loss if val_loader is not None else None,
-            'final_val_step': last_val_step if val_loader is not None else None,
+            #
+            # A resumed run may not reach another validation point. The best
+            # value restored from the checkpoint is still a real measurement,
+            # so do not erase it merely because this process did not open a
+            # validation loader; future arms are compared on the final pass,
+            # which remains None until an actual pass has been run.
+            'best_val_loss': best_val_loss if has_best_val else None,
+            'best_val_step': best_val_step if has_best_val else None,
+            'final_val_loss': last_val_loss,
+            'final_val_step': last_val_step,
             # The final pass is a sample mean over batches: its standard error and
             # interval are the resolution of the number quoted above. A delta
             # smaller than the stderr is not evidence of a difference.
@@ -1553,7 +1570,7 @@ def main():
                 data_reports['test'] = rtest
                 print(f'[data] test split: {rtest}')
             best_path = Path(args.output_dir) / 'ckpt_best.pt'
-            if val_loader is not None and best_path.exists():
+            if best_path.exists():
                 best = _load_checkpoint_cpu(best_path)
                 load_model_state_dict(model, best['model'])
                 best_step = int(best.get('step', 0))
@@ -1628,7 +1645,7 @@ def main():
                 'num_workers': (rtest or {}).get('num_workers', getattr(args, 'num_workers', None)),
                 'batch_size': args.batch_size, 'seq_len': args.seq_len,
             }
-            results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if val_loader is not None else None, 'best_val_loss': best_val_loss if val_loader is not None else None, 'final_val_loss': last_val_loss if val_loader is not None else None, 'final_val_step': last_val_step if val_loader is not None else None, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file, 'exclude_test_hash_file': args.exclude_test_hash_file, 'group_key': args.group_key, 'exclude_group_file': args.exclude_group_file, 'exclude_test_group_file': args.exclude_test_group_file}
+            results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if has_best_val else None, 'best_val_loss': best_val_loss if has_best_val else None, 'final_val_loss': last_val_loss, 'final_val_step': last_val_step, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file, 'exclude_test_hash_file': args.exclude_test_hash_file, 'group_key': args.group_key, 'exclude_group_file': args.exclude_group_file, 'exclude_test_group_file': args.exclude_test_group_file}
             with open(out_path, 'w') as f:
                 json.dump(results, f, indent=2)
             run_manifest.setdefault('artifacts', {})['test_results'] = file_fingerprint(out_path)
@@ -1646,7 +1663,7 @@ def main():
                   f'(n={len(test_batch_losses)} batches, stderr={test_stats["stderr"]:.4f}, {ci}) -> {out_path}')
         if args.error_analysis:
             best_path = Path(args.output_dir) / 'ckpt_best.pt'
-            analysis_ckpt = (best_path if val_loader is not None and best_path.exists()
+            analysis_ckpt = (best_path if best_path.exists()
                              else Path(args.output_dir) / 'ckpt_final.pt')
             error_analysis = run_error_analysis(args, analysis_ckpt, Path(args.output_dir))
             run_manifest['results']['error_analysis'] = error_analysis
