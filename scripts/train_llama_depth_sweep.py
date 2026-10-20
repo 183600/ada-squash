@@ -170,6 +170,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         nonfinite = None
         nonfinite_grad = None
         nonfinite_val = None
+        tokens_per_second = None
+        peak_device_memory_mb = None
         n_layers = None
         dim = None
         n_heads = None
@@ -225,6 +227,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
             nonfinite = results.get('n_nonfinite_losses')
             nonfinite_grad = results.get('n_nonfinite_gradients')
             nonfinite_val = results.get('n_nonfinite_val_losses')
+            tokens_per_second = results.get('tokens_per_second')
+            peak_device_memory_mb = results.get('peak_device_memory_mb')
         per_seed.append({
             'seed': int(seed), 'best_val_loss': best, 'final_val_loss': final,
             'curve_classification': (curve or {}).get('classification'),
@@ -236,6 +240,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
             'norm_share_of_params': (breakdown or {}).get('norm_share_of_total'),
             'flops_per_token_forward': flops_fwd,
             'flops_per_token_training_est': flops_train,
+            'tokens_per_second': tokens_per_second,
+            'peak_device_memory_mb': peak_device_memory_mb,
             'n_loss_spikes': spikes,
             'n_nonfinite_losses': nonfinite,
             'n_nonfinite_gradients': nonfinite_grad,
@@ -268,6 +274,12 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                  if _finite(p.get('flops_per_token_forward'))]
     flops_train = [p['flops_per_token_training_est'] for p in per_seed
                    if _finite(p.get('flops_per_token_training_est'))]
+    throughput_vals = [p['tokens_per_second'] for p in per_seed
+                       if _finite(p.get('tokens_per_second'))]
+    throughput_stats = mean_std_stderr(throughput_vals)
+    peak_mem_vals = [p['peak_device_memory_mb'] for p in per_seed
+                     if _finite(p.get('peak_device_memory_mb'))]
+    peak_mem_stats = mean_std_stderr(peak_mem_vals)
     # A run that crashed, diverged or never finished leaves no readable
     # manifest. Pooling only the survivors would silently turn "this norm
     # destabilized 2 of 3 seeds" into a clean mean over the lucky seed, so the
@@ -323,6 +335,17 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         'norm_share_of_params': (sum(norm_shares) / len(norm_shares)) if norm_shares else None,
         'flops_per_token_forward': (sum(flops_fwd) / len(flops_fwd)) if flops_fwd else None,
         'flops_per_token_training_est': (sum(flops_train) / len(flops_train)) if flops_train else None,
+        # Measured cost from the child manifests. Unlike the analytic FLOPs,
+        # throughput and peak memory include the actual kernels and allocator,
+        # so a depth/norm delta is read next to what it cost on this device.
+        'tokens_per_second': None if throughput_stats is None else throughput_stats['mean'],
+        'tokens_per_second_std': (throughput_stats['std']
+                                  if throughput_stats and len(throughput_vals) >= 2 else None),
+        'peak_device_memory_mb': None if peak_mem_stats is None else peak_mem_stats['mean'],
+        'peak_device_memory_mb_std': (peak_mem_stats['std']
+                                      if peak_mem_stats and len(peak_mem_vals) >= 2 else None),
+        'cost_basis': ('tokens_per_second / peak_device_memory_mb are measured by the '
+                       'child run; memory is null on CPU and throughput is device-dependent'),
         'n_loss_spikes': sum(p['n_loss_spikes'] or 0 for p in per_seed
                              if isinstance(p.get('n_loss_spikes'), (int, float))),
         'n_nonfinite_losses': sum(p['n_nonfinite_losses'] or 0 for p in per_seed
@@ -336,8 +359,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                         'final_val_loss = last validation pass (fixed-step estimate, comparable across cells when early stopping is off). '
                         'curve_classification_counts = per-seed final train/val regime: a cell whose mean was produced '
                         'while some seed was underfit/stalled or overfitting/diverging must not be read as a clean '
-                        'depth/norm effect. n_params/flops_per_token_* = efficiency accounting (identical across the '
-                        'cell seeds by construction) so the accuracy delta can be weighed against its cost. '
+                        'depth/norm effect. n_params/flops_per_token_* are analytic accounting (identical across the '
+                        'cell seeds by construction); tokens_per_second/peak_device_memory_mb are measured by the '
+                        'child runs, so the accuracy delta can be weighed against its actual cost. '
                         'n_layers/dim/n_heads = shape covariates: under the equal-parameter scaling a deeper cell '
                         'is narrower (dim and n_heads change with depth), so a cross-depth delta confounds depth '
                         'with width/head count and must not be read as a pure depth effect; a cross-norm delta at '
@@ -949,6 +973,14 @@ def main():
                 eff += f" flops/token fwd={fwd / 1e6:.2f}M"
             if train is not None:
                 eff += f" train_est={train / 1e6:.2f}M"
+            tps = agg.get('tokens_per_second')
+            if tps is not None:
+                tps_std = agg.get('tokens_per_second_std')
+                tps_str = '' if tps_std is None else f" +/- {tps_std:.1f}"
+                eff += f" measured={tps:.1f}{tps_str} tok/s"
+            peak = agg.get('peak_device_memory_mb')
+            if peak is not None:
+                eff += f" peak={peak:.1f}MB"
             print(eff)
         bad_events = {label: agg.get(key) or 0 for label, key in (
             ('loss step(s)', 'n_nonfinite_losses'),
