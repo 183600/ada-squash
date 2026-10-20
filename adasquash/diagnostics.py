@@ -632,6 +632,8 @@ def classify_nan_stage(evidence: dict) -> dict:
             ],
         )
     if (evidence.get("fp32_forward_finite") is False
+            or evidence.get("fp32_logits_finite") is False
+            or evidence.get("first_nonfinite_modules")
             or evidence.get("loss_denominator_positive") is False
             or evidence.get("forward_error")):
         first = evidence.get("first_nonfinite_modules") or []
@@ -772,6 +774,8 @@ def triage_nonfinite(
     # recorded as skipped instead.
     stage2_bad = (
         evidence.get("fp32_forward_finite") is False
+        or evidence.get("fp32_logits_finite") is False
+        or evidence.get("first_nonfinite_modules")
         or evidence.get("loss_denominator_positive") is False
         or "forward_error" in evidence
     )
