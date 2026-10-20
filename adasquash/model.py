@@ -599,7 +599,14 @@ class GPT(nn.Module):
     @torch.no_grad()
     def reset_parameters(self, seed: Optional[int]=None):
         if seed is not None:
+            # Parameters are usually allocated on the accelerator (callers build
+            # inside `torch.device('cuda')`), so `nn.init.normal_` draws from the
+            # CUDA generator. Seed it too: otherwise the same reset seed gives
+            # different weights depending on how much CUDA RNG the constructor
+            # (e.g. norm alpha jitter) consumed before this call.
             torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
         self.apply(self._init_weights)
         return self
 
