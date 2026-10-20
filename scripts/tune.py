@@ -21,16 +21,17 @@ This driver therefore:
 * runs each trial through `ablation.run_one`, so the tuning protocol and the
   ablation protocol cannot silently drift apart;
 * compares each variant's best trial against the best tuned baseline with a
-  one-sided paired Student-t test over the shared seeds (>= 2 shared seeds
+  one-sided paired Student-t test over the shared seeds (>= 3 shared seeds
   required to certify a win). The t reference distribution is the right
   small-sample choice: over the default three seeds a two-sided 95% critical
   value is 4.30, not the normal 1.96. Each delta is also reported with a
   two-sided 95% confidence interval. A point-estimate win below `--margin`
-  is reported but flagged as not significant, and with only one shared seed
-  the same run's batches are tested for description only (batch noise is not
-  run-to-run noise): such an arm is never certified and stays out of the Holm
-  family. Because every variant arm is tested against the *same* baseline,
-  the seed-replicated p-values are a family and are Holm-Bonferroni adjusted
+  is reported but flagged as not significant; two shared seeds are tested for
+  description only (df = 1), and with only one shared seed the same run's
+  batches are tested for description only (batch noise is not run-to-run
+  noise). Such arms are never certified and stay out of the Holm family.
+  Because every variant arm is tested against the *same* baseline, the
+  seed-replicated p-values are a family and are Holm-Bonferroni adjusted
   before an arm is called significantly better.
   The default selection set is three seeds: with fewer, the lr-grid means
   are too noisy for a small delta to mean anything. An lr cell whose diverged
@@ -67,7 +68,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
+from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.ablation import run_one
 
@@ -236,11 +237,12 @@ def _split_basis(r: dict, use_confirm: bool):
 def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bool = True) -> dict | None:
     """Best variant trials vs the best tuned baseline, paired where possible.
 
-    Only the paired test on >= 2 shared seeds certifies an arm as better:
-    with exactly one shared seed the same run's held-out batches are tested
-    for description only (batch noise is not run-to-run noise), and with no
-    shared seed no test runs at all. Only the seed-replicated rows enter the
-    Holm family. `certify=False` (no held-back confirm seeds were provided)
+    Only the paired test on >= 3 shared seeds certifies an arm as better:
+    with two shared seeds the paired test is descriptive only (df = 1), with
+    exactly one shared seed the same run's held-out batches are tested for
+    description only (batch noise is not run-to-run noise), and with no shared
+    seed no test runs at all. Only the seed-replicated rows enter the Holm
+    family. `certify=False` (no held-back confirm seeds were provided)
     keeps the p-values for description but withholds every significance call:
     a lr selected on `--seeds` and then tested on those same runs is the
     winner's curse.
@@ -344,7 +346,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         if len(common) >= 2:
             test = paired_t_one_sided(arm_vals, ref_vals, margin=margin)
             entry['test_basis'] = 'seed_means'
-            entry['replicated_across_seeds'] = True
+            entry['replicated_across_seeds'] = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
         elif len(common) == 1:
             # One shared seed: test that run's held-out batches for
             # *description only*. Batch-level noise is not run-to-run noise,
@@ -377,6 +379,11 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             entry['df'] = test['df']
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
+        if (entry['test'] is not None and not entry['replicated_across_seeds']
+                and entry['significance_basis'] is None):
+            entry['significance_basis'] = (
+                f'descriptive only: {len(common)} shared seed(s), fewer than the required '
+                f'{MIN_SEEDS_FOR_SIGNIFICANCE}; the p-value is reported but the arm is not certified')
         out['rows'].append(entry)
     # Every seed-replicated arm is tested against the same reference, so those
     # raw p-values are a family of tests; without the Holm step-down the chance
@@ -474,8 +481,9 @@ def print_comparison(comparison: dict | None) -> None:
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}{note}")
     if comparison.get('rows_tested_descriptively_only'):
-        print(f"[tune][compare] NOTE: single-run batch-level tests (fewer than 2 shared seeds) "
-              f"are described but never certified: {comparison['rows_tested_descriptively_only']}")
+        print(f"[tune][compare] NOTE: tests with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared "
+              f"seeds are described but never certified: "
+              f"{comparison['rows_tested_descriptively_only']}")
     if comparison.get('confirm_ignored_arms'):
         print(f"[tune][compare] confirm runs ignored (incomplete confirm coverage for "
               f"{comparison['confirm_ignored_arms']}, missing seeds "

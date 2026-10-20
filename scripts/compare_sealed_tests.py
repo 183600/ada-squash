@@ -15,10 +15,11 @@ This tool performs that comparison honestly:
   silently substituting a weaker unpaired test.
 * **training seeds are the unit of replication.** The certification test is
   the one-sided paired Student-t on the per-seed sealed losses of the arms'
-  *shared* training seeds (>= 2 required), and all raw p-values enter one
-  `holm_adjust` family. A single training run per arm - or a comparison in
-  which only one seed is shared - carries no run-to-run variance: the
-  per-batch paired test is reported for description only and can never set
+  *shared* training seeds (>= 3 required), and the complete seed-paired rows
+  enter one `holm_adjust` family. Two shared seeds are tested for description
+  only (df = 1). A single training run per arm - or a comparison in which only
+  one seed is shared - carries no run-to-run variance: the per-batch paired
+  test is reported for description only and can never set
   `beats_reference_significantly`, because batch noise is not run-to-run
   noise (the same rule `scripts/ablation.py` and
   `scripts/train_llama_depth_sweep.py` enforce on validation losses).
@@ -37,7 +38,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import holm_adjust, mean_ci, mean_std_stderr, paired_t_one_sided, student_t_ppf
+from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_ci, mean_std_stderr, paired_t_one_sided, student_t_ppf
 from adasquash.repro import collect_run_metadata, finish_metadata, save_run_manifest
 
 PAIRING_KEYS = (
@@ -54,8 +55,8 @@ _SEED_DIR_RE = re.compile(r"seed(\d+)$")
 
 # A comparison is certifiable only when at least this many training seeds are
 # shared by both arms: with one seed the test would measure the noise of a
-# single run, not the run-to-run variance a significance claim is about.
-MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE = 2
+# single run, and with two seeds df = 1 is too weak for a decision rule.
+MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE = MIN_SEEDS_FOR_SIGNIFICANCE
 
 
 def load_result(path) -> dict:
@@ -232,9 +233,10 @@ def main():
     ref_seed_means = _seed_means(ref_arm)
     print(f"[compare] reference {_describe_arm(str(reference_path), ref_arm)}")
     if ref_arm["n_runs"] < MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE:
-        print("[compare] reference arm has a single training run: any test below is descriptive "
-              "(batch noise is not run-to-run noise) and can never certify a significance claim. "
-              "Provide seed-replicated runs (>= 2, recommend 3-5) to certify.")
+        print(f"[compare] reference arm has fewer than {MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE} "
+              "training runs: any test below is descriptive (batch noise is not run-to-run "
+              "noise) and can never certify a significance claim. Provide seed-replicated "
+              f"runs (>= {MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE}, recommend 3-5) to certify.")
     if ref_arm["unseeded_runs"]:
         print(f"[compare] reference runs without a recorded training seed: {ref_arm['unseeded_runs']} "
               "(they can only enter batch-level description)")
@@ -282,15 +284,18 @@ def main():
             "p_one_sided_holm": None,
             "beats_reference": False,
             "beats_reference_significantly": False,
+            "certifiable": False,
+            "significance_basis": None,
             "basis": None,
             "min_detectable_delta": None,
         }
         test = None
-        if len(common) >= MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE:
+        if len(common) >= 2:
             a = [cand_seed_means[s] for s in common]
             b = [ref_seed_means[s] for s in common]
             test = paired_t_one_sided(a, b, margin=args.margin, alpha=args.alpha)
             row["basis"] = "seed_means"
+            row["certifiable"] = len(common) >= MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE
             # Headline mean/std over the seeds used by the paired test.
             paired_stats = mean_std_stderr(a)
             row["mean"] = paired_stats["mean"]
@@ -336,12 +341,22 @@ def main():
             row["df"] = test["df"]
             row["p_one_sided"] = test["p_one_sided"]
             row["beats_reference"] = bool(test["mean_delta"] < -args.margin)
+        if row.get("basis") == "seed_means" and not row.get("certifiable"):
+            row["significance_basis"] = (
+                f"descriptive only: {len(common)} shared training seed(s), fewer than the "
+                f"required {MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE}; the delta is reported but "
+                "not certified")
+        elif row.get("basis") and row.get("basis") != "seed_means":
+            row["significance_basis"] = (
+                "descriptive only: batch-level test on a single training run; batch noise "
+                "is not run-to-run noise")
         rows.append(row)
 
-    # Only >= 2-seed paired tests are admissible to the Holm family; a
-    # batch-level description is not a test of the run-to-run claim and must
-    # not influence the family-wise correction of the tests that are.
-    certifiable = [r for r in rows if r.get("basis") == "seed_means"]
+    # Only complete >= 3-seed paired tests are admissible to the Holm family;
+    # a 2-seed or batch-level description is not a test of the run-to-run
+    # claim and must not influence the family-wise correction.
+    certifiable = [r for r in rows
+                   if r.get("basis") == "seed_means" and r.get("certifiable")]
     adjusted = holm_adjust([r["p_one_sided"] for r in certifiable])
     for row, p_holm in zip(certifiable, adjusted):
         row["p_one_sided_holm"] = p_holm
@@ -363,8 +378,15 @@ def main():
                   f"(basis={base}, {r['n_runs_candidate']} vs {r['n_runs_reference']} runs)")
             continue
         if base == "seed_means":
-            verdict = ("significantly better" if r["beats_reference_significantly"]
-                       else ("better but not significant" if r["beats_reference"] else "not better"))
+            if r["beats_reference_significantly"]:
+                verdict = "significantly better"
+            elif r["beats_reference"] and not r.get("certifiable", False):
+                verdict = (f"better but descriptive only (only {r['n_paired_seeds']} shared "
+                           "training seeds)")
+            elif r["beats_reference"]:
+                verdict = "better but not significant"
+            else:
+                verdict = "not better"
             print(f"[compare] {r['candidate']}: mean={r['mean']:.4f} +/- {r['std']:.4f} "
                   f"(seed std, n_seeds={r['n_paired_seeds']}) "
                   f"delta={r['mean_delta']:+.4f} ({ci_label} [{r['delta_ci_low']:+.4f}, {r['delta_ci_high']:+.4f}]) "
@@ -402,13 +424,15 @@ def main():
             "min_paired_seeds_for_significance": MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE,
             "certification_basis": (
                 "only the one-sided paired Student-t on per-seed sealed losses over the arms' "
-                "shared training seeds (>= 2) can set beats_reference_significantly; single-run "
-                "batch-level tests are reported as description and never certified"),
+                f"shared training seeds (>= {MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE}) can set "
+                "beats_reference_significantly; two-seed and single-run batch-level tests are "
+                "reported as description and never certified"),
             "limitations": (
                 "batch-level intervals describe the measurement noise on the shared sealed "
                 "segments of one training run; they do not cover initialization / data-order "
-                "/ batch-sampling variance. Run each arm with >= 2 (recommend 3-5) seeds and "
-                "compare same-seed runs to make the delta a run-to-run statement."),
+                f"/ batch-sampling variance. Run each arm with >= {MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE} "
+                "(recommend 3-5) seeds and compare same-seed runs to make the delta a "
+                "run-to-run statement."),
             "rows": rows,
         }
         manifest = {**collect_run_metadata(), "comparison": payload}

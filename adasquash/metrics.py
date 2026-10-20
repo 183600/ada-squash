@@ -53,6 +53,7 @@ __all__ = [
     "holm_adjust",
     "imbalance_report",
     "macro_weighted_f1",
+    "MIN_SEEDS_FOR_SIGNIFICANCE",
     "mcnemar_test",
     "mean_ci",
     "mean_std_stderr",
@@ -67,6 +68,7 @@ __all__ = [
 ]
 
 _Z_95 = 1.959963984540054
+MIN_SEEDS_FOR_SIGNIFICANCE = 3
 # Negatives-per-positive ratio above which the FPR denominator makes ROC-AUC
 # optimistic and PR-AUC (average precision) is the appropriate summary.
 _EXTREME_IMBALANCE = 1000.0

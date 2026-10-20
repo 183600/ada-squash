@@ -722,7 +722,11 @@ def main():
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
         print(f'[seeds][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
-              f'(a repeated seed is the same run, not an independent replication)')
+              '(a repeated seed is the same run, not an independent replication)')
+    if len(seeds) < 3:
+        print(f'[seeds][warn] {len(seeds)} seed(s): fewer than 3 independent runs cannot '
+              'separate a norm effect from run-to-run noise; treat the result as provisional',
+              file=sys.stderr)
     if len(seeds) > 1:
         if args.resume:
             raise SystemExit(

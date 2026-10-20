@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
-from adasquash.metrics import mcnemar_test, mean_ci, paired_t_one_sided, wilson_interval
+from adasquash.metrics import holm_adjust, mcnemar_test, mean_ci, paired_t_one_sided, wilson_interval
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from scripts.eval_downstream import load_ckpt, needle_decode_overhead, needle_in_haystack
 
@@ -20,8 +20,13 @@ from scripts.eval_downstream import load_ckpt, needle_decode_overhead, needle_in
 # with the same seeds see the *same* placements, so `--compare-to` pairs them:
 # trial-level exact McNemar on the pooled discordant trials plus a paired t on
 # the per-seed accuracies, instead of eyeballing two accuracies whose intervals
-# overlap.
-DEFAULT_SEED = 0
+# overlap. A comparison certified at the placement level also needs >= 3
+# shared placement seeds (2 seeds have df=1, where the t interval is too wide
+# to be a useful decision rule), and the per-context p-values are Holm-adjusted
+# before any context is called a win: scanning 4 context lengths at alpha=0.05
+# without correction gives a ~19% chance of at least one false positive.
+DEFAULT_SEEDS = (0, 1, 2)
+MIN_SHARED_PLACEMENT_SEEDS = 3
 
 def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
     """The tokenizer identity the checkpoint was trained with, else the CLI default."""
@@ -176,7 +181,44 @@ def compare_needle(results, reference_results, alpha=0.05):
             t.update(paired_t_one_sided(ref_accs, cand_accs, alpha=alpha))
             t['direction'] = 'negative mean_delta means the candidate (--ckpt) is better than --compare-to'
         tests.append(t)
+    paired_holm = holm_adjust([t.get('p_one_sided') for t in tests])
+    mcnemar_holm = holm_adjust([t.get('mcnemar', {}).get('p_one_sided') for t in tests])
+    for t, p_holm, m_holm in zip(tests, paired_holm, mcnemar_holm):
+        n_shared = len(t.get('paired_seeds') or [])
+        t['n_shared_placement_seeds'] = n_shared
+        t['p_one_sided_holm'] = p_holm
+        t['certifiable'] = bool(t.get('testable') and n_shared >= MIN_SHARED_PLACEMENT_SEEDS)
+        delta = t.get('mean_delta')
+        t['candidate_better'] = bool(delta is not None and delta < 0.0)
+        t['significant_holm'] = bool(
+            t['certifiable'] and t['candidate_better']
+            and p_holm is not None and p_holm < alpha
+        )
+        if not t['certifiable']:
+            t['significance_basis'] = (
+                f'descriptive only: {n_shared} shared placement seed(s); certification '
+                f'requires >= {MIN_SHARED_PLACEMENT_SEEDS} and a paired test')
+        else:
+            t['significance_basis'] = (
+                f'placement-level paired test on {n_shared} shared placement seeds; '
+                'training-run variance is not covered by this comparison')
+        m = t.get('mcnemar')
+        if isinstance(m, dict):
+            m['p_one_sided_holm'] = m_holm
+            m['candidate_better'] = m.get('n_fixed', 0) > m.get('n_broke', 0)
+            m['significant_holm'] = bool(
+                t['certifiable'] and m['candidate_better']
+                and m_holm is not None and m_holm < alpha
+            )
     return {'alpha': alpha,
+            'unit_of_replication': 'placement draw within each fixed training checkpoint',
+            'min_shared_placement_seeds': MIN_SHARED_PLACEMENT_SEEDS,
+            'multiple_comparison': ('Holm-Bonferroni over the evaluated context lengths, '
+                                    'applied separately to the paired-t and exact-McNemar families'),
+            'certification': ('a context is certified only when the two checkpoints share '
+                              f'>= {MIN_SHARED_PLACEMENT_SEEDS} placement seeds and the '
+                              'Holm-adjusted one-sided p < alpha; fewer seeds are reported '
+                              'as descriptive only, and no training-run variance is inferred'),
             'pairing': ('arms share placement seeds, so trial outcomes are paired within a seed; '
                         'McNemar is exact on the pooled discordant trials, and the paired t weights '
                         'each placement draw equally'),
@@ -193,11 +235,11 @@ def main():
     p.add_argument('--secret', default='The magic number is 98765.')
     p.add_argument('--output', default=None)
     p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; when given it overrides --seeds (one placement draw - the Wilson interval then says nothing about placement variability)')
-    p.add_argument('--seeds', nargs='+', type=int, default=None, help='placement seeds; the whole evaluation is repeated once per seed and reported as cross-seed Mean +/- Std with a t interval over the seed means (default: a single placement draw)')
+    p.add_argument('--seeds', nargs='+', type=int, default=None, help='placement seeds; the whole evaluation is repeated once per seed and reported as cross-seed Mean +/- Std with a t interval over the seed means (default: 0 1 2, the minimum for a placement-level comparison)')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests (e.g. "DyT-CD retains needle accuracy at 4k tokens"); recorded in the manifest so a pass/fail is auditable as a test rather than a fishing trip')
     p.add_argument('--max-failure-examples', type=int, default=3, help='bad-case samples to print per context length (all failures are kept in the JSON)')
     args = p.parse_args()
-    seeds = [args.seed] if args.seed is not None else (list(args.seeds) if args.seeds else [DEFAULT_SEED])
+    seeds = [args.seed] if args.seed is not None else (list(args.seeds) if args.seeds else list(DEFAULT_SEEDS))
     if not seeds:
         p.error('--seeds must not be empty')
     raw_seeds = seeds
@@ -256,15 +298,24 @@ def main():
             verdict = m['favors']
             if m['p_one_sided'] is None:
                 verdict = 'no discordant trials - no evidence either way'
+            mcnemar_p = m['p_one_sided'] if m['p_one_sided'] is None else round(m['p_one_sided'], 4)
+            mcnemar_holm = m.get('p_one_sided_holm')
+            mcnemar_holm = 'n/a' if mcnemar_holm is None else f'{mcnemar_holm:.4f}'
             head = (f"[needle][compare] L={t['ctx_len']}: candidate {t['candidate_acc']:.3f} vs reference "
                     f"{t['reference_acc']:.3f}; McNemar fixed={m['n_fixed']} broke={m['n_broke']} "
-                    f"p={m['p_one_sided'] if m['p_one_sided'] is None else round(m['p_one_sided'], 4)} "
+                    f"p={mcnemar_p} p_holm={mcnemar_holm} "
                     f"(favors {verdict}); paired t delta={t['mean_delta']:+.4f}")
             if t['p_one_sided'] is None:
-                print(f"{head} (n_seeds={t['n']}: one paired seed, no t interval)")
+                print(f"{head} (n_seeds={t['n_shared_placement_seeds']}: no paired t interval; "
+                      f"{t['significance_basis']})")
             else:
+                verdict_t = 'CERTIFIED candidate better' if t['significant_holm'] else 'not certified'
                 print(f"{head} 95% CI [{t['ci_low']:+.4f}, {t['ci_high']:+.4f}] "
-                      f"p={t['p_one_sided']:.4f} (n_seeds={t['n']})")
+                      f"p={t['p_one_sided']:.4f} p_holm={t['p_one_sided_holm']:.4f} "
+                      f"(n_seeds={t['n_shared_placement_seeds']}, {verdict_t}; "
+                      f"{t['significance_basis']})")
+        print(f"[needle][compare] {comparison['multiple_comparison']}; "
+              f"{comparison['certification']}")
     out = args.output or Path(args.ckpt).parent / 'needle_results.json'
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     # Skipped context lengths are part of the result, not a console aside: a
@@ -286,7 +337,8 @@ def main():
         'ci_note': ('ci95_low/high are the cross-seed t interval when >= 2 placement seeds are run '
                     '(ci_basis="t_across_seed_means"); with one seed they are the Wilson interval '
                     '(ci_basis="wilson_within_single_placement_draw"), which covers trial noise within '
-                    'that one placement draw only'),
+                    'that one placement draw only. A --compare-to win additionally requires >= 3 '
+                    'shared placement seeds and a Holm-adjusted one-sided p < alpha'),
     }
     if comparison is not None:
         payload['compare_to'] = args.compare_to

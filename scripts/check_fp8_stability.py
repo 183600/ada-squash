@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided
+from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.model import MLP, build_gpt_124m
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import KurtosisMeter, markov_batch
@@ -22,9 +22,10 @@ DEFAULT_SEEDS = (42, 43, 44)
 # Cross-norm certification needs both dimensions to be replicated:
 # * the training run (initialization / data order) is the run-to-run unit. A
 #   `--ckpt` entry may be a comma-separated list of checkpoint paths (training
-#   seeds) for one norm; when two norms share >= 2 *training* seeds the
+#   seeds) for one norm; when two norms share >= 3 *training* seeds the
 #   comparison pairs their per-training-seed probe means and certifies
-#   significance on that basis.
+#   significance on that basis. Two shared training seeds are descriptive
+#   only (df = 1).
 # * a single trained checkpoint per norm (the common case) leaves only probe
 #   noise in the denominator: `compare_fp8_norms(trained=True)` then reports
 #   the probe-paired tests as descriptive and never calls them significant,
@@ -354,8 +355,9 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
 
     * `trained=True` (checkpoints were probed): the run-to-run unit is the
       *training* seed, and a test is certifiable (`basis='train_seed_means'`)
-      only when both norms provide >= 2 checkpoints with shared training
-      seeds, i.e. when the Delta is observed across independent training runs.
+      only when both norms provide >= 3 checkpoints with shared training
+      seeds, i.e. when the Delta is observed across independent training runs;
+      two shared seeds are described but not certified (df = 1).
       With a single trained checkpoint per norm the paired test degenerates to
       probe-noise pairing on one model each: it is still computed, but labeled
       `basis='probe_paired_single_train_run'`, `certifiable=False`, and
@@ -380,7 +382,7 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                      'a_train_seeds': sorted(a_train), 'b_train_seeds': sorted(b_train)}
                 if len(shared_train) >= 2:
                     t['basis'] = 'train_seed_means'
-                    t['certifiable'] = True
+                    t['certifiable'] = len(shared_train) >= MIN_SEEDS_FOR_SIGNIFICANCE
                     t['n_shared_train_seeds'] = len(shared_train)
                     t['shared_train_seeds'] = shared_train
                     t['n_shared_seeds'] = len(shared)
@@ -407,9 +409,9 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                         # apply to this pair.
                         t['reason'] = '; '.join(filter(None, (
                             t.get('reason'),
-                            f'only {len(shared_train)} shared training seed(s): a single run per '
-                            'arm cannot separate the norm from run-to-run noise, so the probe-paired '
-                            'test is descriptive only; provide >= 2 checkpoints (comma-separated in '
+                            f'only {len(shared_train)} shared training seed(s): fewer than the '
+                            'required 3 cannot certify the norm against run-to-run noise, so the '
+                            'test is descriptive only; provide >= 3 checkpoints (comma-separated in '
                             '--ckpt) with distinct training seeds per norm to certify')))
                 tests.append(t)
     for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
@@ -434,14 +436,14 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
         ranking[metric] = rows
     return {'metrics': list(metrics), 'alpha': alpha, 'trained': trained,
             'pairing': ('probe draws are paired across norms by probe seed and (when available) by training seed; '
-                        'certification requires >= 2 shared training seeds per arm and otherwise stays descriptive'),
+                        'certification requires >= 3 shared training seeds per arm and otherwise stays descriptive'),
             'ranking': ranking, 'tests': tests}
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--norms', nargs='+', default=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
     p.add_argument('--probe', default='markov', choices=['markov', 'random'], help="probe corpus. 'random' is uniform token ids: it has no next-token structure, so the activation magnitudes below describe embedding noise rather than a trained model's activations (kept only for parity)")
-    p.add_argument('--ckpt', nargs='+', default=None, help='one entry per --norms entry; a plain checkpoint path probes the trained weights instead of a fresh random init. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-norm certification then pairs training seeds, so >= 2 shared training seeds across the compared norms are required for comparison.json to certify a winner')
+    p.add_argument('--ckpt', nargs='+', default=None, help='one entry per --norms entry; a plain checkpoint path probes the trained weights instead of a fresh random init. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-norm certification then pairs training seeds, so >= 3 shared training seeds across the compared norms are required for comparison.json to certify a winner')
     p.add_argument('--n-states', type=int, default=64, help="state count of the synthetic 'markov' probe")
     p.add_argument('--batch-size', type=int, default=2)
     p.add_argument('--seq-len', type=int, default=512)
@@ -542,9 +544,9 @@ def main():
         if ckpt_groups:
             r['ckpt'] = list(ckpt_groups[i])
             r['ckpts'] = list(ckpt_groups[i])
-            if ckpt_groups[i] != [None] and len(train_seeds) < 2:
+            if ckpt_groups[i] != [None] and len(train_seeds) < MIN_SEEDS_FOR_SIGNIFICANCE:
                 print(f'[fp8][warn] {norm}: {len(ckpt_groups[i])} checkpoint(s) but {len(train_seeds)} distinct '
-                      'training seed(s); cross-norm certification needs >= 2 independent training runs per arm '
+                      'training seed(s); cross-norm certification needs >= 3 independent training runs per arm '
                       '(pass comma-separated checkpoints with distinct training seeds)', file=sys.stderr)
         print(f'[fp8] {norm}: {r}')
         results.append(r)
@@ -560,7 +562,8 @@ def main():
             continue
         verdict = 'A more stable' if t['significant'] and t['mean_delta'] < 0 else ('B more stable' if t['significant'] else 'inside the noise')
         if not t.get('certifiable'):
-            verdict = 'descriptive only (single training run per arm)'
+            verdict = (f'descriptive only ({t.get("n_shared_train_seeds", 0)} shared '
+                       'training seed(s); >= 3 required)')
         print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4g}, 95% CI [{t['ci_low']:+.4g}, {t['ci_high']:+.4g}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}, basis={t['basis']}) -> {verdict}")
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)

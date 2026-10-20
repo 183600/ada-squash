@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided
+from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.repro import artifact_record, collect_run_metadata, finish_metadata, save_run_manifest
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
@@ -289,9 +289,9 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
     the normal one, is the small-sample-correct reference at the default 3
     seeds (df = 2), and each row also reports a two-sided 95% confidence
     interval for the delta. The assumption-free per-seed sign counts
-    (`n_seeds_favoring`, `n_seeds_tied`) are reported alongside. Holm-Bonferroni
-    adjusts the whole family of sweep comparisons before any row is called
-    significant.
+    (`n_seeds_favoring`, `n_seeds_tied`) are reported alongside. Only complete
+    cells with >= 3 shared seeds enter the Holm-Bonferroni family and can be
+    certified; two shared seeds (df = 1) are descriptive only.
     """
     rows = []
     for depth in sorted(cells_by_depth):
@@ -318,6 +318,8 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 'p_one_sided': None,
                 'p_one_sided_holm': None,
                 'beats_reference_significantly': False,
+                'certifiable': False,
+                'significance_basis': None,
                 't': None,
                 'df': None,
                 'delta_ci_95': None,
@@ -379,14 +381,25 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 entry['n_seeds_tied'] = sum(1 for x, y in zip(a, b) if x == y)
             elif common:
                 entry['mean_delta'] = cand_seeds[common[0]] - ref_seeds[common[0]]
+            entry['certifiable'] = bool(
+                entry['complete'] and len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
+                and entry['cost_matched_within_25pct'] is not False)
+            if entry['p_one_sided'] is not None and not entry['certifiable']:
+                if entry['cost_matched_within_25pct'] is False:
+                    reason = ('the params/FLOPs ratio exceeds the 25% match tolerance, so the '
+                              'delta is confounded with cost')
+                else:
+                    reason = (f'{len(common)} shared seed(s), fewer than the required '
+                              f'{MIN_SEEDS_FOR_SIGNIFICANCE}, or an incomplete cell')
+                entry['significance_basis'] = f'descriptive only: {reason}; not certified'
             rows.append(entry)
-    adjusted = holm_adjust([r['p_one_sided'] for r in rows])
-    for entry, p_holm in zip(rows, adjusted):
+    family = [r for r in rows if r['certifiable'] and r['p_one_sided'] is not None]
+    adjusted = holm_adjust([r['p_one_sided'] for r in family])
+    for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
         entry['beats_reference_significantly'] = bool(
             entry['mean_delta'] is not None and entry['mean_delta'] < -margin
-            and p_holm is not None and p_holm < alpha
-            and entry['complete'])
+            and p_holm is not None and p_holm < alpha)
     incomplete = [
         {'depth': r['depth'], 'norm': r['norm'],
          'candidate_missing_seeds': r['candidate_missing_seeds'],
@@ -398,14 +411,21 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
         'metric': metric,
         'margin': margin,
         'alpha': alpha,
+        'multiple_comparison': (f'Holm-Bonferroni over the {len(family)} complete, cost-matched, '
+                                f'>= {MIN_SEEDS_FOR_SIGNIFICANCE}-seed cell comparison(s); '
+                                f'incomplete, < {MIN_SEEDS_FOR_SIGNIFICANCE}-seed, or cost-mismatched '
+                                f'cells are excluded from the family and are never certified'),
         'rows': rows,
         'incomplete_cells': incomplete,
         'reading_guide': ('paired Student-t on the shared seeds; `mean_delta` < 0 favors the candidate. '
                           'At 3 seeds (df = 2) the one-sided 5% critical value is t = 2.92: read '
                           '`n_seeds_favoring`/3 and the `delta_ci_95` range next to the p-value before '
-                          'treating a delta as real. A cell with `missing_seeds` '
-                          '(`incomplete_cells`) is never certified as significantly better: which runs '
-                          'survived is itself a selection effect. Every row also carries the two sides\' '
+                          'treating a delta as real. Only cells with >= 3 shared seeds and complete '
+                          'coverage enter the Holm family and can be certified; a cell with `missing_seeds` '
+                          '(`incomplete_cells`) is never certified as significantly better because which '
+                          'runs survived is itself a selection effect; a row with '
+                          '`cost_matched_within_25pct = false` is also withheld because its delta is '
+                          'confounded with a params/FLOPs difference. Every row also carries the two sides\' '
                           '`*_curve_classification_counts` and `*_n_params` / '
                           '`*_flops_per_token_forward` (with `params_ratio_vs_reference` / '
                           '`flops_ratio_vs_reference` / `cost_matched_within_25pct`): an off-healthy-regime '
@@ -465,8 +485,11 @@ def print_sweep_comparisons(comparison: dict) -> None:
         if any(v is not None for v in c_shape.values()) or any(v is not None for v in r_shape.values()):
             shape = (f" shape cand L={c_shape.get('n_layers')},dim={c_shape.get('dim')},h={c_shape.get('n_heads')} vs "
                      f"ref L={r_shape.get('n_layers')},dim={r_shape.get('dim')},h={r_shape.get('n_heads')}")
+        note = ''
+        if r.get('significance_basis'):
+            note = f" [{r['significance_basis']}]"
         print(f"[compare] d{r['depth']}-{r['norm']}: delta={r['mean_delta']:+.4f}{ci_str}{sign} "
-              f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}{cost}{shape}{regime}")
+              f"p_holm={p_str} significant={r['beats_reference_significantly']}{miss}{cost}{shape}{regime}{note}")
     if comparison.get('incomplete_cells'):
         print(f"[compare] WARNING: {len(comparison['incomplete_cells'])} comparison(s) involve a cell "
               f"with missing seed runs; significance is withheld there: "

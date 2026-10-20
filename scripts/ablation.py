@@ -26,12 +26,12 @@ Comparison protocol (what the runner guarantees, and checks)
 * **Statistical reliability.** Every row is replicated over >= 3 seeds by
   default and reported as mean +/- std across seeds; the row-vs-baseline
   significance test is a one-sided paired Student-t test on the per-seed
-  means when both rows share >= 2 seeds, because at 3 seeds the normal
-  approximation is anti-conservative. A single shared run is tested at the
-  batch level for description only and is never certified as significant
-  (batch noise is not run-to-run noise), and alias rows that reuse a
-  summary are counted once. Each delta also carries a 95% confidence
-  interval.
+  means when both rows share >= 3 seeds, because at 3 seeds the normal
+  approximation is anti-conservative. Two shared seeds are tested for
+  description only and are never certified (df = 1); a single shared run is
+  tested at the batch level for description only (batch noise is not
+  run-to-run noise). Alias rows that reuse a summary are counted once, and
+  each delta carries a 95% confidence interval.
 """
 import argparse
 import dataclasses
@@ -49,7 +49,7 @@ from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpi
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
-from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
+from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided, welch_t_one_sided
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
@@ -66,7 +66,7 @@ def _finite_metric(value) -> bool:
             and math.isfinite(value))
 
 
-ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
+ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel_tanh_k0': dict(norm_name='dytcd_tanh', k_init=0.0, learnable_k=False), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
 # Every row must state *why* it is run (the scientific hypothesis it tests),
 # not just what it configures. `load_ablations_from_config` enforces this for
 # YAML rows; these are the hypotheses of the built-in fallback rows.
@@ -74,8 +74,8 @@ ABLATION_HYPOTHESES = {
     'ln_baseline': 'Simple statistical baseline: LayerNorm on the identical protocol. The DyT family must beat this untuned-but-fairly-run reference before any added machinery counts as progress.',
     'rmsnorm_baseline': 'Simple statistical baseline: RMSNorm, the strongest no-mean normalization used in modern LLMs. A DyT-family gain is only meaningful relative to this reference.',
     'dyt_no_perchannel': 'Original DyT (one scalar alpha, tanh) matches or beats the LayerNorm/RMSNorm references at this scale, reproducing the paper claim under our protocol.',
-    'dytc_perchannel': 'Adding the per-channel axis (p fixed at 2, jitter off, so only the axis changes) improves held-out loss over scalar DyT.',
-    'dytcd_full': 'Combining the per-channel and depth axes beats both single-axis variants: the two mechanisms interact positively.',
+    'dytc_perchannel_tanh_k0': 'Cross-activation per-channel isolation at flat depth: against dytd_k0_no_depth_schedule this row changes exactly norm_name, keeping frozen k=0, tanh, gamma/beta and LayerScale identical, so a lower loss is attributable to the per-channel factor under tanh rather than to the simultaneous tanh -> softsign switch in dytc_p2_softsign vs dyt_no_perchannel.',
+    'dytcd_full': 'Combining the per-channel and depth axes beats both single-axis variants under the same protocol. The leave-one-out contrasts, not this row alone, identify which component is load-bearing; no positive-interaction claim is made without a 2x2 factorial.',
     'dytcd_no_perchannel': 'Leave-one-out for the per-channel axis of the main proposal: with delta frozen at zero (a zero buffer, not a parameter) alpha_c == alpha_l exactly, while the depth schedule, the softsign family and the LayerScale residual stay identical to the full model. Unlike the dytd_full row, this contrast changes no other mechanism, so a loss increase here is attributable to the per-channel deviation alone.',
     'dytcd_k0_no_depth_schedule': 'Leave-one-out for the depth axis of the main proposal: with k pinned to 0 and frozen, DyT-CD keeps its per-channel factor, softsign and LayerScale, so any loss of the full model advantage is attributable to depth decay.',
     'dytd_k0_no_depth_schedule': 'Depth decay is the source of DyT-D gain: with k pinned to 0 and frozen, dytd_full advantage should vanish.',
@@ -150,6 +150,10 @@ LOO_SPEC = {
                               'diff': ('norm_name',)},
         'learnable_p': {'row': 'dytcd_fixed_p',
                         'diff': ('learnable_p',)},
+    },
+    'dytc_perchannel_tanh_k0': {
+        'per_channel_axis_tanh': {'row': 'dytd_k0_no_depth_schedule',
+                                  'diff': ('norm_name',)},
     },
     'rmsnorm_qk': {
         'qk_squash': {'row': 'rmsnorm_baseline',
@@ -738,15 +742,16 @@ def _paired_row_test(row: dict, reference: dict, margin: float=0.0):
     Every comparison in this module must run through the *same* test logic,
     or `baseline_comparison` and `leave_one_out_comparison` could disagree on
     the same pair of rows. Seeds are the unit of replication, and only the
-    paired per-seed means (`basis='seed_means'`, >= 2 shared seeds) may
-    certify significance in the Holm family. When exactly one seed is shared,
-    the same run's held-out batches are still tested *for description only*
-    (`basis='val_batches_single_seed<s>'`): batch noise is not run-to-run
-    noise, so a single run can never establish that one norm generalizes
-    better across seeds. With no shared seed there is no test - in
+    paired per-seed means (`basis='seed_means'`, >= 3 shared seeds) may
+    certify significance in the Holm family. With two shared seeds the paired
+    test is reported for description only (df = 1), and when exactly one seed
+    is shared the same run's held-out batches are tested *for description
+    only* (`basis='val_batches_single_seed<s>'`): batch noise is not
+    run-to-run noise, so a single run can never establish that one norm
+    generalizes better across seeds. With no shared seed there is no test - in
     particular, batches pooled across different seeds are never zipped
     together. The t reference distribution - not the normal one - is the
-    small-sample-correct choice for the 2-4 seeds these matrices use, and the
+    small-sample-correct choice for the 3-5 seeds these matrices use, and the
     returned interval makes the precision of the delta visible. Returns
     `(test, basis, common_seeds)`, with `test=None` when no basis exists.
     """
@@ -771,9 +776,9 @@ def _paired_row_test(row: dict, reference: dict, margin: float=0.0):
     basis = 'no_shared_seeds' if (row_seeds and ref_seeds) else 'insufficient_seeds'
     return None, basis, common
 
-def _basis_counted_in_family(basis) -> bool:
-    """Only a >= 2-seed paired test is admissible to the Holm family."""
-    return basis == 'seed_means'
+def _basis_counted_in_family(basis, n_shared: int=0) -> bool:
+    """Only a >= 3-seed paired test is admissible to the Holm family."""
+    return basis == 'seed_means' and n_shared >= MIN_SEEDS_FOR_SIGNIFICANCE
 
 def _run_identity(row: dict, parent_of: dict) -> str:
     """Name of the run a row ultimately reuses, following `reused_from` chains.
@@ -798,10 +803,11 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     The reference is the *best* (lowest val_loss) row among `baseline_names`,
     so a variant is only credited with a win if it beats the strongest simple
     baseline on the identical protocol. Significance uses the one-sided paired
-    Student-t test on the per-seed means whenever both rows share >= 2 seeds
-    (seeds are the independent replications). With exactly one shared seed the
-    same run's held-out batches are tested for description only - batch noise
-    is not run-to-run noise - and with no shared seed no test runs at all.
+    Student-t test on the per-seed means whenever both rows share >= 2 seeds,
+    but only >= 3 shared seeds can certify significance (2 seeds have df = 1).
+    With exactly one shared seed the same run's held-out batches are tested
+    for description only - batch noise is not run-to-run noise - and with no
+    shared seed no test runs at all.
     Alias rows (`reused_from`) are the same underlying run and are counted
     once, both in the report and in the Holm family. The t reference distribution matters
     at this replication count: at n = 3, df = 2, the one-sided 5% critical
@@ -839,9 +845,9 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         'margin': margin,
         'alpha': alpha,
         'protocol': ('seeds are the unit of replication: mean +/- std across >= 3 seeds; '
-                     'only the paired test on >= 2 shared per-seed means certifies significance, '
-                     'a single shared run is tested at batch level for description only, and '
-                     'alias rows (reused summaries) are counted once'),
+                     'only the paired test on >= 3 shared per-seed means certifies significance; '
+                     'two or one shared seed(s) are descriptive only, and alias rows '
+                     '(reused summaries) are counted once'),
         'rows': [],
     }
     for row in usable:
@@ -879,7 +885,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         test, basis, common = _paired_row_test(row, reference, margin=margin)
         entry['test_basis'] = basis
         entry['paired_seeds'] = common
-        entry['replicated_across_seeds'] = _basis_counted_in_family(basis)
+        entry['replicated_across_seeds'] = _basis_counted_in_family(basis, len(common))
         if test is not None:
             entry['test'] = test['test']
             entry['p_one_sided'] = test['p_one_sided']
@@ -889,8 +895,8 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             entry['n'] = test['n']
         if entry['test'] is not None and not entry['replicated_across_seeds']:
             entry['significance_basis'] = (
-                'descriptive only: fewer than 2 shared seeds, so the batch-level test '
-                'cannot separate the norm effect from run-to-run noise; not certified and '
+                f'descriptive only: {len(common)} shared seed(s), fewer than the required '
+                f'{MIN_SEEDS_FOR_SIGNIFICANCE}, so the test cannot certify the norm effect; '
                 'not counted in the Holm family')
         out['rows'].append(entry)
     # Alias rows (identical effective config, `reused_from`) are the *same*
@@ -971,8 +977,8 @@ def print_baseline_comparison(comparison: dict | None) -> None:
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}{note}{regime_note}")
     if comparison.get('rows_tested_descriptively_only'):
-        print(f"[compare] NOTE: single-run batch-level tests (fewer than 2 shared seeds) are described "
-              f"but never certified: {comparison['rows_tested_descriptively_only']}")
+        print(f"[compare] NOTE: tests with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are "
+              f"described but never certified: {comparison['rows_tested_descriptively_only']}")
     if comparison.get('rows_with_fewer_than_3_seeds'):
         print(f"[compare] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
               f"{comparison['rows_with_fewer_than_3_seeds']}")
@@ -1144,7 +1150,7 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
             test, basis, common = _paired_row_test(full, ref, margin=margin)
             entry['test_basis'] = basis
             entry['paired_seeds'] = common
-            entry['replicated_across_seeds'] = _basis_counted_in_family(basis)
+            entry['replicated_across_seeds'] = _basis_counted_in_family(basis, len(common))
             if test is not None:
                 entry['test'] = test['test']
                 entry['p_one_sided'] = test['p_one_sided']
@@ -1154,9 +1160,9 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['n'] = test['n']
             if entry['test'] is not None and not entry['replicated_across_seeds']:
                 entry['significance_basis'] = (
-                    'descriptive only: fewer than 2 shared seeds, so the batch-level test '
-                    'cannot separate the mechanism effect from run-to-run noise; not certified '
-                    'and not counted in the Holm family')
+                    f'descriptive only: {len(common)} shared seed(s), fewer than the required '
+                    f'{MIN_SEEDS_FOR_SIGNIFICANCE}, so the test cannot certify the mechanism '
+                    'effect; not counted in the Holm family')
             rows.append(entry)
     if not rows:
         return None
@@ -1189,10 +1195,10 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                             if entry['test'] is not None and not entry['replicated_across_seeds']]
     return {
         'protocol': ('Full vs Full-minus-X: one-sided paired test of H1 "Full has lower '
-                     'held-out val_loss than the X-free row"; only the paired test on >= 2 '
-                     'shared per-seed means certifies significance (a single shared run is '
-                     'tested at batch level for description only), and each underlying '
-                     'contrast is counted once even when rows are aliases'),
+                     'held-out val_loss than the X-free row"; only the paired test on >= 3 '
+                     f'shared per-seed means certifies significance (two or one shared seed(s) '
+                     'are descriptive only), and each underlying contrast is counted once even '
+                     'when rows are aliases'),
         'margin': margin,
         'alpha': alpha,
         'multiple_comparison': (f'Holm-Bonferroni over the '
@@ -1242,7 +1248,7 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
               f"removing_hurts={entry['mechanism_helps']} "
               f"significant={entry['mechanism_helps_significantly']}{note}{regime_note}")
     if comparison.get('rows_tested_descriptively_only'):
-        print(f"[loo] NOTE: single-run batch-level tests (fewer than 2 shared seeds) are described "
+        print(f"[loo] NOTE: tests with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are described "
               f"but never certified: {comparison['rows_tested_descriptively_only']}")
     if comparison.get('rows_with_fewer_than_3_seeds'):
         print(f"[loo] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
@@ -1282,7 +1288,7 @@ def main():
     p.add_argument('--baselines', nargs='+', default=['ln_baseline', 'rmsnorm_baseline'], help='rows treated as the simple reference baselines in the baseline-relative comparison')
     p.add_argument('--simple-baselines', default=None, help='Bayes-limit calibration JSON from scripts/baseline_simple.py; when omitted, auto-detected at <output-dir>/simple_baselines.json. Adds the tuned simple baseline and the memoryless-Bayes-floor / full-context-ceiling gaps to baseline_comparison.json')
     p.add_argument('--baseline-margin', type=float, default=0.0, help='minimum val_loss improvement over the best baseline to count as a win')
-    p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired z-test vs the best baseline')
+    p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired t-test vs the best baseline (Holm-adjusted over rows)')
     p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check for every norm in the selected rows before training them (default: on; a row that cannot overfit one batch has a gradient/loss bug and must not be launched)')
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. an offline host)')
     p.add_argument('--check-matrix', action='store_true', help='validate controlled knobs, stated hypotheses and leave-one-out coverage of the matrix, then exit without training')

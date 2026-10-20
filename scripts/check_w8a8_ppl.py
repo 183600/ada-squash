@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import markov_batch
-from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided
+from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.model import MLP
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from scripts.eval_downstream import load_ckpt
@@ -23,7 +23,7 @@ DEFAULT_SEEDS = (42, 43, 44)
 # entry may be a comma-separated list of checkpoints (ideally distinct training
 # seeds of the same arm), which are all probed and averaged per probe seed.
 # `compare_w8a8_checkpoints` certifies a cross-arm Delta only when both arms
-# supply >= 2 checkpoints with shared training seeds; with a single trained
+# supply >= 3 checkpoints with shared training seeds; two are descriptive only; with a single trained
 # checkpoint per arm the probe-paired test is descriptive only, because one run
 # per arm cannot separate the quantization effect from run-to-run noise. The
 # same applies to the per-arm degradation test, so "0.2% drop under a 0.5% seed
@@ -291,13 +291,14 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
 
     Every arm is a trained checkpoint, so the run-to-run unit is the *training*
     seed: a pairwise test is certifiable (`basis='train_seed_means'`) only when
-    both arms supply >= 2 checkpoints with shared training seeds (comma-separated
-    `--ckpts` entries for the same arm). A single trained checkpoint per arm
+    both arms supply >= 3 checkpoints with shared training seeds (comma-separated
+    `--ckpts` entries for the same arm); two shared seeds are descriptive only
+    (df = 1). A single trained checkpoint per arm
     leaves just probe noise in the denominator: the probe-paired test is still
     computed, but labeled `basis='probe_paired_single_train_run'`,
     `certifiable=False`, and `significant` stays False. The per-arm degradation
     test (`H1: mean(ppl_drop_pct) > 0`) is likewise certifiable only across
-    >= 2 training seeds; with one run it is a descriptive probe-only test, so a
+    >= 3 training seeds; with fewer it is a descriptive probe-only test, so a
     0.2% drop under a 0.5% seed spread is never sold as a real degradation.
     """
     labels = [str(r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
@@ -315,7 +316,7 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
                  'n_shared_seeds': len(shared), 'shared_seeds': shared}
             if len(shared_train) >= 2:
                 t['basis'] = 'train_seed_means'
-                t['certifiable'] = True
+                t['certifiable'] = len(shared_train) >= MIN_SEEDS_FOR_SIGNIFICANCE
                 t.update(paired_t_one_sided([a_train[s] for s in shared_train],
                                             [b_train[s] for s in shared_train], alpha=alpha))
             else:
@@ -331,8 +332,8 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
                 # samples *and* one training run per arm, both facts matter.
                 t['reason'] = '; '.join(filter(None, (
                     t.get('reason'),
-                    f'only {len(shared_train)} shared training seed(s): one run per arm cannot '
-                    'separate the checkpoint from run-to-run noise, so the probe-paired test is '
+                    f'only {len(shared_train)} shared training seed(s): fewer than the required '
+                    '3 cannot certify the arm against run-to-run noise, so the test is '
                     'descriptive only; pass comma-separated checkpoints with distinct training '
                     'seeds per arm to certify')))
             tests.append(t)
@@ -352,7 +353,7 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
              'direction': f'H1: mean({metric}) > 0 (quantization measurably hurts)'}
         if len(train_vals) >= 2:
             d['basis'] = 'train_seed_means'
-            d['certifiable'] = True
+            d['certifiable'] = len(train_vals) >= MIN_SEEDS_FOR_SIGNIFICANCE
             # paired_t_one_sided(zeros, vals) tests mean(0 - vals) < 0, i.e.
             # mean(vals) > 0; the interval is for -mean(vals), so flip it back.
             t = paired_t_one_sided([0.0] * len(train_vals), train_vals, alpha=alpha)
@@ -388,12 +389,12 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
     ranking.sort(key=lambda row: (row['mean'] is None, row['mean']))
     return {'metric': metric, 'alpha': alpha,
             'pairing': ('probe batches are paired across arms by probe seed; certification additionally '
-                        'requires >= 2 shared training seeds per arm and otherwise stays descriptive'),
+                        'requires >= 3 shared training seeds per arm and otherwise stays descriptive'),
             'ranking': ranking, 'pairwise_tests': tests, 'degradation_tests': degradation}
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpts', nargs='+', required=True, help='one entry per arm; a plain path is one trained checkpoint. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-arm certification in ppl_comparison.json pairs training seeds, so >= 2 shared training seeds across the compared arms are required to certify a winner')
+    p.add_argument('--ckpts', nargs='+', required=True, help='one entry per arm; a plain path is one trained checkpoint. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-arm certification in ppl_comparison.json pairs training seeds, so >= 3 shared training seeds across the compared arms are required to certify a winner')
     p.add_argument('--probe', default='markov', choices=['markov', 'dataset', 'random'], help="probe corpus. 'random' is uniform tokens: it has no next-token signal, so ppl_fp ~= vocab_size and the PPL drop is unmeasurable (kept only for parity)")
     p.add_argument('--probe-split', default='validation', choices=['validation', 'test', 'train'], help="held-out split used by --probe dataset. Keep the default: 'test' is sealed for one final evaluation and 'train' reports an optimistically biased PPL")
     p.add_argument('--allow-sealed-test', action='store_true', help="permit the single final check on the sealed test split; comparing checkpoints or quantization settings on 'test' would turn it into an implicit validation set")
@@ -543,9 +544,9 @@ def main():
                         bucket[key].append(float(value))
         r['per_train_seed'] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
                                for ts, bucket in per_train_seed.items()}
-        if len(group) > 1 and len(train_seeds) < 2:
+        if len(group) > 1 and len(train_seeds) < MIN_SEEDS_FOR_SIGNIFICANCE:
             print(f'[w8a8][warn] {label}: {len(group)} checkpoints but {len(train_seeds)} distinct training '
-                  'seed(s); cross-arm certification needs >= 2 independent training runs per arm', file=sys.stderr)
+                  'seed(s); cross-arm certification needs >= 3 independent training runs per arm', file=sys.stderr)
         print(f'[w8a8] {label}: {r}')
         results.append(r)
     out_path = Path(args.output)
@@ -560,7 +561,8 @@ def main():
             continue
         verdict = 'A more robust' if t['significant'] and t['mean_delta'] < 0 else ('B more robust' if t['significant'] else 'inside the noise')
         if not t.get('certifiable'):
-            verdict = 'descriptive only (single training run per arm)'
+            verdict = (f'descriptive only ({t.get("n_shared_train_seeds", 0)} shared '
+                       'training seed(s); >= 3 required)')
         print(f"[w8a8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4f} pts, 95% CI [{t['ci_low']:+.4f}, {t['ci_high']:+.4f}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}, basis={t['basis']}) -> {verdict}")
     for d in comparison['degradation_tests']:
         if d.get('p_one_sided') is None:
@@ -568,7 +570,8 @@ def main():
             continue
         verdict = 'real degradation' if d['significant'] else 'inside the noise'
         if not d.get('certifiable'):
-            verdict = 'descriptive only (single training run)'
+            verdict = (f'descriptive only ({d.get("n_train_seeds", 0)} training '
+                       'seed(s); >= 3 required)')
         print(f"[w8a8][compare] {d['ckpt']}: mean drop {d['mean_drop_pct']:.4f}% pts, 95% CI [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}], Holm p={d['p_holm']:.4f} (n={d['n_seeds']}, basis={d['basis']}) -> {verdict}")
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)

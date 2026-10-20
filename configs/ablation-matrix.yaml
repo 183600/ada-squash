@@ -45,19 +45,24 @@ ablations:
       Original DyT (one scalar alpha, tanh) matches or beats the
       LayerNorm/RMSNorm references at this scale, reproducing the paper
       claim under our protocol.
-  - name: dytc_perchannel
-    norm: dytc
-    p_init: 2.0
-    learnable_p: false
-    alpha_jitter: 0.0
+  - name: dytc_perchannel_tanh_k0
+    norm: dytcd_tanh
+    k_init: 0.0
+    learnable_k: false
     hypothesis: >
-      Turning on the per-channel axis (p fixed at 2, jitter off, so only the
-      axis changes) improves held-out loss over scalar DyT.
+      Cross-activation per-channel isolation at flat depth: against
+      dytd_k0_no_depth_schedule this row changes exactly norm_name, keeping
+      frozen k=0, tanh, gamma/beta and LayerScale identical. A lower loss
+      here attributes the per-channel factor under tanh without the
+      activation-family change that confounds dytc_p2_softsign against scalar
+      tanh DyT.
   - name: dytcd_full
     norm: dytcd
     hypothesis: >
       Combining the per-channel and depth axes beats both single-axis
-      variants: the two mechanisms interact positively.
+      variants under the same protocol. The leave-one-out contrasts, not this
+      row's point estimate alone, identify which component is load-bearing;
+      no positive-interaction claim is made without a 2x2 factorial.
   - name: dytcd_no_perchannel
     norm: dytcd
     learnable_delta: false
