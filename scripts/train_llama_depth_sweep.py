@@ -467,9 +467,9 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 entry['params_ratio_vs_reference'] = c_params / r_params
             if _finite(c_flops) and _finite(r_flops) and r_flops:
                 entry['flops_ratio_vs_reference'] = c_flops / r_flops
-            ratios = [r for r in (entry['params_ratio_vs_reference'],
-                                  entry['flops_ratio_vs_reference']) if r is not None]
-            if ratios:
+            ratios = [entry['params_ratio_vs_reference'],
+                      entry['flops_ratio_vs_reference']]
+            if all(r is not None for r in ratios):
                 entry['cost_matched_within_25pct'] = all(
                     abs(r - 1.0) <= _COMPUTE_MATCH_TOL for r in ratios)
             requested = sorted(set(ref.get('seeds') or []) | set(by_norm[norm].get('seeds') or []))
