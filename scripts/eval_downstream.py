@@ -97,6 +97,13 @@ DEFAULT_NEEDLE = 'The magic number is 12345.'
 DEFAULT_QUESTION = '\n\nWhat is the magic number? The magic number is'
 DEFAULT_HAYSTACK = 'Many sentences follow. '
 
+def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
+    """The tokenizer identity the checkpoint was trained with, else the fallback."""
+    name = ckpt_args.get('tokenizer') or fallback_name
+    revision = ckpt_args.get('tokenizer_revision')
+    return name, revision
+
+
 def needle_target_ids(tokenizer, needle: str=DEFAULT_NEEDLE) -> list:
     secret = needle.strip().rstrip('.!?').split()
     secret = secret[-1] if secret else ''
@@ -295,7 +302,8 @@ def main():
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--needle-test', action='store_true', help='also run needle-in-haystack')
     p.add_argument('--needle-context-len', type=int, default=None, help="needle context length (default: the checkpoint's trained seq_len, or its max_seq_len minus the positions the secret's decode needs when the checkpoint records no seq_len - so a model trained short is not silently evaluated at an extrapolated length; asking for more than max_seq_len raises)")
-    p.add_argument('--tokenizer', default='gpt2')
+    p.add_argument('--tokenizer', default=None, help="tokenizer name; default: the checkpoint's recorded tokenizer, else gpt2")
+    p.add_argument('--tokenizer-revision', default=None, help="tokenizer revision; default: the checkpoint's recorded revision (an explicit flag wins)")
     p.add_argument('--decode-batch', type=int, default=8, help='independent needle trials decoded per forward pass (each step still recomputes the whole prefix)')
     p.add_argument('--seed', type=int, default=0, help='seed for the needle-position and generation RNGs')
     p.add_argument('--output', default=None)
@@ -321,7 +329,16 @@ def main():
         results['tasks_ran'] = None
     if args.needle_test:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(args.tokenizer)
+        tok_name, recorded_revision = _checkpoint_tokenizer(model_args, args.tokenizer or 'gpt2')
+        tok_revision = (args.tokenizer_revision if args.tokenizer_revision is not None
+                        else recorded_revision)
+        tok = AutoTokenizer.from_pretrained(tok_name, revision=tok_revision)
+        results['tokenizer'] = tok_name
+        results['tokenizer_revision'] = tok_revision
+        # Pin the concrete commit the tokenizer resolved to, not only the
+        # mutable request: exact-match needle accuracy depends on it.
+        results['tokenizer_revision_resolved'] = (
+            getattr(tok, '_commit_hash', None) or tok_revision)
         trained_seq_len = model_args.get('seq_len')
         trained_seq_len = int(trained_seq_len) if isinstance(trained_seq_len, int) else None
         max_scoreable = max(1, model.cfg.max_seq_len - needle_decode_overhead(tok))
@@ -369,7 +386,9 @@ def main():
     manifest['results_file'] = file_fingerprint(out)
     manifest['summary'] = {k: results[k] for k in
                            ('norm', 'tasks_ran', 'needle_acc', 'needle_ctx_len',
-                            'needle_ctx_source', 'needle_trained_seq_len') if k in results}
+                            'needle_ctx_source', 'needle_trained_seq_len',
+                            'tokenizer', 'tokenizer_revision',
+                            'tokenizer_revision_resolved') if k in results}
     if args.tasks and not results.get('tasks_ran', False):
         # A requested benchmark that did not run is an incomplete evaluation;
         # the manifest must not claim completion (the SystemExit below says
