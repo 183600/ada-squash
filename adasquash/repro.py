@@ -234,6 +234,45 @@ def file_fingerprint(path) -> dict:
     }
 
 
+# Training variables that must be identical when two arms are compared: a
+# different optimizer/schedule/step count/data slice makes the delta a recipe
+# effect, not an effect of the module. Architecture/initialization knobs are
+# deliberately absent (they are the treatment in an ablation); model shape is
+# checked separately by the callers that load checkpoints.
+TRAINING_RECIPE_KEYS = (
+    "model", "dataset", "dataset_config", "dataset_revision",
+    "tokenizer", "tokenizer_revision", "seq_len", "batch_size", "grad_accum",
+    "max_steps", "lr", "min_lr_ratio", "warmup", "weight_decay",
+    "beta1", "beta2", "grad_clip", "no_bf16", "gradient_checkpointing",
+    "early_stop_patience", "nonfinite_policy", "num_workers",
+    "val_frac", "test_frac", "num_documents", "val_every", "val_batches",
+    "min_doc_chars", "max_doc_chars", "dedup", "train_shuffle_buffer",
+    "exclude_hash_file", "exclude_test_hash_file", "group_key",
+    "exclude_group_file", "exclude_test_group_file",
+)
+
+
+def training_recipe_mismatches(reference: dict, other: dict,
+                               keys=TRAINING_RECIPE_KEYS) -> dict:
+    """Fields whose recorded training variables differ between two runs.
+
+    A missing key is treated as unknown, never as equal: an old record that
+    does not say which step count it used cannot establish that it used the
+    same one. Empty dict means every requested field is present and equal.
+    """
+    if not isinstance(reference, dict) or not isinstance(other, dict):
+        return {"hyperparameters": ["missing in one run", "missing in the other"]}
+    missing = object()
+    out = {}
+    for key in keys:
+        a = reference.get(key, missing)
+        b = other.get(key, missing)
+        if a is missing or b is missing or a != b:
+            out[key] = ["<missing>" if a is missing else a,
+                        "<missing>" if b is missing else b]
+    return out
+
+
 def artifact_record(path) -> dict:
     """Cheap pointer to a run artifact: path, existence, size and mtime.
 
@@ -557,6 +596,8 @@ __all__ = [
     "save_run_manifest",
     "seed_worker",
     "self_test",
+    "training_recipe_mismatches",
+    "TRAINING_RECIPE_KEYS",
     "set_all_seeds",
 ]
 

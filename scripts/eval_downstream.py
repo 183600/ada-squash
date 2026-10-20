@@ -64,6 +64,16 @@ def load_ckpt(path: str, device: str='cuda'):
         with torch.device(device):
             model = GPT(GPTConfig(**cfg_dict), init=False)
     model.load_state_dict(_strip_compile_prefix(ckpt['model']))
+    # Keep the training step with the args: a checkpoint can be `ckpt_best.pt`
+    # (selected at a different step per run) or a mid-run save, so two
+    # checkpoints sharing `max_steps` are not necessarily the same point in
+    # training. Comparison tools can then refuse to attribute a delta to the
+    # norm/quantization when the compared weights were not taken at the same
+    # step.
+    if isinstance(args, dict):
+        args = dict(args)
+        step = ckpt.get('step')
+        args['_checkpoint_step'] = int(step) if isinstance(step, int) and not isinstance(step, bool) else None
     # Drop the heavyweight entries; only `args` travels back to the caller.
     ckpt.pop('model', None)
     ckpt.pop('optimizer', None)

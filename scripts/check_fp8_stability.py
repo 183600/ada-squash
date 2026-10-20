@@ -11,7 +11,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.model import MLP, build_gpt_124m
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import (TRAINING_RECIPE_KEYS, collect_run_metadata, file_fingerprint,
+                             finish_metadata, save_run_manifest, set_all_seeds,
+                             training_recipe_mismatches)
 from adasquash.utils import KurtosisMeter, markov_batch
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
@@ -338,6 +340,33 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
                     and isinstance(b_by_seed[s], (int, float)))
     return shared, [float(a_by_seed[s]) for s in shared], [float(b_by_seed[s]) for s in shared]
 
+def _protocol_record(ckpt_args: dict, model) -> dict:
+    """Training recipe and shape recorded by one checkpoint."""
+    return {
+        'hyperparameters': {key: ckpt_args.get(key) for key in TRAINING_RECIPE_KEYS},
+        'shape': {'model': ckpt_args.get('model'),
+                  'n_layers': int(getattr(model.cfg, 'n_layers', 0)),
+                  'dim': int(getattr(model.cfg, 'dim', 0)),
+                  'n_heads': int(getattr(model.cfg, 'n_heads', 0))},
+        'checkpoint': {'step': ckpt_args.get('_checkpoint_step')},
+    }
+
+def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
+    """Differences in the training recipe or model shape of two checkpoints."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return {'protocol': ['<missing>', '<missing>']}
+    out = training_recipe_mismatches(a.get('hyperparameters'), b.get('hyperparameters'))
+    shape_a = a.get('shape') or {}
+    shape_b = b.get('shape') or {}
+    for key in ('model', 'n_layers', 'dim', 'n_heads'):
+        if shape_a.get(key) != shape_b.get(key):
+            out[f'shape.{key}'] = [shape_a.get(key), shape_b.get(key)]
+    step_a = (a.get('checkpoint') or {}).get('step')
+    step_b = (b.get('checkpoint') or {}).get('step')
+    if step_a is None or step_b is None or step_a != step_b:
+        out['checkpoint.step'] = [step_a, step_b]
+    return out
+
 def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alpha: float=0.05,
                       trained: bool=False) -> dict:
     """Paired, Holm-adjusted significance of one norm's FP8 metrics vs another's.
@@ -380,6 +409,31 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                 t = {'a': labels[i], 'b': labels[j], 'metric': metric,
                      'direction': f'negative mean_delta means A has lower {metric} (more FP8-stable)',
                      'a_train_seeds': sorted(a_train), 'b_train_seeds': sorted(b_train)}
+                if trained:
+                    arm_problems = [f'{labels[idx]} mixes training recipes across its checkpoints'
+                                    for idx, arm in ((i, results[i]), (j, results[j]))
+                                    if arm.get('protocol_consistent') is False]
+                    if arm_problems:
+                        t.update({'basis': 'protocol_mismatch', 'certifiable': False,
+                                  'mean_delta': None, 'p_one_sided': None,
+                                  'n_shared_train_seeds': len(shared_train),
+                                  'shared_train_seeds': shared_train,
+                                  'reason': '; '.join(arm_problems)})
+                        tests.append(t)
+                        continue
+                    protocol_mismatches = _protocol_pair_mismatches(
+                        results[i].get('protocol'), results[j].get('protocol'))
+                    if protocol_mismatches:
+                        t.update({'basis': 'protocol_mismatch', 'certifiable': False,
+                                  'mean_delta': None, 'p_one_sided': None,
+                                  'n_shared_train_seeds': len(shared_train),
+                                  'shared_train_seeds': shared_train,
+                                  'protocol_mismatches': protocol_mismatches,
+                                  'reason': ('training recipe/model shape differs between norms, '
+                                             'so the delta is not attributable to the norm: '
+                                             + json.dumps(protocol_mismatches, sort_keys=True))})
+                        tests.append(t)
+                        continue
                 if len(shared_train) >= 2:
                     t['basis'] = 'train_seed_means'
                     t['certifiable'] = len(shared_train) >= MIN_SEEDS_FOR_SIGNIFICANCE
@@ -502,7 +556,22 @@ def main():
                 r['seed'] = seed
                 per_seed_ckpt.append(r)
             per_ckpt.append({'ckpt': ckpt_path, 'train_seed': train_seed,
+                             'protocol': _protocol_record(ckpt_args, ckpt_model)
+                             if ckpt_model is not None else None,
                              'per_seed': per_seed_ckpt})
+        # A multi-checkpoint norm is one treatment only if its checkpoints
+        # share the training recipe and model shape; keep any disagreement
+        # visible instead of averaging it into the arm.
+        base_protocol = next((c.get('protocol') for c in per_ckpt
+                              if c.get('protocol') is not None), None)
+        arm_protocol_mismatches = []
+        for c in per_ckpt:
+            if c.get('protocol') is None:
+                continue
+            mismatches = _protocol_pair_mismatches(base_protocol, c.get('protocol'))
+            if mismatches:
+                arm_protocol_mismatches.append({'ckpt': c.get('ckpt'),
+                                                'mismatches': mismatches})
         # Norm-level probe records: each probe seed keeps one row whose metrics
         # are the mean over this norm's checkpoints (probe seed is the shared
         # draw; checkpoints are replicates of the arm).
@@ -529,6 +598,10 @@ def main():
         train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
         r['train_seeds'] = train_seeds
         r['n_train_seeds'] = len(train_seeds)
+        if args.ckpt:
+            r['protocol'] = base_protocol
+            r['protocol_consistent'] = not arm_protocol_mismatches
+            r['protocol_mismatches'] = arm_protocol_mismatches
         per_train_seed = {}
         for c in per_ckpt:
             if c['train_seed'] is None:
@@ -541,6 +614,10 @@ def main():
                         bucket[key].append(float(value))
         r['per_train_seed'] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
                                for ts, bucket in per_train_seed.items()}
+        if arm_protocol_mismatches:
+            print(f'[fp8][warn] {norm}: checkpoints disagree on the training recipe/model '
+                  f'shape; cross-norm tests for this arm are descriptive only: '
+                  f'{json.dumps(arm_protocol_mismatches, sort_keys=True)}', file=sys.stderr)
         if ckpt_groups:
             r['ckpt'] = list(ckpt_groups[i])
             r['ckpts'] = list(ckpt_groups[i])

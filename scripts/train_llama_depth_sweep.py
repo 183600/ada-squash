@@ -84,7 +84,59 @@ def seed_dir(cell_dir: Path, seed: int, multi: bool) -> Path:
     for a single-seed layout."""
     return cell_dir / f'seed{seed}' if multi else cell_dir
 
-def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
+# Hyperparameters that must be identical in every child run of the sweep. The
+# launcher passes them explicitly; comparing the recorded manifest against
+# this list is what prevents an old run (or a rerun with a different recipe)
+# from being aggregated as if it belonged to the current grid.
+_CHILD_PROTOCOL_KEYS = (
+    'model', 'dataset', 'dataset_config', 'dataset_revision',
+    'tokenizer', 'tokenizer_revision', 'seq_len', 'batch_size', 'grad_accum',
+    'max_steps', 'lr', 'min_lr_ratio', 'warmup', 'weight_decay', 'beta1',
+    'beta2', 'grad_clip', 'qk_norm', 'layerscale_init', 'alpha_0',
+    'alpha_init', 'k_init', 'p_init', 'qk_alpha_init', 'no_learnable_p',
+    'no_learnable_k', 'no_learnable_delta', 'no_layerscale', 'beta',
+    'alpha_jitter', 'gradient_checkpointing', 'tie_embeddings', 'no_bf16',
+    'compile', 'compile_mode', 'val_frac', 'test_frac', 'num_documents',
+    'val_every', 'val_batches', 'min_doc_chars', 'max_doc_chars', 'dedup',
+    'train_shuffle_buffer', 'exclude_hash_file', 'exclude_test_hash_file',
+    'group_key', 'exclude_group_file', 'exclude_test_group_file',
+)
+
+def expected_child_protocol(args, depth: int, norm: str, seed: int) -> dict:
+    """The controlled recipe and shape a child manifest must record."""
+    hyperparameters = {key: getattr(args, key) for key in _CHILD_PROTOCOL_KEYS}
+    hyperparameters.update({'norm': norm, 'seed': int(seed)})
+    base_dim, base_heads = base_shape_for_model(args.model)
+    if args.no_dim_scaling:
+        dim, heads = base_dim, base_heads
+    else:
+        dim, heads = shape_for_depth(depth, base_dim, base_heads)
+    return {
+        'hyperparameters': hyperparameters,
+        'shape': {'n_layers': int(depth), 'dim': int(dim), 'n_heads': int(heads)},
+    }
+
+def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
+    """Fields where a child manifest disagrees with this sweep invocation."""
+    recorded = manifest.get('hyperparameters') or {}
+    results = manifest.get('results') or {}
+    mismatches = {}
+    for key, wanted in expected['hyperparameters'].items():
+        if recorded.get(key) != wanted:
+            mismatches[key] = [wanted, recorded.get(key)]
+    for key, wanted in expected['shape'].items():
+        if results.get(key) != wanted:
+            mismatches[f'results.{key}'] = [wanted, results.get(key)]
+    return mismatches
+
+def _load_launch_spec(path: Path):
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=None, launch_id=None) -> dict:
     """Pool each seed's reported losses into Mean +/- Std records.
 
     The two validation statistics a run reports are not the same number:
@@ -104,6 +156,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
     two statistics.
     """
     per_seed = []
+    rejected = []
     for seed in seeds:
         path = seed_dir(cell_dir, seed, multi) / 'run_manifest.json'
         best = None
@@ -120,31 +173,58 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         n_layers = None
         dim = None
         n_heads = None
+        expected = protocol_for_seed(seed) if protocol_for_seed is not None else None
+        reject_reason = None
+        if launch_id is not None:
+            spec = _load_launch_spec(path.with_name('launch_spec.json'))
+            if spec is None:
+                reject_reason = ('no launch spec from this sweep invocation: the manifest '
+                                 'may predate this run or the cell was never launched')
+            elif spec.get('launch_id') != launch_id:
+                reject_reason = ('launched by a different sweep invocation; its recipe may '
+                                 'differ from the current grid')
+            elif expected is not None and spec.get('protocol') != expected:
+                reject_reason = 'launch spec does not match the current sweep recipe'
+        manifest = None
         try:
             manifest = json.loads(path.read_text())
-            if isinstance(manifest, dict):
-                results = manifest.get('results') or {}
-                best = results.get('best_val_loss')
-                final = results.get('final_val_loss')
-                # Curve, parameter and FLOPs accounting already travel in
-                # every run manifest; the sweep must pool them instead of
-                # dropping them, otherwise a depth cell is read from one final
-                # number and a wider/deeper cell's shape accounting is
-                # invisible.
-                curve = results.get('curve_diagnosis')
-                n_params = results.get('n_params')
-                n_layers = results.get('n_layers')
-                dim = results.get('dim')
-                n_heads = results.get('n_heads')
-                breakdown = results.get('parameter_breakdown')
-                flops_fwd = results.get('flops_per_token_forward')
-                flops_train = results.get('flops_per_token_training_est')
-                spikes = results.get('n_loss_spikes')
-                nonfinite = results.get('n_nonfinite_losses')
-                nonfinite_grad = results.get('n_nonfinite_gradients')
-                nonfinite_val = results.get('n_nonfinite_val_losses')
         except (OSError, json.JSONDecodeError):
             pass
+        if reject_reason is None and launch_id is not None:
+            if not isinstance(manifest, dict):
+                reject_reason = 'run_manifest.json is missing or unreadable'
+            elif manifest.get('status') != 'finished':
+                reject_reason = (f"run status is {manifest.get('status')!r}, not 'finished'; "
+                                 'the run did not complete')
+            elif expected is not None:
+                mismatches = manifest_protocol_mismatches(manifest, expected)
+                if mismatches:
+                    reject_reason = ('recorded recipe/shape differs from this sweep: '
+                                     + json.dumps(mismatches, sort_keys=True))
+        if reject_reason is not None:
+            rejected.append({'seed': int(seed), 'path': str(path),
+                             'reason': reject_reason})
+        elif isinstance(manifest, dict):
+            results = manifest.get('results') or {}
+            best = results.get('best_val_loss')
+            final = results.get('final_val_loss')
+            # Curve, parameter and FLOPs accounting already travel in
+            # every run manifest; the sweep must pool them instead of
+            # dropping them, otherwise a depth cell is read from one final
+            # number and a wider/deeper cell's shape accounting is
+            # invisible.
+            curve = results.get('curve_diagnosis')
+            n_params = results.get('n_params')
+            n_layers = results.get('n_layers')
+            dim = results.get('dim')
+            n_heads = results.get('n_heads')
+            breakdown = results.get('parameter_breakdown')
+            flops_fwd = results.get('flops_per_token_forward')
+            flops_train = results.get('flops_per_token_training_est')
+            spikes = results.get('n_loss_spikes')
+            nonfinite = results.get('n_nonfinite_losses')
+            nonfinite_grad = results.get('n_nonfinite_gradients')
+            nonfinite_val = results.get('n_nonfinite_val_losses')
         per_seed.append({
             'seed': int(seed), 'best_val_loss': best, 'final_val_loss': final,
             'curve_classification': (curve or {}).get('classification'),
@@ -210,7 +290,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool) -> dict:
         'missing_seeds': missing_seeds,
         'invalid_seeds': invalid_seeds,
         'seeds_without_final_val_loss': seeds_without_final,
-        'complete': len(missing_seeds) == 0 and len(invalid_seeds) == 0,
+        'complete': len(missing_seeds) == 0 and len(invalid_seeds) == 0 and not rejected,
+        'manifest_rejections': rejected,
+        'protocol_verified_by_launch_id': launch_id is not None,
         'per_seed': per_seed,
         'n_seeds': len(best_vals),
         'best_val_loss': None if best_stats is None else best_stats['mean'],
@@ -538,7 +620,7 @@ def _child_env(args, gpu=None, seed=None) -> dict:
             env[var] = str(threads)
     return env
 
-def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=None):
+def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=None, launch_id=None):
     cmd = [sys.executable, str(Path(__file__).parent / 'train_gpt2.py'), '--model', args.model, '--norm', norm, '--dataset', args.dataset, '--dataset-config', args.dataset_config, '--tokenizer', args.tokenizer, '--seq-len', str(args.seq_len), '--batch-size', str(args.batch_size), '--grad-accum', str(args.grad_accum), '--max-steps', str(args.max_steps), '--lr', str(args.lr), '--min-lr-ratio', str(args.min_lr_ratio), '--warmup', str(args.warmup), '--weight-decay', str(args.weight_decay), '--beta1', str(args.beta1), '--beta2', str(args.beta2), '--grad-clip', str(args.grad_clip), '--seed', str(seed), '--alpha-0', str(args.alpha_0), '--alpha-init', str(args.alpha_init), '--k-init', str(args.k_init), '--p-init', str(args.p_init), '--qk-alpha-init', str(args.qk_alpha_init), '--output-dir', str(output_dir), '--log-every', str(args.log_every), '--stats-every', str(args.stats_every), '--save-every', str(args.save_every)]
     if args.qk_norm:
         cmd += ['--qk-norm', args.qk_norm]
@@ -616,6 +698,22 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
         env['ADASQUASH_HEADS_OVERRIDE'] = str(heads)
         shape = f' (dim={dim}, heads={heads})'
     print(f'[sweep] launching depth={depth} norm={norm} -> {output_dir}{shape}')
+    # Invalidate the previous result *before* spawning. A child that dies
+    # before train_gpt2.py writes its own manifest must leave no readable
+    # result, otherwise the aggregator would silently reuse the old run.
+    manifest_path = output_dir / 'run_manifest.json'
+    try:
+        manifest_path.unlink()
+    except FileNotFoundError:
+        pass
+    spec = {
+        'launch_id': launch_id,
+        'depth': int(depth),
+        'norm': norm,
+        'seed': int(seed),
+        'protocol': expected_child_protocol(args, depth, norm, seed),
+    }
+    (output_dir / 'launch_spec.json').write_text(json.dumps(spec, indent=2))
     log = open(output_dir / 'stdout.log', 'w')
     try:
         proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -711,9 +809,14 @@ def main():
     multi = len(seeds) > 1
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    # Every child written by this invocation carries this id in its launch
+    # spec; aggregation refuses manifests from another sweep even when the
+    # cell directory still exists from an earlier run.
+    sweep_launch_id = f'{int(time.time())}-{os.getpid()}'
     sweep_manifest = collect_run_metadata(seed=seeds[0])
     sweep_manifest['hyperparameters'] = vars(args)
     sweep_manifest['seeds'] = seeds
+    sweep_manifest['launch_id'] = sweep_launch_id
     sweep_manifest['grid'] = {
         'depths': list(args.depths),
         'norms': list(args.norms),
@@ -763,7 +866,7 @@ def main():
         if args.sequential and int(args.max_parallel) > 1:
             print('[sweep][warn] --sequential overrides --max-parallel')
         for idx, (depth, norm, out_dir, seed) in enumerate(jobs):
-            proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(idx))
+            proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(idx), launch_id=sweep_launch_id)
             rc = proc.wait()
             print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
     else:
@@ -779,7 +882,7 @@ def main():
                     break
                 gpu = free[0]
                 depth, norm, out_dir, seed = jobs[next_job]
-                proc = launch_one(args, depth, norm, out_dir, seed, gpu=gpu)
+                proc = launch_one(args, depth, norm, out_dir, seed, gpu=gpu, launch_id=sweep_launch_id)
                 next_job += 1
                 busy_gpus.add(gpu)
                 running.append((proc, depth, norm, seed, gpu))
@@ -793,7 +896,10 @@ def main():
                 _reap(*entry[:4])
     aggs_by_depth: dict = {}
     for depth, norm, cell_dir in cells:
-        agg = aggregate_sweep_cell(cell_dir, seeds, multi)
+        agg = aggregate_sweep_cell(
+            cell_dir, seeds, multi,
+            protocol_for_seed=lambda seed, d=depth, n=norm: expected_child_protocol(args, d, n, seed),
+            launch_id=sweep_launch_id)
         with open(cell_dir / 'aggregate.json', 'w') as f:
             json.dump(agg, f, indent=2)
         aggs_by_depth.setdefault(depth, {})[norm] = agg
@@ -854,6 +960,9 @@ def main():
                   f"the ordered triage; read the per-seed triage evidence before comparing "
                   f"this cell (a cell with explicitly handled numerical failures is not a "
                   f"clean replication)")
+        for rejection in agg.get('manifest_rejections') or []:
+            print(f"[sweep] WARNING: d{depth}-{norm} seed={rejection['seed']}: rejected "
+                  f"manifest ({rejection['reason']})")
         if agg.get('missing_seeds'):
             print(f"[sweep] WARNING: d{depth}-{norm}: missing/unfinished runs for seeds "
                   f"{agg['missing_seeds']}; the pooled mean covers {agg['n_seeds']} of "
@@ -886,6 +995,7 @@ def main():
             'final_val_loss_std': agg.get('final_val_loss_std'),
             'missing_seeds': agg.get('missing_seeds'),
             'invalid_seeds': agg.get('invalid_seeds'),
+            'manifest_rejections': agg.get('manifest_rejections'),
             'curve_classification_counts': agg.get('curve_classification_counts'),
         }
         for depth, norm, cell_dir in cells

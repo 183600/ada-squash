@@ -593,6 +593,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         'schedule': {'type': 'constant', 'lr': args.lr},
         'data': {'generator': 'markov_batch', 'batch_size': args.batch_size,
                  'seq_len': args.seq_len, 'outlier_id': outlier_id,
+                 'outlier_scale': 25.0,
                  'val_seed_offset': 1, 'val_batches': n_val_batches},
         'curve_monitoring': {
             'every': curve_every, 'batches': curve_batches,
@@ -732,56 +733,117 @@ def _write_summary(path: Path, summary: dict) -> None:
     with open(path, 'w') as f:
         json.dump(summary, f, indent=2)
 
-def _protocol_signature(args) -> tuple:
+# The controlled recipe is more than (model, lr, steps): changing the
+# optimizer type/betas, grad clip, schedule, data generator, outlier strength
+# or the held-out generator/batch count also changes the number being
+# compared. Every field below is recorded in each row's `controls` block and
+# none of it is allowed to vary between rows in one comparison.
+_PROTOCOL_KEYS = (
+    'model', 'optimizer_name', 'optimizer_betas', 'optimizer_lr',
+    'weight_decay', 'grad_clip', 'schedule_type', 'schedule_lr',
+    'data_generator', 'batch_size', 'seq_len', 'outlier_id', 'outlier_scale',
+    'val_seed_offset', 'val_batches', 'train_steps',
+)
+_PROTOCOL_MODEL_VOCAB = {'gpt2-124m': 50304, 'gpt2-350m': 50304, 'llama-1b': 32000}
+
+def _protocol_outlier_id(model):
+    vocab = _PROTOCOL_MODEL_VOCAB.get(model)
+    return None if vocab is None else vocab - 1
+
+def _protocol_payload(args) -> dict:
     """The controlled training recipe every row of this invocation shares."""
-    return (args.model, args.lr, args.weight_decay, args.batch_size, args.seq_len, args.max_steps)
+    return {
+        'model': args.model,
+        'optimizer_name': 'AdamW',
+        'optimizer_betas': [0.9, 0.95],
+        'optimizer_lr': args.lr,
+        'weight_decay': args.weight_decay,
+        'grad_clip': 1.0,
+        'schedule_type': 'constant',
+        'schedule_lr': args.lr,
+        'data_generator': 'markov_batch',
+        'batch_size': args.batch_size,
+        'seq_len': args.seq_len,
+        'outlier_id': _protocol_outlier_id(args.model),
+        'outlier_scale': 25.0,
+        'val_seed_offset': 1,
+        'val_batches': max(1, int(getattr(args, 'val_batches', 20))),
+        'train_steps': args.max_steps,
+    }
 
-def row_protocol_signature(row: dict, fallback_model=None):
-    """Recorded (model, lr, weight_decay, batch, seq, train_steps), or None.
+def _protocol_signature(args) -> tuple:
+    payload = _protocol_payload(args)
+    return tuple(payload[key] for key in _PROTOCOL_KEYS)
 
-    Missing `controls` (a summary predating protocol recording) counts as
-    unknown, never as matching.
+def _row_protocol_values(row: dict, fallback_model=None):
+    """Recorded controlled-recipe dict, or None when the row predates controls.
+
+    Missing individual fields stay `None`; they compare unequal to this
+    invocation's values, so an incomplete old record can never be treated as
+    matching.
     """
     controls = row.get('controls')
     if not isinstance(controls, dict):
         return None
     optimizer = controls.get('optimizer') or {}
+    schedule = controls.get('schedule') or {}
     data = controls.get('data') or {}
-    return (row.get('model', fallback_model), optimizer.get('lr'), optimizer.get('weight_decay'),
-            data.get('batch_size'), data.get('seq_len'), controls.get('train_steps'))
+    return {
+        'model': row.get('model', fallback_model),
+        'optimizer_name': optimizer.get('name'),
+        'optimizer_betas': optimizer.get('betas'),
+        'optimizer_lr': optimizer.get('lr'),
+        'weight_decay': optimizer.get('weight_decay'),
+        'grad_clip': optimizer.get('grad_clip'),
+        'schedule_type': schedule.get('type'),
+        'schedule_lr': schedule.get('lr'),
+        'data_generator': data.get('generator'),
+        'batch_size': data.get('batch_size'),
+        'seq_len': data.get('seq_len'),
+        'outlier_id': data.get('outlier_id'),
+        'outlier_scale': data.get('outlier_scale'),
+        'val_seed_offset': data.get('val_seed_offset'),
+        'val_batches': data.get('val_batches'),
+        'train_steps': controls.get('train_steps'),
+    }
+
+def row_protocol_signature(row: dict, fallback_model=None):
+    """Canonical recorded controlled-recipe tuple, or None when unknown."""
+    values = _row_protocol_values(row, fallback_model)
+    if values is None:
+        return None
+    return tuple(values[key] for key in _PROTOCOL_KEYS)
 
 def partition_rows_by_protocol(rows: list, args) -> tuple[list, list]:
     """(rows recorded under this invocation's recipe, rows recorded under another).
 
     `all_summaries.json` deliberately accumulates rows across invocations, but
-    a row trained with a different lr/step count/batch/seq/model is not the
-    same experiment: comparing it would credit the module with a change that
-    came from the recipe. The same holds for the number of held-out validation
-    batches, which defines the precision of the selection metric these
-    comparisons use. Mismatched rows stay in the file and in the report, but
-    they are kept out of the statistical comparisons.
+    a row trained with a different model, optimizer, schedule, data generator
+    or validation protocol is not the same experiment: comparing it would
+    credit the module with a change that came from the recipe. Mismatched rows
+    stay in the file and in the report, but they are kept out of the
+    statistical comparisons. Missing/partial controls count as unknown, never
+    as matching.
     """
+    expected_values = _protocol_payload(args)
     expected = _protocol_signature(args)
-    val_batch_count = max(1, int(getattr(args, 'val_batches', 20)))
     keep, stale = [], []
     for row in rows:
-        signature = row_protocol_signature(row, args.model)
-        recorded_batches = row.get('n_val_batches')
-        if signature == expected and recorded_batches == val_batch_count:
+        values = _row_protocol_values(row, args.model)
+        signature = None if values is None else tuple(values[key] for key in _PROTOCOL_KEYS)
+        if signature == expected:
             keep.append(row)
         else:
-            labels = ('model', 'lr', 'weight_decay', 'batch_size', 'seq_len', 'max_steps')
-            if signature is None:
-                reason = 'no recorded controls'
-            elif recorded_batches is None:
-                reason = 'no recorded validation batch count'
-            else:
-                reason = 'trained under a different protocol than this invocation'
+            mismatched = (list(_PROTOCOL_KEYS) if values is None else
+                          [key for key in _PROTOCOL_KEYS
+                           if values[key] != expected_values[key]])
             stale.append({
                 'name': row.get('name'),
-                'reason': reason,
-                'recorded_protocol': {} if signature is None else dict(zip(labels, signature)),
-                'recorded_val_batches': recorded_batches,
+                'reason': ('no recorded controls' if values is None else
+                           'trained under a different protocol than this invocation'),
+                'mismatched_fields': mismatched,
+                'recorded_protocol': values if values is not None else {},
+                'expected_protocol': expected_values,
             })
     return keep, stale
 

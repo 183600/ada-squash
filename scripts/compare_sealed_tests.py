@@ -39,7 +39,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_ci, mean_std_stderr, paired_t_one_sided, student_t_ppf
-from adasquash.repro import collect_run_metadata, finish_metadata, save_run_manifest
+from adasquash.repro import (collect_run_metadata, finish_metadata, save_run_manifest,
+                             training_recipe_mismatches)
 
 PAIRING_KEYS = (
     "dataset", "dataset_config", "dataset_revision",
@@ -87,6 +88,22 @@ def load_result(path) -> dict:
             f"test_batch_losses={mean}; the record is internally inconsistent.")
     return data
 
+
+def load_run_manifest(result_path) -> dict | None:
+    """Training manifest stored next to a sealed-test result, if readable."""
+    path = Path(result_path).with_name("run_manifest.json")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+def _shape_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
+    a = ref_manifest.get("results") or {}
+    b = other_manifest.get("results") or {}
+    return {f"results.{key}": [a.get(key), b.get(key)]
+            for key in ("n_layers", "dim", "n_heads")
+            if a.get(key) != b.get(key)}
 
 def pairing_mismatches(ref: dict, other: dict) -> dict:
     """Keys whose values differ between the two runs' data-protocol blocks."""
@@ -145,6 +162,7 @@ def load_arm(path) -> dict:
             "path": str(run_path),
             "seed": _seed_of(run_path, data),
             "data": data,
+            "manifest": load_run_manifest(run_path),
             "batch_losses": [float(v) for v in data["test_batch_losses"]],
         })
     seeds = [r["seed"] for r in runs if r["seed"] is not None]
@@ -201,6 +219,31 @@ def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
     if len(counts) != 1:
         return (f"runs were scored on different numbers of sealed batches "
                 f"({sorted(counts)}); the arms did not share the same test pass")
+    # Identical test batches are not enough: the training recipe itself must
+    # be controlled, otherwise the delta can be an lr/step/data effect rather
+    # than a property of the compared norm. A missing or unfinished manifest
+    # leaves the recipe unknown, which is never treated as matching.
+    unverified = [r["path"] for r in ref_arm["runs"] + cand_arm["runs"]
+                  if not isinstance(r.get("manifest"), dict)
+                  or r["manifest"].get("status") != "finished"]
+    if unverified:
+        return ("training recipe cannot be verified: missing/unfinished run_manifest.json "
+                "for " + "; ".join(unverified[:3]))
+    recipe_problems = []
+    for run in cand_arm["runs"]:
+        for ref_run in ref_arm["runs"]:
+            ref_manifest = ref_run["manifest"]
+            manifest = run["manifest"]
+            mismatches = training_recipe_mismatches(
+                ref_manifest.get("hyperparameters"), manifest.get("hyperparameters"))
+            mismatches.update(_shape_mismatches(ref_manifest, manifest))
+            if mismatches:
+                recipe_problems.append(
+                    f"{ref_run['path']} vs {run['path']}: "
+                    + json.dumps(mismatches, sort_keys=True))
+    if recipe_problems:
+        return ("training recipe/model shape differs, so the arms are not a controlled "
+                "comparison: " + "; ".join(recipe_problems[:3]))
     return None
 
 

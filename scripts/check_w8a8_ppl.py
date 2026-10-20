@@ -12,7 +12,9 @@ import torch.nn.functional as F
 from adasquash import markov_batch
 from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided
 from adasquash.model import MLP
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import (TRAINING_RECIPE_KEYS, collect_run_metadata, file_fingerprint,
+                             finish_metadata, save_run_manifest, set_all_seeds,
+                             training_recipe_mismatches)
 from scripts.eval_downstream import load_ckpt
 DEFAULT_SEEDS = (42, 43, 44)
 # One probe draw is one sample: the PPL drop is aggregated as Mean +/- Std
@@ -277,6 +279,33 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
                     and isinstance(b_by_seed[s], (int, float)))
     return shared, [float(a_by_seed[s]) for s in shared], [float(b_by_seed[s]) for s in shared]
 
+def _protocol_record(ckpt_args: dict, model) -> dict:
+    """Training recipe and shape recorded by one checkpoint."""
+    return {
+        'hyperparameters': {key: ckpt_args.get(key) for key in TRAINING_RECIPE_KEYS},
+        'shape': {'model': ckpt_args.get('model'),
+                  'n_layers': int(getattr(model.cfg, 'n_layers', 0)),
+                  'dim': int(getattr(model.cfg, 'dim', 0)),
+                  'n_heads': int(getattr(model.cfg, 'n_heads', 0))},
+        'checkpoint': {'step': ckpt_args.get('_checkpoint_step')},
+    }
+
+def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
+    """Differences in the training recipe or model shape of two checkpoints."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return {'protocol': ['<missing>', '<missing>']}
+    out = training_recipe_mismatches(a.get('hyperparameters'), b.get('hyperparameters'))
+    shape_a = a.get('shape') or {}
+    shape_b = b.get('shape') or {}
+    for key in ('model', 'n_layers', 'dim', 'n_heads'):
+        if shape_a.get(key) != shape_b.get(key):
+            out[f'shape.{key}'] = [shape_a.get(key), shape_b.get(key)]
+    step_a = (a.get('checkpoint') or {}).get('step')
+    step_b = (b.get('checkpoint') or {}).get('step')
+    if step_a is None or step_b is None or step_a != step_b:
+        out['checkpoint.step'] = [step_a, step_b]
+    return out
+
 def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: float=0.05) -> dict:
     """Paired, Holm-adjusted significance of one checkpoint's PPL drop vs another's.
 
@@ -314,6 +343,27 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
                  'a_train_seeds': sorted(a_train), 'b_train_seeds': sorted(b_train),
                  'n_shared_train_seeds': len(shared_train), 'shared_train_seeds': shared_train,
                  'n_shared_seeds': len(shared), 'shared_seeds': shared}
+            arm_problems = []
+            for idx, arm in ((i, results[i]), (j, results[j])):
+                if arm.get('protocol_consistent') is False:
+                    arm_problems.append(f'{labels[idx]} mixes training recipes across its checkpoints')
+            if arm_problems:
+                t.update({'basis': 'protocol_mismatch', 'certifiable': False,
+                          'mean_delta': None, 'p_one_sided': None,
+                          'reason': '; '.join(arm_problems)})
+                tests.append(t)
+                continue
+            protocol_mismatches = _protocol_pair_mismatches(
+                results[i].get('protocol'), results[j].get('protocol'))
+            if protocol_mismatches:
+                t.update({'basis': 'protocol_mismatch', 'certifiable': False,
+                          'mean_delta': None, 'p_one_sided': None,
+                          'protocol_mismatches': protocol_mismatches,
+                          'reason': ('training recipe/model shape differs between arms, so the '
+                                     'delta is not attributable to the norm/quantization: '
+                                     + json.dumps(protocol_mismatches, sort_keys=True))})
+                tests.append(t)
+                continue
             if len(shared_train) >= 2:
                 t['basis'] = 'train_seed_means'
                 t['certifiable'] = len(shared_train) >= MIN_SEEDS_FOR_SIGNIFICANCE
@@ -351,7 +401,12 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
              'mean_drop_pct': stats['mean'] if stats else None,
              'mean_drop_pct_across_train_seeds': train_stats['mean'] if train_stats else None,
              'direction': f'H1: mean({metric}) > 0 (quantization measurably hurts)'}
-        if len(train_vals) >= 2:
+        if r.get('protocol_consistent') is False:
+            d.update({'basis': 'protocol_mismatch', 'certifiable': False,
+                      'p_one_sided': None,
+                      'reason': ('this arm mixes training recipes/model shapes across its '
+                                 'checkpoints, so its pooled degradation is not one experiment')})
+        elif len(train_vals) >= 2:
             d['basis'] = 'train_seed_means'
             d['certifiable'] = len(train_vals) >= MIN_SEEDS_FOR_SIGNIFICANCE
             # paired_t_one_sided(zeros, vals) tests mean(0 - vals) < 0, i.e.
@@ -509,8 +564,19 @@ def main():
             if r_ckpt['ppl_fp'] >= 0.5 * model.cfg.vocab_size:
                 print(f"[w8a8] WARNING: {ckpt_path} ppl_fp={r_ckpt['ppl_fp']:.1f} (mean over {r_ckpt['n_seeds']} seeds) is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={r_ckpt['probe_token_coverage']:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet", file=sys.stderr)
             per_ckpt.append({'path': ckpt_path, 'train_seed': train_seed,
+                             'protocol': _protocol_record(ckpt_args, model),
                              'agg': {k: v for k, v in r_ckpt.items() if k != 'per_seed'},
                              'per_seed': per_seed})
+        # A multi-checkpoint arm is one treatment only if its checkpoints
+        # share the training recipe and model shape; record any disagreement
+        # instead of averaging it away.
+        base_protocol = per_ckpt[0].get('protocol') if per_ckpt else None
+        arm_protocol_mismatches = []
+        for c in per_ckpt[1:]:
+            mismatches = _protocol_pair_mismatches(base_protocol, c.get('protocol'))
+            if mismatches:
+                arm_protocol_mismatches.append({'ckpt': c.get('path'),
+                                                'mismatches': mismatches})
         # Arm-level probe records: each probe seed keeps one row whose metrics
         # are the mean over this arm's checkpoints (the probe seed is the
         # shared draw; checkpoints replicate the training run).
@@ -529,6 +595,9 @@ def main():
         train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
         r['train_seeds'] = train_seeds
         r['n_train_seeds'] = len(train_seeds)
+        r['protocol'] = base_protocol
+        r['protocol_consistent'] = not arm_protocol_mismatches
+        r['protocol_mismatches'] = arm_protocol_mismatches
         r['ckpts'] = list(group)
         r['per_checkpoint'] = per_ckpt
         per_train_seed = {}
@@ -543,6 +612,10 @@ def main():
                         bucket[key].append(float(value))
         r['per_train_seed'] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
                                for ts, bucket in per_train_seed.items()}
+        if arm_protocol_mismatches:
+            print(f'[w8a8][warn] {label}: checkpoints disagree on the training recipe/model '
+                  f'shape; cross-arm tests for this arm are descriptive only: '
+                  f'{json.dumps(arm_protocol_mismatches, sort_keys=True)}', file=sys.stderr)
         if len(group) > 1 and len(train_seeds) < MIN_SEEDS_FOR_SIGNIFICANCE:
             print(f'[w8a8][warn] {label}: {len(group)} checkpoints but {len(train_seeds)} distinct training '
                   'seed(s); cross-arm certification needs >= 3 independent training runs per arm', file=sys.stderr)
