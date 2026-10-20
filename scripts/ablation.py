@@ -902,9 +902,16 @@ def _seed_means(row) -> dict:
         return out
     seeds = row.get('seeds') if isinstance(row.get('seeds'), list) else []
     seeds = [s for s in seeds if s is not None] or ([row['seed']] if row.get('seed') is not None else [])
-    if _finite_metric(row.get('val_loss')):
-        for s in seeds:
-            out[int(s)] = float(row['val_loss'])
+    # A single-run summary names exactly one seed, so its pooled val_loss is
+    # that seed's mean. A multi-seed row without per_seed losses has no
+    # per-seed observations: copying the pooled mean to every seed would
+    # invent zero variance and can turn it into a "significant" paired win.
+    unique_seeds = []
+    for s in seeds:
+        if int(s) not in unique_seeds:
+            unique_seeds.append(int(s))
+    if len(unique_seeds) == 1 and _finite_metric(row.get('val_loss')):
+        out[unique_seeds[0]] = float(row['val_loss'])
     return out
 
 def _batches_of_seed(row, seed):
