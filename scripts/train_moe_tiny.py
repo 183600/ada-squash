@@ -261,6 +261,11 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         'tokenizer': getattr(args, 'tokenizer', None),
         'tokenizer_revision': getattr(args, 'tokenizer_revision', None),
         'split_reports': data_reports,
+        'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if getattr(args, 'exclude_hash_file', None) else None,
+        'exclude_test_hash_file': file_fingerprint(args.exclude_test_hash_file) if getattr(args, 'exclude_test_hash_file', None) else None,
+        'group_key': getattr(args, 'group_key', None),
+        'exclude_group_file': file_fingerprint(args.exclude_group_file) if getattr(args, 'exclude_group_file', None) else None,
+        'exclude_test_group_file': file_fingerprint(args.exclude_test_group_file) if getattr(args, 'exclude_test_group_file', None) else None,
     }
     if sanity_report_path is not None:
         run_manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
@@ -280,6 +285,28 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         report = getattr(loader, 'split_report', None)
         if report:
             data_reports['train'] = report
+            # Pin the run (and its manifest) to the resolved upstream commits,
+            # not the mutable revision strings typed on the command line. This
+            # mirrors train_gpt2.py: a later rerun of the recorded manifest
+            # must select the same documents and tokenizer.
+            resolved_revision = report.get('dataset_revision_resolved')
+            current_revision = getattr(args, 'dataset_revision', None)
+            if resolved_revision and resolved_revision != current_revision:
+                print(f'[moe][data] dataset revision pinned: {current_revision!r} -> {resolved_revision}')
+                args.dataset_revision = resolved_revision
+            resolved_tokenizer = report.get('tokenizer_revision_resolved')
+            current_tokenizer = getattr(args, 'tokenizer_revision', None)
+            if resolved_tokenizer and resolved_tokenizer != current_tokenizer:
+                print(f'[moe][data] tokenizer revision pinned: {current_tokenizer!r} -> {resolved_tokenizer}')
+                args.tokenizer_revision = resolved_tokenizer
+            run_manifest['hyperparameters'] = vars(args)
+            run_manifest['data'].update({
+                'dataset_revision': getattr(args, 'dataset_revision', None),
+                'tokenizer_revision': getattr(args, 'tokenizer_revision', None),
+                'dataset_revision_resolved': resolved_revision,
+                'tokenizer_revision_resolved': resolved_tokenizer,
+            })
+            save_run_manifest(manifest_path, run_manifest)
             print(f'[moe][data] train split: {report}')
         data_iter = iter(loader)
 
