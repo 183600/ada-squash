@@ -450,7 +450,10 @@ def main():
                                          max_cost_ratio=args.max_cost_ratio,
                                          cost_name='training_latency',
                                          cost_components=components,
-                                         max_component_ratio=args.max_component_ratio)
+                                         max_component_ratio=args.max_component_ratio,
+                                         statistically_significant=(
+                                             None if sig is None
+                                             else sig.get('beats_reference_significantly')))
             # A gain the seed-level ablation could not call significant is
             # weak evidence: block viability until a longer/multi-seed run
             # clears the significance bar.
