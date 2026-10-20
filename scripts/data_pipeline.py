@@ -168,18 +168,20 @@ def resolve_dataset_revision(dataset_name: str, revision=None) -> str | None:
     the Hub is unreachable the resolution degrades to the requested value (or
     None) instead of failing the run.
     """
-    if revision:
-        return str(revision)
-    key = ("revision", str(dataset_name))
+    requested = str(revision) if revision else None
+    key = ("revision", str(dataset_name), requested)
     if key in _REVISION_CACHE:
         return _REVISION_CACHE[key]
     resolved = None
     try:
         from huggingface_hub import HfApi
 
-        resolved = getattr(HfApi().dataset_info(dataset_name), "sha", None)
+        kwargs = {"revision": requested} if requested else {}
+        resolved = getattr(HfApi().dataset_info(dataset_name, **kwargs), "sha", None)
     except Exception:
         resolved = None
+    if resolved is None and requested:
+        resolved = requested
     _REVISION_CACHE[key] = resolved
     return resolved
 
