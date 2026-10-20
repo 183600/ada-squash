@@ -175,7 +175,7 @@ _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tok
               'val_frac', 'test_frac', 'num_documents',
               'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file',
               'exclude_test_hash_file', 'group_key', 'exclude_group_file',
-              'exclude_test_group_file')
+              'exclude_test_group_file', 'train_shuffle_buffer')
 
 def _ledger_identity(path):
     if not path:
@@ -764,6 +764,7 @@ def main():
     p.add_argument('--resume-skip-data', action='store_true', help='do NOT fast-forward the training dataloader past the batches the checkpoint already consumed (the resumed run then replays training data)')
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
+    seed_explicit = args.seed is not None or args.seeds is not None
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [DEFAULT_SEED])
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
@@ -789,6 +790,20 @@ def main():
     if args.resume:
         resume_ckpt = _load_checkpoint_cpu(args.resume)
         run_args = resume_ckpt.get('args') or {}
+        # The seed determines the training shuffle order (and, for an old
+        # checkpoint without RNG state, the stochastic stream). Treat it like
+        # the split-defining args: resume the recorded seed unless the user
+        # explicitly asked for a different one.
+        saved_seed = run_args.get('seed')
+        if isinstance(saved_seed, int) and not isinstance(saved_seed, bool):
+            if seed_explicit:
+                if args.seed != saved_seed:
+                    print(f'[resume] keeping your explicit seed override {args.seed} '
+                          f'(checkpoint seed={saved_seed}); the resumed run differs from '
+                          f'the one it continues')
+            elif args.seed != saved_seed:
+                print(f'[resume] seed restored from checkpoint: {args.seed} -> {saved_seed}')
+                args.seed = saved_seed
         resume_kept = []
         for name in _RESUME_RUN_ARGS:
             if name not in run_args:
