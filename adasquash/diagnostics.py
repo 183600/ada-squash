@@ -136,6 +136,19 @@ def diagnose_train_val_curve(
 
     raw_train = [float(v) for v in train_losses if v is not None]
     raw_val = [float(v) for v in val_losses if v is not None]
+    # `val_stderr` is parallel to the caller's (unfiltered) `val_losses`: a
+    # `None`/NaN slot still occupies its position. Filter it with the same
+    # finite mask as `val_losses` so the surviving stderr entries stay aligned
+    # with the surviving losses.
+    val_stderr_series = None
+    if val_stderr is not None:
+        if len(val_stderr) != len(val_losses):
+            raise ValueError("val_stderr must be parallel to val_losses")
+        val_stderr_series = [
+            None if se is None else float(se)
+            for v, se in zip(val_losses, val_stderr)
+            if v is not None and math.isfinite(float(v))
+        ]
     # Indices are into the caller's arrays (counting any None entries), so the
     # report points at the curve position the reader can look up.
     bad_train = [i for i, v in enumerate(train_losses)
@@ -146,15 +159,6 @@ def diagnose_train_val_curve(
     val_losses = [v for v in raw_val if math.isfinite(v)]
     train_steps = list(train_steps) if train_steps is not None else []
     val_steps = list(val_steps) if val_steps is not None else []
-    val_stderr_series = None
-    if val_stderr is not None:
-        if len(val_stderr) != len(val_losses):
-            raise ValueError("val_stderr must be parallel to val_losses")
-        val_stderr_series = [
-            None if se is None else float(se)
-            for v, se in zip(raw_val, val_stderr)
-            if math.isfinite(v)
-        ]
 
     out = {
         "classification": "insufficient_data",
