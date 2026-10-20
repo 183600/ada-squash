@@ -512,7 +512,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         losses.append(loss_val)
         if step % args.log_every == 0:
             print(f'  [step {step:4d}] loss={loss_val:.4f}', flush=True)
-        if curve_every > 0 and (step + 1) % curve_every == 0:
+        if curve_every > 0 and ((step + 1) % curve_every == 0 or step + 1 == args.max_steps):
             window = losses[curve_window_start:]
             curve_window_start = len(losses)
             train_point = sum(window) / max(1, len(window))
