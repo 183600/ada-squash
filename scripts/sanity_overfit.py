@@ -488,6 +488,7 @@ def main():
     p.add_argument("--loss-threshold", type=float, default=None)
     p.add_argument("--acc-threshold", type=float, default=None)
     p.add_argument("--baseline-margin", type=float, default=0.05, help="required accuracy margin over the majority-class predictor (guards the metric, not the model)")
+    p.add_argument("--hypothesis", default=None, help="the scientific hypothesis this sanity check tests; recorded in the report manifest so a pass/fail is auditable as a test of a claim rather than a fishing trip")
     p.add_argument("--repro-check", action="store_true",
                    help="retrain the same configuration a second time in-process and require a bit-identical loss curve / accuracy: a direct same-machine seed-stability check (fails if the RNGs, thread counts or kernels introduce run-to-run variance)")
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
@@ -512,6 +513,8 @@ def main():
     if args.log_every < 1:
         p.error(f"--log-every {args.log_every} must be >= 1")
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if args.hypothesis:
+        print(f"[sanity][hypothesis] {args.hypothesis}")
     results = []
     for norm in args.norms:
         print(f"[sanity] task={args.task} model={args.model} norm={norm} device={device}")
@@ -569,6 +572,7 @@ def main():
                       f"{result['gradients']['zero_grad_unaccounted']}")
     report = {
         "passed": all(r["passed"] for r in results),
+        "hypothesis": args.hypothesis,
         "run_metadata": collect_run_metadata(seed=args.seed),
         "config": vars(args),
         "results": results,

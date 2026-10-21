@@ -345,6 +345,7 @@ def main():
     p.add_argument('--max-test-tvd', type=float, default=None, help="fail (exit 1) when train-vs-test token total-variation distance exceeds this; the test split backs the final reported number, so unchecked drift there changes what that number measures")
     p.add_argument('--max-val-test-tvd', type=float, default=None, help="fail (exit 1) when validation-vs-test token total-variation distance exceeds this; the model is selected on validation and reported on test, so drift between the two held-out slices makes the selected checkpoint a poorer fit for the number finally reported")
     p.add_argument('--output', default='runs/data_audit.json')
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this audit tests; recorded in the report and manifest so the result is auditable as a test of a claim rather than a fishing trip')
     args = p.parse_args()
     if (args.write_train_group_file or args.write_val_group_file) and not args.group_key:
         raise SystemExit('--write-*-group-file requires --group-key')
@@ -433,7 +434,7 @@ def main():
             None if splits['train']['doc_chars_mean'] is None or splits['validation']['doc_chars_mean'] is None
             else splits['validation']['doc_chars_mean'] - splits['train']['doc_chars_mean']),
     }
-    out = {'options': vars(args), 'run_metadata': collect_run_metadata(),
+    out = {'options': vars(args), 'hypothesis': args.hypothesis, 'run_metadata': collect_run_metadata(),
            'split_reports': reports, 'split_chronology_problems': chronology,
            'cleaning_and_sanity': splits, 'distribution_shift': shift,
            'train_hash_ledger': train_ledger_info,
@@ -461,6 +462,8 @@ def main():
     print(f"[audit] token TVD train-vs-val={shift['train_vs_validation_tvd']:.4f} "
           f"train-vs-test={shift['train_vs_test_tvd']:.4f} "
           f"val-vs-test={shift['validation_vs_test_tvd']:.4f}")
+    if args.hypothesis:
+        print(f"[audit][hypothesis] {args.hypothesis}")
     print(f"[audit] saved to {args.output}")
     problems = list(chronology)
     for name in ('train', 'validation', 'test'):
@@ -511,6 +514,7 @@ def main():
         problems.append(f"validation-vs-test distribution shift TVD={shift['validation_vs_test_tvd']:.4f} > max-val-test-tvd={args.max_val_test_tvd}")
     manifest = {
         'run_metadata': out['run_metadata'],
+        'hypothesis': args.hypothesis,
         'dataset': args.dataset,
         'dataset_config': args.dataset_config,
         'tokenizer': args.tokenizer,

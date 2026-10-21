@@ -307,6 +307,7 @@ def main():
     p.add_argument('--decode-batch', type=int, default=8, help='independent needle trials decoded per forward pass (each step still recomputes the whole prefix)')
     p.add_argument('--seed', type=int, default=0, help='seed for the needle-position and generation RNGs')
     p.add_argument('--output', default=None)
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests; recorded in the manifest so a pass/fail is auditable as a test of a claim rather than a fishing trip')
     args = p.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(args.seed)
@@ -373,6 +374,7 @@ def main():
                   f"confidence: {needle['failure_confidence']} "
                   f"(per-trial bad-case records in the results JSON)")
     results['seed'] = args.seed
+    results['hypothesis'] = args.hypothesis
     results['hyperparameters'] = vars(args)
     results['run_metadata'] = collect_run_metadata(seed=args.seed)
     out = args.output or Path(args.ckpt).parent / 'eval_results.json'
@@ -382,6 +384,7 @@ def main():
     # results file, which is fingerprinted here rather than duplicated.
     manifest = dict(results['run_metadata'])
     manifest['hyperparameters'] = vars(args)
+    manifest['hypothesis'] = args.hypothesis
     manifest['checkpoint'] = file_fingerprint(args.ckpt)
     manifest['results_file'] = file_fingerprint(out)
     manifest['summary'] = {k: results[k] for k in
@@ -397,6 +400,8 @@ def main():
     else:
         manifest = finish_metadata(manifest)
     save_run_manifest(Path(out).with_name('eval_manifest.json'), manifest)
+    if args.hypothesis:
+        print(f'[eval][hypothesis] {args.hypothesis}')
     print(f'[eval] results saved to {out}')
     if args.tasks and not results.get('tasks_ran', False):
         print(f'[eval] ERROR: tasks {args.tasks} were requested but lm-eval did not run them; '
