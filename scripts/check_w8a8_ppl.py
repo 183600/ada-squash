@@ -173,12 +173,21 @@ def compute_ce_sum(model, batch, target, device='cuda'):
     loss = model(batch, target, return_logits=False)[1]
     return (loss.detach().double() * n.double(), n)
 
+def _exp_or_inf(value: float) -> float:
+    try:
+        return math.exp(value)
+    except OverflowError:
+        # A finite but huge CE is a diverged model, not a reason to abort the
+        # probe: record the PPL as non-finite and let the seed-level filter
+        # report it instead of crashing mid-run.
+        return math.inf
+
 def compute_ppl(model, batch, target, device='cuda'):
     ce, n = compute_ce_sum(model, batch, target, device=device)
     n_val = int(n.item())
     if n_val == 0:
         raise ValueError('probe batch contains no valid target tokens')
-    return math.exp(float(ce) / n_val)
+    return _exp_or_inf(float(ce) / n_val)
 
 def probe_token_coverage(batches) -> float:
     n_pos = 0
@@ -602,8 +611,8 @@ def main():
                 for x, y in pairs:
                     b, _ = compute_ce_sum(model, x, y, device=device)
                     ce_q += b
-                ppl_fp = math.exp(float(ce_fp) / n_tok_val)
-                ppl_q = math.exp(float(ce_q) / n_tok_val)
+                ppl_fp = _exp_or_inf(float(ce_fp) / n_tok_val)
+                ppl_q = _exp_or_inf(float(ce_q) / n_tok_val)
                 per_seed.append({'ckpt': ckpt_path, 'probe': args.probe, 'probe_split': args.probe_split if args.probe == 'dataset' else None, 'seed': seed, 'ppl_fp': ppl_fp, 'ppl_w8a8': ppl_q, 'ppl_drop': ppl_q - ppl_fp, 'ppl_drop_pct': 100.0 * (ppl_q - ppl_fp) / ppl_fp, 'probe_token_coverage': coverage})
             r_ckpt = aggregate_w8a8_seed_rows(ckpt_path, per_seed)
             if args.probe == 'dataset' and args.probe_split != 'validation':
