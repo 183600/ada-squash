@@ -680,8 +680,12 @@ def main():
             continue
         verdict = 'A more stable' if t['significant'] and t['mean_delta'] < 0 else ('B more stable' if t['significant'] else 'inside the noise')
         if not t.get('certifiable'):
-            verdict = (f'descriptive only ({t.get("n_shared_train_seeds", 0)} shared '
-                       'training seed(s); >= 3 required)')
+            if t.get('basis') == 'independent_random_inits':
+                verdict = (f'descriptive only ({t.get("n_shared_seeds", 0)} shared '
+                           'probe/init draw(s); >= 3 required)')
+            else:
+                verdict = (f'descriptive only ({t.get("n_shared_train_seeds", 0)} shared '
+                           'training seed(s); >= 3 required)')
         print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4g}, 95% CI [{t['ci_low']:+.4g}, {t['ci_high']:+.4g}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}, basis={t['basis']}) -> {verdict}")
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
