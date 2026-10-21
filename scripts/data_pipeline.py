@@ -54,6 +54,7 @@ signature (the split / cleaning knobs travel through
 `configure_data_options`) so stubs that monkeypatch it in tests keep
 working.
 """
+import base64
 import hashlib
 import json
 import math
@@ -715,15 +716,34 @@ class PackedStream(IterableDataset):
 
 
 class _JsonlDocumentStream(IterableDataset):
-    """Re-iterable raw-document stream backed by a materialized cache file."""
+    """Re-iterable raw-document stream backed by a materialized cache file.
+
+    The cache stores the raw `text` value with its type: a `bytes` document is
+    base64-tagged and restored as `bytes` instead of being silently decoded to
+    `str`.  Without that, a document the streaming cleaner drops as
+    non-string would be kept when the held-out slice is served from cache -
+    the same corpus would then clean differently with and without the cache.
+    """
 
     def __init__(self, path: Path):
         self.path = str(path)
 
+    @staticmethod
+    def _restore(record):
+        if not isinstance(record, dict):
+            return record
+        text = record.get("text")
+        if record.get("text_encoding") == "base64" and isinstance(text, str):
+            try:
+                return {"text": base64.b64decode(text)}
+            except (ValueError, TypeError):
+                return {"text": text}
+        return record
+
     def __iter__(self):
         with open(self.path, "r", encoding="utf-8") as f:
             for line in f:
-                yield json.loads(line)
+                yield self._restore(json.loads(line))
 
 
 _VERIFIED_CACHES: dict = {}
@@ -814,8 +834,11 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     (sha256 + document count) into a `.meta.json` sidecar and echoed into
     `report['materialized_cache_fingerprint']`, so a run manifest pins the
     concrete cached content, not only its name; before any reuse the payload
-    is verified against that fingerprint, and a cache that fails the check is
-    rebuilt instead of silently serving different held-out documents.
+    is verified against that fingerprint *and* against the declared split
+    `count`, and a cache that fails either check is rebuilt instead of
+    silently serving different or truncated held-out documents.  The payload
+    preserves the type of the raw `text` field (`bytes` included), so the
+    cached and directly streamed splits clean identically.
     """
     start, count = report.get("start"), report.get("count")
     if not start or not count:
@@ -835,7 +858,7 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
         return stream_ds, None
     key = json.dumps(
         {
-            "version": 2,
+            "version": 3,
             "dataset": dataset_name,
             "dataset_config": dataset_config,
             "split": split,
@@ -855,16 +878,22 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     meta_path = cache_path.with_name(cache_path.name + ".meta.json")
     if cache_path.exists():
         fingerprint = _read_cache_fingerprint(meta_path)
-        if fingerprint is not None and _cache_matches(cache_path, fingerprint):
+        cached_documents = None if fingerprint is None else fingerprint.get("documents")
+        if (fingerprint is not None and _cache_matches(cache_path, fingerprint)
+                and isinstance(cached_documents, int)
+                and not isinstance(cached_documents, bool)
+                and cached_documents == int(count)):
             report["materialized_cache_fingerprint"] = fingerprint
             return _JsonlDocumentStream(cache_path), cache_path
-        # A cache without a matching sidecar cannot be trusted (truncated or
-        # edited payload, or a foreign file under the same key): rebuild it
-        # from the upstream stream rather than silently changing the held-out
-        # documents behind the manifest's fingerprint.
+        # A cache without a matching sidecar, or one holding a different
+        # number of documents than the declared split range, cannot be
+        # trusted (truncated/edited payload, moved boundary, or a foreign
+        # file under the same key): rebuild it from the upstream stream
+        # rather than silently changing the held-out documents behind the
+        # manifest's fingerprint.
         print(f"[data] held-out cache {cache_path} failed its fingerprint check "
-              f"(missing/foreign .meta.json or changed content); rebuilding it",
-              file=sys.stderr)
+              f"(missing/foreign .meta.json, changed content, or document count "
+              f"{cached_documents} != {count}); rebuilding it", file=sys.stderr)
         report["materialized_cache_rebuilt"] = True
     root.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
@@ -874,20 +903,36 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
         with open(tmp, "w", encoding="utf-8") as f:
             for example in stream_ds:
                 if isinstance(example, dict):
-                    # Only `text` is read downstream; typing is preserved
-                    # exactly (None / NaN / non-string included) so the
-                    # cleaner's drop counters stay identical. Raw bytes are
-                    # not JSON-serializable: decode them once when building
-                    # the text-only cache instead of aborting the split.
+                    # Only `text` is read downstream; its type is preserved
+                    # exactly (None / NaN / bytes / non-string included) so
+                    # the cleaner's drop counters stay identical with and
+                    # without the cache. Raw bytes are not directly
+                    # JSON-serializable, so they travel base64-tagged and are
+                    # restored as bytes by `_JsonlDocumentStream`.
                     text = example.get("text")
                     if isinstance(text, (bytes, bytearray)):
-                        text = bytes(text).decode("utf-8", errors="replace")
-                    line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
+                        line = json.dumps(
+                            {"text": base64.b64encode(bytes(text)).decode("ascii"),
+                             "text_encoding": "base64"},
+                            ensure_ascii=False) + "\n"
+                    else:
+                        line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
                 else:
                     line = "null\n"
                 f.write(line)
                 hasher.update(line.encode("utf-8"))
                 n_documents += 1
+        if n_documents != int(count):
+            # The declared chronological slice could not be filled: the
+            # upstream stream is shorter than its reported document count (or
+            # the boundary was moved). Serving the short slice would silently
+            # evaluate on a different range than the manifest claims.
+            raise ValueError(
+                f"the {split} split expected {count} documents from the upstream "
+                f"stream but only {n_documents} were available; refusing to "
+                f"materialize a truncated held-out cache. Check that "
+                f"--num-documents matches the actual stream and that the dataset "
+                f"revision is unchanged.")
         os.replace(tmp, cache_path)
     finally:
         if tmp.exists():
@@ -897,7 +942,7 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
                 pass
     fingerprint = {
         "path": str(cache_path),
-        "version": 2,
+        "version": 3,
         "dataset": dataset_name,
         "split": split,
         "dataset_revision_resolved": resolved_revision,
