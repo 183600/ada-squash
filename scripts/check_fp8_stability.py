@@ -472,7 +472,12 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                 else:
                     t['basis'] = ('probe_paired_single_train_run' if trained
                                   else 'independent_random_inits')
-                    t['certifiable'] = not trained
+                    # In random-init mode each seed is an independent (init,
+                    # probe) draw, so it is a legitimate run-to-run unit - but
+                    # only once there are at least three of them. Two draws
+                    # give df=1 and must stay descriptive, exactly like two
+                    # shared training seeds.
+                    t['certifiable'] = (not trained) and len(shared) >= MIN_SEEDS_FOR_SIGNIFICANCE
                     t['n_shared_train_seeds'] = len(shared_train)
                     t['shared_train_seeds'] = shared_train
                     t['n_shared_seeds'] = len(shared)
@@ -483,6 +488,12 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                         t['reason'] = 'need >= 2 shared samples to pair a test'
                     else:
                         t.update(paired_t_one_sided(av, bv, alpha=alpha))
+                    if not trained and len(shared) < MIN_SEEDS_FOR_SIGNIFICANCE:
+                        t['reason'] = '; '.join(filter(None, (
+                            t.get('reason'),
+                            f'only {len(shared)} shared probe draw(s): fewer than the required '
+                            f'{MIN_SEEDS_FOR_SIGNIFICANCE} independent (init, probe) draws, so '
+                            'the test is descriptive only')))
                     if trained:
                         # Append, never replace: with too few shared probe
                         # samples *and* one training run per arm, both reasons
