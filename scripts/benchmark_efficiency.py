@@ -304,21 +304,32 @@ def _cfg_key(model_name: str, cfg_kwargs: dict) -> str:
     return json.dumps(dataclasses.asdict(cfg), sort_keys=True)
 
 
-def load_significance(comparison_path) -> dict:
-    """Per-row `beats_reference_significantly` from baseline_comparison.json.
+def load_significance(comparison_path, expected_reference: str | None = None) -> dict:
+    """Per-row significance metadata from baseline_comparison.json.
 
     A point-estimate gain that the ablation runner could not call significant
     (Holm-adjusted) is weak evidence, so the trade-off verdict must be able
     to see it - otherwise a noise-level delta could be reported as a costed
-    win.
+    win. The comparison's own `reference` row is returned as well: significance
+    against a *different* baseline than the one used for the trade-off delta
+    is not evidence for this claim, so the caller must be able to reject it
+    instead of silently attaching it to the candidate.
     """
+    out = {
+        'rows': {},
+        'reference': None,
+        'reference_matches': expected_reference is None,
+        'path': str(comparison_path) if comparison_path else None,
+    }
     if not comparison_path or not Path(comparison_path).exists():
-        return {}
+        return out
     data = json.loads(Path(comparison_path).read_text())
-    out = {}
+    out['reference'] = data.get('reference')
+    if expected_reference is not None:
+        out['reference_matches'] = data.get('reference') == expected_reference
     for row in (data.get('rows') or []):
         if isinstance(row, dict) and row.get('name') is not None:
-            out[row['name']] = {
+            out['rows'][row['name']] = {
                 'beats_reference_significantly': row.get('beats_reference_significantly'),
                 'p_one_sided': row.get('p_one_sided'),
                 'p_one_sided_holm': row.get('p_one_sided_holm'),
@@ -415,9 +426,20 @@ def main():
         if comparison_path is None:
             sibling = Path(args.summaries).with_name('baseline_comparison.json')
             comparison_path = str(sibling) if sibling.exists() else None
-        significance = load_significance(comparison_path)
-        if significance:
-            print(f"[tradeoff] significance gate -> {comparison_path}")
+        sig_bundle = load_significance(comparison_path, expected_reference=args.reference_name)
+        significance = sig_bundle['rows']
+        if significance and sig_bundle['reference_matches']:
+            print(f"[tradeoff] significance gate -> {comparison_path} "
+                  f"(reference row: {sig_bundle['reference']})")
+        elif significance:
+            print(f"[tradeoff][warn] baseline_comparison.json tests against "
+                  f"reference row '{sig_bundle['reference']}', but the trade-off "
+                  f"delta uses '{args.reference_name}'. Significance against a "
+                  f"different baseline cannot certify this claim, so the gate is "
+                  f"UNVERIFIED (report-only point estimates). Re-run the comparison "
+                  f"with --baselines {args.reference_name}, or point --reference-name "
+                  f"at the comparison's reference.")
+            significance = {}
         else:
             print("[tradeoff][warn] no usable baseline_comparison.json row found; "
                   "the significance gate is UNVERIFIED, so no candidate can be "
@@ -520,6 +542,8 @@ def main():
         tradeoff = {
             'summaries': args.summaries,
             'comparison': comparison_path,
+            'comparison_reference_row': sig_bundle['reference'],
+            'comparison_reference_matches': bool(sig_bundle['reference_matches']),
             'reference_row': args.reference_name,
             'reference_norm': args.reference,
             'min_loss_gain': args.min_loss_gain,
