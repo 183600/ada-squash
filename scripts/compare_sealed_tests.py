@@ -181,6 +181,17 @@ def _manifest_ledger_content(manifest: dict):
             out[key] = fingerprint
     return out
 
+def _ledger_verified(value) -> bool:
+    """True only when the record carries a content hash (or records no file)."""
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    if value.get("exists") is not True:
+        return True
+    sha = value.get("sha256")
+    return isinstance(sha, str) and bool(sha)
+
 def _ledger_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     a = _manifest_ledger_content(ref_manifest)
     b = _manifest_ledger_content(other_manifest)
@@ -192,7 +203,10 @@ def _ledger_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     missing = "<missing>"
     return {f"data.{key}": [a[key], b[key]]
             for key in _LEDGER_MANIFEST_KEYS
-            if a[key] == missing or b[key] == missing or a[key] != b[key]}
+            if (a[key] == missing or b[key] == missing
+                or a[key] != b[key]
+                or not _ledger_verified(a[key])
+                or not _ledger_verified(b[key]))}
 
 def pairing_mismatches(ref: dict, other: dict) -> dict:
     """Keys whose values differ between the two runs' data-protocol blocks."""
