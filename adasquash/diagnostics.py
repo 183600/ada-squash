@@ -23,6 +23,7 @@ Everything here is import-light (torch only) so the training entrypoints can
 call it at the moment of failure; the pure classification functions take
 plain dicts/lists and are unit-testable without a model.
 """
+import bisect
 import math
 from typing import Optional, Sequence
 
@@ -77,6 +78,36 @@ def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]
     first, last = tail[0], tail[-1]
     return (last - first) / max(abs(first), 1e-8)
 
+
+def _step_aligned_gap_points(train_losses, val_losses, train_steps, val_steps):
+    """Gap at each validation pass, paired with the latest train loss at/before its step.
+
+    Train and validation are often logged at different cadences, so zipping
+    the two lists by position compares losses from different steps. When both
+    step arrays are available and parallel to their loss arrays, align them;
+    otherwise return ``None`` so the caller keeps the positional fallback.
+    """
+    if (train_steps is None or val_steps is None
+            or len(train_steps) != len(train_losses)
+            or len(val_steps) != len(val_losses)):
+        return None
+    train_pairs = sorted(
+        (float(step), float(loss)) for step, loss in zip(train_steps, train_losses)
+        if loss is not None and math.isfinite(float(loss))
+    )
+    val_pairs = sorted(
+        (float(step), float(loss)) for step, loss in zip(val_steps, val_losses)
+        if loss is not None and math.isfinite(float(loss))
+    )
+    if not train_pairs or not val_pairs:
+        return None
+    train_steps_sorted = [step for step, _ in train_pairs]
+    gaps = []
+    for val_step, val_loss in val_pairs:
+        index = bisect.bisect_right(train_steps_sorted, val_step) - 1
+        if index >= 0:
+            gaps.append(val_loss - train_pairs[index][1])
+    return gaps or None
 
 def _trend(rel: Optional[float], min_rel_improvement: float, worsen_rel_tolerance: float) -> str:
     if rel is None:
@@ -205,7 +236,12 @@ def diagnose_train_val_curve(
 
     train_rel = relative_change(train_losses, window)
     val_rel = relative_change(val_losses, window)
-    gap_points = [v - t for t, v in zip(train_losses[-len(val_losses):], val_losses)] if len(train_losses) >= len(val_losses) else []
+    gap_points = _step_aligned_gap_points(
+        train_losses, val_losses, train_steps, val_steps)
+    gap_alignment = "steps" if gap_points is not None else "position"
+    if gap_points is None:
+        gap_points = ([v - t for t, v in zip(train_losses[-len(val_losses):], val_losses)]
+                      if len(train_losses) >= len(val_losses) else [])
     gap = gap_points[-1] if gap_points else None
     gap_change = relative_change(gap_points, window) if len(gap_points) >= 2 else None
     train_trend = _trend(train_rel, min_imp, worsen)
@@ -232,8 +268,9 @@ def diagnose_train_val_curve(
     # the validation-difference noise. Without this check a flat val curve
     # with a wide stderr can produce an "overfitting" verdict from a gap move
     # the held-out sample cannot resolve.
-    gap_change_abs = (gap_points[-1] - gap_points[-tail_len]
-                      if tail_len >= 2 and len(gap_points) >= tail_len else None)
+    gap_tail_len = min(window, len(gap_points))
+    gap_change_abs = (gap_points[-1] - gap_points[-gap_tail_len]
+                      if gap_tail_len >= 2 else None)
     gap_change_within_noise = (
         None if val_noise_threshold is None or gap_change_abs is None
         else abs(gap_change_abs) <= val_noise_threshold
@@ -365,6 +402,7 @@ def diagnose_train_val_curve(
             "train_losses_tail": train_losses[-window:],
             "val_losses_tail": val_losses[-window:],
             "log_vocab_size": log_vocab_size,
+            "gap_alignment": gap_alignment,
             "val_change": val_change,
             "val_stderr_tail": (None if val_stderr_series is None
                                 else val_stderr_series[-tail_len:]),
@@ -647,7 +685,9 @@ def classify_nan_stage(evidence: dict) -> dict:
             "recommendations": recommendations,
         }
 
-    if not evidence.get("data_finite", True):
+    if (not evidence.get("data_finite", True)
+            or evidence.get("loss_denominator_positive") is False
+            or evidence.get("loss_mask_nonempty") is False):
         return stage(
             "data",
             "the batch itself is invalid before it ever reaches the model",
@@ -662,7 +702,6 @@ def classify_nan_stage(evidence: dict) -> dict:
     if (evidence.get("fp32_forward_finite") is False
             or evidence.get("fp32_logits_finite") is False
             or evidence.get("first_nonfinite_modules")
-            or evidence.get("loss_denominator_positive") is False
             or evidence.get("forward_error")):
         first = evidence.get("first_nonfinite_modules") or []
         where = ", ".join(f"{m['module']}({m['class']})" for m in first) or "unknown module"
@@ -809,7 +848,6 @@ def triage_nonfinite(
         evidence.get("fp32_forward_finite") is False
         or evidence.get("fp32_logits_finite") is False
         or evidence.get("first_nonfinite_modules")
-        or evidence.get("loss_denominator_positive") is False
         or "forward_error" in evidence
     )
     if stage2_bad:
