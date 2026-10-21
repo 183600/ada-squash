@@ -324,7 +324,9 @@ def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
     in `m`.
     """
     indexed = sorted(
-        (float(p), i) for i, p in enumerate(pvalues) if p is not None
+        (float(p), i) for i, p in enumerate(pvalues)
+        if p is not None and isinstance(p, (int, float))
+        and not isinstance(p, bool) and math.isfinite(float(p))
     )
     m = len(indexed)
     adjusted: list[Optional[float]] = [None] * len(pvalues)
