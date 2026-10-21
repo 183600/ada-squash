@@ -57,6 +57,8 @@ _REDUCE_CHUNK_ELEMS = 1 << 22
 def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim <= 1:
         return a * b
+    if a.shape[-1] == 0:
+        return a.new_zeros(a.shape[-1])
     if a.ndim == 2 and a.is_contiguous() and b.is_contiguous() and a.numel() <= _REDUCE_CHUNK_ELEMS:
         # Larger shapes take the chunked branches below.
         acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
