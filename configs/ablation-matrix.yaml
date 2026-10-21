@@ -142,6 +142,15 @@ ablations:
       default should not be beaten by it on this synthetic corpus.
 
   # --- Attention logits axis: DyT-QK (Variant C) ---
+  - name: ln_qk
+    norm: ln
+    qk_norm: dytqk
+    hypothesis: >
+      Attention-logits axis, standalone on LayerNorm baseline: adding the
+      tanh Q/K scalar squashing to LayerNorm changes exactly qk_norm, so a
+      held-out-loss reduction is attributable to the QK squashing alone
+      rather than to an interaction with the DyT-CD stack. Mirrors rmsnorm_qk
+      for the other simple baseline.
   - name: rmsnorm_qk
     norm: rmsnorm
     qk_norm: dytqk

@@ -150,6 +150,7 @@ ABLATION_HYPOTHESES = {
     'rmsnorm_qk': 'Attention-logits axis, standalone: adding the tanh Q/K scalar squashing to the strongest simple baseline (RMSNorm) changes exactly qk_norm, so a held-out-loss reduction is attributable to the QK squashing alone rather than to an interaction with the DyT-CD stack.',
     'dytcd_qk': 'Leave-one-out for the attention-logits axis of the proposal (DyT-QK, Variant C) in combination: with the norm stack, optimizer, data and qk_alpha_init (shared default 1.0) identical to dytcd_full, the only effective difference is qk_norm = dytqk, so the paired Full-minus-QK contrast attributes any held-out-loss change to the tanh Q/K squashing alone.',
     'dytcd_qknorm': 'QK-Norm comparator for the attention-logits axis: per-head RMSNorm on Q/K is the standard alternative the DyT-QK variant claims to sharpen, run on the identical protocol so a dytcd_qk win is only credited if it also beats this comparator, not just the no-QK row.',
+    'ln_qk': 'Attention-logits axis, standalone on LayerNorm baseline: adding the tanh Q/K scalar squashing to LayerNorm changes exactly qk_norm, so a held-out-loss reduction is attributable to the QK squashing alone rather than to an interaction with the DyT-CD stack. Mirrors rmsnorm_qk for the other simple baseline.',
 }
 _MODEL_BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
 _ABLATION_METADATA_KEYS = ('hypothesis',)
@@ -213,6 +214,10 @@ LOO_SPEC = {
         'qk_squash': {'row': 'rmsnorm_baseline',
                       'diff': ('qk_norm',)},
     },
+    'ln_qk': {
+        'qk_squash': {'row': 'ln_baseline',
+                      'diff': ('qk_norm',)},
+    },
     'dytcd_qk': {
         'qk_squash': {'row': 'dytcd_full',
                       'diff': ('qk_norm',)},
@@ -227,10 +232,24 @@ LOO_SPEC = {
 # rather than assuming it from Full's point estimate. `check_factorial`
 # verifies that switching a factor changes exactly its declared knobs in both
 # arms of the other factor, so a confounded cell is rejected before training.
+#
+# WARNING: This factorial has a known implementation confound. The "neither"
+# and "depth" cells (dytd_k0_no_depth_schedule, dytd_full) use the fused
+# DyT-D kernel (_DyTDForward), while the "per_channel" and "both" cells
+# (dytc_perchannel_tanh_k0, dytcd_no_softsign) use the plain-autograd
+# DyTCDTanh comparator. The per_channel factor therefore compares fused vs
+# plain implementations, not just the per-channel axis. The interaction term
+# is similarly confounded. Results are descriptive only and MUST NOT be used
+# to certify a synergy claim. A clean factorial would require either a fused
+# DyTCDTanh kernel or a plain-autograd DyT-D, neither of which exists in the
+# fixed kernel family (D3).
 FACTORIAL_SPEC = {
     'per_channel_x_depth_tanh': {
         'context': ('tanh activation family, LayerScale on, same gamma/beta and '
-                    'same alpha/k initialization context across the four cells'),
+                    'same alpha/k initialization context across the four cells. '
+                    'KNOWN CONFOUND: per_channel factor mixes fused (DyT-D) and '
+                    'plain-autograd (DyTCDTanh) implementations; interaction '
+                    'term is confounded. Descriptive only - not certified.'),
         'cells': {
             'neither': 'dytd_k0_no_depth_schedule',
             'per_channel': 'dytc_perchannel_tanh_k0',
@@ -1250,6 +1269,10 @@ def print_baseline_comparison(comparison: dict | None) -> None:
                 direction += f" tied={entry['n_seeds_tied']}"
         mde = entry.get('minimum_detectable_delta_95_power80')
         mde_str = '' if mde is None else f" mde80={mde:.4f}"
+        power_warn = ''
+        if mde is not None and entry.get('delta_vs_reference') is not None:
+            if abs(entry['delta_vs_reference']) < mde:
+                power_warn = ' [UNDERPOWERED: |delta| < mde80]'
         regimes = entry.get('curve_classification_counts')
         regime_note = ''
         if regimes:
@@ -1262,7 +1285,7 @@ def print_baseline_comparison(comparison: dict | None) -> None:
               f"delta={entry['delta_vs_reference']:+.4f}{ci_str} p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{basis}{direction}{mde_str} "
               f"beats={entry['beats_reference']} "
-              f"significant={entry['beats_reference_significantly']}{note}{regime_note}")
+              f"significant={entry['beats_reference_significantly']}{note}{regime_note}{power_warn}")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[compare] NOTE: tests with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are "
               f"described but never certified: {comparison['rows_tested_descriptively_only']}")
@@ -1532,6 +1555,10 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
                 direction += f" tied={entry['n_seeds_tied']}"
         mde = entry.get('minimum_detectable_delta_95_power80')
         mde_str = '' if mde is None else f" mde80={mde:.4f}"
+        power_warn = ''
+        if mde is not None and entry.get('delta_full_minus_reference') is not None:
+            if abs(entry['delta_full_minus_reference']) < mde:
+                power_warn = ' [UNDERPOWERED: |delta| < mde80]'
         regime_note = ''
         for label, key in (('full', 'full_curve_classification_counts'),
                            ('ref', 'reference_curve_classification_counts')):
@@ -1547,7 +1574,7 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
               f"p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{entry.get('test_basis') or '-'}{direction}{mde_str} "
               f"removing_hurts={entry['mechanism_helps']} "
-              f"significant={entry['mechanism_helps_significantly']}{note}{regime_note}")
+              f"significant={entry['mechanism_helps_significantly']}{note}{regime_note}{power_warn}")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[loo] NOTE: tests with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are described "
               f"but never certified: {comparison['rows_tested_descriptively_only']}")
@@ -1708,13 +1735,17 @@ def print_factorial_comparison(comparison: dict | None) -> None:
         ci_str = '' if ci is None else f"ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}] "
         mde = entry.get('minimum_detectable_delta_95_power80')
         mde_str = '' if mde is None else f"mde80={mde:.4f} "
+        power_warn = ''
+        if mde is not None and entry.get('delta_seed_mean') is not None:
+            if abs(entry['delta_seed_mean']) < mde:
+                power_warn = ' [UNDERPOWERED: |delta| < mde80]'
         note = '' if entry['replicated_across_seeds'] else ' [descriptive only, not certified]'
         print(f"[factorial] {entry['design']} {entry['kind']} {entry['effect']}: "
               f"delta={entry['delta_seed_mean']:+.4f} {ci_str}"
               f"seeds_favoring={entry['n_seeds_favoring']}/{entry['n_seeds']} "
               f"p(one-sided)={p_str} p(holm)={p_holm_str} {mde_str}"
               f"helps={entry['effect_helps']} "
-              f"significant={entry['effect_helps_significantly']}{note}")
+              f"significant={entry['effect_helps_significantly']}{note}{power_warn}")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[factorial] NOTE: terms with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared "
               f"seeds are described but never certified: "
