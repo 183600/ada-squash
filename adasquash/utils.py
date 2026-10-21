@@ -269,12 +269,16 @@ class LossSpikeCounter:
 def measure_activation_stats(model: nn.Module, batch: torch.Tensor) -> dict:
     stats = ActivationStats(model)
     stats.attach()
-    out = model(batch)
-    if isinstance(out, tuple):
-        out = out[0]
-    s = stats.summary()
-    stats.detach()
-    return s
+    try:
+        out = model(batch)
+        if isinstance(out, tuple):
+            out = out[0]
+        return stats.summary()
+    finally:
+        # A failed forward must not leave hooks bound to the model: later
+        # forwards would keep feeding stale meters (and duplicate the hooks
+        # on the next call).
+        stats.detach()
 
 def count_parameters(model: nn.Module, trainable_only: bool=False) -> int:
     return sum((p.numel() for p in model.parameters() if not trainable_only or p.requires_grad))
