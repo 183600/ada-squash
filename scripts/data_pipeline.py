@@ -157,6 +157,11 @@ def infer_num_documents(ds) -> int | None:
 _REVISION_CACHE: dict = {}
 
 
+def _is_pinned_revision(revision) -> bool:
+    text = str(revision or "")
+    return 7 <= len(text) <= 40 and all(c in "0123456789abcdefABCDEF" for c in text)
+
+
 def resolve_dataset_revision(dataset_name: str, revision=None) -> str | None:
     """Resolve the requested dataset revision to the concrete upstream commit.
 
@@ -771,9 +776,9 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     if root is None:
         return stream_ds, None
     resolved_revision = report.get("dataset_revision_resolved")
-    if not resolved_revision:
-        # Without a resolved revision the cache key would not pin the upstream
-        # commit, so this split is streamed directly and no cache is used.
+    if not _is_pinned_revision(resolved_revision):
+        # Without a resolved commit the cache key would not pin the upstream
+        # revision, so this split is streamed directly and no cache is used.
         print(f"[data] {split} cache disabled: the dataset revision is neither pinned "
               f"nor resolvable, so a cached slice could silently come from a different "
               f"upstream commit than the training stream", file=sys.stderr)
