@@ -213,6 +213,10 @@ def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
     out = []
     for norm in norms:
         norm_rows = [r for r in rows if r['norm'] == norm]
+        if len(norm_rows) != rounds:
+            raise ValueError(
+                f'norm {norm!r} has {len(norm_rows)} measured round(s), expected {rounds}; '
+                'refusing to average an incomplete interleaved benchmark')
         base = dict(norm_rows[0])
         for key in _LATENCY_MEAN_KEYS:
             base[key] = sum(r[key] for r in norm_rows) / len(norm_rows)
@@ -247,6 +251,7 @@ def load_losses(summaries_path: str) -> dict:
     for row in rows:
         if (isinstance(row, dict) and row.get('name') is not None
                 and isinstance(row.get('val_loss'), (int, float))
+                and not isinstance(row.get('val_loss'), bool)
                 and math.isfinite(float(row['val_loss']))):
             out[row['name']] = float(row['val_loss'])
     return out
