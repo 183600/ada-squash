@@ -1490,6 +1490,7 @@ def main():
         n_nonfinite_gradients = 0
         n_nonfinite_val_losses = 0
         nonfinite_streak = 0
+        nonfinite_val_streak = 0
         if resume_ckpt is not None:
             # These are counts over the whole run, like n_loss_spikes. A
             # resumed manifest that starts them at zero would hide the earlier
@@ -1503,6 +1504,8 @@ def main():
             n_nonfinite_losses = _saved_count('n_nonfinite_losses')
             n_nonfinite_gradients = _saved_count('n_nonfinite_gradients')
             n_nonfinite_val_losses = _saved_count('n_nonfinite_val_losses')
+            nonfinite_streak = _saved_count('nonfinite_streak')
+            nonfinite_val_streak = _saved_count('nonfinite_val_streak')
             if (n_nonfinite_losses or n_nonfinite_gradients
                     or n_nonfinite_val_losses):
                 print('[resume] restored non-finite event counts: '
@@ -1526,6 +1529,8 @@ def main():
                 'n_nonfinite_losses': int(n_nonfinite_losses),
                 'n_nonfinite_gradients': int(n_nonfinite_gradients),
                 'n_nonfinite_val_losses': int(n_nonfinite_val_losses),
+                'nonfinite_streak': int(nonfinite_streak),
+                'nonfinite_val_streak': int(nonfinite_val_streak),
                 'data_ledgers': _data_ledger_fingerprints(args),
             }
 
@@ -1536,17 +1541,23 @@ def main():
             `kind` names which quantity first went non-finite (loss, gradient,
             validation/test loss) but the probe order is always the same. The
             policy is shared: `abort` stops, `skip` discards the offending
-            step/point, and 5 consecutive events stop regardless.
+            step/point, and 5 consecutive events of the same kind stop
+            regardless. Training steps and held-out passes have separate
+            streaks: a successful training step must not erase a run of bad
+            validation passes (and vice versa).
             """
             nonlocal n_nonfinite_losses, n_nonfinite_gradients
             nonlocal n_nonfinite_val_losses, nonfinite_streak
+            nonlocal nonfinite_val_streak
             if kind == 'loss':
                 n_nonfinite_losses += 1
+                nonfinite_streak += 1
             elif kind == 'gradient':
                 n_nonfinite_gradients += 1
+                nonfinite_streak += 1
             else:
                 n_nonfinite_val_losses += 1
-            nonfinite_streak += 1
+                nonfinite_val_streak += 1
             lr_now = opt.param_groups[0]['lr']
             was_training = model.training
             if eval_mode:
@@ -1581,7 +1592,8 @@ def main():
                 event.update(extra)
             log_file.write(json.dumps(event, default=str) + '\n')
             log_file.flush()
-            if args.nonfinite_policy == 'abort' or nonfinite_streak >= 5:
+            if (args.nonfinite_policy == 'abort'
+                    or nonfinite_streak >= 5 or nonfinite_val_streak >= 5):
                 where = {
                     'loss': 'the training loss',
                     'gradient': 'the gradients after the backward pass',
@@ -1726,6 +1738,7 @@ def main():
                     _triage_nonfinite('validation_loss', step, *bad_val, eval_mode=True)
                     val_loss = None
                 if val_loss is not None:
+                    nonfinite_val_streak = 0
                     last_val_loss = val_loss
                     last_val_step = step
                     last_val_batches = val_batch_losses
