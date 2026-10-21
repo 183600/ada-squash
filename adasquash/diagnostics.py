@@ -896,6 +896,9 @@ def triage_nonfinite(
     # found, and running the model on it would only crash (or diagnose a
     # consequence of the data, not the cause).
     if not evidence["data_finite"]:
+        model.zero_grad(set_to_none=True)
+        if was_training:
+            model.train()
         verdict = classify_nan_stage(evidence)
         return {"evidence": evidence, **verdict}
 
@@ -916,6 +919,9 @@ def triage_nonfinite(
     except Exception as exc:  # diagnosis must never mask the original failure
         evidence["parameter_report_error"] = repr(exc)
     if evidence.get("parameters_finite") is False:
+        model.zero_grad(set_to_none=True)
+        if was_training:
+            model.train()
         evidence["autocast_forward_finite"] = None
         evidence["gradients_finite"] = None
         evidence["stages_skipped"] = ["fp32_math", "mixed_precision", "gradients"]
