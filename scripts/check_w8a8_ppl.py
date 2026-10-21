@@ -269,16 +269,27 @@ def aggregate_w8a8_seed_rows(ckpt_path: str, per_seed: list) -> dict:
     agg['per_seed'] = per_seed
     return agg
 
+def _finite_metric(value) -> bool:
+    """Whether a probe metric may enter a paired test.
+
+    A diverged probe can leave NaN/Inf in the per-seed record. The aggregate
+    reports those draws as excluded, but the paired tests must exclude them
+    too: a single NaN makes the t statistic NaN and aborts the whole
+    comparison instead of testing the finite draws.
+    """
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)))
+
 def _seed_metric_values(agg: dict, key: str) -> list:
     return [float(r[key]) for r in agg.get('per_seed', [])
-            if isinstance(r.get(key), (int, float))]
+            if _finite_metric(r.get(key))]
 
 def _train_seed_metric_values(agg: dict, key: str) -> dict:
     """Per-training-seed mean of `key` (averaged over that seed's checkpoints)."""
     out = {}
     for train_seed, metrics in (agg.get('per_train_seed') or {}).items():
         value = metrics.get(key) if isinstance(metrics, dict) else None
-        if isinstance(value, (int, float)):
+        if _finite_metric(value):
             out[int(train_seed)] = float(value)
     return out
 
@@ -287,13 +298,15 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
 
     The probe batches of a given seed are identical across checkpoints (one
     generator seeded with that seed), so the two arms' records are paired
-    samples - the same reason the ablation runner pairs its rows by seed.
+    samples - the same reason the ablation runner pairs its rows by seed. A
+    seed with a non-finite metric on either side is not a usable pair and is
+    excluded rather than poisoning the paired t statistic.
     """
     a_by_seed = {r.get('seed'): r.get(key) for r in agg_a.get('per_seed', [])}
     b_by_seed = {r.get('seed'): r.get(key) for r in agg_b.get('per_seed', [])}
     shared = sorted(s for s in set(a_by_seed) & set(b_by_seed)
-                    if isinstance(a_by_seed[s], (int, float))
-                    and isinstance(b_by_seed[s], (int, float)))
+                    if _finite_metric(a_by_seed[s])
+                    and _finite_metric(b_by_seed[s]))
     return shared, [float(a_by_seed[s]) for s in shared], [float(b_by_seed[s]) for s in shared]
 
 def _protocol_record(ckpt_args: dict, model) -> dict:
