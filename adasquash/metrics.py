@@ -164,7 +164,8 @@ def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     remains, `None` is returned so the caller cannot mistake "no measurement"
     for a result.
     """
-    raw = [float(v) for v in values if v is not None]
+    raw = [float(v) for v in values
+           if v is not None and not isinstance(v, bool)]
     vals = [v for v in raw if math.isfinite(v)]
     n_nonfinite = len(raw) - len(vals)
     n = len(vals)
