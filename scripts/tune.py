@@ -378,11 +378,14 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         a: (usable[a].get('confirm') or {}).get('missing_seeds') for a in confirm_ignored}
     use_confirm = len(confirm_ready) == len(usable) and bool(usable)
     split = 'confirm_seeds' if use_confirm else 'selection_seeds'
-    # Prefer a baseline that actually reached the confirm split. Choosing the
-    # lowest selection mean regardless of confirm coverage can crown a
-    # single-split baseline and silently make every certification impossible.
+    # Prefer a baseline that actually reached the confirm split only when the
+    # whole comparison is on the confirm split. If confirm statistics are
+    # incomplete the comparison falls back to the selection split, where
+    # confirm coverage is irrelevant: restricting the pool there would compare
+    # against a worse baseline and make the variant look better than it is.
     confirm_baselines = [arm for arm in baselines if arm in confirm_ready]
-    reference_pool = confirm_baselines if (certify and confirm_baselines) else list(baselines)
+    reference_pool = (confirm_baselines if (use_confirm and confirm_baselines)
+                      else list(baselines))
     ref_arm = min(reference_pool, key=lambda a: baselines[a]['best']['mean'])
     point_best_arm = min(baselines, key=lambda a: baselines[a]['best']['mean'])
     ref = baselines[ref_arm]
@@ -403,8 +406,8 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         'reference_split': split,
         'reference_selection': {
             'rule': ('lowest selection mean among confirm-ready baselines'
-                     if (certify and confirm_baselines)
-                     else 'lowest selection mean (no confirm-ready baseline to prefer)'),
+                     if (use_confirm and confirm_baselines)
+                     else 'lowest selection mean'),
             'confirm_ready_baselines': sorted(confirm_baselines),
             'unconfirmed_baselines': sorted(set(baselines) - set(confirm_baselines)),
             'reference_can_certify': ref_arm in confirm_ready,
