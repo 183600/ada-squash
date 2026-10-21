@@ -215,8 +215,13 @@ def _prev_majority(prev_gold_counts, vocab):
     for key, count in prev_gold.items():
         p = key // vocab
         g = key % vocab
-        if p not in prev_majority or count > prev_majority[p][1]:
-            prev_majority[p] = (g, count)
+        current = prev_majority.get(p)
+        if current is None or count > current[1]:
+            prev_majority[p] = (g, count, False)
+        elif count == current[1] and g != current[0]:
+            # Two successors share the maximum: the context does not have a
+            # single majority target, whichever id happened to be seen first.
+            prev_majority[p] = (current[0], current[1], True)
     return prev_gold, prev_majority
 
 
@@ -247,7 +252,8 @@ def _error_flags(rec, prev_gold, prev_majority, rare_ids, vocab, confidence):
     maj = prev_majority.get(prev)
     gold_here = prev_gold.get(prev * vocab + gold, 0)
     flags['prev_context_ambiguous'] = bool(
-        maj is not None and maj[0] != gold and maj[1] >= gold_here and gold_here > 0
+        maj is not None and gold_here > 0
+        and (maj[2] or (maj[0] != gold and maj[1] >= gold_here))
     )
     flags['rare_gold'] = gold in rare_ids
     flags['repetition_bias'] = bool(pred in rec['context'] and gold not in rec['context'])
@@ -509,7 +515,7 @@ def analyze(model, batches, args, tokenizer=None, device='cpu') -> dict:
     majority_acc = float(target_counts.max().item() / n_tokens) if n_tokens else 0.0
     # The context-majority rule ("predict the most frequent successor of the
     # current token"): a tuned-then-scored trivial baseline, not a strawman.
-    bigram_correct = sum(count for _, count in prev_majority.values())
+    bigram_correct = sum(count for _, count, _ in prev_majority.values())
     bigram_acc = (bigram_correct / n_tokens) if n_tokens else 0.0
     f1 = f1_from_counts(target_counts.tolist(), pred_counts.tolist(), correct_counts.tolist())
     imbalance = imbalance_report(target_counts.tolist())
@@ -913,7 +919,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     cost['note'] = ('parameters and analytic matmul FLOPs at the analysis seq_len; norm layers '
                     'are elementwise so they barely move FLOPs')
 
-    bigram_correct = sum(count for _, count in prev_majority.values())
+    bigram_correct = sum(count for _, count, _ in prev_majority.values())
     mcnemar = mcnemar_test(n_fixed, n_broken)
     summary = {
         'n_tokens': n_tokens,
