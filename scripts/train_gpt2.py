@@ -1516,7 +1516,7 @@ def main():
             'checkpoint_final': artifact_record(Path(args.output_dir) / 'ckpt_final.pt'),
         }
         best_ckpt_path = Path(args.output_dir) / 'ckpt_best.pt'
-        if best_ckpt_path.exists():
+        if has_best_val and best_ckpt_path.exists():
             run_manifest['artifacts']['checkpoint_best'] = artifact_record(best_ckpt_path)
         if n_nonfinite_losses or n_nonfinite_gradients or n_nonfinite_val_losses:
             print(f'[warn] non-finite events handled by --nonfinite-policy '
@@ -1570,7 +1570,7 @@ def main():
                 data_reports['test'] = rtest
                 print(f'[data] test split: {rtest}')
             best_path = Path(args.output_dir) / 'ckpt_best.pt'
-            if best_path.exists():
+            if has_best_val and best_path.exists():
                 best = _load_checkpoint_cpu(best_path)
                 load_model_state_dict(model, best['model'])
                 best_step = int(best.get('step', 0))
@@ -1663,7 +1663,7 @@ def main():
                   f'(n={len(test_batch_losses)} batches, stderr={test_stats["stderr"]:.4f}, {ci}) -> {out_path}')
         if args.error_analysis:
             best_path = Path(args.output_dir) / 'ckpt_best.pt'
-            analysis_ckpt = (best_path if best_path.exists()
+            analysis_ckpt = (best_path if has_best_val and best_path.exists()
                              else Path(args.output_dir) / 'ckpt_final.pt')
             error_analysis = run_error_analysis(args, analysis_ckpt, Path(args.output_dir))
             run_manifest['results']['error_analysis'] = error_analysis
