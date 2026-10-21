@@ -918,9 +918,12 @@ def merge_summaries(previous: list, fresh: list) -> list:
     for row in list(previous) + list(fresh):
         if not isinstance(row, dict) or 'name' not in row:
             continue
-        if row['name'] not in merged:
-            order.append(row['name'])
-        merged[row['name']] = row
+        name = row['name']
+        if isinstance(name, bool) or not isinstance(name, (str, int)):
+            continue
+        if name not in merged:
+            order.append(name)
+        merged[name] = row
     return [merged[name] for name in order if name in merged]
 
 def _seed_means(row) -> dict:
