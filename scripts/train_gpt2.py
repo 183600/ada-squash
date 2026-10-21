@@ -175,7 +175,11 @@ _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tok
               'val_frac', 'test_frac', 'num_documents',
               'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file',
               'exclude_test_hash_file', 'group_key', 'exclude_group_file',
-              'exclude_test_group_file', 'train_shuffle_buffer')
+              'exclude_test_group_file', 'train_shuffle_buffer',
+              # These define the stream geometry: the resumed run must read the
+              # same document windows with the same batch/sequence shape, or
+              # `data_position` no longer points at the same tokens.
+              'seq_len', 'batch_size', 'num_workers')
 
 def _ledger_identity(path):
     if not path:
@@ -1433,7 +1437,7 @@ def main():
             if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
                 print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
                 break
-        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
+        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'val_loss': last_val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
         path = Path(args.output_dir) / 'ckpt_final.pt'
         _atomic_torch_save(ckpt, path)
         print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
