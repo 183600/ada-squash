@@ -792,12 +792,33 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
         and any(isinstance(r.get(k), float) and not math.isfinite(r[k])
                 for k in _MOE_SEED_METRIC_KEYS)})
     agg['n_seeds_requested'] = len(agg['seeds'])
+    requested_seeds = list(agg['seeds'])
+    result_seeds = [int(r['seed']) for r in results
+                    if isinstance(r.get('seed'), int)
+                    and not isinstance(r.get('seed'), bool)]
+    missing_seeds = [s for s in requested_seeds if s not in result_seeds]
+    unexpected_seeds = [s for s in result_seeds if s not in requested_seeds]
+    duplicate_seeds = sorted({s for s in result_seeds if result_seeds.count(s) > 1})
+    seeds_without_val_ce = sorted({
+        int(r['seed']) for r in results
+        if isinstance(r.get('seed'), int) and not isinstance(r.get('seed'), bool)
+        and not _usable(r.get('val_ce'))})
+    agg['missing_seeds'] = missing_seeds
+    agg['unexpected_seeds'] = unexpected_seeds
+    agg['duplicate_seeds'] = duplicate_seeds
+    agg['seeds_without_val_ce'] = seeds_without_val_ce
     # A pooled mean over fewer or divergent seeds is not a clean replication.
     # Record that verdict next to the mean and in the aggregate manifest, so a
     # reader cannot mistake an invalid seed or a moved data snapshot for a
-    # complete study.
+    # complete study. Coverage is checked by seed identity, not merely by
+    # count: two records of one seed must not stand in for a missing seed.
     agg['complete'] = bool(
-        agg['n_seeds'] == len(agg['seeds'])
+        agg['n_seeds'] == len(requested_seeds)
+        and len(result_seeds) == len(results)
+        and not missing_seeds
+        and not unexpected_seeds
+        and not duplicate_seeds
+        and not seeds_without_val_ce
         and not agg['invalid_seeds']
         and agg['data_versions_complete']
         and agg['data_versions_consistent'])
