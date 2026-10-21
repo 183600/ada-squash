@@ -69,6 +69,7 @@ import argparse
 import heapq
 import itertools
 import json
+import math
 import random
 import sys
 from collections import Counter
@@ -183,8 +184,16 @@ def _quantile(values, q):
     if not values:
         return None
     ordered = sorted(values)
-    idx = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
-    return ordered[idx]
+    if len(ordered) == 1:
+        return ordered[0]
+    q = min(1.0, max(0.0, float(q)))
+    pos = q * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return ordered[lo]
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
 
 
 def _prev_majority(prev_gold_counts, vocab):
