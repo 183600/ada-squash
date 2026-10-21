@@ -104,26 +104,15 @@ def register_norm(name: str):
         return cls
     return _decorator
 
-def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False) -> torch.Tensor:
-    p = _as_scalar_exponent(p)
-    if scale is None:
-        t = xs.abs()
-    else:
-        t = xs.mul(scale).abs_()
-    lo = t.clamp(max=1.0)
-    u = t.clamp_(min=1.0).reciprocal_()
-    u.mul_(lo)
-    if isinstance(p, torch.Tensor):
-        neg_log2e_p = -_LOG2E / p.to(torch.promote_types(u.dtype, p.dtype))
-        s = u.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
-    else:
-        s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
-    out = s.mul_(lo).copysign_(xs)
-    if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
-        out.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
-    return out
+def _softsign_core(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False):
+    """Compute shared intermediates for softsign forward/backward.
 
-def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True, scale=None, scale_nonneg: bool=False):
+    Returns (t, lo, r, u) where:
+      t = |xs| or |xs * scale|
+      lo = clamp(t, max=1)
+      r = 1 / clamp(t, min=1)
+      u = lo * r = min(|x|, 1) / max(|x|, 1)  (always <= 1)
+    """
     p = _as_scalar_exponent(p)
     if scale is None:
         t = xs.abs()
@@ -131,24 +120,44 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=
         t = xs.mul(scale).abs_()
     lo = t.clamp(max=1.0)
     r = t.clamp_(min=1.0).reciprocal_()
+    u = lo.mul(r)
+    return t, lo, r, u, p
+
+
+def _compute_s_from_u(u: torch.Tensor, p) -> torch.Tensor:
+    """Compute s = (u^p + 1)^(-1/p) from u, handling tensor and scalar p."""
+    if isinstance(p, torch.Tensor):
+        neg_log2e_p = -_LOG2E / p.to(torch.promote_types(u.dtype, p.dtype))
+        return u.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
+    return u.pow_(p).add_(1.0).pow_(-1.0 / p)
+
+
+def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False) -> torch.Tensor:
+    t, lo, r, u, p = _softsign_core(xs, p, scale, scale_nonneg)
+    s = _compute_s_from_u(u, p)
+    out = s.mul_(lo).copysign_(xs)
+    if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
+        out.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
+    return out
+
+
+def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True, scale=None, scale_nonneg: bool=False):
+    t, lo, r, u, p = _softsign_core(xs, p, scale, scale_nonneg)
     a = None
     if need_u:
         # `lo` only feeds `phi`; when that output is not requested it is not
         # needed separately.
-        u = lo.mul(r) if need_phi else lo.mul_(r)
         if isinstance(p, torch.Tensor):
             q = u.log2_().mul_(p)
             a = q.mul(_LN2).clamp_(min=p * _log_tiny(q.dtype))
-            neg_log2e_p = -_LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))
-            s = q.exp2_().log1p_().mul_(neg_log2e_p).exp2_()
+            s = q.exp2_().log1p_().mul_(-_LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))).exp2_()
         else:
             s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
             a = u.log2_().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
     else:
-        s = lo.mul(r) if need_phi else lo.mul_(r)
+        s = u
         if isinstance(p, torch.Tensor):
-            neg_log2e_p = -_LOG2E / p.to(torch.promote_types(s.dtype, p.dtype))
-            s.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
+            s.log2_().mul_(p).exp2_().log1p_().mul_(-_LOG2E / p.to(torch.promote_types(s.dtype, p.dtype))).exp2_()
         else:
             s.pow_(p).add_(1.0).pow_(-1.0 / p)
     phi = None
