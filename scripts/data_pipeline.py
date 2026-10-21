@@ -553,15 +553,17 @@ class PackedStream(IterableDataset):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         n_workers = worker_info.num_workers if worker_info is not None else 1
+        worker_seed = worker_info.seed if worker_info is not None else 0
         # Duplicate removal is per epoch: documents repeated inside one pass
         # are dropped, while a later epoch over the same corpus still sees its
         # own documents.
         self.cleaner.seen = set()
         epoch = self.epoch
         self.epoch += 1
-        return self._shuffle(self._pack(worker_id, n_workers), worker_id, epoch)
+        return self._shuffle(self._pack(worker_id, n_workers), worker_id, epoch,
+                             worker_seed)
 
-    def _shuffle(self, stream, worker_id: int, epoch: int=0):
+    def _shuffle(self, stream, worker_id: int, epoch: int=0, worker_seed: int=0):
         if self.shuffle_buffer <= 0:
             yield from stream
             return
@@ -570,7 +572,8 @@ class PackedStream(IterableDataset):
         # Include the epoch: otherwise a persistent worker replays the exact
         # same batch permutation every pass, which defeats shuffling after the
         # first epoch.
-        rng = _random.Random(self.seed * 1000003 + worker_id + epoch * 104729)
+        rng = _random.Random(self.seed * 1000003 + worker_id + epoch * 104729
+                             + worker_seed * 1000000007)
         window: list = []
         for item in stream:
             window.append(item)
