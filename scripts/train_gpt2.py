@@ -53,6 +53,32 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
 _TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
 
+def _explicit_arg_names(argv, parser, config_path=None) -> frozenset:
+    """Names of options the user set (CLI tokens or keys in --config).
+
+    Comparing parsed values with parser defaults cannot detect a flag whose
+    value happens to equal the default; on resume that silently loses the
+    override when the checkpoint recorded a different value. Option strings
+    are mapped through the parser so negated aliases such as --no-dedup
+    (dest 'dedup') and --no-beta (dest 'beta') are attributed correctly.
+    """
+    actions = parser._option_string_actions
+    dests = {action.dest for action in parser._actions}
+    names = set()
+    for token in argv:
+        if token == '--':
+            break
+        if token.startswith('--'):
+            action = actions.get(token.split('=', 1)[0])
+            if action is not None:
+                names.add(action.dest)
+    if config_path:
+        for key in load_yaml_config(config_path):
+            dest, _ = _TRAIN_CONFIG_ALIASES.get(key, (key, False))
+            if dest in dests:
+                names.add(dest)
+    return frozenset(names)
+
 def _snapshot_rng_state() -> dict:
     """Every RNG whose stream a resumed run must continue.
 
@@ -1028,7 +1054,7 @@ def main():
         launch_multi_seed(args, seeds)
         return
     args.seed = seeds[0]
-    explicit = frozenset((name for name in _SCHEDULE_ARGS + _MONITOR_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)))
+    explicit = frozenset(_explicit_arg_names(sys.argv[1:], p, known.config) | {name for name in _SCHEDULE_ARGS + _MONITOR_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)})
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     resume_ckpt = None
     run_args: dict = {}
