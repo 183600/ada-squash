@@ -776,6 +776,16 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
         if isinstance(r.get('seed'), int)
         and any(isinstance(r.get(k), float) and not math.isfinite(r[k])
                 for k in _MOE_SEED_METRIC_KEYS)})
+    agg['n_seeds_requested'] = len(agg['seeds'])
+    # A pooled mean over fewer or divergent seeds is not a clean replication.
+    # Record that verdict next to the mean and in the aggregate manifest, so a
+    # reader cannot mistake an invalid seed or a moved data snapshot for a
+    # complete study.
+    agg['complete'] = bool(
+        agg['n_seeds'] == len(agg['seeds'])
+        and not agg['invalid_seeds']
+        and agg['data_versions_complete']
+        and agg['data_versions_consistent'])
     agg['n_loss_spikes_total'] = sum(r['n_loss_spikes'] or 0 for r in results
                                      if isinstance(r.get('n_loss_spikes'), (int, float)))
     # The pooled val_ce can hide that a seed was still over/underfitting at the
@@ -877,6 +887,8 @@ def main():
             manifest,
             results={
                 'n_seeds': agg['n_seeds'],
+                'n_seeds_requested': agg.get('n_seeds_requested'),
+                'complete': agg.get('complete'),
                 'val_ce': agg.get('val_ce'),
                 'val_ce_std': agg.get('val_ce_std'),
                 'invalid_seeds': agg.get('invalid_seeds'),
