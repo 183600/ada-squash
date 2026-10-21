@@ -77,14 +77,15 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             total = total.to(a.dtype)
         return total
     if a.numel() > _REDUCE_CHUNK_ELEMS:
-        row_elems = max(1, a.numel() // a.shape[0])
-        step = max(1, _REDUCE_CHUNK_ELEMS // row_elems)
+        rows = a.numel() // a.shape[-1]
+        step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
         acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
-        lead = tuple(range(a.ndim - 1))
-        total = None
-        for start in range(0, a.shape[0], step):
-            part = (a[start:start + step] * b[start:start + step]).sum(dim=lead, dtype=acc_dtype)
-            total = part if total is None else total.add_(part)
+        a2 = a.reshape(rows, -1)
+        b2 = b.reshape(rows, -1)
+        total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a.device)
+        for start in range(0, rows, step):
+            part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc_dtype)
+            total.add_(part)
         if total.dtype != a.dtype:
             total = total.to(a.dtype)
         return total
