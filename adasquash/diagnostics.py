@@ -290,7 +290,23 @@ def diagnose_train_val_curve(
     )
 
     recommendations: list[str] = []
-    if val_trend == "rising" and val_change_within_noise:
+    # A rising *training* loss is not a held-out sampling event, so validation
+    # noise cannot excuse it. Check the both-rising case before the
+    # `noise_limited` branch: with a wide validation stderr, a run that is
+    # actively diverging (train and val both rising) would otherwise be
+    # reported as "wait for the next pass" while the optimizer leaves the
+    # stable region.
+    if train_trend == "rising" and val_trend == "rising":
+        classification = "diverging"
+        recommendations = [
+            "both curves are rising: suspect a learning rate that is too large "
+            "(re-run the lr grid with scripts/tune.py), missing/weak warmup, or a "
+            "data batch that is itself corrupted - the NaN triage path "
+            "(`--nonfinite-policy abort`) checks the batch first",
+            "log and plot the pre-clip gradient norm: a spike there localizes "
+            "the step where the optimizer left the stable region",
+        ]
+    elif val_trend == "rising" and val_change_within_noise:
         classification = "noise_limited"
         recommendations = [
             f"the validation change {val_change:+.4f} is within {noise_z:g} "
@@ -300,16 +316,6 @@ def diagnose_train_val_curve(
             "keep training and read the next validation passes; increase "
             "--val-batches if the interval stays wider than the effect you "
             "need to detect",
-        ]
-    elif train_trend == "rising" and val_trend == "rising":
-        classification = "diverging"
-        recommendations = [
-            "both curves are rising: suspect a learning rate that is too large "
-            "(re-run the lr grid with scripts/tune.py), missing/weak warmup, or a "
-            "data batch that is itself corrupted - the NaN triage path "
-            "(`--nonfinite-policy abort`) checks the batch first",
-            "log and plot the pre-clip gradient norm: a spike there localizes "
-            "the step where the optimizer left the stable region",
         ]
     elif train_trend == "falling" and val_trend == "rising":
         classification = "overfitting"
