@@ -1318,12 +1318,33 @@ def print_baseline_comparison(comparison: dict | None) -> None:
         print(f"[compare] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
               f"{comparison['rows_with_fewer_than_3_seeds']}")
 
-def load_simple_baselines(path) -> dict | None:
+def _simple_baseline_protocol_mismatches(protocol, args) -> list:
+    """Fields where a calibration report describes a different task/protocol."""
+    if not isinstance(protocol, dict):
+        return ['protocol']
+    expected = {
+        'corpus': 'markov_batch',
+        'n_states': 64,
+        'max_jump': 3,
+        'outlier_channel': _protocol_outlier_id(args.model) is not None,
+        'outlier_id': _protocol_outlier_id(args.model),
+        'vocab_size': _PROTOCOL_MODEL_VOCAB.get(args.model),
+        'batch_size': args.batch_size,
+        'seq_len': args.seq_len,
+        'val_batches': max(1, int(getattr(args, 'val_batches', 20))),
+    }
+    return [f'{key}={protocol.get(key)!r} != {want!r}'
+            for key, want in expected.items() if protocol.get(key) != want]
+
+def load_simple_baselines(path, args=None) -> dict | None:
     """Load the Bayes-limit calibration written by scripts/baseline_simple.py.
 
-    Returns None - with a warning for a malformed file - when the path is
-    absent or does not look like a calibration report, so a stale side file
-    can never abort the matrix; it only removes the floor annotation.
+    Returns None - with a warning for a malformed or stale file - when the
+    path is absent or does not look like a calibration report, so a stale side
+    file can never abort the matrix; it only removes the floor annotation.
+    When `args` is given, the recorded corpus/vocabulary/batch/held-out
+    protocol must match this invocation: annotating rows with limits measured
+    on another task would silently misstate how much signal they captured.
     """
     path = Path(path)
     if not path.exists():
@@ -1341,6 +1362,12 @@ def load_simple_baselines(path) -> dict | None:
     if not isinstance(tuned, dict) or not isinstance(tuned.get('mean_ce_nats'), (int, float)):
         print(f"[compare] WARNING: ignoring simple-baseline file {path}: missing tuned_count_baseline.mean_ce_nats")
         return None
+    if args is not None:
+        mismatches = _simple_baseline_protocol_mismatches(data.get('protocol'), args)
+        if mismatches:
+            print(f"[compare] WARNING: ignoring simple-baseline file {path}: "
+                  f"it describes a different protocol ({'; '.join(mismatches)})")
+            return None
     return data
 
 def run_simple_baseline_calibration(path, seeds, args) -> dict | None:
@@ -1376,7 +1403,7 @@ def run_simple_baseline_calibration(path, seeds, args) -> dict | None:
         raise SystemExit(f'[compare] ERROR: auto simple-baseline calibration failed '
                          f'(exit {proc.returncode}); fix the ladder run or pass '
                          f'--simple-baselines with an existing report')
-    data = load_simple_baselines(path)
+    data = load_simple_baselines(path, args)
     if data is None:
         raise SystemExit(f'[compare] ERROR: simple-baseline calibration wrote {path} but it '
                          f'does not parse as a calibration report')
@@ -2001,7 +2028,7 @@ def main():
               f"{[r['name'] for r in stale_rows]}; rerun them under this recipe to include them")
     comparison = baseline_comparison(comparable, args.baselines, margin=args.baseline_margin, alpha=args.alpha)
     simple_path = Path(args.simple_baselines) if args.simple_baselines else base / 'simple_baselines.json'
-    floor_data = (load_simple_baselines(simple_path)
+    floor_data = (load_simple_baselines(simple_path, args)
                   if args.simple_baselines_enabled else None)
     if (comparison is not None and floor_data is None
             and args.simple_baselines_enabled and args.auto_simple_baselines):
@@ -2025,7 +2052,10 @@ def main():
             'enabled': False, 'status': 'missing', 'source': str(simple_path),
             'bayes_limits': None, 'tuned_simple_ce_nats': None,
             'how_to_generate': (f'python3 scripts/baseline_simple.py --output {simple_path} '
-                                f'--seeds {" ".join(map(str, seeds))}')}
+                                f'--seeds {" ".join(map(str, seeds))} '
+                                f'--vocab-size {_PROTOCOL_MODEL_VOCAB[args.model]} '
+                                f'--batch-size {args.batch_size} --seq-len {args.seq_len} '
+                                f'--val-batches {max(1, int(getattr(args, "val_batches", 20)))}')}
         comparison['calibration_status'] = 'missing'
         print(f"[compare] WARNING: no tuned simple-baseline calibration at {simple_path}; the rows below are "
               f"only ranked against each other. Generate the task's Bayes limits and tuned count model with "
