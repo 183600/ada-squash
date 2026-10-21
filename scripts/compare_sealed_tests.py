@@ -106,16 +106,21 @@ def load_run_manifest(result_path) -> dict | None:
 def _shape_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     a = ref_manifest.get("results") or {}
     b = other_manifest.get("results") or {}
-    return {f"results.{key}": [a.get(key), b.get(key)]
+    missing = "<missing>"
+    return {f"results.{key}": [a.get(key, missing), b.get(key, missing)]
             for key in ("n_layers", "dim", "n_heads")
-            if a.get(key) != b.get(key)}
+            if key not in a or key not in b or a.get(key) != b.get(key)}
 
 def _manifest_ledger_content(manifest: dict):
+    missing = "<missing>"
     data = manifest.get("data") if isinstance(manifest, dict) else None
     if not isinstance(data, dict):
         return None
     out = {}
     for key in _LEDGER_MANIFEST_KEYS:
+        if key not in data:
+            out[key] = missing
+            continue
         fingerprint = data.get(key)
         if isinstance(fingerprint, dict):
             out[key] = {"exists": fingerprint.get("exists"),
@@ -127,10 +132,11 @@ def _manifest_ledger_content(manifest: dict):
 def _ledger_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     a = _manifest_ledger_content(ref_manifest)
     b = _manifest_ledger_content(other_manifest)
-    if a is None and b is None:
-        return {}
+    # Missing ledger identity is unknown, never "the same": fail closed instead
+    # of certifying that two runs were scored on identical held-out documents.
     if a is None or b is None:
-        return {"data": ["missing in one run_manifest", "missing in the other"]}
+        return {"data": ["missing in one run_manifest" if a is None else "recorded",
+                         "missing in the other" if b is None else "recorded"]}
     return {f"data.{key}": [a[key], b[key]]
             for key in _LEDGER_MANIFEST_KEYS if a[key] != b[key]}
 
@@ -139,7 +145,9 @@ def pairing_mismatches(ref: dict, other: dict) -> dict:
     a, b = ref.get("pairing"), other.get("pairing")
     if not isinstance(a, dict) or not isinstance(b, dict):
         return {"pairing": ["missing in one result file", "missing in the other"]}
-    return {k: [a.get(k), b.get(k)] for k in PAIRING_KEYS if a.get(k) != b.get(k)}
+    missing = "<missing>"
+    return {k: [a.get(k, missing), b.get(k, missing)] for k in PAIRING_KEYS
+            if k not in a or k not in b or a.get(k) != b.get(k)}
 
 
 def _mde(stderr: float, df: float, alpha: float, power: float) -> float:
