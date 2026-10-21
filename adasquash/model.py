@@ -138,8 +138,8 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
 
 def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=False) -> dict:
     kwargs: dict = {}
-    is_dyt_family = cfg.norm_name in ('dyt', 'dytd', 'dytc', 'dytcd', 'dytcd_tanh')
-    if cfg.norm_name in ('dytd', 'dytcd', 'dytcd_tanh'):
+    is_dyt_family = cfg.norm_name in ('dyt', 'dytd', 'dytd_tanh', 'dytc', 'dytcd', 'dytcd_tanh')
+    if cfg.norm_name in ('dytd', 'dytd_tanh', 'dytcd', 'dytcd_tanh'):
         if is_final_norm:
             depth_ratio = 1.0
             layer_idx = cfg.n_layers

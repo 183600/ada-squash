@@ -454,6 +454,42 @@ class _DyTDForward(torch.autograd.Function):
             grad_beta = _sum_leading_dims(grad_out)
         return (grad_x, grad_alpha_0, grad_k, grad_gamma, grad_beta, None)
 
+@register_norm("dytd_tanh")
+class DyTDTanh(nn.Module):
+    """Ablation-only comparator: DyT-D with `tanh` (plain autograd).
+
+    Same depth schedule as `DyTD` (`alpha_l = alpha_0 * exp(-k * l/L)`),
+    same `gamma`/`beta`, same LayerScale residual (it lives in `Block`):
+    the only change is using plain autograd `tanh` instead of the fused
+    `_DyTDForward` kernel. This is a control for the factorial design,
+    not part of the research core.
+
+    Frozen `k` is supported via `learnable_k=False` (registers a buffer).
+    """
+
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.num_layers = max(1, num_layers)
+        self._depth_ratio = float(layer_idx) / float(self.num_layers)
+        self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
+        if learnable_k:
+            self.k = nn.Parameter(torch.tensor(float(k_init)))
+        else:
+            self.register_buffer('k', torch.tensor(float(k_init)))
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
+
+    @property
+    def alpha_l(self) -> torch.Tensor:
+        return self.alpha_0 * torch.exp(self.k.mul(-self._depth_ratio))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        phi = torch.tanh(self.alpha_l * x)
+        if self.beta is not None:
+            return phi * self.gamma + self.beta
+        return phi * self.gamma
+
 @register_norm("dyt")
 class DyT(_SquashedAffine):
 
@@ -712,4 +748,4 @@ class QKSquash(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
         return _QKSquashTanh.apply(q, k, self.alpha_q, self.alpha_k)
-__all__ = ['NORM_REGISTRY', 'register_norm', 'build_norm', 'generalized_softsign', 'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'DyTCDTanh', 'QKSquash']
+__all__ = ['NORM_REGISTRY', 'register_norm', 'build_norm', 'generalized_softsign', 'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTDTanh', 'DyTCD', 'DyTCDTanh', 'QKSquash']

@@ -120,7 +120,7 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
     return out
 
 
-ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel_tanh_k0': dict(norm_name='dytcd_tanh', k_init=0.0, learnable_k=False), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
+ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel_tanh_k0': dict(norm_name='dytcd_tanh', k_init=0.0, learnable_k=False), 'dytd_tanh_k0': dict(norm_name='dytd_tanh', k_init=0.0, learnable_k=False), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytcd_no_perchannel_no_depth': dict(norm_name='dytcd', learnable_delta=False, k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytd_tanh_full': dict(norm_name='dytd_tanh'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'rmsnorm_qknorm': dict(norm_name='rmsnorm', qk_norm='qknorm'), 'ln_qk': dict(norm_name='ln', qk_norm='dytqk'), 'ln_qknorm': dict(norm_name='ln', qk_norm='qknorm'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
 # Every row must state *why* it is run (the scientific hypothesis it tests),
 # not just what it configures. `load_ablations_from_config` enforces this for
 # YAML rows; these are the hypotheses of the built-in fallback rows.
@@ -139,6 +139,11 @@ ABLATION_HYPOTHESES = {
     'dytcd_fixed_p': 'Leave-one-out for the learnable saturation exponent of the main proposal: with p frozen at its init (2.0) the model keeps every mechanism of dytcd_full except the per-layer adaptation of the softsign steepness, so a loss increase here is attributable to learnable p alone.',
     'dytcd_ls1e5': 'LayerScale init 1e-5 (the DyT-CD default) is a competitive residual-gate scale, not an arbitrary strawman.',
     'dytcd_ls1e3': 'LayerScale init 1e-3 trades warmup stability for stronger early residual growth; the default should not be beaten by it.',
+    'dytd_tanh_k0': 'Plain-autograd DyT-D at flat depth (k=0 frozen): the "neither" cell of the clean per-channel x depth tanh factorial, matching dytc_perchannel_tanh_k0 in implementation (both plain autograd).',
+    'dytd_tanh_full': 'Plain-autograd DyT-D with depth schedule: the "depth" cell of the clean per-channel x depth tanh factorial, matching dytcd_no_softsign in implementation (both plain autograd).',
+    'dytcd_no_perchannel_no_depth': 'DyT-CD with per-channel off (delta frozen) and depth off (k=0 frozen): the "neither" cell of the softsign arm in the 2x2x2 factorial.',
+    'rmsnorm_qknorm': 'QK-Norm comparator on RMSNorm baseline: per-head RMSNorm on Q/K is the standard alternative; a dytqk win on RMSNorm is only credited if it also beats this comparator.',
+    'ln_qknorm': 'QK-Norm comparator on LayerNorm baseline: mirrors rmsnorm_qknorm for the other simple baseline.',
     'dytc_p1_softsign': 'Softsign sharpness matters: p=1 (classic softsign) is worse than p=2 on this outlier-heavy corpus.',
     'dytc_p2_softsign': 'p=2 (smooth softsign) is the best fixed saturation exponent of {1, 2, 4} for outlier control with usable gradients.',
     'dytc_p4_softsign': 'p=4 saturates harder than p=2; the hypothesis is that this hurts gradient flow and loses to p=2.',
@@ -214,13 +219,25 @@ LOO_SPEC = {
         'qk_squash': {'row': 'rmsnorm_baseline',
                       'diff': ('qk_norm',)},
     },
+    'rmsnorm_qknorm': {
+        'qk_norm_comparator': {'row': 'rmsnorm_baseline',
+                               'diff': ('qk_norm',)},
+    },
     'ln_qk': {
         'qk_squash': {'row': 'ln_baseline',
                       'diff': ('qk_norm',)},
     },
+    'ln_qknorm': {
+        'qk_norm_comparator': {'row': 'ln_baseline',
+                               'diff': ('qk_norm',)},
+    },
     'dytcd_qk': {
         'qk_squash': {'row': 'dytcd_full',
                       'diff': ('qk_norm',)},
+    },
+'dytcd_qknorm': {
+        'qk_norm_comparator': {'row': 'dytcd_full',
+                               'diff': ('qk_norm',)},
     },
 }
 
@@ -233,27 +250,20 @@ LOO_SPEC = {
 # verifies that switching a factor changes exactly its declared knobs in both
 # arms of the other factor, so a confounded cell is rejected before training.
 #
-# WARNING: This factorial has a known implementation confound. The "neither"
-# and "depth" cells (dytd_k0_no_depth_schedule, dytd_full) use the fused
-# DyT-D kernel (_DyTDForward), while the "per_channel" and "both" cells
-# (dytc_perchannel_tanh_k0, dytcd_no_softsign) use the plain-autograd
-# DyTCDTanh comparator. The per_channel factor therefore compares fused vs
-# plain implementations, not just the per-channel axis. The interaction term
-# is similarly confounded. Results are descriptive only and MUST NOT be used
-# to certify a synergy claim. A clean factorial would require either a fused
-# DyTCDTanh kernel or a plain-autograd DyT-D, neither of which exists in the
-# fixed kernel family (D3).
+# This factorial now uses plain-autograd comparators for ALL cells (dytd_tanh
+# and dytcd_tanh), so the per_channel factor cleanly isolates the per-channel
+# axis without mixing fused vs plain implementations. The interaction term is
+# now unconfounded and can be used to certify synergy.
 FACTORIAL_SPEC = {
     'per_channel_x_depth_tanh': {
         'context': ('tanh activation family, LayerScale on, same gamma/beta and '
                     'same alpha/k initialization context across the four cells. '
-                    'KNOWN CONFOUND: per_channel factor mixes fused (DyT-D) and '
-                    'plain-autograd (DyTCDTanh) implementations; interaction '
-                    'term is confounded. Descriptive only - not certified.'),
+                    'All cells use plain-autograd (dytd_tanh / dytcd_tanh) so the '
+                    'per_channel and depth factors are implementation-clean.'),
         'cells': {
-            'neither': 'dytd_k0_no_depth_schedule',
+            'neither': 'dytd_tanh_k0',
             'per_channel': 'dytc_perchannel_tanh_k0',
-            'depth': 'dytd_full',
+            'depth': 'dytd_tanh_full',
             'both': 'dytcd_no_softsign',
         },
         'factors': {
@@ -1791,6 +1801,7 @@ def main():
     p.add_argument('--check-matrix', action='store_true', help='validate controlled knobs, stated hypotheses and leave-one-out coverage of the matrix, then exit without training')
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
+    p.add_argument('--allow-uncertified', action='store_true', help='allow running with <3 seeds (certification will be disabled); by default <3 seeds is an error')
     apply_config_to_parser(p, known.config)
     args = p.parse_args()
     for flag, value in (('--batch-size', args.batch_size),
@@ -1804,8 +1815,8 @@ def main():
     if len(seeds) != len(raw_seeds):
         print(f'[warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
               f'(a repeated seed is the same run, not an independent replication)')
-    if len(seeds) < 3:
-        print(f'[warn] {len(seeds)} seed(s) selected: with <3 independent runs a difference cannot be separated from run-to-run noise; report error bars and treat significance as provisional')
+    if len(seeds) < 3 and not args.allow_uncertified:
+        p.error(f'{len(seeds)} seed(s) selected: certification requires >= 3 independent seeds; use --allow-uncertified to run anyway (results will be descriptive only)')
     try:
         matrix_report = validate_matrix(ablations, hypotheses, args.model)
     except ValueError as exc:

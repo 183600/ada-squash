@@ -120,6 +120,28 @@ ablations:
     hypothesis: >
       Depth decay is the source of DyT-D's gain: with k pinned at 0 and
       frozen the advantage of dytd_full over scalar DyT should vanish.
+  - name: dytd_tanh_k0
+    norm: dytd_tanh
+    k_init: 0.0
+    learnable_k: false
+    hypothesis: >
+      Plain-autograd DyT-D at flat depth (k=0 frozen): the "neither" cell of
+      the clean per-channel x depth tanh factorial, matching
+      dytc_perchannel_tanh_k0 in implementation (both plain autograd).
+  - name: dytd_tanh_full
+    norm: dytd_tanh
+    hypothesis: >
+      Plain-autograd DyT-D with depth schedule: the "depth" cell of the clean
+      per-channel x depth tanh factorial, matching dytcd_no_softsign in
+      implementation (both plain autograd).
+  - name: dytcd_no_perchannel_no_depth
+    norm: dytcd
+    learnable_delta: false
+    k_init: 0.0
+    learnable_k: false
+    hypothesis: >
+      DyT-CD with per-channel off (delta frozen) and depth off (k=0 frozen):
+      the "neither" cell of the softsign arm in the 2x2x2 factorial.
 
   # --- LayerScale residual gate ---
   - name: dytcd_no_ls
@@ -160,6 +182,22 @@ ablations:
       qk_norm, so a held-out-loss reduction is attributable to the QK
       squashing alone rather than to an interaction with the DyT-CD stack.
       The mechanism bounds every pre-dot-product q/k coordinate to (-1, 1).
+  - name: ln_qknorm
+    norm: ln
+    qk_norm: qknorm
+    hypothesis: >
+      QK-Norm comparator on LayerNorm baseline: per-head RMSNorm on Q/K is
+      the standard alternative the DyT-QK variant claims to sharpen, run on
+      the identical protocol so a dytqk win on LayerNorm is only credited if
+      it also beats this comparator.
+  - name: rmsnorm_qknorm
+    norm: rmsnorm
+    qk_norm: qknorm
+    hypothesis: >
+      QK-Norm comparator on RMSNorm baseline: per-head RMSNorm on Q/K is the
+      standard alternative the DyT-QK variant claims to sharpen, run on the
+      identical protocol so a dytqk win on RMSNorm is only credited if it
+      also beats this comparator.
   - name: dytcd_qk
     norm: dytcd
     qk_norm: dytqk

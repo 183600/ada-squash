@@ -581,6 +581,13 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                                      if isinstance(r.get('n_nonfinite_gradients'), (int, float))),
         'n_nonfinite_val_losses': sum(r['n_nonfinite_val_losses'] or 0 for r in per_seed
                                       if isinstance(r.get('n_nonfinite_val_losses'), (int, float))),
+        'certified': len(final_vals) >= 3 and not missing and not invalid,
+        'certification_basis': ('certified: >= 3 seeds with finite final_val_loss, no missing/invalid seeds'
+                                if len(final_vals) >= 3 and not missing and not invalid
+                                else 'not certified: ' + (
+                                    f'{len(final_vals)} seeds (< 3)' if len(final_vals) < 3 else
+                                    f'missing seeds: {missing}' if missing else
+                                    f'invalid seeds: {invalid}')),
         'aggregation': (
             'Mean +/- Std across independent seed runs of the identical recipe (same optimizer, '
             'schedule, data protocol and step count). final_val_loss = last validation pass at the '
@@ -603,8 +610,8 @@ def launch_multi_seed(args, seeds) -> None:
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
     if len(seeds) < 3:
-        print(f'[seeds][warn] {len(seeds)} seed(s): a norm effect cannot be separated from '
-              f'run-to-run noise; use >= 3 independent seeds before interpreting deltas')
+        print(f'[seeds][error] {len(seeds)} seed(s): certification requires >= 3 independent seeds to separate norm effect from run-to-run noise; use --seeds with >= 3 values')
+        raise SystemExit('[seeds] insufficient seeds for certified replication')
     child_argv = list(sys.argv[1:])
     script = str(Path(__file__).resolve())
     failed_seeds: list = []
