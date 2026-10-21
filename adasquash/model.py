@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
 import torch
@@ -45,7 +46,7 @@ class GPTConfig:
 _CROSSENTROPY_CHUNK_BYTES = 1 << 27
 _CROSS_ENTROPY_FAST_PATH_BYTES = 1 << 23
 _CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
-_CE_SCRATCH_CACHE: dict[tuple, torch.Tensor] = {}
+_CE_SCRATCH_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 # At most one shape pair is live at a time: the fp32 accumulator plus (under
 # autocast) its low-precision cast twin.
 _CE_SCRATCH_MAX_ENTRIES = 2
@@ -84,8 +85,10 @@ def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tens
     if buf is None:
         buf = torch.empty(rows, vocab, dtype=dtype, device=device)
         if len(_CE_SCRATCH_CACHE) >= _CE_SCRATCH_MAX_ENTRIES:
-            _CE_SCRATCH_CACHE.clear()
+            _CE_SCRATCH_CACHE.popitem(last=False)
         _CE_SCRATCH_CACHE[key] = buf
+    else:
+        _CE_SCRATCH_CACHE.move_to_end(key)
     return buf
 
 def clear_ce_scratch_cache() -> None:
