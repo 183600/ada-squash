@@ -769,6 +769,16 @@ def main():
     p.add_argument('--resume-skip-data', action='store_true', help='do NOT fast-forward the training dataloader past the batches the checkpoint already consumed (the resumed run then replays training data)')
     apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
     args = p.parse_args()
+    for name, value, minimum in (
+        ('--batch-size', args.batch_size, 1),
+        ('--seq-len', args.seq_len, 1),
+        ('--grad-accum', args.grad_accum, 1),
+        ('--log-every', args.log_every, 1),
+        ('--stats-every', args.stats_every, 1),
+        ('--save-every', args.save_every, 1),
+    ):
+        if value < minimum:
+            p.error(f'{name} {value} must be >= {minimum}')
     seed_explicit = args.seed is not None or args.seeds is not None
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [DEFAULT_SEED])
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
