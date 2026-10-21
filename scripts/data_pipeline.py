@@ -706,10 +706,17 @@ def _cache_matches(cache_path: Path, fingerprint: dict) -> bool:
         st = cache_path.stat()
     except OSError:
         return False
-    if expected_bytes is not None and st.st_size != int(expected_bytes):
+    try:
+        expected_size = None if expected_bytes is None else int(expected_bytes)
+    except (TypeError, ValueError):
         return False
-    if not sha:
-        return expected_bytes is not None
+    if expected_size is not None and st.st_size != expected_size:
+        return False
+    # The size alone cannot identify the payload: an edited cache with the same
+    # length would pass. Version-2 sidecars always carry the sha256, so a
+    # missing/empty digest means this is not a verifiable fingerprint.
+    if not isinstance(sha, str) or not sha:
+        return False
     stamp = (sha, st.st_size, st.st_mtime_ns)
     if _VERIFIED_CACHES.get(str(cache_path)) == stamp:
         return True
