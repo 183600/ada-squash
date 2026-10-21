@@ -38,6 +38,14 @@ Comparison protocol (what the runner guarantees, and checks)
   a power-based minimum detectable delta. The reference baseline is the best
   *replicated* baseline (with the point-estimate best recorded alongside), so
   a lucky single-seed row cannot make certification impossible.
+* **Task-grounded calibration.** A transformer-vs-transformer ranking only
+  says which model is least bad; the tuned count model and the exact Bayes
+  limits from `scripts/baseline_simple.py` say whether any row learned the
+  task at all. The runner therefore records the calibration status in
+  `baseline_comparison.json` (`calibration_status`), can auto-run the cheap
+  ladder (`--auto-simple-baselines`) and can make a missing calibration a
+  hard failure (`--require-simple-baselines`); `--no-simple-baselines` is the
+  explicit, recorded opt-out.
 """
 import argparse
 import dataclasses
@@ -1257,6 +1265,13 @@ def print_baseline_comparison(comparison: dict | None) -> None:
         print(f"[compare] reference selection: {selection.get('rule')}; "
               f"point-estimate best={comparison.get('point_estimate_best_baseline')}; "
               f"reference can certify={selection.get('reference_can_certify')}")
+    calibration_status = comparison.get('calibration_status')
+    if calibration_status == 'missing':
+        print('[compare] calibration: MISSING - rows are ranked only against each other; '
+              'regenerate with scripts/baseline_simple.py to read them against the task '
+              'Bayes limits (see simple_baseline.how_to_generate in the JSON)')
+    elif calibration_status == 'explicitly_disabled':
+        print('[compare] calibration: explicitly disabled (--no-simple-baselines)')
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_holm = entry.get('p_one_sided_holm')
@@ -1327,6 +1342,35 @@ def load_simple_baselines(path) -> dict | None:
         print(f"[compare] WARNING: ignoring simple-baseline file {path}: missing tuned_count_baseline.mean_ce_nats")
         return None
     return data
+
+def run_simple_baseline_calibration(path, seeds) -> dict | None:
+    """Run the cheap count-model/Bayes ladder for a missing calibration.
+
+    The ladder fits on the same synthetic generator as the ablation rows
+    (one stream per seed), tunes the add-k smoothing on a disjoint stream and
+    scores on the held-out stream, so its numbers are directly comparable.
+    A failed subprocess is an error: continuing would silently drop the only
+    reference that says whether a row learned the task.
+    """
+    import subprocess
+    cmd = [sys.executable, str(ROOT / 'scripts' / 'baseline_simple.py'),
+           '--output', str(path), '--seeds', *[str(int(seed)) for seed in seeds]]
+    print(f"[compare] calibration missing: running {' '.join(cmd)}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    if proc.returncode != 0:
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+        raise SystemExit(f'[compare] ERROR: auto simple-baseline calibration failed '
+                         f'(exit {proc.returncode}); fix the ladder run or pass '
+                         f'--simple-baselines with an existing report')
+    data = load_simple_baselines(path)
+    if data is None:
+        raise SystemExit(f'[compare] ERROR: simple-baseline calibration wrote {path} but it '
+                         f'does not parse as a calibration report')
+    return data
+
 
 def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, source) -> dict:
     """Annotate every comparison row with its distance to the task's Bayes limits.
@@ -1794,6 +1838,9 @@ def main():
     p.add_argument('--curve-batches', type=int, default=5, help='held-out batches per curve-monitoring point')
     p.add_argument('--baselines', nargs='+', default=['ln_baseline', 'rmsnorm_baseline'], help='rows treated as the simple reference baselines in the baseline-relative comparison')
     p.add_argument('--simple-baselines', default=None, help='Bayes-limit calibration JSON from scripts/baseline_simple.py; when omitted, auto-detected at <output-dir>/simple_baselines.json. Adds the tuned simple baseline and the memoryless-Bayes-floor / full-context-ceiling gaps to baseline_comparison.json')
+    p.add_argument('--auto-simple-baselines', action='store_true', help='when the calibration is missing, run scripts/baseline_simple.py once for the selected seeds (same synthetic corpus protocol) instead of writing a comparison with no Bayes-limit reference')
+    p.add_argument('--require-simple-baselines', action='store_true', help='fail before writing baseline_comparison.json when no calibration is available and --auto-simple-baselines did not produce one; a comparison without the tuned count model and Bayes limits cannot show that a row learned the task')
+    p.add_argument('--no-simple-baselines', dest='simple_baselines_enabled', action='store_false', help='explicitly opt out of the simple-baseline calibration annotation; the opt-out is recorded in baseline_comparison.json')
     p.add_argument('--baseline-margin', type=float, default=0.0, help='minimum val_loss improvement over the best baseline to count as a win')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired t-test vs the best baseline (Holm-adjusted over rows)')
     p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check for every norm in the selected rows before training them (default: on; a row that cannot overfit one batch has a gradient/loss bug and must not be launched)')
@@ -1937,13 +1984,42 @@ def main():
               f"{[r['name'] for r in stale_rows]}; rerun them under this recipe to include them")
     comparison = baseline_comparison(comparable, args.baselines, margin=args.baseline_margin, alpha=args.alpha)
     simple_path = Path(args.simple_baselines) if args.simple_baselines else base / 'simple_baselines.json'
-    floor_data = load_simple_baselines(simple_path)
+    floor_data = (load_simple_baselines(simple_path)
+                  if args.simple_baselines_enabled else None)
+    if (comparison is not None and floor_data is None
+            and args.simple_baselines_enabled and args.auto_simple_baselines):
+        floor_data = run_simple_baseline_calibration(simple_path, seeds)
     if comparison is not None and floor_data is not None:
         comparison['simple_baseline'] = attach_simple_baseline_calibration(comparison, floor_data, simple_path)
+        comparison['calibration_status'] = 'attached'
+    elif comparison is not None and not args.simple_baselines_enabled:
+        # The opt-out must be visible in the artifact, not just on stdout: a
+        # reader of baseline_comparison.json otherwise sees the same file as a
+        # fully calibrated comparison.
+        comparison['simple_baseline'] = {
+            'enabled': False, 'status': 'explicitly_disabled',
+            'reason': 'disabled by --no-simple-baselines',
+            'bayes_limits': None, 'tuned_simple_ce_nats': None}
+        comparison['calibration_status'] = 'explicitly_disabled'
+        print('[compare] simple-baseline calibration disabled by --no-simple-baselines: rows are '
+              'ranked only against each other, not against the task Bayes limits')
     elif comparison is not None:
-        print(f"[compare] note: no tuned simple-baseline calibration at {simple_path}; run "
-              f"'python3 scripts/baseline_simple.py --output {simple_path}' so every row is read against the "
-              f"task's Bayes limits and a tuned count model, not only against the other transformer rows")
+        comparison['simple_baseline'] = {
+            'enabled': False, 'status': 'missing', 'source': str(simple_path),
+            'bayes_limits': None, 'tuned_simple_ce_nats': None,
+            'how_to_generate': (f'python3 scripts/baseline_simple.py --output {simple_path} '
+                                f'--seeds {" ".join(map(str, seeds))}')}
+        comparison['calibration_status'] = 'missing'
+        print(f"[compare] WARNING: no tuned simple-baseline calibration at {simple_path}; the rows below are "
+              f"only ranked against each other. Generate the task's Bayes limits and tuned count model with "
+              f"'{comparison['simple_baseline']['how_to_generate']}' (or pass --auto-simple-baselines / "
+              f"--require-simple-baselines)")
+        if args.require_simple_baselines:
+            raise SystemExit(
+                f'[compare] ERROR: --require-simple-baselines is set but no calibration exists at '
+                f'{simple_path}; refusing to write baseline_comparison.json without the tuned count-model '
+                f'and Bayes-limit reference. Generate it with '
+                f"'{comparison['simple_baseline']['how_to_generate']}'.")
     if comparison is not None:
         comparison['rows_excluded_protocol_mismatch'] = stale_rows
         with open(base / 'baseline_comparison.json', 'w') as f:
