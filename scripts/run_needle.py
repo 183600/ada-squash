@@ -341,6 +341,10 @@ def main():
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests (e.g. "DyT-CD retains needle accuracy at 4k tokens"); recorded in the manifest so a pass/fail is auditable as a test rather than a fishing trip')
     p.add_argument('--max-failure-examples', type=int, default=3, help='bad-case samples to print per context length (all failures are kept in the JSON)')
     args = p.parse_args()
+    if args.compare_to and not args.hypothesis:
+        p.error('--compare-to requires --hypothesis "..." so the claim, direction and context '
+                'family are registered before the paired comparison is run, not selected after '
+                'seeing which context length moved')
     seeds = [args.seed] if args.seed is not None else (list(args.seeds) if args.seeds else list(DEFAULT_SEEDS))
     if not seeds:
         p.error('--seeds must not be empty')
