@@ -84,13 +84,15 @@ def _lr_key(lr: float) -> str:
     return repr(float(lr))
 
 
-def cached_trial_matches(summary: dict, arm: str, lr: float, args) -> bool:
+def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | None=None) -> bool:
     """Whether a cached trial ran under the *same protocol* as this invocation.
 
     The trial path (`arm/lr/seed`) does not encode `--max-steps`,
     `--batch-size`, `--seq-len` or `--weight-decay`, so reusing a summary
     without checking those would silently compare and select under two
-    different recipes.
+    different recipes. The full `cfg` (not only its norm name), the model and
+    the recorded seed are part of the identity too: a same-norm summary with
+    extra config overrides or a different seed is a different trial.
     """
     if not isinstance(summary, dict):
         return False
@@ -100,16 +102,26 @@ def cached_trial_matches(summary: dict, arm: str, lr: float, args) -> bool:
     optimizer = controls.get('optimizer') or {}
     data = controls.get('data') or {}
     cfg = summary.get('cfg')
-    return bool(
-        isinstance(cfg, dict) and cfg.get('norm_name') == arm
-        and summary.get('model') == args.model
+    if not (isinstance(cfg, dict) and cfg == {'norm_name': arm}):
+        return False
+    if not (
+        summary.get('model') == args.model
         and optimizer.get('lr') == float(lr)
         and optimizer.get('weight_decay') == args.weight_decay
         and data.get('batch_size') == args.batch_size
         and data.get('seq_len') == args.seq_len
         and controls.get('train_steps') == args.max_steps
         and summary.get('n_val_batches') == max(1, args.val_batches)
-    )
+    ):
+        return False
+    if seed is not None:
+        recorded = summary.get('seed')
+        if recorded is None:
+            seeds = summary.get('seeds')
+            recorded = seeds[0] if isinstance(seeds, list) and seeds else None
+        if recorded is None or int(recorded) != int(seed):
+            return False
+    return True
 
 
 def run_trial(arm: str, lr: float, seed: int, args, base: Path, run_metadata: dict | None = None) -> dict:
@@ -121,7 +133,7 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path, run_metadata: di
     if (run_dir / 'summary.json').exists() and (not args.force):
         try:
             cached = json.loads((run_dir / 'summary.json').read_text())
-            if cached_trial_matches(cached, arm, lr, args):
+            if cached_trial_matches(cached, arm, lr, args, seed=seed):
                 print(f'[tune][skip] {arm} lr={lr:g} seed={seed} (summary exists, --force to rerun)')
                 return cached
             print(f'[tune][stale] {arm} lr={lr:g} seed={seed}: cached trial ran under a different '
