@@ -137,8 +137,10 @@ def _ledger_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     if a is None or b is None:
         return {"data": ["missing in one run_manifest" if a is None else "recorded",
                          "missing in the other" if b is None else "recorded"]}
+    missing = "<missing>"
     return {f"data.{key}": [a[key], b[key]]
-            for key in _LEDGER_MANIFEST_KEYS if a[key] != b[key]}
+            for key in _LEDGER_MANIFEST_KEYS
+            if a[key] == missing or b[key] == missing or a[key] != b[key]}
 
 def pairing_mismatches(ref: dict, other: dict) -> dict:
     """Keys whose values differ between the two runs' data-protocol blocks."""
