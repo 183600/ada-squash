@@ -250,9 +250,22 @@ def aggregate_w8a8_seed_rows(ckpt_path: str, per_seed: list) -> dict:
         vals = [r[key] for r in per_seed if isinstance(r.get(key), (int, float))]
         stats = mean_std_stderr(vals)
         if stats is None:
+            # Every probe draw was non-finite: report "unmeasured", never keep
+            # the first seed's NaN as if it were the aggregate. A probe that
+            # overflowed is a numerical failure to triage, not a PPL result.
+            agg[key] = None
+            agg[key + '_std'] = None
+            agg[key + '_n_finite'] = 0
+            agg[key + '_n_nonfinite'] = len(vals)
+            if vals:
+                agg.setdefault('nonfinite_metric_counts', {})[key] = len(vals)
             continue
         agg[key] = stats['mean']
         agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
+        agg[key + '_n_finite'] = stats['n']
+        agg[key + '_n_nonfinite'] = stats['n_nonfinite']
+        if stats['n_nonfinite']:
+            agg.setdefault('nonfinite_metric_counts', {})[key] = stats['n_nonfinite']
     agg['per_seed'] = per_seed
     return agg
 
@@ -578,7 +591,13 @@ def main():
             r_ckpt = aggregate_w8a8_seed_rows(ckpt_path, per_seed)
             if args.probe == 'dataset' and args.probe_split != 'validation':
                 print(f"[w8a8] WARNING: --probe dataset scored on the '{args.probe_split}' split; use 'validation' for model comparison ('test' is reserved for the single final evaluation, 'train' is optimistically biased)", file=sys.stderr)
-            if r_ckpt['ppl_fp'] >= 0.5 * model.cfg.vocab_size:
+            nonfinite_counts = r_ckpt.get('nonfinite_metric_counts') or {}
+            if nonfinite_counts:
+                print(f"[w8a8] WARNING: {ckpt_path}: non-finite probe metric(s) "
+                      f"excluded from the reported means: {nonfinite_counts} "
+                      f"(per-seed records kept); triage the overflow before quoting "
+                      f"the PPL drop", file=sys.stderr)
+            if r_ckpt.get('ppl_fp') is not None and r_ckpt['ppl_fp'] >= 0.5 * model.cfg.vocab_size:
                 print(f"[w8a8] WARNING: {ckpt_path} ppl_fp={r_ckpt['ppl_fp']:.1f} (mean over {r_ckpt['n_seeds']} seeds) is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={r_ckpt['probe_token_coverage']:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet", file=sys.stderr)
             per_ckpt.append({'path': ckpt_path, 'train_seed': train_seed,
                              'protocol': _protocol_record(ckpt_args, model),
