@@ -737,8 +737,9 @@ def classify_nan_stage(evidence: dict) -> dict:
             ],
         )
     if evidence.get("parameters_finite") is False:
-        bad = evidence.get("nonfinite_parameters") or []
-        where = ", ".join(p["name"] for p in bad) or "unknown parameter"
+        bad = ((evidence.get("nonfinite_parameters") or [])
+               + (evidence.get("nonfinite_buffers") or []))
+        where = ", ".join(p["name"] for p in bad) or "unknown parameter/buffer"
         return stage(
             "gradients",
             "the weights are already non-finite before this batch reaches the "
