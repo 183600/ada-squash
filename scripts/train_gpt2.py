@@ -567,11 +567,12 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     pooled across seeds, and the sealed `test_loss` of every seed (when the
     run evaluated it) is kept per seed so `scripts/compare_sealed_tests.py`
     can pair two arms by their shared training seeds instead of by test
-    batches of a single run. Missing/invalid seeds are reported, never
-    silently dropped.
+    batches of a single run. Missing, invalid, and rejected (unfinished or
+    mismatched) seed manifests are reported, never silently dropped.
     """
     seeds = [int(s) for s in seeds]
     per_seed = []
+    rejections = []
     for seed in seeds:
         run_dir = seed_run_dir(base_dir, seed)
         record = {
@@ -585,36 +586,57 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             'test_loss': None,
             'tokens_per_second': None, 'peak_device_memory_mb': None,
         }
+        reject_reason = None
+        manifest = None
         try:
             manifest = json.loads((run_dir / 'run_manifest.json').read_text())
-            results = manifest.get('results') if isinstance(manifest, dict) else None
-            if isinstance(results, dict):
-                record['final_val_loss'] = results.get('final_val_loss')
-                record['best_val_loss'] = results.get('best_val_loss')
-                record['final_val_step'] = results.get('final_val_step')
-                record['best_val_step'] = results.get('best_val_step')
-                record['n_params'] = results.get('n_params')
-                record['n_layers'] = results.get('n_layers')
-                record['dim'] = results.get('dim')
-                record['n_heads'] = results.get('n_heads')
-                record['n_loss_spikes'] = results.get('n_loss_spikes')
-                record['n_nonfinite_losses'] = results.get('n_nonfinite_losses')
-                record['n_nonfinite_gradients'] = results.get('n_nonfinite_gradients')
-                record['n_nonfinite_val_losses'] = results.get('n_nonfinite_val_losses')
-                record['tokens_per_second'] = results.get('tokens_per_second')
-                record['peak_device_memory_mb'] = results.get('peak_device_memory_mb')
-                curve = results.get('curve_diagnosis') or {}
-                record['curve_classification'] = curve.get('classification')
-                record['curve_generalization_gap'] = curve.get('generalization_gap')
         except (OSError, json.JSONDecodeError):
-            pass
-        try:
-            test = json.loads((run_dir / 'test_results.json').read_text())
-            value = test.get('test_loss') if isinstance(test, dict) else None
-            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            reject_reason = 'run_manifest.json is missing or unreadable'
+        results = manifest.get('results') if isinstance(manifest, dict) else None
+        if reject_reason is None:
+            if not isinstance(manifest, dict):
+                reject_reason = 'run_manifest.json is missing or unreadable'
+            elif manifest.get('status') != 'finished':
+                reject_reason = (f"run status is {manifest.get('status')!r}, not 'finished'; "
+                                 'the run did not complete')
+            else:
+                recorded = manifest.get('hyperparameters')
+                if isinstance(recorded, dict):
+                    expected = {'model': model, 'norm': norm, 'seed': int(seed)}
+                    mismatches = {
+                        key: [wanted, recorded.get(key)]
+                        for key, wanted in expected.items()
+                        if recorded.get(key) is not None and recorded.get(key) != wanted
+                    }
+                    if mismatches:
+                        reject_reason = ('recorded model/norm/seed differs from this aggregate: '
+                                         + json.dumps(mismatches, sort_keys=True))
+        if reject_reason is not None:
+            record['rejected'] = reject_reason
+            rejections.append({'seed': int(seed), 'path': str(run_dir / 'run_manifest.json'),
+                               'reason': reject_reason})
+        elif isinstance(results, dict):
+            record['final_val_loss'] = results.get('final_val_loss')
+            record['best_val_loss'] = results.get('best_val_loss')
+            record['final_val_step'] = results.get('final_val_step')
+            record['best_val_step'] = results.get('best_val_step')
+            record['n_params'] = results.get('n_params')
+            record['n_layers'] = results.get('n_layers')
+            record['dim'] = results.get('dim')
+            record['n_heads'] = results.get('n_heads')
+            record['n_loss_spikes'] = results.get('n_loss_spikes')
+            record['n_nonfinite_losses'] = results.get('n_nonfinite_losses')
+            record['n_nonfinite_gradients'] = results.get('n_nonfinite_gradients')
+            record['n_nonfinite_val_losses'] = results.get('n_nonfinite_val_losses')
+            record['tokens_per_second'] = results.get('tokens_per_second')
+            record['peak_device_memory_mb'] = results.get('peak_device_memory_mb')
+            curve = results.get('curve_diagnosis') or {}
+            record['curve_classification'] = curve.get('classification')
+            record['curve_generalization_gap'] = curve.get('generalization_gap')
+            value = results.get('test_loss')
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(float(value))):
                 record['test_loss'] = float(value)
-        except (OSError, json.JSONDecodeError):
-            pass
         per_seed.append(record)
 
     def _finite(value) -> bool:
@@ -647,6 +669,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'n_seeds': len(final_vals),
         'missing_seeds': missing,
         'invalid_seeds': invalid,
+        'manifest_rejections': rejections,
         'complete': not missing and not invalid,
         'per_seed': per_seed,
         'final_val_loss': None if final_stats is None else final_stats['mean'],
@@ -713,12 +736,16 @@ def launch_multi_seed(args, seeds) -> None:
     if len(seeds) < 3:
         print(f'[seeds][error] {len(seeds)} seed(s): certification requires >= 3 independent seeds to separate norm effect from run-to-run noise; use --seeds with >= 3 values')
         raise SystemExit('[seeds] insufficient seeds for certified replication')
+    (base / 'aggregate.json').unlink(missing_ok=True)
+    (base / 'run_manifest.json').unlink(missing_ok=True)
     child_argv = list(sys.argv[1:])
     script = str(Path(__file__).resolve())
     failed_seeds: list = []
     for seed in seeds:
         out_dir = seed_run_dir(base, seed)
         out_dir.mkdir(parents=True, exist_ok=True)
+        for stale in ('run_manifest.json', 'test_results.json'):
+            (out_dir / stale).unlink(missing_ok=True)
         print(f'[seeds] launching seed={seed} -> {out_dir}', flush=True)
         env = dict(os.environ)
         env['PYTHONHASHSEED'] = str(seed)
@@ -754,6 +781,9 @@ def launch_multi_seed(args, seeds) -> None:
             print(f'[seeds][warn] {sum(off.values())} seed(s) ended in {off}: the pooled '
                   'loss describes that regime as much as the norm; read the per-seed '
                   'curves before attributing the mean delta to the change')
+    for rejection in agg.get('manifest_rejections') or []:
+        print(f'[seeds][warn] seed={rejection["seed"]}: rejected manifest '
+              f'({rejection["reason"]})')
     if agg['missing_seeds']:
         print(f'[seeds][warn] missing/unfinished seed runs: {agg["missing_seeds"]}; the pooled mean '
               f'covers {agg["n_seeds"]} of {agg["n_seeds_requested"]} requested seeds')
