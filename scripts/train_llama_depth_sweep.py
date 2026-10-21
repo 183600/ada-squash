@@ -361,6 +361,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                            if not _finite(p['final_val_loss'])]
     return {
         'cell': cell_dir.name,
+        'launch_id': launch_id,
         'seeds': seed_list,
         'n_seeds_requested': len(seed_list),
         'missing_seeds': missing_seeds,
@@ -938,6 +939,11 @@ def main():
         for norm in args.norms:
             cell_dir = base / f'd{depth}-{norm}'
             cell_dir.mkdir(parents=True, exist_ok=True)
+            # This aggregate belongs to the previous sweep invocation until
+            # the new cells are re-aggregated below. Remove it up front so a
+            # launcher that dies mid-run cannot leave old means that look like
+            # the current grid's results.
+            (cell_dir / 'aggregate.json').unlink(missing_ok=True)
             for seed in seeds:
                 out_dir = seed_dir(cell_dir, seed, multi)
                 out_dir.mkdir(parents=True, exist_ok=True)
