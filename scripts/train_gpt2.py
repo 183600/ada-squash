@@ -24,7 +24,7 @@ from adasquash.metrics import mean_ci, mean_std_stderr
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.norms import NORM_REGISTRY
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
-from scripts.data_pipeline import build_dataloader, configure_data_options
+from scripts.data_pipeline import build_dataloader, configure_data_options, _is_pinned_revision
 
 def load_yaml_config(path: str) -> dict:
     import yaml
@@ -570,6 +570,27 @@ def seed_run_dir(base: Path, seed: int) -> Path:
     """Per-seed run directory: `<output-dir>/seed{N}/` in multi-seed mode."""
     return base / f'seed{int(seed)}'
 
+def _manifest_data_version(manifest: dict):
+    """Concrete dataset/tokenizer commits a seed actually trained on, if pinned."""
+    data = manifest.get('data') if isinstance(manifest, dict) else None
+    if not isinstance(data, dict):
+        return None
+    reports = data.get('split_reports') or {}
+    train = reports.get('train') if isinstance(reports, dict) else None
+    train = train if isinstance(train, dict) else {}
+    dataset_resolved = (train.get('dataset_revision_resolved')
+                        or data.get('dataset_revision_resolved'))
+    tokenizer_resolved = (train.get('tokenizer_revision_resolved')
+                          or data.get('tokenizer_revision_resolved'))
+    if not _is_pinned_revision(dataset_resolved):
+        return None
+    if not _is_pinned_revision(tokenizer_resolved):
+        return None
+    return {
+        'dataset_revision_resolved': dataset_resolved,
+        'tokenizer_revision_resolved': tokenizer_resolved,
+    }
+
 def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     """Pool per-seed runs into one Mean +/- Std record (Phase 1 statistics).
 
@@ -598,7 +619,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             'n_loss_spikes': None, 'n_nonfinite_losses': None,
             'n_nonfinite_gradients': None, 'n_nonfinite_val_losses': None,
             'curve_classification': None, 'curve_generalization_gap': None,
-            'test_loss': None,
+            'test_loss': None, 'data_version': None,
             'tokens_per_second': None, 'peak_device_memory_mb': None,
         }
         reject_reason = None
@@ -642,6 +663,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             record['n_layers'] = results.get('n_layers')
             record['dim'] = results.get('dim')
             record['n_heads'] = results.get('n_heads')
+            record['data_version'] = _manifest_data_version(manifest)
             record['n_loss_spikes'] = results.get('n_loss_spikes')
             record['n_nonfinite_losses'] = results.get('n_nonfinite_losses')
             record['n_nonfinite_gradients'] = results.get('n_nonfinite_gradients')
@@ -664,6 +686,18 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         vals = [float(r[key]) for r in per_seed if _finite(r.get(key))]
         return vals, (mean_std_stderr(vals) if vals else None)
 
+    # A pooled loss is only one arm's number if every seed trained on the
+    # same upstream snapshot. A missing resolved revision is unknown, not a
+    # match (the Hub may have been unreachable and left a branch name).
+    data_versions_by_seed = {
+        int(r['seed']): r.get('data_version') for r in per_seed}
+    known_versions = {
+        json.dumps(v, sort_keys=True) for v in data_versions_by_seed.values()
+        if v is not None}
+    unknown_data_version_seeds = sorted(
+        seed for seed, v in data_versions_by_seed.items() if v is None)
+    data_versions_complete = bool(data_versions_by_seed) and not unknown_data_version_seeds
+    data_versions_consistent = (data_versions_complete and len(known_versions) <= 1)
     final_vals, final_stats = _pool('final_val_loss')
     best_vals, best_stats = _pool('best_val_loss')
     test_vals, test_stats = _pool('test_loss')
@@ -680,6 +714,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     missing = [r['seed'] for r in per_seed if not _finite(r['final_val_loss'])]
     invalid = [r['seed'] for r in per_seed
                if any(isinstance(r[k], float) and not math.isfinite(r[k]) for k in ('final_val_loss', 'best_val_loss'))]
+    pool_ok = (not missing and not invalid
+               and data_versions_complete and data_versions_consistent)
     return {
         'model': model, 'norm': norm,
         'seeds': seeds,
@@ -688,7 +724,11 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'missing_seeds': missing,
         'invalid_seeds': invalid,
         'manifest_rejections': rejections,
-        'complete': not missing and not invalid,
+        'data_versions_by_seed': data_versions_by_seed,
+        'unknown_data_version_seeds': unknown_data_version_seeds,
+        'data_versions_complete': data_versions_complete,
+        'data_versions_consistent': data_versions_consistent,
+        'complete': pool_ok,
         'per_seed': per_seed,
         'final_val_loss': None if final_stats is None else final_stats['mean'],
         'final_val_loss_std': None if final_stats is None or len(final_vals) < 2 else final_stats['std'],
@@ -723,13 +763,16 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                                      if isinstance(r.get('n_nonfinite_gradients'), (int, float))),
         'n_nonfinite_val_losses': sum(r['n_nonfinite_val_losses'] or 0 for r in per_seed
                                       if isinstance(r.get('n_nonfinite_val_losses'), (int, float))),
-        'certified': len(final_vals) >= 3 and not missing and not invalid,
-        'certification_basis': ('certified: >= 3 seeds with finite final_val_loss, no missing/invalid seeds'
-                                if len(final_vals) >= 3 and not missing and not invalid
+        'certified': len(final_vals) >= 3 and pool_ok,
+        'certification_basis': ('certified: >= 3 seeds with finite final_val_loss, no missing/invalid seeds, and one resolved data version'
+                                if len(final_vals) >= 3 and pool_ok
                                 else 'not certified: ' + (
                                     f'{len(final_vals)} seeds (< 3)' if len(final_vals) < 3 else
                                     f'missing seeds: {missing}' if missing else
-                                    f'invalid seeds: {invalid}')),
+                                    f'invalid seeds: {invalid}' if invalid else
+                                    f'unknown data version for seeds: {unknown_data_version_seeds}'
+                                    if not data_versions_complete else
+                                    'seeds trained on different resolved data versions')),
         'aggregation': (
             'Mean +/- Std across independent seed runs of the identical recipe (same optimizer, '
             'schedule, data protocol and step count). final_val_loss = last validation pass at the '
