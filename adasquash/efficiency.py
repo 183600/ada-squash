@@ -124,6 +124,8 @@ def parameter_breakdown(model) -> dict:
     skipped = 0
     for name, p in model.named_parameters(remove_duplicate=False):
         key = p.data_ptr()
+        if key == 0:
+            key = id(p)
         if key in seen:
             skipped += int(p.numel())
             continue
