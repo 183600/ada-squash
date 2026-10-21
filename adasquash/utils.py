@@ -39,7 +39,7 @@ class MaxAbsMeter:
                     self._peak = v.clone() if torch.isfinite(v) else v.clone()
                 elif self._peak.dtype != v.dtype or self._peak.device != v.device:
                     self._peak = self._peak.to(dtype=torch.promote_types(self._peak.dtype, v.dtype), device=v.device)
-                torch.fmax(self._peak, v, out=self._peak)
+                torch.maximum(self._peak, v, out=self._peak)
         self.count += 1
 
 # One workspace pair per (name, device, dtype), shared by every meter: the
