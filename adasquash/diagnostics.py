@@ -165,6 +165,8 @@ def diagnose_train_val_curve(
     gap_widen = float(thresholds["gap_widen_rel"])
     noise_z = float(thresholds["noise_z"])
 
+    n_train_input = len(train_losses)
+    n_val_input = len(val_losses)
     raw_train = [float(v) for v in train_losses if v is not None]
     raw_val = [float(v) for v in val_losses if v is not None]
     # `val_stderr` is parallel to the caller's (unfiltered) `val_losses`: a
@@ -186,10 +188,21 @@ def diagnose_train_val_curve(
                  if v is not None and not math.isfinite(float(v))]
     bad_val = [i for i, v in enumerate(val_losses)
                if v is not None and not math.isfinite(float(v))]
-    train_losses = [v for v in raw_train if math.isfinite(v)]
-    val_losses = [v for v in raw_val if math.isfinite(v)]
-    train_steps = list(train_steps) if train_steps is not None else []
-    val_steps = list(val_steps) if val_steps is not None else []
+    # Keep each surviving loss paired with its original step. Filtering only
+    # the loss list (while passing the unfiltered step list) makes the arrays
+    # unequal in length, and `_step_aligned_gap_points` silently falls back to
+    # positional pairing - exactly the train/val cadence bug it exists to
+    # prevent. None means "no point logged": drop the step with its loss.
+    finite_train_idx = [i for i, v in enumerate(train_losses)
+                        if v is not None and math.isfinite(float(v))]
+    finite_val_idx = [i for i, v in enumerate(val_losses)
+                      if v is not None and math.isfinite(float(v))]
+    train_losses = [float(train_losses[i]) for i in finite_train_idx]
+    val_losses = [float(val_losses[i]) for i in finite_val_idx]
+    train_steps = ([] if train_steps is None or len(train_steps) != n_train_input
+                   else [train_steps[i] for i in finite_train_idx])
+    val_steps = ([] if val_steps is None or len(val_steps) != n_val_input
+                 else [val_steps[i] for i in finite_val_idx])
 
     out = {
         "classification": "insufficient_data",
@@ -403,6 +416,7 @@ def diagnose_train_val_curve(
             "val_losses_tail": val_losses[-window:],
             "log_vocab_size": log_vocab_size,
             "gap_alignment": gap_alignment,
+            "gap_points": gap_points,
             "val_change": val_change,
             "val_stderr_tail": (None if val_stderr_series is None
                                 else val_stderr_series[-tail_len:]),
@@ -475,19 +489,31 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
     ignore_index = int(getattr(getattr(model, "cfg", None), "ignore_index", -100))
     x_report = tensor_finite_report(x)
     y_report = tensor_finite_report(y)
-    targets_valid = True
-    if y.numel():
+
+    def _integer_ids(t: torch.Tensor) -> bool:
+        # Embedding and cross-entropy both index with these tensors; a float
+        # tensor (even one holding integral values) is a data-pipeline bug that
+        # would otherwise surface as a downstream model/CE exception and be
+        # misdiagnosed as fp32 math.
+        return not (t.is_floating_point() or t.is_complex() or t.dtype == torch.bool)
+
+    input_integer_ids = _integer_ids(x)
+    target_integer_ids = _integer_ids(y)
+    targets_valid = target_integer_ids
+    if y.numel() and target_integer_ids:
         in_range = (y == ignore_index) | ((y >= 0) & (y < vocab_size))
         targets_valid = bool(in_range.all().item())
-    if x.is_floating_point() or x.is_complex():
-        tokens_valid = x_report["finite"]
+    if x.numel() and input_integer_ids:
+        tokens_valid = bool(((x >= 0) & (x < vocab_size)).all().item())
     else:
-        tokens_valid = bool(((x >= 0) & (x < vocab_size)).all().item()) if x.numel() else True
-    mask_count = int((y != ignore_index).sum().item())
+        tokens_valid = input_integer_ids
+    mask_count = int((y != ignore_index).sum().item()) if target_integer_ids and y.numel() else 0
     return {
         "input": x_report,
         "targets": y_report,
         "vocab_size": vocab_size,
+        "input_integer_ids": bool(input_integer_ids),
+        "target_integer_ids": bool(target_integer_ids),
         "targets_valid": bool(targets_valid),
         "input_token_ids_valid": bool(tokens_valid),
         "loss_mask_nonempty": mask_count > 0,
@@ -688,26 +714,52 @@ def classify_nan_stage(evidence: dict) -> dict:
     if (not evidence.get("data_finite", True)
             or evidence.get("loss_denominator_positive") is False
             or evidence.get("loss_mask_nonempty") is False):
+        dtype_bad = (evidence.get("input_integer_ids") is False
+                     or evidence.get("target_integer_ids") is False)
+        if dtype_bad:
+            diagnosis = ("the batch's token ids/targets are not an integer dtype "
+                         "(floating or boolean tensors cannot index an embedding "
+                         "or be used as cross-entropy targets)")
+        else:
+            diagnosis = "the batch itself is invalid before it ever reaches the model"
         return stage(
             "data",
-            "the batch itself is invalid before it ever reaches the model",
+            diagnosis,
             [
                 "inspect the first bad batch: which field is NaN/Inf, which token "
                 "id is out of vocabulary, or why the loss mask is empty",
+                "cast input_ids/targets to an integer dtype (int64) at the "
+                "tokenizer/packer boundary; do not let float tensors reach "
+                "embedding() or cross_entropy()",
                 "re-run scripts/audit_data.py (it counts missing/NaN text, "
                 "out-of-range ids and tokenizer failures) and check the packing "
                 "pipeline in scripts/data_pipeline.py",
             ],
         )
+    training_path_bad = (
+        evidence.get("fp32_fused_loss_finite") is False
+        or evidence.get("fused_forward_error")
+        or evidence.get("first_nonfinite_modules_training_path")
+    )
     if (evidence.get("fp32_forward_finite") is False
             or evidence.get("fp32_logits_finite") is False
             or evidence.get("first_nonfinite_modules")
-            or evidence.get("forward_error")):
-        first = evidence.get("first_nonfinite_modules") or []
+            or evidence.get("forward_error")
+            or training_path_bad):
+        first = ((evidence.get("first_nonfinite_modules") or [])
+                 + (evidence.get("first_nonfinite_modules_training_path") or []))
         where = ", ".join(f"{m['module']}({m['class']})" for m in first) or "unknown module"
         if evidence.get("forward_error"):
             diagnosis = ("the fp32 forward raised before a finite loss could be measured "
                          f"({evidence['forward_error']})")
+        elif evidence.get("fused_forward_error"):
+            diagnosis = ("the fp32 logits path raised "
+                         f"({evidence['fused_forward_error']})")
+        elif evidence.get("fp32_fused_loss_finite") is False:
+            diagnosis = ("the fp32 training-path (fused cross-entropy) loss is "
+                         "non-finite while the logits path is finite: the bug is "
+                         "in the fused CE path (log-sum-exp/denominator/ignore-index "
+                         f"handling), not in the backbone; first bad module(s): {where}")
         else:
             diagnosis = ("the fp32 forward is already non-finite (softmax/log/division "
                          f"pathology), first bad module(s): {where}")
@@ -718,6 +770,10 @@ def classify_nan_stage(evidence: dict) -> dict:
                 "if the named module computes log/softmax/division, check its "
                 "denominator: log(0) -> -inf, x/0 -> inf; a fully masked batch "
                 "makes the cross-entropy denominator zero",
+                "for a fused-CE-only failure, check adasquash/model.py's "
+                "fused_cross_entropy_mean/_FusedLinearCrossEntropy: the same "
+                "batch must be finite through both return_logits=True and "
+                "return_logits=False (the trainer uses the latter)",
                 "re-run the forward in float64 on a tiny batch to confirm the "
                 "value is truly non-finite and not a dtype artifact",
             ],
@@ -793,10 +849,12 @@ def triage_nonfinite(
 
     1. data validity: NaN/Inf, token-id range, empty loss mask, zero
        cross-entropy denominator;
-    2. fp32 forward with module hooks: if non-finite, name the first module
-       whose output goes bad (log/softmax/division pathologies live there);
-    3. autocast (bf16/fp16) forward: fp32 finite + autocast non-finite pinpoints
-       low-precision overflow;
+    2. fp32 forward, on both the logits path (`return_logits=True`) and the
+       fused-CE training path (`return_logits=False`, what the trainer uses),
+       with module hooks: if non-finite, name the first module whose output
+       goes bad (log/softmax/division pathologies live there);
+    3. autocast (bf16/fp16) forward on the training path: fp32 finite +
+       autocast non-finite pinpoints low-precision overflow;
     4. fp32 backward: non-finite or exploding gradients point at the learning
        rate / clipping rather than the data or the math.
 
@@ -831,6 +889,7 @@ def triage_nonfinite(
         return out
 
     evidence["fp32_forward_finite"] = None
+    evidence["fp32_fused_loss_finite"] = None
     try:
         with torch.no_grad():
             evidence["first_nonfinite_modules"] = first_nonfinite_module(model, _capture_forward)
@@ -841,14 +900,44 @@ def triage_nonfinite(
     except Exception as exc:  # diagnosis must never mask the original failure
         evidence["forward_error"] = repr(exc)
 
-    # The first stage that went bad already settles the diagnosis: the fp32
-    # forward is non-finite (or could not run at all), so stages 3-4 are
+    # The trainer consumes `return_logits=False` (fused CE), which never
+    # materializes the logits tensor the block above probes. Both paths must be
+    # checked: a log-sum-exp/denominator bug can be non-finite only in the
+    # fused path, and diagnosing that as "unreproduced" sends the reader to
+    # hardware/transience instead of the actual CE implementation.
+    try:
+        with torch.no_grad():
+            fused_loss = _forward(loss_only=True)
+            evidence["fp32_fused_loss_finite"] = bool(
+                torch.isfinite(fused_loss).all().item())
+            evidence["fp32_fused_loss"] = float(fused_loss.detach().item())
+    except Exception as exc:  # diagnosis must never mask the original failure
+        evidence["fused_forward_error"] = repr(exc)
+    if (evidence.get("fp32_fused_loss_finite") is False
+            and not evidence.get("first_nonfinite_modules")
+            and "forward_error" not in evidence):
+        # The backbone itself was finite on the logits path, so the logits-path
+        # hook census cannot locate a fused-only failure. Re-run the census on
+        # the actual training path to name the first hidden state that is bad
+        # before the fused CE consumes it.
+        try:
+            with torch.no_grad():
+                evidence["first_nonfinite_modules_training_path"] = first_nonfinite_module(
+                    model, lambda: _forward(loss_only=True))
+        except Exception as exc:  # diagnosis must never mask the original failure
+            evidence["fused_hook_error"] = repr(exc)
+
+    # The first stage that went bad already settles the diagnosis: either fp32
+    # loss path is non-finite (or could not run at all), so stages 3-4 are
     # recorded as skipped instead.
     stage2_bad = (
         evidence.get("fp32_forward_finite") is False
         or evidence.get("fp32_logits_finite") is False
+        or evidence.get("fp32_fused_loss_finite") is False
         or evidence.get("first_nonfinite_modules")
+        or evidence.get("first_nonfinite_modules_training_path")
         or "forward_error" in evidence
+        or "fused_forward_error" in evidence
     )
     if stage2_bad:
         model.zero_grad(set_to_none=True)
