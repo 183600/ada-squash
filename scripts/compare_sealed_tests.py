@@ -13,6 +13,10 @@ This tool performs that comparison honestly:
   scored on the same held-out batches, so the comparison is not paired; the
   script reports the row as not comparable (and exits non-zero) instead of
   silently substituting a weaker unpaired test.
+* the sealed result must belong to the finished run it sits next to. A
+  leftover `test_results.json` from an earlier run is rejected unless the
+  manifest records the same `results.test_loss` and, when present, the
+  artifact fingerprint matches its content.
 * **training seeds are the unit of replication.** The certification test is
   the one-sided paired Student-t on the per-seed sealed losses of the arms'
   *shared* training seeds (>= 3 required), and the complete seed-paired rows
@@ -29,6 +33,7 @@ This tool performs that comparison honestly:
   equality.
 """
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -102,6 +107,53 @@ def load_run_manifest(result_path) -> dict | None:
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+def _sealed_result_problem(run: dict) -> str | None:
+    """Why this sealed-test file cannot be tied to its finished run, or None."""
+    manifest = run.get("manifest")
+    results = manifest.get("results") if isinstance(manifest, dict) else None
+    if not isinstance(results, dict):
+        return "manifest has no results block"
+    recorded = results.get("test_loss")
+    if (isinstance(recorded, bool) or not isinstance(recorded, (int, float))
+            or not math.isfinite(float(recorded))):
+        return ("manifest has no finite results.test_loss: this run did not record a "
+                "sealed test evaluation, so a test_results.json in its directory cannot "
+                "be attributed to it")
+    actual = run["data"].get("test_loss")
+    if (isinstance(actual, bool) or not isinstance(actual, (int, float))
+            or not math.isfinite(float(actual))):
+        return "test_results.json has no finite test_loss"
+    tolerance = 1e-9 * max(1.0, abs(float(recorded)))
+    if abs(float(actual) - float(recorded)) > tolerance:
+        return (f"test_results.json test_loss={actual} disagrees with manifest "
+                f"results.test_loss={recorded}; the file does not belong to this run")
+    artifacts = manifest.get("artifacts")
+    artifact = artifacts.get("test_results") if isinstance(artifacts, dict) else None
+    if isinstance(artifact, dict):
+        sha = artifact.get("sha256")
+        if artifact.get("exists") is False or not isinstance(sha, str) or not sha:
+            return "manifest artifacts.test_results is missing or has no sha256"
+        path = Path(run["path"])
+        hasher = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    hasher.update(chunk)
+            size = path.stat().st_size
+        except OSError as exc:
+            return f"cannot read test_results.json for fingerprint verification: {exc}"
+        if hasher.hexdigest() != sha:
+            return "test_results.json content hash disagrees with the manifest fingerprint"
+        expected_bytes = artifact.get("bytes")
+        if expected_bytes is not None:
+            try:
+                expected_size = int(expected_bytes)
+            except (TypeError, ValueError):
+                return "manifest artifacts.test_results has a malformed byte count"
+            if size != expected_size:
+                return "test_results.json size disagrees with the manifest fingerprint"
+    return None
 
 def _shape_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     a = ref_manifest.get("results") or {}
@@ -268,6 +320,14 @@ def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
     if unverified:
         return ("training recipe cannot be verified: missing/unfinished run_manifest.json "
                 "for " + "; ".join(unverified[:3]))
+    association_problems = []
+    for run in ref_arm["runs"] + cand_arm["runs"]:
+        problem = _sealed_result_problem(run)
+        if problem:
+            association_problems.append(f"{run['path']}: {problem}")
+    if association_problems:
+        return ("sealed test result cannot be tied to its run: "
+                + "; ".join(association_problems[:3]))
     recipe_problems = []
     ledger_problems = []
     for run in cand_arm["runs"]:
