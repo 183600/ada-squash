@@ -64,13 +64,19 @@ def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = 
     mlp = float(n_layers * 6 * d * h)           # 3 d x h matmuls/token/layer
     lm_head = float(2 * d * vocab)
     forward = attn + attn_scores + mlp + lm_head
+    training = 3.0 * forward
+    # `backward` selects the reported estimate; both component estimates stay
+    # available so callers can compare a forward-only run with a training run.
+    per_token = training if backward else forward
     return {
         "attention": attn,
         "attention_scores": attn_scores,
         "mlp": mlp,
         "lm_head": lm_head,
         "forward_per_token": forward,
-        "training_per_token": 3.0 * forward,
+        "training_per_token": training,
+        "per_token": per_token,
+        "backward": bool(backward),
         "backward_factor": 3.0,
         "mlp_hidden": h,
         "seq_len": T,
