@@ -13,8 +13,11 @@ This driver therefore:
 * gives every arm (baseline or variant) the identical compute - same
   `--max-steps`, batch size, sequence length, corpus generator and seed set -
   while sweeping the learning rate, the hyper-parameter that dominates
-  short-run optimization;
-* selects the learning rate per arm on a *held-out* metric only: the mean
+  short-run optimization. `--weight-decays` adds an optional second axis:
+  selection then runs over the joint (lr, wd) grid with the same coverage and
+  confirm-split rules, closing the "the baseline was tuned on lr only"
+  objection without changing the default lr-only protocol;
+* selects the (lr, wd) cell per arm on a *held-out* metric only: the mean
   `val_loss` over fresh synthetic batches from a generator the optimizer
   never sees (`ablation.run_one` computes it); the sealed real-data test
   split is never touched;
@@ -52,7 +55,8 @@ the rows carry `beats_reference_significantly = false` and a
 Usage
 -----
     python3 scripts/tune.py --arms ln rmsnorm dyt dytcd \
-        --lrs 3e-4 6e-4 1.2e-3 --seeds 42 43 --confirm-seeds 44 45 \
+        --lrs 3e-4 6e-4 1.2e-3 --weight-decays 0.01 0.1 \
+        --seeds 42 43 --confirm-seeds 44 45 \
         --output-dir runs/tune
 """
 from __future__ import annotations
@@ -80,11 +84,32 @@ def _lr_key(lr: float) -> str:
     ``format(lr, 'g')`` rounds to 6 significant digits: two distinct lrs can
     share a cache directory / grid key, and the selected rounded value no
     longer matches the trial records. ``repr`` round-trips the float exactly.
+    The same key is used for weight decay.
     """
     return repr(float(lr))
 
 
-def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | None=None) -> bool:
+def _grid_weight_decays(args) -> list[float]:
+    """The weight-decay axis, defaulting to the single legacy --weight-decay."""
+    values = getattr(args, 'weight_decays', None) or [getattr(args, 'weight_decay', 0.1)]
+    return [float(value) for value in values]
+
+
+def _cell_key(lr: float, weight_decay: float, multi_wd: bool) -> str:
+    """Grid/trials identity for an (lr, wd) cell.
+
+    A single weight decay keeps the legacy `lr{...}` layout so existing caches
+    stay usable; a real second axis appends `_wd{...}` because the same lr at
+    two decays are two different cells.
+    """
+    lr_key = _lr_key(lr)
+    if not multi_wd:
+        return lr_key
+    return f'{lr_key}_wd{_lr_key(weight_decay)}'
+
+
+def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | None=None,
+                         weight_decay: float | None=None) -> bool:
     """Whether a cached trial ran under the *same protocol* as this invocation.
 
     The trial path (`arm/lr/seed`) does not encode `--max-steps`,
@@ -104,10 +129,12 @@ def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | N
     cfg = summary.get('cfg')
     if not (isinstance(cfg, dict) and cfg == {'norm_name': arm}):
         return False
+    expected_wd = float(getattr(args, 'weight_decay', 0.1)
+                        if weight_decay is None else weight_decay)
     if not (
         summary.get('model') == args.model
         and optimizer.get('lr') == float(lr)
-        and optimizer.get('weight_decay') == args.weight_decay
+        and optimizer.get('weight_decay') == expected_wd
         and data.get('batch_size') == args.batch_size
         and data.get('seq_len') == args.seq_len
         and controls.get('train_steps') == args.max_steps
@@ -124,35 +151,44 @@ def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | N
     return True
 
 
-def run_trial(arm: str, lr: float, seed: int, args, base: Path, run_metadata: dict | None = None) -> dict:
-    """One (arm, lr, seed) run, reusing the ablation runner verbatim."""
+def run_trial(arm: str, lr: float, seed: int, args, base: Path,
+              run_metadata: dict | None = None,
+              weight_decay: float | None = None) -> dict:
+    """One (arm, lr, weight_decay, seed) run, reusing the ablation runner verbatim."""
+    wd = float(getattr(args, 'weight_decay', 0.1)
+               if weight_decay is None else weight_decay)
+    multi_wd = len(_grid_weight_decays(args)) > 1
     trial_args = copy.copy(args)
     trial_args.lr = float(lr)
+    trial_args.weight_decay = wd
     trial_args.seed = int(seed)
-    run_dir = base / 'trials' / arm / f'lr{_lr_key(lr)}' / f'seed{seed}'
+    cell_dir = f'lr{_lr_key(lr)}' if not multi_wd else f'lr{_lr_key(lr)}_wd{_lr_key(wd)}'
+    run_dir = base / 'trials' / arm / cell_dir / f'seed{seed}'
     if (run_dir / 'summary.json').exists() and (not args.force):
         try:
             cached = json.loads((run_dir / 'summary.json').read_text())
-            if cached_trial_matches(cached, arm, lr, args, seed=seed):
-                print(f'[tune][skip] {arm} lr={lr:g} seed={seed} (summary exists, --force to rerun)')
+            if cached_trial_matches(cached, arm, lr, args, seed=seed, weight_decay=wd):
+                print(f'[tune][skip] {arm} lr={lr:g} wd={wd:g} seed={seed} '
+                      f'(summary exists, --force to rerun)')
                 return cached
-            print(f'[tune][stale] {arm} lr={lr:g} seed={seed}: cached trial ran under a different '
-                  f'protocol (max_steps/batch/seq/weight_decay/model); retraining and overwriting')
+            print(f'[tune][stale] {arm} lr={lr:g} wd={wd:g} seed={seed}: cached trial ran under '
+                  f'a different protocol (max_steps/batch/seq/lr/wd/model); retraining and overwriting')
         except (OSError, json.JSONDecodeError):
             pass
     summary = run_one(
-        f'{arm}|lr={lr:g}|seed={seed}', {'norm_name': arm}, trial_args, run_dir, seed=seed,
+        f'{arm}|lr={lr:g}|wd={wd:g}|seed={seed}', {'norm_name': arm}, trial_args, run_dir, seed=seed,
         run_metadata=run_metadata,
-        hypothesis=(f'Compute-matched lr-sweep cell for arm {arm}: baselines and variants get the '
-                    f'identical grid and compute, so the selected lr makes the later arm '
-                    f'comparison a test against a tuned reference, not against a strawman.'),
+        hypothesis=(f'Compute-matched (lr, weight_decay)-grid cell for arm {arm}: baselines and '
+                    f'variants get the identical grid and compute, so the selected cell makes the '
+                    f'later arm comparison a test against a tuned reference, not against a strawman.'),
     )
     return summary
 
 
-def _trial_record(summary: dict, lr: float, seed: int) -> dict:
+def _trial_record(summary: dict, lr: float, seed: int, weight_decay: float | None = None) -> dict:
     return {
         'lr': float(lr),
+        'weight_decay': None if weight_decay is None else float(weight_decay),
         'seed': int(seed),
         'val_loss': summary.get('val_loss'),
         'val_loss_std': summary.get('val_loss_std'),
@@ -180,68 +216,80 @@ def _usable_loss(value) -> bool:
 
 
 def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> dict:
-    """Sweep the learning-rate grid for one arm over the selection seeds."""
+    """Sweep the (lr, weight_decay) grid for one arm over the selection seeds."""
+    weight_decays = _grid_weight_decays(args)
+    multi_wd = len(weight_decays) > 1
     trials = []
     for lr in args.lrs:
-        for seed in args.seeds:
-            summary = run_trial(arm, lr, seed, args, base, run_metadata=run_metadata)
-            trials.append(_trial_record(summary, lr, seed))
+        for wd in weight_decays:
+            for seed in args.seeds:
+                summary = run_trial(arm, lr, seed, args, base, run_metadata=run_metadata,
+                                    weight_decay=wd)
+                trials.append(_trial_record(summary, lr, seed, wd))
     n_selection_seeds = len(args.seeds) or 1
     lr_grid = {}
     for lr in args.lrs:
-        cell = [t for t in trials if t['lr'] == lr]
-        losses = [t['val_loss'] for t in cell if _usable_loss(t['val_loss'])]
-        stats = mean_std_stderr(losses)
-        if stats is not None:
-            stats = dict(stats)
-            # A cell whose diverged seeds were dropped has a mean over a
-            # *subset* of the seeds; letting it win against a cell with full
-            # coverage is survivorship bias (the unstable lr looks good
-            # because its failures are not in its own mean).
-            stats['missing_seeds'] = sorted(
-                t['seed'] for t in cell if not _usable_loss(t['val_loss']))
-            stats['complete_coverage'] = not stats['missing_seeds']
-            stats['n_selection_seeds'] = n_selection_seeds
-            stats['curve_classification_counts'] = dict(Counter(
-                t['curve_classification'] for t in cell if t.get('curve_classification')))
-            stats['curve_classifications_by_seed'] = {
-                t['seed']: t.get('curve_classification') for t in cell}
-            stats['lr'] = float(lr)
-            lr_grid[_lr_key(lr)] = stats
+        for wd in weight_decays:
+            cell = [t for t in trials
+                    if t['lr'] == lr and t.get('weight_decay') == wd]
+            losses = [t['val_loss'] for t in cell if _usable_loss(t['val_loss'])]
+            stats = mean_std_stderr(losses)
+            if stats is not None:
+                stats = dict(stats)
+                # A cell whose diverged seeds were dropped has a mean over a
+                # *subset* of the seeds; letting it win against a cell with
+                # full coverage is survivorship bias (the unstable cell looks
+                # good because its failures are not in its own mean).
+                stats['missing_seeds'] = sorted(
+                    t['seed'] for t in cell if not _usable_loss(t['val_loss']))
+                stats['complete_coverage'] = not stats['missing_seeds']
+                stats['n_selection_seeds'] = n_selection_seeds
+                stats['curve_classification_counts'] = dict(Counter(
+                    t['curve_classification'] for t in cell if t.get('curve_classification')))
+                stats['curve_classifications_by_seed'] = {
+                    t['seed']: t.get('curve_classification') for t in cell}
+                stats['lr'] = float(lr)
+                stats['weight_decay'] = float(wd)
+                lr_grid[_cell_key(lr, wd, multi_wd)] = stats
     if not lr_grid:
         return {'arm': arm, 'trials': trials, 'lr_grid': {}, 'best': None}
     complete = {k: v for k, v in lr_grid.items() if v['complete_coverage']}
     pool, pool_name = (complete, 'complete_coverage') if complete else (lr_grid, 'partial_coverage')
     if complete and len(complete) < len(lr_grid):
-        print(f"[tune][warn] {arm}: lr cell(s) "
+        print(f"[tune][warn] {arm}: grid cell(s) "
               f"{sorted(set(lr_grid) - set(complete))} lack a usable val_loss for every "
-              f"selection seed ({n_selection_seeds} required); they are excluded from lr "
+              f"selection seed ({n_selection_seeds} required); they are excluded from "
               f"selection rather than winning on a survivor-only mean. Rerun with --force "
               f"or add seeds to fill them in.")
-    best_lr_key = min(pool, key=lambda k: pool[k]['mean'])
-    best = {**pool[best_lr_key], 'selection_pool': pool_name}
+    best_key = min(pool, key=lambda k: pool[k]['mean'])
+    best = {**pool[best_key], 'selection_pool': pool_name}
     return {'arm': arm, 'trials': trials, 'lr_grid': lr_grid, 'best': best}
 
 
 def add_confirm_trials(arm_result: dict, args, base: Path, run_metadata: dict | None = None) -> dict:
-    """Score the selected learning rate on the held-back confirm seeds."""
+    """Score the selected grid cell on the held-back confirm seeds."""
     if arm_result.get('best') is None or not args.confirm_seeds:
         return arm_result
     lr = arm_result['best']['lr']
+    wd = arm_result['best'].get('weight_decay')
     confirm = []
     for seed in args.confirm_seeds:
-        summary = run_trial(arm_result['arm'], lr, seed, args, base, run_metadata=run_metadata)
-        confirm.append(_trial_record(summary, lr, seed))
+        summary = run_trial(arm_result['arm'], lr, seed, args, base, run_metadata=run_metadata,
+                            weight_decay=wd)
+        confirm.append(_trial_record(summary, lr, seed, wd))
     arm_result['confirm_trials'] = confirm
     losses = [t['val_loss'] for t in confirm if _usable_loss(t['val_loss'])]
     missing = sorted(t['seed'] for t in confirm if not _usable_loss(t['val_loss']))
-    arm_result['confirm'] = {'lr': lr, 'stats': mean_std_stderr(losses),
+    arm_result['confirm'] = {'lr': lr, 'weight_decay': wd, 'stats': mean_std_stderr(losses),
                              'missing_seeds': missing, 'complete_coverage': not missing}
     return arm_result
 
 
-def _trial_by_seed(trials, lr):
-    return {t['seed']: t for t in trials if t['lr'] == lr}
+def _trial_by_seed(trials, lr, weight_decay=None):
+    if weight_decay is None:
+        return {t['seed']: t for t in trials if t['lr'] == lr}
+    return {t['seed']: t for t in trials
+            if t['lr'] == lr and t.get('weight_decay') == weight_decay}
 
 
 def _split_basis(r: dict, use_confirm: bool):
@@ -346,6 +394,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     out = {
         'reference_arm': ref_arm,
         'reference_lr': ref['best']['lr'],
+        'reference_weight_decay': ref['best'].get('weight_decay'),
         'reference_val_loss': ref_mean,
         'reference_val_loss_std': ref_std,
         'reference_n_seeds': ref_n,
@@ -364,6 +413,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         'point_estimate_best_baseline': {
             'arm': point_best_arm,
             'lr': baselines[point_best_arm]['best']['lr'],
+            'weight_decay': baselines[point_best_arm]['best'].get('weight_decay'),
             'selection_val_loss': baselines[point_best_arm]['best']['mean'],
         },
         'certify_requested': bool(certify),
@@ -387,16 +437,20 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     def _split_trials(r):
         return (r.get('confirm_trials') or []) if use_confirm else r['trials']
 
+    ref_wd = ref['best'].get('weight_decay')
     ref_seed_losses = {
         t['seed']: t['val_loss'] for t in _split_trials(ref)
-        if t['lr'] == ref['best']['lr'] and _usable_loss(t['val_loss'])
+        if t['lr'] == ref['best']['lr'] and t.get('weight_decay') == ref_wd
+        and _usable_loss(t['val_loss'])
     }
     for arm, r in usable.items():
         if arm in baselines:
             continue
+        arm_wd = r['best'].get('weight_decay')
         arm_seed_losses = {
             t['seed']: t['val_loss'] for t in _split_trials(r)
-            if t['lr'] == r['best']['lr'] and _usable_loss(t['val_loss'])
+            if t['lr'] == r['best']['lr'] and t.get('weight_decay') == arm_wd
+            and _usable_loss(t['val_loss'])
         }
         common = sorted(set(arm_seed_losses) & set(ref_seed_losses))
         arm_vals = [arm_seed_losses[s] for s in common]
@@ -407,6 +461,7 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         entry = {
             'arm': arm,
             'best_lr': r['best']['lr'],
+            'best_weight_decay': r['best'].get('weight_decay'),
             'val_loss': arm_mean,
             'val_loss_std': arm_std,
             'n_seeds': arm_n,
@@ -443,8 +498,10 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             # so a single run can never certify that an arm generalizes better
             # (and it must not enter the Holm family).
             seed = common[0]
-            a_trial = _trial_by_seed(_split_trials(r), r['best']['lr']).get(seed)
-            b_trial = _trial_by_seed(_split_trials(ref), ref['best']['lr']).get(seed)
+            a_trial = _trial_by_seed(_split_trials(r), r['best']['lr'],
+                                     r['best'].get('weight_decay')).get(seed)
+            b_trial = _trial_by_seed(_split_trials(ref), ref['best']['lr'],
+                                     ref['best'].get('weight_decay')).get(seed)
             a_batches = a_trial.get('val_losses') if a_trial else None
             b_batches = b_trial.get('val_losses') if b_trial else None
             test = None
@@ -527,8 +584,10 @@ def print_comparison(comparison: dict | None) -> None:
     ref_off = _off_regime(comparison.get('reference_curve_classification_counts'))
     if ref_off:
         ref_note = f" [curve regimes {ref_off}: the reference lr was selected in a non-healthy regime]"
+    ref_wd = comparison.get('reference_weight_decay')
+    ref_wd_str = '' if ref_wd is None else f" wd={ref_wd:g}"
     print(f"[tune][compare] reference: arm={comparison['reference_arm']} "
-          f"lr={comparison['reference_lr']:g} "
+          f"lr={comparison['reference_lr']:g}{ref_wd_str} "
           f"val_loss={comparison['reference_val_loss']:.4f}{ref_std_str} "
           f"n_seeds={comparison.get('reference_n_seeds')} "
           f"(split={comparison['reference_split']}; "
@@ -576,7 +635,9 @@ def print_comparison(comparison: dict | None) -> None:
         if off:
             note += (f" [curve regimes {off}: the arm's best lr was picked in a non-healthy "
                      f"regime - read the trial curves before attributing the delta to the norm]")
-        print(f"[tune][compare] {entry['arm']:>12s} lr={entry['best_lr']:g} "
+        entry_wd = entry.get('best_weight_decay')
+        entry_wd_str = '' if entry_wd is None else f" wd={entry_wd:g}"
+        print(f"[tune][compare] {entry['arm']:>12s} lr={entry['best_lr']:g}{entry_wd_str} "
               f"val_loss={entry['val_loss']:.4f}{std_str} "
               f"delta={delta_str}{ci_str} p(one-sided)={p_str} "
               f"p(holm)={p_holm_str} paired_seeds={entry['n_paired_seeds']}{direction} "
@@ -609,7 +670,8 @@ def main():
     p.add_argument('--max-steps', type=int, default=1000)
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--seq-len', type=int, default=512)
-    p.add_argument('--weight-decay', type=float, default=0.1)
+    p.add_argument('--weight-decay', type=float, default=0.1, help='single weight decay when --weight-decays is omitted (legacy)')
+    p.add_argument('--weight-decays', nargs='+', type=float, default=None, help='optional weight-decay axis: selection runs over the joint (lr, wd) grid with the same coverage, confirm-seed and Holm rules. Omitted: the single --weight-decay value is used (identical selection rule to the lr-only protocol)')
     p.add_argument('--log-every', type=int, default=200)
     p.add_argument('--stats-every', type=int, default=10 ** 9)
     p.add_argument('--val-batches', type=int, default=20, help='held-out synthetic batches per trial (selection metric)')
@@ -629,6 +691,20 @@ def main():
     if len(set(args.lrs)) != len(args.lrs):
         p.error(f'--lrs contains duplicates: {args.lrs}; a repeated lr reruns the identical '
                 f'cells, so it inflates n and fakes replication (std would collapse toward 0)')
+    if args.weight_decays is None:
+        args.weight_decays = [float(args.weight_decay)]
+    elif args.weight_decay not in args.weight_decays:
+        print(f'[tune][warn] --weight-decay {args.weight_decay:g} is ignored: '
+              f'--weight-decays {args.weight_decays} defines the grid axis')
+    if any(not math.isfinite(wd) or wd < 0.0 for wd in args.weight_decays):
+        p.error(f'--weight-decays must be finite and >= 0, got {args.weight_decays}')
+    if len(set(args.weight_decays)) != len(args.weight_decays):
+        p.error(f'--weight-decays contains duplicates: {args.weight_decays}; a repeated wd '
+                f'reruns the identical cells, so it fakes replication')
+    if len(args.weight_decays) > 1:
+        print(f'[tune] weight-decay axis enabled: {args.weight_decays}; selection runs over the '
+              f'joint (lr, wd) grid ({len(args.lrs)} lr x {len(args.weight_decays)} wd '
+              f'= {len(args.lrs) * len(args.weight_decays)} cells per seed)')
     if not args.seeds:
         p.error('--seeds must not be empty')
     if len(set(args.seeds)) != len(args.seeds):
@@ -673,7 +749,9 @@ def main():
         tuned[arm] = tune_arm(arm, args, base, run_metadata=run_metadata)
         if tuned[arm]['best'] is not None:
             b = tuned[arm]['best']
-            print(f"[tune] {arm}: best lr={b['lr']:g} val_loss={b['mean']:.4f} "
+            b_wd = b.get('weight_decay')
+            b_wd_str = '' if b_wd is None else f" wd={b_wd:g}"
+            print(f"[tune] {arm}: best lr={b['lr']:g}{b_wd_str} val_loss={b['mean']:.4f} "
                   f"(stderr={b['stderr']:.4f} over {b['n']} runs)")
             regimes = b.get('curve_classification_counts') or {}
             if regimes:
@@ -693,8 +771,11 @@ def main():
             c = tuned[arm]['confirm']
             stats = c['stats']
             if stats:
-                print(f"[tune] {arm}: confirm on seeds={args.confirm_seeds} lr={c['lr']:g} "
-                      f"val_loss={stats['mean']:.4f} +/- {stats['std']:.4f} (n={stats['n']})")
+                c_wd = c.get('weight_decay')
+                c_wd_str = '' if c_wd is None else f" wd={c_wd:g}"
+                print(f"[tune] {arm}: confirm on seeds={args.confirm_seeds} lr={c['lr']:g}"
+                      f"{c_wd_str} val_loss={stats['mean']:.4f} +/- {stats['std']:.4f} "
+                      f"(n={stats['n']})")
             else:
                 print(f"[tune] {arm}: confirm produced no usable losses")
     comparison = compare(tuned, args.baselines, args.margin, args.alpha,
@@ -706,6 +787,7 @@ def main():
             'arms': list(args.arms),
             'baselines': list(args.baselines),
             'lrs': list(args.lrs),
+            'weight_decays': list(args.weight_decays),
             'selection_seeds': list(args.seeds),
             'confirm_seeds': list(args.confirm_seeds),
             'max_steps': args.max_steps,
@@ -714,7 +796,9 @@ def main():
             'weight_decay': args.weight_decay,
             'val_batches': args.val_batches,
             'selection_metric': 'held-out synthetic val_loss (mean over val batches)',
-            'compute_matched': 'every arm/seed/lr trial runs the identical max_steps x batch_size x seq_len',
+            'compute_matched': ('every arm/seed/(lr, wd) trial runs the identical '
+                                'max_steps x batch_size x seq_len; all arms share the same '
+                                'grid, so the selected cell is tuned at matched compute'),
             'curve_monitoring': {
                 'every': args.curve_every, 'batches': args.curve_batches,
                 'note': ('per-trial train/val regime recorded by ablation.run_one; curve '
@@ -741,7 +825,8 @@ def main():
     # selected and what it scored, so a completed grid is readable from the
     # manifest without parsing every trial record.
     manifest['selected_lr_by_arm'] = {
-        arm: ({'lr': r['best']['lr'], 'val_loss': r['best']['mean'],
+        arm: ({'lr': r['best']['lr'], 'weight_decay': r['best'].get('weight_decay'),
+               'val_loss': r['best']['mean'],
                'stderr': r['best']['stderr'], 'n': r['best']['n']}
               if r.get('best') else None)
         for arm, r in tuned.items()
