@@ -190,7 +190,7 @@ class ActivationStats:
             self.kurtosis = defaultdict(KurtosisMeter)
         for name, m in self.model.named_modules():
             cls_name = m.__class__.__name__
-            if cls_name in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'DyTCDTanh'}:
+            if cls_name in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTDTanh', 'DyTCD', 'DyTCDTanh'}:
                 self.handles.append(m.register_forward_hook(self._make_hook(name)))
 
     def detach(self):

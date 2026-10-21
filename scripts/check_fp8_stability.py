@@ -196,7 +196,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
     with torch.no_grad():
         logits_fp32, _ = model(x)
     for name, m in model.named_modules():
-        if m.__class__.__name__ in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTCD', 'DyTCDTanh'}:
+        if m.__class__.__name__ in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTDTanh', 'DyTCD', 'DyTCDTanh'}:
             handles.append(m.register_forward_hook(make_stat_hook()))
     block_handles = [blk.register_forward_hook(make_block_hook(i)) for i, blk in enumerate(model.blocks)]
     with fp8_forward(model, to_fp8_e4m3):
