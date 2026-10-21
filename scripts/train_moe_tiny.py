@@ -788,13 +788,12 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
     param_counts = [int(r['n_params']) for r in results
                     if isinstance(r.get('n_params'), int)
                     and not isinstance(r.get('n_params'), bool)]
-    if param_counts and len(set(param_counts)) == 1:
-        agg['n_params'] = param_counts[0]
-    else:
-        # A parameter count that moved across seeds means the recipe did not
-        # hold; report it as unknown rather than as a property of the cell.
-        agg['n_params'] = None
-    agg['n_params_consistent'] = bool(param_counts) and len(set(param_counts)) == 1
+    # Every seed must report the same count: a missing count is not evidence of
+    # consistency, and a moved count means the recipe did not hold.
+    agg['n_params_consistent'] = bool(
+        param_counts and len(param_counts) == len(results)
+        and len(set(param_counts)) == 1)
+    agg['n_params'] = param_counts[0] if agg['n_params_consistent'] else None
     # A readable manifest can still report NaN/Inf (a diverged validation
     # pass); it is not a usable replication and is listed rather than silently
     # pooled into the mean.
@@ -832,6 +831,7 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
         and not duplicate_seeds
         and not seeds_without_val_ce
         and not agg['invalid_seeds']
+        and agg['n_params_consistent']
         and agg['data_versions_complete']
         and agg['data_versions_consistent'])
     agg['n_loss_spikes_total'] = sum(r['n_loss_spikes'] or 0 for r in results
@@ -894,7 +894,8 @@ def _moe_cell_replicated(cell: dict) -> bool:
         seeds and len(records) == len(seeds)
         and not cell.get('missing_seeds') and not cell.get('unexpected_seeds')
         and not cell.get('duplicate_seeds') and not cell.get('invalid_seeds')
-        and not cell.get('seeds_without_val_ce'))
+        and not cell.get('seeds_without_val_ce')
+        and cell.get('n_params_consistent', True))
 
 def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
     """Cross-cell data-snapshot guard for a MoE norm comparison."""
