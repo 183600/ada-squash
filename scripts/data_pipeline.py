@@ -142,15 +142,16 @@ def infer_num_documents(ds) -> int | None:
     splits = getattr(info, "splits", None)
     if not splits:
         return None
-    for name in ("train", "validation", "test"):
-        try:
-            split_info = splits.get(name)
-        except AttributeError:
-            split_info = splits[name] if name in splits else None
-        n = getattr(split_info, "num_examples", None) if split_info is not None else None
-        if isinstance(n, int) and n > 0:
-            return n
-    return None
+    # The streaming dataset was loaded with split="train", so only the train
+    # count describes this stream. Falling back to validation/test would
+    # place the chronological boundaries at a different corpus length (and
+    # could select documents that are not in the stream at all).
+    try:
+        split_info = splits.get("train")
+    except AttributeError:
+        split_info = splits["train"] if "train" in splits else None
+    n = getattr(split_info, "num_examples", None) if split_info is not None else None
+    return n if isinstance(n, int) and n > 0 else None
 
 
 _REVISION_CACHE: dict = {}
@@ -541,6 +542,7 @@ class PackedStream(IterableDataset):
         self.buf: torch.Tensor | None = None
         self.fill = 0
         self.pos = 0
+        self.epoch = 0
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -550,15 +552,20 @@ class PackedStream(IterableDataset):
         # are dropped, while a later epoch over the same corpus still sees its
         # own documents.
         self.cleaner.seen = set()
-        return self._shuffle(self._pack(worker_id, n_workers), worker_id)
+        epoch = self.epoch
+        self.epoch += 1
+        return self._shuffle(self._pack(worker_id, n_workers), worker_id, epoch)
 
-    def _shuffle(self, stream, worker_id: int):
+    def _shuffle(self, stream, worker_id: int, epoch: int=0):
         if self.shuffle_buffer <= 0:
             yield from stream
             return
         import random as _random
 
-        rng = _random.Random(self.seed * 1000003 + worker_id)
+        # Include the epoch: otherwise a persistent worker replays the exact
+        # same batch permutation every pass, which defeats shuffling after the
+        # first epoch.
+        rng = _random.Random(self.seed * 1000003 + worker_id + epoch * 104729)
         window: list = []
         for item in stream:
             window.append(item)
@@ -815,8 +822,13 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
                 if isinstance(example, dict):
                     # Only `text` is read downstream; typing is preserved
                     # exactly (None / NaN / non-string included) so the
-                    # cleaner's drop counters stay identical.
-                    line = json.dumps({"text": example.get("text")}, ensure_ascii=False) + "\n"
+                    # cleaner's drop counters stay identical. Raw bytes are
+                    # not JSON-serializable: decode them once when building
+                    # the text-only cache instead of aborting the split.
+                    text = example.get("text")
+                    if isinstance(text, (bytes, bytearray)):
+                        text = bytes(text).decode("utf-8", errors="replace")
+                    line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
                 else:
                     line = "null\n"
                 f.write(line)
