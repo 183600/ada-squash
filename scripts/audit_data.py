@@ -226,11 +226,27 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     return stats, tokens, report, hashes, lengths, groups
 
 
+def _linear_quantile(ordered, q):
+    if not ordered:
+        return None
+    if len(ordered) == 1:
+        return ordered[0]
+    q = min(1.0, max(0.0, float(q)))
+    pos = q * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return ordered[lo]
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
 def length_fence(lengths) -> dict:
     """3 x IQR fence (q1, q3, lower, upper) of a length sample."""
     ordered = sorted(lengths)
-    q1 = ordered[len(ordered) // 4]
-    q3 = ordered[(3 * len(ordered)) // 4]
+    if not ordered:
+        return {'q1': None, 'q3': None, 'lower': 0, 'upper': 0}
+    q1 = _linear_quantile(ordered, 0.25)
+    q3 = _linear_quantile(ordered, 0.75)
     iqr = q3 - q1
     return {'q1': q1, 'q3': q3, 'lower': max(0, q1 - 3 * iqr), 'upper': q3 + 3 * iqr}
 
