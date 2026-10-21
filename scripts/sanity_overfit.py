@@ -364,6 +364,12 @@ def run_one(norm: str, args, device: str) -> dict:
 
     history = []
     initial_loss = None
+    # Final loss alone cannot see a transient NaN/explosion that recovers by
+    # the last step. Track the full optimizer trajectory (not only logged
+    # points) so the overfit gate reports the curve it actually traversed.
+    all_step_losses_finite = True
+    best_step_loss = None
+    worst_step_loss = None
     final_metrics = next_token_metrics(model, x, y, ctx=ctx)
     grad_info = {}
     t0 = time.time()
@@ -374,6 +380,13 @@ def run_one(norm: str, args, device: str) -> dict:
         loss_val = float(loss.detach().item())
         if initial_loss is None:
             initial_loss = loss_val
+        if math.isfinite(loss_val):
+            best_step_loss = (loss_val if best_step_loss is None
+                              else min(best_step_loss, loss_val))
+            worst_step_loss = (loss_val if worst_step_loss is None
+                               else max(worst_step_loss, loss_val))
+        else:
+            all_step_losses_finite = False
         loss.backward()
         if step == 1:
             grad_info = gradient_report(model)
@@ -411,6 +424,20 @@ def run_one(norm: str, args, device: str) -> dict:
     checks["initial_loss_as_expected"] = bool(
         initial_loss is not None and initial_loss >= math.log(vocab) * 0.5
     )
+    checks["all_step_losses_finite"] = bool(all_step_losses_finite)
+    explosion_limit = (max(2.0 * initial_loss, initial_loss + 1.0)
+                       if initial_loss is not None and math.isfinite(initial_loss)
+                       else None)
+    checks["no_transient_loss_explosion"] = bool(
+        worst_step_loss is not None and explosion_limit is not None
+        and worst_step_loss <= explosion_limit
+    )
+    final_near_best_tol = (max(0.05 * abs(best_step_loss), 1e-3)
+                           if best_step_loss is not None else None)
+    checks["final_loss_close_to_best_step_loss"] = bool(
+        best_step_loss is not None and final_near_best_tol is not None
+        and final_loss <= best_step_loss + final_near_best_tol
+    )
     checks["loss_decreased"] = bool(final_loss < initial_loss - 1e-4)
     checks["loss_below_threshold"] = bool(final_loss <= thresholds["loss"])
     # Strawman guards: an accuracy the majority-class predictor already reaches
@@ -428,6 +455,9 @@ def run_one(norm: str, args, device: str) -> dict:
         "checks": checks,
         "initial_loss": initial_loss,
         "final_loss": final_loss,
+        "best_step_loss": best_step_loss,
+        "worst_step_loss": worst_step_loss,
+        "all_step_losses_finite": bool(all_step_losses_finite),
         "final_accuracy": final_acc,
         "final_macro_f1": final_metrics["macro_f1"],
         "final_metrics": final_metrics,
