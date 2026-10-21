@@ -34,9 +34,25 @@ DEFAULT_SEEDS = (42, 43, 44)
 _W8A8_SEED_METRIC_KEYS = ('ppl_fp', 'ppl_w8a8', 'ppl_drop', 'ppl_drop_pct',
                           'probe_token_coverage')
 
-def _checkpoint_defaulted(args, parser, ckpt_args: dict, name: str):
-    """The CLI value when explicitly set, else the checkpoint's recorded value."""
+def _explicit_cli_names(argv) -> set:
+    """Option names typed on the command line (`--val-frac=...` or `--val-frac ...`)."""
+    names = set()
+    for token in argv:
+        if token.startswith('--') and len(token) > 2:
+            names.add(token[2:].split('=', 1)[0].replace('-', '_'))
+    return names
+
+def _checkpoint_defaulted(args, parser, ckpt_args: dict, name: str,
+                          explicit: set | None = None):
+    """The CLI value when explicitly set, else the checkpoint's recorded value.
+
+    Comparing the parsed value to the parser default cannot tell an explicit
+    `--val-frac 0.005` from an omitted flag when the checkpoint used a
+    different fraction, so callers pass the names actually typed.
+    """
     value = getattr(args, name)
+    if explicit is not None and name in explicit:
+        return value
     if value == parser.get_default(name) and ckpt_args.get(name) is not None:
         return ckpt_args[name]
     return value
@@ -541,6 +557,7 @@ def main():
         if args.probe == 'markov':
             return _probe_markov(rng, args.batch_size, args.seq_len, device, n_states=args.n_states)
         return dataset_probe()
+    explicit_cli = _explicit_cli_names(sys.argv[1:])
     ckpt_groups = [[path for path in str(entry).split(',') if path] for entry in args.ckpts]
     if any(not group for group in ckpt_groups):
         p.error('--ckpts entries must not be empty')
@@ -555,7 +572,7 @@ def main():
             # the probe is the same held-out slice; a flag typed on the command
             # line wins.
             def split_arg(name):
-                return _checkpoint_defaulted(args, p, ckpt_args, name)
+                return _checkpoint_defaulted(args, p, ckpt_args, name, explicit_cli)
             # Same precedence for the data version: an explicit flag wins, else
             # the revision the checkpoint recorded, else upstream default branch.
             dataset_revision = args.dataset_revision if args.dataset_revision is not None else ckpt_args.get('dataset_revision')
