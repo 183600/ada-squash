@@ -192,14 +192,15 @@ def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float)
 
 def build_lr_lambda(args):
     return lambda s: cosine_schedule(s + 1, args.max_steps, args.warmup, args.min_lr_ratio)
-_SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip')
+_SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip', 'grad_accum')
+_MONITOR_ARGS = ('val_every', 'val_batches', 'early_stop_patience')
 _ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'no_learnable_delta', 'beta', 'alpha_0', 'k_init', 'alpha_init', 'p_init', 'alpha_jitter')
 _NUMERIC_ARGS = ('compile', 'compile_mode', 'no_bf16')
 _RESUME_RUN_ARGS = _ARCH_ARGS + _NUMERIC_ARGS
 
-def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
+def _restore_run_args(args, ckpt_args: dict, names, explicit: frozenset=frozenset()) -> list:
     changed = []
-    for name in _SCHEDULE_ARGS:
+    for name in names:
         if name not in ckpt_args:
             continue
         if getattr(args, name, None) != ckpt_args[name]:
@@ -208,6 +209,21 @@ def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()
             continue
         setattr(args, name, ckpt_args[name])
     return changed
+
+def restore_schedule_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
+    return _restore_run_args(args, ckpt_args, _SCHEDULE_ARGS, explicit)
+
+def restore_monitor_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
+    """Restore the cadence that defines the validation/selection protocol.
+
+    `val_every` and `val_batches` decide which held-out slices produce curve
+    points and how noisy each point is; `early_stop_patience` decides when a
+    run ends. A resume that silently resets them to CLI defaults would mix two
+    selection protocols in one history (the same reason schedule and data flags
+    are restored). `grad_accum` travels with the schedule because it changes
+    the effective batch size and the meaning of the saved data position.
+    """
+    return _restore_run_args(args, ckpt_args, _MONITOR_ARGS, explicit)
 # The split-defining args are part of a run's identity: resuming with a
 # different boundary could move documents the model already trained on into
 # the validation split (and vice versa), so they are restored from the
@@ -1046,6 +1062,16 @@ def main():
                 print(f'[resume] keeping your explicit override(s) {kept} - the resumed run therefore follows a different schedule than the one it continues')
         start_step = int(resume_ckpt.get('step', 0))
         print(f'[resume] {args.resume} -> step {start_step}')
+        monitor_changed = restore_monitor_args(args, run_args, explicit=explicit)
+        if monitor_changed:
+            kept = [n for n in monitor_changed if n in explicit]
+            adopted = [n for n in monitor_changed if n not in explicit]
+            if adopted:
+                print(f'[resume] monitoring args restored from checkpoint: {adopted}')
+            if kept:
+                print(f'[resume] keeping your explicit monitoring override(s) {kept} - '
+                      f'the resumed run therefore uses a different validation/selection '
+                      f'protocol than the checkpoint it continues')
         # Restore the stochastic state before the first post-resume batch, so
         # dropout and the Python-side shuffle buffer continue where the saved
         # run stopped instead of restarting from --seed.
