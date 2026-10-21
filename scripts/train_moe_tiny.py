@@ -753,10 +753,10 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
         for seed, prov in provenance_by_seed.items()}
     known_versions = {
         json.dumps(v, sort_keys=True) for v in versions_by_seed.values()
-        if v is not None and any(value is not None for value in v.values())}
+        if v is not None and all(value is not None for value in v.values())}
     unknown_version_seeds = [
         seed for seed, version in versions_by_seed.items()
-        if version is None or not any(value is not None for value in version.values())]
+        if version is None or any(value is None for value in version.values())]
     agg['data_provenance_by_seed'] = provenance_by_seed
     agg['data_versions_by_seed'] = versions_by_seed
     agg['unknown_data_version_seeds'] = sorted(unknown_version_seeds)
