@@ -131,10 +131,15 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         text_batch.clear()
 
     capped = False
+    documents_read = 0
     for example in stream:
-        if n_docs and len(lengths) >= n_docs:
+        # `--n-docs` bounds documents *sampled* (read), not documents kept:
+        # otherwise a split with many filtered documents would silently read
+        # far past the requested sample and claim a prefix it did not use.
+        if n_docs and documents_read >= n_docs:
             capped = True
             break
+        documents_read += 1
         text = cleaner(example)
         if text is None:
             # Count tokenizer failures too by trying only kept-looking docs is
@@ -263,8 +268,16 @@ def _chronology_problems(reports: dict) -> list:
         return []
     train_end = train['start'] + train['count']
     validation_end = validation['start'] + validation['count']
+    test_end = test['start'] + test['count']
     if train['start'] != 0 or validation['start'] != train_end or test['start'] != validation_end:
-        return [f"split ranges are not contiguous chronological slices: train=[{train['start']},{train_end}) validation=[{validation['start']},{validation_end}) test=[{test['start']},{test['start']+test['count']})"]
+        return [f"split ranges are not contiguous chronological slices: train=[{train['start']},{train_end}) validation=[{validation['start']},{validation_end}) test=[{test['start']},{test_end})"]
+    total = train.get('num_documents')
+    if isinstance(total, int):
+        counts_match = all(r.get('num_documents') == total
+                           for r in (validation, test))
+        if not counts_match or test_end != total:
+            return [f"split ranges do not cover the full document stream: "
+                    f"test ends at {test_end} but num_documents={total}"]
     return []
 
 
@@ -308,7 +321,10 @@ def _write_hash_ledger(path, hashes: set, n_docs: int, split_name: str,
 def _total_variation(a: Counter, b: Counter) -> float:
     total_a, total_b = sum(a.values()), sum(b.values())
     if not total_a or not total_b:
-        return 0.0
+        # An empty histogram has no distribution to compare. Returning 0.0
+        # would make a split with no usable documents look perfectly matched;
+        # 1.0 is the maximal divergence and trips any finite TVD cap.
+        return 1.0
     keys = set(a) | set(b)
     return 0.5 * sum(abs(a.get(k, 0) / total_a - b.get(k, 0) / total_b) for k in keys)
 
@@ -425,6 +441,8 @@ def main():
             splits[name]['length_outliers_train_fence'] = None
             splits[name]['length_outliers_train_fence_fraction'] = None
     chronology = _chronology_problems(reports)
+    empty_token_splits = [name for name in ('train', 'validation', 'test')
+                          if not sum(tokens[name].values())]
     shift = {
         'train_vs_validation_tvd': _total_variation(tokens['train'], tokens['validation']),
         'train_vs_test_tvd': _total_variation(tokens['train'], tokens['test']),
@@ -466,6 +484,9 @@ def main():
         print(f"[audit][hypothesis] {args.hypothesis}")
     print(f"[audit] saved to {args.output}")
     problems = list(chronology)
+    if empty_token_splits:
+        problems.append('no usable tokens could be sampled from: ' + ', '.join(empty_token_splits)
+                        + ' (an empty histogram makes TVD undefined, not zero)')
     for name in ('train', 'validation', 'test'):
         stats = splits[name]
         if stats['length_outliers_3iqr']:
