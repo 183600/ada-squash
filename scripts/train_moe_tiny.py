@@ -20,6 +20,7 @@ from adasquash.metrics import mean_std_stderr
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, clear_cast_weight_cache, _LayerScaleResidual
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
+from scripts.data_pipeline import _is_pinned_revision
 _FLAT_TOKEN_CACHE: dict = {}
 _FLAT_TOKEN_CACHE_MAX_ENTRIES = 8
 
@@ -753,10 +754,12 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
         for seed, prov in provenance_by_seed.items()}
     known_versions = {
         json.dumps(v, sort_keys=True) for v in versions_by_seed.values()
-        if v is not None and all(value is not None for value in v.values())}
+        if v is not None and all(_is_pinned_revision(value)
+                                 for value in v.values())}
     unknown_version_seeds = [
         seed for seed, version in versions_by_seed.items()
-        if version is None or any(value is None for value in version.values())]
+        if version is None or not all(_is_pinned_revision(value)
+                                      for value in version.values())]
     agg['data_provenance_by_seed'] = provenance_by_seed
     agg['data_versions_by_seed'] = versions_by_seed
     agg['unknown_data_version_seeds'] = sorted(unknown_version_seeds)

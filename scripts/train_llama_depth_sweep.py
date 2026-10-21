@@ -38,6 +38,7 @@ sys.path.insert(0, str(ROOT))
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
                                paired_t_one_sided, student_t_ppf)
 from adasquash.repro import artifact_record, collect_run_metadata, finish_metadata, save_run_manifest
+from scripts.data_pipeline import _is_pinned_revision
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
     if step < warmup:
@@ -164,15 +165,18 @@ def _manifest_data_version(manifest: dict) -> dict | None:
     reports = data.get('split_reports') or {}
     train = reports.get('train') if isinstance(reports, dict) else None
     train = train if isinstance(train, dict) else {}
-    # Only the explicit `*_resolved` fields prove what the loader used. The
-    # manifest's `dataset_revision`/`tokenizer_revision` may still be the
-    # requested branch or tag when the Hub was unreachable; treating that as
-    # the resolved version would silently certify a mutable snapshot as pinned.
+    # Only a concrete commit in the explicit `*_resolved` fields proves what
+    # the loader used. The manifest's `dataset_revision`/`tokenizer_revision`
+    # may still be the requested branch or tag when the Hub was unreachable;
+    # the resolved fields fall back to those requests too, so a non-commit
+    # value must not silently certify a mutable snapshot as pinned.
     dataset_resolved = (train.get('dataset_revision_resolved')
                         or data.get('dataset_revision_resolved'))
     tokenizer_resolved = (train.get('tokenizer_revision_resolved')
                           or data.get('tokenizer_revision_resolved'))
-    if dataset_resolved is None or tokenizer_resolved is None:
+    if not _is_pinned_revision(dataset_resolved):
+        return None
+    if not _is_pinned_revision(tokenizer_resolved):
         return None
     return {
         'dataset_revision_resolved': dataset_resolved,
