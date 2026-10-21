@@ -903,21 +903,39 @@ def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
     keys = set()
     unknown = []
     for norm, cell in cells.items():
-        for seed, provenance in (cell.get('data_provenance_by_seed') or {}).items():
-            dataset = (provenance or {}).get('dataset')
+        provenance_by_seed = cell.get('data_provenance_by_seed') or {}
+        expected = [int(seed) for seed in (cell.get('seeds') or [])]
+        if not expected:
+            expected = [int(record['seed']) for record in (cell.get('per_seed') or [])
+                        if isinstance(record.get('seed'), int)
+                        and not isinstance(record.get('seed'), bool)]
+        if not expected:
+            unknown.append((norm, '<no seed records>'))
+            continue
+        for seed in expected:
+            provenance = provenance_by_seed.get(seed)
+            if provenance is None and str(seed) in provenance_by_seed:
+                provenance = provenance_by_seed[str(seed)]
+            # Missing provenance is not a synthetic run: it is an unauditable
+            # one, so fail closed instead of treating every absent record as
+            # "no external snapshot to pin".
+            if not isinstance(provenance, dict):
+                unknown.append((norm, seed))
+                continue
+            dataset = provenance.get('dataset')
             if not dataset:
                 continue
             synthetic = False
             versions = {
-                'dataset_revision_resolved': (provenance or {}).get('dataset_revision_resolved'),
-                'tokenizer_revision_resolved': (provenance or {}).get('tokenizer_revision_resolved'),
+                'dataset_revision_resolved': provenance.get('dataset_revision_resolved'),
+                'tokenizer_revision_resolved': provenance.get('tokenizer_revision_resolved'),
             }
             if not all(_is_pinned_revision(value) for value in versions.values()):
                 unknown.append((norm, seed))
                 continue
             keys.add(json.dumps(versions, sort_keys=True))
     if unknown:
-        return False, (f'cells {unknown} trained on an unpinned dataset/tokenizer revision, '
+        return False, (f'cells {unknown} have missing or unpinned data provenance, '
                        'so the norm contrast is not tied to one snapshot')
     if synthetic:
         return True, ('synthetic corpus generated deterministically from seed '
