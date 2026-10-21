@@ -910,7 +910,7 @@ def main():
         launch_multi_seed(args, seeds)
         return
     args.seed = seeds[0]
-    explicit = frozenset((name for name in _SCHEDULE_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)))
+    explicit = frozenset((name for name in _SCHEDULE_ARGS + _MONITOR_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)))
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     resume_ckpt = None
     run_args: dict = {}
