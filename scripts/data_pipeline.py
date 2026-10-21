@@ -1028,12 +1028,16 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
             "it no held-out document can be matched to a listed group")
     split = opts["split"]
     group_key = opts.get("group_key")
+    # The validation->test ledgers only have a source side when a validation
+    # split exists. With val_frac=0 the only boundary is train<->test, and
+    # demanding the (unusable) second ledger would refuse a valid protocol.
+    has_val_split = float(opts.get("val_frac") or 0.0) > 0.0
     if group_key and split in ("validation", "test"):
         missing_group_ledgers = []
         if not opts.get("exclude_group_file"):
             missing_group_ledgers.append(
                 "--exclude-group-file (train<->held-out groups)")
-        if split == "test" and not opts.get("exclude_test_group_file"):
+        if split == "test" and has_val_split and not opts.get("exclude_test_group_file"):
             missing_group_ledgers.append(
                 "--exclude-test-group-file (validation<->test groups)")
         if missing_group_ledgers:
@@ -1076,7 +1080,8 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     # to the sealed test split only, and neither is ever applied to train.
     report["group_key"] = opts.get("group_key") or None
     applied_train_groups = opts.get("exclude_group_file") if opts["split"] != "train" else None
-    applied_test_groups = opts.get("exclude_test_group_file") if opts["split"] == "test" else None
+    applied_test_groups = (opts.get("exclude_test_group_file")
+                           if opts["split"] == "test" and has_val_split else None)
     group_files = [p for p in (applied_train_groups, applied_test_groups) if p]
     group_exclusion_active = bool(opts.get("group_key") and group_files)
     exclude_group_hashes: set = set()
