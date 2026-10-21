@@ -56,17 +56,22 @@ def _cross_entropy_chunk_rows(vocab_size: int) -> int:
         _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
     return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
 
+_FUSED_LINEAR_CHUNK_ROWS_CACHE: dict[tuple, int] = {}
+
 def _fused_linear_chunk_rows(chunk_rows: int, vocab: int, dt: torch.dtype, acc: torch.dtype) -> int:
     """Cap a fused-CE chunk at the row-block size.
 
     The fused loss can hold the low-precision logits plus their accumulator
     image at the same time, so the chunk accounts for both.
     """
-    element_bytes = torch.finfo(acc).bits // 8
-    if dt != acc:
-        element_bytes += torch.finfo(dt).bits // 8
-    cap = max(1, _CROSSENTROPY_CHUNK_BYTES // max(1, vocab * element_bytes))
-    return min(chunk_rows, cap)
+    key = (vocab, dt, acc)
+    if key not in _FUSED_LINEAR_CHUNK_ROWS_CACHE:
+        element_bytes = torch.finfo(acc).bits // 8
+        if dt != acc:
+            element_bytes += torch.finfo(dt).bits // 8
+        cap = max(1, _CROSSENTROPY_CHUNK_BYTES // max(1, vocab * element_bytes))
+        _FUSED_LINEAR_CHUNK_ROWS_CACHE[key] = cap
+    return min(chunk_rows, _FUSED_LINEAR_CHUNK_ROWS_CACHE[key])
 
 def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tensor:
     """Reusable ``(rows, vocab)`` logit scratch for the chunked losses.
