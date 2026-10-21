@@ -27,6 +27,84 @@ from scripts.eval_downstream import load_ckpt, needle_decode_overhead, needle_in
 # without correction gives a ~19% chance of at least one false positive.
 DEFAULT_SEEDS = (0, 1, 2)
 MIN_SHARED_PLACEMENT_SEEDS = 3
+# Training-recipe fields that must match before a checkpoint delta can be
+# attributed to the norm/quantization treatment. Norm internals
+# (`norm`, `qk_norm`, `alpha_init`, `k_init`, `p_init`, `no_learnable_*`,
+# `no_layerscale`, ...) are deliberately absent: they *are* the treatment.
+# Training seeds are absent too: independent seeds are the replication unit of
+# the training-run variance this comparison does not cover.
+TRAINING_PROTOCOL_KEYS = (
+    'model', '_depth_override', '_dim_override', '_heads_override',
+    'dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tokenizer_revision',
+    'val_frac', 'test_frac', 'num_documents', 'min_doc_chars', 'max_doc_chars',
+    'dedup', 'group_key', 'exclude_hash_file', 'exclude_test_hash_file',
+    'exclude_group_file', 'exclude_test_group_file', 'train_shuffle_buffer',
+    'seq_len', 'batch_size', 'grad_accum', 'max_steps', 'lr', 'min_lr_ratio',
+    'warmup', 'weight_decay', 'beta1', 'beta2', 'grad_clip', 'bf16',
+    'num_workers', 'gradient_checkpointing', 'tie_embeddings',
+    'val_every', 'val_batches', 'early_stop_patience', 'nonfinite_policy',
+    'test_batches',
+)
+
+def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dict:
+    """Check that two checkpoints were trained under one comparable recipe.
+
+    A checkpoint pair can differ in the norm (the treatment) but not in the
+    data snapshot, step count, sequence length or optimizer recipe, otherwise
+    a "needle accuracy delta" is a confound. `_checkpoint_step` is handled
+    separately: when both checkpoints record it and the steps differ, the
+    weights are not the same point in training and the pair is marked
+    incomparable. A missing step is reported (and certification requires both
+    steps to be known), not silently treated as equal.
+    """
+    mismatches = {}
+    for key in TRAINING_PROTOCOL_KEYS:
+        if key not in candidate_args and key not in reference_args:
+            continue
+        candidate_value = candidate_args.get(key)
+        reference_value = reference_args.get(key)
+        if candidate_value != reference_value:
+            mismatches[key] = {'candidate': candidate_value,
+                               'reference': reference_value}
+    candidate_step = candidate_args.get('_checkpoint_step')
+    reference_step = reference_args.get('_checkpoint_step')
+    steps_known = candidate_step is not None and reference_step is not None
+    if steps_known and candidate_step != reference_step:
+        mismatches['_checkpoint_step'] = {'candidate': candidate_step,
+                                          'reference': reference_step}
+    if steps_known:
+        step_basis = f'both checkpoints record step {candidate_step}'
+    else:
+        step_basis = (f'checkpoint step not recorded for '
+                      f'{"candidate" if candidate_step is None else "reference"} '
+                      '- the compared weights are not verifiably at the same training step')
+    return {
+        'ok': not mismatches,
+        'mismatches': mismatches or None,
+        'keys_compared': list(TRAINING_PROTOCOL_KEYS),
+        'keys_excluded_as_treatment': [
+            'norm', 'qk_norm', 'qk_alpha_init', 'alpha_init', 'alpha_0',
+            'k_init', 'p_init', 'no_learnable_p', 'no_learnable_k',
+            'no_learnable_delta', 'layerscale_init', 'no_layerscale', 'no_beta',
+            'seed', 'seeds'],
+        'candidate_checkpoint_step': candidate_step,
+        'reference_checkpoint_step': reference_step,
+        'checkpoint_steps_known': steps_known,
+        'checkpoint_step_basis': step_basis,
+    }
+
+def _print_protocol_guard(guard: dict) -> None:
+    steps = (f"candidate step={guard['candidate_checkpoint_step']}, "
+             f"reference step={guard['reference_checkpoint_step']}")
+    if guard['ok']:
+        print(f'[needle][protocol] comparable recipes ({steps}; '
+              f'{len(guard["keys_compared"])} protocol fields matched)')
+    else:
+        print(f'[needle][protocol] recipe mismatch: {guard["mismatches"]} ({steps})',
+              file=sys.stderr)
+    if not guard['checkpoint_steps_known']:
+        print(f"[needle][protocol] {guard['checkpoint_step_basis']}; a certified "
+              'comparison requires both steps to be known', file=sys.stderr)
 
 def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
     """The tokenizer identity the checkpoint was trained with, else the CLI default."""
@@ -128,7 +206,7 @@ def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
         results.append(record)
     return results, skipped
 
-def compare_needle(results, reference_results, alpha=0.05):
+def compare_needle(results, reference_results, alpha=0.05, protocol=None):
     """Paired candidate-vs-reference tests on the shared placements.
 
     Both arms were scored with the same seeds, so within a seed the trial
@@ -138,6 +216,12 @@ def compare_needle(results, reference_results, alpha=0.05):
     with a paired t (`H1: mean(reference - candidate) < 0`, so a negative
     `mean_delta` means the candidate is better), which weights each placement
     draw equally instead of each trial.
+
+    `protocol` is the `comparison_protocol_guard` verdict. A pair whose
+    training recipes (data, steps, seq_len, optimizer) differ, or whose
+    checkpoint steps are not verifiably identical, is reported but never
+    certified: placement-level pairing cannot remove a training-recipe
+    confound.
     """
     ref_by_ctx = {r['ctx_len']: r for r in reference_results}
     tests = []
@@ -183,11 +267,17 @@ def compare_needle(results, reference_results, alpha=0.05):
         tests.append(t)
     paired_holm = holm_adjust([t.get('p_one_sided') for t in tests])
     mcnemar_holm = holm_adjust([t.get('mcnemar', {}).get('p_one_sided') for t in tests])
+    protocol_ok = bool(protocol.get('ok')) if protocol else True
+    steps_verified = bool(protocol.get('checkpoint_steps_known')) if protocol else True
     for t, p_holm, m_holm in zip(tests, paired_holm, mcnemar_holm):
         n_shared = len(t.get('paired_seeds') or [])
         t['n_shared_placement_seeds'] = n_shared
         t['p_one_sided_holm'] = p_holm
-        t['certifiable'] = bool(t.get('testable') and n_shared >= MIN_SHARED_PLACEMENT_SEEDS)
+        t['protocol_ok'] = protocol_ok
+        t['checkpoint_steps_verified'] = steps_verified
+        t['certifiable'] = bool(t.get('testable')
+                                and n_shared >= MIN_SHARED_PLACEMENT_SEEDS
+                                and protocol_ok and steps_verified)
         delta = t.get('mean_delta')
         t['candidate_better'] = bool(delta is not None and delta < 0.0)
         t['significant_holm'] = bool(
@@ -195,13 +285,22 @@ def compare_needle(results, reference_results, alpha=0.05):
             and p_holm is not None and p_holm < alpha
         )
         if not t['certifiable']:
+            reasons = []
+            if n_shared < MIN_SHARED_PLACEMENT_SEEDS:
+                reasons.append(f'{n_shared} shared placement seed(s) < '
+                               f'{MIN_SHARED_PLACEMENT_SEEDS}')
+            if not protocol_ok:
+                reasons.append('training recipes differ')
+            if not steps_verified:
+                reasons.append('checkpoint steps not verifiably identical')
             t['significance_basis'] = (
-                f'descriptive only: {n_shared} shared placement seed(s); certification '
-                f'requires >= {MIN_SHARED_PLACEMENT_SEEDS} and a paired test')
+                'descriptive only: ' + ('; '.join(reasons) or 'not testable')
+                + ' - the placement-level t/McNemar cannot certify this delta')
         else:
             t['significance_basis'] = (
-                f'placement-level paired test on {n_shared} shared placement seeds; '
-                'training-run variance is not covered by this comparison')
+                f'placement-level paired test on {n_shared} shared placement seeds with '
+                'identical training recipes and checkpoint steps; training-run variance '
+                'is not covered by this comparison')
         m = t.get('mcnemar')
         if isinstance(m, dict):
             m['p_one_sided_holm'] = m_holm
@@ -216,9 +315,11 @@ def compare_needle(results, reference_results, alpha=0.05):
             'multiple_comparison': ('Holm-Bonferroni over the evaluated context lengths, '
                                     'applied separately to the paired-t and exact-McNemar families'),
             'certification': ('a context is certified only when the two checkpoints share '
-                              f'>= {MIN_SHARED_PLACEMENT_SEEDS} placement seeds and the '
-                              'Holm-adjusted one-sided p < alpha; fewer seeds are reported '
-                              'as descriptive only, and no training-run variance is inferred'),
+                              f'>= {MIN_SHARED_PLACEMENT_SEEDS} placement seeds, were trained '
+                              'under identical data/step/sequence/optimizer recipes, both record '
+                              'the same checkpoint step, and the Holm-adjusted one-sided p < '
+                              'alpha; anything else is reported as descriptive only, and no '
+                              'training-run variance is inferred'),
             'pairing': ('arms share placement seeds, so trial outcomes are paired within a seed; '
                         'McNemar is exact on the pooled discordant trials, and the paired t weights '
                         'each placement draw equally'),
@@ -227,7 +328,8 @@ def compare_needle(results, reference_results, alpha=0.05):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True)
-    p.add_argument('--compare-to', default=None, help='reference checkpoint to compare against with the same placement seeds; adds paired McNemar + per-seed paired t to the payload (the comparison --ckpt vs --compare-to)')
+    p.add_argument('--compare-to', default=None, help='reference checkpoint to compare against with the same placement seeds; adds paired McNemar + per-seed paired t to the payload (the comparison --ckpt vs --compare-to). The pair must share the training recipe (data, seq_len, steps, optimizer) and checkpoint step or the comparison is refused')
+    p.add_argument('--allow-protocol-mismatch', action='store_true', help='report a comparison whose training recipe or checkpoint step does not match, but never certify it (the payload records the mismatched fields)')
     p.add_argument('--ctx-lens', nargs='+', type=int, default=[512, 1024, 2048, 4096])
     p.add_argument('--trials', type=int, default=20, help='independent placements per seed; the Wilson interval covers these trials only, the cross-seed Mean +/- Std covers placement draws')
     p.add_argument('--decode-batch', type=int, default=8, help='independent trials decoded per forward pass (the per-trial prefix is still recomputed every step)')
@@ -286,8 +388,17 @@ def main():
                 f'reference uses {ref_tok_name!r}@{ref_tok_revision!r}. Paired placement '
                 'comparisons require identical tokenization; re-train with one tokenizer '
                 'or evaluate the checkpoints separately.')
+        protocol = comparison_protocol_guard(model_args, ref_args)
+        _print_protocol_guard(protocol)
+        if not protocol['ok'] and not args.allow_protocol_mismatch:
+            raise SystemExit(
+                '[needle] refusing to compare checkpoints trained under different recipes: '
+                f"{protocol['mismatches']}. A recipe/step difference confounds the norm effect; "
+                're-train both arms under one protocol, compare ckpts at the same step, or pass '
+                '--allow-protocol-mismatch to get a descriptive (never certified) comparison.')
         ref_results, _ = evaluate_model(ref_model, tok, args, device, seeds, ref_trained_seq_len)
-        comparison = compare_needle(results, ref_results, alpha=0.05)
+        comparison = compare_needle(results, ref_results, alpha=0.05, protocol=protocol)
+        comparison['protocol_guard'] = protocol
         comparison['candidate'] = args.ckpt
         comparison['reference'] = args.compare_to
         for t in comparison['tests']:
