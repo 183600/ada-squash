@@ -172,6 +172,7 @@ def efficiency_verdict(
     statistically_significant: Optional[bool] = None,
     cost_ratio_stderr: Optional[float] = None,
     cost_ratio_n: Optional[int] = None,
+    cost_is_proxy: bool = False,
 ) -> dict:
     """Is `loss_improvement` worth `cost_ratio` times the baseline cost?
 
@@ -195,6 +196,13 @@ def efficiency_verdict(
     point estimate: a noisy benchmark whose ratio could be either 1.01x or
     1.30x has not shown the cost is acceptable. Without a standard error the
     old point-estimate rule is unchanged.
+
+    `statistically_significant=None` means the significance gate was **not
+    established** (no comparison row, or no significance test was run), not
+    that it passed. Certification is fail-closed: only `True` can certify a
+    gain; `None` and `False` both block viability. `cost_is_proxy=True` does
+    the same for cost: a measurement taken on a different architecture cannot
+    certify the candidate's cost.
     """
     verdict = {
         "loss_improvement": loss_improvement,
@@ -205,6 +213,11 @@ def efficiency_verdict(
         "max_component_ratio": (float(max_cost_ratio) if max_component_ratio is None
                                 else float(max_component_ratio)),
         "statistically_significant": statistically_significant,
+        "significance_status": (
+            "certified" if statistically_significant is True
+            else "not_significant" if statistically_significant is False
+            else "no_evidence"),
+        "cost_is_proxy": bool(cost_is_proxy),
         "component_costs": {},
         "component_failures": [],
         "gain_meaningful": None,
@@ -269,14 +282,25 @@ def efficiency_verdict(
         and not verdict["component_failures"])
     # A gain that the seed-level comparison could not call significant is weak
     # evidence: a micro point estimate is not a win on its own, so it cannot be
-    # certified as viable regardless of how cheap it is.
+    # certified as viable regardless of how cheap it is. `None` is not a pass:
+    # it means no significance evidence was produced, and the fail-closed rule
+    # must not turn missing evidence into certification.
     if statistically_significant is False:
         verdict["component_failures"] = list(verdict["component_failures"]) + [
             "gain is not statistically significant; a micro point estimate is "
             "not convincing evidence of an improvement"]
+    elif statistically_significant is None:
+        verdict["component_failures"] = list(verdict["component_failures"]) + [
+            "no significance evidence is available (no comparison row or no "
+            "seed-replicated comparison was run); a point estimate cannot "
+            "certify the gain"]
+    if cost_is_proxy:
+        verdict["component_failures"] = list(verdict["component_failures"]) + [
+            "cost is a proxy measured on a different architecture; it cannot "
+            "certify this candidate's cost"]
     verdict["viable"] = bool(
         verdict["gain_meaningful"] and verdict["cost_acceptable"]
-        and statistically_significant is not False)
+        and statistically_significant is True and not cost_is_proxy)
     if gain > 0:
         verdict["cost_per_loss_point"] = cost / gain
     reasons = []
@@ -296,8 +320,6 @@ def efficiency_verdict(
             "certify the cost is acceptable"
         )
     reasons.extend(verdict["component_failures"])
-    if statistically_significant is False and "gain is not statistically significant; a micro point estimate is not convincing evidence of an improvement" not in reasons:
-        reasons.append("gain is not statistically significant")
     verdict["reason"] = "; ".join(reasons) if reasons else (
         f"gain {gain:+.4f} clears {min_loss_gain:g} at cost {cost:.3f}x within "
         f"{max_cost_ratio:.3f}x"

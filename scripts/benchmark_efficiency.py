@@ -418,6 +418,10 @@ def main():
         significance = load_significance(comparison_path)
         if significance:
             print(f"[tradeoff] significance gate -> {comparison_path}")
+        else:
+            print("[tradeoff][warn] no usable baseline_comparison.json row found; "
+                  "the significance gate is UNVERIFIED, so no candidate can be "
+                  "certified viable (report-only point estimates)")
         # The candidate measurement is taken here for the same model/norm;
         # the reference measurement is the --reference norm's. The benchmark
         # only builds the base norm, so a row whose trained architecture
@@ -491,18 +495,14 @@ def main():
                                              None if sig is None
                                              else sig.get('beats_reference_significantly')),
                                          cost_ratio_stderr=cost_stats.get('stderr'),
-                                         cost_ratio_n=cost_stats.get('n_rounds'))
-            # A gain the seed-level ablation could not call significant is
-            # weak evidence: block viability until a longer/multi-seed run
-            # clears the significance bar.
+                                         cost_ratio_n=cost_stats.get('n_rounds'),
+                                         cost_is_proxy=cost_is_proxy)
+            # Keep the comparison metadata on the verdict for auditing; the
+            # viability decision itself (including the fail-closed treatment of
+            # missing significance evidence) is made inside efficiency_verdict.
             if sig:
-                verdict['statistically_significant'] = sig['beats_reference_significantly']
                 verdict['p_one_sided_holm'] = sig['p_one_sided_holm']
                 verdict['n_seeds'] = sig['n_seeds']
-                if sig['beats_reference_significantly'] is False:
-                    verdict['viable'] = False
-                    verdict['reason'] += ('; ablation comparison on the same seeds does not call the '
-                                          'gain significant (Holm-adjusted), so the point estimate is weak evidence')
             rows.append({
                 'candidate': cand,
                 'candidate_norm': cand_norm,
@@ -535,9 +535,9 @@ def main():
                 print(f"[tradeoff] {row['candidate']}: {row['error']}")
                 continue
             v = row['verdict']
-            sig_str = ''
-            if v.get('statistically_significant') is not None:
-                sig_str = f" significant={v['statistically_significant']} (p_holm={v['p_one_sided_holm']})"
+            sig_str = f" significance={v.get('significance_status', 'no_evidence')}"
+            if v.get('p_one_sided_holm') is not None:
+                sig_str += f" (p_holm={v['p_one_sided_holm']})"
             proxy_str = ' [proxy cost]' if row.get('cost_is_proxy') else ''
             print(f"[tradeoff] {row['candidate']}: val_loss={row['candidate_val_loss']:.4f} vs "
                   f"{row['reference_row']}={row['reference_val_loss']:.4f} "
