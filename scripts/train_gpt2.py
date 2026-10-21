@@ -242,11 +242,25 @@ _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tok
               # `data_position` no longer points at the same tokens.
               'seq_len', 'batch_size', 'num_workers')
 
+_LEDGER_ARGS = ('exclude_hash_file', 'exclude_test_hash_file',
+                'exclude_group_file', 'exclude_test_group_file')
+
 def _ledger_identity(path):
     if not path:
         return None
     fingerprint = file_fingerprint(path)
     return {key: fingerprint.get(key) for key in ('path', 'exists', 'sha256', 'bytes')}
+
+def _data_ledger_fingerprints(args) -> dict:
+    """Content fingerprints of the cross-split ledgers a run depends on.
+
+    The checkpoint stores these so a resume can prove it is continuing on the
+    same held-out documents: a ledger file replaced *at the same path* between
+    runs would otherwise silently change which held-out documents are dropped
+    (and therefore which documents the validation/test numbers describe)
+    while every recorded argument still looks identical.
+    """
+    return {name: _ledger_identity(getattr(args, name, None)) for name in _LEDGER_ARGS}
 
 def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) -> list:
     changed = []
@@ -1051,7 +1065,44 @@ def main():
             if adopted:
                 print(f'[resume] data-split args restored from checkpoint: {adopted}')
             if kept:
-                print(f'[resume] keeping your explicit data-split override(s) {kept} - the resumed run therefore evaluates on a different split than the one it continues')
+                # A different split boundary, dataset revision, cleaning
+                # policy or ledger changes which documents are trained on and
+                # which are held out. Honoring it could move already-trained
+                # documents into validation (or the sealed test), so it is a
+                # leak rather than an override: refuse instead of warning.
+                raise SystemExit(
+                    f'[resume] refusing to resume with explicit data-split '
+                    f'override(s) {sorted(kept)} that differ from the checkpoint: '
+                    f'the resumed run would train/evaluate on a different data '
+                    f'identity than the one it continues (documents the model '
+                    f'already saw could re-enter the held-out splits). Start a '
+                    f'fresh run if the data protocol must change, or drop the '
+                    f'overrides to continue the checkpointed split exactly.')
+        saved_ledgers = resume_ckpt.get('data_ledgers')
+        if saved_ledgers is None:
+            print('[resume] checkpoint predates ledger-content pinning: the split '
+                  'ledger files are not verified, so a replaced ledger could change '
+                  'the held-out documents under the same paths')
+        else:
+            current_ledgers = _data_ledger_fingerprints(args)
+            ledger_changes = []
+            for name in _LEDGER_ARGS:
+                old = saved_ledgers.get(name)
+                new = current_ledgers.get(name)
+                if old != new:
+                    ledger_changes.append({
+                        'role': name,
+                        'checkpoint': old,
+                        'current': new,
+                    })
+            if ledger_changes:
+                raise SystemExit(
+                    '[resume] refusing to resume: the cross-split ledger content '
+                    'differs from the checkpoint, so the resumed run would drop a '
+                    f'different set of held-out documents ({ledger_changes}). '
+                    'Restore the original ledger files or start a fresh run with '
+                    'the new split protocol.')
+            print('[resume] cross-split ledger fingerprints match the checkpoint')
     data_reports: dict = {}
     loader = open_data_split('train', args)
     data_iter = iter(loader)
@@ -1404,6 +1455,7 @@ def main():
                 'n_nonfinite_losses': int(n_nonfinite_losses),
                 'n_nonfinite_gradients': int(n_nonfinite_gradients),
                 'n_nonfinite_val_losses': int(n_nonfinite_val_losses),
+                'data_ledgers': _data_ledger_fingerprints(args),
             }
 
         def _triage_nonfinite(kind: str, step: int, x_bad, y_bad, bad_value: float,
