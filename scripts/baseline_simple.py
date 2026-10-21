@@ -347,6 +347,11 @@ def evaluate_seed(seed: int, args, device: str) -> dict:
     record['predictors']['uniform_vocab'] = math.log(args.vocab_size)
     record['predictors']['uniform_targets'] = math.log(args.n_states)
     for name, ce_fn in (('unigram', ce_unigram), ('bigram', ce_bigram), ('trigram', ce_trigram)):
+        if name == 'trigram' and not counts['with_trigram']:
+            # Report it as skipped rather than falling back to the bigram under
+            # a "trigram" label, which would overstate what was evaluated.
+            record['predictors'][name] = None
+            continue
         tuning = tune_smoothing(lambda k, fn=ce_fn: fn(counts, tune, n_symbols, k), args.ks)
         record['tuning'][name] = tuning
         record['predictors'][name] = (None if tuning['best_k'] is None
@@ -492,11 +497,13 @@ def main():
         record = evaluate_seed(seed, args, device)
         records.append(record)
         preds = record['predictors']
-        tuned = {name: record['tuning'][name]['best_k'] for name in SIMPLE_PREDICTORS}
+        tuned = {name: record['tuning'][name]['best_k'] for name in record['tuning']}
+        trigram = ('skipped' if preds.get('trigram') is None
+                   else f"{preds['trigram']:.4f}")
         print(f"[baseline] seed {seed}: uniform_vocab={preds['uniform_vocab']:.4f} "
               f"uniform_targets={preds['uniform_targets']:.4f} "
               f"unigram={preds['unigram']:.4f} bigram={preds['bigram']:.4f} "
-              f"trigram={preds['trigram']:.4f} walk_rule={preds['walk_rule']:.4f} "
+              f"trigram={trigram} walk_rule={preds['walk_rule']:.4f} "
               f"hmm_bayes={preds['hmm_bayes']:.4f} (ks: {tuned})")
     aggregate = aggregate_records(records, ('uniform_vocab', 'uniform_targets', *SIMPLE_PREDICTORS,
                                             'walk_rule', 'hmm_bayes'))
