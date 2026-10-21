@@ -202,8 +202,10 @@ def efficiency_verdict(
     even if a stderr is present: one round has no degrees of freedom, so a
     zero stderr cannot turn a single timing into a zero-width interval. A
     negative or non-finite standard error is not a measurement either, and a
-    non-finite loss gain or a negative cost ratio is rejected rather than
-    treated as an infinite gain or free compute.
+    round count that cannot be interpreted as an integer (non-numeric,
+    non-finite, or fractional) is rejected as an invalid measurement rather
+    than raising. A non-finite loss gain or a negative cost ratio is rejected
+    rather than treated as an infinite gain or free compute.
 
     `statistically_significant=None` means the significance gate was **not
     established** (no comparison row, or no significance test was run), not
@@ -265,13 +267,26 @@ def efficiency_verdict(
                 cost_se = candidate_se
             else:
                 invalid_se = repr(candidate_se)
-    cost_n = None if cost_ratio_n is None else int(cost_ratio_n)
+    cost_n = None
+    invalid_n = None
+    if cost_ratio_n is not None:
+        try:
+            candidate_n = int(cost_ratio_n)
+        except (TypeError, ValueError, OverflowError):
+            invalid_n = repr(cost_ratio_n)
+        else:
+            if isinstance(cost_ratio_n, float) and not math.isfinite(cost_ratio_n):
+                invalid_n = repr(cost_ratio_n)
+            elif isinstance(cost_ratio_n, float) and not cost_ratio_n.is_integer():
+                invalid_n = repr(cost_ratio_n)
+            else:
+                cost_n = candidate_n
     enough_rounds = cost_n is None or cost_n >= 2
     if cost_se is not None:
         verdict["cost_ratio_stderr"] = cost_se
     if cost_n is not None:
         verdict["cost_ratio_n"] = cost_n
-    if cost_se is not None and enough_rounds:
+    if cost_se is not None and enough_rounds and invalid_n is None:
         if cost_n is None:
             t_crit = 1.96
             df = None
@@ -287,7 +302,7 @@ def efficiency_verdict(
     # must fail closed. A supplied but invalid standard error is not the same
     # as no uncertainty estimate: it cannot certify anything either.
     verdict["cost_uncertainty_certified"] = (
-        False if invalid_se is not None
+        False if invalid_se is not None or invalid_n is not None
         else None if cost_n is None
         else (cost_se is not None and enough_rounds))
     component_limit = verdict["max_component_ratio"]
@@ -295,6 +310,10 @@ def efficiency_verdict(
         verdict["component_failures"].append(
             f"cost ratio standard error {invalid_se} is not a finite, "
             f"non-negative measurement; cannot certify the {cost_name} cost")
+    elif invalid_n is not None:
+        verdict["component_failures"].append(
+            f"cost ratio round count {invalid_n} is not an integer measurement; "
+            f"cannot certify the {cost_name} cost")
     elif verdict["cost_uncertainty_certified"] is False:
         if cost_se is not None:
             failure = (
