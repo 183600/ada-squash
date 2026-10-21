@@ -847,6 +847,8 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         cand_flags, cand_cause = _classify_one(rec, 'candidate')
         reference_cause[ref_cause] += 1
         candidate_cause[cand_cause] += 1
+        _bump(cause_summary, ref_cause, 'reference_errors')
+        _bump(cause_summary, cand_cause, 'candidate_errors')
         rec['reference_flags'] = ref_flags
         rec['candidate_flags'] = cand_flags
         rec['reference_cause'] = ref_cause
