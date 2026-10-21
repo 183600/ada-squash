@@ -187,8 +187,13 @@ def _ledger_verified(value) -> bool:
         return True
     if not isinstance(value, dict):
         return False
-    if value.get("exists") is not True:
+    exists = value.get("exists")
+    if exists is False:
         return True
+    if exists is not True:
+        # A malformed/old record with no explicit existence flag is unknown,
+        # not "no file": certifying it would skip the content-hash check.
+        return False
     sha = value.get("sha256")
     return isinstance(sha, str) and bool(sha)
 
