@@ -611,11 +611,14 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                     if mismatches:
                         reject_reason = ('recorded model/norm/seed differs from this aggregate: '
                                          + json.dumps(mismatches, sort_keys=True))
+                    elif not isinstance(results, dict):
+                        reject_reason = ('run_manifest.json has no results block; a finished '
+                                         'run must record its results')
         if reject_reason is not None:
             record['rejected'] = reject_reason
             rejections.append({'seed': int(seed), 'path': str(run_dir / 'run_manifest.json'),
                                'reason': reject_reason})
-        elif isinstance(results, dict):
+        else:
             record['final_val_loss'] = results.get('final_val_loss')
             record['best_val_loss'] = results.get('best_val_loss')
             record['final_val_step'] = results.get('final_val_step')
