@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import json
+import math
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -289,9 +290,22 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
         vals = [r[key] for r in per_seed if isinstance(r.get(key), (int, float))]
         stats = mean_std_stderr(vals)
         if stats is None:
+            # Every probe draw was non-finite: report "unmeasured" instead of
+            # leaving the first seed's NaN in the aggregate. A probe that
+            # overflowed is a numerical failure to triage, not a result.
+            agg[key] = None
+            agg[key + '_std'] = None
+            agg[key + '_n_finite'] = 0
+            agg[key + '_n_nonfinite'] = len(vals)
+            if vals:
+                agg.setdefault('nonfinite_metric_counts', {})[key] = len(vals)
             continue
         agg[key] = stats['mean']
         agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
+        agg[key + '_n_finite'] = stats['n']
+        agg[key + '_n_nonfinite'] = stats['n_nonfinite']
+        if stats['n_nonfinite']:
+            agg.setdefault('nonfinite_metric_counts', {})[key] = stats['n_nonfinite']
     nonfinite = [r['first_nonfinite_layer'] for r in per_seed
                  if isinstance(r.get('first_nonfinite_layer'), int)]
     overflowing = [r['first_overflow_layer'] for r in per_seed
@@ -312,16 +326,27 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
 FP8_COMPARISON_METRICS = ('logit_rel_divergence', 'mean_overflow_rate_e4m3',
                           'mean_underflow_rate_e4m3')
 
+def _finite_metric(value) -> bool:
+    """Whether a probe metric may enter a paired test.
+
+    A diverged probe can leave NaN/Inf in the per-seed record. The aggregate
+    reports those draws as excluded, but the paired tests must exclude them
+    too: a single NaN makes the t statistic NaN and aborts the whole
+    comparison instead of testing the finite draws.
+    """
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)))
+
 def _seed_metric_values(agg: dict, key: str) -> list:
     return [float(r[key]) for r in agg.get('per_seed', [])
-            if isinstance(r.get(key), (int, float))]
+            if _finite_metric(r.get(key))]
 
 def _train_seed_metric_values(agg: dict, key: str) -> dict:
     """Per-training-seed mean of `key` (averaged over that seed's checkpoints)."""
     out = {}
     for train_seed, metrics in (agg.get('per_train_seed') or {}).items():
         value = metrics.get(key) if isinstance(metrics, dict) else None
-        if isinstance(value, (int, float)):
+        if _finite_metric(value):
             out[int(train_seed)] = float(value)
     return out
 
@@ -331,13 +356,14 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
     For a fixed seed the probe draw (and, in random-init mode, the model
     initialization seed) is identical for every norm, so the two norms'
     records are paired samples - the same reason the ablation runner pairs its
-    rows by seed.
+    rows by seed. A seed with a non-finite metric on either side is not a
+    usable pair and is excluded rather than poisoning the paired t statistic.
     """
     a_by_seed = {r.get('seed'): r.get(key) for r in agg_a.get('per_seed', [])}
     b_by_seed = {r.get('seed'): r.get(key) for r in agg_b.get('per_seed', [])}
     shared = sorted(s for s in set(a_by_seed) & set(b_by_seed)
-                    if isinstance(a_by_seed[s], (int, float))
-                    and isinstance(b_by_seed[s], (int, float)))
+                    if _finite_metric(a_by_seed[s])
+                    and _finite_metric(b_by_seed[s]))
     return shared, [float(a_by_seed[s]) for s in shared], [float(b_by_seed[s]) for s in shared]
 
 def _protocol_record(ckpt_args: dict, model) -> dict:
