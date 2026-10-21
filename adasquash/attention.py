@@ -1,17 +1,18 @@
 from __future__ import annotations
 import math
+from collections import OrderedDict
 from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import skip_init
 from .norms import QKSquash, _RMSNorm
-_TRIL_MASK_CACHE: dict = {}
-_ROPE_TABLE_CACHE: dict = {}
-_LOGIT_SCRATCH_CACHE: dict = {}
+_TRIL_MASK_CACHE: OrderedDict = OrderedDict()
+_ROPE_TABLE_CACHE: OrderedDict = OrderedDict()
+_LOGIT_SCRATCH_CACHE: OrderedDict = OrderedDict()
 _CACHE_MAX_ENTRIES = 8
 _LOGIT_SCRATCH_MAX_ENTRIES = 2
-_ROPE_HALF_SCRATCH_CACHE: dict = {}
+_ROPE_HALF_SCRATCH_CACHE: OrderedDict = OrderedDict()
 _ROPE_HALF_SCRATCH_MAX_ENTRIES = 4
 
 def _rope_half_scratch(x_lo: torch.Tensor) -> torch.Tensor:
@@ -27,8 +28,10 @@ def _rope_half_scratch(x_lo: torch.Tensor) -> torch.Tensor:
     if buf is None:
         buf = torch.empty(x_lo.shape, dtype=x_lo.dtype, device=x_lo.device)
         if len(_ROPE_HALF_SCRATCH_CACHE) >= _ROPE_HALF_SCRATCH_MAX_ENTRIES:
-            _ROPE_HALF_SCRATCH_CACHE.clear()
+            _ROPE_HALF_SCRATCH_CACHE.popitem(last=False)
         _ROPE_HALF_SCRATCH_CACHE[key] = buf
+    else:
+        _ROPE_HALF_SCRATCH_CACHE.move_to_end(key)
     return buf
 
 def clear_logit_scratch_cache() -> None:
@@ -140,8 +143,10 @@ class CausalSelfAttention(nn.Module):
             ij = torch.arange(T, device=device)
             mask = ij[:, None] < ij[None, :]
             if len(_TRIL_MASK_CACHE) >= _CACHE_MAX_ENTRIES:
-                _TRIL_MASK_CACHE.clear()
+                _TRIL_MASK_CACHE.popitem(last=False)
             _TRIL_MASK_CACHE[key] = mask
+        else:
+            _TRIL_MASK_CACHE.move_to_end(key)
         self._tril_cache = (key, mask)
         return mask
     _LOGITS_CHUNK_BYTES = 1 << 27
@@ -157,8 +162,10 @@ class CausalSelfAttention(nn.Module):
             # contiguous prefix of the shape it needs.
             buf = torch.empty(B * H * R * T, dtype=dtype, device=device)
             if len(_LOGIT_SCRATCH_CACHE) >= _LOGIT_SCRATCH_MAX_ENTRIES:
-                _LOGIT_SCRATCH_CACHE.clear()
+                _LOGIT_SCRATCH_CACHE.popitem(last=False)
             _LOGIT_SCRATCH_CACHE[key] = buf
+        else:
+            _LOGIT_SCRATCH_CACHE.move_to_end(key)
         return buf
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
@@ -262,8 +269,10 @@ def _rope_table_entry(freqs_cis: torch.Tensor):
         sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
         entry = (freqs_cis, cos, sin, {})
         if len(_ROPE_TABLE_CACHE) >= _CACHE_MAX_ENTRIES:
-            _ROPE_TABLE_CACHE.clear()
+            _ROPE_TABLE_CACHE.popitem(last=False)
         _ROPE_TABLE_CACHE[key] = entry
+    else:
+        _ROPE_TABLE_CACHE.move_to_end(key)
     return (key, entry)
 
 def _rope_pair_for_dtype(entry, dtype: torch.dtype):
