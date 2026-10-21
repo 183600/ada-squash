@@ -983,6 +983,7 @@ def main():
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--device', default=None)
     p.add_argument('--output', default=None)
+    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this error analysis tests; recorded in the report and manifest so the result is auditable as a test of a claim rather than a fishing trip')
     # dataset-corpus options (must match the trained run's split protocol)
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
@@ -1097,6 +1098,7 @@ def main():
         report['reference_data_protocol_mismatches'] = reference_protocol_mismatches
     report['checkpoint_health'] = checkpoint_health
     report['run_metadata'] = collect_run_metadata(seed=args.seed)
+    report['hypothesis'] = args.hypothesis
 
     if reference_model is not None:
         s = report['summary']
@@ -1176,6 +1178,7 @@ def main():
     Path(out).write_text(json.dumps(report, indent=2, default=str))
     manifest = {
         'run_metadata': report['run_metadata'], 'ckpt': args.ckpt,
+        'hypothesis': args.hypothesis,
         'corpus': args.corpus, 'config': vars(args),
         'summary': report['summary'], 'checkpoint_health': checkpoint_health,
     }
@@ -1183,6 +1186,8 @@ def main():
         manifest['reference_ckpt'] = args.reference_ckpt
     manifest = finish_metadata(manifest, artifacts={'report': file_fingerprint(out)})
     save_run_manifest(Path(out).with_name('error_analysis_manifest.json'), manifest)
+    if args.hypothesis:
+        print(f'[errors][hypothesis] {args.hypothesis}')
     print(f'[errors] report -> {out}')
 
 
