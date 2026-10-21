@@ -58,11 +58,15 @@ def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dic
     steps to be known), not silently treated as equal.
     """
     mismatches = {}
+    missing = '<missing>'
     for key in TRAINING_PROTOCOL_KEYS:
+        # A field absent from *both* checkpoints is unknown, not equal: an old
+        # or incomplete checkpoint must not certify as protocol-compatible.
         if key not in candidate_args and key not in reference_args:
+            mismatches[key] = {'candidate': missing, 'reference': missing}
             continue
-        candidate_value = candidate_args.get(key)
-        reference_value = reference_args.get(key)
+        candidate_value = candidate_args.get(key, missing)
+        reference_value = reference_args.get(key, missing)
         if candidate_value != reference_value:
             mismatches[key] = {'candidate': candidate_value,
                                'reference': reference_value}
