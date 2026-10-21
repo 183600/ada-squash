@@ -698,6 +698,23 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         seed for seed, v in data_versions_by_seed.items() if v is None)
     data_versions_complete = bool(data_versions_by_seed) and not unknown_data_version_seeds
     data_versions_consistent = (data_versions_complete and len(known_versions) <= 1)
+    # The same recipe also means the same architecture: a stale checkpoint or
+    # a per-seed ADASQUASH_*_OVERRIDE leaves a seed with a different shape,
+    # whose loss cannot be averaged with the others.
+    shape_keys = ('n_params', 'n_layers', 'dim', 'n_heads')
+    shapes_by_seed = {}
+    unknown_shape_seeds = []
+    for r in per_seed:
+        shape = {key: r.get(key) for key in shape_keys}
+        if all(isinstance(v, int) and not isinstance(v, bool) and v > 0
+               for v in shape.values()):
+            shapes_by_seed[int(r['seed'])] = shape
+        else:
+            unknown_shape_seeds.append(int(r['seed']))
+    shape_signatures = {
+        json.dumps(shape, sort_keys=True) for shape in shapes_by_seed.values()}
+    shapes_complete = bool(shapes_by_seed) and not unknown_shape_seeds
+    shapes_consistent = shapes_complete and len(shape_signatures) <= 1
     final_vals, final_stats = _pool('final_val_loss')
     best_vals, best_stats = _pool('best_val_loss')
     test_vals, test_stats = _pool('test_loss')
@@ -715,7 +732,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     invalid = [r['seed'] for r in per_seed
                if any(isinstance(r[k], float) and not math.isfinite(r[k]) for k in ('final_val_loss', 'best_val_loss'))]
     pool_ok = (not missing and not invalid
-               and data_versions_complete and data_versions_consistent)
+               and data_versions_complete and data_versions_consistent
+               and shapes_complete and shapes_consistent)
     return {
         'model': model, 'norm': norm,
         'seeds': seeds,
@@ -728,6 +746,10 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'unknown_data_version_seeds': unknown_data_version_seeds,
         'data_versions_complete': data_versions_complete,
         'data_versions_consistent': data_versions_consistent,
+        'shapes_by_seed': shapes_by_seed,
+        'unknown_shape_seeds': sorted(unknown_shape_seeds),
+        'shapes_complete': shapes_complete,
+        'shapes_consistent': shapes_consistent,
         'complete': pool_ok,
         'per_seed': per_seed,
         'final_val_loss': None if final_stats is None else final_stats['mean'],
@@ -772,7 +794,11 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                                     f'invalid seeds: {invalid}' if invalid else
                                     f'unknown data version for seeds: {unknown_data_version_seeds}'
                                     if not data_versions_complete else
-                                    'seeds trained on different resolved data versions')),
+                                    'seeds trained on different resolved data versions'
+                                    if not data_versions_consistent else
+                                    f'unknown model shape for seeds: {sorted(unknown_shape_seeds)}'
+                                    if not shapes_complete else
+                                    'seeds trained with different model shapes')),
         'aggregation': (
             'Mean +/- Std across independent seed runs of the identical recipe (same optimizer, '
             'schedule, data protocol and step count). final_val_loss = last validation pass at the '
