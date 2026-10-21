@@ -883,6 +883,7 @@ def main():
     p.add_argument('--nonfinite-policy', choices=['abort', 'skip'], default='abort', help='what to do when a training loss is NaN/Inf: abort (default) runs the ordered data->math->precision->gradient triage and stops; skip runs the triage and discards only that step (5 consecutive non-finite steps still abort)')
     p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first); per-batch losses and the data-pairing block are stored in test_results.json so scripts/compare_sealed_tests.py can test two arms on the shared sealed batches')
     p.add_argument('--allow-test-rerun', action='store_true', help='permit a second one-shot evaluation of the sealed test split in the same output dir (breaks the seal: the test set becomes an implicit validation set)')
+    p.add_argument('--allow-missing-split-ledgers', action='store_true', help='proceed with --final-test-eval even though the cross-split document/group ledgers are missing; the sealed test set is then not proven disjoint from train/validation, so the score is not a valid held-out estimate (debugging only)')
     p.add_argument('--test-batches', type=int, default=20, help='batches for the one-shot final test evaluation')
     p.add_argument('--error-analysis', action='store_true', help='after training, run scripts/analyze_errors.py on the best-validation checkpoint over the validation split: prints the mispredicted samples with their cause taxonomy (the main source of the next hypothesis) and records error_analysis_validation.json in the manifest')
     p.add_argument('--error-analysis-batches', type=int, default=8, help='held-out batches scanned by --error-analysis')
@@ -1900,25 +1901,40 @@ def main():
                 print('[test] WARNING: --val-every 0 disables validation-based selection; '
                       'the sealed test split reports the final model only and must never be '
                       'used to pick hyperparameters.', file=sys.stderr)
-            if args.dataset and args.val_frac > 0 and args.test_frac > 0:
+            if args.dataset and args.test_frac > 0:
                 missing_ledgers = []
                 if not args.exclude_hash_file:
-                    missing_ledgers.append('--exclude-hash-file (train<->held-out duplicates)')
-                if not args.exclude_test_hash_file:
+                    missing_ledgers.append('--exclude-hash-file (train<->test duplicates)')
+                if args.val_frac > 0 and not args.exclude_test_hash_file:
                     missing_ledgers.append('--exclude-test-hash-file (validation<->test duplicates)')
                 if args.group_key:
                     if not args.exclude_group_file:
-                        missing_ledgers.append(f"--exclude-group-file (train<->held-out groups on '{args.group_key}')")
-                    if not args.exclude_test_group_file:
+                        missing_ledgers.append(f"--exclude-group-file (train<->test groups on '{args.group_key}')")
+                    if args.val_frac > 0 and not args.exclude_test_group_file:
                         missing_ledgers.append(f"--exclude-test-group-file (validation<->test groups on '{args.group_key}')")
+                if missing_ledgers and not args.allow_missing_split_ledgers:
+                    # The one-shot score is only a held-out estimate if the
+                    # sealed split is disjoint from everything used earlier.
+                    # Warning-and-proceeding produces a number that looks like
+                    # a sealed test result while training/selection documents
+                    # may sit inside it: refuse unless the user explicitly
+                    # accepts an unverified, non-held-out number.
+                    raise SystemExit(
+                        '[test] refusing the sealed test evaluation: no cross-split '
+                        'ledger supplied, so ' + ' and '.join(missing_ledgers) +
+                        ' are not dropped and the test split is not proven disjoint '
+                        'from train/validation. Build the ledgers with '
+                        'scripts/audit_data.py --write-train-hash-file / '
+                        '--write-val-hash-file (and --write-train-group-file / '
+                        '--write-val-group-file --group-key K for grouped corpora; '
+                        'use --n-docs 0 for full coverage) and pass them to the run. '
+                        'Pass --allow-missing-split-ledgers only to knowingly '
+                        'produce an unverified, non-held-out score.')
                 if missing_ledgers:
                     print('[test] WARNING: no cross-split ledger supplied, so '
                           + ' and '.join(missing_ledgers) +
-                          ' are not dropped; the held-out splits may not be disjoint. Build the '
-                          'ledgers with scripts/audit_data.py --write-train-hash-file / '
-                          '--write-val-hash-file (and --write-train-group-file / '
-                          '--write-val-group-file --group-key K for grouped corpora; use --n-docs 0 '
-                          'for full coverage) and pass them to the run.', file=sys.stderr)
+                          ' are not dropped; the sealed test score is NOT a held-out '
+                          'estimate (--allow-missing-split-ledgers).', file=sys.stderr)
             test_loader = open_data_split('test', args)
             rtest = getattr(test_loader, 'split_report', None)
             if rtest:
