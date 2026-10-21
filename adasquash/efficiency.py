@@ -18,6 +18,8 @@ import math
 from collections import defaultdict
 from typing import Optional
 
+from .metrics import student_t_ppf
+
 __all__ = [
     "DEFAULT_MIN_LOSS_GAIN",
     "DEFAULT_MAX_COST_RATIO",
@@ -45,7 +47,7 @@ def _t_critical_95(df: int) -> float:
         return float("inf")
     if df <= len(_T95):
         return _T95[df - 1]
-    return 1.96
+    return student_t_ppf(0.975, float(df))
 
 
 def mlp_hidden_size(dim: int, mlp_ratio: float) -> int:
