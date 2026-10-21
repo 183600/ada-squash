@@ -670,6 +670,10 @@ def imbalance_report(counts: Sequence[int]) -> dict:
         "majority_minority_ratio": ratio,
         "extreme": extreme,
         "prefer_pr_auc": extreme,
+        "suggested_primary_metric": (
+            "average_precision (PR-AUC) for the minority classes, plus macro_f1"
+            if extreme else "macro_f1 (and accuracy only if the classes are balanced)"
+        ),
         "note": (
             f"majority:minority = {ratio:.1f}:1"
             + (
