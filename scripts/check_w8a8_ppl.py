@@ -34,6 +34,13 @@ DEFAULT_SEEDS = (42, 43, 44)
 _W8A8_SEED_METRIC_KEYS = ('ppl_fp', 'ppl_w8a8', 'ppl_drop', 'ppl_drop_pct',
                           'probe_token_coverage')
 
+def _checkpoint_defaulted(args, parser, ckpt_args: dict, name: str):
+    """The CLI value when explicitly set, else the checkpoint's recorded value."""
+    value = getattr(args, name)
+    if value == parser.get_default(name) and ckpt_args.get(name) is not None:
+        return ckpt_args[name]
+    return value
+
 def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
     # `ord=inf` vector norm is max(|w|).
     mx = torch.linalg.vector_norm(w, ord=float('inf'), dim=-1, keepdim=True).clamp_(min=1e-06)
@@ -535,19 +542,16 @@ def main():
         per_ckpt = []
         for ckpt_path in group:
             model, ckpt_args = load_ckpt(ckpt_path, device=device)
-            # Prefer the split the checkpoint was trained with, so the probe is
-            # the same held-out slice; a flag typed on the command line wins.
+            # Prefer the dataset and split the checkpoint was trained with, so
+            # the probe is the same held-out slice; a flag typed on the command
+            # line wins.
             def split_arg(name):
-                value = getattr(args, name)
-                default = p.get_default(name)
-                if value == default and name in ckpt_args and ckpt_args.get(name) is not None:
-                    return ckpt_args[name]
-                return value
+                return _checkpoint_defaulted(args, p, ckpt_args, name)
             # Same precedence for the data version: an explicit flag wins, else
             # the revision the checkpoint recorded, else upstream default branch.
             dataset_revision = args.dataset_revision if args.dataset_revision is not None else ckpt_args.get('dataset_revision')
             tokenizer_revision = args.tokenizer_revision if args.tokenizer_revision is not None else ckpt_args.get('tokenizer_revision')
-            dataset_probe = make_dataset_probe(args.dataset, args.dataset_config, ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), exclude_test_hash_file=ckpt_args.get('exclude_test_hash_file'), group_key=ckpt_args.get('group_key'), exclude_group_file=ckpt_args.get('exclude_group_file'), exclude_test_group_file=ckpt_args.get('exclude_test_group_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision, seed=seeds[0], num_workers=args.num_workers) if args.probe == 'dataset' else None
+            dataset_probe = make_dataset_probe(split_arg('dataset'), split_arg('dataset_config'), ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), exclude_test_hash_file=ckpt_args.get('exclude_test_hash_file'), group_key=ckpt_args.get('group_key'), exclude_group_file=ckpt_args.get('exclude_group_file'), exclude_test_group_file=ckpt_args.get('exclude_test_group_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision, seed=seeds[0], num_workers=args.num_workers) if args.probe == 'dataset' else None
             if dataset_probe is not None:
                 dataset_probe_reports.append({
                     'ckpt': ckpt_path,
