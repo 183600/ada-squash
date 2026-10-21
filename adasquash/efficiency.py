@@ -200,7 +200,10 @@ def efficiency_verdict(
     missing, certification fails closed because a single timing has no
     resolution of its own. A supplied round count below 2 also fails closed
     even if a stderr is present: one round has no degrees of freedom, so a
-    zero stderr cannot turn a single timing into a zero-width interval.
+    zero stderr cannot turn a single timing into a zero-width interval. A
+    negative or non-finite standard error is not a measurement either, and a
+    non-finite loss gain or a negative cost ratio is rejected rather than
+    treated as an infinite gain or free compute.
 
     `statistically_significant=None` means the significance gate was **not
     established** (no comparison row, or no significance test was run), not
@@ -241,11 +244,27 @@ def efficiency_verdict(
         return verdict
     gain = float(loss_improvement)
     cost = float(cost_ratio)
+    if not math.isfinite(gain):
+        verdict["reason"] = (
+            f"loss improvement {gain!r} is not a finite measurement; nothing to certify")
+        return verdict
+    if not math.isfinite(cost) or cost < 0.0:
+        verdict["reason"] = (
+            f"cost ratio {cost!r} is not a finite non-negative measurement; "
+            "nothing to certify")
+        return verdict
     cost_se = None
+    invalid_se = None
     if cost_ratio_stderr is not None:
-        candidate_se = float(cost_ratio_stderr)
-        if math.isfinite(candidate_se) and candidate_se >= 0.0:
-            cost_se = candidate_se
+        try:
+            candidate_se = float(cost_ratio_stderr)
+        except (TypeError, ValueError):
+            invalid_se = repr(cost_ratio_stderr)
+        else:
+            if math.isfinite(candidate_se) and candidate_se >= 0.0:
+                cost_se = candidate_se
+            else:
+                invalid_se = repr(candidate_se)
     cost_n = None if cost_ratio_n is None else int(cost_ratio_n)
     enough_rounds = cost_n is None or cost_n >= 2
     if cost_se is not None:
@@ -265,11 +284,18 @@ def efficiency_verdict(
     # A round count without a standard error has no resolution, and a supplied
     # round count below 2 has no degrees of freedom: in either case the point
     # estimate cannot prove the cost stays within the cap, so certification
-    # must fail closed.
+    # must fail closed. A supplied but invalid standard error is not the same
+    # as no uncertainty estimate: it cannot certify anything either.
     verdict["cost_uncertainty_certified"] = (
-        None if cost_n is None else (cost_se is not None and enough_rounds))
+        False if invalid_se is not None
+        else None if cost_n is None
+        else (cost_se is not None and enough_rounds))
     component_limit = verdict["max_component_ratio"]
-    if verdict["cost_uncertainty_certified"] is False:
+    if invalid_se is not None:
+        verdict["component_failures"].append(
+            f"cost ratio standard error {invalid_se} is not a finite, "
+            f"non-negative measurement; cannot certify the {cost_name} cost")
+    elif verdict["cost_uncertainty_certified"] is False:
         if cost_se is not None:
             failure = (
                 f"cost ratio was measured in {cost_n} round(s); at least 2 "
@@ -290,12 +316,16 @@ def efficiency_verdict(
                 f"{name} is unmeasured; cannot certify it stays within {component_limit:.3f}x")
             continue
         ratio = float(ratio)
-        acceptable = ratio <= component_limit
+        valid = math.isfinite(ratio) and ratio >= 0.0
+        acceptable = valid and ratio <= component_limit
         verdict["component_costs"][str(name)] = {
             "ratio": ratio,
             "acceptable": bool(acceptable),
         }
-        if not acceptable:
+        if not valid:
+            verdict["component_failures"].append(
+                f"{name} ratio {ratio!r} is not a finite non-negative measurement")
+        elif not acceptable:
             verdict["component_failures"].append(
                 f"{name} ratio {ratio:.3f}x exceeds {component_limit:.3f}x")
     verdict["gain_meaningful"] = gain >= float(min_loss_gain)
