@@ -195,7 +195,10 @@ def efficiency_verdict(
     interval's *upper* bound to stay within `max_cost_ratio`, not merely the
     point estimate: a noisy benchmark whose ratio could be either 1.01x or
     1.30x has not shown the cost is acceptable. Without a standard error the
-    old point-estimate rule is unchanged.
+    old point-estimate rule applies when no round count is supplied; if
+    `cost_ratio_n` is supplied (a stochastic benchmark) but the stderr is
+    missing, certification fails closed because a single timing has no
+    resolution of its own.
 
     `statistically_significant=None` means the significance gate was **not
     established** (no comparison row, or no significance test was run), not
@@ -224,6 +227,7 @@ def efficiency_verdict(
         "cost_ratio_stderr": None,
         "cost_ratio_n": None,
         "cost_ratio_ci_95": None,
+        "cost_uncertainty_certified": None,
         "cost_confidently_acceptable": None,
         "cost_acceptable": None,
         "viable": None,
@@ -252,7 +256,18 @@ def efficiency_verdict(
         verdict["cost_ratio_stderr"] = cost_se
         verdict["cost_ratio_n"] = None if cost_ratio_n is None else int(cost_ratio_n)
         verdict["cost_ratio_ci_95_df"] = df
+    # A round count without a standard error means the caller tried to
+    # benchmark a stochastic cost but did not produce >= 2 paired rounds.
+    # A single timing has no resolution of its own: the point estimate cannot
+    # prove the cost stays within the cap, so certification must fail closed.
+    verdict["cost_uncertainty_certified"] = (
+        None if cost_ratio_n is None else cost_se is not None)
     component_limit = verdict["max_component_ratio"]
+    if verdict["cost_uncertainty_certified"] is False:
+        verdict["component_failures"].append(
+            f"cost ratio has no uncertainty estimate from {int(cost_ratio_n)} "
+            f"round(s); at least 2 paired rounds are needed to certify the "
+            f"{cost_name} cost")
     for name, ratio in (cost_components or {}).items():
         if ratio is None:
             verdict["component_costs"][str(name)] = {
