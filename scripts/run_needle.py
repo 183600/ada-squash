@@ -33,8 +33,15 @@ MIN_SHARED_PLACEMENT_SEEDS = 3
 # `no_layerscale`, ...) are deliberately absent: they *are* the treatment.
 # Training seeds are absent too: independent seeds are the replication unit of
 # the training-run variance this comparison does not cover.
+# Shape overrides are optional: the trainer only records them when the
+# corresponding ADASQUASH_*_OVERRIDE env var was set, so two normal
+# checkpoints both lack all three. Absence from both therefore means "no
+# override", not "unknown".
+OPTIONAL_PROTOCOL_KEYS = (
+    '_depth_override', '_dim_override', '_heads_override',
+)
 TRAINING_PROTOCOL_KEYS = (
-    'model', '_depth_override', '_dim_override', '_heads_override',
+    'model', *OPTIONAL_PROTOCOL_KEYS,
     'dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tokenizer_revision',
     'val_frac', 'test_frac', 'num_documents', 'min_doc_chars', 'max_doc_chars',
     'dedup', 'group_key', 'exclude_hash_file', 'exclude_test_hash_file',
@@ -62,8 +69,11 @@ def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dic
     for key in TRAINING_PROTOCOL_KEYS:
         # A field absent from *both* checkpoints is unknown, not equal: an old
         # or incomplete checkpoint must not certify as protocol-compatible.
+        # Optional fields are the exception: both absent means neither run
+        # used an override, while present-vs-absent is still a real mismatch.
         if key not in candidate_args and key not in reference_args:
-            mismatches[key] = {'candidate': missing, 'reference': missing}
+            if key not in OPTIONAL_PROTOCOL_KEYS:
+                mismatches[key] = {'candidate': missing, 'reference': missing}
             continue
         candidate_value = candidate_args.get(key, missing)
         reference_value = reference_args.get(key, missing)
