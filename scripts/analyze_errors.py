@@ -219,10 +219,16 @@ def _prev_majority(prev_gold_counts, vocab):
 
 def _rare_ids(target_counts, rare_quantile):
     """Token ids in the bottom `rare_quantile` of the observed target frequencies."""
+    if rare_quantile <= 0:
+        # Zero explicitly disables the long-tail bucket; the quantile at 0 is
+        # the minimum observed count and would otherwise still flag tokens.
+        return set(), None
     positive_counts = [int(c) for c in target_counts.tolist() if c > 0]
+    if not positive_counts:
+        return set(), None
     rare_threshold = _quantile(positive_counts, rare_quantile)
     return {i for i, c in enumerate(target_counts.tolist())
-            if 0 < c <= (rare_threshold or 0)}, rare_threshold
+            if 0 < c <= rare_threshold}, rare_threshold
 
 
 def _error_flags(rec, prev_gold, prev_majority, rare_ids, vocab, confidence):
