@@ -173,11 +173,14 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     # batching (which only groups independent trials) changes no placement.
     contexts: list = []
     for _ in range(n_trials):
-        body_len = context_len - len(needle_ids) - len(question_ids) - 2
+        body_len = context_len - len(needle_ids) - len(question_ids)
         if body_len < len(prompt_ids):
             raise ValueError(f'context_len={context_len} is too short to hold the needle ({len(needle_ids)} tok) + question ({len(question_ids)} tok) + one haystack repeat ({len(prompt_ids)} tok)')
-        n_repeats = body_len // len(prompt_ids)
-        body = prompt_ids * n_repeats
+        n_repeats, remainder = divmod(body_len, len(prompt_ids))
+        # Fill the final partial repeat too: flooring alone left the context
+        # up to one prompt shorter than the requested length, so trials were
+        # silently scored at different (and smaller) than reported contexts.
+        body = prompt_ids * n_repeats + prompt_ids[:remainder]
         pos = rng.randint(0, max(1, len(body) - 1))
         full = body[:pos] + needle_ids + body[pos:] + question_ids
         contexts.append((pos, full))
@@ -330,7 +333,15 @@ def main():
         results['tasks_ran'] = None
     if args.needle_test:
         from transformers import AutoTokenizer
-        tok_name, recorded_revision = _checkpoint_tokenizer(model_args, args.tokenizer or 'gpt2')
+        if args.tokenizer is not None:
+            # An explicit tokenizer is the user's choice, not a hint: the
+            # checkpoint may have been trained with a different vocabulary and
+            # silently overriding the flag evaluates a different model.
+            tok_name = args.tokenizer
+            recorded_revision = (model_args.get('tokenizer_revision')
+                                 if model_args.get('tokenizer') == args.tokenizer else None)
+        else:
+            tok_name, recorded_revision = _checkpoint_tokenizer(model_args, 'gpt2')
         tok_revision = (args.tokenizer_revision if args.tokenizer_revision is not None
                         else recorded_revision)
         tok = AutoTokenizer.from_pretrained(tok_name, revision=tok_revision)
@@ -378,7 +389,9 @@ def main():
     results['hyperparameters'] = vars(args)
     results['run_metadata'] = collect_run_metadata(seed=args.seed)
     out = args.output or Path(args.ckpt).parent / 'eval_results.json'
-    Path(out).write_text(json.dumps(results, indent=2, default=str))
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(results, indent=2, default=str))
     # The manifest mirrors what the run needs to be auditable: which checkpoint
     # (hashed), with which args, and what came out. Task scores live in the
     # results file, which is fingerprinted here rather than duplicated.
