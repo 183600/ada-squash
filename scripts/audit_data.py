@@ -65,6 +65,16 @@ from scripts.data_pipeline import (DocumentCleaner, canonical_document_hash, doc
 def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
+    # The pipeline checks the cross-split group/document ledgers *before* the
+    # within-split duplicate set, because a ledger drop must not make the next
+    # copy of the same document look unique.  Replaying that order needs its
+    # own cleaner: `cleaner` above reports the pre-ledger view (so overlaps
+    # with earlier splits stay visible), while `effective_cleaner` is the split
+    # the training run actually consumes.
+    effective_cleaner = DocumentCleaner(
+        dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars,
+        exclude_hashes=exclude_hashes, group_key=group_key,
+        exclude_group_hashes=exclude_group_hashes)
     # One machine-word int per document.
     lengths = array('q')
     # Token ids are counted per document with `np.bincount`; a per-document
@@ -88,8 +98,6 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     group_overlap_extra_groups: set = set()
     group_value_missing = 0
     tokenizer_errors = 0
-    ledger_dropped = 0
-    effective_documents = 0
     vocab_size = int(getattr(tokenizer, 'vocab_size', 0) or 0)
 
     def _add_ids(ids, which='raw') -> None:
@@ -117,31 +125,26 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         counts[:bc.shape[0]] += bc
         count_bufs[which] = counts
 
-    def _flush_tokens() -> None:
+    def _flush_tokens(batch: list, which: str) -> None:
         nonlocal tokenizer_errors
-        if not text_batch:
+        if not batch:
             return
         try:
-            enc = tokenizer(text_batch, add_special_tokens=False)['input_ids']
+            enc = tokenizer(batch, add_special_tokens=False)['input_ids']
         except Exception:
             enc = None
         if enc is None:
-            for t, effective in zip(text_batch, text_batch_effective):
+            for t in batch:
                 try:
                     ids = tokenizer(t, add_special_tokens=False)['input_ids']
                 except Exception:
                     tokenizer_errors += 1
                     continue
-                _add_ids(ids, 'raw')
-                if effective:
-                    _add_ids(ids, 'effective')
+                _add_ids(ids, which)
         else:
-            for ids, effective in zip(enc, text_batch_effective):
-                _add_ids(ids, 'raw')
-                if effective:
-                    _add_ids(ids, 'effective')
-        text_batch.clear()
-        text_batch_effective.clear()
+            for ids in enc:
+                _add_ids(ids, which)
+        batch.clear()
 
     capped = False
     documents_read = 0
@@ -153,54 +156,54 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             capped = True
             break
         documents_read += 1
+        # Call both cleaners for every example.  The raw cleaner may drop a
+        # duplicate that the effective cleaner keeps (the first copy was
+        # excluded by a ledger), so its verdict, or the effective verdict,
+        # cannot be derived from the other one.
         text = cleaner(example)
-        if text is None:
-            # Count tokenizer failures too by trying only kept-looking docs is
-            # impossible here; the cleaner's own counters cover the rest.
-            continue
-        lengths.append(len(text))
-        h = document_hash(text)
-        ch = canonical_document_hash(text)
-        if collect_hashes:
-            # Both digests, so a held-out formatting variant of a training
-            # document is caught by the ledger the same way the cleaner
-            # catches it (and the hash itself is still found either way).
-            hashes.add(h)
-            hashes.add(ch)
-        # The ledger holds exact *and* canonical digests; checking only the
-        # exact one would undercount formatting-variant duplicates that the
-        # cleaner (and therefore the actual held-out split) does drop.
-        dropped_by_ledger = bool(
-            exclude_hashes and (h in exclude_hashes or ch in exclude_hashes))
-        if known_hashes is not None and (h in known_hashes or ch in known_hashes):
-            overlap += 1
-        if known_hashes_extra is not None and (h in known_hashes_extra or ch in known_hashes_extra):
-            overlap_extra += 1
-        if group_key:
-            value = extract_group_value(example, group_key)
-            if value is None:
-                group_value_missing += 1
-            else:
-                gh = group_hash(value)
-                if collect_groups:
-                    groups.add(gh)
-                if exclude_group_hashes and gh in exclude_group_hashes:
-                    dropped_by_ledger = True
-                if known_groups is not None and gh in known_groups:
-                    group_overlap += 1
-                    group_overlap_groups.add(gh)
-                if known_groups_extra is not None and gh in known_groups_extra:
-                    group_overlap_extra += 1
-                    group_overlap_extra_groups.add(gh)
-        if dropped_by_ledger:
-            ledger_dropped += 1
-        else:
-            effective_documents += 1
-        text_batch.append(text)
-        text_batch_effective.append(not dropped_by_ledger)
+        effective_text = effective_cleaner(example)
+        if text is not None:
+            lengths.append(len(text))
+            h = document_hash(text)
+            ch = canonical_document_hash(text)
+            # The ledger holds exact *and* canonical digests; checking only
+            # the exact one would undercount formatting-variant duplicates
+            # that the cleaner (and therefore the actual split) does drop.
+            if known_hashes is not None and (h in known_hashes or ch in known_hashes):
+                overlap += 1
+            if known_hashes_extra is not None and (h in known_hashes_extra or ch in known_hashes_extra):
+                overlap_extra += 1
+            if group_key:
+                value = extract_group_value(example, group_key)
+                if value is None:
+                    group_value_missing += 1
+                else:
+                    gh = group_hash(value)
+                    if known_groups is not None and gh in known_groups:
+                        group_overlap += 1
+                        group_overlap_groups.add(gh)
+                    if known_groups_extra is not None and gh in known_groups_extra:
+                        group_overlap_extra += 1
+                        group_overlap_extra_groups.add(gh)
+            text_batch.append(text)
+        if effective_text is not None:
+            if collect_hashes:
+                # Both digests, so a held-out formatting variant of a training
+                # document is caught by the ledger the same way the cleaner
+                # catches it (and the hash itself is still found either way).
+                hashes.add(document_hash(effective_text))
+                hashes.add(canonical_document_hash(effective_text))
+            if collect_groups and group_key:
+                value = extract_group_value(example, group_key)
+                if value is not None:
+                    groups.add(group_hash(value))
+            text_batch_effective.append(effective_text)
         if len(text_batch) >= 256:
-            _flush_tokens()
-    _flush_tokens()
+            _flush_tokens(text_batch, 'raw')
+        if len(text_batch_effective) >= 256:
+            _flush_tokens(text_batch_effective, 'effective')
+    _flush_tokens(text_batch, 'raw')
+    _flush_tokens(text_batch_effective, 'effective')
     if count_bufs['raw'] is not None:
         tokens = Counter({int(t): int(c) for t, c in enumerate(count_bufs['raw']) if c})
     else:
@@ -215,18 +218,24 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stats = cleaner.report()
     # Count every document read from the stream, including dropped ones.
     stats['documents_sampled'] = int(stats.get('documents_read', len(lengths)))
+    if effective_cleaner.report().get('dedup_cap_reached'):
+        # The effective split is the one whose dedup guarantee matters.
+        stats['dedup_cap_reached'] = 1
     # Whether the counters cover the whole split or only a prefix. A stream
     # that ends naturally before --n-docs is fully read even though n_docs is
     # nonzero, so the cap is tracked by whether the loop actually broke. With
     # a truncated sample, `duplicate_overlap_with_train = 0` is a lower bound
     # on the true overlap, not evidence that the splits are disjoint.
     stats['exhaustive'] = not capped
-    stats['ledger_documents_dropped'] = (ledger_dropped
-                                         if exclude_hashes is not None or exclude_group_hashes is not None
-                                         else None)
-    stats['effective_documents_kept'] = (effective_documents
-                                         if exclude_hashes is not None or exclude_group_hashes is not None
-                                         else stats.get('documents_kept', len(lengths)))
+    effective_stats = effective_cleaner.report()
+    if exclude_hashes is not None or exclude_group_hashes is not None:
+        stats['ledger_documents_dropped'] = (
+            int(effective_stats.get('dropped_cross_split_duplicate', 0))
+            + int(effective_stats.get('dropped_cross_split_group', 0)))
+        stats['effective_documents_kept'] = int(effective_stats.get('documents_kept', 0))
+    else:
+        stats['ledger_documents_dropped'] = None
+        stats['effective_documents_kept'] = stats.get('documents_kept', len(lengths))
     stats['duplicate_overlap_with_train'] = overlap if known_hashes is not None else None
     stats['duplicate_overlap_with_validation'] = overlap_extra if known_hashes_extra is not None else None
     stats['duplicate_overlap_is_lower_bound'] = bool(capped) if (known_hashes is not None or known_hashes_extra is not None) else None
