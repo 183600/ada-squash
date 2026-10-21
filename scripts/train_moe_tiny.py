@@ -16,7 +16,8 @@ import torch.nn.functional as F
 from adasquash import build_norm, markov_batch
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.attention import CausalSelfAttention, clear_logit_scratch_cache
-from adasquash.metrics import mean_std_stderr
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
+                               mean_std_stderr, paired_t_one_sided, student_t_ppf)
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, clear_cast_weight_cache, _LayerScaleResidual
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
@@ -664,6 +665,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             'final_loss': history[-1]['loss'] if history else None,
             'final_expert_cv': (float(history[-1]['expert_cv_t'][-1])
                                 if history and history[-1]['expert_cv_t'].numel() else None),
+            'n_params': count_parameters(model),
             'val_loss': val_loss,
             'val_ce': val_ce,
             'val_ce_stderr': val_ce_stderr,
@@ -783,6 +785,16 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
                                         if mem_stats and mem_stats['n'] >= 2 else None)
     agg['cost_basis'] = ('tokens_per_second / peak_device_memory_mb are measured '
                          'this run; memory is null on CPU')
+    param_counts = [int(r['n_params']) for r in results
+                    if isinstance(r.get('n_params'), int)
+                    and not isinstance(r.get('n_params'), bool)]
+    if param_counts and len(set(param_counts)) == 1:
+        agg['n_params'] = param_counts[0]
+    else:
+        # A parameter count that moved across seeds means the recipe did not
+        # hold; report it as unknown rather than as a property of the cell.
+        agg['n_params'] = None
+    agg['n_params_consistent'] = bool(param_counts) and len(set(param_counts)) == 1
     # A readable manifest can still report NaN/Inf (a diverged validation
     # pass); it is not a usable replication and is listed rather than silently
     # pooled into the mean.
@@ -835,9 +847,300 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
                           'values are excluded and listed in invalid_seeds.')
     return agg
 
+_NORM_CHOICES = ['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd']
+# Everything that changes the trained weights, the held-out sample or the
+# evaluation count. A cross-norm comparison must hold all of these fixed, or
+# the norm contrast is confounded with a recipe change.
+_MOE_PROTOCOL_KEYS = (
+    'probe', 'dataset', 'dataset_config', 'dataset_revision', 'tokenizer',
+    'tokenizer_revision', 'n_experts', 'dim', 'n_layers', 'n_heads',
+    'seq_len', 'batch_size', 'max_steps', 'lr', 'val_frac', 'test_frac',
+    'num_documents', 'min_doc_chars', 'max_doc_chars', 'dedup',
+    'exclude_hash_file', 'exclude_test_hash_file', 'group_key',
+    'exclude_group_file', 'exclude_test_group_file', 'train_shuffle_buffer',
+    'val_batches', 'sanity_check',
+)
+_MOE_COMPARISON_METRICS = ('val_ce', 'final_expert_cv')
+
+def moe_protocol_signature(args) -> dict:
+    """The comparison-relevant slice of the resolved MoE recipe."""
+    return {key: getattr(args, key, None) for key in _MOE_PROTOCOL_KEYS}
+
+def _moe_finite(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)))
+
+def _moe_seed_metric(cell: dict, metric: str) -> dict:
+    values = {}
+    for record in cell.get('per_seed', []):
+        seed = record.get('seed')
+        value = record.get(metric)
+        if (isinstance(seed, int) and not isinstance(seed, bool)
+                and _moe_finite(value)):
+            values[int(seed)] = float(value)
+    return values
+
+def _moe_cell_replicated(cell: dict) -> bool:
+    """True when every requested seed produced a clean record for this cell.
+
+    `aggregate_moe_seed_results` additionally folds in pinned-data provenance;
+    that verdict stays visible in the cell summary but a synthetic run has no
+    external snapshot to pin, so the cross-norm comparison applies this
+    seed-level check plus the explicit data guard below.
+    """
+    seeds = [int(s) for s in cell.get('seeds') or []]
+    records = cell.get('per_seed') or []
+    return bool(
+        seeds and len(records) == len(seeds)
+        and not cell.get('missing_seeds') and not cell.get('unexpected_seeds')
+        and not cell.get('duplicate_seeds') and not cell.get('invalid_seeds')
+        and not cell.get('seeds_without_val_ce'))
+
+def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
+    """Cross-cell data-snapshot guard for a MoE norm comparison."""
+    synthetic = True
+    keys = set()
+    unknown = []
+    for norm, cell in cells.items():
+        for seed, provenance in (cell.get('data_provenance_by_seed') or {}).items():
+            dataset = (provenance or {}).get('dataset')
+            if not dataset:
+                continue
+            synthetic = False
+            versions = {
+                'dataset_revision_resolved': (provenance or {}).get('dataset_revision_resolved'),
+                'tokenizer_revision_resolved': (provenance or {}).get('tokenizer_revision_resolved'),
+            }
+            if not all(_is_pinned_revision(value) for value in versions.values()):
+                unknown.append((norm, seed))
+                continue
+            keys.add(json.dumps(versions, sort_keys=True))
+    if unknown:
+        return False, (f'cells {unknown} trained on an unpinned dataset/tokenizer revision, '
+                       'so the norm contrast is not tied to one snapshot')
+    if synthetic:
+        return True, ('synthetic corpus generated deterministically from seed '
+                      '(+1 for validation); no external snapshot to pin')
+    if len(keys) > 1:
+        return False, 'the compared cells resolved different dataset/tokenizer revisions'
+    return True, 'all compared cells resolved the same pinned dataset/tokenizer revisions'
+
+def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMPARISON_METRICS,
+                      alpha: float = 0.05, margin: float = 0.0, power: float = 0.8) -> dict:
+    """Paired cross-norm comparison for the MoE study.
+
+    `cells` maps a norm name to its `aggregate_moe_seed_results` dict. Each
+    non-reference norm is paired with the best replicated baseline on the
+    common seeds, tested one-sided with the paired Student-t (the same test
+    the dense ablation uses), Holm-corrected across the whole metric family,
+    and annotated with the minimum detectable effect. A cell is only counted
+    in the family when it is seed-complete, carries the same resolved recipe
+    as the reference, and rests on the same data snapshot; everything else is
+    reported descriptively so it cannot be read as a certified win.
+    """
+    metrics = tuple(metrics)
+    out = {
+        'available': False,
+        'reference': None,
+        'reference_baselines': [b for b in baselines if b in cells],
+        'norms': list(cells),
+        'metrics': list(metrics),
+        'alpha': alpha,
+        'margin': margin,
+        'power_target': power,
+        'data_versions_consistent': None,
+        'data_version_basis': None,
+        'reference_selection': None,
+        'rows': [],
+        'multiple_comparison': None,
+    }
+    replicated_baselines = [
+        name for name in out['reference_baselines']
+        if _moe_cell_replicated(cells[name])
+        and any(_moe_finite(cells[name].get(metric)) for metric in metrics)]
+    if not replicated_baselines:
+        out['reason'] = ('no replicated baseline cell among '
+                         f"{out['reference_baselines'] or 'the requested baselines'}")
+        return out
+    reference = min((name for name in replicated_baselines),
+                    key=lambda name: (cells[name].get('val_ce')
+                                      if _moe_finite(cells[name].get('val_ce'))
+                                      else float('inf')))
+    out['available'] = True
+    out['reference'] = reference
+    out['reference_selection'] = (
+        f'lowest mean val_ce among replicated baselines {replicated_baselines}; '
+        'the strongest baseline is the reference so a win is not against a straw man')
+    data_ok, data_basis = _moe_data_version_guard(cells)
+    out['data_versions_consistent'] = data_ok
+    out['data_version_basis'] = data_basis
+    reference_cell = cells[reference]
+
+    for metric in metrics:
+        reference_by_seed = _moe_seed_metric(reference_cell, metric)
+        for norm, cell in cells.items():
+            if norm == reference:
+                continue
+            candidate_by_seed = _moe_seed_metric(cell, metric)
+            common = sorted(set(candidate_by_seed) & set(reference_by_seed))
+            cand_values = [candidate_by_seed[seed] for seed in common]
+            ref_values = [reference_by_seed[seed] for seed in common]
+            mismatches = {
+                key: {'reference': protocols.get(reference, {}).get(key),
+                      'candidate': protocols.get(norm, {}).get(key)}
+                for key in _MOE_PROTOCOL_KEYS
+                if protocols.get(reference, {}).get(key) != protocols.get(norm, {}).get(key)}
+            entry = {
+                'name': f'{norm} vs {reference}',
+                'norm': norm,
+                'reference': reference,
+                'metric': metric,
+                'direction': 'lower_is_better',
+                'val_ce': cell.get('val_ce'),
+                'val_ce_std': cell.get('val_ce_std'),
+                'metric_mean': (sum(cand_values) / len(cand_values)) if cand_values else None,
+                'reference_metric_mean': (sum(ref_values) / len(ref_values)) if ref_values else None,
+                'final_expert_cv': cell.get('final_expert_cv'),
+                'reference_final_expert_cv': reference_cell.get('final_expert_cv'),
+                'n_params': cell.get('n_params'),
+                'n_params_ratio_vs_reference': None,
+                'paired_seeds': common,
+                'protocol_mismatches': mismatches or None,
+                'data_versions_consistent': data_ok,
+                'hypothesis': cell.get('hypothesis'),
+                'curve_classification_counts': cell.get('curve_classification_counts'),
+                'beats_reference': False,
+                'beats_reference_significantly': False,
+                'test': None,
+                'test_basis': None,
+                'significance_basis': None,
+                'excluded_from_family': None,
+                'p_one_sided': None,
+                'p_one_sided_holm': None,
+                't': None,
+                'df': None,
+                'delta_ci_95': None,
+                'n_seeds_favoring': None,
+                'n_seeds_tied': None,
+                'n_seeds_against': None,
+                'per_seed_delta': None,
+                'paired_delta_std': None,
+                'minimum_detectable_delta_95_power80': None,
+            }
+            cand_params = cell.get('n_params')
+            ref_params = reference_cell.get('n_params')
+            if _moe_finite(cand_params) and _moe_finite(ref_params) and ref_params:
+                entry['n_params_ratio_vs_reference'] = cand_params / ref_params
+            if len(common) >= 2:
+                test = paired_t_one_sided(cand_values, ref_values, margin=margin, alpha=alpha)
+                entry['test'] = test['test']
+                entry['p_one_sided'] = test['p_one_sided']
+                entry['t'] = test['t']
+                entry['df'] = test['df']
+                entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
+                deltas = [cand - ref for cand, ref in zip(cand_values, ref_values)]
+                stats = mean_std_stderr(deltas)
+                entry.update({
+                    'delta_vs_reference': (sum(deltas) / len(deltas)),
+                    'n_seeds_favoring': sum(v < 0.0 for v in deltas),
+                    'n_seeds_tied': sum(v == 0.0 for v in deltas),
+                    'n_seeds_against': sum(v > 0.0 for v in deltas),
+                    'per_seed_delta': {str(seed): value for seed, value in zip(common, deltas)},
+                    'paired_delta_std': None if stats is None else stats['std'],
+                })
+                if test.get('df') and isinstance(test.get('ci_low'), (int, float)):
+                    half = (test['ci_high'] - test['ci_low']) / 2.0
+                    critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
+                    if critical > 0.0:
+                        stderr = half / critical
+                        entry['minimum_detectable_delta_95_power80'] = (
+                            student_t_ppf(1.0 - alpha, float(test['df']))
+                            + student_t_ppf(power, float(test['df']))) * stderr
+                entry['beats_reference'] = bool(entry['delta_vs_reference'] < -margin)
+            entry['test_basis'] = ('per-seed paired t' if len(common) >= 2
+                                   else f'described only: {len(common)} shared seed(s)')
+            reasons = []
+            if mismatches:
+                reasons.append('recipe differs from the reference: '
+                               + ', '.join(sorted(mismatches)))
+            if not data_ok:
+                reasons.append('data snapshot differs/unknown')
+            if not _moe_cell_replicated(cell):
+                reasons.append('cell is not seed-complete and clean')
+            if not _moe_cell_replicated(reference_cell):
+                reasons.append('reference cell is not seed-complete and clean')
+            if len(common) < MIN_SEEDS_FOR_SIGNIFICANCE:
+                reasons.append(f'{len(common)} shared seed(s) < {MIN_SEEDS_FOR_SIGNIFICANCE}')
+            entry['excluded_from_family'] = '; '.join(reasons) or None
+            out['rows'].append(entry)
+
+    family = [entry for entry in out['rows']
+              if entry['test'] is not None and entry['excluded_from_family'] is None]
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['beats_reference_significantly'] = bool(
+            entry['beats_reference'] and p_holm is not None and p_holm < alpha)
+    out['certified_norms'] = sorted({entry['norm'] for entry in family
+                                     if entry['beats_reference_significantly']})
+    described = [entry['name'] for entry in out['rows']
+                 if entry['test'] is not None and entry['excluded_from_family'] is not None]
+    out['rows_tested_descriptively_only'] = described
+    out['multiple_comparison'] = (
+        f'Holm-Bonferroni over {len(family)} seed-replicated cell(s) x metric(s) against '
+        f'the same baseline ({reference}); a row is certified only when the adjusted p-value '
+        f'is < {alpha}. Tests on mismatched recipes, divergent data snapshots, incomplete cells '
+        'or fewer than 3 shared seeds are descriptive only and cannot be certified.')
+    return out
+
+def print_moe_norm_comparison(comparison: dict) -> None:
+    if not comparison.get('available'):
+        print(f"[moe][compare] not available: {comparison.get('reason')}")
+        return
+    print(f"[moe][compare] reference={comparison['reference']} "
+          f"({comparison['reference_selection']}); data: {comparison['data_version_basis']}")
+    for entry in comparison['rows']:
+        delta = entry.get('delta_vs_reference')
+        delta_str = 'n/a' if delta is None else f'{delta:+.4f}'
+        ci = entry.get('delta_ci_95')
+        ci_str = '' if ci is None else f' ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]'
+        p = entry.get('p_one_sided')
+        p_holm = entry.get('p_one_sided_holm')
+        p_str = 'n/a' if p is None else f'{p:.3g}'
+        p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
+        mde = entry.get('minimum_detectable_delta_95_power80')
+        mde_str = '' if mde is None else f' mde80={mde:.4f}'
+        votes = ''
+        if entry.get('n_seeds_favoring') is not None:
+            n = len(entry.get('paired_seeds') or [])
+            votes = (f" seeds_favoring={entry['n_seeds_favoring']}/{n}"
+                     + (f" tied={entry['n_seeds_tied']}" if entry.get('n_seeds_tied') else ''))
+        note = ''
+        if entry.get('excluded_from_family'):
+            note = f" [{entry['excluded_from_family']}]"
+        ratio = entry.get('n_params_ratio_vs_reference')
+        ratio_str = '' if ratio is None else f' params_ratio={ratio:.4f}'
+        print(f"[moe][compare] {entry['norm']:>8s} {entry['metric']}: "
+              f"mean={entry.get('metric_mean')} vs ref={entry.get('reference_metric_mean')} "
+              f"delta={delta_str}{ci_str} p={p_str} p(holm)={p_holm_str}{mde_str}{votes}"
+              f"{ratio_str} beats={entry['beats_reference']} "
+              f"significant={entry['beats_reference_significantly']}{note}")
+    if comparison.get('rows_tested_descriptively_only'):
+        print('[moe][compare] descriptive only (not certified): '
+              + ', '.join(comparison['rows_tested_descriptively_only']))
+    if comparison.get('certified_norms'):
+        print(f"[moe][compare] certified norms: {comparison['certified_norms']}")
+    else:
+        print('[moe][compare] no norm certified as beating the reference at '
+              f"alpha={comparison['alpha']}")
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--norm', default='dytcd', choices=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
+    p.add_argument('--norm', default='dytcd', choices=_NORM_CHOICES)
+    p.add_argument('--norms', nargs='+', default=None, choices=_NORM_CHOICES, help='run several norms under one identical recipe and compare them against the best replicated baseline with a paired t-test, Holm correction and an MDE; requires --hypothesis')
+    p.add_argument('--baselines', nargs='+', default=['ln', 'rmsnorm'], choices=_NORM_CHOICES, help='norm variants treated as references in a --norms study; the strongest replicated one is used as the comparison baseline')
+    p.add_argument('--alpha', type=float, default=0.05, help='one-sided family-wise significance level for --norms comparisons')
+    p.add_argument('--margin', type=float, default=0.0, help='practical-equivalence margin: a norm must beat the baseline by more than this for beats_* to be true')
     p.add_argument('--n-experts', type=int, default=8)
     p.add_argument('--dim', type=int, default=512)
     p.add_argument('--n-layers', type=int, default=8)
@@ -893,21 +1196,41 @@ def main():
               f'(a repeated seed reruns the identical run, it is not an independent replication)')
     if len(seeds) < 3:
         print(f'[moe][warn] {len(seeds)} seed(s): expert load and held-out loss vary run to run; use >= 3 independent seeds before interpreting a difference')
-    multi = len(seeds) > 1
+    norms = list(dict.fromkeys(args.norms or [args.norm]))
+    if args.norms:
+        if args.norm not in norms:
+            print(f'[moe][warn] --norm {args.norm} is ignored by --norms {norms}')
+        if len(norms) < 2:
+            p.error('--norms needs at least two norm variants')
+        if not args.hypothesis:
+            p.error('--norms requires --hypothesis: a cross-norm claim must be '
+                    'registered before the runs so the tested family and direction are '
+                    'not chosen after seeing the results')
+    multi_norm = len(norms) > 1
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
-    results = []
-    for seed in seeds:
-        out_dir = base / f'seed{seed}' if multi else base
-        print(f'[moe] seed={seed} -> {out_dir}')
-        results.append(run_one(args, seed, out_dir))
-    if multi:
+    cells: dict = {}
+    for norm in norms:
+        cell_args = copy.copy(args)
+        cell_args.norm = norm
+        cell_base = base / norm if multi_norm else base
+        cell_base.mkdir(parents=True, exist_ok=True)
+        cell_multi = len(seeds) > 1
+        results = []
+        for seed in seeds:
+            out_dir = cell_base / f'seed{seed}' if cell_multi else cell_base
+            print(f'[moe] norm={norm} seed={seed} -> {out_dir}')
+            results.append(run_one(cell_args, seed, out_dir))
+        if not (cell_multi or multi_norm):
+            continue
         agg = aggregate_moe_seed_results(results, seeds)
-        summary_path = base / 'seeds_summary.json'
+        agg['hypothesis'] = args.hypothesis
+        agg['norm'] = norm
+        summary_path = cell_base / 'seeds_summary.json'
         with open(summary_path, 'w') as f:
             json.dump(agg, f, indent=2, default=str)
         manifest = collect_run_metadata(seed=seeds[0])
-        manifest['hyperparameters'] = vars(args)
+        manifest['hyperparameters'] = vars(cell_args)
         manifest['seeds'] = seeds
         if args.hypothesis:
             manifest['hypothesis'] = args.hypothesis
@@ -933,14 +1256,14 @@ def main():
             },
             artifacts={'seeds_summary': file_fingerprint(summary_path)},
         )
-        save_run_manifest(base / 'run_manifest.json', manifest)
+        save_run_manifest(cell_base / 'run_manifest.json', manifest)
         val = agg.get('val_ce')
         val_std = agg.get('val_ce_std')
         if val is not None:
             std_str = '' if val_std is None else f' +/- {val_std:.4f}'
             loss = agg.get('val_loss')
             loss_str = '' if loss is None else f' (combined incl. aux={loss:.4f})'
-            print(f"[moe][done] {args.norm}: val_ce={val:.4f}{std_str}{loss_str} "
+            print(f"[moe][done] {norm}: val_ce={val:.4f}{std_str}{loss_str} "
                   f"over {agg['n_seeds']} seeds -> {summary_path}")
         else:
             print(f'[moe][done] no usable val_ce across seeds -> {summary_path}')
@@ -958,6 +1281,49 @@ def main():
         if agg.get('invalid_seeds'):
             print(f"[moe][warn] seeds {agg['invalid_seeds']} produced NaN/Inf metrics; "
                   f"they are excluded from the pooled mean, not treated as clean replications")
+        cells[norm] = agg
+    if multi_norm:
+        protocols = {norm: moe_protocol_signature(args) for norm in norms}
+        comparison = compare_moe_norms(cells, args.baselines, protocols,
+                                       alpha=args.alpha, margin=args.margin)
+        comparison['hypothesis'] = args.hypothesis
+        comparison_path = base / 'norm_comparison.json'
+        with open(comparison_path, 'w') as f:
+            json.dump(comparison, f, indent=2, default=str)
+        study = collect_run_metadata(seed=seeds[0])
+        study['hyperparameters'] = vars(args)
+        study['seeds'] = seeds
+        study['norms'] = norms
+        study['hypothesis'] = args.hypothesis
+        study['protocol'] = protocols
+        study['cells'] = {
+            norm: {
+                'complete': cells[norm].get('complete'),
+                'val_ce': cells[norm].get('val_ce'),
+                'val_ce_std': cells[norm].get('val_ce_std'),
+                'final_expert_cv': cells[norm].get('final_expert_cv'),
+                'n_params': cells[norm].get('n_params'),
+                'seeds_summary': str(base / norm / 'seeds_summary.json'),
+            }
+            for norm in norms}
+        study = finish_metadata(
+            study,
+            results={
+                'n_norms': len(norms),
+                'n_seeds': len(seeds),
+                'reference': comparison.get('reference'),
+                'comparison_available': comparison.get('available'),
+                'certified_norms': comparison.get('certified_norms'),
+            },
+            artifacts={
+                'norm_comparison': file_fingerprint(comparison_path),
+                'cell_summaries': {
+                    norm: file_fingerprint(base / norm / 'seeds_summary.json')
+                    for norm in norms},
+            },
+        )
+        save_run_manifest(base / 'run_manifest.json', study)
+        print_moe_norm_comparison(comparison)
 
 def _expert_cv(tpe) -> float:
     if not isinstance(tpe, torch.Tensor) or tpe.numel() < 2:
