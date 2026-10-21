@@ -736,6 +736,25 @@ def classify_nan_stage(evidence: dict) -> dict:
                 "pipeline in scripts/data_pipeline.py",
             ],
         )
+    if evidence.get("parameters_finite") is False:
+        bad = evidence.get("nonfinite_parameters") or []
+        where = ", ".join(p["name"] for p in bad) or "unknown parameter"
+        return stage(
+            "gradients",
+            "the weights are already non-finite before this batch reaches the "
+            "model, so a previous optimizer update (or the loaded checkpoint) "
+            f"corrupted them; the current data/loss math did not create it. "
+            f"First bad parameter(s): {where}",
+            [
+                "restore the last finite ckpt_best.pt instead of resuming from "
+                "the corrupted step",
+                "inspect the pre-clip gradient norm and optimizer state around "
+                "the update that produced the non-finite weight (a finite loss "
+                "can still be followed by an overflow in the optimizer step)",
+                "lower the learning rate / strengthen warmup and keep the "
+                "optimizer step in fp32; do not keep training this state",
+            ],
+        )
     training_path_bad = (
         evidence.get("fp32_fused_loss_finite") is False
         or evidence.get("fused_forward_error")
@@ -870,6 +889,29 @@ def triage_nonfinite(
     # found, and running the model on it would only crash (or diagnose a
     # consequence of the data, not the cause).
     if not evidence["data_finite"]:
+        verdict = classify_nan_stage(evidence)
+        return {"evidence": evidence, **verdict}
+
+    # The data is valid, but the model may already be corrupted from an earlier
+    # optimizer step: a forward on non-finite weights would look like an
+    # fp32-math failure and send the reader after the batch instead of the
+    # update that actually produced the bad weights.
+    evidence["parameters_finite"] = None
+    try:
+        param_report = parameter_finite_report(model)
+        evidence.update(
+            parameters_finite=param_report["finite"],
+            n_nonfinite_parameters=param_report["n_nonfinite_parameters"],
+            nonfinite_parameters=param_report["nonfinite_parameters"],
+            n_nonfinite_buffers=param_report["n_nonfinite_buffers"],
+            nonfinite_buffers=param_report["nonfinite_buffers"],
+        )
+    except Exception as exc:  # diagnosis must never mask the original failure
+        evidence["parameter_report_error"] = repr(exc)
+    if evidence.get("parameters_finite") is False:
+        evidence["autocast_forward_finite"] = None
+        evidence["gradients_finite"] = None
+        evidence["stages_skipped"] = ["fp32_math", "mixed_precision", "gradients"]
         verdict = classify_nan_stage(evidence)
         return {"evidence": evidence, **verdict}
 
