@@ -1321,6 +1321,24 @@ def main():
         n_nonfinite_gradients = 0
         n_nonfinite_val_losses = 0
         nonfinite_streak = 0
+        if resume_ckpt is not None:
+            # These are counts over the whole run, like n_loss_spikes. A
+            # resumed manifest that starts them at zero would hide the earlier
+            # NaN/Inf events that are often the reason the run was resumed.
+            def _saved_count(name: str) -> int:
+                value = resume_ckpt.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return max(0, int(value))
+                return 0
+
+            n_nonfinite_losses = _saved_count('n_nonfinite_losses')
+            n_nonfinite_gradients = _saved_count('n_nonfinite_gradients')
+            n_nonfinite_val_losses = _saved_count('n_nonfinite_val_losses')
+            if (n_nonfinite_losses or n_nonfinite_gradients
+                    or n_nonfinite_val_losses):
+                print('[resume] restored non-finite event counts: '
+                      f'losses={n_nonfinite_losses}, gradients={n_nonfinite_gradients}, '
+                      f'validation={n_nonfinite_val_losses}')
 
         def _curve_checkpoint_fields() -> dict:
             return {
@@ -1336,6 +1354,9 @@ def main():
                 'last_val_stderr': last_val_stderr,
                 'last_val_batches': list(last_val_batches),
                 'val_batches_consumed': int(val_state.get('batches_consumed', 0)),
+                'n_nonfinite_losses': int(n_nonfinite_losses),
+                'n_nonfinite_gradients': int(n_nonfinite_gradients),
+                'n_nonfinite_val_losses': int(n_nonfinite_val_losses),
             }
 
         def _triage_nonfinite(kind: str, step: int, x_bad, y_bad, bad_value: float,
