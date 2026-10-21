@@ -346,7 +346,9 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     is untouched by `collect`, so the returned mean is bit-identical either
     way. `cycle` restarts a validation loader that has fewer batches than
     requested; the one-shot sealed-test pass disables it so the same batch is
-    never counted twice.
+    never counted twice. `state['batches_consumed']` counts every fetched
+    batch across passes, so a checkpoint can restore this cursor instead of
+    silently scoring an earlier held-out slice after a resume.
     """
     # With dropout at its default 0 the module-mode switch changes no
     # numerics, so skip it; inference_mode already blocks grads. `training`
@@ -379,6 +381,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
                     batch = next(it)
                 except StopIteration:
                     break
+            state['batches_consumed'] = int(state.get('batches_consumed', 0)) + 1
             x, y = batch
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -403,6 +406,43 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
         # so the returned mean and the collected series are unchanged.
         collect.extend(torch.stack(terms).cpu().tolist())
     return float(total) / n if n else None
+
+def _fast_forward_validation_stream(loader, state: dict) -> None:
+    """Restore a resumed run's validation cursor.
+
+    The pipeline exposes a forward-only iterator, so a checkpoint stores the
+    number of held-out batches already scored and this helper replays the
+    deterministic split up to that point. Without it the post-resume passes
+    read earlier documents than an uninterrupted run, which breaks paired
+    cross-arm comparisons even though the model weights are restored exactly.
+    """
+    count = int(state.get('resume_skip') or 0)
+    if count <= 0:
+        state['resume_skip'] = 0
+        return
+    print(f'[resume] fast-forwarding the validation stream past {count} already-scored batch(es)...', flush=True)
+    it = iter(loader)
+    skipped = 0
+    while skipped < count:
+        try:
+            next(it)
+            skipped += 1
+        except StopIteration:
+            it = iter(loader)
+            try:
+                next(it)
+                skipped += 1
+            except StopIteration:
+                print('[resume][warn] validation split produced no batches while restoring the cursor; '
+                      'the next validation pass will fail rather than score an empty slice', flush=True)
+                state['iter'] = None
+                state['resume_skip'] = 0
+                return
+    state['iter'] = it
+    state['resume_skip'] = 0
+    print('[resume] validation stream position restored: the next pass continues at the '
+          'same held-out batch an uninterrupted run would have scored', flush=True)
+
 
 def load_model_state_dict(model, state_dict) -> None:
     target = getattr(model, '_orig_mod', model)
@@ -985,7 +1025,7 @@ def main():
             args.tokenizer_revision = resolved_tokenizer
         print(f'[data] train split: {report}')
     val_loader = None
-    val_state: dict = {'iter': None}
+    val_state: dict = {'iter': None, 'batches_consumed': 0, 'resume_skip': 0}
     best_val_loss = float('inf')
     best_val_step = 0
     val_checks_without_improvement = 0
@@ -1048,6 +1088,40 @@ def main():
                     print(f'  [skip] {i + 1}/{saved_position} batches ({time.time() - t_skip:.0f}s)', flush=True)
             batches_consumed = int(saved_position)
             print(f'[resume] data position restored: the next batch is #{int(saved_position) + 1} in the stream')
+        # The validation loader is a second forward-only stream. If it
+        # restarted at batch 0 after a resume, the next validation pass would
+        # read a different held-out slice than an uninterrupted run, so
+        # best-checkpoint selection and cross-arm final losses would silently
+        # stop being paired. Restore the consumed-batch count and fast-forward
+        # the next validation loader past it (the split is deterministic).
+        saved_val_position = resume_ckpt.get('val_batches_consumed')
+        if saved_val_position is not None:
+            val_state['batches_consumed'] = max(0, int(saved_val_position))
+            val_state['resume_skip'] = max(0, int(saved_val_position))
+            print(f'[resume] validation stream position: {val_state["batches_consumed"]} '
+                  f'batch(es) already scored; the next pass continues from there')
+        elif args.val_every > 0:
+            print('[resume] checkpoint predates validation-position tracking: the '
+                  'validation stream restarts at batch 0, so this run evaluates '
+                  'different held-out slices than an uninterrupted run')
+        saved_last_val = resume_ckpt.get('last_val_loss')
+        if (isinstance(saved_last_val, (int, float))
+                and not isinstance(saved_last_val, bool)
+                and math.isfinite(float(saved_last_val))):
+            last_val_loss = float(saved_last_val)
+            last_val_step = (None if resume_ckpt.get('last_val_step') is None
+                             else int(resume_ckpt['last_val_step']))
+            saved_stderr = resume_ckpt.get('last_val_stderr')
+            last_val_stderr = (float(saved_stderr)
+                               if isinstance(saved_stderr, (int, float))
+                               and not isinstance(saved_stderr, bool)
+                               and math.isfinite(float(saved_stderr)) else None)
+            saved_batches = resume_ckpt.get('last_val_batches')
+            if isinstance(saved_batches, list):
+                last_val_batches = [float(v) for v in saved_batches
+                                    if isinstance(v, (int, float))
+                                    and not isinstance(v, bool)
+                                    and math.isfinite(float(v))]
         # The best-validation tracker is run state like the step counter and
         # the loss-spike baseline: restarting it at `inf` would let the first
         # post-resume validation unconditionally overwrite a possibly better
@@ -1175,10 +1249,68 @@ def main():
         curve_steps: list = []
         diagnosis_history: list = []
         last_diagnosis = None
+        if resume_ckpt is not None:
+            # Curve history is run state, not a cosmetic log: without it the
+            # post-resume diagnosis only sees the tail and can label a run
+            # "healthy" just because the earlier divergence scrolled off. Only
+            # accept internally consistent, finite points; a malformed or
+            # pre-monitoring checkpoint must not poison the new curve.
+            def _finite_point(value) -> bool:
+                return (isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value)))
+
+            saved_train = resume_ckpt.get('curve_train')
+            saved_val = resume_ckpt.get('curve_val')
+            saved_stderr = resume_ckpt.get('curve_val_stderr')
+            saved_steps = resume_ckpt.get('curve_steps')
+            lengths = [len(v) for v in (saved_train, saved_val, saved_stderr, saved_steps)
+                       if isinstance(v, list)]
+            valid_curves = (
+                len(lengths) == 4 and lengths[0] > 0 and len(set(lengths)) == 1
+                and all(_finite_point(v) for v in saved_train)
+                and all(_finite_point(v) for v in saved_val)
+                and all(v is None or _finite_point(v) for v in saved_stderr)
+                and all(_finite_point(v) for v in saved_steps))
+            if valid_curves:
+                curve_train.extend(float(v) for v in saved_train)
+                curve_val.extend(float(v) for v in saved_val)
+                curve_val_stderr.extend(None if v is None else float(v) for v in saved_stderr)
+                curve_steps.extend(int(v) for v in saved_steps)
+                print(f'[resume] restored {len(curve_train)} held-out curve point(s) '
+                      f'(last step {curve_steps[-1]}) so the diagnosis reads the full run')
+            saved_window = resume_ckpt.get('train_window')
+            if (isinstance(saved_window, list)
+                    and all(_finite_point(v) for v in saved_window)):
+                train_window.extend(float(v) for v in saved_window)
+                print(f'[resume] restored {len(train_window)} training-loss window '
+                      f'value(s); the next curve point covers the whole validation interval')
+            saved_history = resume_ckpt.get('curve_diagnosis_history')
+            if isinstance(saved_history, list):
+                diagnosis_history.extend(d for d in saved_history if isinstance(d, dict))
+            saved_diagnosis = resume_ckpt.get('curve_diagnosis')
+            if isinstance(saved_diagnosis, dict):
+                last_diagnosis = saved_diagnosis
         n_nonfinite_losses = 0
         n_nonfinite_gradients = 0
         n_nonfinite_val_losses = 0
         nonfinite_streak = 0
+
+        def _curve_checkpoint_fields() -> dict:
+            return {
+                'train_window': list(train_window),
+                'curve_train': list(curve_train),
+                'curve_val': list(curve_val),
+                'curve_val_stderr': list(curve_val_stderr),
+                'curve_steps': list(curve_steps),
+                'curve_diagnosis': last_diagnosis,
+                'curve_diagnosis_history': list(diagnosis_history),
+                'last_val_loss': last_val_loss,
+                'last_val_step': last_val_step,
+                'last_val_stderr': last_val_stderr,
+                'last_val_batches': list(last_val_batches),
+                'val_batches_consumed': int(val_state.get('batches_consumed', 0)),
+            }
 
         def _triage_nonfinite(kind: str, step: int, x_bad, y_bad, bad_value: float,
                               extra: dict | None = None, eval_mode: bool = False) -> dict:
@@ -1348,6 +1480,8 @@ def main():
                     if rval:
                         data_reports['validation'] = rval
                         print(f'[data] validation split: {rval}')
+                if val_state.get('resume_skip'):
+                    _fast_forward_validation_stream(val_loader, val_state)
                 val_batch_losses: list = []
                 val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device, collect=val_batch_losses)
                 if val_loss is None:
@@ -1401,12 +1535,6 @@ def main():
                         tb.add_scalar('val/loss', val_loss, step)
                         if val_stderr is not None:
                             tb.add_scalar('val/stderr', val_stderr, step)
-                    if improved:
-                        ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
-                        path = Path(args.output_dir) / 'ckpt_best.pt'
-                        _assert_checkpoint_finite(model, opt, path, step)
-                        _atomic_torch_save(ckpt_best, path)
-                        print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
                     # Curve diagnosis: pair the held-out point with the mean
                     # training loss over the interval it covers, then classify the
                     # regime (overfit / underfit / diverging / healthy) and print
@@ -1436,6 +1564,17 @@ def main():
                         'gap_change_within_noise': last_diagnosis['evidence'].get('gap_change_within_noise'),
                         'recommendations': last_diagnosis['recommendations'],
                     })
+                    # Save after the curve update, not before it: a checkpoint
+                    # must contain the validation point it was selected on and
+                    # a cleared train window. Saving before `train_window = []`
+                    # would make a resume replay the previous interval's losses
+                    # into the next curve point (double counting).
+                    if improved:
+                        ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance, **_curve_checkpoint_fields()}
+                        path = Path(args.output_dir) / 'ckpt_best.pt'
+                        _assert_checkpoint_finite(model, opt, path, step)
+                        _atomic_torch_save(ckpt_best, path)
+                        print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
                     print(f"[curve] step={step} train_window={train_point:.4f} val={val_loss:.4f}{noise_str} "
                           f"-> {last_diagnosis['classification']} "
                           f"(train {last_diagnosis['train_trend']}, val {last_diagnosis['val_trend']})", flush=True)
@@ -1483,7 +1622,7 @@ def main():
                     for k, v in s.items():
                         tb.add_scalar(f'stats/{k}', v, step)
             if step % args.save_every == 0 and step > 0:
-                ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
+                ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance, **_curve_checkpoint_fields()}
                 path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
                 _assert_checkpoint_finite(model, opt, path, step)
                 _atomic_torch_save(ckpt, path)
@@ -1491,7 +1630,7 @@ def main():
             if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
                 print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
                 break
-        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'val_loss': last_val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
+        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'val_loss': last_val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance, **_curve_checkpoint_fields()}
         path = Path(args.output_dir) / 'ckpt_final.pt'
         _assert_checkpoint_finite(model, opt, path, step)
         _atomic_torch_save(ckpt, path)
@@ -1562,6 +1701,7 @@ def main():
             'curve_steps': curve_steps,
             'curve_diagnosis': last_diagnosis,
             'curve_diagnosis_history': diagnosis_history,
+            'val_batches_consumed': int(val_state.get('batches_consumed', 0)),
             # Model accounting travels with the accuracy numbers.
             'n_params': n_params,
             'n_trainable': n_trainable,
