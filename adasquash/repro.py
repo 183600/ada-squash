@@ -94,6 +94,36 @@ def apply_deterministic_algorithms(mode: str | None = None) -> str | None:
     return mode
 
 
+def deterministic_algorithms_context(mode: str | None = None):
+    """Context manager to temporarily enable deterministic algorithms.
+
+    Usage:
+        with deterministic_algorithms_context("warn"):
+            # training code here
+            pass
+        # original setting restored
+
+    The mode can be 'warn' (route to deterministic kernels where available,
+    warn otherwise) or 'strict' (raise on nondeterministic ops). If None,
+    reads from `ADASQUASH_DETERMINISTIC_ALGORITHMS` env var.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        previous_enabled = torch.are_deterministic_algorithms_enabled()
+        previous_warn_only = bool(
+            getattr(torch, "is_deterministic_algorithms_warn_only_enabled", lambda: False)()
+        )
+        applied = apply_deterministic_algorithms(mode)
+        try:
+            yield applied
+        finally:
+            torch.use_deterministic_algorithms(previous_enabled, warn_only=previous_warn_only)
+
+    return _ctx()
+
+
 def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     """Seed the Python, NumPy, torch and CUDA RNGs from `seed`.
 
@@ -106,13 +136,17 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     `torch.use_deterministic_algorithms` mode is applied here as well, and
     `environment_info` records it in the manifest.
 
-    Note on `PYTHONHASHSEED`: it is exported here so child processes
+    Note on `PYTHONHASHSEED` (IMPORTANT): it is exported here so child processes
     (DataLoader workers, subprocess launches) get a fixed string-hash seed
     from interpreter startup. The *current* process already picked its hash
     seed at startup (recorded as `pythonhashseed_at_process_start` in the
-    manifest), so a launcher that spawns training subprocesses (e.g. the
-    depth sweep) should also put `PYTHONHASHSEED=<seed>` in the child
-    environment explicitly - that is the only point where it takes effect.
+    manifest), so **setting `PYTHONHASHSEED` here does NOT affect the current
+    process's hash randomization**. A launcher that spawns training subprocesses
+    (e.g. the depth sweep, multi-seed launcher) MUST also put
+    `PYTHONHASHSEED=<seed>` in the child environment explicitly - that is the
+    only point where it takes effect. This is handled automatically by
+    `launch_multi_seed` in `train_gpt2.py` and `_child_env` in
+    `train_llama_depth_sweep.py`.
     """
     seed = int(seed)
     random.seed(seed)
@@ -636,6 +670,7 @@ __all__ = [
     "apply_deterministic_algorithms",
     "artifact_record",
     "collect_run_metadata",
+    "deterministic_algorithms_context",
     "environment_info",
     "file_fingerprint",
     "finish_metadata",
