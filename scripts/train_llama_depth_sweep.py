@@ -172,7 +172,7 @@ def _manifest_data_version(manifest: dict) -> dict | None:
                         or data.get('dataset_revision_resolved'))
     tokenizer_resolved = (train.get('tokenizer_revision_resolved')
                           or data.get('tokenizer_revision_resolved'))
-    if dataset_resolved is None and tokenizer_resolved is None:
+    if dataset_resolved is None or tokenizer_resolved is None:
         return None
     return {
         'dataset_revision_resolved': dataset_resolved,
