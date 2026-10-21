@@ -201,6 +201,10 @@ def split_document_boundaries(num_documents: int, val_frac: float, test_frac: fl
         raise ValueError(f"val_frac/test_frac must be in [0, 1), got {val_frac}/{test_frac}")
     val_n = int(round(num_documents * val_frac))
     test_n = int(round(num_documents * test_frac))
+    if val_frac > 0.0:
+        val_n = max(1, val_n)
+    if test_frac > 0.0:
+        test_n = max(1, test_n)
     train_n = num_documents - val_n - test_n
     if train_n <= 0:
         raise ValueError(
