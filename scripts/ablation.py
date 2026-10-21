@@ -1343,18 +1343,29 @@ def load_simple_baselines(path) -> dict | None:
         return None
     return data
 
-def run_simple_baseline_calibration(path, seeds) -> dict | None:
+def run_simple_baseline_calibration(path, seeds, args) -> dict | None:
     """Run the cheap count-model/Bayes ladder for a missing calibration.
 
     The ladder fits on the same synthetic generator as the ablation rows
     (one stream per seed), tunes the add-k smoothing on a disjoint stream and
     scores on the held-out stream, so its numbers are directly comparable.
+    The vocabulary, outlier id, batch shape and held-out batch count must be
+    the invocation's protocol: scoring a different stream would attach a
+    Bayes floor/ceiling that describes a different task.
     A failed subprocess is an error: continuing would silently drop the only
     reference that says whether a row learned the task.
     """
     import subprocess
+    vocab_size = _PROTOCOL_MODEL_VOCAB.get(args.model)
+    if vocab_size is None:
+        raise SystemExit(f'[compare] ERROR: no calibration vocabulary is registered '
+                         f'for model {args.model!r}')
     cmd = [sys.executable, str(ROOT / 'scripts' / 'baseline_simple.py'),
-           '--output', str(path), '--seeds', *[str(int(seed)) for seed in seeds]]
+           '--output', str(path), '--seeds', *[str(int(seed)) for seed in seeds],
+           '--vocab-size', str(int(vocab_size)),
+           '--batch-size', str(int(args.batch_size)),
+           '--seq-len', str(int(args.seq_len)),
+           '--val-batches', str(max(1, int(getattr(args, 'val_batches', 20))))]
     print(f"[compare] calibration missing: running {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.stdout:
@@ -1994,7 +2005,7 @@ def main():
                   if args.simple_baselines_enabled else None)
     if (comparison is not None and floor_data is None
             and args.simple_baselines_enabled and args.auto_simple_baselines):
-        floor_data = run_simple_baseline_calibration(simple_path, seeds)
+        floor_data = run_simple_baseline_calibration(simple_path, seeds, args)
     if comparison is not None and floor_data is not None:
         comparison['simple_baseline'] = attach_simple_baseline_calibration(comparison, floor_data, simple_path)
         comparison['calibration_status'] = 'attached'
