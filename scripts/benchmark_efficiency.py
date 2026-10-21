@@ -445,6 +445,7 @@ def main():
                 'peak_inference_memory': _ratio('peak_inference_memory_mb'),
                 'peak_training_memory': _ratio('peak_training_memory_mb'),
             }
+            sig = significance.get(cand)
             verdict = efficiency_verdict(loss_improvement, cost_ratio,
                                          min_loss_gain=args.min_loss_gain,
                                          max_cost_ratio=args.max_cost_ratio,
@@ -457,7 +458,6 @@ def main():
             # A gain the seed-level ablation could not call significant is
             # weak evidence: block viability until a longer/multi-seed run
             # clears the significance bar.
-            sig = significance.get(cand)
             if sig:
                 verdict['statistically_significant'] = sig['beats_reference_significantly']
                 verdict['p_one_sided_holm'] = sig['p_one_sided_holm']
