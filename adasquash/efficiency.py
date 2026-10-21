@@ -14,6 +14,7 @@ from __future__ import annotations
 The functions are pure (config/model in, dict out) so ablation and sweep
 runners can attach the numbers to their summaries.
 """
+import math
 from collections import defaultdict
 from typing import Optional
 
@@ -28,6 +29,23 @@ __all__ = [
 
 DEFAULT_MIN_LOSS_GAIN = 0.01
 DEFAULT_MAX_COST_RATIO = 1.25
+
+# Two-sided 95% Student-t critical values, by degrees of freedom. Efficiency
+# measurements usually have very few rounds (the benchmark defaults to 3), so
+# the normal 1.96 would report an interval far narrower than the data support.
+_T95 = (
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+)
+
+
+def _t_critical_95(df: int) -> float:
+    if df <= 0:
+        return float("inf")
+    if df <= len(_T95):
+        return _T95[df - 1]
+    return 1.96
 
 
 def mlp_hidden_size(dim: int, mlp_ratio: float) -> int:
@@ -150,6 +168,8 @@ def efficiency_verdict(
     cost_components: Optional[dict] = None,
     max_component_ratio: Optional[float] = None,
     statistically_significant: Optional[bool] = None,
+    cost_ratio_stderr: Optional[float] = None,
+    cost_ratio_n: Optional[int] = None,
 ) -> dict:
     """Is `loss_improvement` worth `cost_ratio` times the baseline cost?
 
@@ -166,6 +186,13 @@ def efficiency_verdict(
     (default: `max_cost_ratio`), so a win cannot hide a 10x memory or
     parameter blow-up behind one cheap primary cost. Components are reported
     individually; a missing component is never treated as passing.
+
+    `cost_ratio_stderr` (with `cost_ratio_n`) turns the point estimate into a
+    two-sided 95% Student-t interval. Certification then requires the
+    interval's *upper* bound to stay within `max_cost_ratio`, not merely the
+    point estimate: a noisy benchmark whose ratio could be either 1.01x or
+    1.30x has not shown the cost is acceptable. Without a standard error the
+    old point-estimate rule is unchanged.
     """
     verdict = {
         "loss_improvement": loss_improvement,
@@ -179,6 +206,10 @@ def efficiency_verdict(
         "component_costs": {},
         "component_failures": [],
         "gain_meaningful": None,
+        "cost_ratio_stderr": None,
+        "cost_ratio_n": None,
+        "cost_ratio_ci_95": None,
+        "cost_confidently_acceptable": None,
         "cost_acceptable": None,
         "viable": None,
         "cost_per_loss_point": None,
@@ -189,6 +220,23 @@ def efficiency_verdict(
         return verdict
     gain = float(loss_improvement)
     cost = float(cost_ratio)
+    cost_se = None
+    if cost_ratio_stderr is not None:
+        candidate_se = float(cost_ratio_stderr)
+        if math.isfinite(candidate_se) and candidate_se >= 0.0:
+            cost_se = candidate_se
+    if cost_se is not None:
+        if cost_ratio_n is None:
+            t_crit = 1.96
+            df = None
+        else:
+            df = max(1, int(cost_ratio_n) - 1)
+            t_crit = _t_critical_95(df)
+        half = t_crit * cost_se
+        verdict["cost_ratio_ci_95"] = [max(0.0, cost - half), cost + half]
+        verdict["cost_ratio_stderr"] = cost_se
+        verdict["cost_ratio_n"] = None if cost_ratio_n is None else int(cost_ratio_n)
+        verdict["cost_ratio_ci_95_df"] = df
     component_limit = verdict["max_component_ratio"]
     for name, ratio in (cost_components or {}).items():
         if ratio is None:
@@ -209,8 +257,14 @@ def efficiency_verdict(
             verdict["component_failures"].append(
                 f"{name} ratio {ratio:.3f}x exceeds {component_limit:.3f}x")
     verdict["gain_meaningful"] = gain >= float(min_loss_gain)
+    ci_upper = (None if verdict["cost_ratio_ci_95"] is None
+                else float(verdict["cost_ratio_ci_95"][1]))
+    verdict["cost_confidently_acceptable"] = bool(
+        ci_upper is None or ci_upper <= float(max_cost_ratio))
     verdict["cost_acceptable"] = bool(
-        cost <= float(max_cost_ratio) and not verdict["component_failures"])
+        cost <= float(max_cost_ratio)
+        and verdict["cost_confidently_acceptable"]
+        and not verdict["component_failures"])
     # A gain that the seed-level comparison could not call significant is weak
     # evidence: a micro point estimate is not a win on its own, so it cannot be
     # certified as viable regardless of how cheap it is.
@@ -232,6 +286,12 @@ def efficiency_verdict(
     if not primary_ok:
         reasons.append(
             f"cost ratio {cost:.3f}x exceeds the allowed maximum {max_cost_ratio:.3f}x"
+        )
+    elif ci_upper is not None and ci_upper > float(max_cost_ratio):
+        reasons.append(
+            f"cost ratio {cost:.3f}x has a 95% upper bound {ci_upper:.3f}x above "
+            f"the allowed maximum {max_cost_ratio:.3f}x; the measurement cannot "
+            "certify the cost is acceptable"
         )
     reasons.extend(verdict["component_failures"])
     if statistically_significant is False and "gain is not statistically significant; a micro point estimate is not convincing evidence of an improvement" not in reasons:

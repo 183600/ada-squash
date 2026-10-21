@@ -244,6 +244,35 @@ def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
     return out
 
 
+def paired_training_cost_stats(cand_bench: dict, ref_bench: dict) -> dict:
+    """Per-round paired candidate/reference training-latency ratios.
+
+    The report's cost ratio is a ratio of cross-round means, which hides
+    whether the difference is larger than the round-to-round spread. Because
+    the benchmark interleaves every norm in each round, the per-round ratios
+    are paired samples; their standard error measures how well this machine
+    resolved the cost difference at this `--rounds` count.
+    """
+    def _by_round(bench, key):
+        return {
+            int(r['round']): float(r[key]['mean_ms'])
+            for r in (bench.get('latency_by_round') or [])
+            if r.get(key) and r[key].get('mean_ms') is not None
+        }
+
+    cand = _by_round(cand_bench, 'training_ms')
+    ref = _by_round(ref_bench, 'training_ms')
+    ratios = [cand[r] / ref[r] for r in sorted(set(cand) & set(ref))
+              if ref[r] > 0.0 and math.isfinite(cand[r])
+              and math.isfinite(ref[r])]
+    out = {'n_rounds': len(ratios), 'mean_ratio': None, 'stderr': None}
+    if ratios:
+        out['mean_ratio'] = statistics.fmean(ratios)
+    if len(ratios) >= 2:
+        out['stderr'] = statistics.stdev(ratios) / math.sqrt(len(ratios))
+    return out
+
+
 def load_losses(summaries_path: str) -> dict:
     data = json.loads(Path(summaries_path).read_text())
     rows = data if isinstance(data, list) else (data.get('rows') or data.get('summaries') or [])
@@ -428,6 +457,7 @@ def main():
                       f"(proxy cost)")
             loss_improvement = losses[args.reference_name] - cand_loss
             cost_ratio = cand_bench['training_latency_ms_per_token'] / ref_bench['training_latency_ms_per_token']
+            cost_stats = paired_training_cost_stats(cand_bench, ref_bench)
 
             def _ratio(key):
                 a, b = cand_bench.get(key), ref_bench.get(key)
@@ -459,7 +489,9 @@ def main():
                                          max_component_ratio=args.max_component_ratio,
                                          statistically_significant=(
                                              None if sig is None
-                                             else sig.get('beats_reference_significantly')))
+                                             else sig.get('beats_reference_significantly')),
+                                         cost_ratio_stderr=cost_stats.get('stderr'),
+                                         cost_ratio_n=cost_stats.get('n_rounds'))
             # A gain the seed-level ablation could not call significant is
             # weak evidence: block viability until a longer/multi-seed run
             # clears the significance bar.
@@ -480,6 +512,7 @@ def main():
                 'candidate_val_loss': cand_loss,
                 'reference_val_loss': losses[args.reference_name],
                 'significance': sig,
+                'cost_ratio_per_round': cost_stats,
                 'cost_model_norm': cand_norm,
                 'cost_is_proxy': cost_is_proxy,
                 'verdict': verdict,
