@@ -162,6 +162,39 @@ def _is_pinned_revision(revision) -> bool:
     return 7 <= len(text) <= 40 and all(c in "0123456789abcdefABCDEF" for c in text)
 
 
+def _resolve_hub_revision(kind: str, name: str, revision) -> str | None:
+    """Resolve a dataset/tokenizer revision to a concrete Hub commit hash.
+
+    A revision that already looks like a commit is returned as-is (there is
+    nothing to move).  For "latest" / a branch / a tag the Hub's current
+    `sha` is looked up once per process and cached; when the Hub is
+    unreachable the requested value (or None) is returned so an offline run
+    still works and the caller can decide whether a cache may be used.
+    """
+    requested = str(revision) if revision else None
+    key = (kind, str(name), requested)
+    if key in _REVISION_CACHE:
+        return _REVISION_CACHE[key]
+    if _is_pinned_revision(requested):
+        _REVISION_CACHE[key] = requested
+        return requested
+    resolved = None
+    try:
+        from huggingface_hub import HfApi
+
+        kwargs = {"revision": requested} if requested else {}
+        api = HfApi()
+        info = (api.dataset_info(name, **kwargs) if kind == "dataset"
+                else api.model_info(name, **kwargs))
+        resolved = getattr(info, "sha", None)
+    except Exception:
+        resolved = None
+    if resolved is None and requested:
+        resolved = requested
+    _REVISION_CACHE[key] = resolved
+    return resolved
+
+
 def resolve_dataset_revision(dataset_name: str, revision=None) -> str | None:
     """Resolve the requested dataset revision to the concrete upstream commit.
 
@@ -174,22 +207,18 @@ def resolve_dataset_revision(dataset_name: str, revision=None) -> str | None:
     the Hub is unreachable the resolution degrades to the requested value (or
     None) instead of failing the run.
     """
-    requested = str(revision) if revision else None
-    key = ("revision", str(dataset_name), requested)
-    if key in _REVISION_CACHE:
-        return _REVISION_CACHE[key]
-    resolved = None
-    try:
-        from huggingface_hub import HfApi
+    return _resolve_hub_revision("dataset", dataset_name, revision)
 
-        kwargs = {"revision": requested} if requested else {}
-        resolved = getattr(HfApi().dataset_info(dataset_name, **kwargs), "sha", None)
-    except Exception:
-        resolved = None
-    if resolved is None and requested:
-        resolved = requested
-    _REVISION_CACHE[key] = resolved
-    return resolved
+
+def resolve_tokenizer_revision(tokenizer_name: str, revision=None) -> str | None:
+    """Resolve a tokenizer revision to the concrete Hub commit hash.
+
+    The tokenizer is part of the data version just like the corpus: a run
+    that records the requested branch but loads it before it is pinned can
+    train and evaluate with different tokenizers.  Resolving first lets the
+    loader pass the concrete commit to `from_pretrained`.
+    """
+    return _resolve_hub_revision("tokenizer", tokenizer_name, revision)
 
 
 def split_document_boundaries(num_documents: int, val_frac: float, test_frac: float) -> dict:
@@ -275,17 +304,27 @@ def select_stream_split(ds, split: str, options: dict | None = None):
 
 
 def load_document_stream(dataset_name: str, dataset_config: str | None, split: str, options: dict | None = None):
-    """Raw (unpacked, uncleaned) document stream for one logical split."""
+    """Raw (unpacked, uncleaned) document stream for one logical split.
+
+    The requested revision is resolved *before* the stream is opened and the
+    concrete commit is passed to `load_dataset`.  Loading the mutable
+    request first and recording the resolved hash afterwards can mix two
+    upstream versions inside one train/validation/test split (and makes the
+    recorded hash describe a different snapshot than the one actually read).
+    """
     from datasets import load_dataset
 
     opts = dict(DEFAULT_DATA_OPTIONS)
     if options:
         opts.update(options)
+    requested_revision = opts.get("dataset_revision")
+    resolved_revision = resolve_dataset_revision(dataset_name, requested_revision)
+    load_revision = resolved_revision or requested_revision
     ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True,
-                      revision=opts.get("dataset_revision"))
+                      revision=load_revision)
     stream, report = select_stream_split(ds, split, opts)
-    report["dataset_revision_resolved"] = resolve_dataset_revision(
-        dataset_name, opts.get("dataset_revision"))
+    report["dataset_revision_resolved"] = resolved_revision
+    report["dataset_revision_loaded"] = load_revision
     return stream, report
 
 
@@ -893,19 +932,25 @@ _TOKENIZER_CACHE_MAX_ENTRIES = 8
 
 
 def _cached_tokenizer(name: str, revision):
-    """Process-wide `AutoTokenizer` cache keyed by (name, revision).
+    """Process-wide `AutoTokenizer` cache keyed by (name, resolved revision).
 
     Checkpoint scans call `build_dataloader` once per checkpoint; without the
     cache each call repeats the tokenizer resolution (network/cache lookup and
     config parsing) even though the tokenizer identity is fixed by the model.
-    The cache is a plain dict keyed by the revision-pinned name, bounded like
-    the other scratch caches, and `pad_token_id` is still normalized per call.
+    The requested revision is resolved to a concrete commit before loading, so
+    the tokenizer used to train and the one used to evaluate cannot come from
+    different snapshots of a moving branch.  The cache is a plain dict keyed
+    by the pinned name, bounded like the other scratch caches, and
+    `pad_token_id` is still normalized per call.
     """
-    key = (name, revision)
+    requested = str(revision) if revision else None
+    resolved = resolve_tokenizer_revision(name, requested)
+    load_revision = resolved or requested
+    key = (name, load_revision)
     tok = _TOKENIZER_CACHE.get(key)
     if tok is None:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(name, revision=revision)
+        tok = AutoTokenizer.from_pretrained(name, revision=load_revision)
         if len(_TOKENIZER_CACHE) >= _TOKENIZER_CACHE_MAX_ENTRIES:
             _TOKENIZER_CACHE.clear()
         _TOKENIZER_CACHE[key] = tok
@@ -942,14 +987,21 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     tok = _cached_tokenizer(tokenizer, opts.get("tokenizer_revision"))
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id
+    # Resolve "latest"/branch/tag requests *before* opening the stream: the
+    # concrete commit is what train, validation and test must all be read
+    # from. Recording the resolved hash only after the load can describe a
+    # snapshot other than the one actually consumed.
+    requested_revision = opts.get("dataset_revision")
+    resolved_revision = resolve_dataset_revision(dataset_name, requested_revision)
+    load_revision = resolved_revision or requested_revision
     stream_ds = load_dataset(dataset_name, dataset_config, split="train",
-                             streaming=True, revision=opts.get("dataset_revision"))
+                             streaming=True, revision=load_revision)
     stream_ds, report = select_stream_split(stream_ds, opts["split"], opts)
     # Pin "latest" to a concrete upstream commit before anything is cached or
     # trained on, and carry the hash into the split report (data-version
     # tracking). Degrades to None when the Hub is unreachable.
-    report["dataset_revision_resolved"] = resolve_dataset_revision(
-        dataset_name, opts.get("dataset_revision"))
+    report["dataset_revision_resolved"] = resolved_revision
+    report["dataset_revision_loaded"] = load_revision
     # Group ledgers follow the same earlier-side-only rule: the training-group
     # ledger is applied to both held-out splits, the validation-group ledger
     # to the sealed test split only, and neither is ever applied to train.
@@ -1057,6 +1109,7 @@ __all__ = [
     "load_document_stream",
     "load_hash_file",
     "resolve_dataset_revision",
+    "resolve_tokenizer_revision",
     "select_stream_split",
     "split_document_boundaries",
 ]
