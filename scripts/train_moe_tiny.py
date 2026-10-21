@@ -1187,6 +1187,8 @@ def main():
         p.error(f'--stats-every {args.stats_every} must be >= 1')
     if args.val_batches < 0:
         p.error(f'--val-batches {args.val_batches} must be >= 0')
+    if args.max_steps < 1:
+        p.error(f'--max-steps {args.max_steps} must be >= 1')
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds)
     if not raw_seeds:
         p.error('--seeds must not be empty')
