@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from typing import Optional, Dict
 import torch
 import torch.nn as nn
@@ -44,12 +44,26 @@ class MaxAbsMeter:
 
 # One workspace pair per (name, device, dtype), shared by every meter: the
 # sampling hooks run one at a time, so a single pair serves all norms.
-_KURTOSIS_WORKSPACES: dict = {}
+_KURTOSIS_WORKSPACES: OrderedDict = OrderedDict()
 _KURTOSIS_WORKSPACES_MAX_ENTRIES = 8
 
 def release_kurtosis_workspaces() -> None:
     """Release the shared KurtosisMeter scratch buffers (window / run end)."""
     _KURTOSIS_WORKSPACES.clear()
+
+def _kurtosis_workspace_get_or_create(key: tuple, n: int, dtype: torch.dtype, device) -> torch.Tensor:
+    """Get or create a workspace buffer with LRU eviction."""
+    buf = _KURTOSIS_WORKSPACES.get(key)
+    if buf is None or buf.numel() < n:
+        buf = torch.empty(n, dtype=dtype, device=device)
+        if len(_KURTOSIS_WORKSPACES) >= _KURTOSIS_WORKSPACES_MAX_ENTRIES:
+            # LRU eviction: remove oldest entry (first inserted)
+            _KURTOSIS_WORKSPACES.popitem(last=False)
+        _KURTOSIS_WORKSPACES[key] = buf
+    else:
+        # Move to end (most recently used)
+        _KURTOSIS_WORKSPACES.move_to_end(key)
+    return buf
 
 class KurtosisMeter:
     # The per-chunk workspace is bounded and reused across samples.
@@ -63,12 +77,7 @@ class KurtosisMeter:
         """A reusable buffer at least as large as `like` (a view is returned)."""
         n = like.numel()
         key = (name, like.device, like.dtype)
-        buf = _KURTOSIS_WORKSPACES.get(key)
-        if buf is None or buf.numel() < n:
-            buf = torch.empty(n, dtype=like.dtype, device=like.device)
-            if len(_KURTOSIS_WORKSPACES) >= _KURTOSIS_WORKSPACES_MAX_ENTRIES:
-                _KURTOSIS_WORKSPACES.clear()
-            _KURTOSIS_WORKSPACES[key] = buf
+        buf = _kurtosis_workspace_get_or_create(key, n, like.dtype, like.device)
         return buf[:n].view(like.shape)
 
     def reset(self):
