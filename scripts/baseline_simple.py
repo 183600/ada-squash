@@ -174,7 +174,12 @@ def collect_counts(split: dict, n_symbols: int, with_trigram: bool=True) -> dict
                         minlength=n_symbols * n_symbols).to(torch.float64).view(n_symbols, n_symbols)
     tri = None
     if with_trigram and n_symbols ** 3 <= 1 << 27:
-        idx = (split['x2'] * n_symbols + split['x']) * n_symbols + split['y']
+        # Position 0 has no real predecessor; `flatten_split` marks it with
+        # the unseen bucket so the trigram must fall back to the bigram
+        # there. Counting those artificial contexts would make `seen2` true
+        # and defeat the documented fallback.
+        real_context = split['x2'].ne(n_symbols - 1)
+        idx = ((split['x2'] * n_symbols + split['x']) * n_symbols + split['y'])[real_context]
         tri = torch.bincount(idx, minlength=n_symbols ** 3).to(torch.float64).view(n_symbols, n_symbols, n_symbols)
     else:
         with_trigram = False
@@ -460,6 +465,17 @@ def main():
         p.error(f'--n-states {args.n_states} must be >= 1')
     if args.max_jump < 1:
         p.error(f'--max-jump {args.max_jump} must be >= 1')
+    if args.vocab_size < 1:
+        p.error(f'--vocab-size {args.vocab_size} must be >= 1')
+    if args.n_states > args.vocab_size:
+        p.error(f'--n-states {args.n_states} cannot exceed --vocab-size {args.vocab_size}')
+    if args.outlier_channel and args.n_states >= args.vocab_size:
+        p.error(f'--n-states {args.n_states} must be smaller than --vocab-size {args.vocab_size} '
+                'when the outlier channel is enabled (the outlier id is vocab_size - 1)')
+    if not args.ks:
+        p.error('--ks must not be empty')
+    if any((not math.isfinite(k)) or k <= 0.0 for k in args.ks):
+        p.error('--ks entries must be finite and > 0')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(args.seeds[0])
     outlier_id = args.vocab_size - 1 if args.outlier_channel else None
