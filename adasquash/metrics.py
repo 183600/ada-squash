@@ -924,6 +924,8 @@ def ndcg_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]]
         raise ValueError(f"ranked/relevant query count mismatch: {len(ranked)} vs {len(relevant)}")
     if not ranked:
         return None
+    if not any(rel for rel in relevant):
+        return None
     k = max(1, int(k))
     ndcgs = []
     for r, rel in zip(ranked, relevant):
@@ -932,10 +934,15 @@ def ndcg_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]]
             ndcgs.append(0.0)
             continue
         dcg = 0.0
+        seen = set()
         for i, item in enumerate(r[:k]):
-            if item in rel_set:
+            # A repeated id is one relevant item, not several: scoring every
+            # occurrence would let a padded/duplicated ranking exceed the
+            # ideal DCG and push NDCG above 1.
+            if item in rel_set and item not in seen:
                 dcg += 1.0 / math.log2(i + 2)
+                seen.add(item)
         ideal_hits = min(len(rel_set), k)
         idcg = sum(1.0 / math.log2(i + 2) for i in range(ideal_hits))
-        ndcgs.append(dcg / idcg if idcg > 0 else 0.0)
+        ndcgs.append(min(1.0, dcg / idcg) if idcg > 0 else 0.0)
     return sum(ndcgs) / len(ndcgs)
