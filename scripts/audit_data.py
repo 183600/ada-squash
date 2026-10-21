@@ -62,7 +62,7 @@ from scripts.data_pipeline import (DocumentCleaner, canonical_document_hash, doc
                                    extract_group_value, group_hash, load_document_stream)
 
 
-def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, collect_groups=True):
+def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     # One machine-word int per document.
@@ -70,9 +70,14 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     # Token ids are counted per document with `np.bincount`; a per-document
     # fallback keeps one bad document from losing the whole batch. Ids that
     # cannot go through bincount (negative) use the Python-counter path.
-    counts = None
+    # Two histograms are built: the raw one over every kept document, and the
+    # *effective* one over the documents that survive the cross-split ledgers
+    # the training run applies (exclude_hashes / exclude_group_hashes), i.e.
+    # the distribution the model actually evaluates on.
+    count_bufs: dict = {'raw': None, 'effective': None}
+    legacy_bufs: dict = {'raw': Counter(), 'effective': Counter()}
     text_batch: list = []
-    legacy_tokens: Counter = Counter()
+    text_batch_effective: list = []
     hashes: set = set()
     groups: set = set()
     overlap = 0
@@ -83,23 +88,25 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     group_overlap_extra_groups: set = set()
     group_value_missing = 0
     tokenizer_errors = 0
+    ledger_dropped = 0
+    effective_documents = 0
     vocab_size = int(getattr(tokenizer, 'vocab_size', 0) or 0)
 
-    def _add_ids(ids) -> None:
-        nonlocal counts
+    def _add_ids(ids, which='raw') -> None:
         try:
             arr = np.asarray(ids, dtype=np.int64)
         except (TypeError, ValueError):
-            legacy_tokens.update(ids)
+            legacy_bufs[which].update(ids)
             return
         if arr.size == 0:
             return
         if arr.min() < 0:
             # np.bincount rejects negatives; a tokenizer that emits them
             # still gets counted here (and flagged below).
-            legacy_tokens.update(arr.tolist())
+            legacy_bufs[which].update(arr.tolist())
             return
         bc = np.bincount(arr)
+        counts = count_bufs[which]
         if counts is None:
             counts = np.zeros(max(bc.shape[0], vocab_size + 1), dtype=np.int64)
         elif bc.shape[0] > counts.shape[0]:
@@ -108,6 +115,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             counts = np.concatenate(
                 [counts, np.zeros(bc.shape[0] - counts.shape[0], dtype=np.int64)])
         counts[:bc.shape[0]] += bc
+        count_bufs[which] = counts
 
     def _flush_tokens() -> None:
         nonlocal tokenizer_errors
@@ -118,17 +126,22 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         except Exception:
             enc = None
         if enc is None:
-            for t in text_batch:
+            for t, effective in zip(text_batch, text_batch_effective):
                 try:
                     ids = tokenizer(t, add_special_tokens=False)['input_ids']
                 except Exception:
                     tokenizer_errors += 1
                     continue
-                _add_ids(ids)
+                _add_ids(ids, 'raw')
+                if effective:
+                    _add_ids(ids, 'effective')
         else:
-            for ids in enc:
-                _add_ids(ids)
+            for ids, effective in zip(enc, text_batch_effective):
+                _add_ids(ids, 'raw')
+                if effective:
+                    _add_ids(ids, 'effective')
         text_batch.clear()
+        text_batch_effective.clear()
 
     capped = False
     documents_read = 0
@@ -157,6 +170,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         # The ledger holds exact *and* canonical digests; checking only the
         # exact one would undercount formatting-variant duplicates that the
         # cleaner (and therefore the actual held-out split) does drop.
+        dropped_by_ledger = bool(
+            exclude_hashes and (h in exclude_hashes or ch in exclude_hashes))
         if known_hashes is not None and (h in known_hashes or ch in known_hashes):
             overlap += 1
         if known_hashes_extra is not None and (h in known_hashes_extra or ch in known_hashes_extra):
@@ -169,21 +184,34 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
                 gh = group_hash(value)
                 if collect_groups:
                     groups.add(gh)
+                if exclude_group_hashes and gh in exclude_group_hashes:
+                    dropped_by_ledger = True
                 if known_groups is not None and gh in known_groups:
                     group_overlap += 1
                     group_overlap_groups.add(gh)
                 if known_groups_extra is not None and gh in known_groups_extra:
                     group_overlap_extra += 1
                     group_overlap_extra_groups.add(gh)
+        if dropped_by_ledger:
+            ledger_dropped += 1
+        else:
+            effective_documents += 1
         text_batch.append(text)
+        text_batch_effective.append(not dropped_by_ledger)
         if len(text_batch) >= 256:
             _flush_tokens()
     _flush_tokens()
-    if counts is not None:
-        tokens = Counter({int(t): int(c) for t, c in enumerate(counts) if c})
+    if count_bufs['raw'] is not None:
+        tokens = Counter({int(t): int(c) for t, c in enumerate(count_bufs['raw']) if c})
     else:
         tokens = Counter()
-    tokens.update(legacy_tokens)
+    tokens.update(legacy_bufs['raw'])
+    if count_bufs['effective'] is not None:
+        tokens_effective = Counter({int(t): int(c)
+                                    for t, c in enumerate(count_bufs['effective']) if c})
+    else:
+        tokens_effective = Counter()
+    tokens_effective.update(legacy_bufs['effective'])
     stats = cleaner.report()
     # Count every document read from the stream, including dropped ones.
     stats['documents_sampled'] = int(stats.get('documents_read', len(lengths)))
@@ -193,6 +221,12 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     # a truncated sample, `duplicate_overlap_with_train = 0` is a lower bound
     # on the true overlap, not evidence that the splits are disjoint.
     stats['exhaustive'] = not capped
+    stats['ledger_documents_dropped'] = (ledger_dropped
+                                         if exclude_hashes is not None or exclude_group_hashes is not None
+                                         else None)
+    stats['effective_documents_kept'] = (effective_documents
+                                         if exclude_hashes is not None or exclude_group_hashes is not None
+                                         else stats.get('documents_kept', len(lengths)))
     stats['duplicate_overlap_with_train'] = overlap if known_hashes is not None else None
     stats['duplicate_overlap_with_validation'] = overlap_extra if known_hashes_extra is not None else None
     stats['duplicate_overlap_is_lower_bound'] = bool(capped) if (known_hashes is not None or known_hashes_extra is not None) else None
@@ -228,7 +262,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stats['token_ids_out_of_range'] = sum(c for t, c in tokens.items() if not 0 <= t < getattr(tokenizer, 'vocab_size', 2 ** 31))
     stats['distinct_token_ids'] = len(tokens)
     stats['finite_lengths'] = bool(all(math.isfinite(v) for v in (stats['doc_chars_mean'] or 0.0, stats['doc_chars_min'] or 0.0, stats['doc_chars_max'] or 0.0)))
-    return stats, tokens, report, hashes, lengths, groups
+    return stats, tokens, report, hashes, lengths, groups, tokens_effective
 
 
 def _linear_quantile(ordered, q):
@@ -377,6 +411,7 @@ def main():
                'tokenizer_revision': args.tokenizer_revision}
     splits = {}
     tokens = {}
+    effective_tokens = {}
     reports = {}
     lengths = {}
     train_hashes = None
@@ -392,7 +427,19 @@ def main():
         # and the overlap reference); test only needs to be compared against
         # them.  Test is checked against train *and* validation: a val/test
         # duplicate makes the selection split and the final split non-disjoint.
-        stats, tok_counter, report, hashes, split_lengths, groups = _collect_split(
+        if name == 'train':
+            exclude_hashes = exclude_groups = None
+        elif name == 'validation':
+            exclude_hashes = train_hashes
+            exclude_groups = train_groups if args.group_key else None
+        else:
+            # The sealed test split is opened by the run with the training
+            # ledger *and* the validation ledger, so its effective documents
+            # are the ones that survive both.
+            exclude_hashes = (set(train_hashes or ()) | set(val_hashes or ()))
+            exclude_groups = ((set(train_groups or ()) | set(val_groups or ()))
+                              if args.group_key else None)
+        stats, tok_counter, report, hashes, split_lengths, groups, tok_effective = _collect_split(
             name, args.dataset, args.dataset_config, tokenizer, options,
             args.n_docs, args.min_doc_chars, args.max_doc_chars, args.dedup,
             known_hashes=train_hashes,
@@ -401,9 +448,12 @@ def main():
             group_key=args.group_key,
             known_groups=train_groups,
             known_groups_extra=(val_groups if name == 'test' else None),
-            collect_groups=(name in ('train', 'validation')))
+            collect_groups=(name in ('train', 'validation')),
+            exclude_hashes=exclude_hashes,
+            exclude_group_hashes=exclude_groups)
         splits[name] = stats
         tokens[name] = tok_counter
+        effective_tokens[name] = tok_effective
         reports[name] = report
         lengths[name] = split_lengths
         if name == 'train':
@@ -447,6 +497,16 @@ def main():
         'train_vs_validation_tvd': _total_variation(tokens['train'], tokens['validation']),
         'train_vs_test_tvd': _total_variation(tokens['train'], tokens['test']),
         'validation_vs_test_tvd': _total_variation(tokens['validation'], tokens['test']),
+        # The same distances over the documents that survive the cross-split
+        # ledgers: that is the distribution the trained model is actually
+        # selected and reported on, and it can differ from the raw one when a
+        # ledger is non-trivial.
+        'train_vs_validation_tvd_effective': _total_variation(
+            effective_tokens['train'], effective_tokens['validation']),
+        'train_vs_test_tvd_effective': _total_variation(
+            effective_tokens['train'], effective_tokens['test']),
+        'validation_vs_test_tvd_effective': _total_variation(
+            effective_tokens['validation'], effective_tokens['test']),
         'top_shifted_train_vs_validation': _top_shifted(tokens['train'], tokens['validation']),
         'doc_chars_mean_delta_train_validation': (
             None if splits['train']['doc_chars_mean'] is None or splits['validation']['doc_chars_mean'] is None
@@ -467,6 +527,9 @@ def main():
                 f"dropped_empty={stats.get('dropped_empty', 0)} dropped_missing={stats.get('dropped_missing_text', 0)} "
                 f"dropped_duplicate={stats.get('dropped_duplicate', 0)} overlap_with_train={stats['duplicate_overlap_with_train']} "
                 f"overlap_with_validation={stats['duplicate_overlap_with_validation']}")
+        if name != 'train':
+            line += (f" effective_kept={stats['effective_documents_kept']} "
+                     f"ledger_dropped={stats['ledger_documents_dropped']}")
         if args.group_key:
             line += (f" group_overlap_with_train={stats.get('group_overlap_with_train')} "
                      f"group_overlap_with_validation={stats.get('group_overlap_with_validation')}")
@@ -480,6 +543,9 @@ def main():
     print(f"[audit] token TVD train-vs-val={shift['train_vs_validation_tvd']:.4f} "
           f"train-vs-test={shift['train_vs_test_tvd']:.4f} "
           f"val-vs-test={shift['validation_vs_test_tvd']:.4f}")
+    print(f"[audit] token TVD after ledgers train-vs-val={shift['train_vs_validation_tvd_effective']:.4f} "
+          f"train-vs-test={shift['train_vs_test_tvd_effective']:.4f} "
+          f"val-vs-test={shift['validation_vs_test_tvd_effective']:.4f}")
     if args.hypothesis:
         print(f"[audit][hypothesis] {args.hypothesis}")
     print(f"[audit] saved to {args.output}")
@@ -523,6 +589,25 @@ def main():
             straddling.append(f"test shares {n_groups} group(s) with validation")
         if straddling:
             problems.append(f"grouping unit '{args.group_key}' straddles a split boundary: " + '; '.join(straddling) + ' (group leakage)')
+    # A ledger written from a sampled prefix only covers that prefix; a run
+    # consuming it drops duplicates/groups of the prefix and silently keeps
+    # the rest, so the audit must not bless it as a verified split guarantee.
+    for info in (train_ledger_info, val_ledger_info,
+                 train_group_ledger_info, val_group_ledger_info):
+        if info and not info.get('exhaustive'):
+            problems.append(
+                f"the {info['split']} ledger {info['path']} covers only the first "
+                f"{info['n_docs_limit']} documents of its split, so a run consuming it "
+                f"still accepts cross-split duplicates/groups beyond that prefix "
+                f"(re-run with --n-docs 0 for a full ledger)")
+    empty_effective = [name for name in ('validation', 'test')
+                       if splits[name].get('documents_kept')
+                       and not splits[name].get('effective_documents_kept')]
+    if empty_effective:
+        problems.append(
+            'the cross-split ledgers drop every kept document of: '
+            + ', '.join(empty_effective)
+            + ' (the effective held-out split is empty; the run would evaluate on nothing)')
     out_of_range = [name for name in ('train', 'validation', 'test')
                     if splits[name]['token_ids_out_of_range']]
     if out_of_range:
