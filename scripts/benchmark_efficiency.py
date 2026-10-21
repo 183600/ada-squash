@@ -167,13 +167,12 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     from scripts.train_gpt2 import build_optimizer
     opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     fwd_timing = measure_timed(forward, args.iters, args.warmup, device)
+    # Measure inference before the training timing/backward pass: otherwise the
+    # gradients (and any optimizer state) left by the last training step are
+    # still resident and would be counted as inference memory.
+    fwd_mem = measure_peak_memory(forward, device) if measure_heavy else None
     train_timing = measure_timed(train_step, args.iters, args.warmup, device)
-    # Measure both quantities once per norm.
-    if measure_heavy:
-        fwd_mem = measure_peak_memory(forward, device)
-        train_mem = measure_peak_memory(train_step, device)
-    else:
-        fwd_mem = train_mem = None
+    train_mem = measure_peak_memory(train_step, device) if measure_heavy else None
     model.zero_grad(set_to_none=True)
     flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
     measured = measured_forward_flops(forward, tokens) if measure_heavy else None
