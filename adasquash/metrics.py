@@ -65,6 +65,8 @@ __all__ = [
     "welch_t_one_sided",
     "welch_z_one_sided",
     "wilson_interval",
+    "recall_at_k",
+    "ndcg_at_k",
 ]
 
 _Z_95 = 1.959963984540054
@@ -875,3 +877,61 @@ def binary_auc_report(
             "whose FPR has a huge denominator and stays optimistic"
         ),
     }
+
+
+def recall_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]], k: int) -> Optional[float]:
+    """Mean recall@k over queries: fraction of relevant items found in top-k.
+
+    `ranked[q]` is the ordered list of item ids predicted for query q and
+    `relevant[q]` the set of truly relevant items. Returns None when there are
+    no queries. A metric suited to retrieval-style research goals (the
+    prompt's "recommendation systems care about NDCG/recall") rather than to
+    the classification metrics above.
+    """
+    ranked = list(ranked)
+    relevant = list(relevant)
+    if len(ranked) != len(relevant):
+        raise ValueError(f"ranked/relevant query count mismatch: {len(ranked)} vs {len(relevant)}")
+    if not ranked:
+        return None
+    k = max(1, int(k))
+    recalls = []
+    for r, rel in zip(ranked, relevant):
+        rel_set = set(rel)
+        if not rel_set:
+            recalls.append(0.0)
+            continue
+        hits = len(set(r[:k]) & rel_set)
+        recalls.append(hits / len(rel_set))
+    return sum(recalls) / len(recalls)
+
+
+def ndcg_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]], k: int) -> Optional[float]:
+    """Mean NDCG@k (binary relevance) over queries.
+
+    Each relevant item contributes 1 / log2(rank + 1) (rank is 1-based) in
+    the numerator; the denominator is the ideal DCG with all relevant items
+    placed at the top. Returns None when there are no queries or no relevant
+    items in a query set's union (so the metric is defined).
+    """
+    ranked = list(ranked)
+    relevant = list(relevant)
+    if len(ranked) != len(relevant):
+        raise ValueError(f"ranked/relevant query count mismatch: {len(ranked)} vs {len(relevant)}")
+    if not ranked:
+        return None
+    k = max(1, int(k))
+    ndcgs = []
+    for r, rel in zip(ranked, relevant):
+        rel_set = set(rel)
+        if not rel_set:
+            ndcgs.append(0.0)
+            continue
+        dcg = 0.0
+        for i, item in enumerate(r[:k]):
+            if item in rel_set:
+                dcg += 1.0 / math.log2(i + 2)
+        ideal_hits = min(len(rel_set), k)
+        idcg = sum(1.0 / math.log2(i + 2) for i in range(ideal_hits))
+        ndcgs.append(dcg / idcg if idcg > 0 else 0.0)
+    return sum(ndcgs) / len(ndcgs)
