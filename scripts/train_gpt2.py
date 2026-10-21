@@ -1188,6 +1188,20 @@ def main():
         if 'scheduler' in resume_ckpt:
             sched.load_state_dict(resume_ckpt['scheduler'])
         apply_explicit_optimizer_args(opt, sched, args, explicit)
+        # A checkpoint written by an older run can carry non-finite weights or
+        # Adam moments even though the new save guard would refuse to create
+        # one. Continuing from it would only reproduce the NaN on the first
+        # step and overwrite the last good checkpoint with a corrupted one, so
+        # fail at the resume boundary with the offending tensors named.
+        resume_failures = _checkpoint_nonfinite(model, opt)
+        if resume_failures:
+            shown = '; '.join(resume_failures[:10])
+            more = '' if len(resume_failures) <= 10 else f' (+{len(resume_failures) - 10} more)'
+            raise SystemExit(
+                f'[resume] refusing to continue from {args.resume}: the checkpoint '
+                f'contains non-finite training state ({shown}{more}). Restore an '
+                'earlier finite checkpoint; the NaN triage order is data -> fp32 '
+                'math -> mixed precision -> gradients.')
         # Everything heavy has been copied into the live objects; drop the
         # checkpoint's copies. `val_loss` / `step` stay: they are scalars the
         # tracker reads.
