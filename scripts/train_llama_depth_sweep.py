@@ -367,6 +367,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         'invalid_seeds': invalid_seeds,
         'seeds_without_final_val_loss': seeds_without_final,
         'complete': (len(missing_seeds) == 0 and len(invalid_seeds) == 0
+                     and not seeds_without_final
                      and not rejected and data_versions_complete
                      and not data_version_mismatch),
         'manifest_rejections': rejected,
@@ -944,6 +945,7 @@ def main():
                 jobs.append((depth, norm, out_dir, seed))
             cells.append((depth, norm, cell_dir))
     gpus = list(dict.fromkeys(str(g) for g in args.gpus)) if args.gpus else []
+    failed_jobs = []
 
     def _gpu_for(idx: int):
         return gpus[idx % len(gpus)] if gpus else None
@@ -951,8 +953,10 @@ def main():
     def _reap(proc, depth, norm, seed):
         rc = proc.wait()
         if rc != 0:
+            failed_jobs.append((depth, norm, seed, rc))
             print(f'[sweep] WARNING: d{depth}-{norm} seed={seed} exited rc={rc}; '
                   f'its manifest may be missing, which flags the cell incomplete')
+        return rc
 
     max_parallel = max(1, int(args.max_parallel))
     if max_parallel > 1 and not args.sequential:
@@ -974,6 +978,8 @@ def main():
         for idx, (depth, norm, out_dir, seed) in enumerate(jobs):
             proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(idx), launch_id=sweep_launch_id)
             rc = proc.wait()
+            if rc != 0:
+                failed_jobs.append((depth, norm, seed, rc))
             print(f'[sweep] finished d{depth}-{norm} seed={seed} rc={rc}')
     else:
         # A bounded launch queue: at most `max_parallel` training children
@@ -1160,6 +1166,11 @@ def main():
         artifacts={'sweep_comparisons': artifact_record(comp_path)},
     )
     save_run_manifest(base / 'run_manifest.json', sweep_manifest)
+    if jobs and len(failed_jobs) == len(jobs):
+        print(f'[sweep] ERROR: every one of the {len(jobs)} child run(s) failed; '
+              'the sweep produced no usable cell. See the per-seed logs above.',
+              file=sys.stderr)
+        raise SystemExit(1)
     print('[sweep] done')
 if __name__ == '__main__':
     main()
