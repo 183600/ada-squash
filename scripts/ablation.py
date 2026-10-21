@@ -1762,6 +1762,12 @@ def main():
     p.add_argument('--force', action='store_true')
     apply_config_to_parser(p, known.config)
     args = p.parse_args()
+    for flag, value in (('--batch-size', args.batch_size),
+                        ('--seq-len', args.seq_len),
+                        ('--log-every', args.log_every),
+                        ('--stats-every', args.stats_every)):
+        if value < 1:
+            p.error(f'{flag} {value} must be >= 1')
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or DEFAULT_SEEDS)
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
