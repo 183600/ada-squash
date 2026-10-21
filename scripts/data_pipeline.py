@@ -1026,6 +1026,30 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
             "exclude_group_file/exclude_test_group_file require group_key: the "
             "group hash ledger is keyed by the value at --group-key, and without "
             "it no held-out document can be matched to a listed group")
+    split = opts["split"]
+    group_key = opts.get("group_key")
+    if group_key and split in ("validation", "test"):
+        missing_group_ledgers = []
+        if not opts.get("exclude_group_file"):
+            missing_group_ledgers.append(
+                "--exclude-group-file (train<->held-out groups)")
+        if split == "test" and not opts.get("exclude_test_group_file"):
+            missing_group_ledgers.append(
+                "--exclude-test-group-file (validation<->test groups)")
+        if missing_group_ledgers:
+            # `group_key` alone excludes nothing: `DocumentCleaner` only drops
+            # cross-split groups when an earlier-side ledger lists them.
+            # Proceeding would leave sibling documents of training/selection
+            # groups inside this held-out split while the run still looks like
+            # it enforces group-disjoint evaluation.
+            raise ValueError(
+                f"group_key '{group_key}' is set but the {split} split is "
+                f"missing {missing_group_ledgers}: without those ledger(s) "
+                f"documents whose group already appeared on an earlier side "
+                f"would enter this split. Write them with "
+                f"scripts/audit_data.py --group-key {group_key} "
+                f"(--write-train-group-file / --write-val-group-file), or drop "
+                f"--group-key if groups do not need to stay whole.")
     from datasets import load_dataset
     from torch.utils.data import DataLoader
 
