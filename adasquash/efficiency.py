@@ -188,7 +188,9 @@ def efficiency_verdict(
     Every present component must stay within `max_component_ratio`
     (default: `max_cost_ratio`), so a win cannot hide a 10x memory or
     parameter blow-up behind one cheap primary cost. Components are reported
-    individually; a missing component is never treated as passing.
+    individually; a missing component is never treated as passing, and a value
+    that cannot be read as a finite non-negative ratio is a reported failure
+    rather than an exception.
 
     `cost_ratio_stderr` (with `cost_ratio_n`) turns the point estimate into a
     two-sided 95% Student-t interval. Certification then requires the
@@ -325,8 +327,8 @@ def efficiency_verdict(
                 f"round(s); at least 2 paired rounds are needed to certify the "
                 f"{cost_name} cost")
         verdict["component_failures"].append(failure)
-    for name, ratio in (cost_components or {}).items():
-        if ratio is None:
+    for name, raw_ratio in (cost_components or {}).items():
+        if raw_ratio is None:
             verdict["component_costs"][str(name)] = {
                 "ratio": None,
                 "acceptable": False,
@@ -334,7 +336,16 @@ def efficiency_verdict(
             verdict["component_failures"].append(
                 f"{name} is unmeasured; cannot certify it stays within {component_limit:.3f}x")
             continue
-        ratio = float(ratio)
+        try:
+            ratio = float(raw_ratio)
+        except (TypeError, ValueError):
+            verdict["component_costs"][str(name)] = {
+                "ratio": None,
+                "acceptable": False,
+            }
+            verdict["component_failures"].append(
+                f"{name} ratio {raw_ratio!r} is not a finite non-negative measurement")
+            continue
         valid = math.isfinite(ratio) and ratio >= 0.0
         acceptable = valid and ratio <= component_limit
         verdict["component_costs"][str(name)] = {
