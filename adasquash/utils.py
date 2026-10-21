@@ -30,8 +30,13 @@ class MaxAbsMeter:
             xd = x.detach().reshape(-1)
             v = self._abs_max(xd) if xd.numel() else None
             if v is not None:
+                if not torch.isfinite(v):
+                    # A non-finite activation is not a finite peak: record it
+                    # as NaN so the corruption is visible instead of being
+                    # masked by a finite running maximum.
+                    v = torch.full((), float('nan'), dtype=v.dtype, device=v.device)
                 if self._peak is None:
-                    self._peak = torch.full((), -float('inf'), dtype=v.dtype, device=v.device)
+                    self._peak = v.clone() if torch.isfinite(v) else v.clone()
                 elif self._peak.dtype != v.dtype or self._peak.device != v.device:
                     self._peak = self._peak.to(dtype=torch.promote_types(self._peak.dtype, v.dtype), device=v.device)
                 torch.fmax(self._peak, v, out=self._peak)
