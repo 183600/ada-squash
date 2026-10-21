@@ -567,10 +567,41 @@ def f1_from_counts(
         if support else 0.0
     )
     micro = (sum(tp) / support) if support else 0.0
+    # Per-class precision/recall, then macro/weighted/micro aggregates, so a
+    # caller whose research goal is recall (e.g. medical screening) or
+    # precision (e.g. alerting) can read the matching named quantity instead
+    # of inferring it from F1.
+    precision_by_class = {}
+    recall_by_class = {}
+    for i in present:
+        denom_p = tp[i] + fp[i]
+        denom_r = tp[i] + fn[i]
+        precision_by_class[i] = (tp[i] / denom_p) if denom_p else 0.0
+        recall_by_class[i] = (tp[i] / denom_r) if denom_r else 0.0
+    macro_precision = (sum(precision_by_class.values()) / len(precision_by_class)
+                       if precision_by_class else 0.0)
+    macro_recall = (sum(recall_by_class.values()) / len(recall_by_class)
+                    if recall_by_class else 0.0)
+    weighted_precision = (
+        sum(precision_by_class[i] * (tp[i] + fn[i]) for i in present) / support
+        if support else 0.0
+    )
+    weighted_recall = (
+        sum(recall_by_class[i] * (tp[i] + fn[i]) for i in present) / support
+        if support else 0.0
+    )
+    micro_precision = (sum(tp) / (sum(tp) + sum(fp))) if (sum(tp) + sum(fp)) else 0.0
+    micro_recall = (sum(tp) / (sum(tp) + sum(fn))) if (sum(tp) + sum(fn)) else 0.0
     return {
         "macro_f1": macro,
         "weighted_f1": weighted,
         "micro_f1": micro,
+        "macro_precision": macro_precision,
+        "weighted_precision": weighted_precision,
+        "micro_precision": micro_precision,
+        "macro_recall": macro_recall,
+        "weighted_recall": weighted_recall,
+        "micro_recall": micro_recall,
         "n_classes_present": len(present),
         "support": support,
     }
