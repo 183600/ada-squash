@@ -18,7 +18,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from adasquash import GPTConfig, GPT, count_parameters, ActivationStats, LossSpikeCounter
 from adasquash.attention import clear_logit_scratch_cache
-from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
+from adasquash.diagnostics import diagnose_train_val_curve, parameter_finite_report, tensor_finite_report, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import mean_ci, mean_std_stderr
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
@@ -90,6 +90,51 @@ def _atomic_torch_save(obj, path: Path) -> None:
                 tmp.unlink()
             except OSError:
                 pass
+
+def _checkpoint_nonfinite(model, opt) -> list:
+    """Non-finite weights or optimizer moments that must never be persisted.
+
+    A finite loss and finite gradients do not guarantee a finite optimizer
+    state: an overflow in `exp_avg_sq` can leave the weights finite at save
+    time and surface as a NaN on the next step. Writing such a checkpoint
+    silently destroys the last restorable state, so both the model and every
+    floating optimizer tensor are inspected before the atomic replace.
+    """
+    failures: list = []
+    report = parameter_finite_report(model)
+    if not report['finite']:
+        for entry in report['nonfinite_parameters']:
+            failures.append(f"parameter {entry['name']} (nan={entry['n_nan']}, inf={entry['n_inf']})")
+        for entry in report['nonfinite_buffers']:
+            failures.append(f"buffer {entry['name']} (nan={entry['n_nan']}, inf={entry['n_inf']})")
+    names = {id(p): name for name, p in model.named_parameters()}
+    for param, state in opt.state.items():
+        name = names.get(id(param), f"parameter#{id(param)}")
+        for key, value in state.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if not (value.is_floating_point() or value.is_complex()):
+                continue
+            finite = tensor_finite_report(value.detach())
+            if not finite['finite']:
+                failures.append(
+                    f"optimizer {name}.{key} (nan={finite['n_nan']}, inf={finite['n_inf']})")
+    return failures
+
+
+def _assert_checkpoint_finite(model, opt, path: Path, step: int) -> None:
+    failures = _checkpoint_nonfinite(model, opt)
+    if not failures:
+        return
+    shown = '; '.join(failures[:10])
+    more = '' if len(failures) <= 10 else f' (+{len(failures) - 10} more)'
+    raise SystemExit(
+        f'[ckpt] refusing to write {path} at step {step}: non-finite training state '
+        f'({shown}{more}). The previous checkpoint is kept. Restore it and run the '
+        f'NaN triage on the step that produced the overflow (data -> fp32 math -> '
+        f'mixed precision -> gradients) instead of persisting a checkpoint that is '
+        f'already corrupted.')
+
 
 def _load_checkpoint_cpu(path) -> dict:
     """Load a checkpoint on CPU (memory-mapped when the format allows).
@@ -1359,6 +1404,7 @@ def main():
                     if improved:
                         ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
                         path = Path(args.output_dir) / 'ckpt_best.pt'
+                        _assert_checkpoint_finite(model, opt, path, step)
                         _atomic_torch_save(ckpt_best, path)
                         print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
                     # Curve diagnosis: pair the held-out point with the mean
@@ -1439,6 +1485,7 @@ def main():
             if step % args.save_every == 0 and step > 0:
                 ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
                 path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
+                _assert_checkpoint_finite(model, opt, path, step)
                 _atomic_torch_save(ckpt, path)
                 print(f'[ckpt] saved {path}')
             if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
@@ -1446,6 +1493,7 @@ def main():
                 break
         ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'val_loss': last_val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance}
         path = Path(args.output_dir) / 'ckpt_final.pt'
+        _assert_checkpoint_finite(model, opt, path, step)
         _atomic_torch_save(ckpt, path)
         print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
         run_manifest['data']['split_reports'] = data_reports
