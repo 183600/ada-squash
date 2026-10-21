@@ -277,38 +277,50 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     rng = torch.Generator(device=device).manual_seed(seed)
     data_iter = None
     if args.dataset:
-        # Both loaders go through the same split configuration: the training
-        # boundary must reserve exactly the held-out validation range with the
-        # same cleaning policy, otherwise validation documents could overlap
-        # the documents the model trained on.
-        loader = open_data_split('train', args)
-        report = getattr(loader, 'split_report', None)
-        if report:
-            data_reports['train'] = report
-            # Pin the run (and its manifest) to the resolved upstream commits,
-            # not the mutable revision strings typed on the command line. This
-            # mirrors train_gpt2.py: a later rerun of the recorded manifest
-            # must select the same documents and tokenizer.
-            resolved_revision = report.get('dataset_revision_resolved')
-            current_revision = getattr(args, 'dataset_revision', None)
-            if resolved_revision and resolved_revision != current_revision:
-                print(f'[moe][data] dataset revision pinned: {current_revision!r} -> {resolved_revision}')
-                args.dataset_revision = resolved_revision
-            resolved_tokenizer = report.get('tokenizer_revision_resolved')
-            current_tokenizer = getattr(args, 'tokenizer_revision', None)
-            if resolved_tokenizer and resolved_tokenizer != current_tokenizer:
-                print(f'[moe][data] tokenizer revision pinned: {current_tokenizer!r} -> {resolved_tokenizer}')
-                args.tokenizer_revision = resolved_tokenizer
-            run_manifest['hyperparameters'] = vars(args)
-            run_manifest['data'].update({
-                'dataset_revision': getattr(args, 'dataset_revision', None),
-                'tokenizer_revision': getattr(args, 'tokenizer_revision', None),
-                'dataset_revision_resolved': resolved_revision,
-                'tokenizer_revision_resolved': resolved_tokenizer,
-            })
+        try:
+            # Both loaders go through the same split configuration: the training
+            # boundary must reserve exactly the held-out validation range with the
+            # same cleaning policy, otherwise validation documents could overlap
+            # the documents the model trained on.
+            loader = open_data_split('train', args)
+            report = getattr(loader, 'split_report', None)
+            if report:
+                data_reports['train'] = report
+                # Pin the run (and its manifest) to the resolved upstream commits,
+                # not the mutable revision strings typed on the command line. This
+                # mirrors train_gpt2.py: a later rerun of the recorded manifest
+                # must select the same documents and tokenizer.
+                resolved_revision = report.get('dataset_revision_resolved')
+                current_revision = getattr(args, 'dataset_revision', None)
+                if resolved_revision and resolved_revision != current_revision:
+                    print(f'[moe][data] dataset revision pinned: {current_revision!r} -> {resolved_revision}')
+                    args.dataset_revision = resolved_revision
+                resolved_tokenizer = report.get('tokenizer_revision_resolved')
+                current_tokenizer = getattr(args, 'tokenizer_revision', None)
+                if resolved_tokenizer and resolved_tokenizer != current_tokenizer:
+                    print(f'[moe][data] tokenizer revision pinned: {current_tokenizer!r} -> {resolved_tokenizer}')
+                    args.tokenizer_revision = resolved_tokenizer
+                run_manifest['hyperparameters'] = vars(args)
+                run_manifest['data'].update({
+                    'dataset_revision': getattr(args, 'dataset_revision', None),
+                    'tokenizer_revision': getattr(args, 'tokenizer_revision', None),
+                    'dataset_revision_resolved': resolved_revision,
+                    'tokenizer_revision_resolved': resolved_tokenizer,
+                })
+                save_run_manifest(manifest_path, run_manifest)
+                print(f'[moe][data] train split: {report}')
+            data_iter = iter(loader)
+        except BaseException:
+            # The training try/finally starts only after the helpers below, so
+            # an unreadable split here would otherwise leave a permanently
+            # 'running' manifest behind. Record the setup failure and re-raise.
+            run_manifest['status'] = 'failed'
+            run_manifest['failed_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            run_manifest['results_partial'] = {'steps_completed': 0,
+                                               'last_step': None, 'last_loss': None,
+                                               'n_loss_spikes': 0}
             save_run_manifest(manifest_path, run_manifest)
-            print(f'[moe][data] train split: {report}')
-        data_iter = iter(loader)
+            raise
 
     def random_probe_batch(generator):
         x = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len),
