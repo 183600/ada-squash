@@ -489,12 +489,12 @@ def welch_t_one_sided(
     vb = sum((v - mb) ** 2 for v in b) / (nb - 1)
     delta = ma - mb
     se = math.sqrt(va / na + vb / nb)
-    df = float(na + nb - 2)
+    df = float(max(1, na + nb - 2))
     if se > 0.0:
         spread_a, spread_b = va / na, vb / nb
         denom = spread_a ** 2 / (na - 1) + spread_b ** 2 / (nb - 1)
         if denom > 0.0:
-            df = (spread_a + spread_b) ** 2 / denom
+            df = max(1.0, (spread_a + spread_b) ** 2 / denom)
     if se == 0.0:
         t = float("-inf") if delta + margin < 0.0 else (float("inf") if delta + margin > 0.0 else 0.0)
     else:
