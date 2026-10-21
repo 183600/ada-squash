@@ -1851,6 +1851,12 @@ def main():
     p.add_argument('--allow-uncertified', action='store_true', help='allow running with <3 seeds (certification will be disabled); by default <3 seeds is an error')
     apply_config_to_parser(p, known.config)
     args = p.parse_args()
+    if not args.simple_baselines_enabled and (args.auto_simple_baselines
+                                              or args.require_simple_baselines):
+        p.error('--no-simple-baselines cannot be combined with '
+                '--auto-simple-baselines or --require-simple-baselines: the '
+                'calibration is explicitly disabled, so those requests cannot '
+                'be honored')
     for flag, value in (('--batch-size', args.batch_size),
                         ('--seq-len', args.seq_len),
                         ('--log-every', args.log_every),
