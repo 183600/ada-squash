@@ -610,7 +610,7 @@ def main():
             record = {k: v for k, v in per_ckpt[0]['per_seed'][j].items() if not k.startswith('__')}
             for key in _FP8_SEED_METRIC_KEYS:
                 vals = [c['per_seed'][j][key] for c in per_ckpt
-                        if isinstance(c['per_seed'][j].get(key), (int, float))]
+                        if _finite_metric(c['per_seed'][j].get(key))]
                 if vals:
                     record[key] = sum(vals) / len(vals)
             flags = [c['per_seed'][j] for c in per_ckpt]
@@ -640,7 +640,7 @@ def main():
             for rec in c['per_seed']:
                 for key in _FP8_SEED_METRIC_KEYS:
                     value = rec.get(key)
-                    if isinstance(value, (int, float)):
+                    if _finite_metric(value):
                         bucket[key].append(float(value))
         r['per_train_seed'] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
                                for ts, bucket in per_train_seed.items()}
