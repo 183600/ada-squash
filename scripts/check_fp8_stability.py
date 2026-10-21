@@ -35,8 +35,9 @@ DEFAULT_SEEDS = (42, 43, 44)
 #   because "norm A is more FP8-stable" is a claim about training runs, not
 #   about one draw of probe batches on one trained model. In random-init mode
 #   each seed re-initializes the model too, so the paired test does cover
-#   independent (init, probe) draws and stays certifiable - but it still says
-#   nothing about trained weights.
+#   independent (init, probe) draws and is certifiable once there are at least
+#   three of them - but it still says nothing about trained weights. Two
+#   independent draws (df = 1) are descriptive only, like two training seeds.
 # The comparison is saved next to the results as `comparison.json`.
 _FP8_SEED_METRIC_KEYS = (
     'max_abs_pre_norm', 'max_abs_post_norm', 'mean_excess_kurtosis_pre_norm',
@@ -420,8 +421,9 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
       winner from repeated probes of one run per arm.
     * `trained=False` (fresh random init): each seed re-initializes the model
       as well as the probe, so `basis='independent_random_inits'` pairs
-      independent (init, probe) draws and is certifiable - with the standing
-      caveat that a random init says nothing about trained weights.
+      independent (init, probe) draws. It is certifiable only with >= 3
+      shared draws; two (df = 1) are descriptive. The standing caveat is that
+      a random init says nothing about trained weights.
     """
     labels = [str(r.get('norm') or r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
     tests = []
