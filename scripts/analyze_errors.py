@@ -168,6 +168,9 @@ def data_protocol_mismatches(args, model_args: dict) -> dict:
         'group_key': args.group_key,
         'exclude_group_file': args.exclude_group_file,
         'exclude_test_group_file': args.exclude_test_group_file,
+        'seq_len': args.seq_len,
+        'batch_size': args.batch_size,
+        'num_workers': args.num_workers,
     }
     out = {}
     for key, value in current.items():

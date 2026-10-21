@@ -330,6 +330,7 @@ def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
         '--max-doc-chars', str(args.max_doc_chars),
         '--num-workers', str(args.num_workers),
         '--seq-len', str(args.seq_len),
+        '--batch-size', str(args.batch_size),
         '--n-batches', str(args.error_analysis_batches),
         '--max-examples', str(args.error_analysis_examples),
         '--confidence', str(args.error_analysis_confidence),
