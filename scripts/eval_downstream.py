@@ -181,7 +181,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         # up to one prompt shorter than the requested length, so trials were
         # silently scored at different (and smaller) than reported contexts.
         body = prompt_ids * n_repeats + prompt_ids[:remainder]
-        pos = rng.randint(0, max(1, len(body) - 1))
+        pos = rng.randint(0, len(body))
         full = body[:pos] + needle_ids + body[pos:] + question_ids
         contexts.append((pos, full))
     n_run = len(contexts)
