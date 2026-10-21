@@ -198,7 +198,9 @@ def efficiency_verdict(
     old point-estimate rule applies when no round count is supplied; if
     `cost_ratio_n` is supplied (a stochastic benchmark) but the stderr is
     missing, certification fails closed because a single timing has no
-    resolution of its own.
+    resolution of its own. A supplied round count below 2 also fails closed
+    even if a stderr is present: one round has no degrees of freedom, so a
+    zero stderr cannot turn a single timing into a zero-width interval.
 
     `statistically_significant=None` means the significance gate was **not
     established** (no comparison row, or no significance test was run), not
@@ -244,30 +246,40 @@ def efficiency_verdict(
         candidate_se = float(cost_ratio_stderr)
         if math.isfinite(candidate_se) and candidate_se >= 0.0:
             cost_se = candidate_se
+    cost_n = None if cost_ratio_n is None else int(cost_ratio_n)
+    enough_rounds = cost_n is None or cost_n >= 2
     if cost_se is not None:
-        if cost_ratio_n is None:
+        verdict["cost_ratio_stderr"] = cost_se
+    if cost_n is not None:
+        verdict["cost_ratio_n"] = cost_n
+    if cost_se is not None and enough_rounds:
+        if cost_n is None:
             t_crit = 1.96
             df = None
         else:
-            df = max(1, int(cost_ratio_n) - 1)
+            df = cost_n - 1
             t_crit = _t_critical_95(df)
         half = t_crit * cost_se
         verdict["cost_ratio_ci_95"] = [max(0.0, cost - half), cost + half]
-        verdict["cost_ratio_stderr"] = cost_se
-        verdict["cost_ratio_n"] = None if cost_ratio_n is None else int(cost_ratio_n)
         verdict["cost_ratio_ci_95_df"] = df
-    # A round count without a standard error means the caller tried to
-    # benchmark a stochastic cost but did not produce >= 2 paired rounds.
-    # A single timing has no resolution of its own: the point estimate cannot
-    # prove the cost stays within the cap, so certification must fail closed.
+    # A round count without a standard error has no resolution, and a supplied
+    # round count below 2 has no degrees of freedom: in either case the point
+    # estimate cannot prove the cost stays within the cap, so certification
+    # must fail closed.
     verdict["cost_uncertainty_certified"] = (
-        None if cost_ratio_n is None else cost_se is not None)
+        None if cost_n is None else (cost_se is not None and enough_rounds))
     component_limit = verdict["max_component_ratio"]
     if verdict["cost_uncertainty_certified"] is False:
-        verdict["component_failures"].append(
-            f"cost ratio has no uncertainty estimate from {int(cost_ratio_n)} "
-            f"round(s); at least 2 paired rounds are needed to certify the "
-            f"{cost_name} cost")
+        if cost_se is not None:
+            failure = (
+                f"cost ratio was measured in {cost_n} round(s); at least 2 "
+                f"paired rounds are needed to certify the {cost_name} cost")
+        else:
+            failure = (
+                f"cost ratio has no uncertainty estimate from {cost_n} "
+                f"round(s); at least 2 paired rounds are needed to certify the "
+                f"{cost_name} cost")
+        verdict["component_failures"].append(failure)
     for name, ratio in (cost_components or {}).items():
         if ratio is None:
             verdict["component_costs"][str(name)] = {
