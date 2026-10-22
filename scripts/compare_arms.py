@@ -102,6 +102,10 @@ def _shape_signature(agg: dict):
     return next(iter(signatures))
 
 
+def _signature_unknown(value) -> bool:
+    return value is None or value == 'MIXED'
+
+
 def _final_step(agg: dict):
     per_seed = agg.get('per_seed') if isinstance(agg, dict) else None
     if not isinstance(per_seed, list):
@@ -204,13 +208,16 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
     data_values = {sig['data_version'] for sig in signatures.values()}
     model_values = {sig['model'] for sig in signatures.values()}
     protocol_problems = []
-    if len(shape_values) != 1 or 'MIXED' in shape_values or None in shape_values:
+    def _has_unknown(values) -> bool:
+        return any(_signature_unknown(value) for value in values)
+
+    if len(shape_values) != 1 or _has_unknown(shape_values):
         protocol_problems.append(f'model shapes differ or are unknown: {sorted(map(str, shape_values))}')
-    if len(step_values) != 1 or None in step_values:
+    if len(step_values) != 1 or _has_unknown(step_values):
         protocol_problems.append(f'final step differs or is unknown: {sorted(map(str, step_values))}')
-    if len(data_values) != 1 or None in data_values:
+    if len(data_values) != 1 or _has_unknown(data_values):
         protocol_problems.append(f'data versions differ or are unknown: {sorted(map(str, data_values))}')
-    if len(model_values) != 1 or None in model_values:
+    if len(model_values) != 1 or _has_unknown(model_values):
         protocol_problems.append(f'model selectors differ or are unknown: {sorted(map(str, model_values))}')
     protocol_ok = not protocol_problems
 
@@ -223,22 +230,17 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         # contrasts, and a candidate at a different scale must not be
         # certified against the reference.
         pair_problems = []
-        if signatures[name]['shape'] != signatures[reference]['shape']:
-            pair_problems.append(
-                f"model shape differs: {signatures[name]['shape']} vs "
-                f"{signatures[reference]['shape']}")
-        if signatures[name]['final_step'] != signatures[reference]['final_step']:
-            pair_problems.append(
-                f"final step differs: {signatures[name]['final_step']} vs "
-                f"{signatures[reference]['final_step']}")
-        if signatures[name]['data_version'] != signatures[reference]['data_version']:
-            pair_problems.append(
-                f"data version differs: {signatures[name]['data_version']} vs "
-                f"{signatures[reference]['data_version']}")
-        if signatures[name]['model'] != signatures[reference]['model']:
-            pair_problems.append(
-                f"model selector differs: {signatures[name]['model']} vs "
-                f"{signatures[reference]['model']}")
+        for field, label in (('shape', 'model shape'), ('final_step', 'final step'),
+                             ('data_version', 'data version'),
+                             ('model', 'model selector')):
+            candidate_value = signatures[name][field]
+            reference_value = signatures[reference][field]
+            if (_signature_unknown(candidate_value)
+                    or _signature_unknown(reference_value)
+                    or candidate_value != reference_value):
+                pair_problems.append(
+                    f'{label} differs or is unknown: {candidate_value} vs '
+                    f'{reference_value}')
         cand_hyper = ((manifests.get(name) or {}).get('hyperparameters')
                       if isinstance(manifests.get(name), dict) else None)
         ref_hyper = ((manifests.get(reference) or {}).get('hyperparameters')
@@ -250,11 +252,14 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                 pair_problems.append(
                     'training recipe differs: '
                     + json.dumps(recipe_mismatches, sort_keys=True))
-        elif require_recipe:
+        else:
+            # A missing recipe is unknown, not equal. `--allow-missing-recipe`
+            # permits the comparison to be produced, but it can never certify:
+            # the optimizer/schedule/token budget was not checked.
             pair_problems.append(
                 'training recipe (optimizer/schedule/token budget) was not recorded '
-                'for one or both arms; pass --allow-missing-recipe only for an '
-                'exploratory comparison')
+                'for one or both arms; the comparison is descriptive only'
+                + ('' if require_recipe else ' (--allow-missing-recipe)'))
         pair_protocol_ok = not pair_problems
         common = sorted(set(cand['values']) & set(ref['values']))
         entry = {
