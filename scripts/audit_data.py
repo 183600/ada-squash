@@ -427,6 +427,27 @@ def main():
     p.add_argument('--output', default='runs/data_audit.json')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this audit tests; recorded in the report and manifest so the result is auditable as a test of a claim rather than a fishing trip')
     args = p.parse_args()
+    for flag, value in (('--n-docs', args.n_docs),
+                        ('--min-doc-chars', args.min_doc_chars),
+                        ('--max-doc-chars', args.max_doc_chars)):
+        if value < 0:
+            raise SystemExit(f'{flag} {value} must be >= 0')
+    if args.max_doc_chars and args.min_doc_chars > args.max_doc_chars:
+        raise SystemExit(
+            f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
+            f'{args.max_doc_chars}; no document could pass the cleaner')
+    for flag, value in (('--val-frac', args.val_frac), ('--test-frac', args.test_frac)):
+        if not math.isfinite(value) or value < 0.0:
+            raise SystemExit(f'{flag} {value} must be finite and >= 0')
+    if args.val_frac + args.test_frac > 1.0:
+        raise SystemExit(
+            f'--val-frac {args.val_frac} + --test-frac {args.test_frac} exceeds 1.0; '
+            'the splits would overlap instead of tiling the stream')
+    for flag, value in (('--max-tvd', args.max_tvd),
+                        ('--max-test-tvd', args.max_test_tvd),
+                        ('--max-val-test-tvd', args.max_val_test_tvd)):
+        if value is not None and (not math.isfinite(value) or value < 0.0):
+            raise SystemExit(f'{flag} {value} must be finite and >= 0')
     if (args.write_train_group_file or args.write_val_group_file) and not args.group_key:
         raise SystemExit('--write-*-group-file requires --group-key')
     try:
@@ -702,6 +723,19 @@ def main():
     if (args.max_val_test_tvd is not None and shift['validation_vs_test_tvd'] is not None
             and shift['validation_vs_test_tvd'] > args.max_val_test_tvd):
         problems.append(f"validation-vs-test distribution shift TVD={shift['validation_vs_test_tvd']:.4f} > max-val-test-tvd={args.max_val_test_tvd}")
+    for flag, cap, key, label in (
+            ('--max-tvd', args.max_tvd, 'train_vs_validation_tvd_effective',
+             'train-vs-validation'),
+            ('--max-test-tvd', args.max_test_tvd, 'train_vs_test_tvd_effective',
+             'train-vs-test'),
+            ('--max-val-test-tvd', args.max_val_test_tvd, 'validation_vs_test_tvd_effective',
+             'validation-vs-test')):
+        value = shift.get(key)
+        if cap is not None and value is not None and value > cap:
+            problems.append(
+                f"{label} distribution shift TVD={value:.4f} after the cross-split "
+                f"ledgers > {flag}={cap}; the effective held-out distribution is the "
+                "one the model is actually selected and reported on")
     manifest = {
         'run_metadata': out['run_metadata'],
         'hypothesis': args.hypothesis,
