@@ -41,6 +41,16 @@ def _finite(value) -> bool:
             and math.isfinite(float(value)))
 
 
+def _reported_p(primary, fallback):
+    """The Holm p when it is a real value, else the unadjusted p.
+
+    A producer may emit the `p_*_holm` key with a null value for a row that
+    was excluded from its family; that null is not a p-value and must not hide
+    the raw one.
+    """
+    return primary if _finite(primary) else fallback
+
+
 def _match_quality(label, target: str) -> int:
     """2 = exact/arm label, 1 = same basename, 0 = no match."""
     label = str(label or '')
@@ -115,7 +125,8 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
         # A reversed pair tests the opposite one-sided hypothesis; keep it as a
         # descriptive sign observation but never inherit its certification.
         'certified': bool(entry.get('significant')) if orientation == 'candidate_vs_reference' else False,
-        'p_one_sided': entry.get('p_holm', entry.get('p_one_sided')) if orientation == 'candidate_vs_reference' else None,
+        'p_one_sided': (_reported_p(entry.get('p_holm'), entry.get('p_one_sided'))
+                        if orientation == 'candidate_vs_reference' else None),
         'n_seeds': (entry.get('n_shared_train_seeds')
                     if entry.get('n_shared_train_seeds') not in (None, 0)
                     else entry.get('n_shared_seeds', entry.get('n_seeds'))),
@@ -153,7 +164,8 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
             'delta': delta,
             'certified': (bool(row.get('beats_reference_significantly'))
                           if orientation == 'candidate_vs_reference' else False),
-            'p_one_sided': (row.get('p_one_sided_holm', row.get('p_one_sided'))
+            'p_one_sided': (_reported_p(row.get('p_one_sided_holm'),
+                                        row.get('p_one_sided'))
                             if orientation == 'candidate_vs_reference' else None),
             'n_seeds': len(row.get('paired_seeds') or []),
             'orientation': orientation,
