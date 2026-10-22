@@ -255,10 +255,15 @@ def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
         # Counting rows is not enough: two samples of round 1 and none of round
         # 2 would still pass a length check while leaving the interleaving (and
         # therefore the drift cancellation) unverified.
-        measured_rounds = {r.get('round') for r in norm_rows}
-        if measured_rounds != set(range(rounds)):
+        raw_rounds = [r.get('round') for r in norm_rows]
+        measured_rounds = set(raw_rounds)
+        valid_rounds = all(
+            isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value < rounds for value in raw_rounds)
+        if not valid_rounds or measured_rounds != set(range(rounds)):
             raise ValueError(
-                f'norm {norm!r} measured round(s) {sorted(measured_rounds)} but expected '
+                f'norm {norm!r} measured round(s) '
+                f'{sorted(measured_rounds, key=repr)} but expected '
                 f'0..{rounds - 1}; refusing to average a mis-numbered round set')
         base = dict(norm_rows[0])
         for key in _LATENCY_MEAN_KEYS:
