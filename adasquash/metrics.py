@@ -896,9 +896,13 @@ def recall_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int
     relevant = list(relevant)
     if len(ranked) != len(relevant):
         raise ValueError(f"ranked/relevant query count mismatch: {len(ranked)} vs {len(relevant)}")
+    k = int(k)
+    if k < 1:
+        # Keep the reported depth honest: silently clamping top-0 to top-1
+        # reports a retrieval result that was not requested.
+        raise ValueError(f"recall_at_k needs k >= 1, got {k}")
     if not ranked:
         return None
-    k = max(1, int(k))
     recalls = []
     for r, rel in zip(ranked, relevant):
         rel_set = set(rel)
@@ -922,11 +926,14 @@ def ndcg_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]]
     relevant = list(relevant)
     if len(ranked) != len(relevant):
         raise ValueError(f"ranked/relevant query count mismatch: {len(ranked)} vs {len(relevant)}")
+    k = int(k)
+    if k < 1:
+        # top-0 is not an evaluated depth; do not silently report top-1.
+        raise ValueError(f"ndcg_at_k needs k >= 1, got {k}")
     if not ranked:
         return None
     if not any(rel for rel in relevant):
         return None
-    k = max(1, int(k))
     ndcgs = []
     for r, rel in zip(ranked, relevant):
         rel_set = set(rel)
