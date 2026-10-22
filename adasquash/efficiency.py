@@ -271,8 +271,14 @@ def efficiency_verdict(
             "loss improvement/cost ratio is a boolean, not a measurement; "
             "nothing to certify")
         return verdict
-    gain = float(loss_improvement)
-    cost = float(cost_ratio)
+    try:
+        gain = float(loss_improvement)
+        cost = float(cost_ratio)
+    except (TypeError, ValueError, OverflowError):
+        verdict["reason"] = (
+            "loss improvement/cost ratio cannot be read as a finite measurement; "
+            "nothing to certify")
+        return verdict
     if not math.isfinite(gain):
         verdict["reason"] = (
             f"loss improvement {gain!r} is not a finite measurement; nothing to certify")
@@ -295,7 +301,7 @@ def efficiency_verdict(
         else:
             try:
                 candidate_se = float(cost_ratio_stderr)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 invalid_se = repr(cost_ratio_stderr)
                 candidate_se = None
         if invalid_se is None:
@@ -386,7 +392,7 @@ def efficiency_verdict(
             continue
         try:
             ratio = float(raw_ratio)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             verdict["component_costs"][str(name)] = {
                 "ratio": None,
                 "acceptable": False,
@@ -414,10 +420,12 @@ def efficiency_verdict(
     # malformed stderr explicitly failed uncertainty certification, the cost
     # cannot simultaneously be reported as confidently acceptable.
     verdict["cost_confidently_acceptable"] = bool(
-        verdict["cost_uncertainty_certified"] is not False
+        not cost_is_proxy
+        and verdict["cost_uncertainty_certified"] is not False
         and (ci_upper is None or ci_upper <= float(max_cost_ratio)))
     verdict["cost_acceptable"] = bool(
-        cost <= float(max_cost_ratio)
+        not cost_is_proxy
+        and cost <= float(max_cost_ratio)
         and verdict["cost_confidently_acceptable"]
         and not verdict["component_failures"])
     # A gain that the seed-level comparison could not call significant is weak
