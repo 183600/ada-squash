@@ -248,10 +248,15 @@ def git_revision() -> dict:
         if lines and lines[0].startswith("## "):
             header = lines[0][3:].strip()
             if header.startswith("No commits yet"):
-                # Unborn repository: the header names the branch-to-be
-                # (`## No commits yet on master`) but no branch exists yet,
-                # so ask `rev-parse --abbrev-ref HEAD`.
-                branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
+                # Unborn repository: the header itself names the branch-to-be
+                # (`## No commits yet on master`). `rev-parse --abbrev-ref
+                # HEAD` fails because HEAD points at no commit, so parse the
+                # header and fall back to `symbolic-ref`.
+                marker = "No commits yet on "
+                branch = (header[len(marker):].strip()
+                          if header.startswith(marker) else None)
+                if not branch:
+                    branch = _run_git("symbolic-ref", "--short", "HEAD")
             else:
                 name = header.split("...")[0].split(" ")[0]
                 branch = name or None
