@@ -870,6 +870,10 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
         cmd.append('--no-sanity-check')
     if args.compile:
         cmd.append('--compile')
+    # `compile_mode` is part of the recorded child protocol even when
+    # compilation is off, so a non-default value must reach the child or
+    # every aggregate rejects the manifest as a protocol mismatch.
+    if args.compile or args.compile_mode != 'reduce-overhead':
         cmd += ['--compile-mode', args.compile_mode]
     # Every cell carries the hypothesis the sweep tests, recorded in the run
     # manifest: the reference cell establishes the bar, a candidate cell
