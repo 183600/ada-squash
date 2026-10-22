@@ -447,6 +447,14 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                      or (isinstance(p['final_val_loss'], float) and not math.isfinite(p['final_val_loss']))]
     seeds_without_final = [p['seed'] for p in per_seed
                            if not _finite(p['final_val_loss'])]
+    # A cell is one architecture. Seeds that report different shapes are not
+    # independent replications of the same depth/norm cell and must not be
+    # pooled into a certifiable mean.
+    shape_signatures = {
+        (p.get('n_layers'), p.get('dim'), p.get('n_heads'))
+        for p in per_seed
+        if any(_finite(p.get(k)) for k in ('n_layers', 'dim', 'n_heads'))}
+    shape_consistent = len(shape_signatures) <= 1
     return {
         'cell': cell_dir.name,
         'launch_id': launch_id,
@@ -458,7 +466,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         'complete': (len(missing_seeds) == 0 and len(invalid_seeds) == 0
                      and not seeds_without_final
                      and not rejected and data_versions_complete
-                     and not data_version_mismatch),
+                     and not data_version_mismatch
+                     and shape_consistent),
         'manifest_rejections': rejected,
         'protocol_verified_by_launch_id': launch_id is not None,
         # A cell is only one data version: if the resolved upstream commits
@@ -497,9 +506,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         'n_heads': heads[0] if heads else None,
         'shape_by_seed': {p['seed']: {'n_layers': p.get('n_layers'), 'dim': p.get('dim'),
                                       'n_heads': p.get('n_heads')} for p in per_seed},
-        'shape_consistent_across_seeds': len({(p.get('n_layers'), p.get('dim'), p.get('n_heads'))
-                                              for p in per_seed
-                                              if any(_finite(p.get(k)) for k in ('n_layers', 'dim', 'n_heads'))}) <= 1,
+        'shape_consistent_across_seeds': shape_consistent,
         'norm_share_of_params': (sum(norm_shares) / len(norm_shares)) if norm_shares else None,
         'flops_per_token_forward': (sum(flops_fwd) / len(flops_fwd)) if flops_fwd else None,
         'flops_per_token_training_est': (sum(flops_train) / len(flops_train)) if flops_train else None,
