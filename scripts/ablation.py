@@ -46,6 +46,16 @@ Comparison protocol (what the runner guarantees, and checks)
   ladder (`--auto-simple-baselines`) and can make a missing calibration a
   hard failure (`--require-simple-baselines`); `--no-simple-baselines` is the
   explicit, recorded opt-out.
+* **Tuned baseline certificate.** A win over a fixed-recipe baseline is not a
+  win over a *tuned* baseline. `--baseline-tuning` consumes the
+  `tuning_summary.json` from `scripts/tune.py` and records whether the
+  baseline's selected (lr, weight_decay) cell is the matrix's fixed recipe,
+  whether tune.py confirmed it on held-back seeds, and whether the task,
+  step budget, batch/sequence shape and selection seeds match this matrix.
+  `--require-baseline-tuning` makes a missing or non-certifying report a hard
+  failure before training; otherwise the comparison is still written with an
+  explicit `baseline_tuning.status`/`certified_against_tuned_reference=false`
+  so a reader cannot mistake it for a tuned-baseline result.
 """
 import argparse
 import dataclasses
@@ -1276,6 +1286,17 @@ def print_baseline_comparison(comparison: dict | None) -> None:
               'Bayes limits (see simple_baseline.how_to_generate in the JSON)')
     elif calibration_status == 'explicitly_disabled':
         print('[compare] calibration: explicitly disabled (--no-simple-baselines)')
+    tuning = comparison.get('baseline_tuning') or {}
+    if tuning.get('certified_against_tuned_reference'):
+        print(f"[compare] baseline tuning: CERTIFIED against {tuning.get('reference_row')!r} "
+              f"at the matrix recipe (source: {tuning.get('source')})")
+    elif tuning.get('status') == 'not_requested':
+        print('[compare] baseline tuning: not requested - results are vs fixed-recipe '
+              'baselines, not a certified tuned baseline (see baseline_tuning.how_to_generate)')
+    else:
+        why = tuning.get('why_not_certified') or [tuning.get('status') or 'missing']
+        print('[compare] baseline tuning: NOT CERTIFIED - '
+              f"{'; '.join(str(item) for item in why)}")
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_holm = entry.get('p_one_sided_holm')
@@ -1423,6 +1444,177 @@ def run_simple_baseline_calibration(path, seeds, args) -> dict | None:
         raise SystemExit(f'[compare] ERROR: simple-baseline calibration wrote {path} but it '
                          f'does not parse as a calibration report')
     return data
+
+
+def _baseline_tuning_protocol_mismatches(protocol: dict, args, seeds) -> list:
+    """Fields where a tune.py report describes a different matrix recipe."""
+    expected = {
+        'model': args.model,
+        'max_steps': args.max_steps,
+        'batch_size': args.batch_size,
+        'seq_len': args.seq_len,
+        'val_batches': max(1, int(getattr(args, 'val_batches', 20))),
+    }
+    mismatches = [f'{key}={protocol.get(key)!r} != {want!r}'
+                  for key, want in expected.items() if protocol.get(key) != want]
+    recorded = protocol.get('selection_seeds')
+    if not isinstance(recorded, list) or set(int(seed) for seed in recorded) != set(seeds):
+        mismatches.append(f'selection_seeds={recorded!r} != {sorted(seeds)!r} '
+                          '(the baseline lr must be selected on the same independent runs)')
+    return mismatches
+
+
+def _tuning_cell(arm: dict, lr: float, weight_decay: float):
+    """The recorded (lr, wd) cell of a tune.py arm, or None."""
+    for cell in (arm.get('lr_grid') or {}).values():
+        if (isinstance(cell, dict)
+                and cell.get('lr') == float(lr)
+                and cell.get('weight_decay') == float(weight_decay)):
+            return cell
+    return None
+
+
+def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
+    """Load the compute-matched tune.py report and certify the baseline recipe.
+
+    A matrix at one fixed recipe can only claim a win over a *tuned* baseline
+    if the baseline's selected ``(lr, weight_decay)`` cell is that same recipe
+    and the selection was confirmed on held-back seeds. The report is also
+    rejected when its task/protocol (model, steps, batch/sequence, held-out
+    batch count or selection seeds) differs from this matrix: a baseline tuned
+    on another task cannot certify this comparison.
+
+    Returns ``None`` (with a warning) for a missing, unreadable or
+    protocol-mismatched file. `main` turns that into a hard error under
+    ``--require-baseline-tuning``; otherwise the comparison is still written
+    but explicitly marked as not certified against a tuned reference.
+    """
+    path = Path(path)
+    if not path.exists():
+        print(f'[tune-cert] WARNING: baseline tuning report {path} does not exist')
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f'[tune-cert] WARNING: cannot read baseline tuning report {path}: {exc}')
+        return None
+    if not isinstance(data, dict):
+        print(f'[tune-cert] WARNING: {path} is not a tuning summary object')
+        return None
+    protocol = data.get('protocol') or {}
+    arms = data.get('arms') or {}
+    if not isinstance(protocol, dict) or not isinstance(arms, dict):
+        print(f'[tune-cert] WARNING: {path} has no protocol/arms block')
+        return None
+    mismatches = _baseline_tuning_protocol_mismatches(protocol, args, seeds)
+    if mismatches:
+        print(f'[tune-cert] WARNING: ignoring {path}: it describes a different matrix '
+              f'recipe ({"; ".join(mismatches)})')
+        return None
+    weight_decays = protocol.get('weight_decays')
+    if not isinstance(weight_decays, list):
+        weight_decays = [protocol.get('weight_decay')]
+    recipe_in_grid = (any(isinstance(wd, (int, float)) and float(wd) == args.weight_decay
+                          for wd in weight_decays)
+                      and any(isinstance(lr, (int, float)) and float(lr) == args.lr
+                              for lr in (protocol.get('lrs') or [])))
+    tuning_confirmed = bool((data.get('comparison') or {}).get('certified'))
+    per_baseline = {}
+    for row_name in args.baselines:
+        norm_name = (rows.get(row_name) or {}).get('norm_name')
+        arm = arms.get(norm_name) if norm_name else None
+        best = (arm or {}).get('best') if isinstance(arm, dict) else None
+        entry = {
+            'row': row_name,
+            'norm': norm_name,
+            'found': isinstance(best, dict),
+            'selected_lr': None if not isinstance(best, dict) else best.get('lr'),
+            'selected_weight_decay': None if not isinstance(best, dict) else best.get('weight_decay'),
+            'selected_val_loss': None if not isinstance(best, dict) else best.get('mean'),
+            'confirm_complete': bool(((arm or {}).get('confirm') or {}).get('complete_coverage')),
+            'confirm_val_loss': (((arm or {}).get('confirm') or {}).get('stats') or {}).get('mean'),
+            'recipe_in_grid': recipe_in_grid,
+            'fixed_recipe_cell_val_loss': None,
+            'recipe_is_selected_cell': False,
+        }
+        if isinstance(best, dict):
+            entry['recipe_is_selected_cell'] = (
+                entry['selected_lr'] == args.lr
+                and entry['selected_weight_decay'] == args.weight_decay)
+            cell = _tuning_cell(arm, args.lr, args.weight_decay)
+            if cell is not None:
+                entry['fixed_recipe_cell_val_loss'] = cell.get('mean')
+        per_baseline[row_name] = entry
+    found = [entry for entry in per_baseline.values() if entry['found']]
+    if not found:
+        print(f'[tune-cert] WARNING: {path} has no tuned arm for any baseline '
+              f'{args.baselines}')
+        return None
+    # Rank by the confirm split when every candidate has one, otherwise by the
+    # selection grid mean (the same preference tune.py itself uses).
+    rank_key = ((lambda entry: entry['confirm_val_loss'])
+                if all(entry['confirm_complete'] and _finite_metric(entry['confirm_val_loss'])
+                       for entry in found)
+                else (lambda entry: entry['selected_val_loss']))
+    best_row = min(found, key=rank_key)['row']
+    all_at_recipe = all(entry['recipe_is_selected_cell'] for entry in found)
+    block = {
+        'source': str(path),
+        'protocol_checked': True,
+        'recipe': {'lr': args.lr, 'weight_decay': args.weight_decay,
+                   'max_steps': args.max_steps, 'batch_size': args.batch_size,
+                   'seq_len': args.seq_len,
+                   'val_batches': max(1, int(getattr(args, 'val_batches', 20))),
+                   'seeds': list(seeds)},
+        'recipe_in_tuning_grid': recipe_in_grid,
+        'tuning_confirmed_on_held_back_seeds': tuning_confirmed,
+        'per_baseline': per_baseline,
+        'best_tuned_baseline_row': best_row,
+        'all_baselines_selected_this_recipe': all_at_recipe,
+        'certified': bool(recipe_in_grid and tuning_confirmed and all_at_recipe),
+        'reading': ('a matrix at one fixed recipe may claim a win over a tuned baseline only '
+                    'when every compared baseline selected that exact (lr, weight_decay) cell '
+                    'and the selection was confirmed on seeds held back from the grid; '
+                    'otherwise the comparison is against the fixed-recipe baseline, not its '
+                    'tuned optimum'),
+    }
+    if not block['certified']:
+        reasons = []
+        if not recipe_in_grid:
+            reasons.append('the matrix recipe is not in the tuning grid')
+        if not tuning_confirmed:
+            reasons.append('tune.py did not certify on held-back --confirm-seeds')
+        if not all_at_recipe:
+            reasons.append('at least one baseline selected a different (lr, weight_decay) cell')
+        block['why_not_certified'] = reasons
+        print(f'[tune-cert] WARNING: {path} does not certify the fixed recipe: '
+              f'{"; ".join(reasons)}')
+    else:
+        print(f'[tune-cert] certified: baselines {sorted(per_baseline)} were tuned at '
+              f'lr={args.lr:g} wd={args.weight_decay:g} and confirmed on held-back seeds '
+              f'({path})')
+    return block
+
+
+def attach_baseline_tuning(comparison: dict, tuning: dict) -> dict:
+    """Tie the tuning certificate to the reference baseline actually used."""
+    block = dict(tuning)
+    reference = comparison.get('reference')
+    entry = (tuning.get('per_baseline') or {}).get(reference)
+    block['reference_row'] = reference
+    block['reference_baseline_tuned_at_this_recipe'] = bool(
+        entry and entry.get('recipe_is_selected_cell'))
+    block['certified_against_tuned_reference'] = bool(
+        tuning.get('certified') and block['reference_baseline_tuned_at_this_recipe'])
+    if not block['certified_against_tuned_reference']:
+        print(f'[compare] WARNING: the reference baseline {reference!r} was not certified at '
+              f'this matrix recipe; the significance rows below compare against a fixed-recipe '
+              f'baseline, not necessarily its tuned optimum (see baseline_tuning)')
+    else:
+        print(f'[compare] tuned-baseline certificate: reference {reference!r} selected '
+              f'lr={tuning["recipe"]["lr"]:g} wd={tuning["recipe"]["weight_decay"]:g} '
+              f'and was confirmed on held-back seeds')
+    return block
 
 
 def _count_seed_ce(records: list, predictor: str | None) -> dict:
@@ -1985,6 +2177,8 @@ def main():
     p.add_argument('--auto-simple-baselines', action='store_true', help='when the calibration is missing, run scripts/baseline_simple.py once for the selected seeds (same synthetic corpus protocol) instead of writing a comparison with no Bayes-limit reference')
     p.add_argument('--require-simple-baselines', action='store_true', help='fail before writing baseline_comparison.json when no calibration is available and --auto-simple-baselines did not produce one; a comparison without the tuned count model and Bayes limits cannot show that a row learned the task')
     p.add_argument('--no-simple-baselines', dest='simple_baselines_enabled', action='store_false', help='explicitly opt out of the simple-baseline calibration annotation; the opt-out is recorded in baseline_comparison.json')
+    p.add_argument('--baseline-tuning', default=None, help='tuning_summary.json from scripts/tune.py; certifies whether the fixed matrix recipe is the baselines\' selected (lr, weight_decay) cell on the same seeds and records the result in baseline_comparison.json')
+    p.add_argument('--require-baseline-tuning', action='store_true', help='fail before training unless --baseline-tuning certifies that every compared baseline selected this exact (lr, weight_decay) cell and tune.py confirmed it on held-back seeds; without this flag an uncertified comparison is written but marked as such')
     p.add_argument('--baseline-margin', type=float, default=0.0, help='minimum val_loss improvement over the best baseline to count as a win')
     p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired t-test vs the best baseline (Holm-adjusted over rows)')
     p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check for every norm in the selected rows before training them (default: on; a row that cannot overfit one batch has a gradient/loss bug and must not be launched)')
@@ -2028,6 +2222,27 @@ def main():
     if args.check_matrix:
         print(json.dumps(matrix_report, indent=2))
         return
+    baseline_tuning = None
+    if args.require_baseline_tuning and not args.baseline_tuning:
+        p.error('--require-baseline-tuning needs --baseline-tuning <tuning_summary.json>: '
+                'without the tune.py report there is no evidence that the baselines were '
+                'tuned at this matrix recipe')
+    if args.baseline_tuning:
+        baseline_tuning = load_baseline_tuning(args.baseline_tuning, args, ablations, seeds)
+        if baseline_tuning is None and args.require_baseline_tuning:
+            raise SystemExit(
+                f'[tune-cert] ERROR: --require-baseline-tuning is set but '
+                f'{args.baseline_tuning} is missing, unreadable or describes a different '
+                f'protocol; refusing to train/compare against baselines without a valid '
+                f'tuning certificate.')
+        if (baseline_tuning is not None and args.require_baseline_tuning
+                and not baseline_tuning.get('certified')):
+            raise SystemExit(
+                f'[tune-cert] ERROR: --require-baseline-tuning is set but the report does not '
+                f'certify this recipe: '
+                f'{"; ".join(baseline_tuning.get("why_not_certified") or [])}. '
+                f'Rerun the matrix at the baseline\'s selected (lr, weight_decay) cell, or '
+                f'tune the baselines with this recipe and held-back --confirm-seeds.')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
     run_metadata = collect_run_metadata(seed=seeds[0], extra={'seeds': seeds})
@@ -2179,6 +2394,35 @@ def main():
                 f'and Bayes-limit reference. Generate it with '
                 f"'{comparison['simple_baseline']['how_to_generate']}'.")
     if comparison is not None:
+        if baseline_tuning is not None:
+            comparison['baseline_tuning'] = attach_baseline_tuning(comparison, baseline_tuning)
+        else:
+            baseline_norms = [ablations[name].get('norm_name', name)
+                              for name in args.baselines if name in ablations]
+            comparison['baseline_tuning'] = {
+                'enabled': False,
+                'status': ('missing' if args.baseline_tuning else 'not_requested'),
+                'source': args.baseline_tuning,
+                'certified': False,
+                'certified_against_tuned_reference': False,
+                'reading': ('the baseline comparison below is against the fixed matrix recipe, '
+                            'not a certified tuned baseline; pass --baseline-tuning plus '
+                            '--require-baseline-tuning to make this claim fail-closed'),
+                'how_to_generate': (
+                    f"python3 scripts/tune.py --model {args.model} "
+                    f"--arms {' '.join(baseline_norms) or 'ln rmsnorm'} "
+                    f"--max-steps {args.max_steps} --batch-size {args.batch_size} "
+                    f"--seq-len {args.seq_len} "
+                    f"--val-batches {max(1, int(getattr(args, 'val_batches', 20)))} "
+                    f"--lrs {args.lr:g} 3e-4 1.2e-3 "
+                    f"--weight-decays {args.weight_decay:g} "
+                    f"--seeds {' '.join(map(str, seeds))} "
+                    f"--confirm-seeds <held-back seeds> --output-dir {base / 'tune'}"),
+            }
+            print('[compare] WARNING: no baseline-tuning certificate; the significance test below '
+                  'uses the fixed-recipe baselines. Generate one with '
+                  f"'{comparison['baseline_tuning']['how_to_generate']}' and rerun with "
+                  '--baseline-tuning (or --require-baseline-tuning to fail closed).')
         comparison['rows_excluded_protocol_mismatch'] = stale_rows
         with open(base / 'baseline_comparison.json', 'w') as f:
             json.dump(comparison, f, indent=2)
