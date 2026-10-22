@@ -94,14 +94,12 @@ def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dic
     for prefix in ('dataset', 'tokenizer'):
         resolved_key = prefix + '_revision_resolved'
         requested_key = prefix + '_revision'
-        resolved_present = (resolved_key in candidate_args
-                            or resolved_key in reference_args)
-        if resolved_present:
-            # When the resolved fields exist they are the actual snapshot; only
-            # two identical concrete commits prove it. Two unknown/None values
-            # are not evidence of one snapshot.
-            candidate_value = candidate_args.get(resolved_key)
-            reference_value = reference_args.get(resolved_key)
+        candidate_value = candidate_args.get(resolved_key)
+        reference_value = reference_args.get(resolved_key)
+        if candidate_value is not None or reference_value is not None:
+            # An actual resolved value is the snapshot; only two identical
+            # concrete commits prove it. One None next to a commit is not
+            # evidence of the same snapshot.
             if not (_is_pinned_revision(candidate_value)
                     and _is_pinned_revision(reference_value)
                     and candidate_value == reference_value):
@@ -110,9 +108,10 @@ def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dic
                     'reference': reference_value,
                 })
             continue
-        # Older checkpoints may only record the requested revision. A concrete
-        # pinned commit on both sides still proves the snapshot; two None
-        # values (the mutable default branch) do not.
+        # Older checkpoints may only record the requested revision (or carry
+        # the resolved fields as None). A concrete pinned commit on both sides
+        # still proves the snapshot; two None values (the mutable default
+        # branch) do not.
         candidate_value = candidate_args.get(requested_key)
         reference_value = reference_args.get(requested_key)
         if not (_is_pinned_revision(candidate_value)
