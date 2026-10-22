@@ -53,6 +53,24 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
 _TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
 
+def _optional_dest(parser, option: str):
+    """`dest` of an option spelling, including argparse's unambiguous prefixes.
+
+    `_parse_optional` returns a list of `(action, option_string, sep,
+    explicit_arg)` candidates (a single tuple on older Pythons); an unknown or
+    ambiguous spelling has no single destination and is ignored.
+    """
+    try:
+        parsed = parser._parse_optional(option)
+    except Exception:
+        return None
+    if not parsed:
+        return None
+    entries = parsed if isinstance(parsed, list) else [parsed]
+    actions = [entry[0] for entry in entries if entry and entry[0] is not None]
+    dests = {action.dest for action in actions}
+    return dests.pop() if len(dests) == 1 else None
+
 def _explicit_arg_names(argv, parser, config_path=None) -> frozenset:
     """Names of options the user set (CLI tokens or keys in --config).
 
@@ -62,16 +80,18 @@ def _explicit_arg_names(argv, parser, config_path=None) -> frozenset:
     are mapped through the parser so negated aliases such as --no-dedup
     (dest 'dedup') and --no-beta (dest 'beta') are attributed correctly.
     """
-    actions = parser._option_string_actions
     dests = {action.dest for action in parser._actions}
     names = set()
     for token in argv:
         if token == '--':
             break
         if token.startswith('--'):
-            action = actions.get(token.split('=', 1)[0])
-            if action is not None:
-                names.add(action.dest)
+            # Resolve through argparse, not the exact option-string table:
+            # argparse accepts unambiguous prefixes (`--val-f` for
+            # `--val-frac`) and that spelling is just as explicit.
+            dest = _optional_dest(parser, token.split('=', 1)[0])
+            if dest is not None:
+                names.add(dest)
     if config_path:
         for key in load_yaml_config(config_path):
             dest, _ = _TRAIN_CONFIG_ALIASES.get(key, (key, False))
