@@ -306,6 +306,11 @@ def student_t_ppf(p: float, df: float) -> float:
         raise ValueError("student_t_ppf needs 0 < p < 1")
     if df <= 0:
         raise ValueError("student_t_ppf needs df > 0")
+    if p == 0.5:
+        # The median of every Student-t is exactly zero. Bisection can stop on
+        # adjacent floats whose CDF rounds around 0.5 and return a tiny
+        # nonzero value, which would make a 50% interval asymmetric.
+        return 0.0
     lo, hi = -1.0, 1.0
     while student_t_cdf(lo, df) > p:
         lo *= 2.0
@@ -317,7 +322,10 @@ def student_t_ppf(p: float, df: float) -> float:
             # Adjacent floats: no later iteration can move the interval, so
             # the fixed-point 200-iteration return value is already reached.
             break
-        if student_t_cdf(mid, df) < p:
+        cdf_mid = student_t_cdf(mid, df)
+        if cdf_mid == p:
+            return mid
+        if cdf_mid < p:
             lo = mid
         else:
             hi = mid
@@ -336,11 +344,21 @@ def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
     `None` entries (tests that could not run) stay `None` and are not counted
     in `m`.
     """
-    indexed = sorted(
-        (float(p), i) for i, p in enumerate(pvalues)
-        if p is not None and isinstance(p, (int, float))
-        and not isinstance(p, bool) and math.isfinite(float(p))
-    )
+    # Accept any real numeric scalar (including NumPy integer/float scalars),
+    # not only Python int/float: dropping an unrecognised scalar returns None
+    # for that test and silently removes it from the correction family. Bools
+    # are still rejected, and non-numeric / non-finite values stay None.
+    indexed = []
+    for i, p in enumerate(pvalues):
+        if p is None or isinstance(p, bool):
+            continue
+        try:
+            value = float(p)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            indexed.append((value, i))
+    indexed.sort()
     m = len(indexed)
     adjusted: list[Optional[float]] = [None] * len(pvalues)
     running = 0.0
