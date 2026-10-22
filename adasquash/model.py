@@ -199,7 +199,10 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         chunk_rows = ctx.chunk_rows
         # The row mask and the scatter source depend only on the targets.
         valid = targets.ne(ctx.ignore_index)
-        gold = targets.masked_fill(~valid, 0).unsqueeze(-1)
+        # `scatter_add_` requires an int64 index. Cross-entropy accepts uint8
+        # (Byte) targets as class ids, so cast the index copy, not the saved
+        # target used by the mask.
+        gold = targets.to(torch.long).masked_fill(~valid, 0).unsqueeze(-1)
         keep = valid.unsqueeze(-1).to(logits.dtype)
         neg_keep = keep.neg()
         keep.mul_(grad_scale)
@@ -322,7 +325,9 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         cast_buf = None
         # Target-only row mask and scatter source.
         valid = targets.ne(ctx.ignore_index)
-        gold = targets.masked_fill(~valid, 0).unsqueeze(-1)
+        # `scatter_add_` requires an int64 index; Byte targets are valid class
+        # ids for cross-entropy and must not fail only in this fused backward.
+        gold = targets.to(torch.long).masked_fill(~valid, 0).unsqueeze(-1)
         keep = valid.unsqueeze(-1).to(acc)
         neg_keep = keep.neg()
         keep.mul_(grad_scale)
