@@ -70,6 +70,29 @@ _SEED_DIR_RE = re.compile(r"seed(\d+)$")
 MIN_PAIRED_SEEDS_FOR_SIGNIFICANCE = MIN_SEEDS_FOR_SIGNIFICANCE
 
 
+def _finite_number(value):
+    """A finite real measurement as a float, or None for anything else.
+
+    JSON can carry an arbitrarily large integer; ``float(value)`` raises
+    ``OverflowError`` for one that has no finite double representation, and
+    ``math.isfinite(value)`` can raise the same way on the raw integer. Such a
+    value is not a usable loss, so every reader of a recorded statistic goes
+    through this helper and fails closed instead of crashing the comparison.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return converted if math.isfinite(converted) else None
+
+
+def _positive_shape_int(value) -> bool:
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value > 0)
+
+
 def load_result(path) -> dict:
     """Load one `test_results.json` and validate the per-batch record."""
     p = Path(path)
@@ -96,7 +119,7 @@ def load_result(path) -> dict:
             "malformed measurement, not a loss")
     try:
         losses = [float(v) for v in losses]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise SystemExit(
             f"[compare] {p} contains non-numeric per-batch test losses; fix the run first")
     if not all(math.isfinite(v) for v in losses):
@@ -122,10 +145,10 @@ def load_result(path) -> dict:
             "per-batch losses; the sealed-test record is internally inconsistent")
     reported = data.get("test_loss")
     mean = sum(losses) / len(losses)
-    if (isinstance(reported, bool) or not isinstance(reported, (int, float))
-            or not math.isfinite(reported)):
+    reported_value = _finite_number(reported)
+    if reported_value is None:
         raise SystemExit(f"[compare] {p} has no finite 'test_loss' to cross-check")
-    if abs(mean - float(reported)) > 1e-9 * max(1.0, abs(float(reported))):
+    if abs(mean - reported_value) > 1e-9 * max(1.0, abs(reported_value)):
         raise SystemExit(
             f"[compare] {p}: stored test_loss={reported} disagrees with the mean of "
             f"test_batch_losses={mean}; the record is internally inconsistent.")
@@ -147,18 +170,16 @@ def _sealed_result_problem(run: dict) -> str | None:
     results = manifest.get("results") if isinstance(manifest, dict) else None
     if not isinstance(results, dict):
         return "manifest has no results block"
-    recorded = results.get("test_loss")
-    if (isinstance(recorded, bool) or not isinstance(recorded, (int, float))
-            or not math.isfinite(float(recorded))):
+    recorded = _finite_number(results.get("test_loss"))
+    if recorded is None:
         return ("manifest has no finite results.test_loss: this run did not record a "
                 "sealed test evaluation, so a test_results.json in its directory cannot "
                 "be attributed to it")
-    actual = run["data"].get("test_loss")
-    if (isinstance(actual, bool) or not isinstance(actual, (int, float))
-            or not math.isfinite(float(actual))):
+    actual = _finite_number(run["data"].get("test_loss"))
+    if actual is None:
         return "test_results.json has no finite test_loss"
-    tolerance = 1e-9 * max(1.0, abs(float(recorded)))
-    if abs(float(actual) - float(recorded)) > tolerance:
+    tolerance = 1e-9 * max(1.0, abs(recorded))
+    if abs(actual - recorded) > tolerance:
         return (f"test_results.json test_loss={actual} disagrees with manifest "
                 f"results.test_loss={recorded}; the file does not belong to this run")
     artifacts = manifest.get("artifacts")
@@ -219,9 +240,19 @@ def _shape_mismatches(ref_manifest: dict, other_manifest: dict,
     a = ref_manifest.get("results") or {}
     b = other_manifest.get("results") or {}
     missing = "<missing>"
-    out = {f"results.{key}": [a.get(key, missing), b.get(key, missing)]
-           for key in ("n_layers", "dim", "n_heads", "final_step")
-           if key not in a or key not in b or a.get(key) != b.get(key)}
+    out = {}
+    for key in ("n_layers", "dim", "n_heads", "final_step"):
+        ref_value = a.get(key, missing)
+        other_value = b.get(key, missing)
+        # Unknown is not equal. Two old manifests that both omit a shape field
+        # used to compare equal, letting a comparison certify without ever
+        # verifying the architecture/step it was run on. A malformed value is
+        # rejected for the same reason.
+        if (ref_value is missing or other_value is missing
+                or not _positive_shape_int(ref_value)
+                or not _positive_shape_int(other_value)
+                or ref_value != other_value):
+            out[f"results.{key}"] = [ref_value, other_value]
     if compare_evaluated_step:
         ref_step = _evaluated_checkpoint_step(a)
         other_step = _evaluated_checkpoint_step(b)
