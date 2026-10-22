@@ -519,11 +519,21 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
     input_integer_ids = _integer_ids(x)
     target_integer_ids = _integer_ids(y)
     targets_valid = target_integer_ids
-    if y.numel() and target_integer_ids and known_vocab:
-        in_range = (y == ignore_index) | ((y >= 0) & (y < vocab_size))
+    if y.numel() and target_integer_ids:
+        # A negative id is invalid whether or not the vocabulary upper bound
+        # is known; ignore_index is the only negative value the loss accepts.
+        in_range = (y == ignore_index) | (y >= 0)
+        if known_vocab:
+            in_range = in_range & (y < vocab_size)
         targets_valid = bool(in_range.all().item())
-    if x.numel() and input_integer_ids and known_vocab:
-        tokens_valid = bool(((x >= 0) & (x < vocab_size)).all().item())
+    if x.numel() and input_integer_ids:
+        # Embedding ids are never allowed to be negative. When the vocabulary
+        # size is unknown the upper bound stays unchecked (the comment above
+        # `known_vocab`), but a negative id is still a data-stage failure.
+        in_range = x >= 0
+        if known_vocab:
+            in_range = in_range & (x < vocab_size)
+        tokens_valid = bool(in_range.all().item())
     else:
         tokens_valid = input_integer_ids
     mask_count = int((y != ignore_index).sum().item()) if target_integer_ids and y.numel() else 0
@@ -836,12 +846,20 @@ def classify_nan_stage(evidence: dict) -> dict:
                 "reports the first overflow layer and the overflow rate",
             ],
         )
-    if evidence.get("gradients_finite") is False or evidence.get("gradient_explosion", False):
+    if (evidence.get("gradients_finite") is False
+            or evidence.get("gradient_explosion", False)
+            or evidence.get("backward_error")):
         norm = evidence.get("grad_total_norm")
         norm_s = "n/a" if norm is None else f"{norm:.3e}"
+        if evidence.get("backward_error"):
+            diagnosis = ("the fp32 backward raised before a gradient census could "
+                         f"run ({evidence['backward_error']})")
+        else:
+            diagnosis = (f"the backward is the first non-finite/huge stage "
+                         f"(total grad norm {norm_s})")
         return stage(
             "gradients",
-            f"the backward is the first non-finite/huge stage (total grad norm {norm_s})",
+            diagnosis,
             [
                 "lower the learning rate and/or increase warmup; re-tune with "
                 "scripts/tune.py rather than guessing",
