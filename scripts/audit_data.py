@@ -975,21 +975,25 @@ def _chronology_problems(reports: dict) -> list:
     for (_, _, prev_end), (name, start, _) in zip(ranges, ranges[1:]):
         if start != prev_end:
             return [f"split ranges are not contiguous chronological slices: {ranges}"]
-    known_totals = sorted({r.get('num_documents') for r in active
-                           if isinstance(r.get('num_documents'), int)
-                           and not isinstance(r.get('num_documents'), bool)})
+    raw_totals = [r.get('num_documents') for r in active
+                  if r.get('num_documents') is not None]
+    invalid_totals = [value for value in raw_totals
+                      if isinstance(value, bool) or not isinstance(value, int)]
+    if invalid_totals:
+        return [f"num_documents {invalid_totals[0]!r} is not an integer document "
+                "total; the split tiling cannot be verified"]
+    known_totals = sorted(set(raw_totals))
     if len(known_totals) > 1:
         # Reports from different runs/streams can tile by accident while
         # describing different corpora; their counts are not comparable.
         return [f"split reports were computed against different document totals: "
                 f"{known_totals}"]
-    total = active[0].get('num_documents')
+    # Use the total from *any* active report that recorded one. Reading only
+    # the first split let a train report with no total hide a later report
+    # that did know the stream length, so a prefix tiling looked complete.
+    total = known_totals[0] if known_totals else None
     last_name, _, last_end = ranges[-1]
-    if total is not None and (not isinstance(total, int)
-                              or isinstance(total, bool)):
-        return [f"num_documents {total!r} is not an integer document total; "
-                "the split tiling cannot be verified"]
-    if isinstance(total, int) and last_end != total:
+    if total is not None and last_end != total:
         return [f"split ranges do not cover the full document stream: "
                 f"{last_name} ends at {last_end} but num_documents={total}"]
     return []

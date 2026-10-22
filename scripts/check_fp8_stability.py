@@ -592,6 +592,12 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
       a random init says nothing about trained weights.
     """
     labels = [str(r.get('label') or r.get('norm') or r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
+    # The cross-scale contrast identity is the norm pair, not the display
+    # label: in multi-model mode the label carries an `@model` suffix, which
+    # made the "same" test at two scales look like two different contrasts and
+    # silently disabled the replication report.
+    norm_ids = [str(r.get('norm') or str(labels[i]).split('@', 1)[0])
+                for i, r in enumerate(results)]
     tests = []
     for metric in metrics:
         for i in range(len(results)):
@@ -603,6 +609,7 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                 a_scale = _result_scale(results[i], i)
                 b_scale = _result_scale(results[j], j)
                 t = {'a': labels[i], 'b': labels[j], 'metric': metric,
+                     'a_norm': norm_ids[i], 'b_norm': norm_ids[j],
                      'a_scale': a_scale, 'b_scale': b_scale,
                      'same_scale': a_scale == b_scale,
                      'direction': f'negative mean_delta means A has lower {metric} (more FP8-stable)',
@@ -699,7 +706,7 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
     for t in tests:
         if t.get('same_scale') and t.get('mean_delta') is not None:
             scale_obs.append({'scale': t.get('a_scale'), 'metric': t.get('metric'),
-                              'contrast': f"{t.get('a')} vs {t.get('b')}",
+                              'contrast': f"{t.get('a_norm')} vs {t.get('b_norm')}",
                               'delta': t.get('mean_delta'),
                               'certified': bool(t.get('significant')),
                               'p_one_sided': t.get('p_holm', t.get('p_one_sided')),

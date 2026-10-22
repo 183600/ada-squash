@@ -359,6 +359,18 @@ def load_row_cfgs(summaries_path: str) -> dict:
     return out
 
 
+def load_row_models(summaries_path: str) -> dict:
+    """{row name: recorded model selector} from the ablation summaries.
+
+    The config kwargs only describe builder knobs under one model family. A
+    row trained on a different model (e.g. llama-1b) must not inherit a
+    gpt2-124m benchmark merely because its cfg dict is identical.
+    """
+    rows = _summary_rows(summaries_path)
+    return {row['name']: row.get('model') for row in rows
+            if isinstance(row, dict) and row.get('name') is not None}
+
+
 def _cfg_key(model_name: str, cfg_kwargs: dict) -> str:
     """Canonical identity of the model a config builds (like the ablation runner)."""
     with torch.device('meta'):
@@ -545,6 +557,7 @@ def main():
         # silently substituting the model.
         by_norm = {r['norm']: r for r in results}
         cand_cfgs = load_row_cfgs(args.summaries)
+        cand_models = load_row_models(args.summaries)
         # The loss delta uses --reference-name while the cost ratio uses
         # --reference. Those must identify the same norm/architecture, or the
         # tradeoff mixes a gain against one model with a cost against
@@ -563,7 +576,11 @@ def main():
                   file=sys.stderr)
             raise SystemExit(1)
 
-        def _cfg_is_proxy(cfg, norm):
+        def _cfg_is_proxy(cfg, norm, row_model=None):
+            if row_model is not None and str(row_model) != str(args.model):
+                # The row was trained on a different model family/scale; its
+                # cost cannot be represented by this benchmark's base model.
+                return True
             if not isinstance(cfg, dict):
                 return True
             try:
@@ -577,7 +594,8 @@ def main():
                 # comparison had failed.
                 return True
 
-        ref_cost_is_proxy = _cfg_is_proxy(ref_cfg, ref_norm)
+        ref_cost_is_proxy = _cfg_is_proxy(
+            ref_cfg, ref_norm, cand_models.get(args.reference_name))
         if ref_cost_is_proxy:
             print(f"[tradeoff][warn] reference row '{args.reference_name}' has an "
                   f"architecture beyond the benchmarked base '{ref_norm}'; its cost is "
@@ -600,10 +618,13 @@ def main():
             # base-norm measurement matches the trained architecture. An
             # unknown config must not be treated as a match. A proxy cost on
             # either side of the ratio makes the whole ratio a proxy.
-            cost_is_proxy = (_cfg_is_proxy(cand_cfg, cand_norm)
+            cost_is_proxy = (_cfg_is_proxy(cand_cfg, cand_norm,
+                                           cand_models.get(cand))
                              or ref_cost_is_proxy)
             if cost_is_proxy:
-                owner = 'candidate' if _cfg_is_proxy(cand_cfg, cand_norm) else 'reference'
+                owner = ('candidate' if _cfg_is_proxy(cand_cfg, cand_norm,
+                                                       cand_models.get(cand))
+                         else 'reference')
                 print(f"[tradeoff][warn] {cand}: the benchmark has no row for the exact "
                       f"{owner} architecture; cost is measured on the base model "
                       f"(proxy cost)")
