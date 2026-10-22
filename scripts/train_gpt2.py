@@ -50,8 +50,21 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
         if dest not in known:
             unknown.append(key)
             continue
-        if invert and isinstance(value, bool):
-            value = not value
+        if invert:
+            # `use_layerscale: 0` / `bf16: "false"` must not remain a truthy
+            # default that `not args.no_*` later reads as enabled.
+            if isinstance(value, bool):
+                bool_value = value
+            elif isinstance(value, (int, float)) and value in (0, 1):
+                bool_value = bool(value)
+            elif isinstance(value, str) and value.strip().lower() in (
+                    'true', 'yes', 'on', '1', 'false', 'no', 'off', '0'):
+                bool_value = value.strip().lower() in ('true', 'yes', 'on', '1')
+            else:
+                raise ValueError(
+                    f"config '{path}': {key}={value!r} is not a boolean; "
+                    f"cannot map it to {dest}")
+            value = not bool_value
         parser.set_defaults(**{dest: value})
     if unknown:
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
