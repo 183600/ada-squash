@@ -249,27 +249,38 @@ def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> di
                     if t['lr'] == lr and t.get('weight_decay') == wd]
             losses = [t['val_loss'] for t in cell if _usable_loss(t['val_loss'])]
             stats = mean_std_stderr(losses)
-            if stats is not None:
+            if stats is None:
+                # Keep the failed cell visible instead of silently omitting
+                # it: a fully diverged lr/wd cell must be reportable (and
+                # excluded from selection, never treated as a missing grid
+                # point).
+                stats = {'mean': None, 'std': None, 'stderr': None, 'n': 0}
+            else:
                 stats = dict(stats)
-                # A cell whose diverged seeds were dropped has a mean over a
-                # *subset* of the seeds; letting it win against a cell with
-                # full coverage is survivorship bias (the unstable cell looks
-                # good because its failures are not in its own mean).
-                stats['missing_seeds'] = sorted(
-                    t['seed'] for t in cell if not _usable_loss(t['val_loss']))
-                stats['complete_coverage'] = not stats['missing_seeds']
-                stats['n_selection_seeds'] = n_selection_seeds
-                stats['curve_classification_counts'] = dict(Counter(
-                    t['curve_classification'] for t in cell if t.get('curve_classification')))
-                stats['curve_classifications_by_seed'] = {
-                    t['seed']: t.get('curve_classification') for t in cell}
-                stats['lr'] = float(lr)
-                stats['weight_decay'] = float(wd)
-                lr_grid[_cell_key(lr, wd, multi_wd)] = stats
+            # A cell whose diverged seeds were dropped has a mean over a
+            # *subset* of the seeds; letting it win against a cell with
+            # full coverage is survivorship bias (the unstable cell looks
+            # good because its failures are not in its own mean).
+            stats['missing_seeds'] = sorted(
+                t['seed'] for t in cell if not _usable_loss(t['val_loss']))
+            stats['complete_coverage'] = (stats['mean'] is not None
+                                          and not stats['missing_seeds'])
+            stats['n_selection_seeds'] = n_selection_seeds
+            stats['curve_classification_counts'] = dict(Counter(
+                t['curve_classification'] for t in cell if t.get('curve_classification')))
+            stats['curve_classifications_by_seed'] = {
+                t['seed']: t.get('curve_classification') for t in cell}
+            stats['lr'] = float(lr)
+            stats['weight_decay'] = float(wd)
+            lr_grid[_cell_key(lr, wd, multi_wd)] = stats
     if not lr_grid:
         return {'arm': arm, 'trials': trials, 'lr_grid': {}, 'best': None}
-    complete = {k: v for k, v in lr_grid.items() if v['complete_coverage']}
-    pool, pool_name = (complete, 'complete_coverage') if complete else (lr_grid, 'partial_coverage')
+    selectable = {k: v for k, v in lr_grid.items() if v.get('mean') is not None}
+    if not selectable:
+        return {'arm': arm, 'trials': trials, 'lr_grid': lr_grid, 'best': None}
+    complete = {k: v for k, v in selectable.items() if v['complete_coverage']}
+    pool, pool_name = ((complete, 'complete_coverage') if complete
+                       else (selectable, 'partial_coverage'))
     if complete and len(complete) < len(lr_grid):
         print(f"[tune][warn] {arm}: grid cell(s) "
               f"{sorted(set(lr_grid) - set(complete))} lack a usable val_loss for every "

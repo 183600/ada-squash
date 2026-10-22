@@ -248,7 +248,8 @@ def walk_rule_stats(split: dict, n_states: int, max_jump: int, outlier_id) -> di
             'rule_target_mismatches': mismatches,
             'outlier_input_fraction': float(is_outlier.to(torch.float64).mean())}
 
-def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
+def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id,
+                    ignore_index: int = -100) -> dict:
     """Exact predictive CE of the full-context Bayes observer (HMM forward filter).
 
     Hidden chain: `s_{t+1} = s_t + j`, `j` uniform in `{0..max_jump-1}`.
@@ -263,6 +264,8 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
     """
     n_states = int(n_states)
     batches = list(batches)
+    if not batches:
+        raise ValueError('hmm filter received no batches')
     # The filter lives on the batch device: indexing with `rows`/`x`/`y`
     # (which come from the caller's batches) must not mix CPU and CUDA tensors.
     device = batches[0][0].device
@@ -292,8 +295,14 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id) -> dict:
         pred = torch.empty_like(belief)
         for t in range(x.shape[1] - 1):
             torch.mm(belief, transition, out=pred)
-            ce_sum_t = ce_sum_t - pred[rows, y[:, t]].log().sum()
-            n_tokens += batch
+            # Unmasked held-out targets only: an ignore-index position is not
+            # a prediction target (indexing it would either crash or wrap).
+            valid = y[:, t] != ignore_index
+            if bool(valid.any()):
+                valid_rows = rows[valid]
+                targets = y[:, t][valid].to(torch.long)
+                ce_sum_t = ce_sum_t - pred[valid_rows, targets].log().sum()
+                n_tokens += int(valid.sum())
             obs = x[:, t + 1]
             if outlier_id is None:
                 pred.zero_()
@@ -554,12 +563,25 @@ def _row_calibration_protocol(row: dict) -> dict | None:
         'val_batches': data.get('val_batches'),
     }
 
+def _same_protocol_value(actual, expected) -> bool:
+    """Type-aware comparison: ``True == 1`` and ``12.0 == 12`` are not IDs."""
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return actual is expected
+    if isinstance(expected, int):
+        return (isinstance(actual, int) and not isinstance(actual, bool)
+                and actual == expected)
+    if expected is None:
+        return actual is None
+    return actual == expected
+
+
 def _calibration_protocol_mismatches(row_protocol: dict | None,
                                      expected: dict) -> list:
     if row_protocol is None:
         return list(_CALIBRATION_PROTOCOL_KEYS)
     return [key for key in _CALIBRATION_PROTOCOL_KEYS
-            if row_protocol.get(key) != expected.get(key)]
+            if not _same_protocol_value(row_protocol.get(key),
+                                        expected.get(key))]
 
 def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_ce,
                             log_vocab, tuned_predictor: str | None = None,
