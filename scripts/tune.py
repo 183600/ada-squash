@@ -165,13 +165,18 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path,
               run_metadata: dict | None = None,
               weight_decay: float | None = None) -> dict:
     """One (arm, lr, weight_decay, seed) run, reusing the ablation runner verbatim."""
+    # Validate before using the seed for the RNG, the directory name or the
+    # record: in the old code a 42.9 request trained seed 42 into `seed42.9`.
+    if not _is_seed_id(seed):
+        raise ValueError(f'trial seed must be an integer, got {seed!r}')
+    seed = int(seed)
     wd = float(getattr(args, 'weight_decay', 0.1)
                if weight_decay is None else weight_decay)
     multi_wd = len(_grid_weight_decays(args)) > 1
     trial_args = copy.copy(args)
     trial_args.lr = float(lr)
     trial_args.weight_decay = wd
-    trial_args.seed = int(seed)
+    trial_args.seed = seed
     cell_dir = f'lr{_lr_key(lr)}' if not multi_wd else f'lr{_lr_key(lr)}_wd{_lr_key(wd)}'
     run_dir = base / 'trials' / arm / cell_dir / f'seed{seed}'
     if (run_dir / 'summary.json').exists() and (not args.force):

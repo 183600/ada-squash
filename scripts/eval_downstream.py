@@ -165,13 +165,16 @@ class AdaSquashLM:
         for req in requests:
             context, continuation = req.args[:2]
             ctx, cont = self._encode_pair(context, continuation)
-            budget = self.max_length - len(cont)
-            if budget < 1:
-                ctx, cont = (ctx[:1], cont[:self.max_length - 1])
-                budget = 1
-            if len(ctx) > budget:
-                ctx = ctx[len(ctx) - budget:]
-            ids = ctx + cont
+            # The final continuation token is a target, not an input: the
+            # model consumes `ctx + cont[:-1]`. Reserving a slot for the full
+            # `cont` used to drop one context token on every truncation (and
+            # the old overflow branch kept the *first* context token instead
+            # of the most recent one).
+            if cont and len(cont) >= self.max_length:
+                cont = cont[:max(1, self.max_length - 1)]
+            keep_ctx = self.max_length - max(0, len(cont) - 1)
+            ctx = ctx[-keep_ctx:] if keep_ctx > 0 else ctx[-1:]
+            ids = ctx + cont[:-1]
             logprobs = self._forward_logprobs(ids)
             start = len(ctx) - 1
             rows = logprobs[start:start + len(cont)]
@@ -497,7 +500,10 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
             trial_correct.extend(not f for f in failed)
             decode = getattr(tok, 'decode', None)
             for i, (pos, _) in enumerate(group):
-                pos_frac = pos / max(1, body_len)
+                # Position is relative to the full evaluated context; the
+                # haystack body excludes the needle+question tokens, so
+                # dividing by it inflated late-placement fractions.
+                pos_frac = pos / max(1, context_len)
                 generated_text = ''
                 if generated[i] and callable(decode):
                     try:

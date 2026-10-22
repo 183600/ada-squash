@@ -130,7 +130,10 @@ def build_remap(vocab_size: int, support, device='cpu') -> torch.Tensor:
 
 def generate_batches(seed: int, n_batches: int, args, device: str):
     """The ablation runner's stream: same generator seed, corpus and batch shape."""
-    rng = torch.Generator(device=device).manual_seed(int(seed))
+    if not _is_seed_id(seed):
+        raise ValueError(f'stream seed must be an integer, got {seed!r}')
+    seed = int(seed)
+    rng = torch.Generator(device=device).manual_seed(seed)
     outlier_id = int(args.vocab_size) - 1 if args.outlier_channel else None
     for _ in range(int(n_batches)):
         yield markov_batch(rng, -100, args.batch_size, args.seq_len, device,
@@ -332,6 +335,9 @@ def tune_smoothing(ce_fn, ks) -> dict:
 
 def evaluate_seed(seed: int, args, device: str) -> dict:
     """Fit, tune and evaluate the whole predictor ladder for one seed."""
+    if not _is_seed_id(seed):
+        raise ValueError(f'seed must be an integer, got {seed!r}')
+    seed = int(seed)
     outlier_id = args.vocab_size - 1 if args.outlier_channel else None
     support = build_support(args.n_states, outlier_id)
     n_symbols = len(support) + 1

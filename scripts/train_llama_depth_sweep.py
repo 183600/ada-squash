@@ -56,9 +56,33 @@ def _finite(value) -> bool:
     """A usable numeric statistic: not None/NaN/Inf (bool is not a number here).
 
     A diverged run can report `Inf`/`NaN` from a readable manifest; pooling it
-    would poison the cell mean while looking like a complete seed.
+    would poison the cell mean while looking like a complete seed. A huge
+    JSON integer has no finite float conversion, so it is not usable either.
     """
-    return isinstance(value, (int, float)) and (not isinstance(value, bool)) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _is_seed_id(value) -> bool:
+    """A seed id is an integer; bool/fractional/string values are not."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _normalize_seed_ids(seeds) -> list[int]:
+    """Materialize unique integer seed ids without coercing malformed values."""
+    values = list(seeds)
+    if not all(_is_seed_id(seed) for seed in values):
+        raise ValueError(f'seeds must be integer ids, got {values!r}')
+    return list(dict.fromkeys(int(seed) for seed in values))
+
+
+def _is_event_count(value) -> bool:
+    """A numerical-health counter is a non-negative integer, not NaN/bool/1.5."""
+    return (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
 
 # Both ratios are reported next to every comparison row; a cell pair outside
 # this band is not compute-matched, so its loss delta is not a depth/norm-only
@@ -285,7 +309,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
     """
     # One seed is one run; a repeated seed would read the same manifest twice
     # and inflate the apparent replication count.
-    seeds = list(dict.fromkeys(int(s) for s in seeds))
+    seeds = _normalize_seed_ids(seeds)
     per_seed = []
     rejected = []
     reference_context = None
@@ -461,7 +485,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
     # to any pooled mean (the same exclusion missing seeds get).
     invalid_seed_set = {
         p['seed'] for p in per_seed
-        if any(isinstance(p.get(key), float) and not math.isfinite(p.get(key))
+        if any(p.get(key) is not None and not _finite(p.get(key))
                for key in ('best_val_loss', 'final_val_loss'))}
 
     def _pool(key: str):
@@ -476,25 +500,28 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
     for p in per_seed:
         if p.get('curve_classification'):
             curve_counts[p['curve_classification']] = curve_counts.get(p['curve_classification'], 0) + 1
-    gaps = [p['curve_generalization_gap'] for p in per_seed
+    valid_seeds = [p for p in per_seed if p['seed'] not in invalid_seed_set]
+    gaps = [p['curve_generalization_gap'] for p in valid_seeds
             if _finite(p.get('curve_generalization_gap'))]
     # Model accounting pooled next to the losses: the shared recipe
     # (same dim/heads per depth) makes these quantities identical across a
-    # cell's seeds, so any cross-seed spread here is a red flag.
-    params = [p['n_params'] for p in per_seed if _finite(p.get('n_params'))]
-    layers = [p['n_layers'] for p in per_seed if _finite(p.get('n_layers'))]
-    dims = [p['dim'] for p in per_seed if _finite(p.get('dim'))]
-    heads = [p['n_heads'] for p in per_seed if _finite(p.get('n_heads'))]
-    norm_shares = [p['norm_share_of_params'] for p in per_seed
+    # cell's seeds, so any cross-seed spread here is a red flag. An invalid
+    # (NaN/Inf-loss) seed is excluded from every auxiliary pool too, not only
+    # from the loss means.
+    params = [p['n_params'] for p in valid_seeds if _finite(p.get('n_params'))]
+    layers = [p['n_layers'] for p in valid_seeds if _finite(p.get('n_layers'))]
+    dims = [p['dim'] for p in valid_seeds if _finite(p.get('dim'))]
+    heads = [p['n_heads'] for p in valid_seeds if _finite(p.get('n_heads'))]
+    norm_shares = [p['norm_share_of_params'] for p in valid_seeds
                    if _finite(p.get('norm_share_of_params'))]
-    flops_fwd = [p['flops_per_token_forward'] for p in per_seed
+    flops_fwd = [p['flops_per_token_forward'] for p in valid_seeds
                  if _finite(p.get('flops_per_token_forward'))]
-    flops_train = [p['flops_per_token_training_est'] for p in per_seed
+    flops_train = [p['flops_per_token_training_est'] for p in valid_seeds
                    if _finite(p.get('flops_per_token_training_est'))]
-    throughput_vals = [p['tokens_per_second'] for p in per_seed
+    throughput_vals = [p['tokens_per_second'] for p in valid_seeds
                        if _finite(p.get('tokens_per_second'))]
     throughput_stats = mean_std_stderr(throughput_vals)
-    peak_mem_vals = [p['peak_device_memory_mb'] for p in per_seed
+    peak_mem_vals = [p['peak_device_memory_mb'] for p in valid_seeds
                      if _finite(p.get('peak_device_memory_mb'))]
     peak_mem_stats = mean_std_stderr(peak_mem_vals)
     # A run that crashed, diverged or never finished leaves no readable
@@ -598,14 +625,14 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                                       if peak_mem_stats and len(peak_mem_vals) >= 2 else None),
         'cost_basis': ('tokens_per_second / peak_device_memory_mb are measured by the '
                        'child run; memory is null on CPU and throughput is device-dependent'),
-        'n_loss_spikes': sum(p['n_loss_spikes'] or 0 for p in per_seed
-                             if isinstance(p.get('n_loss_spikes'), (int, float))),
-        'n_nonfinite_losses': sum(p['n_nonfinite_losses'] or 0 for p in per_seed
-                                  if isinstance(p.get('n_nonfinite_losses'), (int, float))),
-        'n_nonfinite_gradients': sum(p['n_nonfinite_gradients'] or 0 for p in per_seed
-                                     if isinstance(p.get('n_nonfinite_gradients'), (int, float))),
-        'n_nonfinite_val_losses': sum(p['n_nonfinite_val_losses'] or 0 for p in per_seed
-                                      if isinstance(p.get('n_nonfinite_val_losses'), (int, float))),
+        'n_loss_spikes': sum(p['n_loss_spikes'] for p in per_seed
+                             if _is_event_count(p.get('n_loss_spikes'))),
+        'n_nonfinite_losses': sum(p['n_nonfinite_losses'] for p in per_seed
+                                  if _is_event_count(p.get('n_nonfinite_losses'))),
+        'n_nonfinite_gradients': sum(p['n_nonfinite_gradients'] for p in per_seed
+                                     if _is_event_count(p.get('n_nonfinite_gradients'))),
+        'n_nonfinite_val_losses': sum(p['n_nonfinite_val_losses'] for p in per_seed
+                                      if _is_event_count(p.get('n_nonfinite_val_losses'))),
         'aggregation': ('Mean +/- Std across seeds (each seed is an independent run of the identical recipe). '
                         'best_val_loss = min over validation passes (checkpoint-selection statistic, optimistically biased); '
                         'final_val_loss = last validation pass (fixed-step estimate, comparable across cells when early stopping is off). '
@@ -629,17 +656,25 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
 def _cell_seed_metric(cell: dict, metric: str) -> dict:
     """{seed: metric value} of an aggregate cell; seeds without the metric dropped."""
     out = {}
+    # A seed the cell already marked invalid (NaN/Inf loss) is not a usable
+    # replication for *any* metric; including its finite throughput/parameter
+    # value would make the paired delta disagree with the cell mean.
+    invalid = {int(seed) for seed in (cell.get('invalid_seeds') or [])
+               if _is_seed_id(seed)}
     for item in cell.get('per_seed') or []:
         if not isinstance(item, dict):
             continue
         seed = item.get('seed')
         # A boolean/fractional/string seed is not an independent replication
         # id; int(True)/int("42") would silently pair a different run.
-        if isinstance(seed, bool) or not isinstance(seed, int):
+        if not _is_seed_id(seed):
+            continue
+        seed = int(seed)
+        if seed in invalid:
             continue
         value = item.get(metric)
         if _finite(value):
-            out[int(seed)] = float(value)
+            out[seed] = float(value)
     return out
 
 def _cell_step_context(cell: dict):
@@ -1499,7 +1534,7 @@ def main():
         raw_seeds = [args.seed]
     else:
         raw_seeds = list(args.seeds or [42])
-    seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    seeds = _normalize_seed_ids(raw_seeds)
     if len(seeds) != len(raw_seeds):
         print(f'[sweep][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
               f'(a repeated seed is the same run, not an independent replication)')

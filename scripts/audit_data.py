@@ -157,9 +157,7 @@ def token_shingles(ids, shingle_size: int = 8) -> set:
     result independent of the process-wide hash seed (unlike `hash(tuple)`), so
     two audit runs compare the same shingles.
     """
-    k = int(shingle_size)
-    if k < 1:
-        raise ValueError(f"shingle_size must be >= 1, got {shingle_size}")
+    k = _strict_int_option(shingle_size, "shingle_size", 1)
     tokens = [int(t) + 1 for t in ids]
     n = len(tokens)
     if n == 0:
@@ -212,9 +210,7 @@ def near_duplicate_record(ids, shingle_size: int = 8,
     """
     shingles = token_shingles(ids, shingle_size)
     total_shingles = len(shingles)
-    limit = int(max_shingles)
-    if limit < 1:
-        raise ValueError(f"max_shingles must be >= 1, got {max_shingles}")
+    limit = _strict_int_option(max_shingles, "max_shingles", 1)
     if total_shingles > limit:
         values = np.fromiter(shingles, dtype=np.uint64, count=total_shingles)
         values = np.partition(values, limit - 1)[:limit]
@@ -637,9 +633,13 @@ def near_duplicate_ledger_additions(report: dict) -> dict:
     pairs = report.get("pairs")
     if not isinstance(pairs, dict):
         return {"hashes": additions, "missing_digest_documents": missing}
-    if not isinstance(by_later, dict):
-        missing = sum(int(pair.get("flagged_later_missing_digest") or 0)
-                      for pair in pairs.values() if isinstance(pair, dict))
+    # A pair-only report (or one whose by_later block omits the missing
+    # count) still knows how many flagged documents lacked a digest. Taking
+    # the maximum avoids undercounting when only one of the two views carries
+    # the field, without double-counting a document listed in both.
+    pair_missing = sum(int(pair.get("flagged_later_missing_digest") or 0)
+                       for pair in pairs.values() if isinstance(pair, dict))
+    missing = max(missing, pair_missing)
     for pair in pairs.values():
         if not isinstance(pair, dict):
             continue

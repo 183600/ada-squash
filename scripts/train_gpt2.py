@@ -237,6 +237,12 @@ def cosine_schedule(step: int, max_steps: int, warmup: int, min_lr_ratio: float)
     return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 def build_lr_lambda(args):
+    if args.warmup == 0:
+        # LambdaLR evaluates step 0 for the first update. With no warmup the
+        # first update must use the peak, and the last update (s =
+        # max_steps-1) must reach the cosine floor.
+        return lambda s: cosine_schedule(
+            s, max(1, args.max_steps - 1), 0, args.min_lr_ratio)
     return lambda s: cosine_schedule(s + 1, args.max_steps, args.warmup, args.min_lr_ratio)
 _SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip', 'grad_accum')
 _MONITOR_ARGS = ('val_every', 'val_batches', 'early_stop_patience')
@@ -602,6 +608,35 @@ def apply_explicit_optimizer_args(opt, sched, args, explicit: frozenset=frozense
 
 DEFAULT_SEED = 42
 
+
+def _is_seed_id(value) -> bool:
+    """A seed id is an integer; bool/fractional/string values are not."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _normalize_seed_ids(seeds) -> list[int]:
+    """Materialize unique integer seed ids without coercing malformed values."""
+    values = list(seeds)
+    if not all(_is_seed_id(seed) for seed in values):
+        raise ValueError(f'seeds must be integer ids, got {values!r}')
+    return list(dict.fromkeys(int(seed) for seed in values))
+
+
+def _is_event_count(value) -> bool:
+    """A numerical-health counter is a non-negative integer, not NaN/bool/1.5."""
+    return (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+
+
+def _is_finite_number(value) -> bool:
+    """A real scalar with a finite float image (huge JSON ints are not)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 # Default (n_layers, dim, n_heads) of the model variants. The preflight uses
 # them - adjusted by the sweep's ADASQUASH_*_OVERRIDE env vars - so the
 # small-batch overfit check exercises the architecture this run will train
@@ -736,7 +771,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     # direct caller passes a duplicate: reading the same directory twice would
     # otherwise count the same run as independent replication (and could lift
     # a two-seed set over the three-seed certification threshold).
-    seeds = list(dict.fromkeys(int(s) for s in seeds))
+    seeds = _normalize_seed_ids(seeds)
     per_seed = []
     rejections = []
     reference_recipe = None
@@ -894,20 +929,19 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             record['curve_classification'] = curve.get('classification')
             record['curve_generalization_gap'] = curve.get('generalization_gap')
             value = results.get('test_loss')
-            if (isinstance(value, (int, float)) and not isinstance(value, bool)
-                    and math.isfinite(float(value))):
+            if _is_finite_number(value):
                 record['test_loss'] = float(value)
         per_seed.append(record)
 
     def _finite(value) -> bool:
-        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+        return _is_finite_number(value)
 
     # A seed whose manifest reports NaN/Inf is not a usable replication even
     # when its other loss is finite: it must not enter any pooled mean (the
     # same exclusion missing seeds get).
     invalid_seed_set = {
         r['seed'] for r in per_seed
-        if any(isinstance(r.get(key), float) and not math.isfinite(r.get(key))
+        if any(r.get(key) is not None and not _is_finite_number(r.get(key))
                for key in ('final_val_loss', 'best_val_loss'))}
 
     def _pool(key: str):
@@ -1027,12 +1061,12 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         # Numerical-health counters pooled across seeds: an arm whose mean
         # covers triaged NaN gradient/validation events is not a clean
         # replication of an arm with none.
-        'n_nonfinite_losses': sum(r['n_nonfinite_losses'] or 0 for r in per_seed
-                                  if isinstance(r.get('n_nonfinite_losses'), (int, float))),
-        'n_nonfinite_gradients': sum(r['n_nonfinite_gradients'] or 0 for r in per_seed
-                                     if isinstance(r.get('n_nonfinite_gradients'), (int, float))),
-        'n_nonfinite_val_losses': sum(r['n_nonfinite_val_losses'] or 0 for r in per_seed
-                                      if isinstance(r.get('n_nonfinite_val_losses'), (int, float))),
+        'n_nonfinite_losses': sum(r['n_nonfinite_losses'] for r in per_seed
+                                  if _is_event_count(r.get('n_nonfinite_losses'))),
+        'n_nonfinite_gradients': sum(r['n_nonfinite_gradients'] for r in per_seed
+                                     if _is_event_count(r.get('n_nonfinite_gradients'))),
+        'n_nonfinite_val_losses': sum(r['n_nonfinite_val_losses'] for r in per_seed
+                                      if _is_event_count(r.get('n_nonfinite_val_losses'))),
         'certified': len(final_vals) >= 3 and pool_ok,
         'certification_basis': ('certified: >= 3 seeds with finite final_val_loss, no missing/invalid seeds, one cross-split ledger identity, and one resolved data version'
                                 if len(final_vals) >= 3 and pool_ok
@@ -1327,7 +1361,7 @@ def main():
         raw_seeds = [args.seed]
     else:
         raw_seeds = list(args.seeds or [DEFAULT_SEED])
-    seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    seeds = _normalize_seed_ids(raw_seeds)
     if len(seeds) != len(raw_seeds):
         print(f'[seeds][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
               '(a repeated seed is the same run, not an independent replication)')
@@ -2124,7 +2158,8 @@ def main():
                 # for the entire run.
                 train_window.append(loss_val)
             step += 1
-            if args.val_every > 0 and step % args.val_every == 0:
+            if (args.val_every > 0
+                    and (step % args.val_every == 0 or step == args.max_steps)):
                 if val_loader is None:
                     val_loader = open_data_split('validation', args)
                     rval = getattr(val_loader, 'split_report', None)

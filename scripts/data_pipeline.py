@@ -58,6 +58,7 @@ import base64
 import hashlib
 import json
 import math
+import numbers
 import os
 import sys
 import unicodedata
@@ -536,8 +537,17 @@ def extract_group_value(example, group_key: str):
             if not isinstance(value, dict) or part not in value:
                 return None
             value = value[part]
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if value is None:
         return None
+    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+        # Catch NumPy float scalars too (`np.float32(nan)` is not a Python
+        # float); otherwise every NaN group hashes as the same "nan" group
+        # and can collapse unrelated documents into one exclusion unit.
+        try:
+            if math.isnan(float(value)):
+                return None
+        except (TypeError, ValueError, OverflowError):
+            pass
     if isinstance(value, str) and not value.strip():
         return None
     return value
@@ -859,6 +869,13 @@ class PackedStream(IterableDataset):
             nonlocal fill
             try:
                 token_lists = self.tok(batch, add_special_tokens=False)["input_ids"]
+                if len(token_lists) != len(batch):
+                    # A batch tokenizer that returns a different number of
+                    # rows cannot be aligned to the documents; silently
+                    # dropping/pulling tokens would change the corpus.
+                    raise ValueError(
+                        f'tokenizer returned {len(token_lists)} row(s) for '
+                        f'{len(batch)} document(s)')
             except Exception:
                 token_lists = []
                 for text in batch:
@@ -966,7 +983,14 @@ def _cache_matches(cache_path: Path, fingerprint: dict) -> bool:
         return False
     try:
         expected_size = None if expected_bytes is None else int(expected_bytes)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (expected_size is not None
+            and (isinstance(expected_bytes, bool)
+                 or expected_size != expected_bytes
+                 or expected_size < 0)):
+        # A bool/fractional/string byte count is not a verifiable fingerprint;
+        # `int(10.5)`/`int(True)` used to truncate into a plausible size.
         return False
     if expected_size is not None and st.st_size != expected_size:
         return False
@@ -1173,7 +1197,7 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
 def _read_cache_fingerprint(meta_path: Path):
     try:
         data = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -1321,8 +1345,15 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     report["tokenizer_revision"] = opts.get("tokenizer_revision")
     # The requested revision alone cannot pin a mutable upstream tokenizer:
     # record the concrete commit the load resolved to (None for a local path).
+    # Some tokenizer objects do not expose `_commit_hash`, so retain the
+    # resolved key from the same cache lookup instead of falling back to the
+    # mutable branch/tag request.
+    requested_tok_revision = opts.get("tokenizer_revision")
+    resolved_tok_revision = (
+        resolve_tokenizer_revision(tokenizer, requested_tok_revision)
+        or requested_tok_revision)
     report["tokenizer_revision_resolved"] = (
-        getattr(tok, "_commit_hash", None) or opts.get("tokenizer_revision"))
+        getattr(tok, "_commit_hash", None) or resolved_tok_revision)
     report["shuffle_buffer"] = int(opts["shuffle_buffer"]) if opts["split"] == "train" else 0
     # The train-document ledger is consumed by both held-out splits; the
     # validation-document ledger is consumed by the sealed test split only, so
