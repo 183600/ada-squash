@@ -120,7 +120,7 @@ def needle_target_ids(tokenizer, needle: str=DEFAULT_NEEDLE) -> list:
 def needle_decode_overhead(tokenizer, needle: str=DEFAULT_NEEDLE) -> int:
     return max(0, len(needle_target_ids(tokenizer, needle)) - 1)
 
-def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0, return_counts: bool=False, decode_batch: int=8):
+def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0, return_counts: bool=False, decode_batch: int=8, return_details: bool=False):
     """Exact-match accuracy of the secret over `n_trials` independent placements.
 
     Cost: every trial generates `len(target_ids)` steps and each step runs one
@@ -133,7 +133,11 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     with `return_counts=True` the result is
     `{'accuracy', 'n_correct', 'n_trials', 'trial_correct', 'ci95_low',
     'ci95_high', 'failures', 'failure_causes', 'failure_confidence'}` with a
-    Wilson 95% interval over the trials. The Wilson interval describes the
+    Wilson 95% interval over the trials. `return_details=True` instead returns
+    `(accuracy, per_trial)` where each record carries the needle's relative
+    position (`pos_frac`, `bucket` = early/middle/late) and pass/fail, so a
+    scalar cannot hide failure that is concentrated at deep positions. The
+    Wilson interval describes the
     trial noise *within one placement draw*: it does not cover run-to-run or
     placement-to-placement variability, so callers comparing arms must recur
     over several `seed` values. `trial_correct` is the per-trial pass/fail
@@ -196,6 +200,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     n_correct = 0
     trial_correct: list = []
     failures: list = []
+    details: list = []
     last_logits = getattr(model, 'last_position_logits', None)
     decode_batch = max(1, int(decode_batch))
     with torch.inference_mode():
@@ -291,9 +296,32 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                 n += 1
             n_correct += sum(not f for f in failed)
             trial_correct.extend(not f for f in failed)
+            decode = getattr(tok, 'decode', None)
+            for i, (pos, _) in enumerate(group):
+                pos_frac = pos / max(1, body_len)
+                generated_text = ''
+                if generated[i] and callable(decode):
+                    try:
+                        generated_text = decode([int(v) for v in generated[i]])
+                    except Exception:
+                        generated_text = ''
+                details.append({
+                    'trial': b0 + i,
+                    'pos_frac': pos_frac,
+                    'bucket': ('early' if pos_frac < 1 / 3
+                               else 'middle' if pos_frac < 2 / 3 else 'late'),
+                    'correct': bool(not failed[i]),
+                    'generated': generated_text,
+                })
     if n_run == 0:
         raise ValueError('needle test produced no trials')
     acc = n_correct / n_run
+    if return_details:
+        # Position-resolved coverage: a scalar accuracy can hide a model that
+        # only succeeds on shallow needles. The default return type stays a
+        # float (and return_counts keeps its dict), so existing callers are
+        # untouched.
+        return acc, details
     if return_counts:
         low, high = wilson_interval(n_correct, n_run)
         return {'accuracy': acc, 'n_correct': n_correct, 'n_trials': n_run,
