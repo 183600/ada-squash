@@ -35,6 +35,9 @@ import time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from adasquash.design import (order_drift_report,
+                               randomized_complete_block_schedule,
+                               schedule_balance_report)
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
                                paired_design_summary, paired_t_one_sided,
                                paired_trend_test, student_t_ppf)
@@ -1151,7 +1154,7 @@ def _child_env(args, gpu=None, seed=None) -> dict:
             env[var] = str(threads)
     return env
 
-def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=None, launch_id=None):
+def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=None, launch_id=None, order_info=None):
     cmd = [sys.executable, str(Path(__file__).parent / 'train_gpt2.py'), '--model', args.model, '--norm', norm, '--dataset', args.dataset, '--seq-len', str(args.seq_len), '--batch-size', str(args.batch_size), '--grad-accum', str(args.grad_accum), '--max-steps', str(args.max_steps), '--lr', str(args.lr), '--min-lr-ratio', str(args.min_lr_ratio), '--warmup', str(args.warmup), '--weight-decay', str(args.weight_decay), '--beta1', str(args.beta1), '--beta2', str(args.beta2), '--grad-clip', str(args.grad_clip), '--seed', str(seed), '--alpha-0', str(args.alpha_0), '--alpha-init', str(args.alpha_init), '--k-init', str(args.k_init), '--p-init', str(args.p_init), '--qk-alpha-init', str(args.qk_alpha_init), '--output-dir', str(output_dir), '--log-every', str(args.log_every), '--stats-every', str(args.stats_every), '--save-every', str(args.save_every)]
     # Optional identifiers must be omitted, not forwarded as the literal
     # string "None": load_dataset(..., dataset_config="None") / a tokenizer
@@ -1256,6 +1259,11 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
         'seed': int(seed),
         'protocol': expected_child_protocol(args, depth, norm, seed),
     }
+    if order_info is not None:
+        # The randomized schedule is recorded in the same launch spec the
+        # aggregator already reads, so a cell's place in time is auditable
+        # without re-deriving it from wall-clock logs.
+        spec['run_order'] = dict(order_info)
     (output_dir / 'launch_spec.json').write_text(json.dumps(spec, indent=2))
     log = open(output_dir / 'stdout.log', 'w')
     try:
@@ -1338,6 +1346,8 @@ def main():
     p.add_argument('--sequential', action='store_true', help='run configs strictly one at a time (equivalent to --max-parallel 1, which is the default)')
     p.add_argument('--max-parallel', type=int, default=1, help='maximum number of concurrently training cells; the default 1 keeps a 4x3x3 depth/norm/seed grid from launching 36 1B runs at once. Only raise it together with --gpus so each child has its own device')
     p.add_argument('--gpus', nargs='+', default=None, metavar='ID', help='GPU ids the cells are pinned to, round-robin in launch order (written to CUDA_VISIBLE_DEVICES of each child); without it all children share the ambient CUDA_VISIBLE_DEVICES')
+    p.add_argument('--schedule-seed', type=int, default=0, help='seed of the randomized complete-block launch schedule; the schedule is written to run_schedule.json and its order is recorded per launch')
+    p.add_argument('--no-randomize-order', dest='randomize_order', action='store_false', help='launch cells in the input depth/norm/seed order instead of a randomized complete-block schedule; order drift is then confounded with depth')
     p.add_argument('--threads-per-run', type=int, default=1, help='OMP/MKL/OpenBLAS/etc thread cap for each child (0 = inherit the parent environment); 1 avoids oversubscription when cells share a host, raise it for a single serial run')
     apply_config_to_parser(p, known.config, _SWEEP_CONFIG_ALIASES)
     args = p.parse_args()
@@ -1412,6 +1422,34 @@ def main():
                 (out_dir / 'depth.txt').write_text(str(depth))
                 jobs.append((depth, norm, out_dir, seed))
             cells.append((depth, norm, cell_dir))
+    run_schedule = None
+    order_by_job: dict = {}
+    if args.randomize_order:
+        treatment_ids = [f'd{depth}-{norm}'
+                         for depth in args.depths for norm in args.norms]
+        run_schedule = randomized_complete_block_schedule(
+            treatment_ids, [str(seed) for seed in seeds], seed=args.schedule_seed)
+        order_by_job = {
+            (entry['unit'], int(entry['replicate'])): entry
+            for entry in run_schedule['entries']}
+        jobs.sort(key=lambda job: order_by_job[
+            (f'd{job[0]}-{job[1]}', int(job[3]))]['position'])
+        (base / 'run_schedule.json').write_text(json.dumps(run_schedule, indent=2))
+        print(f"[sweep][design] randomized complete-block schedule: "
+              f"{run_schedule['n_treatments']} cell(s) x {run_schedule['n_blocks']} "
+              f"block(s) = {run_schedule['n_units']} launch(es), fingerprint "
+              f"{run_schedule['fingerprint'][:12]}; every cell runs once per block")
+    else:
+        print('[sweep][design] WARNING: --no-randomize-order keeps depth-major launch '
+              'order; a time drift is then confounded with depth and cannot be '
+              'separated from it after the fact')
+    sweep_manifest['run_schedule'] = run_schedule
+    if run_schedule is not None:
+        sweep_manifest['schedule_balance'] = schedule_balance_report(
+            run_schedule,
+            arm_of=lambda unit: unit.rsplit('::rep=', 1)[0]
+            if '::rep=' in unit else unit)
+    save_run_manifest(base / 'run_manifest.json', sweep_manifest)
     gpus = list(dict.fromkeys(str(g) for g in args.gpus)) if args.gpus else []
     failed_jobs = []
 
@@ -1444,7 +1482,10 @@ def main():
         if args.sequential and int(args.max_parallel) > 1:
             print('[sweep][warn] --sequential overrides --max-parallel')
         for idx, (depth, norm, out_dir, seed) in enumerate(jobs):
-            proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(idx), launch_id=sweep_launch_id)
+            order_info = (order_by_job.get((f'd{depth}-{norm}', int(seed)))
+                          if run_schedule is not None else None)
+            proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(idx),
+                              launch_id=sweep_launch_id, order_info=order_info)
             rc = proc.wait()
             if rc != 0:
                 failed_jobs.append((depth, norm, seed, rc))
@@ -1462,7 +1503,10 @@ def main():
                     break
                 gpu = free[0]
                 depth, norm, out_dir, seed = jobs[next_job]
-                proc = launch_one(args, depth, norm, out_dir, seed, gpu=gpu, launch_id=sweep_launch_id)
+                order_info = (order_by_job.get((f'd{depth}-{norm}', int(seed)))
+                              if run_schedule is not None else None)
+                proc = launch_one(args, depth, norm, out_dir, seed, gpu=gpu,
+                                  launch_id=sweep_launch_id, order_info=order_info)
                 next_job += 1
                 busy_gpus.add(gpu)
                 running.append((proc, depth, norm, seed, gpu))
@@ -1608,6 +1652,45 @@ def main():
     with open(comp_path, 'w') as f:
         json.dump(comparison, f, indent=2)
     print(f'[compare] comparisons -> {comp_path}')
+    order_audit = None
+    if run_schedule is not None:
+        observations = []
+        for depth, norm, cell_dir in cells:
+            agg = aggs_by_depth.get(depth, {}).get(norm, {})
+            for item in agg.get('per_seed') or []:
+                if not isinstance(item, dict):
+                    continue
+                seed = item.get('seed')
+                value = item.get('final_val_loss')
+                if (isinstance(seed, bool) or not isinstance(seed, int)
+                        or isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))):
+                    continue
+                entry = order_by_job.get((f'd{depth}-{norm}', seed))
+                if entry is None:
+                    continue
+                observations.append({
+                    'unit': entry['run_id'],
+                    'arm': f'd{depth}-{norm}',
+                    'position': entry['position'],
+                    'value': float(value),
+                })
+        order_audit = order_drift_report(observations)
+        with open(base / 'run_order_audit.json', 'w') as f:
+            json.dump(order_audit, f, indent=2)
+        if order_audit.get('status') == 'tested':
+            print(f"[sweep][order] within-cell drift: rho={order_audit['spearman_rho']:+.3f}, "
+                  f"p={order_audit['p_two_sided']:.3f}, "
+                  f"direction={order_audit['direction']} ({order_audit['n_observations']} "
+                  f"run(s))")
+            if order_audit['drift_detected']:
+                print('[sweep][order] WARNING: launch order is confounded with the '
+                      'fixed-step loss; re-run the affected cells in a fresh block '
+                      'before reading their cross-depth deltas')
+        else:
+            print(f"[sweep][order] not testable: {order_audit.get('note')}")
+        sweep_manifest['run_order_audit'] = order_audit
     # The manifest was written before the children launched; finalize it now
     # with the outcome, otherwise a completed sweep is indistinguishable from a
     # launcher that died silently after writing the (pre-run) manifest.
@@ -1636,7 +1719,13 @@ def main():
             'n_jobs': len(jobs),
             'incomplete_cells': comparison.get('incomplete_cells') if isinstance(comparison, dict) else None,
         },
-        artifacts={'sweep_comparisons': artifact_record(comp_path)},
+        artifacts={
+            'sweep_comparisons': artifact_record(comp_path),
+            'run_schedule': (artifact_record(base / 'run_schedule.json')
+                             if run_schedule is not None else {'enabled': False}),
+            'run_order_audit': (artifact_record(base / 'run_order_audit.json')
+                                if order_audit is not None else {'enabled': False}),
+        },
     )
     all_children_failed = bool(jobs) and len(failed_jobs) == len(jobs)
     if all_children_failed:

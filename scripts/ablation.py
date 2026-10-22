@@ -38,6 +38,22 @@ Comparison protocol (what the runner guarantees, and checks)
   a power-based minimum detectable delta. The reference baseline is the best
   *replicated* baseline (with the point-estimate best recorded alongside), so
   a lucky single-seed row cannot make certification impossible.
+* **Randomized complete-block execution order.** Every row runs once in each
+  time block, with an independent per-row seed permutation and a keyed-SHA-256
+  within-block order; the schedule (and its fingerprint) is frozen in
+  `analysis_plan.json` before training. A block-level drift then hits every row
+  once and cancels from the paired arm contrast. `run_order_audit.json` tests
+  whether the realized position still predicts the held-out loss after
+  centering within arm, and reports when cached runs predate the schedule
+  instead of inventing an order for them. `--no-randomize-order` is the
+  recorded opt-out.
+* **Pre-flight design readiness.** `design_readiness.json` checks replication,
+  stated hypotheses, a pre-specified smallest effect, planned power (from
+  `--assumed-paired-sd`), schedule completeness/balance and the presence of
+  the identity `dytcd_full` / `dytcd_ls1e5` control pair. `--require-design-ready`
+  turns a structural failure into a pre-training error. When a margin and an
+  assumed SD are supplied, the same file calibrates the actual paired-test code
+  on synthetic data (`simulate_paired_design`) instead of trusting its formula.
 * **Pre-registered analysis plan.** `build_analysis_plan` freezes every
   confirmatory contrast (baseline, leave-one-out, factorial, QK) with a stable
   id, its stated hypothesis, test direction and a SHA-256 fingerprint before
@@ -88,6 +104,9 @@ sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
 from adasquash.attention import clear_logit_scratch_cache
+from adasquash.design import (design_readiness_audit, order_drift_report,
+                               randomized_complete_block_schedule,
+                               schedule_balance_report, simulate_paired_design)
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
@@ -718,7 +737,7 @@ def load_ablations_from_config(path: str, include_metadata: bool = False) -> dic
         )
     return out
 
-def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: dict | None=None, hypothesis: str | None=None, seed: int | None=None):
+def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: dict | None=None, hypothesis: str | None=None, seed: int | None=None, order_info: dict | None=None):
     if seed is None:
         seed = getattr(args, 'seed', None)
     if seed is None:
@@ -929,6 +948,12 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     summary['parameter_breakdown'] = param_breakdown
     summary['flops_per_token_forward'] = flops['forward_per_token']
     summary['flops_per_token_training_est'] = flops['training_per_token']
+    # Execution order is run state, not a nuisance detail: a later run in the
+    # same session may see a different thermal/clock regime. Only runs that
+    # actually executed under the schedule carry it; a cached summary from an
+    # earlier session keeps whatever (possibly absent) order it recorded.
+    if order_info is not None:
+        summary['run_order'] = dict(order_info)
     if run_metadata is None:
         run_metadata = collect_run_metadata(seed=seed)
     else:
@@ -995,6 +1020,10 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
             # before curve monitoring existed, or for very short runs).
             'curve_classification': s.get('curve_classification'),
             'curve_diagnosis': s.get('curve_diagnosis'),
+            # Present only for runs that executed under this session's
+            # randomized schedule; the order audit must not invent one for a
+            # cached summary from an earlier, differently ordered session.
+            'run_order': s.get('run_order'),
         })
     seed_losses = [p['val_loss'] for p in per_seed if _finite_metric(p['val_loss'])]
     stats = mean_std_stderr(seed_losses) or {'mean': None, 'std': None, 'stderr': None, 'n': 0}
@@ -1055,8 +1084,80 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
         'curve_last_generalization_gap_by_seed': {
             str(p['seed']): (p.get('curve_diagnosis') or {}).get('generalization_gap')
             for p in per_seed},
+        # Per-seed execution position, so run_order_audit can test whether the
+        # realized order predicts the outcome after removing the arm mean.
+        'run_order_by_seed': {
+            str(p['seed']): p.get('run_order') for p in per_seed
+            if p.get('run_order') is not None},
     })
     return agg
+
+def run_order_audit(summaries: list, schedule: dict | None=None) -> dict:
+    """Test whether the realized execution order predicts the held-out loss.
+
+    Only runs that actually executed under this session's schedule carry a
+    `run_order`; cached summaries from an older session are reported as
+    missing instead of having an order invented for them. Alias rows are
+    excluded because their losses are copies of a canonical run, not
+    independent observations. The per-arm centering inside
+    `order_drift_report` is what keeps a real arm difference from being
+    misread as a time trend.
+    """
+    observations: list = []
+    rows_with_order = 0
+    rows_without_order = 0
+    for row in summaries or []:
+        if not isinstance(row, dict) or row.get('reused_from'):
+            continue
+        per_seed = row.get('per_seed')
+        if not isinstance(per_seed, list):
+            continue
+        found = False
+        for item in per_seed:
+            if not isinstance(item, dict) or not _finite_metric(item.get('val_loss')):
+                continue
+            order = item.get('run_order')
+            if not isinstance(order, dict):
+                continue
+            position = order.get('position')
+            if (isinstance(position, bool)
+                    or not isinstance(position, (int, float))
+                    or not math.isfinite(float(position))):
+                continue
+            observations.append({
+                'unit': order.get('run_id') or f"{row.get('name')}::seed={item.get('seed')}",
+                'arm': str(row.get('name')),
+                'position': float(position),
+                'value': float(item['val_loss']),
+            })
+            found = True
+        if found:
+            rows_with_order += 1
+        else:
+            rows_without_order += 1
+    report = order_drift_report(observations)
+    report['schedule_fingerprint'] = (schedule or {}).get('fingerprint')
+    report['n_rows_with_order'] = rows_with_order
+    report['n_rows_without_order'] = rows_without_order
+    if schedule is not None:
+        report['schedule_balance'] = schedule_balance_report(
+            schedule,
+            arm_of=lambda unit: unit.rsplit('::rep=', 1)[0]
+            if '::rep=' in unit else unit)
+    if report.get('status') == 'tested':
+        print(f"[order] within-arm order drift: rho={report['spearman_rho']:+.3f}, "
+              f"p={report['p_two_sided']:.3f}, direction={report['direction']} "
+              f"({report['n_observations']} run(s) with recorded order)")
+        if report['drift_detected']:
+            print('[order] WARNING: execution order is confounded with the outcome; '
+                  're-run the affected arms in a fresh randomized block before '
+                  'interpreting their deltas')
+    else:
+        print(f"[order] not testable: {report.get('note')} "
+              f"({rows_with_order} row(s) with recorded order, "
+              f"{rows_without_order} without)")
+    return report
+
 
 def _load_summary(path: Path):
     try:
@@ -2794,7 +2895,8 @@ def print_factorial_comparison(comparison: dict | None) -> None:
 def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         baseline_names, model_name: str, seeds,
                         alpha: float=0.05, margin: float=0.0,
-                        equivalence_margin: float=0.0) -> dict:
+                        equivalence_margin: float=0.0,
+                        run_schedule: dict | None=None) -> dict:
     """Freeze the confirmatory contrast registry *before* any training starts.
 
     A comparison experiment is only confirmatory if the set of tests is fixed
@@ -2937,6 +3039,10 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
             key: matrix_report.get(key)
             for key in ('leave_one_out', 'factorial', 'qk_axis')
         },
+        # The randomized execution order is part of the pre-registration: a
+        # schedule chosen after seeing which arms look good is a design
+        # degree of freedom exactly like choosing the contrasts afterwards.
+        'run_schedule': run_schedule,
         'contrasts': contrasts,
     }
     fingerprint = hashlib.sha256(
@@ -3285,6 +3391,10 @@ def main():
     p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check for every norm in the selected rows before training them (default: on; a row that cannot overfit one batch has a gradient/loss bug and must not be launched)')
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. an offline host)')
     p.add_argument('--check-matrix', action='store_true', help='validate controlled knobs, stated hypotheses and leave-one-out coverage of the matrix, then exit without training')
+    p.add_argument('--schedule-seed', type=int, default=0, help='seed of the randomized complete-block execution schedule; the schedule is frozen in analysis_plan.json before training, so changing it changes the pre-registration fingerprint')
+    p.add_argument('--no-randomize-order', dest='randomize_order', action='store_false', help='keep the matrix row order instead of a randomized complete-block schedule (the order is then recorded as not randomized; order drift cannot be separated from the arm)')
+    p.add_argument('--assumed-paired-sd', type=float, default=None, help='pre-run assumption for the paired across-seed SD (e.g. from a pilot); with --baseline-margin this makes the design-readiness audit check planned power before launching runs')
+    p.add_argument('--require-design-ready', action='store_true', help='fail before training when the design-readiness audit has a structural failure (missing replication/hypothesis, incomplete schedule, absent control pair, or underpowered for the stated margin)')
     p.add_argument('--require-plan-lock', action='store_true', help='fail when this invocation would replace an existing analysis_plan.json with a different fingerprint (changed seeds/alpha/margins/hypotheses); without it the drift is recorded and warned about, but the run proceeds')
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
@@ -3342,10 +3452,45 @@ def main():
         sys.exit(1)
     print(f"[matrix] ok: {len(matrix_report['rows'])} rows, controlled optimizer/schedule/data, "
           f"every row has a hypothesis, leave-one-out coverage {matrix_report['leave_one_out']}")
+    # Resolve the rows that will actually execute, and collapse alias rows
+    # (identical effective model config) onto one canonical run. The schedule
+    # is over canonical runs only, so an alias cannot consume a slot in a
+    # block and unbalance the design.
+    selected = list(dict.fromkeys(name for name in args.names if name in ablations))
+    for unknown in sorted(set(args.names) - set(ablations)):
+        print(f"[warn] unknown ablation '{unknown}', skipping")
+    config_groups: dict[str, list[str]] = {}
+    for name in selected:
+        config_groups.setdefault(
+            effective_config_key(args.model, ablations[name]), []).append(name)
+    alias_of: dict[str, str] = {}
+    canonical_rows: list[str] = []
+    for group in config_groups.values():
+        canonical = group[0]
+        canonical_rows.append(canonical)
+        for alias in group[1:]:
+            alias_of[alias] = canonical
+    if alias_of:
+        print(f'[design] {len(alias_of)} alias row(s) reuse a canonical run and are '
+              f'outside the execution schedule: {alias_of}')
+    run_schedule = None
+    if args.randomize_order and canonical_rows:
+        run_schedule = randomized_complete_block_schedule(
+            canonical_rows, [str(seed) for seed in seeds], seed=args.schedule_seed)
+        print(f"[design] randomized complete-block schedule: {len(canonical_rows)} row(s) x "
+              f"{len(seeds)} seed(s) = {run_schedule['n_units']} run(s) in "
+              f"{run_schedule['n_blocks']} time block(s), fingerprint "
+              f"{run_schedule['fingerprint'][:12]}; every row runs once per block")
+    elif not canonical_rows:
+        print('[design] no rows selected: no execution schedule was generated')
+    else:
+        print('[design] WARNING: --no-randomize-order keeps the input row order; '
+              'a time drift is then confounded with the arm and cannot be '
+              'separated from it after the fact')
     analysis_plan = build_analysis_plan(
         ablations, hypotheses, matrix_report, args.baselines, args.model, seeds,
         alpha=args.alpha, margin=args.baseline_margin,
-        equivalence_margin=args.equivalence_margin)
+        equivalence_margin=args.equivalence_margin, run_schedule=run_schedule)
     matrix_report['analysis_plan'] = analysis_plan
     print(f"[plan] {analysis_plan['n_contrasts']} pre-registered confirmatory contrast(s) "
           f"(fingerprint {analysis_plan['fingerprint'][:12]}); every test outside this "
@@ -3376,6 +3521,53 @@ def main():
                 f'tune the baselines with this recipe and held-back --confirm-seeds.')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    if run_schedule is not None:
+        with open(base / 'run_schedule.json', 'w') as f:
+            json.dump(run_schedule, f, indent=2)
+    schedule_arm_of = (lambda unit: unit.rsplit('::rep=', 1)[0]
+                       if '::rep=' in unit else unit)
+    control_pairs = []
+    if 'dytcd_full' in ablations and 'dytcd_ls1e5' in ablations:
+        # Explicit-default LayerScale is an identity pair: the two rows build
+        # the same effective model, so its contrast is a known null that tests
+        # the analysis pipeline end to end.
+        control_pairs.append(('dytcd_full', 'dytcd_ls1e5'))
+    expected_schedule_units = (
+        [f'{name}::rep={seed}' for name in canonical_rows for seed in seeds]
+        if run_schedule is not None else None)
+    design_readiness = design_readiness_audit(
+        seeds, ablations, hypotheses, schedule=run_schedule,
+        expected_units=expected_schedule_units,
+        schedule_arm_of=schedule_arm_of, margin=args.baseline_margin,
+        equivalence_margin=args.equivalence_margin,
+        assumed_paired_sd=args.assumed_paired_sd, alpha=args.alpha,
+        identity_controls=control_pairs)
+    if run_schedule is not None:
+        design_readiness['schedule_balance'] = schedule_balance_report(
+            run_schedule, arm_of=schedule_arm_of)
+    if (args.assumed_paired_sd is not None and args.baseline_margin > 0.0):
+        # Calibrate the actual paired-test code against the pre-run assumption:
+        # under the alternative the planned effect is -margin (candidate lower
+        # loss). This is a preparation check, not a result.
+        design_readiness['simulated_power_check'] = simulate_paired_design(
+            n_pairs=len(seeds), effect=-float(args.baseline_margin),
+            paired_sd=float(args.assumed_paired_sd), reps=1000,
+            alpha=args.alpha, seed=args.schedule_seed)
+    with open(base / 'design_readiness.json', 'w') as f:
+        json.dump(design_readiness, f, indent=2)
+    for check in design_readiness['checks']:
+        if check['status'] != 'pass':
+            print(f"[design] {check['status'].upper()}: {check['id']}: {check['detail']}")
+    if not design_readiness['ready']:
+        if args.require_design_ready:
+            raise SystemExit(
+                '[design] ERROR: --require-design-ready is set but the pre-flight '
+                'design audit has structural failure(s): '
+                + '; '.join(check['detail'] for check in design_readiness['checks']
+                            if check['status'] == 'fail'))
+        print('[design] WARNING: the design audit has a structural failure; the run '
+              'will proceed, but the failure is recorded in design_readiness.json '
+              'and the comparison cannot claim a clean confirmatory design')
     # Pre-registration drift: a rerun that changes the seeds, alpha, margins or
     # hypotheses changes the plan fingerprint. Silently replacing the old plan
     # would erase the fact that the confirmatory family moved after results
@@ -3393,13 +3585,14 @@ def main():
     analysis_plan['plan_changed'] = plan_changed
     analysis_plan['previous_fingerprint'] = previous_fingerprint
     analysis_plan['plan_change_policy'] = (
-        'the fingerprint covers the confirmatory contrast registry, seeds, alpha '
-        'and margins; a changed fingerprint means the analysis plan moved after '
-        'it was first fixed')
+        'the fingerprint covers the confirmatory contrast registry, seeds, alpha, '
+        'margins and the randomized execution schedule; a changed fingerprint '
+        'means the analysis plan moved after it was first fixed')
     if plan_changed:
         message = (f'the analysis plan changed since the previous run in this '
                    f'output directory ({str(previous_fingerprint)[:12]} -> '
-                   f'{analysis_plan["fingerprint"][:12]}); the change is recorded '
+                   f'{analysis_plan["fingerprint"][:12]}; seeds, alpha, margins, '
+                   f'hypotheses or the randomized schedule); the change is recorded '
                    f'as post-hoc unless this is a fresh pre-registration')
         if args.require_plan_lock:
             raise SystemExit(f'[plan] ERROR: {message}. Remove the old output '
@@ -3447,52 +3640,134 @@ def main():
                   f"much as the module; read curve_val_loss and the per-seed verdicts "
                   f"before attributing it to the norm")
 
-    for name in args.names:
-        if name not in ablations:
-            print(f"[warn] unknown ablation '{name}', skipping")
-            continue
-        cfg_kwargs = ablations[name]
+    def _prepare_row(name: str):
+        """Create a row directory and locate its per-seed summary paths."""
         row_dir = base / name
-        summary_paths = {seed: (row_dir / f'seed{seed}' / 'summary.json' if multi else row_dir / 'summary.json') for seed in seeds}
+        row_dir.mkdir(parents=True, exist_ok=True)
+        summary_paths = {
+            seed: (row_dir / f'seed{seed}' / 'summary.json' if multi
+                   else row_dir / 'summary.json')
+            for seed in seeds}
         legacy = row_dir / 'summary.json'
-        if multi and legacy.exists() and (not (row_dir / 'summary.preseed.json').exists()) and (not any(p.exists() for p in summary_paths.values())):
+        if (multi and legacy.exists()
+                and not (row_dir / 'summary.preseed.json').exists()
+                and not any(path.exists() for path in summary_paths.values())):
             os.replace(legacy, row_dir / 'summary.preseed.json')
-            print(f'[keep] {name}: moved pre-replication single-seed summary to summary.preseed.json')
-        config_key = effective_config_key(args.model, cfg_kwargs)
-        source = trained.get(config_key)
-        if source is not None and (not args.force):
-            source_paths = {seed: (base / source / f'seed{seed}' / 'summary.json' if multi else base / source / 'summary.json') for seed in seeds}
-            if all(p.exists() for p in source_paths.values()):
-                reused = [_load_summary(p) for p in source_paths.values()]
-                if all(isinstance(s, dict) for s in reused):
-                    reused = [dict(s, name=name, cfg=cfg_kwargs, reused_from=source, hypothesis=hypotheses.get(name)) for s in reused]
-                    for seed, summary in zip(seeds, reused):
-                        if multi:
-                            _write_summary(summary_paths[seed], summary)
-                    agg = aggregate_seed_summaries(name, reused, cfg_kwargs, hypotheses.get(name))
-                    _write_summary(row_dir / 'summary.json', agg)
-                    print(f'[alias] {name}: identical model config to {source}, reusing its summaries (no retrain)')
-                    _report_curve_regimes(agg)
-                    trained[config_key] = name
-                    all_summaries.append(agg)
-                    continue
-        seed_summaries = []
-        for seed in seeds:
-            path = summary_paths[seed]
-            if path.exists() and (not args.force):
-                summary = _load_summary(path)
-                if isinstance(summary, dict):
-                    if cached_seed_matches(summary, name, cfg_kwargs, args, seed):
-                        print(f'[skip] {name} seed={seed} already done, use --force to rerun')
-                        seed_summaries.append(summary)
-                        continue
-                    print(f'[stale] {name} seed={seed}: cached summary recorded a different '
-                          f'model/cfg/protocol; retraining and overwriting')
-            seed_summaries.append(run_one(name, cfg_kwargs, args, path.parent, run_metadata=run_metadata, hypothesis=hypotheses.get(name), seed=seed))
-        agg = aggregate_seed_summaries(name, seed_summaries, cfg_kwargs, hypotheses.get(name))
+            print(f'[keep] {name}: moved pre-replication single-seed summary to '
+                  f'summary.preseed.json')
+        return row_dir, summary_paths
+
+    row_layout = {name: _prepare_row(name) for name in canonical_rows}
+    row_summaries: dict[str, list] = {name: [] for name in canonical_rows}
+    row_done: set[str] = set()
+
+    def _finish_row(name: str) -> None:
+        cfg_kwargs = ablations[name]
+        row_dir, _ = row_layout[name]
+        seed_summaries = sorted(row_summaries[name], key=lambda item: item.get('seed'))
+        agg = aggregate_seed_summaries(name, seed_summaries, cfg_kwargs,
+                                       hypotheses.get(name))
         _write_summary(row_dir / 'summary.json', agg)
         _report_curve_regimes(agg)
-        trained[config_key] = name
+        trained[effective_config_key(args.model, cfg_kwargs)] = name
+        row_done.add(name)
+        all_summaries.append(agg)
+
+    if run_schedule is not None:
+        schedule_entries = run_schedule['entries']
+        schedule_fingerprint = run_schedule['fingerprint']
+        randomized = True
+    else:
+        # Explicit opt-out: a deterministic row-major sequence, recorded as
+        # not randomized so the order audit can say the design did not address
+        # time drift rather than pretend it did.
+        schedule_entries = []
+        for block_index, seed in enumerate(seeds):
+            for name in canonical_rows:
+                schedule_entries.append({
+                    'unit': name, 'replicate': str(seed),
+                    'run_id': f'{name}::rep={seed}', 'block': block_index,
+                    'position': len(schedule_entries)})
+        schedule_fingerprint = None
+        randomized = False
+
+    for entry in schedule_entries:
+        name = entry.get('unit')
+        if name not in row_summaries or name in row_done:
+            continue
+        try:
+            seed = int(entry.get('replicate'))
+        except (TypeError, ValueError):
+            raise SystemExit(
+                f'[design] ERROR: schedule entry {entry!r} has no integer seed')
+        if seed not in seeds:
+            raise SystemExit(
+                f'[design] ERROR: schedule entry {entry!r} names seed {seed} outside '
+                f'the registered seed set {seeds}')
+        cfg_kwargs = ablations[name]
+        _, summary_paths = row_layout[name]
+        path = summary_paths[seed]
+        if path.exists() and (not args.force):
+            summary = _load_summary(path)
+            if isinstance(summary, dict):
+                if cached_seed_matches(summary, name, cfg_kwargs, args, seed):
+                    print(f'[skip] {name} seed={seed} already done, use --force to rerun')
+                    row_summaries[name].append(summary)
+                    if len(row_summaries[name]) == len(seeds):
+                        _finish_row(name)
+                    continue
+                print(f'[stale] {name} seed={seed}: cached summary recorded a different '
+                      f'model/cfg/protocol; retraining and overwriting')
+        order_info = {
+            'position': entry.get('position'),
+            'block': entry.get('block'),
+            'run_id': entry.get('run_id'),
+            'randomized': randomized,
+            'schedule_fingerprint': schedule_fingerprint,
+            'schedule_seed': (run_schedule.get('seed') if run_schedule else None),
+        }
+        row_summaries[name].append(run_one(
+            name, cfg_kwargs, args, path.parent, run_metadata=run_metadata,
+            hypothesis=hypotheses.get(name), seed=seed, order_info=order_info))
+        if len(row_summaries[name]) == len(seeds):
+            _finish_row(name)
+
+    unresolved_rows = [name for name in canonical_rows if name not in row_done]
+    if unresolved_rows:
+        raise SystemExit(
+            f'[design] ERROR: the run schedule did not complete row(s) '
+            f'{unresolved_rows}; no aggregate can be written for them. This is a '
+            f'schedule/execution bug, not a scientific exclusion.')
+
+    # Alias rows are deterministic copies of a canonical trained row. They are
+    # written after the canonical run so they can never be scheduled as an
+    # independent arm (which would double-count one run in the block design).
+    for alias, canonical in alias_of.items():
+        cfg_kwargs = ablations[alias]
+        row_dir, summary_paths = _prepare_row(alias)
+        source_row_dir, _ = row_layout[canonical]
+        source_paths = {
+            seed: (source_row_dir / f'seed{seed}' / 'summary.json' if multi
+                   else source_row_dir / 'summary.json')
+            for seed in seeds}
+        reused = [_load_summary(path) for path in source_paths.values()]
+        if not all(isinstance(summary, dict) for summary in reused):
+            raise SystemExit(
+                f'[design] ERROR: alias row {alias!r} reuses {canonical!r}, but its '
+                f'per-seed summaries are incomplete; refusing to write a row that '
+                f'is not actually a copy of a completed run')
+        reused = [dict(summary, name=alias, cfg=cfg_kwargs,
+                       reused_from=canonical, hypothesis=hypotheses.get(alias))
+                  for summary in reused]
+        for seed, summary in zip(seeds, reused):
+            if multi:
+                _write_summary(summary_paths[seed], summary)
+        agg = aggregate_seed_summaries(alias, reused, cfg_kwargs,
+                                       hypotheses.get(alias))
+        _write_summary(row_dir / 'summary.json', agg)
+        print(f'[alias] {alias}: identical model config to {canonical}, reusing its '
+              f'summaries (no retrain)')
+        _report_curve_regimes(agg)
         all_summaries.append(agg)
     agg_path = base / 'all_summaries.json'
     previous: list = []
@@ -3637,6 +3912,12 @@ def main():
         with open(base / 'study_level_tests.json', 'w') as f:
             json.dump(study, f, indent=2)
     print_study_level_correction(study)
+    # Execution-order audit: a significant within-arm rank correlation is a
+    # design warning, not an arm result. It is written next to the comparisons
+    # so a reader can see whether the randomized schedule actually held.
+    order_audit = run_order_audit(comparable, run_schedule)
+    with open(base / 'run_order_audit.json', 'w') as f:
+        json.dump(order_audit, f, indent=2)
     manifest = dict(run_metadata)
     manifest['git'] = git_revision()
     manifest['hyperparameters'] = vars(args)
@@ -3658,6 +3939,9 @@ def main():
     manifest['qk_axis_comparison'] = qk_axis
     manifest['analysis_plan'] = analysis_plan
     manifest['study_level_tests'] = study
+    manifest['run_schedule'] = run_schedule
+    manifest['design_readiness'] = design_readiness
+    manifest['run_order_audit'] = order_audit
     if sanity_report_path is not None:
         manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
     else:
@@ -3673,6 +3957,10 @@ def main():
         'factorial_comparison': artifact_record(base / 'factorial_comparison.json'),
         'qk_axis_comparison': artifact_record(base / 'qk_axis_comparison.json'),
         'study_level_tests': artifact_record(base / 'study_level_tests.json'),
+        'run_schedule': (artifact_record(base / 'run_schedule.json')
+                         if run_schedule is not None else {'enabled': False}),
+        'design_readiness': artifact_record(base / 'design_readiness.json'),
+        'run_order_audit': artifact_record(base / 'run_order_audit.json'),
         'sanity_report': file_fingerprint(sanity_report_path) if sanity_report_path else {'enabled': False},
     })
     save_run_manifest(base / 'run_manifest.json', manifest)
