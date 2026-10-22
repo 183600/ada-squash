@@ -572,8 +572,8 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
             entry['complete'] = (
                 not entry['candidate_missing_seeds']
                 and not entry['reference_missing_seeds']
-                and ref.get('complete', True)
-                and by_norm[norm].get('complete', True))
+                and ref.get('complete') is True
+                and by_norm[norm].get('complete') is True)
             if len(common) >= 2:
                 a = [cand_seeds[s] for s in common]
                 b = [ref_seeds[s] for s in common]
@@ -678,7 +678,7 @@ def print_sweep_comparisons(comparison: dict) -> None:
         mde = r.get('minimum_detectable_delta_95_power80')
         mde_str = '' if mde is None else f" mde80={mde:.4f}"
         miss = ''
-        if not r.get('complete', True):
+        if r.get('complete') is not True:
             miss = (f" INCOMPLETE(candidate missing {r['candidate_missing_seeds']}, "
                     f"reference missing {r['reference_missing_seeds']})")
         regime = ''
