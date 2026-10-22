@@ -534,7 +534,12 @@ def main():
                 return (_cfg_key(args.model, cfg)
                         != _cfg_key(args.model, {'norm_name': norm}))
             except Exception:
-                return bool(set(cfg) - {'norm_name'})
+                # If the canonical config key cannot even be computed, the
+                # measurement is unverified. That is a proxy (fail closed),
+                # not a match: the previous fallback treated a bare
+                # `{'norm_name': ...}` config as non-proxy precisely when the
+                # comparison had failed.
+                return True
 
         ref_cost_is_proxy = _cfg_is_proxy(ref_cfg, ref_norm)
         if ref_cost_is_proxy:
