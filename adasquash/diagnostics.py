@@ -1034,7 +1034,7 @@ def triage_nonfinite(
                     grad_n_missing=report["n_missing_grad"],
                     grad_n_zero=report["n_zero_grad"],
                 )
-                threshold = max(1e4, explosion_factor * float(grad_clip)) if grad_clip else 1e4
+                threshold = explosion_factor * float(grad_clip) if grad_clip else 1e4
                 evidence["gradient_explosion"] = bool(report["total_norm"] > threshold)
                 evidence["gradient_explosion_threshold"] = threshold
             else:
