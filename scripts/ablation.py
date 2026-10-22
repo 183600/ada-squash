@@ -1343,13 +1343,17 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
         'val_losses_by_seed': by_seed,
         'final_loss': _mean_of('final_loss'),
         'mean_last_100_loss': _mean_of('mean_last_100_loss'),
-        'n_loss_spikes': sum(p['n_loss_spikes'] or 0 for p in per_seed
-                             if isinstance(p.get('n_loss_spikes'), (int, float))),
-        'elapsed_s': sum(p['elapsed_s'] or 0.0 for p in per_seed
-                         if isinstance(p.get('elapsed_s'), (int, float))),
+        # Sum only measured finite values: one NaN seed used to poison the
+        # row's elapsed time (and a bool/Inf spike count was admitted as a
+        # real event) even though the loss mean was filtered correctly.
+        'n_loss_spikes': sum(p['n_loss_spikes'] for p in per_seed
+                             if _finite_metric(p.get('n_loss_spikes'))),
+        'elapsed_s': sum(float(p['elapsed_s']) for p in per_seed
+                         if _finite_metric(p.get('elapsed_s'))),
         # Measured cost of the arm, carried next to the loss delta.
         'tokens_processed': sum(p['tokens_processed'] for p in per_seed
-                                if isinstance(p.get('tokens_processed'), int)),
+                                if isinstance(p.get('tokens_processed'), int)
+                                and not isinstance(p.get('tokens_processed'), bool)),
         'tokens_per_second': None if tps_stats is None else tps_stats['mean'],
         'tokens_per_second_seed_std': (tps_stats['std'] if tps_stats and len(tps_vals) >= 2 else None),
         'peak_device_memory_mb': _mean_of('peak_device_memory_mb'),
@@ -1587,18 +1591,35 @@ def cached_seed_matches(summary: dict, name: str, cfg_kwargs: dict, args, seed: 
             and row_protocol_signature(summary, args.model) == _protocol_signature(args)
             and summary.get('n_val_batches') == max(1, int(getattr(args, 'val_batches', 20)))):
         return False
-    per_seed = summary.get('per_seed')
-    if isinstance(per_seed, list) and len(per_seed) > 1:
+    # The body of the cached summary must describe exactly the requested run,
+    # not merely carry a matching top-level `seed`. A one-seed aggregate whose
+    # per-seed record names a different seed, or a multi-seed summary with no
+    # per-seed records, is a different cache entry.
+    if not _is_seed_id(seed):
         return False
+    per_seed = summary.get('per_seed')
+    if per_seed is not None:
+        if not isinstance(per_seed, list) or len(per_seed) != 1:
+            return False
+        record = per_seed[0]
+        if not isinstance(record, dict) or not _is_seed_id(record.get('seed')):
+            return False
+        if int(record['seed']) != int(seed):
+            return False
+    seeds = summary.get('seeds')
+    if seeds is not None:
+        if not isinstance(seeds, list) or len(seeds) != 1:
+            return False
+        if not _is_seed_id(seeds[0]) or int(seeds[0]) != int(seed):
+            return False
     recorded = summary.get('seed')
     if recorded is None:
-        seeds = summary.get('seeds')
         recorded = seeds[0] if isinstance(seeds, list) and seeds else None
     # A malformed cached seed is unknown, not another spelling of `seed`:
     # `int(True)`/`int(42.9)` used to reuse a run that was never seeded 1/42.
     if not _is_seed_id(recorded) or not _is_seed_id(seed):
         return False
-    return recorded == seed
+    return int(recorded) == int(seed)
 
 def merge_summaries(previous: list, fresh: list) -> list:
     merged: dict[str, dict] = {}
@@ -1617,6 +1638,26 @@ def merge_summaries(previous: list, fresh: list) -> list:
 def _is_seed_id(value) -> bool:
     """A seed id is an int; 42.9/True must not be paired with seed 42/1."""
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _seed_key_id(value):
+    """Canonical int seed from an int or its exact JSON string key.
+
+    JSON turns integer mapping keys into strings, so ``"42"`` names the same
+    run as ``42``; ``"42.0"``, ``"042"``, booleans and fractional numbers do
+    not. Returns None for anything that is not a canonical seed id.
+    """
+    if _is_seed_id(value):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            converted = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if str(converted) == value:
+            return converted
+    return None
+
 
 def _seed_means(row) -> dict:
     """{seed: val_loss} for every row shape.
@@ -2121,10 +2162,25 @@ def _simple_baseline_protocol_mismatches(protocol, args) -> list:
     recorded_seeds = protocol.get('seeds')
     current_seeds = getattr(args, 'seeds', None)
     if current_seeds is not None:
-        recorded = set(recorded_seeds) if isinstance(recorded_seeds, list) else None
-        current = set(int(seed) for seed in current_seeds)
-        if recorded != current:
-            mismatches.append(f'seeds={recorded_seeds!r} != {sorted(current)!r}')
+        # Normalize only genuine integer seed ids; `int(True)`/`int(42.9)`
+        # must not make a calibration fitted on 1/42 look like the current
+        # 42/1 seed set. Duplicates are not a set of independent runs.
+        recorded = None
+        if (isinstance(recorded_seeds, list)
+                and all(_is_seed_id(seed) for seed in recorded_seeds)):
+            recorded_values = [int(seed) for seed in recorded_seeds]
+            if len(set(recorded_values)) == len(recorded_values):
+                recorded = set(recorded_values)
+        current = None
+        current_values = list(current_seeds)
+        if all(_is_seed_id(seed) for seed in current_values):
+            current_values = [int(seed) for seed in current_values]
+            if len(set(current_values)) == len(current_values):
+                current = set(current_values)
+        if recorded is None or current is None or recorded != current:
+            mismatches.append(
+                f'seeds={recorded_seeds!r} != '
+                f'{sorted(current) if current is not None else "<malformed>"!r}')
     return mismatches
 
 def load_simple_baselines(path, args=None) -> dict | None:
@@ -2147,10 +2203,13 @@ def load_simple_baselines(path, args=None) -> dict | None:
         return None
     limits = data.get('bayes_limits') if isinstance(data, dict) else None
     tuned = data.get('tuned_count_baseline') if isinstance(data, dict) else None
-    if not isinstance(limits, dict) or not isinstance(limits.get('memoryless_nats'), (int, float)):
+    # A bool/NaN/Inf is not a measured cross-entropy: `float(True)` would
+    # otherwise be accepted as 1.0 nat and silently annotate every row with a
+    # fabricated Bayes floor.
+    if not isinstance(limits, dict) or not _finite_metric(limits.get('memoryless_nats')):
         print(f"[compare] WARNING: ignoring simple-baseline file {path}: missing bayes_limits.memoryless_nats")
         return None
-    if not isinstance(tuned, dict) or not isinstance(tuned.get('mean_ce_nats'), (int, float)):
+    if not isinstance(tuned, dict) or not _finite_metric(tuned.get('mean_ce_nats')):
         print(f"[compare] WARNING: ignoring simple-baseline file {path}: missing tuned_count_baseline.mean_ce_nats")
         return None
     if args is not None:
@@ -2460,7 +2519,7 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
     limits = floor_data['bayes_limits']
     floor = float(limits['memoryless_nats'])
     ceiling = limits.get('full_context_nats')
-    ceiling = float(ceiling) if isinstance(ceiling, (int, float)) else None
+    ceiling = float(ceiling) if _finite_metric(ceiling) else None
     tuned = floor_data['tuned_count_baseline']
     tuned_ce = float(tuned['mean_ce_nats'])
     tuned_predictor = tuned.get('predictor')
@@ -2482,9 +2541,14 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
         entry['beats_tuned_simple_baseline'] = bool(val_loss < tuned_ce)
         if log_vocab is not None and ceiling is not None and log_vocab > ceiling:
             entry['signal_captured_fraction'] = (log_vocab - val_loss) / (log_vocab - ceiling)
-        row_seeds = {int(seed): float(value)
-                     for seed, value in (entry.get('per_seed_val_loss') or {}).items()
-                     if _finite_metric(value)}
+        row_seeds = {}
+        for seed, value in (entry.get('per_seed_val_loss') or {}).items():
+            # JSON object keys are strings; only a canonical integer spelling
+            # names a seed. ``int("42.9")`` used to crash the annotation and
+            # ``int(True)`` paired the row with run 1.
+            seed_id = _seed_key_id(seed)
+            if seed_id is not None and _finite_metric(value):
+                row_seeds[seed_id] = float(value)
         common = sorted(set(row_seeds) & set(seed_ce))
         test = None
         entry.update({
@@ -3969,8 +4033,12 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             hypothesis=entry.get('hypothesis'),
             replicated=entry.get('replicated_across_seeds'),
             test_basis=entry.get('test_basis'),
-            effect=entry.get('delta_paired_mean',
-                             entry.get('delta_candidate_minus_reference')))
+            # `delta_paired_mean` is always present on a QK row (None until
+            # the paired test runs), so `dict.get(key, fallback)` would drop
+            # a finite descriptive candidate-reference delta on untested rows.
+            effect=(entry.get('delta_paired_mean')
+                    if entry.get('delta_paired_mean') is not None
+                    else entry.get('delta_candidate_minus_reference')))
 
     registered: list = []
     unregistered: list = []
