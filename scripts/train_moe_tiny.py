@@ -822,20 +822,47 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
             'tokenizer_revision_resolved': prov.get('tokenizer_revision_resolved'),
         })
         for seed, prov in provenance_by_seed.items()}
+    # `_moe_data_version_guard` treats an explicit ``dataset: None`` as the
+    # runner's synthetic corpus (generated deterministically from the seed), so
+    # it has no external snapshot to pin. The aggregate must use the same
+    # definition: marking every clean synthetic seed "unknown" contradicted the
+    # comparison guard and made a complete synthetic replication look failed.
+    real_version_seeds = []
+    synthetic_data_seeds = []
+    unknown_version_seeds = []
+    for seed, prov in provenance_by_seed.items():
+        if not isinstance(prov, dict) or 'dataset' not in prov:
+            unknown_version_seeds.append(seed)
+            continue
+        dataset = prov.get('dataset')
+        if dataset is None:
+            synthetic_data_seeds.append(seed)
+            continue
+        if not isinstance(dataset, str) or not dataset.strip():
+            unknown_version_seeds.append(seed)
+            continue
+        version = versions_by_seed.get(seed) or {}
+        if all(_is_pinned_revision(value) for value in version.values()):
+            real_version_seeds.append(seed)
+        else:
+            unknown_version_seeds.append(seed)
     known_versions = {
-        json.dumps(v, sort_keys=True) for v in versions_by_seed.values()
-        if v is not None and all(_is_pinned_revision(value)
-                                 for value in v.values())}
-    unknown_version_seeds = [
-        seed for seed, version in versions_by_seed.items()
-        if version is None or not all(_is_pinned_revision(value)
-                                      for value in version.values())]
+        json.dumps(versions_by_seed[seed], sort_keys=True)
+        for seed in real_version_seeds}
     agg['data_provenance_by_seed'] = provenance_by_seed
     agg['data_versions_by_seed'] = versions_by_seed
+    agg['real_data_seeds'] = sorted(real_version_seeds)
+    agg['synthetic_data_seeds'] = sorted(synthetic_data_seeds)
     agg['unknown_data_version_seeds'] = sorted(unknown_version_seeds)
-    agg['data_versions_complete'] = bool(versions_by_seed) and not unknown_version_seeds
-    agg['data_versions_consistent'] = (agg['data_versions_complete']
-                                       and len(known_versions) <= 1)
+    agg['data_versions_complete'] = (bool(versions_by_seed)
+                                     and not unknown_version_seeds)
+    # Synthetic and real-data losses do not share a data-generating process,
+    # and real runs must resolve one concrete snapshot. An all-synthetic cell
+    # is consistent by construction.
+    agg['data_versions_consistent'] = bool(
+        agg['data_versions_complete']
+        and not (real_version_seeds and synthetic_data_seeds)
+        and len(known_versions) <= 1)
     for key in _MOE_SEED_METRIC_KEYS:
         vals = [r[key] for r in results if _usable(r.get(key))]
         stats = mean_std_stderr(vals)
@@ -958,10 +985,32 @@ def _moe_cell_replicated(cell: dict) -> bool:
     external snapshot to pin, so the cross-norm comparison applies this
     seed-level check plus the explicit data guard below.
     """
-    seeds = [int(s) for s in cell.get('seeds') or []]
+    raw_seeds = cell.get('seeds') or []
     records = cell.get('per_seed') or []
+    if not isinstance(raw_seeds, list) or not raw_seeds:
+        return False
+    if any(isinstance(seed, bool) or not isinstance(seed, int)
+           for seed in raw_seeds):
+        return False
+    seeds = [int(seed) for seed in raw_seeds]
+    if len(set(seeds)) != len(seeds):
+        return False
+    record_seeds = []
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        seed = record.get('seed')
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            return False
+        record_seeds.append(int(seed))
+    # Equal counts are not equal coverage: records for seeds 42/43/45 must not
+    # stand in for a requested 42/43/44 set. Requiring the seed identities also
+    # makes a missing per-seed completeness field fail closed here rather than
+    # depending on the aggregate writer to have filled it.
     return bool(
-        seeds and len(records) == len(seeds)
+        len(record_seeds) == len(seeds)
+        and len(set(record_seeds)) == len(record_seeds)
+        and set(record_seeds) == set(seeds)
         and not cell.get('missing_seeds') and not cell.get('unexpected_seeds')
         and not cell.get('duplicate_seeds') and not cell.get('invalid_seeds')
         and not cell.get('seeds_without_val_ce')
