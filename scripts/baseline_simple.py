@@ -132,7 +132,7 @@ def generate_batches(seed: int, n_batches: int, args, device: str):
     """The ablation runner's stream: same generator seed, corpus and batch shape."""
     rng = torch.Generator(device=device).manual_seed(int(seed))
     outlier_id = int(args.vocab_size) - 1 if args.outlier_channel else None
-    for _ in range(max(1, int(n_batches))):
+    for _ in range(int(n_batches)):
         yield markov_batch(rng, -100, args.batch_size, args.seq_len, device,
                            n_states=args.n_states, outlier_id=outlier_id,
                            max_jump=args.max_jump)
@@ -567,6 +567,13 @@ def main():
     if len(args.seeds) != len(raw_seeds):
         print(f'[baseline][warn] duplicate seeds removed: {raw_seeds} -> {args.seeds} '
               '(a repeated seed reruns the identical fit, not an independent sample)')
+    for flag, value in (('--batch-size', args.batch_size),
+                        ('--seq-len', args.seq_len),
+                        ('--train-batches', args.train_batches),
+                        ('--tune-batches', args.tune_batches),
+                        ('--val-batches', args.val_batches)):
+        if value < 1:
+            p.error(f'{flag} {value} must be >= 1')
     if args.n_states < 1:
         p.error(f'--n-states {args.n_states} must be >= 1')
     if args.max_jump < 1:
