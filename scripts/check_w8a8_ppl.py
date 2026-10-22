@@ -762,7 +762,7 @@ def main():
                     'split_report': getattr(dataset_probe, 'split_report', None),
                 })
             raw_seed = ckpt_args.get('seed')
-            train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
+            train_seed = _seed_id(raw_seed)
             # Snapshot the fp32 weights on the host before the in-place
             # quantizer runs; each seed needs them back.
             fp_state = {k: t.detach().to('cpu', copy=True) for k, t in model.state_dict().items()}

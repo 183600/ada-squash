@@ -891,7 +891,7 @@ def main():
             if ckpt_path is not None:
                 ckpt_model, ckpt_args = load_ckpt(ckpt_path, device=device)
                 raw_seed = (ckpt_args or {}).get('seed')
-                train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
+                train_seed = _seed_id(raw_seed)
                 arm_model = (ckpt_args or {}).get('model')
                 arm_cfg = getattr(ckpt_model, 'cfg', None)
             per_seed_ckpt = []
