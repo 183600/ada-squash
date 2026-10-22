@@ -765,15 +765,24 @@ def _chronology_problems(reports: dict) -> list:
             isinstance(r, dict) and isinstance(r.get('start'), int)
             and not isinstance(r.get('start'), bool)
             and isinstance(r.get('count'), int)
-            and not isinstance(r.get('count'), bool) for r in active):
+            and not isinstance(r.get('count'), bool)
+            and r.get('start') >= 0 and r.get('count') >= 0 for r in active):
         # Train-only with count=None is the legitimate "held-out splits
         # disabled" shape. With more than one active split, missing
         # start/count means the tiling cannot be verified at all; reporting
-        # that as clean would fail open.
+        # that as clean would fail open. A malformed single report (negative,
+        # boolean, or a non-zero start) is not the disabled-shape exception.
         if len(active) > 1:
             return ["cannot verify chronological split tiling: one or more active "
                     "split reports lack an integer start/count"]
-        return []
+        report = active[0]
+        if isinstance(report, dict):
+            start, count = report.get('start'), report.get('count')
+            if (isinstance(start, int) and not isinstance(start, bool)
+                    and start == 0 and count is None):
+                return []
+        return [f"cannot verify chronological split tiling: invalid start/count "
+                f"in the active split report {report!r}"]
     ranges = [(name, r['start'], r['start'] + r['count'])
               for name, r in zip(names, active)]
     if ranges[0][1] != 0:
