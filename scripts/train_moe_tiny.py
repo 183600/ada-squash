@@ -1214,6 +1214,15 @@ def main():
         p.error(f'--val-batches {args.val_batches} must be >= 0')
     if args.max_steps < 1:
         p.error(f'--max-steps {args.max_steps} must be >= 1')
+    if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
+        p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
+    if not math.isfinite(args.margin) or args.margin < 0.0:
+        p.error(f'--margin {args.margin} must be finite and >= 0')
+    if not math.isfinite(args.lr) or args.lr <= 0.0:
+        p.error(f'--lr {args.lr} must be finite and positive')
+    if len(set(args.baselines)) != len(args.baselines):
+        p.error(f'--baselines contains duplicates: {args.baselines}; a baseline is one '
+                'reference arm, not repeated evidence')
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds)
     if not raw_seeds:
         p.error('--seeds must not be empty')
