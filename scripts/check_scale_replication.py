@@ -118,7 +118,10 @@ def load_comparison(kind: str, path: Path) -> dict:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f'[scale] cannot read {path}: {exc}')
-    if not isinstance(data, dict):
+    # A generic input is either an object with an `observations` list or the
+    # bare list of observation records (the documented form). The kind-specific
+    # comparison artifacts are always objects.
+    if kind != 'generic' and not isinstance(data, dict):
         raise SystemExit(f'[scale] {path} is not a comparison object')
     return data
 
@@ -138,7 +141,8 @@ def build_observations(kind: str, scales: list[tuple[str, Path]],
                 if not isinstance(record, dict):
                     continue
                 item = dict(record)
-                item.setdefault('scale', label)
+                if not item.get('scale'):
+                    item['scale'] = label
                 if metric is not None and item.get('metric', 'default') != metric:
                     continue
                 observations.append(item)
