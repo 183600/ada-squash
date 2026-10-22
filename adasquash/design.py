@@ -1049,27 +1049,31 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             'no randomized run schedule: execution order may be confounded with '
             'the arm and with time drift')
     else:
-        balance = schedule_balance_report(schedule, arm_of=schedule_arm_of)
-        if expected_units is not None:
-            expected = {str(unit) for unit in expected_units}
-            realized = {str(unit) for unit in schedule.get('order') or []}
-            if expected != realized:
-                add('schedule', 'fail',
-                    f'schedule does not cover the planned runs: missing '
-                    f'{sorted(expected - realized)}, extra {sorted(realized - expected)}')
+        try:
+            balance = schedule_balance_report(schedule, arm_of=schedule_arm_of)
+        except ValueError as exc:
+            add('schedule', 'fail', f'malformed run schedule: {exc}')
+        else:
+            if expected_units is not None:
+                expected = {str(unit) for unit in expected_units}
+                realized = {str(unit) for unit in schedule.get('order') or []}
+                if expected != realized:
+                    add('schedule', 'fail',
+                        f'schedule does not cover the planned runs: missing '
+                        f'{sorted(expected - realized)}, extra {sorted(realized - expected)}')
+                elif balance['warnings']:
+                    add('schedule', 'warn', '; '.join(balance['warnings']))
+                else:
+                    add('schedule', 'pass',
+                        f'{schedule.get("n_units")} run(s) in '
+                        f'{schedule.get("n_blocks")} block(s), fingerprint '
+                        f'{str(schedule.get("fingerprint"))[:12]}')
             elif balance['warnings']:
                 add('schedule', 'warn', '; '.join(balance['warnings']))
             else:
                 add('schedule', 'pass',
                     f'{schedule.get("n_units")} run(s) in '
-                    f'{schedule.get("n_blocks")} block(s), fingerprint '
-                    f'{str(schedule.get("fingerprint"))[:12]}')
-        elif balance['warnings']:
-            add('schedule', 'warn', '; '.join(balance['warnings']))
-        else:
-            add('schedule', 'pass',
-                f'{schedule.get("n_units")} run(s) in '
-                f'{schedule.get("n_blocks")} block(s)')
+                    f'{schedule.get("n_blocks")} block(s)')
 
     pairs = [tuple(pair) for pair in identity_controls if pair]
     if not pairs:
