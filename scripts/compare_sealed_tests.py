@@ -300,8 +300,12 @@ def _mde(stderr: float, df: float, alpha: float, power: float,
     ``margin + (t_alpha + t_power) * stderr``. Omitting the margin understates
     the resolution whenever ``--margin`` is non-zero.
     """
-    if stderr <= 0.0 or df <= 0.0:
+    if df <= 0.0 or stderr < 0.0:
         return 0.0
+    # A zero-variance paired sample leaves no sampling noise to add, but the
+    # alternative is still ``mean(delta) < -margin``: a raw effect smaller
+    # than the practical margin cannot clear it. Returning 0 here would
+    # advertise infinite resolution exactly when the design has none.
     return (float(margin)
             + (student_t_ppf(1.0 - alpha, df) + student_t_ppf(power, df)) * stderr)
 
