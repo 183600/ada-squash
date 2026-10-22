@@ -353,7 +353,8 @@ def main():
             getattr(tok, '_commit_hash', None) or tok_revision)
         trained_seq_len = model_args.get('seq_len')
         trained_seq_len = int(trained_seq_len) if isinstance(trained_seq_len, int) else None
-        max_scoreable = max(1, model.cfg.max_seq_len - needle_decode_overhead(tok))
+        needle_overhead = needle_decode_overhead(tok)
+        max_scoreable = max(1, model.cfg.max_seq_len - needle_overhead)
         # The longest length the model can be *scored* at is not the same as
         # the length it was *trained* at: evaluating at max_seq_len after
         # training at a shorter context measures out-of-distribution positional
@@ -369,11 +370,12 @@ def main():
             ctx_source = 'max_seq_len'
         results['needle_trained_seq_len'] = trained_seq_len
         results['needle_ctx_source'] = ctx_source
-        if trained_seq_len is not None and ctx_len > trained_seq_len:
+        if trained_seq_len is not None and ctx_len + needle_overhead > trained_seq_len:
             results['needle_ctx_exceeds_trained_seq_len'] = True
-            print(f'[eval][warn] needle context length {ctx_len} exceeds the trained seq_len='
-                  f'{trained_seq_len}: the result measures positional extrapolation, not '
-                  f'in-distribution long-context accuracy', file=sys.stderr)
+            print(f'[eval][warn] needle context length {ctx_len} + {needle_overhead} scoring '
+                  f'positions exceeds the trained seq_len={trained_seq_len}: the result '
+                  f'measures positional extrapolation, not in-distribution long-context '
+                  f'accuracy', file=sys.stderr)
         needle = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed, return_counts=True, decode_batch=args.decode_batch)
         results['needle_acc'] = needle['accuracy']
         results['needle'] = needle

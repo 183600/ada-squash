@@ -193,7 +193,7 @@ def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
         record['seeds'] = list(seeds)
         record['per_seed'] = per_seed
         record['trial_correct'] = [c for r in per_seed for c in r['trial_correct']]
-        record['exceeds_trained_seq_len'] = (trained_seq_len is not None and L > trained_seq_len)
+        record['exceeds_trained_seq_len'] = (trained_seq_len is not None and L + overhead > trained_seq_len)
         # Bad-case records: a bare accuracy cannot tell "never found the needle"
         # (retrieval_miss) from "found it, then lost the thread" (decode_drift/
         # context_copy) or from a confident wrong answer; print decoded
@@ -215,8 +215,9 @@ def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
                       f"margin={f['logit_margin_over_expected']:+.2f}, "
                       f"in_context={f['predicted_in_context']})")
         if record['exceeds_trained_seq_len']:
-            print(f"[needle][warn] L={L} exceeds the trained seq_len={trained_seq_len}: this is "
-                  f"positional extrapolation, not measured in-distribution long-context ability")
+            print(f"[needle][warn] L={L} + {overhead} scoring positions exceeds the "
+                  f"trained seq_len={trained_seq_len}: this is positional extrapolation, "
+                  f"not measured in-distribution long-context ability")
         results.append(record)
     return results, skipped
 
