@@ -41,10 +41,41 @@ def _finite(value) -> bool:
             and math.isfinite(float(value)))
 
 
-def _matches(label, target: str) -> bool:
+def _match_quality(label, target: str) -> int:
+    """2 = exact/arm label, 1 = same basename, 0 = no match."""
     label = str(label or '')
-    return (label == target or label.startswith(target + '@')
-            or Path(label).name == Path(target).name)
+    target = str(target or '')
+    if label == target or label.startswith(target + '@'):
+        return 2
+    if Path(label).name == Path(target).name:
+        return 1
+    return 0
+
+
+def _pair_orientation(a, b, candidate: str, reference: str):
+    """Candidate/reference orientation, or None when the pair is ambiguous.
+
+    Exact/arm-label matches outrank a basename match. A basename-only match is
+    inherently ambiguous when both arms are, e.g., ``ckpt_best.pt`` from
+    different directories: treating that as forward would inherit the
+    candidate's certification for a reversed pair. Fail closed on ambiguity.
+    """
+    forward = (_match_quality(a, candidate), _match_quality(b, reference))
+    reversed_ = (_match_quality(a, reference), _match_quality(b, candidate))
+    forward_exact = min(forward) == 2
+    reversed_exact = min(reversed_) == 2
+    if forward_exact and reversed_exact:
+        if forward == reversed_:
+            return None
+        return ('candidate_vs_reference' if forward > reversed_
+                else 'reversed')
+    if forward_exact:
+        return 'candidate_vs_reference'
+    if reversed_exact:
+        return 'reversed'
+    if min(forward) == 0 or min(reversed_) == 0 or forward == reversed_:
+        return None
+    return 'candidate_vs_reference' if forward > reversed_ else 'reversed'
 
 
 def _pair_rows_from_fp8_w8a8(data, kind: str) -> list[dict]:
@@ -59,11 +90,8 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
     a, b = entry.get('a'), entry.get('b')
     if metric is not None and entry.get('metric') != metric:
         return None
-    if _matches(a, candidate) and _matches(b, reference):
-        orientation = 'candidate_vs_reference'
-    elif _matches(a, reference) and _matches(b, candidate):
-        orientation = 'reversed'
-    else:
+    orientation = _pair_orientation(a, b, candidate, reference)
+    if orientation is None:
         return None
     # A cross-scale pair is a deliberately descriptive comparison, not an
     # observation of the same mechanism at another scale: folding its delta
@@ -104,11 +132,9 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
     for row in rows:
         if metric is not None and row.get('metric') != metric:
             continue
-        if _matches(row.get('norm'), candidate) and _matches(row.get('reference'), reference):
-            orientation = 'candidate_vs_reference'
-        elif _matches(row.get('norm'), reference) and _matches(row.get('reference'), candidate):
-            orientation = 'reversed'
-        else:
+        orientation = _pair_orientation(row.get('norm'), row.get('reference'),
+                                        candidate, reference)
+        if orientation is None:
             continue
         if row.get('same_scale') is False or row.get('excluded_from_family') is not None:
             # Cross-scale or otherwise excluded rows are not independent
