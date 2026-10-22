@@ -9,7 +9,8 @@ sys.path.insert(0, str(ROOT))
 import torch
 from adasquash.metrics import holm_adjust, mcnemar_test, mean_ci, paired_t_one_sided, wilson_interval
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
-from scripts.eval_downstream import load_ckpt, needle_decode_overhead, needle_in_haystack
+from scripts.eval_downstream import (DEFAULT_HAYSTACK, DEFAULT_QUESTION, load_ckpt,
+                                       needle_decode_overhead, needle_in_haystack)
 
 # One placement draw is one run-level sample: a single seed's Wilson interval
 # describes only the trial noise inside that draw, so a "retains needle
@@ -152,7 +153,22 @@ def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
     results = []
     skipped = []
     overhead = needle_decode_overhead(tok, args.secret)
+    # The haystack builder needs at least one repeat of the filler plus the
+    # needle and question; a smaller requested length cannot be evaluated at
+    # all, so report it as skipped instead of letting the first seed raise.
+    min_context = (len(tok(args.secret, add_special_tokens=False)['input_ids'])
+                   + len(tok(DEFAULT_QUESTION, add_special_tokens=False)['input_ids'])
+                   + len(tok(DEFAULT_HAYSTACK, add_special_tokens=False)['input_ids']))
     for L in args.ctx_lens:
+        if L < min_context:
+            reason = (f'{L} is too short to hold the needle + question + one haystack '
+                      f'repeat (minimum {min_context} tokens)')
+            print(f'[skip] L={L}: {reason}')
+            skipped.append({'ctx_len': L, 'reason': reason,
+                            'model_max_seq_len': int(model.cfg.max_seq_len),
+                            'scoring_overhead': overhead,
+                            'minimum_context': min_context})
+            continue
         if L + overhead > model.cfg.max_seq_len:
             reason = (f'{L} + {overhead} scoring positions for the secret exceed '
                       f'max_seq_len={model.cfg.max_seq_len}; RoPE scaling needed')
