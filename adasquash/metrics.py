@@ -114,6 +114,27 @@ def _strict_int(value, name: str, minimum: Optional[int] = None) -> int:
     return converted
 
 
+def _validate_alpha(alpha, name: str = "alpha") -> float:
+    """A significance level must be a finite probability in (0, 1).
+
+    ``student_t_ppf(1 - alpha/2, ...)`` needs a probability strictly inside
+    (0, 1). Without this guard an out-of-range alpha either raises from deep
+    inside the distribution helper (alpha = 0) or silently produces an
+    inverted interval (alpha > 1), which looks like a measured confidence
+    interval instead of a malformed request.
+    """
+    if isinstance(alpha, bool):
+        raise ValueError(f"{name} must be a probability, got bool {alpha!r}")
+    try:
+        value = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a probability, got {alpha!r}") from None
+    if not math.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(
+            f"{name} must be finite and strictly between 0 and 1, got {alpha!r}")
+    return value
+
+
 def _binary_labels(labels, name: str = "labels") -> list[int]:
     """0/1 labels without truthiness coercion.
 
@@ -258,6 +279,7 @@ def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
     stats = mean_std_stderr(values)
     if stats is None:
         return None
+    alpha = _validate_alpha(alpha)
     out = dict(stats)
     out["ci_level"] = 1.0 - float(alpha)
     out["ci_low"] = None
@@ -333,7 +355,7 @@ def student_t_cdf(t: float, df: float) -> float:
     n - 1 = 1-4). This is the reference distribution for the paired and Welch
     tests below; the normal CDF (z) is only the df -> infinity limit.
     """
-    if df <= 0:
+    if not math.isfinite(df) or df <= 0:
         raise ValueError("student_t_cdf needs df > 0")
     if math.isnan(t):
         raise ValueError("student_t_cdf got a NaN statistic")
@@ -354,7 +376,7 @@ def student_t_ppf(p: float, df: float) -> float:
     """
     if not 0.0 < p < 1.0:
         raise ValueError("student_t_ppf needs 0 < p < 1")
-    if df <= 0:
+    if not math.isfinite(df) or df <= 0:
         raise ValueError("student_t_ppf needs df > 0")
     if p == 0.5:
         # The median of every Student-t is exactly zero. Bisection can stop on
@@ -480,6 +502,7 @@ def paired_t_one_sided(
     """
     a = [float(v) for v in a]
     b = [float(v) for v in b]
+    alpha = _validate_alpha(alpha)
     if len(a) != len(b):
         raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
     n = len(a)
@@ -712,7 +735,7 @@ def tost_paired(
     out = {
         "test": "tost_paired",
         "margin": None,
-        "alpha": float(alpha),
+        "alpha": _validate_alpha(alpha),
         "equivalent": None,
         "p_tost": None,
         "p_low": None,
@@ -804,6 +827,14 @@ def leave_one_out_jackknife(
     """
     vals = [float(v) for v in values]
     n = len(vals)
+    # Validate the labels even on the early-return paths: a caller that
+    # supplies the wrong number of names has a programming error, and silently
+    # ignoring it for an empty/non-finite input makes the contract depend on
+    # the data value.
+    names = list(range(n)) if labels is None else list(labels)
+    if len(names) != n:
+        raise ValueError(
+            f"jackknife labels need {n} entries, got {len(names)}")
     if n == 0:
         return None
     if any(not math.isfinite(v) for v in vals):
@@ -820,10 +851,6 @@ def leave_one_out_jackknife(
             "max_abs_change": None,
             "note": "non-finite observation(s); jackknife skipped",
         }
-    names = list(range(n)) if labels is None else list(labels)
-    if len(names) != n:
-        raise ValueError(
-            f"jackknife labels need {n} entries, got {len(names)}")
     full = sum(vals) / n
 
     def _sign(x: float) -> str:
@@ -961,6 +988,7 @@ def paired_trend_test(
     reported in ``excluded_seeds``.
     """
     raw_doses = list(doses)
+    alpha = _validate_alpha(alpha)
     dose_values = []
     for dose in raw_doses:
         if (not isinstance(dose, (int, float)) or isinstance(dose, bool)
@@ -1145,6 +1173,7 @@ def welch_t_one_sided(
     """
     a = [float(v) for v in a]
     b = [float(v) for v in b]
+    alpha = _validate_alpha(alpha)
     na, nb = len(a), len(b)
     empty = {
         "mean_delta": None, "t": None, "df": None, "p_one_sided": None,
