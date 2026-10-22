@@ -127,6 +127,13 @@ def main(argv=None) -> None:
     names = [scale['name'] for scale in scales]
     if len(set(names)) != len(names):
         p.error(f'duplicate scale names: {names}')
+    # Two labels for the same architecture are one scale, not two independent
+    # replications. Reject the duplicate before launching any child run.
+    shapes = [(scale['dim'], scale['n_layers'], scale['n_heads'],
+               scale['n_experts']) for scale in scales]
+    if len(set(shapes)) != len(shapes):
+        p.error(f'duplicate model shape(s) across --scale entries: {shapes}; '
+                'one architecture is one scale')
     if len(scales) < args.min_scales:
         p.error(f'{len(scales)} scale(s) supplied but --min-scales={args.min_scales}; '
                 'a single scale cannot support a multi-scale claim')

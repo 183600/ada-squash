@@ -731,9 +731,17 @@ class PackedStream(IterableDataset):
                  shuffle_buffer: int = 0, seed: int = 42):
         self.ds = ds
         self.tok = tok
-        self.seq_len = int(seq_len)
+        # A zero sequence length never advances `drain()`, so a full iteration
+        # would loop forever yielding empty windows. Validate the geometry
+        # here (direct callers bypass build_dataloader's checks).
+        self.seq_len = _int_option("seq_len", seq_len, 1)
+        eos = getattr(tok, "eos_token_id", None)
+        if eos is None:
+            raise ValueError(
+                "PackedStream needs a tokenizer with a non-None eos_token_id: "
+                "the end-of-document separator is appended between documents")
         self.cleaner = cleaner if cleaner is not None else DocumentCleaner()
-        self.shuffle_buffer = int(shuffle_buffer or 0)
+        self.shuffle_buffer = _int_option("shuffle_buffer", shuffle_buffer or 0, 0)
         self.seed = int(seed)
         # A one-dimensional long tensor plus integer offsets. The tokenizer
         # returns Python ints, so the tensor is filled by copying small
@@ -1179,6 +1187,8 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     (data-version tracking), the latter also keying the held-out cache.
     """
     opts = validate_data_options(get_data_options())
+    seq_len = _int_option("seq_len", seq_len, 1)
+    batch_size = _int_option("batch_size", batch_size, 1)
     if (opts.get("exclude_group_file") or opts.get("exclude_test_group_file")) and not opts.get("group_key"):
         # Without the key the pipeline cannot extract a group value, so the
         # supplied ledger would be silently ignored and the held-out splits

@@ -187,14 +187,13 @@ def build_observations(kind: str, scales: list[tuple[str, Path]],
                 item = _observation_from_pair(entry, candidate, reference, metric)
                 if item is None:
                     continue
-                # Several comparisons can be present in one file; label the
-                # source scale explicitly so two same-shaped files stay
-                # distinct observations rather than overwriting one another.
-                item['scale'] = f'{label}:{item["scale"]}'
+                # Keep the artifact's own model-scale identity. The CLI label
+                # is only the source name: prefixing it made two copies of the
+                # same run under different labels look like two independent
+                # scales and manufactured a multi-scale certification.
                 observations.append(item)
         elif kind == 'moe':
             for item in _observations_from_moe(data, candidate, reference, metric):
-                item['scale'] = f'{label}:{item["scale"]}'
                 observations.append(item)
         else:
             raise SystemExit(f'[scale] unknown kind {kind!r}')
