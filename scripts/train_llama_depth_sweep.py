@@ -403,8 +403,17 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
     data_version_mismatch = len(known_versions) > 1
     data_versions_complete = bool(versions_by_seed) and not unknown_version_seeds
 
+    # A seed whose manifest reports NaN/Inf is not a usable replication even
+    # when its *other* loss field happens to be finite: it must not contribute
+    # to any pooled mean (the same exclusion missing seeds get).
+    invalid_seed_set = {
+        p['seed'] for p in per_seed
+        if any(isinstance(p.get(key), float) and not math.isfinite(p.get(key))
+               for key in ('best_val_loss', 'final_val_loss'))}
+
     def _pool(key: str):
-        vals = [p[key] for p in per_seed if _finite(p[key])]
+        vals = [p[key] for p in per_seed
+                if p['seed'] not in invalid_seed_set and _finite(p[key])]
         return vals, mean_std_stderr(vals)
 
     best_vals, best_stats = _pool('best_val_loss')
@@ -446,8 +455,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                      if not _finite(p['best_val_loss'])
                      and not _finite(p['final_val_loss'])]
     invalid_seeds = [p['seed'] for p in per_seed
-                     if (isinstance(p['best_val_loss'], float) and not math.isfinite(p['best_val_loss']))
-                     or (isinstance(p['final_val_loss'], float) and not math.isfinite(p['final_val_loss']))]
+                     if p['seed'] in invalid_seed_set]
     seeds_without_final = [p['seed'] for p in per_seed
                            if not _finite(p['final_val_loss'])]
     # A cell is one architecture. Seeds that report different shapes are not

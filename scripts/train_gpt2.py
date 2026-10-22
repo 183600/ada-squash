@@ -829,8 +829,17 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     def _finite(value) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
 
+    # A seed whose manifest reports NaN/Inf is not a usable replication even
+    # when its other loss is finite: it must not enter any pooled mean (the
+    # same exclusion missing seeds get).
+    invalid_seed_set = {
+        r['seed'] for r in per_seed
+        if any(isinstance(r.get(key), float) and not math.isfinite(r.get(key))
+               for key in ('final_val_loss', 'best_val_loss'))}
+
     def _pool(key: str):
-        vals = [float(r[key]) for r in per_seed if _finite(r.get(key))]
+        vals = [float(r[key]) for r in per_seed
+                if r['seed'] not in invalid_seed_set and _finite(r.get(key))]
         return vals, (mean_std_stderr(vals) if vals else None)
 
     # A pooled loss is only one arm's number if every seed trained on the
@@ -876,8 +885,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     # selection statistic (the minimum over passes), not the fixed-step
     # estimate the cross-arm comparison uses.
     missing = [r['seed'] for r in per_seed if not _finite(r['final_val_loss'])]
-    invalid = [r['seed'] for r in per_seed
-               if any(isinstance(r[k], float) and not math.isfinite(r[k]) for k in ('final_val_loss', 'best_val_loss'))]
+    invalid = [r['seed'] for r in per_seed if r['seed'] in invalid_seed_set]
     pool_ok = (not missing and not invalid
                and data_versions_complete and data_versions_consistent
                and shapes_complete and shapes_consistent)
