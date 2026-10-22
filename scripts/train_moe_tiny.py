@@ -1023,6 +1023,11 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
             shape_only_mismatch = bool(mismatches) and set(mismatches) <= _MOE_SHAPE_KEYS
             a_shape = {key: protocols.get(norm, {}).get(key) for key in _MOE_SHAPE_KEYS}
             b_shape = {key: protocols.get(reference, {}).get(key) for key in _MOE_SHAPE_KEYS}
+            # Scale identity is decided by the shape fields alone. A pair can
+            # differ in both shape and a non-shape recipe field; that must not
+            # be labelled same-scale merely because the mismatch set is not
+            # shape-only.
+            same_scale = a_shape == b_shape
             entry = {
                 'name': f'{norm} vs {reference}',
                 'norm': norm,
@@ -1030,7 +1035,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 'metric': metric,
                 'scale': json.dumps(a_shape, sort_keys=True),
                 'reference_scale': json.dumps(b_shape, sort_keys=True),
-                'same_scale': not shape_only_mismatch,
+                'same_scale': same_scale,
                 'direction': 'lower_is_better',
                 'val_ce': cell.get('val_ce'),
                 'val_ce_std': cell.get('val_ce_std'),
@@ -1125,7 +1130,8 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
     scale_obs = []
     for entry in out['rows']:
         if (entry.get('same_scale') and entry.get('delta_vs_reference') is not None
-                and entry.get('test') is not None):
+                and entry.get('test') is not None
+                and entry.get('excluded_from_family') is None):
             scale_obs.append({'scale': entry.get('scale'), 'metric': entry.get('metric'),
                               'delta': entry.get('delta_vs_reference'),
                               'certified': bool(entry.get('beats_reference_significantly')),
