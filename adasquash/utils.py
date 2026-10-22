@@ -269,6 +269,23 @@ class LossSpikeCounter:
         self.history: deque = deque(maxlen=4096)
 
     def update(self, loss_value: float) -> bool:
+        # A NaN/Inf loss is not a jump relative to the EMA: folding it into
+        # the EMA makes every later comparison false, permanently disabling
+        # spike detection. Keep it visible in the history but leave the
+        # baseline untouched so the next finite loss is still judged against
+        # the last finite one.
+        if isinstance(loss_value, bool):
+            self.history.append((loss_value, self.ema, False))
+            return False
+        try:
+            numeric_loss = float(loss_value)
+        except (TypeError, ValueError, OverflowError):
+            self.history.append((loss_value, self.ema, False))
+            return False
+        if not math.isfinite(numeric_loss):
+            self.history.append((numeric_loss, self.ema, False))
+            return False
+        loss_value = numeric_loss
         is_spike = False
         if self.ema is not None:
             rel_jump = (loss_value - self.ema) / max(self.ema, 1e-06)
