@@ -706,7 +706,11 @@ def split_token_budget(stats: dict, report: dict) -> dict:
         return result
     mean_tokens = tokens / effective_documents
     result['tokens_per_effective_document'] = mean_tokens
-    if result['exhaustive'] and (nominal is None or sampled >= nominal):
+    if result['exhaustive']:
+        # `exhaustive` means the collector reached the end of the split
+        # stream. The observed count is then exact even when the upstream
+        # stream is shorter than its reported nominal length; extrapolating
+        # to `nominal` would invent documents the stream never contained.
         estimated_documents = float(effective_documents)
         result['basis'] = 'observed'
     elif nominal is not None:
