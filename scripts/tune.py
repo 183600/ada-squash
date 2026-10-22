@@ -600,6 +600,117 @@ def _off_regime(regimes) -> dict:
             if k not in ('healthy', 'insufficient_data')}
 
 
+def lr_sensitivity(tuned: dict) -> dict:
+    """Does the tuning result depend on the one lr cell that was selected?
+
+    A norm study can turn a learning-rate bonus into a mechanism claim: the
+    arm that happens to prefer the grid's winning cell looks better even when
+    its loss at neighbouring lrs is ordinary. This block reports, for every
+    arm, the spread of the complete (lr, weight_decay) cells relative to that
+    arm's seed std, and the *cross-arm winner at each shared cell*. If the
+    winner changes with lr, the fixed-lr matrix comparison is not robust to
+    the optimisation recipe and must not be reported as a norm effect.
+    """
+    per_arm: dict[str, dict] = {}
+    arm_cells: dict[str, dict[tuple[float, float], dict]] = {}
+    for arm, result in (tuned or {}).items():
+        grid = result.get('lr_grid') or {}
+        cells = {}
+        for cell in grid.values():
+            if not isinstance(cell, dict):
+                continue
+            if not cell.get('complete_coverage'):
+                continue
+            lr, wd, mean = cell.get('lr'), cell.get('weight_decay'), cell.get('mean')
+            if not (isinstance(lr, (int, float)) and isinstance(wd, (int, float))
+                    and isinstance(mean, (int, float))):
+                continue
+            if not (math.isfinite(float(lr)) and math.isfinite(float(wd))
+                    and math.isfinite(float(mean))):
+                continue
+            cells[(float(lr), float(wd))] = cell
+        arm_cells[arm] = cells
+        if not cells:
+            per_arm[arm] = {'cells': 0, 'range': None, 'range_over_seed_std': None,
+                            'lr_effect_exceeds_seed_noise': None, 'selected': None}
+            continue
+        means = [float(cell['mean']) for cell in cells.values()]
+        stds = [float(cell['std']) for cell in cells.values()
+                if isinstance(cell.get('std'), (int, float))
+                and math.isfinite(float(cell['std']))]
+        spread = max(means) - min(means)
+        noise = max(stds) if stds else None
+        best = min(cells.items(), key=lambda item: item[1]['mean'])
+        worst = max(cells.items(), key=lambda item: item[1]['mean'])
+        per_arm[arm] = {
+            'cells': len(cells),
+            'range': spread,
+            'range_over_seed_std': (spread / noise if noise and noise > 0.0 else None),
+            'lr_effect_exceeds_seed_noise': (bool(spread > noise)
+                                             if noise is not None else None),
+            'selected': {'lr': best[0][0], 'weight_decay': best[0][1],
+                         'val_loss': float(best[1]['mean'])},
+            'worst': {'lr': worst[0][0], 'weight_decay': worst[0][1],
+                      'val_loss': float(worst[1]['mean'])},
+            'val_loss_by_cell': {
+                f'lr={lr:g}|wd={wd:g}': float(cell['mean'])
+                for (lr, wd), cell in sorted(cells.items())},
+        }
+    common: set[tuple[float, float]] = set()
+    if arm_cells:
+        common = set.intersection(*(set(cells) for cells in arm_cells.values()))
+    winner_by_cell = {}
+    rank_by_cell = {}
+    for cell in sorted(common):
+        means = {arm: float(cells[cell]['mean'])
+                 for arm, cells in arm_cells.items() if cell in cells}
+        if len(means) < 2:
+            continue
+        ranked = sorted(means, key=lambda arm: (means[arm], arm))
+        winner_by_cell[f'lr={cell[0]:g}|wd={cell[1]:g}'] = {
+            'winner': ranked[0], 'ranking': ranked,
+            'means': means,
+        }
+        rank_by_cell[f'lr={cell[0]:g}|wd={cell[1]:g}'] = ranked
+    winners = {block['winner'] for block in winner_by_cell.values()}
+    return {
+        'per_arm': per_arm,
+        'common_cells': len(common),
+        'winner_by_cell': winner_by_cell,
+        'winner_stable_across_cells': (len(winners) == 1 if winners else None),
+        'winners': sorted(winners),
+        'reading': ('a norm whose selected cell beats the baseline only at one lr is an '
+                    'lr-bonus result, not a mechanism result; the matrix comparison is '
+                    'robust only when the winner is stable across the shared cells and '
+                    'the per-arm lr spread is not larger than its seed noise'),
+    }
+
+def print_lr_sensitivity(block: dict | None) -> None:
+    if not block:
+        print('[tune][lr] no complete lr grid available; sensitivity not tested')
+        return
+    for arm, info in sorted((block.get('per_arm') or {}).items()):
+        if not info.get('cells'):
+            print(f'[tune][lr] {arm}: no complete lr cell')
+            continue
+        ratio = info.get('range_over_seed_std')
+        ratio_str = '' if ratio is None else f' range/seed_std={ratio:.2f}'
+        flag = (' [LR EFFECT > SEED NOISE]'
+                if info.get('lr_effect_exceeds_seed_noise') else '')
+        print(f"[tune][lr] {arm}: {info['cells']} complete cell(s), selected "
+              f"lr={info['selected']['lr']:g} wd={info['selected']['weight_decay']:g} "
+              f"val_loss={info['selected']['val_loss']:.4f}, range={info['range']:.4f}"
+              f"{ratio_str}{flag}")
+    if block.get('winner_stable_across_cells') is True:
+        print(f"[tune][lr] winner stable across {block['common_cells']} shared cell(s): "
+              f"{block['winners']}")
+    elif block.get('winner_stable_across_cells') is False:
+        print(f"[tune][lr] WARNING: the winning arm changes with lr across the shared cells "
+              f"({block['winners']}); a fixed-lr norm win is not robust to the optimisation "
+              'recipe and must not be reported as a mechanism effect')
+    else:
+        print('[tune][lr] not enough shared complete cells to test winner stability across lr')
+
 def print_comparison(comparison: dict | None) -> None:
     if comparison is None:
         print('[tune][compare] no tuned baseline arm present; comparison skipped')
@@ -828,6 +939,8 @@ def main():
     comparison = compare(tuned, args.baselines, args.margin, args.alpha,
                          certify=bool(args.confirm_seeds))
     print_comparison(comparison)
+    sensitivity = lr_sensitivity(tuned)
+    print_lr_sensitivity(sensitivity)
     out = {
         'protocol': {
             'model': args.model,
@@ -856,6 +969,7 @@ def main():
         },
         'arms': tuned,
         'comparison': comparison,
+        'lr_sensitivity': sensitivity,
         'run_metadata': run_metadata,
     }
     with open(base / 'tuning_summary.json', 'w') as f:
@@ -871,6 +985,15 @@ def main():
     # Compact per-arm outcome next to the full summary file: which lr was
     # selected and what it scored, so a completed grid is readable from the
     # manifest without parsing every trial record.
+    manifest['lr_sensitivity'] = {
+        'winner_stable_across_cells': sensitivity.get('winner_stable_across_cells'),
+        'winners': sensitivity.get('winners'),
+        'per_arm': {arm: {'selected': info.get('selected'),
+                          'range': info.get('range'),
+                          'range_over_seed_std': info.get('range_over_seed_std'),
+                          'lr_effect_exceeds_seed_noise': info.get('lr_effect_exceeds_seed_noise')}
+                    for arm, info in (sensitivity.get('per_arm') or {}).items()},
+    }
     manifest['selected_lr_by_arm'] = {
         arm: ({'lr': r['best']['lr'], 'weight_decay': r['best'].get('weight_decay'),
                'val_loss': r['best']['mean'],
