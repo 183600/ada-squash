@@ -1118,9 +1118,18 @@ def eval_batch_capacity(budget: dict | None, seq_len: int, batch_size: int) -> d
     """
     seq_len = _strict_int_option(seq_len, "seq_len", 1)
     batch_size = _strict_int_option(batch_size, "batch_size", 1)
+    if budget is not None and not isinstance(budget, dict):
+        raise ValueError(
+            f"budget must be a mapping or None, got {type(budget).__name__}")
     budget = budget or {}
     tokens = budget.get('estimated_effective_tokens')
     if tokens is not None:
+        # A bool is not a token measurement: float(True) would turn it into a
+        # one-token budget and report a capacity for a value the audit never
+        # measured (the same rule the sibling budget helpers enforce).
+        if _is_boolean_scalar(tokens):
+            raise ValueError(
+                f"estimated_effective_tokens must be numeric or None, got {tokens!r}")
         try:
             tokens = float(tokens)
         except (TypeError, ValueError, OverflowError):
