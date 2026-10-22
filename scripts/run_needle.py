@@ -64,6 +64,12 @@ def _is_pinned_revision(value) -> bool:
         return False
     return all(ch in '0123456789abcdefABCDEF' for ch in value)
 
+def _is_checkpoint_step(value) -> bool:
+    """A recorded optimizer step is a non-negative integer, not True/1.0."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0)
+
+
 def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dict:
     """Check that two checkpoints were trained under one comparable recipe.
 
@@ -123,15 +129,19 @@ def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dic
             }
     candidate_step = candidate_args.get('_checkpoint_step')
     reference_step = reference_args.get('_checkpoint_step')
-    steps_known = candidate_step is not None and reference_step is not None
+    candidate_step_known = _is_checkpoint_step(candidate_step)
+    reference_step_known = _is_checkpoint_step(reference_step)
+    steps_known = candidate_step_known and reference_step_known
     if steps_known and candidate_step != reference_step:
         mismatches['_checkpoint_step'] = {'candidate': candidate_step,
                                           'reference': reference_step}
     if steps_known:
         step_basis = f'both checkpoints record step {candidate_step}'
     else:
-        step_basis = (f'checkpoint step not recorded for '
-                      f'{"candidate" if candidate_step is None else "reference"} '
+        unknown = [side for side, known in
+                   (('candidate', candidate_step_known),
+                    ('reference', reference_step_known)) if not known]
+        step_basis = (f'checkpoint step not recorded/valid for {", ".join(unknown)} '
                       '- the compared weights are not verifiably at the same training step')
     return {
         'ok': not mismatches,
