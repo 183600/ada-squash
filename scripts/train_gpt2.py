@@ -1042,7 +1042,14 @@ def main():
     p.add_argument('--alpha-jitter', type=float, default=0.05, help='per-channel alpha init jitter for DyTC (0 for deterministic)')
     p.add_argument('--gradient-checkpointing', action='store_true', help='enable gradient checkpointing')
     p.add_argument('--tie-embeddings', dest='tie_embeddings', action='store_true', default=None, help='tie input/output embeddings (default: GPT-2 yes, LLaMA no)')
-    p.add_argument('--no-tie-embeddings', dest='tie_embeddings', action='store_false')
+    # Both spellings must share the *same* default. `store_false` alone would
+    # default this dest to True while `--tie-embeddings` defaults to None; the
+    # resume explicitness test compares the parsed value with
+    # `parser.get_default`, so that mismatch would mark `tie_embeddings` as
+    # explicitly overridden even when the flag was never typed, skipping the
+    # checkpoint value (an untied checkpoint then rebuilds tied and its
+    # optimizer state no longer loads).
+    p.add_argument('--no-tie-embeddings', dest='tie_embeddings', action='store_false', default=None)
     p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
     p.add_argument('--dataset-config', default='sample-10BT')
     p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) to pin; recorded in the run manifest so the trained-on data version is auditable (None = upstream default branch, which can move)')
