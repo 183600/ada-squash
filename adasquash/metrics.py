@@ -94,6 +94,19 @@ MIN_SEEDS_FOR_SIGNIFICANCE = 3
 _EXTREME_IMBALANCE = 1000.0
 
 
+def _is_boolean_value(value) -> bool:
+    """Python and NumPy booleans.
+
+    ``isinstance(np.bool_(True), bool)`` is False; without this check a NumPy
+    boolean is silently coerced to 1/0 by ``int()`` and can enter a count or a
+    multiplicity family as a real observation.
+    """
+    if isinstance(value, bool):
+        return True
+    cls = type(value)
+    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
 def _strict_int(value, name: str, minimum: Optional[int] = None) -> int:
     """An integer-valued count/id, rejecting bools and fractional values.
 
@@ -101,7 +114,7 @@ def _strict_int(value, name: str, minimum: Optional[int] = None) -> int:
     still looks like it describes the requested measurement. Bools are not
     counts either; a caller passing ``True`` almost certainly has a bug.
     """
-    if isinstance(value, bool):
+    if _is_boolean_value(value):
         raise ValueError(f"{name} must be an integer, got bool {value!r}")
     try:
         converted = int(value)
@@ -123,7 +136,7 @@ def _validate_alpha(alpha, name: str = "alpha") -> float:
     inverted interval (alpha > 1), which looks like a measured confidence
     interval instead of a malformed request.
     """
-    if isinstance(alpha, bool):
+    if _is_boolean_value(alpha):
         raise ValueError(f"{name} must be a probability, got bool {alpha!r}")
     try:
         value = float(alpha)
@@ -144,7 +157,7 @@ def _binary_labels(labels, name: str = "labels") -> list[int]:
     """
     out = []
     for value in labels:
-        if isinstance(value, bool):
+        if _is_boolean_value(value):
             out.append(int(value))
             continue
         converted = _strict_int(value, name)
@@ -248,7 +261,7 @@ def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     for a result.
     """
     raw = [float(v) for v in values
-           if v is not None and not isinstance(v, bool)]
+           if v is not None and not _is_boolean_value(v)]
     vals = [v for v in raw if math.isfinite(v)]
     n_nonfinite = len(raw) - len(vals)
     n = len(vals)
@@ -422,7 +435,7 @@ def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
     # are still rejected, and non-numeric / non-finite values stay None.
     indexed = []
     for i, p in enumerate(pvalues):
-        if p is None or isinstance(p, bool):
+        if p is None or _is_boolean_value(p):
             continue
         try:
             value = float(p)
@@ -553,9 +566,9 @@ def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[floa
     """
     if t is None or df is None:
         return None
-    if not isinstance(t, (int, float)) or isinstance(t, bool):
+    if not isinstance(t, (int, float)) or _is_boolean_value(t):
         return None
-    if not isinstance(df, (int, float)) or isinstance(df, bool):
+    if not isinstance(df, (int, float)) or _is_boolean_value(df):
         return None
     t, df = float(t), float(df)
     if math.isnan(t) or math.isnan(df) or df <= 0.0:
@@ -579,7 +592,7 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
 
 
 def _validate_design_inputs(std, alpha: float, power: float) -> tuple[float, float, float]:
-    if isinstance(std, bool) or std is None:
+    if _is_boolean_value(std) or std is None:
         raise ValueError(f"paired standard deviation must be a number, got {std!r}")
     try:
         std = float(std)
@@ -590,7 +603,7 @@ def _validate_design_inputs(std, alpha: float, power: float) -> tuple[float, flo
         raise ValueError(
             f"paired standard deviation must be finite and >= 0, got {std!r}")
     for name, value in (("alpha", alpha), ("power", power)):
-        if isinstance(value, bool):
+        if _is_boolean_value(value):
             raise ValueError(f"{name} must be a probability, got {value!r}")
         try:
             value = float(value)
@@ -624,7 +637,7 @@ def paired_required_n(std: float, effect: float, alpha: float = 0.05,
     deterministic).
     """
     std, alpha, power = _validate_design_inputs(std, alpha, power)
-    if isinstance(effect, bool) or effect is None:
+    if _is_boolean_value(effect) or effect is None:
         raise ValueError(f"effect must be a positive number, got {effect!r}")
     try:
         effect = float(effect)
@@ -681,7 +694,7 @@ def paired_design_summary(std: float, n: int, margin: float = 0.0,
         "note": ("pass a positive pre-specified margin to compute the pairs "
                  "needed for that smallest effect of interest"),
     }
-    if isinstance(margin, bool) or margin is None:
+    if _is_boolean_value(margin) or margin is None:
         return out
     try:
         margin = float(margin)
@@ -754,7 +767,7 @@ def tost_paired(
         raise ValueError(f"TOST needs equal lengths, got {len(a)} vs {len(b)}")
     n = len(a)
     out["n"] = n
-    if not (isinstance(margin, (int, float)) and not isinstance(margin, bool)
+    if not (isinstance(margin, (int, float)) and not _is_boolean_value(margin)
             and math.isfinite(float(margin)) and float(margin) > 0.0):
         out["note"] = ("equivalence margin must be a positive finite number; "
                        "pass an explicit scientific margin to enable TOST")
@@ -991,7 +1004,7 @@ def paired_trend_test(
     alpha = _validate_alpha(alpha)
     dose_values = []
     for dose in raw_doses:
-        if (not isinstance(dose, (int, float)) or isinstance(dose, bool)
+        if (not isinstance(dose, (int, float)) or _is_boolean_value(dose)
                 or not math.isfinite(float(dose))):
             raise ValueError(f"trend doses must be finite numbers, got {dose!r}")
         dose_values.append(float(dose))
@@ -1046,7 +1059,7 @@ def paired_trend_test(
         pairs = []
         dropped = []
         for position, (x, y) in enumerate(zip(dose_values, values)):
-            if (isinstance(y, (int, float)) and not isinstance(y, bool)
+            if (isinstance(y, (int, float)) and not _is_boolean_value(y)
                     and math.isfinite(float(y))):
                 pairs.append((x, float(y)))
             else:
@@ -1247,7 +1260,7 @@ def scale_replication_summary(observations: Sequence[dict],
         if not scale:
             excluded.append({'index': index, 'reason': 'missing scale'})
             continue
-        if isinstance(delta, bool) or delta is None:
+        if _is_boolean_value(delta) or delta is None:
             excluded.append({'index': index, 'scale': scale, 'metric': metric,
                              'reason': f'non-finite delta {delta!r}'})
             continue
