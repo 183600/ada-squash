@@ -619,11 +619,19 @@ def cross_depth_trend_analysis(comparison: dict, alpha: float = 0.05) -> dict:
                 excluded.append({'depth': depth,
                                  'reason': 'depth is not a positive number'})
                 continue
-            if row.get('complete') is False:
-                excluded.append({'depth': depth,
-                                 'reason': ('the candidate/reference cell pair '
-                                            'is incomplete or its data revision '
-                                            'could not be verified')})
+            if row.get('complete') is not True:
+                # `False` is a known-incomplete pair; a missing/non-bool flag
+                # (an old artifact or a hand-built comparison) is *unknown*.
+                # Treating unknown as complete would let an unverified cell
+                # enter the certifying dose-response test.
+                excluded.append({
+                    'depth': depth,
+                    'reason': (
+                        'the candidate/reference cell pair is incomplete or '
+                        'its data revision could not be verified'
+                        if row.get('complete') is False else
+                        'the cell pair has no explicit complete=True marker, '
+                        'so its completeness is unknown')})
                 continue
             if row.get('cost_matched_within_25pct') is False:
                 excluded.append({'depth': depth,
