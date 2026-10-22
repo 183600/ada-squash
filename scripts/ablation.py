@@ -54,6 +54,14 @@ Comparison protocol (what the runner guarantees, and checks)
   turns a structural failure into a pre-training error. When a margin and an
   assumed SD are supplied, the same file calibrates the actual paired-test code
   on synthetic data (`simulate_paired_design`) instead of trusting its formula.
+* **Pre-specified attrition policy.** `exclusion_policy.json` fixes which runs
+  may leave the primary contrast (missing run, protocol/provenance mismatch,
+  non-finite loss) and which are retained with a sensitivity flag (a diverged
+  but finite curve). The policy fingerprint is part of `analysis_plan.json`.
+  After the runs, `exclusion_audit.json` keeps every planned run in a per-arm
+  denominator, reports duplicate run/seed ids and differential attrition, and
+  refuses to certify an arm left below three analyzable seeds;
+  `--require-exclusion-audit` makes that a hard failure.
 * **Pre-registered analysis plan.** `build_analysis_plan` freezes every
   confirmatory contrast (baseline, leave-one-out, factorial, QK) with a stable
   id, its stated hypothesis, test direction and a SHA-256 fingerprint before
@@ -104,8 +112,12 @@ sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
 from adasquash.attention import clear_logit_scratch_cache
-from adasquash.design import (design_readiness_audit, order_drift_report,
+from adasquash.design import (classify_run_exclusions,
+                               design_readiness_audit,
+                               exclusion_policy_fingerprint, normalize_exclusion_policy,
+                               order_drift_report,
                                randomized_complete_block_schedule,
+                               run_exclusion_audit,
                                schedule_balance_report, simulate_paired_design)
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
@@ -988,7 +1000,9 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     clear_ce_scratch_cache()
     return summary
 
-def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None=None, hypothesis: str | None=None) -> dict:
+def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None=None,
+                             hypothesis: str | None=None,
+                             exclusion_policy: dict | None=None) -> dict:
     """Pool per-seed runs into one Mean +/- Std summary.
 
     The seed is the unit of replication: two runs with different seeds are
@@ -999,6 +1013,11 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
     `val_loss_std_basis` recording which variability it describes), and the
     per-batch losses are kept tagged by seed so the comparison can pair rows
     seed by seed.
+
+    Every seed also carries its pre-specified exclusion status. A non-finite
+    seed still contributes no value to the mean, but it is now visible as
+    `excluded` in `per_seed` and `exclusion_status_by_seed` instead of only
+    reducing `n_seeds` - the denominator is part of the result.
     """
     per_seed = []
     for s in summaries:
@@ -1037,6 +1056,22 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
                 if _finite_metric(p.get('tokens_per_second'))]
     tps_stats = mean_std_stderr(tps_vals)
 
+    # Attrition is part of the row, not an implicit side effect of filtering
+    # non-finite values out of the mean. The policy is fixed before training
+    # and every seed is classified against it; a diverged-but-finite seed is
+    # retained and flagged, never dropped for being unlucky.
+    policy = normalize_exclusion_policy(exclusion_policy)
+    classified = classify_run_exclusions([
+        {'run_id': f'{name}::seed={p.get("seed")}', 'arm': name,
+         'seed': p.get('seed'), 'val_loss': p.get('val_loss'),
+         'curve_classification': p.get('curve_classification')}
+        for p in per_seed], policy=policy)
+    classification_by_seed = {str(item.get('seed')): item for item in classified}
+    for p in per_seed:
+        status = classification_by_seed.get(str(p.get('seed')), {})
+        p['exclusion_status'] = status.get('status', 'analyzed')
+        p['exclusion_reasons'] = status.get('reasons', [])
+
     agg = dict(summaries[0]) if summaries else {}
     pooled: list = []
     by_seed: dict = {}
@@ -1051,6 +1086,19 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
         'seeds': [p['seed'] for p in per_seed],
         'n_seeds': len(seed_losses),
         'per_seed': per_seed,
+        'exclusion_policy_fingerprint': exclusion_policy_fingerprint(policy),
+        'exclusion_status_by_seed': {
+            str(seed): item.get('status')
+            for seed, item in classification_by_seed.items()},
+        'exclusion_reasons_by_seed': {
+            str(seed): item.get('reasons') or []
+            for seed, item in classification_by_seed.items()},
+        'excluded_seeds': sorted(
+            (str(seed) for seed, item in classification_by_seed.items()
+             if item.get('status') == 'excluded')),
+        'n_seeds_excluded': sum(
+            1 for item in classification_by_seed.values()
+            if item.get('status') == 'excluded'),
         'val_loss': stats['mean'],
         'val_loss_seed_std': stats['std'] if multi else None,
         'val_loss_seed_stderr': stats['stderr'] if multi else None,
@@ -1528,6 +1576,8 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         'reference_val_loss_stderr': ref_stderr,
         'reference_n_seeds': reference.get('n_seeds', 1),
         'reference_seeds': sorted(ref_seeds),
+        'reference_excluded_seeds': reference.get('excluded_seeds') or [],
+        'reference_n_seeds_excluded': reference.get('n_seeds_excluded', 0),
         'reference_selection': {
             'rule': ('lowest val_loss among baselines with >= '
                      f'{MIN_SEEDS_FOR_SIGNIFICANCE} seeds'
@@ -1552,8 +1602,10 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         'equivalence_margin': equivalence_margin,
         'protocol': ('seeds are the unit of replication: mean +/- std across >= 3 seeds; '
                      'only the paired test on >= 3 shared per-seed means certifies significance; '
-                     'two or one shared seed(s) are descriptive only, and alias rows '
-                     '(reused summaries) are counted once'),
+                     'two or one shared seed(s) are descriptive only, alias rows '
+                     '(reused summaries) are counted once, and a seed excluded by the '
+                     'pre-specified attrition policy is reported in excluded_seeds instead '
+                     'of silently reducing n_seeds'),
         'rows': [],
     }
     for row in usable:
@@ -1567,6 +1619,9 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'val_loss': row['val_loss'],
             'val_loss_std': _row_std(row),
             'n_seeds': row.get('n_seeds', 1),
+            'excluded_seeds': row.get('excluded_seeds') or [],
+            'n_seeds_excluded': row.get('n_seeds_excluded', 0),
+            'exclusion_status_by_seed': row.get('exclusion_status_by_seed'),
             'delta_vs_reference': delta,
             # The paired test is the certifying statistic; its effect is the
             # shared-seed mean, which can differ from the difference of the
@@ -2943,7 +2998,8 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         baseline_names, model_name: str, seeds,
                         alpha: float=0.05, margin: float=0.0,
                         equivalence_margin: float=0.0,
-                        run_schedule: dict | None=None) -> dict:
+                        run_schedule: dict | None=None,
+                        exclusion_policy: dict | None=None) -> dict:
     """Freeze the confirmatory contrast registry *before* any training starts.
 
     A comparison experiment is only confirmatory if the set of tests is fixed
@@ -2960,6 +3016,9 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     The baseline reference is a *rule* ("best replicated baseline"), not a
     single row name, because which baseline is strongest is a result of the
     run; the realized reference is recorded in `baseline_comparison.json`.
+    The exclusion policy is normalized and hashed into the same fingerprint:
+    a rerun that quietly changes which runs may be dropped is a changed
+    experiment, not a re-analysis.
     """
     baseline_set = set(baseline_names or [])
     contrasts: list = []
@@ -3090,6 +3149,10 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         )
         entry['tier'] = 1 if primary else 2
         entry['tier_role'] = 'primary' if primary else 'secondary'
+    # The exclusion policy is a design decision too: changing which runs may
+    # be dropped changes the analysed sample, so it belongs in the same
+    # fingerprint as the contrasts and the randomized schedule.
+    exclusion_policy = normalize_exclusion_policy(exclusion_policy)
     payload = {
         'model': model_name,
         'seeds': [int(seed) for seed in seeds],
@@ -3097,6 +3160,8 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         'margin': float(margin),
         'equivalence_margin': float(equivalence_margin),
         'baseline_pool': sorted(baseline_set),
+        'exclusion_policy': exclusion_policy,
+        'exclusion_policy_fingerprint': exclusion_policy_fingerprint(exclusion_policy),
         # The contrast *ids* alone do not identify the experiment: two
         # matrices can reuse the same row names and hypotheses while changing
         # a model knob (e.g. alpha_init), or can map a factorial design to
@@ -3471,6 +3536,7 @@ def main():
     p.add_argument('--assumed-paired-sd', type=float, default=None, help='pre-run assumption for the paired across-seed SD (e.g. from a pilot); with --baseline-margin this makes the design-readiness audit check planned power before launching runs')
     p.add_argument('--require-design-ready', action='store_true', help='fail before training when the design-readiness audit has a structural failure (missing replication/hypothesis, incomplete schedule, absent control pair, or underpowered for the stated margin)')
     p.add_argument('--require-plan-lock', action='store_true', help='fail when this invocation would replace an existing analysis_plan.json with a different fingerprint (changed seeds/alpha/margins/hypotheses); without it the drift is recorded and warned about, but the run proceeds')
+    p.add_argument('--require-exclusion-audit', action='store_true', help='fail after training when the pre-specified attrition audit finds a duplicate run/seed, an unaccounted exclusion, or an arm left below 3 analyzable seeds; the audit is always written to exclusion_audit.json')
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
     p.add_argument('--allow-uncertified', action='store_true', help='allow running with <3 seeds (certification will be disabled); by default <3 seeds is an error')
@@ -3562,10 +3628,12 @@ def main():
         print('[design] WARNING: --no-randomize-order keeps the input row order; '
               'a time drift is then confounded with the arm and cannot be '
               'separated from it after the fact')
+    exclusion_policy = normalize_exclusion_policy()
     analysis_plan = build_analysis_plan(
         ablations, hypotheses, matrix_report, args.baselines, args.model, seeds,
         alpha=args.alpha, margin=args.baseline_margin,
-        equivalence_margin=args.equivalence_margin, run_schedule=run_schedule)
+        equivalence_margin=args.equivalence_margin, run_schedule=run_schedule,
+        exclusion_policy=exclusion_policy)
     matrix_report['analysis_plan'] = analysis_plan
     print(f"[plan] {analysis_plan['n_contrasts']} pre-registered confirmatory contrast(s) "
           f"(fingerprint {analysis_plan['fingerprint'][:12]}); every test outside this "
@@ -3596,6 +3664,8 @@ def main():
                 f'tune the baselines with this recipe and held-back --confirm-seeds.')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    with open(base / 'exclusion_policy.json', 'w') as f:
+        json.dump(exclusion_policy, f, indent=2)
     if run_schedule is not None:
         with open(base / 'run_schedule.json', 'w') as f:
             json.dump(run_schedule, f, indent=2)
@@ -3616,7 +3686,7 @@ def main():
         schedule_arm_of=schedule_arm_of, margin=args.baseline_margin,
         equivalence_margin=args.equivalence_margin,
         assumed_paired_sd=args.assumed_paired_sd, alpha=args.alpha,
-        identity_controls=control_pairs)
+        identity_controls=control_pairs, exclusion_policy=exclusion_policy)
     if run_schedule is not None:
         design_readiness['schedule_balance'] = schedule_balance_report(
             run_schedule, arm_of=schedule_arm_of)
@@ -3744,7 +3814,8 @@ def main():
         row_dir, _ = row_layout[name]
         seed_summaries = sorted(row_summaries[name], key=lambda item: item.get('seed'))
         agg = aggregate_seed_summaries(name, seed_summaries, cfg_kwargs,
-                                       hypotheses.get(name))
+                                       hypotheses.get(name),
+                                       exclusion_policy=exclusion_policy)
         _write_summary(row_dir / 'summary.json', agg)
         _report_curve_regimes(agg)
         trained[effective_config_key(args.model, cfg_kwargs)] = name
@@ -3841,7 +3912,8 @@ def main():
             if multi:
                 _write_summary(summary_paths[seed], summary)
         agg = aggregate_seed_summaries(alias, reused, cfg_kwargs,
-                                       hypotheses.get(alias))
+                                       hypotheses.get(alias),
+                                       exclusion_policy=exclusion_policy)
         _write_summary(row_dir / 'summary.json', agg)
         print(f'[alias] {alias}: identical model config to {canonical}, reusing its '
               f'summaries (no retrain)')
@@ -3867,6 +3939,58 @@ def main():
         print(f"[compare] WARNING: {len(stale_rows)} accumulated row(s) excluded from the comparisons "
               f"(trained under a different model/cfg/protocol than this invocation): "
               f"{[r['name'] for r in stale_rows]}; rerun them under this recipe to include them")
+    # Pre-specified attrition: the comparisons below silently drop a
+    # non-finite seed from a pooled mean, so the denominator is audited
+    # explicitly. Every planned (row, seed) is a record; missing or
+    # non-finite runs are excluded only for the reasons frozen in
+    # exclusion_policy.json, and an arm that falls below the certification
+    # replication count is reported instead of being averaged over survivors.
+    row_by_name = {row.get('name'): row for row in all_summaries
+                   if isinstance(row, dict) and row.get('name')}
+    stale_names = {row.get('name') for row in stale_rows
+                   if isinstance(row, dict)}
+    planned_runs = []
+    for entry in schedule_entries:
+        name = entry.get('unit')
+        if name not in canonical_rows:
+            continue
+        try:
+            seed = int(entry.get('replicate'))
+        except (TypeError, ValueError):
+            continue
+        agg = row_by_name.get(name) or {}
+        item = next((p for p in (agg.get('per_seed') or [])
+                     if isinstance(p, dict) and p.get('seed') == seed), None)
+        planned_runs.append({
+            'run_id': entry.get('run_id') or f'{name}::rep={seed}',
+            'arm': name,
+            'seed': seed,
+            'val_loss': item.get('val_loss') if item else None,
+            'present': item is not None,
+            'protocol_mismatch': name in stale_names,
+            'curve_classification': (item or {}).get('curve_classification'),
+        })
+    exclusion_audit = run_exclusion_audit(planned_runs, exclusion_policy)
+    exclusion_audit['schedule_fingerprint'] = (
+        run_schedule.get('fingerprint') if run_schedule else None)
+    with open(base / 'exclusion_audit.json', 'w') as f:
+        json.dump(exclusion_audit, f, indent=2)
+    if exclusion_audit['n_excluded'] or exclusion_audit['n_sensitivity']:
+        print(f"[exclusion] {exclusion_audit['n_planned']} planned run(s): "
+              f"{exclusion_audit['n_analyzed']} retained, "
+              f"{exclusion_audit['n_sensitivity']} sensitivity-only, "
+              f"{exclusion_audit['n_excluded']} excluded "
+              f"(policy {exclusion_audit['policy_fingerprint'][:12]})")
+    for warning in exclusion_audit['warnings']:
+        print(f'[exclusion] WARNING: {warning}')
+    if not exclusion_audit['ready']:
+        message = ('the attrition audit found an unusable design: '
+                   + '; '.join(exclusion_audit['violations']))
+        if args.require_exclusion_audit:
+            raise SystemExit('[exclusion] ERROR: ' + message)
+        print('[exclusion] WARNING: ' + message
+              + '; the comparisons below are reported with the attrition '
+                'visible in exclusion_audit.json')
     comparison = baseline_comparison(comparable, args.baselines, margin=args.baseline_margin,
                                      alpha=args.alpha,
                                      equivalence_margin=args.equivalence_margin)
@@ -4018,6 +4142,8 @@ def main():
     manifest['analysis_plan'] = analysis_plan
     manifest['study_level_tests'] = study
     manifest['run_schedule'] = run_schedule
+    manifest['exclusion_policy'] = exclusion_policy
+    manifest['exclusion_audit'] = exclusion_audit
     manifest['design_readiness'] = design_readiness
     manifest['run_order_audit'] = order_audit
     if sanity_report_path is not None:
@@ -4037,6 +4163,8 @@ def main():
         'study_level_tests': artifact_record(base / 'study_level_tests.json'),
         'run_schedule': (artifact_record(base / 'run_schedule.json')
                          if run_schedule is not None else {'enabled': False}),
+        'exclusion_policy': artifact_record(base / 'exclusion_policy.json'),
+        'exclusion_audit': artifact_record(base / 'exclusion_audit.json'),
         'design_readiness': artifact_record(base / 'design_readiness.json'),
         'run_order_audit': artifact_record(base / 'run_order_audit.json'),
         'sanity_report': file_fingerprint(sanity_report_path) if sanity_report_path else {'enabled': False},

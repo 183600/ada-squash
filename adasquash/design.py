@@ -29,10 +29,16 @@ This module supplies the reusable, pure-Python pieces:
     Within-arm rank correlation between execution position and outcome, with
     a within-arm permutation test.  Centering by arm is what distinguishes
     "time drift correlated with the arm" from a real arm difference.
+``default_exclusion_policy`` / ``run_exclusion_audit``
+    A pre-specified attrition rule: only missing runs, protocol/provenance
+    mismatches and non-finite losses may be excluded, and every planned run
+    is retained in a per-arm denominator instead of disappearing from a
+    pooled mean.  A finite but unlucky seed is never an exclusion.
 ``design_readiness_audit``
     A pre-flight checklist: replication, stated hypotheses, a pre-specified
-    smallest effect, adequate planned power, a complete randomized schedule
-    and the presence of an identity/negative control pair.
+    smallest effect, adequate planned power, a complete randomized schedule,
+    a locked exclusion policy and the presence of an identity/negative
+    control pair.
 ``simulate_paired_design``
     A Monte-Carlo calibration of the actual paired-test code: empirical
     type-I error under a synthetic null and empirical power under a known
@@ -46,13 +52,18 @@ Wiring in this repository
 ``--require-design-ready`` available to fail closed) and
 ``run_order_audit.json`` (the realized-order drift test); the schedule is
 embedded in ``analysis_plan.json`` so changing it changes the pre-registration
-fingerprint.  ``scripts/train_llama_depth_sweep.py`` writes the schedule and
-the order audit for the depth/norm grid.  ``--no-randomize-order`` is the
-recorded opt-out in both runners.
+fingerprint.  The same runner freezes ``exclusion_policy.json`` before
+training, embeds its fingerprint in the plan, and writes
+``exclusion_audit.json`` afterwards (``--require-exclusion-audit`` makes an
+arm left below the replication minimum a hard failure).
+``scripts/train_llama_depth_sweep.py`` writes the schedule and the order audit
+for the depth/norm grid.  ``--no-randomize-order`` is the recorded opt-out in
+both runners.
 """
 import hashlib
 import json
 import math
+import numbers
 import random
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
@@ -63,6 +74,11 @@ __all__ = [
     'randomized_complete_block_schedule',
     'schedule_balance_report',
     'order_drift_report',
+    'default_exclusion_policy',
+    'normalize_exclusion_policy',
+    'exclusion_policy_fingerprint',
+    'classify_run_exclusions',
+    'run_exclusion_audit',
     'design_readiness_audit',
     'simulate_paired_design',
 ]
@@ -532,6 +548,352 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
     return base
 
 
+EXCLUSION_POLICY_SCHEMA = 'adasquash.exclusion_policy.v1'
+_EXCLUSION_ACTIONS = ('exclude', 'sensitivity')
+# A confirmatory design may not discard a run because its outcome is
+# inconvenient. These are the only failure modes the default policy treats as
+# exclusions; all of them are observable before/independently of the arm
+# contrast.
+_REQUIRED_EXCLUSION_RULES = ('missing_run', 'protocol_mismatch', 'non_finite_loss')
+_DIVERGED_CLASSIFICATIONS = ('diverging', 'diverged', 'nonfinite_loss')
+
+
+def default_exclusion_policy() -> dict:
+    """The pre-specified attrition policy used by the confirmatory runners.
+
+    An exclusion changes the analysed sample, so it is a design decision that
+    has to be fixed before the outcomes are seen. The default admits only
+    *protocol* failures - a planned run with no artifact, a run whose recorded
+    recipe/provenance differs from the registered one, and a run whose
+    held-out loss is NaN/Inf - plus a non-excluding ``sensitivity`` flag for a
+    run whose loss curve already diverged. A finite but unlucky loss is never
+    an exclusion reason: dropping the worst seed after looking at the results
+    is exactly the garden of forking paths this policy is meant to stop.
+    """
+    return {
+        'schema': EXCLUSION_POLICY_SCHEMA,
+        'version': 1,
+        'rules': [
+            {'id': 'missing_run', 'action': 'exclude', 'outcome_blind': True,
+             'description': ('planned run has no readable summary, checkpoint or '
+                             'finished manifest')},
+            {'id': 'protocol_mismatch', 'action': 'exclude', 'outcome_blind': True,
+             'description': ('recorded model/data/optimizer recipe or pinned '
+                             'provenance differs from the registered protocol')},
+            {'id': 'non_finite_loss', 'action': 'exclude', 'outcome_blind': True,
+             'description': ('held-out loss is NaN/Inf, so no finite paired '
+                             'contrast can be computed')},
+            {'id': 'diverged_curve', 'action': 'sensitivity', 'outcome_blind': False,
+             'description': ('the training curve is already diverging; the run is '
+                             'retained in the primary analysis and reported as a '
+                             'sensitivity check instead of being dropped')},
+        ],
+        'forbidden_exclusion_criteria': [
+            'val_loss_outlier', 'best_of_seeds', 'drop_worst_arm',
+            'post_hoc_loss_threshold',
+        ],
+        'protocol': (
+            'exclusions are fixed before outcomes are inspected; only missing '
+            'runs, protocol/provenance mismatches and non-finite losses may be '
+            'excluded, and every excluded or flagged run is counted per arm'),
+    }
+
+
+def normalize_exclusion_policy(policy: Optional[Mapping] = None) -> dict:
+    """Validate and canonicalize an exclusion policy (``None`` -> default).
+
+    The returned object has rules sorted by id and only the fields that carry
+    meaning, so two semantically identical policies have the same
+    fingerprint. A rule with ``action='exclude'`` must be declared
+    ``outcome_blind=True``; an outcome-dependent exclusion is rejected rather
+    than silently allowed. The three protocol rules are mandatory: a policy
+    cannot quietly stop treating a missing or non-finite run as attrition.
+    """
+    if policy is None:
+        policy = default_exclusion_policy()
+    if not isinstance(policy, Mapping):
+        raise ValueError(f'exclusion policy must be a mapping, got {type(policy).__name__}')
+    if policy.get('schema') != EXCLUSION_POLICY_SCHEMA:
+        raise ValueError(
+            f"exclusion policy schema must be {EXCLUSION_POLICY_SCHEMA!r}, "
+            f"got {policy.get('schema')!r}")
+    version = policy.get('version', 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError(f'exclusion policy version must be a positive integer, got {version!r}')
+    raw_rules = policy.get('rules')
+    if (not isinstance(raw_rules, Sequence) or isinstance(raw_rules, (str, bytes))
+            or not raw_rules):
+        raise ValueError('exclusion policy needs a non-empty list of rules')
+    rules: list[dict] = []
+    seen: set[str] = set()
+    for raw in raw_rules:
+        if not isinstance(raw, Mapping):
+            raise ValueError(f'exclusion rule must be a mapping, got {type(raw).__name__}')
+        rule_id = raw.get('id')
+        if not isinstance(rule_id, str) or not rule_id.strip():
+            raise ValueError(f'exclusion rule id must be a non-empty string, got {rule_id!r}')
+        if rule_id in seen:
+            raise ValueError(f'duplicate exclusion rule id {rule_id!r}')
+        seen.add(rule_id)
+        action = raw.get('action')
+        if action not in _EXCLUSION_ACTIONS:
+            raise ValueError(
+                f'exclusion rule {rule_id!r} action must be one of '
+                f'{_EXCLUSION_ACTIONS}, got {action!r}')
+        blind = raw.get('outcome_blind')
+        if not isinstance(blind, bool):
+            raise ValueError(
+                f'exclusion rule {rule_id!r} must declare outcome_blind true/false')
+        if action == 'exclude' and not blind:
+            raise ValueError(
+                f'exclusion rule {rule_id!r} is outcome-dependent; an exclude '
+                f'rule must be outcome_blind, otherwise a bad result can be '
+                f'dropped after it is seen')
+        rule = {'id': rule_id, 'action': action, 'outcome_blind': blind}
+        description = raw.get('description')
+        if description is not None:
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError(
+                    f'exclusion rule {rule_id!r} description must be a non-empty string')
+            rule['description'] = description
+        rules.append(rule)
+    missing = [rule_id for rule_id in _REQUIRED_EXCLUSION_RULES if rule_id not in seen]
+    if missing:
+        raise ValueError(
+            f'exclusion policy is missing mandatory protocol rule(s): {missing}; '
+            f'a run may not disappear without a recorded reason')
+    forbidden = policy.get('forbidden_exclusion_criteria', [])
+    if (not isinstance(forbidden, Sequence) or isinstance(forbidden, (str, bytes))):
+        raise ValueError('forbidden_exclusion_criteria must be a sequence of strings')
+    if any(not isinstance(item, str) or not item.strip() for item in forbidden):
+        raise ValueError(
+            'forbidden_exclusion_criteria must contain non-empty strings, got '
+            f'{[item for item in forbidden if not isinstance(item, str) or not item.strip()]!r}')
+    forbidden = list(forbidden)
+    used_forbidden = sorted(seen.intersection(forbidden))
+    if used_forbidden:
+        raise ValueError(
+            f'exclusion rule id(s) {used_forbidden} are listed as forbidden '
+            f'outcome-based criteria; a policy cannot both forbid and use them')
+    protocol = policy.get('protocol')
+    if protocol is not None and not isinstance(protocol, str):
+        raise ValueError('exclusion policy protocol must be a string')
+    return {
+        'schema': EXCLUSION_POLICY_SCHEMA,
+        'version': int(version),
+        'rules': sorted(rules, key=lambda rule: rule['id']),
+        'forbidden_exclusion_criteria': sorted(set(forbidden)),
+        'protocol': protocol or (
+            'only pre-specified, outcome-blind protocol failures may be excluded; '
+            'the per-arm attrition is audited after the run'),
+    }
+
+
+def exclusion_policy_fingerprint(policy: Optional[Mapping] = None) -> str:
+    """Stable SHA-256 of the canonical exclusion policy."""
+    canonical = normalize_exclusion_policy(policy)
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()
+
+
+def classify_run_exclusions(runs: Sequence[Mapping],
+                            policy: Optional[Mapping] = None) -> list[dict]:
+    """Apply the pre-specified policy to every planned run.
+
+    ``runs`` records use ``run_id``, ``arm``, optional ``seed``,
+    ``val_loss``, ``present``, ``protocol_mismatch`` and
+    ``curve_classification``. The result keeps one record per planned run
+    (including a missing one) with the reasons that fired and a status:
+
+    * ``excluded``  - at least one ``exclude`` rule fired (removed from the
+      primary contrast, but still counted in the audit);
+    * ``sensitivity`` - only a non-excluding flag fired (kept in the primary
+      analysis, reported as a sensitivity check);
+    * ``analyzed`` - no rule fired.
+
+    Facts are derived from protocol metadata and finiteness, never from the
+    rank of the loss, so a surprisingly good/bad but finite run cannot be
+    classified as an exclusion.
+    """
+    canonical = normalize_exclusion_policy(policy)
+    rule_action = {rule['id']: rule['action'] for rule in canonical['rules']}
+    if isinstance(runs, (str, bytes)) or not isinstance(runs, Sequence):
+        raise ValueError('runs must be a sequence of run records')
+    classified: list[dict] = []
+    for index, run in enumerate(runs):
+        if not isinstance(run, Mapping):
+            raise ValueError(f'run record {index} must be a mapping, '
+                             f'got {type(run).__name__}')
+        run_id = run.get('run_id')
+        arm = run.get('arm')
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError(f'run record {index} needs a non-empty string run_id')
+        if not isinstance(arm, str) or not arm.strip():
+            raise ValueError(f'run record {index} ({run_id!r}) needs a non-empty arm')
+        present = run.get('present', True)
+        if not isinstance(present, bool):
+            raise ValueError(f'run record {run_id!r} present must be a boolean, '
+                             f'got {present!r}')
+        facts: list[str] = []
+        if not present:
+            facts.append('missing_run')
+        if bool(run.get('protocol_mismatch')):
+            facts.append('protocol_mismatch')
+        loss = run.get('val_loss')
+        if present:
+            if loss is None:
+                facts.append('missing_run')
+            elif (isinstance(loss, bool) or not isinstance(loss, numbers.Real)
+                  or not math.isfinite(float(loss))):
+                # A bool, a string or a NaN/Inf all mean the same thing for
+                # the paired contrast: there is no finite loss to analyse.
+                facts.append('non_finite_loss')
+        curve = run.get('curve_classification')
+        if isinstance(curve, str) and curve in _DIVERGED_CLASSIFICATIONS:
+            facts.append('diverged_curve')
+        facts = list(dict.fromkeys(facts))
+        unknown = [fact for fact in facts if fact not in rule_action]
+        actions = [rule_action[fact] for fact in facts if fact in rule_action]
+        if 'exclude' in actions:
+            status = 'excluded'
+        elif 'sensitivity' in actions:
+            status = 'sensitivity'
+        else:
+            status = 'analyzed'
+        classified.append({
+            'run_id': run_id,
+            'arm': arm,
+            'seed': run.get('seed'),
+            'val_loss': loss if present else None,
+            'curve_classification': curve,
+            'reasons': facts,
+            'unknown_reasons': unknown,
+            'actions': actions,
+            'status': status,
+        })
+    return classified
+
+
+def run_exclusion_audit(runs: Sequence[Mapping],
+                        policy: Optional[Mapping] = None,
+                        min_seeds: int = MIN_SEEDS_FOR_SIGNIFICANCE) -> dict:
+    """Pre-specified attrition audit over all planned runs.
+
+    Unlike a pooled mean, this report keeps the denominator: every planned
+    run is either retained, flagged as a sensitivity case, or excluded with a
+    reason that was fixed in advance. It fails closed when an arm loses so
+    many runs that it can no longer reach ``min_seeds`` independent
+    replications, or when a run id or seed is duplicated. Differential
+    attrition across arms is a warning: a random non-finite run can
+    legitimately hit one arm, but an arm that lost most of its runs must not
+    be read as a clean mean over the survivors.
+    """
+    if isinstance(min_seeds, bool) or not isinstance(min_seeds, int) or min_seeds < 1:
+        raise ValueError(f'min_seeds must be a positive integer, got {min_seeds!r}')
+    canonical = normalize_exclusion_policy(policy)
+    fingerprint = exclusion_policy_fingerprint(canonical)
+    classified = classify_run_exclusions(runs, canonical)
+    violations: list[str] = []
+    warnings: list[str] = []
+    if not classified:
+        violations.append('no planned runs were supplied to the attrition audit')
+
+    seen_ids: set[str] = set()
+    duplicate_ids: list[str] = []
+    seen_seed_keys: set[tuple] = set()
+    duplicate_seeds: list[str] = []
+    by_reason: dict[str, int] = {}
+    by_status: dict[str, int] = {'analyzed': 0, 'sensitivity': 0, 'excluded': 0}
+    per_arm: dict[str, dict] = {}
+    excluded_runs: list[dict] = []
+    sensitivity_runs: list[dict] = []
+    unknown_reasons: set[str] = set()
+    for record in classified:
+        run_id = record['run_id']
+        if run_id in seen_ids:
+            duplicate_ids.append(run_id)
+        seen_ids.add(run_id)
+        seed = record.get('seed')
+        if seed is not None:
+            key = (record['arm'], str(seed))
+            if key in seen_seed_keys:
+                duplicate_seeds.append(f'{record["arm"]}::seed={seed}')
+            seen_seed_keys.add(key)
+        status = record['status']
+        by_status[status] += 1
+        for reason in record['reasons']:
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+        unknown_reasons.update(record['unknown_reasons'])
+        bucket = per_arm.setdefault(record['arm'], {
+            'planned': 0, 'analyzed': 0, 'clean': 0, 'sensitivity': 0,
+            'excluded': 0, 'seeds': set(),
+        })
+        bucket['planned'] += 1
+        if status != 'excluded':
+            bucket['analyzed'] += 1
+            if seed is not None:
+                bucket['seeds'].add(str(seed))
+        if status == 'analyzed':
+            bucket['clean'] += 1
+        elif status == 'sensitivity':
+            bucket['sensitivity'] += 1
+            sensitivity_runs.append(record)
+        else:
+            bucket['excluded'] += 1
+            excluded_runs.append(record)
+
+    for arm, bucket in sorted(per_arm.items()):
+        bucket['seeds'] = sorted(bucket['seeds'])
+        bucket['n_seeds_analyzed'] = len(bucket['seeds'])
+        bucket['excluded_fraction'] = (
+            bucket['excluded'] / bucket['planned'] if bucket['planned'] else 0.0)
+        if bucket['planned'] >= min_seeds and bucket['n_seeds_analyzed'] < min_seeds:
+            violations.append(
+                f'arm {arm!r}: {bucket["n_seeds_analyzed"]} analyzable seed(s) '
+                f'after pre-specified exclusions, below the certification '
+                f'minimum of {min_seeds}')
+    if duplicate_ids:
+        violations.append(f'duplicate run id(s): {sorted(set(duplicate_ids))}')
+    if duplicate_seeds:
+        violations.append(f'duplicate seed(s) within an arm: {sorted(set(duplicate_seeds))}')
+    if unknown_reasons:
+        warnings.append(
+            'run fact(s) with no policy rule, treated as no exclusion: '
+            f'{sorted(unknown_reasons)}')
+    if by_status['excluded'] and len(per_arm) > 1:
+        fractions = [bucket['excluded_fraction'] for bucket in per_arm.values()]
+        if max(fractions) - min(fractions) >= 0.5:
+            warnings.append(
+                'differential attrition across arms (excluded fraction range '
+                f'{min(fractions):.2f}-{max(fractions):.2f}); compare the per-arm '
+                'counts before reading a pooled mean')
+    return {
+        'schema': 'adasquash.exclusion_audit.v1',
+        'policy_fingerprint': fingerprint,
+        'policy': canonical,
+        'min_seeds': min_seeds,
+        'n_planned': len(classified),
+        'n_analyzed': by_status['analyzed'] + by_status['sensitivity'],
+        'n_clean': by_status['analyzed'],
+        'n_sensitivity': by_status['sensitivity'],
+        'n_excluded': by_status['excluded'],
+        'by_status': by_status,
+        'by_reason': by_reason,
+        'per_arm': per_arm,
+        'excluded_runs': excluded_runs,
+        'sensitivity_runs': sensitivity_runs,
+        'violations': violations,
+        'warnings': warnings,
+        'ready': not violations,
+        'attrition_balanced': not warnings,
+        'protocol': (
+            'every planned run is either retained, flagged for a sensitivity '
+            'check, or excluded for a pre-specified outcome-blind protocol '
+            'failure; an arm below the replication minimum cannot be certified'),
+    }
+
+
 def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                            hypotheses: Mapping[str, str],
                            schedule: Optional[dict] = None,
@@ -543,7 +905,8 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                            target_power: float = 0.8,
                            alpha: float = 0.05,
                            min_seeds: int = MIN_SEEDS_FOR_SIGNIFICANCE,
-                           identity_controls: Sequence[Sequence[str]] = ()) -> dict:
+                           identity_controls: Sequence[Sequence[str]] = (),
+                           exclusion_policy: Optional[Mapping] = None) -> dict:
     """Pre-flight design checklist, written before any run starts.
 
     Failures are structural and should stop a confirmatory launch; warnings are
@@ -685,6 +1048,19 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                 f'{len(pairs)} identity/negative-control pair(s) present: '
                 f'{[list(pair) for pair in pairs]}')
 
+    canonical_policy = None
+    policy_fingerprint = None
+    try:
+        canonical_policy = normalize_exclusion_policy(exclusion_policy)
+        policy_fingerprint = exclusion_policy_fingerprint(canonical_policy)
+    except ValueError as exc:
+        add('exclusions', 'fail', f'invalid exclusion policy: {exc}')
+    else:
+        rules = {rule['id']: rule for rule in canonical_policy['rules']}
+        add('exclusions', 'pass',
+            f'pre-specified attrition policy with {len(rules)} rule(s), '
+            f'fingerprint {policy_fingerprint[:12]}')
+
     n_fail = sum(1 for check in checks if check['status'] == 'fail')
     n_warn = sum(1 for check in checks if check['status'] == 'warn')
     return {
@@ -693,6 +1069,8 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         'n_fail': n_fail,
         'n_warn': n_warn,
         'checks': checks,
+        'exclusion_policy': canonical_policy,
+        'exclusion_policy_fingerprint': policy_fingerprint,
         'note': ('failures block a confirmatory launch; warnings are recorded so a '
                  'reader can see which design decisions were left open'),
     }
