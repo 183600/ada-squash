@@ -895,7 +895,7 @@ def _moe_cell_replicated(cell: dict) -> bool:
         and not cell.get('missing_seeds') and not cell.get('unexpected_seeds')
         and not cell.get('duplicate_seeds') and not cell.get('invalid_seeds')
         and not cell.get('seeds_without_val_ce')
-        and cell.get('n_params_consistent', True))
+        and cell.get('n_params_consistent') is True)
 
 def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
     """Cross-cell data-snapshot guard for a MoE norm comparison."""
