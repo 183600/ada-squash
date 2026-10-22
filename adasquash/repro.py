@@ -124,6 +124,23 @@ def deterministic_algorithms_context(mode: str | None = None):
     return _ctx()
 
 
+def _strict_seed(seed) -> int:
+    """A seed is an integer; bool/fractional/non-numeric values are rejected.
+
+    ``int(1.9)`` silently seeds a different run while the manifest still
+    claims the requested seed, defeating the reproducibility contract.
+    """
+    if isinstance(seed, bool):
+        raise ValueError(f"seed must be an integer, got bool {seed!r}")
+    try:
+        converted = int(seed)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"seed must be an integer, got {seed!r}") from None
+    if converted != seed:
+        raise ValueError(f"seed must be an integer, got {seed!r}")
+    return converted
+
+
 def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     """Seed the Python, NumPy, torch and CUDA RNGs from `seed`.
 
@@ -148,7 +165,7 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     `launch_multi_seed` in `train_gpt2.py` and `_child_env` in
     `train_llama_depth_sweep.py`.
     """
-    seed = int(seed)
+    seed = _strict_seed(seed)
     random.seed(seed)
     try:
         import numpy as np
@@ -443,7 +460,7 @@ def collect_run_metadata(seed: int | None = None, extra: dict | None = None,
     """
     metadata = {
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "seed": None if seed is None else int(seed),
+        "seed": None if seed is None else _strict_seed(seed),
         "git": git_revision(),
         "environment": environment_info(),
     }
