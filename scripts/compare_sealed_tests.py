@@ -251,11 +251,19 @@ def pairing_mismatches(ref: dict, other: dict) -> dict:
             if k not in a or k not in b or a.get(k) != b.get(k)}
 
 
-def _mde(stderr: float, df: float, alpha: float, power: float) -> float:
-    """Minimum detectable delta of a one-sided t-test at `alpha` and `power`."""
+def _mde(stderr: float, df: float, alpha: float, power: float,
+         margin: float = 0.0) -> float:
+    """Minimum detectable *raw* delta of a one-sided t-test at `alpha` and `power`.
+
+    The test is H1 ``mean(delta) < -margin``, so the smallest raw effect that
+    clears both the practical margin and the sampling noise is
+    ``margin + (t_alpha + t_power) * stderr``. Omitting the margin understates
+    the resolution whenever ``--margin`` is non-zero.
+    """
     if stderr <= 0.0 or df <= 0.0:
         return 0.0
-    return (student_t_ppf(1.0 - alpha, df) + student_t_ppf(power, df)) * stderr
+    return (float(margin)
+            + (student_t_ppf(1.0 - alpha, df) + student_t_ppf(power, df)) * stderr)
 
 
 def _discover_results(path: Path) -> list[Path]:
@@ -513,7 +521,8 @@ def main():
             deltas = [x - y for x, y in zip(a, b)]
             delta_stats = mean_std_stderr(deltas)
             row["min_detectable_delta"] = _mde(
-                delta_stats["stderr"], test["df"], args.alpha, args.power)
+                delta_stats["stderr"], test["df"], args.alpha, args.power,
+                margin=args.margin)
         else:
             # One shared training run (or only unseeded runs): a paired test
             # over that run's batches describes the measurement noise on the
@@ -538,7 +547,8 @@ def main():
                     delta_stats = mean_std_stderr(deltas)
                     if test["df"] is not None:
                         row["min_detectable_delta"] = _mde(
-                            delta_stats["stderr"], test["df"], args.alpha, args.power)
+                            delta_stats["stderr"], test["df"], args.alpha, args.power,
+                            margin=args.margin)
         if test is not None and test["mean_delta"] is not None:
             row["mean_delta"] = test["mean_delta"]
             row["delta_ci_low"] = test["ci_low"]
