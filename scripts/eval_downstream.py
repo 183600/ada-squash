@@ -117,7 +117,10 @@ class AdaSquashLM:
 
     def tok_encode(self, string: str, add_special_tokens: bool=False,
                    left_truncate_len: int | None=None) -> list:
-        ids = self.tokenizer(string, add_special_tokens=False)['input_ids']
+        # Honor the caller's flag: the harness passes it through, and silently
+        # forcing `False` would tokenize a special-token request differently.
+        ids = self.tokenizer(
+            string, add_special_tokens=bool(add_special_tokens))['input_ids']
         if left_truncate_len is not None and len(ids) > left_truncate_len:
             ids = ids[len(ids) - left_truncate_len:]
         return list(ids)
@@ -205,8 +208,21 @@ class AdaSquashLM:
             until = list(gen_kwargs.get('until', [])) + [
                 s for s in stops if s not in gen_kwargs.get('until', [])]
             max_toks = int(gen_kwargs.get('max_gen_toks', self.max_gen_toks))
+            # A request for more tokens than the positional table can hold is
+            # capped, not allowed to run past `max_seq_len` and crash on the
+            # first forward whose prefix is already full.
+            max_toks = max(0, min(max_toks, max(0, self.max_length - 1)))
             budget = max(1, self.max_length - max_toks)
             ids = self.tok_encode(context, left_truncate_len=budget)
+            if not ids:
+                # Generation needs at least one context position; mirror the
+                # empty-context handling of `_encode_pair`.
+                eos = self.tokenizer.eos_token_id
+                if eos is not None:
+                    ids = [int(eos)]
+                elif max_toks > 0:
+                    out.append('')
+                    continue
             generated: list = []
             with torch.no_grad():
                 for _ in range(max_toks):
