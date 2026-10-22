@@ -16,6 +16,15 @@ Reads a bounded sample of the train / validation / test splits produced by
   selection split peek at the sealed final split). Duplicates are detected on
   the exact text *and* on a canonical form (Unicode NFKC + collapsed
   whitespace), so formatting variants are caught too;
+* near-duplicate hygiene: exact/canonical hashes cannot see a held-out
+  document that repeats most of a training document with a changed sentence
+  or template.  A deterministic token 8-shingle MinHash sketch with LSH
+  candidate bands estimates cross-split Jaccard similarity and reports pairs
+  at or above `--near-dup-threshold` (default 0.8); pairs within
+  `--near-dup-margin` below the threshold are listed as borderline rather
+  than silently dropped.  The scan is bounded by `--near-dup-max-docs`, and a
+  sampled/truncated scan reports itself as a lower bound rather than claiming
+  the splits are clean;
 * group hygiene (`--group-key`): documents sharing a grouping unit (same
   user / item / source page) must not straddle any split boundary. The audit
   counts held-out documents whose group occurs in an earlier split and fails
@@ -27,7 +36,18 @@ Reads a bounded sample of the train / validation / test splits produced by
   distributions of train vs validation / test, plus document-length means and
   3xIQR length-outlier counts. Outliers are also counted under the fence
   derived from the *training* lengths only, so a held-out slice is never
-  trimmed with statistics it contributed to.
+  trimmed with statistics it contributed to;
+* data adequacy: total effective tokens and documents behind every held-out
+  split, with the observed count when the split was fully read and a clearly
+  labelled prefix extrapolation otherwise.  `--min-eval-tokens` /
+  `--min-eval-docs` turn "the validation slice is too small to support the
+  comparison" into a failed audit instead of a wide confidence interval that
+  is never mentioned;
+* training token budget: the estimated effective train-split token count,
+  compared with `--scheduled-train-tokens` (= steps x batch x grad-accum x
+  seq-len).  A loader that runs out of unique documents silently starts
+  another epoch, so `--fail-on-train-wrap` refuses a run whose advertised
+  token budget is really a repeated pass over the same corpus.
 
 `--write-train-hash-file` emits the training-document hash ledger (exact and
 canonical digests) consumed by `--exclude-hash-file` in the trainers, so
@@ -62,7 +82,281 @@ from scripts.data_pipeline import (DocumentCleaner, canonical_document_hash, doc
                                    extract_group_value, group_hash, load_document_stream)
 
 
-def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, known_hashes_exhaustive=True, known_hashes_extra_exhaustive=True, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, known_groups_exhaustive=True, known_groups_extra_exhaustive=True, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None):
+# ---------------------------------------------------------------------------
+# Near-duplicate contamination
+# ---------------------------------------------------------------------------
+# Exact and canonical hashes only catch a document that is byte-identical (up
+# to Unicode/whitespace formatting).  A held-out document that repeats most of
+# a training document with a changed sentence, an extra header or a different
+# template is still contamination, but it is invisible to those hashes.  The
+# audit therefore also compares token 8-shingles with a MinHash + LSH sketch:
+# deterministic, bounded-memory, and independent of the tokenizer's string form.
+_NEAR_DUP_MASK = (1 << 64) - 1
+_NEAR_DUP_SHINGLE_BASE = 0x9E3779B185EBCA87
+_NEAR_DUP_BANDS = 40
+_NEAR_DUP_ROWS = 6
+_NEAR_DUP_PERMUTATIONS = _NEAR_DUP_BANDS * _NEAR_DUP_ROWS
+# A long FineWeb document can contain hundreds of thousands of 8-shingles; a
+# full signature over all of them would dominate the audit.  Keep the bottom-k
+# shingles (deterministic and unbiased with respect to shingle order); for a
+# pair that is mostly the same document, the bottom-k sketches overlap in the
+# same proportion, so the near-duplicate decision is preserved.
+_NEAR_DUP_MAX_SHINGLES = 1024
+
+
+def _splitmix64(state: int):
+    """Deterministic 64-bit PRNG step used to derive the hash permutations."""
+    state = (state + 0x9E3779B97F4A7C15) & _NEAR_DUP_MASK
+    z = state
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _NEAR_DUP_MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _NEAR_DUP_MASK
+    return state, (z ^ (z >> 31)) & _NEAR_DUP_MASK
+
+
+def _near_dup_permutations(n: int = _NEAR_DUP_PERMUTATIONS):
+    """`n` affine permutations of the 64-bit shingle-hash space.
+
+    `a` is forced odd, so `(a*h + b) mod 2**64` is a bijection; taking the
+    minimum over a document's shingles is therefore a valid MinHash of its
+    shingle set, not merely a random projection.  The seed is fixed so two
+    audits of the same corpus produce the same signatures.
+    """
+    a, b = [], []
+    state = 0xAD45_9A5D_2026_0001
+    while len(a) < n:
+        state, r1 = _splitmix64(state)
+        state, r2 = _splitmix64(state)
+        a.append((r1 | 1) & _NEAR_DUP_MASK)
+        b.append(r2)
+    return (np.asarray(a, dtype=np.uint64), np.asarray(b, dtype=np.uint64))
+
+
+_NEAR_DUP_A, _NEAR_DUP_B = _near_dup_permutations()
+
+
+def token_shingles(ids, shingle_size: int = 8) -> set:
+    """Set of rolling 64-bit hashes of the token n-grams in one document.
+
+    A rolling polynomial hash keeps this O(len(ids)) in Python and makes the
+    result independent of the process-wide hash seed (unlike `hash(tuple)`), so
+    two audit runs compare the same shingles.
+    """
+    k = int(shingle_size)
+    if k < 1:
+        raise ValueError(f"shingle_size must be >= 1, got {shingle_size}")
+    tokens = [int(t) + 1 for t in ids]
+    n = len(tokens)
+    if n == 0:
+        return set()
+    k = min(k, n)
+    h = 0
+    for token in tokens[:k]:
+        h = ((h * _NEAR_DUP_SHINGLE_BASE) + token) & _NEAR_DUP_MASK
+    out = {h}
+    if n == k:
+        return out
+    place = pow(_NEAR_DUP_SHINGLE_BASE, k - 1, 1 << 64)
+    for i in range(k, n):
+        outgoing = (tokens[i - k] * place) & _NEAR_DUP_MASK
+        h = (((h - outgoing) * _NEAR_DUP_SHINGLE_BASE) + tokens[i]) & _NEAR_DUP_MASK
+        out.add(h)
+    return out
+
+
+def minhash_signature(shingles) -> tuple:
+    """MinHash signature (one minimum per permutation) of a shingle set."""
+    if not shingles:
+        return tuple([int(_NEAR_DUP_MASK)] * _NEAR_DUP_PERMUTATIONS)
+    hashes = np.fromiter(shingles, dtype=np.uint64, count=len(shingles))
+    best = np.full(_NEAR_DUP_PERMUTATIONS, _NEAR_DUP_MASK, dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        for start in range(0, hashes.size, 512):
+            chunk = hashes[start:start + 512]
+            values = (_NEAR_DUP_A[:, None] * chunk[None, :]
+                      + _NEAR_DUP_B[:, None])
+            np.minimum(best, values.min(axis=1), out=best)
+    return tuple(int(v) for v in best)
+
+
+def near_duplicate_record(ids, shingle_size: int = 8,
+                          max_shingles: int = _NEAR_DUP_MAX_SHINGLES) -> dict:
+    """Compact near-duplicate sketch of one document's token stream.
+
+    At most `max_shingles` bottom-hash shingles are used, so a very long
+    document cannot make the audit quadratic in its length.  The full count is
+    still reported alongside the number actually sketched.
+    """
+    shingles = token_shingles(ids, shingle_size)
+    total_shingles = len(shingles)
+    limit = int(max_shingles)
+    if limit < 1:
+        raise ValueError(f"max_shingles must be >= 1, got {max_shingles}")
+    if total_shingles > limit:
+        values = np.fromiter(shingles, dtype=np.uint64, count=total_shingles)
+        values = np.partition(values, limit - 1)[:limit]
+        shingles = set(int(v) for v in values)
+    return {
+        "signature": minhash_signature(shingles),
+        "n_tokens": len(ids),
+        "n_shingles": total_shingles,
+        "n_shingles_sketched": len(shingles),
+    }
+
+
+def _band_key(signature, band: int):
+    start = band * _NEAR_DUP_ROWS
+    return (band,) + tuple(signature[start:start + _NEAR_DUP_ROWS])
+
+
+def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
+                           margin: float = 0.05, shingle_size: int = 8,
+                           max_examples: int = 20,
+                           exhaustive_by_split: dict | None = None,
+                           truncated_by_split: dict | None = None) -> dict:
+    """Find held-out documents whose shingle sets overlap an earlier split.
+
+    A document is compared only with documents from an earlier split (train
+    before validation/test, validation before test), so a flagged pair is
+    genuinely cross-split.  LSH bands generate candidates cheaply; the
+    MinHash signature then estimates Jaccard similarity, which is what the
+    threshold is applied to.  The estimate has a standard error of roughly
+    `sqrt(J*(1-J)/240)` (about 0.026 at J=0.8), so a value just below the
+    threshold is not proof of independence - it is a reason to inspect the
+    corpus, not a certificate.
+    """
+    if not (0.0 < float(threshold) <= 1.0):
+        raise ValueError(f"near-duplicate threshold must be in (0, 1], got {threshold}")
+    margin = float(margin)
+    if not (math.isfinite(margin) and 0.0 <= margin < 1.0):
+        raise ValueError(f"near-duplicate margin must be in [0, 1), got {margin}")
+    screening = max(0.0, float(threshold) - margin)
+    ordered = [name for name in ("train", "validation", "test")
+               if records_by_split.get(name)]
+    exhaustive_by_split = exhaustive_by_split or {}
+    truncated_by_split = truncated_by_split or {}
+    pairs = {}
+    problems = []
+    notes = []
+    any_truncated = any(bool(truncated_by_split.get(name)) for name in ordered)
+    any_sampled = any(not bool(exhaustive_by_split.get(name, True)) for name in ordered)
+    for i, earlier in enumerate(ordered):
+        earlier_records = records_by_split[earlier]
+        if not earlier_records:
+            continue
+        earlier_sigs = np.asarray([r["signature"] for r in earlier_records],
+                                  dtype=np.uint64)
+        index: dict = {}
+        for doc_i, signature in enumerate(earlier_records):
+            for band in range(_NEAR_DUP_BANDS):
+                index.setdefault(_band_key(signature["signature"], band), []).append(doc_i)
+        for later in ordered[i + 1:]:
+            later_records = records_by_split[later]
+            if not later_records:
+                continue
+            n_pairs = 0
+            flagged_docs = set()
+            candidate_pairs = 0
+            examples = []
+            borderline_pairs = 0
+            borderline_docs = set()
+            borderline_examples = []
+            for later_i, later_record in enumerate(later_records):
+                candidates = set()
+                for band in range(_NEAR_DUP_BANDS):
+                    candidates.update(index.get(
+                        _band_key(later_record["signature"], band), ()))
+                if not candidates:
+                    continue
+                candidate_pairs += len(candidates)
+                candidate_ids = np.fromiter(sorted(candidates), dtype=np.int64,
+                                            count=len(candidates))
+                sims = (earlier_sigs[candidate_ids]
+                        == np.asarray(later_record["signature"], dtype=np.uint64)).mean(axis=1)
+                hits = np.flatnonzero(sims >= float(threshold))
+                borderline = np.flatnonzero((sims >= screening)
+                                            & (sims < float(threshold)))
+                if borderline.size:
+                    borderline_pairs += int(borderline.size)
+                    borderline_docs.add(later_i)
+                    if len(borderline_examples) < max_examples:
+                        best = int(borderline[int(np.argmax(sims[borderline]))])
+                        earlier_i = int(candidate_ids[best])
+                        borderline_examples.append({
+                            "earlier_document_index": int(earlier_records[earlier_i]["doc_index"]),
+                            "later_document_index": int(later_record["doc_index"]),
+                            "estimated_jaccard": round(float(sims[best]), 4),
+                        })
+                if not hits.size:
+                    continue
+                n_pairs += int(hits.size)
+                flagged_docs.add(later_i)
+                if len(examples) < max_examples:
+                    best = int(hits[int(np.argmax(sims[hits]))])
+                    earlier_i = int(candidate_ids[best])
+                    examples.append({
+                        "earlier_split": earlier,
+                        "later_split": later,
+                        "earlier_document_index": int(earlier_records[earlier_i]["doc_index"]),
+                        "later_document_index": int(later_record["doc_index"]),
+                        "estimated_jaccard": round(float(sims[best]), 4),
+                        "earlier_n_tokens": int(earlier_records[earlier_i]["n_tokens"]),
+                        "later_n_tokens": int(later_record["n_tokens"]),
+                    })
+            key = f"{earlier}->{later}"
+            pairs[key] = {
+                "earlier_split": earlier,
+                "later_split": later,
+                "earlier_documents": len(earlier_records),
+                "later_documents": len(later_records),
+                "candidate_pairs": int(candidate_pairs),
+                "flagged_pairs": int(n_pairs),
+                "flagged_later_documents": len(flagged_docs),
+                "borderline_pairs": int(borderline_pairs),
+                "borderline_later_documents": len(borderline_docs),
+                "borderline_examples": borderline_examples,
+                "examples": examples,
+            }
+            if n_pairs:
+                problems.append(
+                    f"near-duplicate documents cross {key}: {len(flagged_docs)} later "
+                    f"document(s) have a token-shingle Jaccard estimate >= {threshold} "
+                    f"with an earlier split ({n_pairs} matching pair(s)); exact/canonical "
+                    "hash dedup cannot catch this overlap")
+    n_borderline = sum(pair["borderline_pairs"] for pair in pairs.values())
+    if n_borderline:
+        notes.append(
+            f"{n_borderline} cross-split pair(s) are within {margin:g} Jaccard of the "
+            f"{threshold:g} threshold (screening >= {screening:g}); they are reported "
+            "for inspection but are not counted as confirmed near-duplicate failures")
+    truncated = any_truncated or any_sampled
+    if truncated:
+        found = any(pair["flagged_pairs"] for pair in pairs.values())
+        notes.append(
+            "the near-duplicate scan covered a sampled/truncated prefix (or fewer than "
+            "the requested documents), so "
+            + ("the flagged-pair count is a lower bound; more contaminated pairs may "
+               "exist beyond the prefix" if found else
+               "zero flagged pairs is a lower bound, not proof that the splits are "
+               "near-duplicate free"))
+    return {
+        "enabled": True,
+        "threshold_jaccard": float(threshold),
+        "borderline_margin": margin,
+        "screening_jaccard": screening,
+        "estimator": "minhash_lsh",
+        "permutations": _NEAR_DUP_PERMUTATIONS,
+        "bands": _NEAR_DUP_BANDS,
+        "rows_per_band": _NEAR_DUP_ROWS,
+        "shingle_size": int(shingle_size),
+        "pairs": pairs,
+        "problems": problems,
+        "notes": notes,
+        "exhaustive": not truncated,
+        "lower_bound": bool(truncated),
+    }
+
+
+def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, known_hashes_exhaustive=True, known_hashes_extra_exhaustive=True, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, known_groups_exhaustive=True, known_groups_extra_exhaustive=True, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None, near_dup=False, near_dup_shingle=8, near_dup_max_docs=4000, near_dup_max_shingles=_NEAR_DUP_MAX_SHINGLES):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     # The pipeline checks the cross-split group/document ledgers *before* the
@@ -75,8 +369,29 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars,
         exclude_hashes=exclude_hashes, group_key=group_key,
         exclude_group_hashes=exclude_group_hashes)
-    # One machine-word int per document.
+    # One machine-word int per document. `lengths` is the pre-ledger (raw)
+    # view; `effective_lengths` is what the run actually consumes and is what
+    # the held-out token-budget estimate is based on.
     lengths = array('q')
+    effective_lengths = array('q')
+    near_records: list = []
+    near_dup_docs_seen = 0
+    near_dup_truncated = False
+
+    def _record_near_dup(doc_index, ids) -> None:
+        nonlocal near_dup_docs_seen, near_dup_truncated
+        near_dup_docs_seen += 1
+        if near_dup_docs_seen > int(near_dup_max_docs):
+            near_dup_truncated = True
+            return
+        if not ids:
+            # A tokenizer that emits no tokens for a document leaves no
+            # shingle to compare; an all-max signature would make every such
+            # document look identical to every other one.
+            return
+        record = near_duplicate_record(ids, near_dup_shingle, near_dup_max_shingles)
+        record['doc_index'] = int(doc_index)
+        near_records.append(record)
     # Token ids are counted per document with `np.bincount`; a per-document
     # fallback keeps one bad document from losing the whole batch. Ids that
     # cannot go through bincount (negative) use the Python-counter path.
@@ -133,7 +448,10 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             enc = tokenizer(texts, add_special_tokens=False)['input_ids']
         except Exception:
             enc = None
-        if enc is None:
+        # A batch tokenizer that returns a different number of rows cannot be
+        # aligned to the documents; fall back to one call per document rather
+        # than silently sketching/counting the wrong document.
+        if enc is None or len(enc) != len(batch):
             for doc_index, text in batch:
                 try:
                     ids = tokenizer(text, add_special_tokens=False)['input_ids']
@@ -144,9 +462,13 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
                     tokenizer_error_docs.add(doc_index)
                     continue
                 _add_ids(ids, which)
+                if which == 'effective' and near_dup:
+                    _record_near_dup(doc_index, ids)
         else:
-            for ids in enc:
+            for (doc_index, _), ids in zip(batch, enc):
                 _add_ids(ids, which)
+                if which == 'effective' and near_dup:
+                    _record_near_dup(doc_index, ids)
         batch.clear()
 
     capped = False
@@ -191,6 +513,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
                         group_overlap_extra_groups.add(gh)
             text_batch.append((doc_index, text))
         if effective_text is not None:
+            effective_lengths.append(len(effective_text))
             if collect_hashes:
                 # Both digests, so a held-out formatting variant of a training
                 # document is caught by the ledger the same way the cleaner
@@ -282,6 +605,17 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         stats['doc_chars_mean'] = stats['doc_chars_min'] = stats['doc_chars_max'] = None
         stats['doc_chars_q1'] = stats['doc_chars_q3'] = None
         stats['length_outliers_3iqr'] = None
+    stats['tokens_total'] = int(sum(tokens.values()))
+    stats['tokens_total_effective'] = int(sum(tokens_effective.values()))
+    stats['chars_total'] = int(sum(lengths))
+    stats['chars_total_effective'] = int(sum(effective_lengths))
+    stats['tokens_per_char_effective'] = (
+        stats['tokens_total_effective'] / stats['chars_total_effective']
+        if stats['chars_total_effective'] else None)
+    effective_documents = len(effective_lengths)
+    stats['tokens_per_document_effective'] = (
+        stats['tokens_total_effective'] / effective_documents
+        if effective_documents else None)
     stats['tokenizer_errors'] = len(tokenizer_error_docs)
     vocab_limit = getattr(tokenizer, 'vocab_size', 2 ** 31)
     stats['token_ids_out_of_range'] = sum(c for t, c in tokens.items() if not 0 <= t < vocab_limit)
@@ -290,7 +624,17 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stats['distinct_token_ids'] = len(tokens)
     stats['distinct_token_ids_effective'] = len(tokens_effective)
     stats['finite_lengths'] = bool(all(math.isfinite(v) for v in (stats['doc_chars_mean'] or 0.0, stats['doc_chars_min'] or 0.0, stats['doc_chars_max'] or 0.0)))
-    return stats, tokens, report, hashes, lengths, groups, tokens_effective
+    near_meta = {
+        'enabled': bool(near_dup),
+        'shingle_size': int(near_dup_shingle),
+        'documents_scanned': int(near_dup_docs_seen),
+        'documents_sketched': len(near_records),
+        'max_documents': int(near_dup_max_docs),
+        'max_shingles': int(near_dup_max_shingles),
+        'truncated': bool(near_dup_truncated),
+    }
+    return (stats, tokens, report, hashes, lengths, groups, tokens_effective,
+            near_records, near_meta)
 
 
 def _linear_quantile(ordered, q):
@@ -316,6 +660,81 @@ def length_fence(lengths) -> dict:
     q3 = _linear_quantile(ordered, 0.75)
     iqr = q3 - q1
     return {'q1': q1, 'q3': q3, 'lower': max(0, q1 - 3 * iqr), 'upper': q3 + 3 * iqr}
+
+
+def split_token_budget(stats: dict, report: dict) -> dict:
+    """Estimate how many *effective* held-out tokens one split really contains.
+
+    A loss/PPL estimate is only as precise as the number of independent tokens
+    behind it, but the split is placed by *document* fraction.  Document
+    lengths vary, the cleaner/ledgers remove a non-random subset, and a
+    bounded `--n-docs` sample is only a prefix - so the nominal `val_frac`
+    alone cannot tell a reviewer whether the held-out slice is large enough
+    for the claimed comparison.  When the split was fully read this is the
+    observed token count; otherwise the mean effective tokens per kept
+    document is extrapolated to the nominal split size and the basis is
+    recorded (never presented as an exact count).
+    """
+    sampled = int(stats.get('documents_sampled') or 0)
+    effective_documents = stats.get('effective_documents_kept')
+    if effective_documents is None:
+        effective_documents = stats.get('documents_kept', 0)
+    effective_documents = int(effective_documents or 0)
+    tokens = int(stats.get('tokens_total_effective') or 0)
+    nominal = report.get('count')
+    nominal = int(nominal) if isinstance(nominal, int) and not isinstance(nominal, bool) else None
+    result = {
+        'nominal_documents': nominal,
+        'documents_sampled': sampled,
+        'sampled_effective_documents': effective_documents,
+        'sampled_effective_tokens': tokens,
+        'estimated_effective_documents': None,
+        'estimated_effective_tokens': None,
+        'tokens_per_effective_document': None,
+        'basis': 'no_usable_documents',
+        'exhaustive': bool(stats.get('exhaustive', False)),
+    }
+    if sampled <= 0 or effective_documents <= 0 or tokens <= 0:
+        return result
+    mean_tokens = tokens / effective_documents
+    result['tokens_per_effective_document'] = mean_tokens
+    if result['exhaustive'] and (nominal is None or sampled >= nominal):
+        estimated_documents = float(effective_documents)
+        result['basis'] = 'observed'
+    elif nominal is not None:
+        estimated_documents = nominal * (effective_documents / sampled)
+        result['basis'] = 'extrapolated_from_sampled_prefix'
+    else:
+        estimated_documents = float(effective_documents)
+        result['basis'] = 'sampled_only'
+    result['estimated_effective_documents'] = estimated_documents
+    result['estimated_effective_tokens'] = mean_tokens * estimated_documents
+    return result
+
+
+def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
+    """Compare the planned training-token budget with the effective train split.
+
+    `train_gpt2.py` restarts its loader on `StopIteration`, which is the right
+    behaviour for an intentionally multi-epoch run but silently turns a
+    "trained on N unique tokens" claim into a repeated pass when the split is
+    smaller than the schedule.  The audit reports the coverage ratio and makes
+    the wrap explicit; `--fail-on-train-wrap` decides whether it is fatal.
+    """
+    scheduled = int(scheduled_tokens or 0)
+    estimated = None if budget is None else budget.get('estimated_effective_tokens')
+    result = {
+        'scheduled_tokens': scheduled or None,
+        'estimated_effective_tokens': estimated,
+        'basis': None if budget is None else budget.get('basis'),
+        'exhaustive': None if budget is None else budget.get('exhaustive'),
+        'wrap_expected': None,
+        'coverage_ratio': None,
+    }
+    if scheduled > 0 and estimated is not None:
+        result['coverage_ratio'] = estimated / scheduled
+        result['wrap_expected'] = estimated < scheduled
+    return result
 
 
 def _chronology_problems(reports: dict) -> list:
@@ -443,6 +862,16 @@ def main():
     p.add_argument('--max-tvd', type=float, default=None, help="fail (exit 1) when train-vs-validation token total-variation distance exceeds this")
     p.add_argument('--max-test-tvd', type=float, default=None, help="fail (exit 1) when train-vs-test token total-variation distance exceeds this; the test split backs the final reported number, so unchecked drift there changes what that number measures")
     p.add_argument('--max-val-test-tvd', type=float, default=None, help="fail (exit 1) when validation-vs-test token total-variation distance exceeds this; the model is selected on validation and reported on test, so drift between the two held-out slices makes the selected checkpoint a poorer fit for the number finally reported")
+    p.add_argument('--no-near-dup', dest='near_dup', action='store_false', help='disable the token-shingle MinHash near-duplicate scan (exact/canonical hash checks still run)')
+    p.add_argument('--near-dup-threshold', type=float, default=0.8, help='token-shingle Jaccard similarity at/above which a cross-split pair is reported as near-duplicate contamination (default 0.8)')
+    p.add_argument('--near-dup-margin', type=float, default=0.05, help='report pairs whose Jaccard estimate is within this margin below the threshold as borderline (default 0.05); they are not counted as failures')
+    p.add_argument('--near-dup-shingle', type=int, default=8, help='token n-gram size used by the near-duplicate MinHash sketch (default 8)')
+    p.add_argument('--near-dup-max-docs', type=int, default=4000, help='maximum documents sketched per split; the scan is then a prefix and reports itself as a lower bound (default 4000)')
+    p.add_argument('--near-dup-max-shingles', type=int, default=_NEAR_DUP_MAX_SHINGLES, help='bottom-k token shingles used per document (default %(default)s); bounds the sketch cost on very long documents')
+    p.add_argument('--min-eval-tokens', type=int, default=0, help='fail when the estimated effective tokens of validation or test fall below this floor (0 = report only); the estimate is exact when --n-docs 0, otherwise extrapolated from the sampled prefix')
+    p.add_argument('--min-eval-docs', type=int, default=0, help='fail when the estimated effective document count of validation or test falls below this floor (0 = report only)')
+    p.add_argument('--scheduled-train-tokens', type=int, default=0, help='planned unique training tokens (max_steps * batch_size * grad_accum * seq_len); when > 0, compare it with the estimated effective train-split budget so a silently recycled training stream is visible')
+    p.add_argument('--fail-on-train-wrap', action='store_true', help='fail the audit when the scheduled training tokens exceed the estimated effective train split (the loader would start a second pass over already-seen documents)')
     p.add_argument('--output', default='runs/data_audit.json')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this audit tests; recorded in the report and manifest so the result is auditable as a test of a claim rather than a fishing trip')
     args = p.parse_args()
@@ -467,6 +896,20 @@ def main():
                         ('--max-val-test-tvd', args.max_val_test_tvd)):
         if value is not None and (not math.isfinite(value) or value < 0.0):
             raise SystemExit(f'{flag} {value} must be finite and >= 0')
+    if not (math.isfinite(args.near_dup_threshold)
+            and 0.0 < args.near_dup_threshold <= 1.0):
+        raise SystemExit(f'--near-dup-threshold {args.near_dup_threshold} must be in (0, 1]')
+    if not (math.isfinite(args.near_dup_margin)
+            and 0.0 <= args.near_dup_margin < 1.0):
+        raise SystemExit(f'--near-dup-margin {args.near_dup_margin} must be in [0, 1)')
+    for flag, value, minimum in (('--near-dup-shingle', args.near_dup_shingle, 1),
+                                 ('--near-dup-max-docs', args.near_dup_max_docs, 1),
+                                 ('--near-dup-max-shingles', args.near_dup_max_shingles, 1),
+                                 ('--min-eval-tokens', args.min_eval_tokens, 0),
+                                 ('--min-eval-docs', args.min_eval_docs, 0),
+                                 ('--scheduled-train-tokens', args.scheduled_train_tokens, 0)):
+        if value < minimum:
+            raise SystemExit(f'{flag} {value} must be >= {minimum}')
     if (args.write_train_group_file or args.write_val_group_file) and not args.group_key:
         raise SystemExit('--write-*-group-file requires --group-key')
     try:
@@ -484,6 +927,8 @@ def main():
     effective_tokens = {}
     reports = {}
     lengths = {}
+    near_records = {}
+    near_meta = {}
     train_hashes = None
     val_hashes = None
     train_groups = None
@@ -515,7 +960,8 @@ def main():
             exclude_hashes = (set(train_hashes or ()) | set(val_hashes or ()))
             exclude_groups = ((set(train_groups or ()) | set(val_groups or ()))
                               if args.group_key else None)
-        stats, tok_counter, report, hashes, split_lengths, groups, tok_effective = _collect_split(
+        (stats, tok_counter, report, hashes, split_lengths, groups, tok_effective,
+         split_near_records, split_near_meta) = _collect_split(
             name, args.dataset, args.dataset_config, tokenizer, options,
             args.n_docs, args.min_doc_chars, args.max_doc_chars, args.dedup,
             known_hashes=train_hashes,
@@ -536,8 +982,14 @@ def main():
                                            if name == 'test' else True),
             collect_groups=(name in ('train', 'validation')),
             exclude_hashes=exclude_hashes,
-            exclude_group_hashes=exclude_groups)
+            exclude_group_hashes=exclude_groups,
+            near_dup=args.near_dup,
+            near_dup_shingle=args.near_dup_shingle,
+            near_dup_max_docs=args.near_dup_max_docs,
+            near_dup_max_shingles=args.near_dup_max_shingles)
         splits[name] = stats
+        near_records[name] = split_near_records
+        near_meta[name] = split_near_meta
         tokens[name] = tok_counter
         effective_tokens[name] = tok_effective
         reports[name] = report
@@ -611,9 +1063,46 @@ def main():
                      or splits['validation']['doc_chars_mean'] is None)
             else splits['validation']['doc_chars_mean'] - splits['train']['doc_chars_mean']),
     }
+    # Data-adequacy: how many effective held-out tokens actually back the
+    # validation/test numbers, and how many independent documents a selection
+    # pass can draw on.  `val_frac` alone is a document fraction, not a token
+    # budget, so it is reported separately for every held-out split.
+    token_budgets = {name: split_token_budget(splits[name], reports[name])
+                     for name in ('validation', 'test') if name in splits}
+    train_budget = (split_token_budget(splits['train'], reports['train'])
+                    if 'train' in splits else None)
+    scheduled_train_tokens = int(args.scheduled_train_tokens or 0)
+    train_wrap = train_wrap_status(train_budget, scheduled_train_tokens)
+    if args.near_dup:
+        near_dup_report = near_duplicate_leakage(
+            near_records, threshold=args.near_dup_threshold,
+            margin=args.near_dup_margin,
+            shingle_size=args.near_dup_shingle,
+            exhaustive_by_split={name: bool(splits[name].get('exhaustive'))
+                                 for name in active_splits},
+            truncated_by_split={name: bool(near_meta[name].get('truncated'))
+                                for name in active_splits})
+        near_dup_report['scan_by_split'] = near_meta
+    else:
+        near_dup_report = {
+            'enabled': False,
+            'threshold_jaccard': args.near_dup_threshold,
+            'borderline_margin': args.near_dup_margin,
+            'shingle_size': args.near_dup_shingle,
+            'pairs': {},
+            'problems': [],
+            'notes': ['the token-shingle near-duplicate scan was disabled by --no-near-dup'],
+            'exhaustive': False,
+            'lower_bound': False,
+            'scan_by_split': near_meta,
+        }
     out = {'options': vars(args), 'hypothesis': args.hypothesis, 'run_metadata': collect_run_metadata(),
            'split_reports': reports, 'split_chronology_problems': chronology,
            'cleaning_and_sanity': splits, 'distribution_shift': shift,
+           'held_out_token_budget': token_budgets,
+           'train_token_budget': train_budget,
+           'train_stream_wrap': train_wrap,
+           'near_duplicate_leakage': near_dup_report,
            'train_hash_ledger': train_ledger_info,
            'validation_hash_ledger': val_ledger_info,
            'train_group_ledger': train_group_ledger_info,
@@ -648,6 +1137,37 @@ def main():
     print(f"[audit] token TVD after ledgers train-vs-val={_fmt_tvd(shift['train_vs_validation_tvd_effective'])} "
           f"train-vs-test={_fmt_tvd(shift['train_vs_test_tvd_effective'])} "
           f"val-vs-test={_fmt_tvd(shift['validation_vs_test_tvd_effective'])}")
+    def _fmt_budget(value):
+        return 'n/a' if value is None else f'{value:.0f}'
+
+    if train_budget is not None:
+        print(f"[audit] train token budget: ~"
+              f"{_fmt_budget(train_budget['estimated_effective_tokens'])} effective tokens over ~"
+              f"{_fmt_budget(train_budget['estimated_effective_documents'])} documents "
+              f"({train_budget['basis']}; {train_budget['sampled_effective_tokens']} sampled)")
+        if train_wrap['wrap_expected']:
+            print(f"[audit] NOTE: the scheduled {scheduled_train_tokens} training tokens exceed "
+                  f"the estimated ~{_fmt_budget(train_wrap['estimated_effective_tokens'])} "
+                  f"effective train tokens (coverage {train_wrap['coverage_ratio']:.2f}x); "
+                  "the loader will start another pass and reuse documents, so the run is "
+                  "not a single-epoch token budget")
+    for name, budget in token_budgets.items():
+        print(f"[audit] {name} token budget: ~"
+              f"{_fmt_budget(budget['estimated_effective_tokens'])} effective tokens over ~"
+              f"{_fmt_budget(budget['estimated_effective_documents'])} documents "
+              f"({budget['basis']}; {budget['sampled_effective_tokens']} sampled)")
+    if near_dup_report['enabled']:
+        if near_dup_report['pairs']:
+            for key, pair in near_dup_report['pairs'].items():
+                print(f"[audit] near-dup {key}: {pair['flagged_later_documents']} later doc(s) "
+                      f"at Jaccard >= {near_dup_report['threshold_jaccard']} "
+                      f"({pair['candidate_pairs']} LSH candidate pair(s), "
+                      f"{pair['borderline_pairs']} borderline)")
+        else:
+            print(f"[audit] near-dup scan: no cross-split pair at Jaccard >= "
+                  f"{near_dup_report['threshold_jaccard']} in the sketched documents")
+        for note in near_dup_report['notes']:
+            print(f"[audit] NOTE: {note}")
     if args.hypothesis:
         print(f"[audit][hypothesis] {args.hypothesis}")
     print(f"[audit] saved to {args.output}")
@@ -759,6 +1279,40 @@ def main():
                 f"{label} distribution shift TVD={value:.4f} after the cross-split "
                 f"ledgers > {flag}={cap}; the effective held-out distribution is the "
                 "one the model is actually selected and reported on")
+    # Data adequacy: a held-out split can be perfectly disjoint and still be
+    # too small to select a checkpoint or to support the claimed test. Report
+    # the estimated effective token count and, when the caller sets a floor,
+    # fail instead of letting a tiny slice masquerade as a precise estimate.
+    for name, budget in token_budgets.items():
+        estimated_tokens = budget.get('estimated_effective_tokens')
+        estimated_docs = budget.get('estimated_effective_documents')
+        if estimated_tokens is not None and estimated_tokens < 100_000:
+            print(f"[audit] NOTE: {name} has only ~{estimated_tokens:.0f} effective tokens "
+                  f"({budget['basis']}); loss/PPL confidence intervals and paired tests "
+                  "over so few tokens will be wide, and a validation pass may revisit "
+                  "the same held-out batches")
+        if args.min_eval_tokens and (estimated_tokens is None
+                                     or estimated_tokens < args.min_eval_tokens):
+            problems.append(
+                f"{name} holds only ~"
+                f"{'0' if estimated_tokens is None else f'{estimated_tokens:.0f}'} estimated "
+                f"effective tokens, below --min-eval-tokens={args.min_eval_tokens} "
+                f"({budget['basis']}); the held-out estimate is too small to support "
+                "the comparison")
+        if args.min_eval_docs and (estimated_docs is None
+                                   or estimated_docs < args.min_eval_docs):
+            problems.append(
+                f"{name} holds only ~"
+                f"{'0' if estimated_docs is None else f'{estimated_docs:.0f}'} estimated "
+                f"effective documents, below --min-eval-docs={args.min_eval_docs} "
+                f"({budget['basis']})")
+    if args.fail_on_train_wrap and train_wrap['wrap_expected']:
+        problems.append(
+            f"the scheduled {scheduled_train_tokens} training tokens exceed the estimated "
+            f"~{train_wrap['estimated_effective_tokens']:.0f} effective train tokens "
+            f"(coverage {train_wrap['coverage_ratio']:.2f}x); the training loader would "
+            "reuse documents in a second pass instead of consuming unique data")
+    problems.extend(near_dup_report.get('problems') or [])
     # The report itself must carry the verdict. It was written before the
     # leakage/sanity checks ran, so a failed audit's data_audit.json used to
     # look like a clean report with no problems while only the separate
@@ -774,6 +1328,10 @@ def main():
         'tokenizer': args.tokenizer,
         'options': vars(args),
         'split_reports': reports,
+        'held_out_token_budget': token_budgets,
+        'train_token_budget': train_budget,
+        'train_stream_wrap': train_wrap,
+        'near_duplicate_leakage': near_dup_report,
         'train_hash_ledger': train_ledger_info,
         'validation_hash_ledger': val_ledger_info,
         'train_group_ledger': train_group_ledger_info,

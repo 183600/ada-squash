@@ -118,13 +118,111 @@ DEFAULT_DATA_OPTIONS = {
 _active_data_options = dict(DEFAULT_DATA_OPTIONS)
 
 
+def _int_option(name: str, value, minimum: int, *, allow_none: bool = False):
+    """Validate an integer-valued data option without silently coercing it.
+
+    A negative `max_doc_chars`, for example, is truthy in `DocumentCleaner`
+    and drops *every* document; an integer conversion plus a lower bound turns
+    that silent data loss into a configuration error.
+    """
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"data option {name} must be an integer, got bool {value!r}")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"data option {name} must be an integer, got {value!r}") from None
+    if converted != value:
+        raise ValueError(f"data option {name} must be an integer, got {value!r}")
+    if converted < minimum:
+        raise ValueError(f"data option {name}={converted} must be >= {minimum}")
+    return converted
+
+
+def _fraction_option(name: str, value) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"data option {name} must be a fraction, got {value!r}")
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"data option {name} must be a fraction, got {value!r}") from None
+    if not math.isfinite(converted) or not 0.0 <= converted < 1.0:
+        raise ValueError(f"data option {name}={converted} must be finite and in [0, 1)")
+    return converted
+
+
+def validate_data_options(options: dict | None = None) -> dict:
+    """Return a validated copy of the split / cleaning options.
+
+    The training and evaluation scripts validate their command-line flags, but
+    `configure_data_options` is also a public entry point used by probes and
+    tests.  Validating here means a probe cannot run with, say, a zero
+    `dedup_max` (silently disabling deduplication) or `min_doc_chars` larger
+    than `max_doc_chars` (no document can pass the cleaner) while still writing
+    a manifest that looks like a normal leakage-safe run.
+    """
+    opts = dict(DEFAULT_DATA_OPTIONS)
+    if options:
+        opts.update(options)
+    unknown = sorted(set(opts) - set(DEFAULT_DATA_OPTIONS))
+    if unknown:
+        raise KeyError(f"unknown data-pipeline option(s): {unknown}")
+    split = opts.get("split")
+    if split not in ("train", "validation", "test"):
+        raise ValueError(f"data option split must be train/validation/test, got {split!r}")
+    opts["val_frac"] = _fraction_option("val_frac", opts.get("val_frac"))
+    opts["test_frac"] = _fraction_option("test_frac", opts.get("test_frac"))
+    if opts["val_frac"] + opts["test_frac"] >= 1.0:
+        raise ValueError(
+            f"data options val_frac={opts['val_frac']} + test_frac={opts['test_frac']} "
+            "leave no training documents; the split fractions must sum to less than 1")
+    opts["num_documents"] = _int_option(
+        "num_documents", opts.get("num_documents"), 1, allow_none=True)
+    opts["dedup"] = bool(opts.get("dedup"))
+    opts["dedup_max"] = _int_option("dedup_max", opts.get("dedup_max"), 1)
+    opts["min_doc_chars"] = _int_option("min_doc_chars", opts.get("min_doc_chars"), 0)
+    opts["max_doc_chars"] = _int_option("max_doc_chars", opts.get("max_doc_chars"), 0)
+    if opts["max_doc_chars"] and opts["min_doc_chars"] > opts["max_doc_chars"]:
+        raise ValueError(
+            f"data options min_doc_chars={opts['min_doc_chars']} exceeds "
+            f"max_doc_chars={opts['max_doc_chars']}; no document could pass the cleaner")
+    opts["shuffle_buffer"] = _int_option("shuffle_buffer", opts.get("shuffle_buffer"), 0)
+    opts["seed"] = _int_option("seed", opts.get("seed"), -(2 ** 63))
+    opts["num_workers"] = _int_option("num_workers", opts.get("num_workers"), 0)
+    opts["prefetch_factor"] = _int_option("prefetch_factor", opts.get("prefetch_factor"), 1)
+    opts["persistent_workers"] = bool(opts.get("persistent_workers"))
+    for name in ("dataset_revision", "tokenizer_revision"):
+        value = opts.get(name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"data option {name} must be a string or None, got {value!r}")
+    group_key = opts.get("group_key")
+    if group_key is not None and (not isinstance(group_key, str) or not group_key.strip()):
+        raise ValueError(f"data option group_key must be a non-empty string or None, got {group_key!r}")
+    opts["group_key"] = group_key.strip() if isinstance(group_key, str) else None
+    for name in ("exclude_hash_file", "exclude_test_hash_file",
+                 "exclude_group_file", "exclude_test_group_file"):
+        value = opts.get(name)
+        if value is not None and not isinstance(value, (str, os.PathLike)):
+            raise ValueError(f"data option {name} must be a path or None, got {value!r}")
+    return opts
+
+
 def configure_data_options(**overrides) -> dict:
-    """Set the split / cleaning options used by the next `build_dataloader`."""
+    """Set the split / cleaning options used by the next `build_dataloader`.
+
+    The candidate state is validated before it is committed, so a rejected
+    call cannot leave the process in a half-updated configuration that a later
+    `build_dataloader` would silently consume.
+    """
     unknown = sorted(set(overrides) - set(DEFAULT_DATA_OPTIONS))
     if unknown:
         raise KeyError(f"unknown data-pipeline option(s): {unknown}")
-    for key, value in overrides.items():
-        _active_data_options[key] = value
+    candidate = dict(_active_data_options)
+    candidate.update(overrides)
+    validated = validate_data_options(candidate)
+    _active_data_options.clear()
+    _active_data_options.update(validated)
     return dict(_active_data_options)
 
 
@@ -1046,7 +1144,7 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     both the request and the resolved hash are copied into the split report
     (data-version tracking), the latter also keying the held-out cache.
     """
-    opts = get_data_options()
+    opts = validate_data_options(get_data_options())
     if (opts.get("exclude_group_file") or opts.get("exclude_test_group_file")) and not opts.get("group_key"):
         # Without the key the pipeline cannot extract a group value, so the
         # supplied ledger would be silently ignored and the held-out splits
@@ -1219,4 +1317,5 @@ __all__ = [
     "resolve_tokenizer_revision",
     "select_stream_split",
     "split_document_boundaries",
+    "validate_data_options",
 ]
