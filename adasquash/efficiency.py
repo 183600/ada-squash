@@ -246,6 +246,11 @@ def efficiency_verdict(
     if loss_improvement is None or cost_ratio is None:
         verdict["reason"] = "missing loss or cost measurement; nothing to judge"
         return verdict
+    if isinstance(loss_improvement, bool) or isinstance(cost_ratio, bool):
+        verdict["reason"] = (
+            "loss improvement/cost ratio is a boolean, not a measurement; "
+            "nothing to certify")
+        return verdict
     gain = float(loss_improvement)
     cost = float(cost_ratio)
     if not math.isfinite(gain):
@@ -333,6 +338,15 @@ def efficiency_verdict(
                 f"{cost_name} cost")
         verdict["component_failures"].append(failure)
     for name, raw_ratio in (cost_components or {}).items():
+        if isinstance(raw_ratio, bool):
+            verdict["component_costs"][str(name)] = {
+                "ratio": None,
+                "acceptable": False,
+            }
+            verdict["component_failures"].append(
+                f"{name} ratio {raw_ratio!r} is a boolean, not a finite "
+                "non-negative measurement")
+            continue
         if raw_ratio is None:
             verdict["component_costs"][str(name)] = {
                 "ratio": None,
