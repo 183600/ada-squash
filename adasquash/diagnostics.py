@@ -500,6 +500,11 @@ def tensor_finite_report(t: torch.Tensor) -> dict:
 
 def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
     vocab_size = int(getattr(getattr(model, "cfg", None), "vocab_size", 0) or 0)
+    # A wrapper/test double may not expose a vocabulary size. Absence of a
+    # known vocabulary is *unknown*, not a vocabulary of zero: treating every
+    # non-negative token as out of range would misroute every valid batch to
+    # the data stage before the model is ever evaluated.
+    known_vocab = vocab_size > 0
     ignore_index = int(getattr(getattr(model, "cfg", None), "ignore_index", -100))
     x_report = tensor_finite_report(x)
     y_report = tensor_finite_report(y)
@@ -514,10 +519,10 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
     input_integer_ids = _integer_ids(x)
     target_integer_ids = _integer_ids(y)
     targets_valid = target_integer_ids
-    if y.numel() and target_integer_ids:
+    if y.numel() and target_integer_ids and known_vocab:
         in_range = (y == ignore_index) | ((y >= 0) & (y < vocab_size))
         targets_valid = bool(in_range.all().item())
-    if x.numel() and input_integer_ids:
+    if x.numel() and input_integer_ids and known_vocab:
         tokens_valid = bool(((x >= 0) & (x < vocab_size)).all().item())
     else:
         tokens_valid = input_integer_ids
