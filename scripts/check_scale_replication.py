@@ -78,7 +78,10 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
     return {
         'scale': entry.get('a_scale') or entry.get('scale') or 'unknown',
         'metric': entry.get('metric') or metric or 'default',
-        'contrast': f'{a} vs {b}',
+        # The delta below is always candidate - reference (reversed pairs are
+        # sign-flipped), so the contrast label must use that same orientation.
+        'contrast': (f'{a} vs {b}' if orientation == 'candidate_vs_reference'
+                     else f'{b} vs {a}'),
         'delta': delta,
         # A reversed pair tests the opposite one-sided hypothesis; keep it as a
         # descriptive sign observation but never inherit its certification.
@@ -117,7 +120,10 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
         out.append({
             'scale': row.get('scale') or data.get('scale') or 'unknown',
             'metric': row.get('metric') or metric or 'default',
-            'contrast': f"{row.get('norm')} vs {row.get('reference')}",
+            # Same canonical orientation as the sign-flipped delta.
+            'contrast': (f"{row.get('norm')} vs {row.get('reference')}"
+                         if orientation == 'candidate_vs_reference'
+                         else f"{row.get('reference')} vs {row.get('norm')}"),
             'delta': delta,
             'certified': (bool(row.get('beats_reference_significantly'))
                           if orientation == 'candidate_vs_reference' else False),
