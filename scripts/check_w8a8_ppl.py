@@ -616,16 +616,30 @@ def main():
             # Snapshot the fp32 weights on the host before the in-place
             # quantizer runs; each seed needs them back.
             fp_state = {k: t.detach().to('cpu', copy=True) for k, t in model.state_dict().items()}
+            # The dataset split is read unshuffled, so a loader restarted for
+            # every seed would score the identical first N batches and report
+            # zero probe variance. Draw one non-overlapping block per seed
+            # from the same deterministic probe stream instead; the block for
+            # a given seed is identical across checkpoints, which keeps the
+            # cross-arm pairing intact.
+            dataset_probe_batches = None
+            if dataset_probe is not None:
+                dataset_probe_batches = [
+                    dataset_probe() for _ in range(args.n_batches * len(seeds))]
             per_seed = []
-            for seed in seeds:
+            for seed_index, seed in enumerate(seeds):
                 _unwrap_w8a8(model)
                 model.load_state_dict(fp_state)
                 model.eval()
                 rng = torch.Generator(device=device).manual_seed(seed)
                 batches = []
-                for _ in range(args.n_batches):
-                    x = make_probe(rng, model.cfg, dataset_probe)
-                    batches.append(x)
+                if dataset_probe_batches is not None:
+                    start = seed_index * args.n_batches
+                    batches = list(dataset_probe_batches[start:start + args.n_batches])
+                else:
+                    for _ in range(args.n_batches):
+                        x = make_probe(rng, model.cfg, dataset_probe)
+                        batches.append(x)
                 # The targets are a pure function of the probe; build them once
                 # and reuse them for the fp32 and the W8A8 pass.
                 pairs = []
@@ -757,6 +771,8 @@ def main():
         'probe': args.probe,
         'probe_split': args.probe_split if args.probe == 'dataset' else None,
         'probe_loader_seed': seeds[0],
+        'probe_slice_batches': (args.n_batches if args.probe == 'dataset' else None),
+        'probe_slice_seeds': (list(seeds) if args.probe == 'dataset' else None),
         'num_workers': args.num_workers,
         'split_reports': dataset_probe_reports,
     }
