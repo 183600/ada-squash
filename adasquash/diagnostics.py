@@ -575,10 +575,13 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
 
     input_integer_ids = _integer_ids(x)
     target_integer_ids = _integer_ids(y)
-    # `nn.Embedding` accepts the narrower integer ids, but cross-entropy only
-    # accepts Long/Byte targets. An int32/int16 target is a data-pipeline
-    # dtype bug: without this check the later forward raises and the ordered
-    # triage misclassifies it as an fp32-math failure.
+    # `nn.Embedding` accepts Long and Int input ids only; int16/int8/uint8
+    # tensors are integer-valued but raise inside the embedding lookup. Without
+    # this check the later forward raises and the ordered triage misclassifies
+    # the bad data as an fp32-math failure.
+    input_dtype_ok = x.dtype in (torch.int64, torch.int32)
+    # Cross-entropy accepts only Long/Byte targets. An int32/int16 target is a
+    # data-pipeline dtype bug for the same reason.
     target_dtype_ok = y.dtype in (torch.int64, torch.uint8)
     targets_valid = target_integer_ids and target_dtype_ok
     if y.numel() and target_integer_ids and target_dtype_ok:
@@ -588,7 +591,7 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
         if known_vocab:
             in_range = in_range & (y < vocab_size)
         targets_valid = bool(in_range.all().item())
-    if x.numel() and input_integer_ids:
+    if x.numel() and input_integer_ids and input_dtype_ok:
         # Embedding ids are never allowed to be negative. When the vocabulary
         # size is unknown the upper bound stays unchecked (the comment above
         # `known_vocab`), but a negative id is still a data-stage failure.
@@ -597,13 +600,14 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
             in_range = in_range & (x < vocab_size)
         tokens_valid = bool(in_range.all().item())
     else:
-        tokens_valid = input_integer_ids
+        tokens_valid = input_integer_ids and input_dtype_ok
     mask_count = int((y != ignore_index).sum().item()) if target_integer_ids and y.numel() else 0
     return {
         "input": x_report,
         "targets": y_report,
         "vocab_size": vocab_size,
         "input_integer_ids": bool(input_integer_ids),
+        "input_dtype_valid": bool(input_dtype_ok),
         "target_integer_ids": bool(target_integer_ids),
         "target_dtype_valid": bool(target_dtype_ok),
         "targets_valid": bool(targets_valid),
@@ -811,6 +815,7 @@ def classify_nan_stage(evidence: dict) -> dict:
             or evidence.get("loss_denominator_positive") is False
             or evidence.get("loss_mask_nonempty") is False):
         dtype_bad = (evidence.get("input_integer_ids") is False
+                     or evidence.get("input_dtype_valid") is False
                      or evidence.get("target_integer_ids") is False
                      or evidence.get("target_dtype_valid") is False)
         if (evidence.get("target_integer_ids") is True
@@ -818,6 +823,11 @@ def classify_nan_stage(evidence: dict) -> dict:
             diagnosis = ("the targets are an integer tensor but not Long/Byte, "
                          "which cross-entropy requires (cast the targets at the "
                          "data-pipeline boundary)")
+        elif (evidence.get("input_integer_ids") is True
+                and evidence.get("input_dtype_valid") is False):
+            diagnosis = ("the input token ids are an integer tensor but not "
+                         "Long/Int, which nn.Embedding requires (cast input_ids "
+                         "to int64 at the data-pipeline boundary)")
         elif dtype_bad:
             diagnosis = ("the batch's token ids/targets are not an integer dtype "
                          "(floating or boolean tensors cannot index an embedding "
