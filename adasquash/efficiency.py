@@ -50,6 +50,34 @@ _T95 = (
 )
 
 
+def _positive_int(value, name: str) -> int:
+    """A positive integer geometry field without truncating/coercing it."""
+    if _is_boolean_value(value) or value is None:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from None
+    if converted != value:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if converted < 1:
+        raise ValueError(f"{name} must be >= 1, got {converted}")
+    return converted
+
+
+def _positive_real(value, name: str) -> float:
+    """A finite strictly-positive real (a ratio/scale, not a count)."""
+    if _is_boolean_value(value) or value is None:
+        raise ValueError(f"{name} must be a positive number, got {value!r}")
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a positive number, got {value!r}") from None
+    if not math.isfinite(converted) or converted <= 0.0:
+        raise ValueError(f"{name} must be finite and > 0, got {value!r}")
+    return converted
+
+
 def _t_critical_95(df: int) -> float:
     if df <= 0:
         return float("inf")
@@ -60,6 +88,8 @@ def _t_critical_95(df: int) -> float:
 
 def mlp_hidden_size(dim: int, mlp_ratio: float) -> int:
     """Hidden width of the SwiGLU MLP, exactly as `model.MLP` computes it."""
+    dim = _positive_int(dim, "dim")
+    mlp_ratio = _positive_real(mlp_ratio, "mlp_ratio")
     hidden = int(int(dim * mlp_ratio) * 2 / 3)
     return hidden + 7 & ~7
 
@@ -81,10 +111,10 @@ def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = 
     `backward=True` returns the training-step estimate: forward plus backward,
     with the multiplier used recorded as ``backward_factor``.
     """
-    d = int(cfg.dim)
-    n_layers = int(cfg.n_layers)
-    vocab = int(cfg.vocab_size)
-    h = mlp_hidden_size(d, float(cfg.mlp_ratio))
+    d = _positive_int(getattr(cfg, "dim", None), "cfg.dim")
+    n_layers = _positive_int(getattr(cfg, "n_layers", None), "cfg.n_layers")
+    vocab = _positive_int(getattr(cfg, "vocab_size", None), "cfg.vocab_size")
+    h = mlp_hidden_size(d, getattr(cfg, "mlp_ratio", None))
     # The default (`cfg.max_seq_len`) is the same kind of context length as an
     # explicit `seq_len`: a fractional/bool/negative table size cannot be
     # silently truncated or clamped to a different protocol. `None` means the
