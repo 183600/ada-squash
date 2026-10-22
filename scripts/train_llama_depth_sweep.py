@@ -134,8 +134,10 @@ def _is_commit_revision(value) -> bool:
 
 def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
     """Fields where a child manifest disagrees with this sweep invocation."""
-    recorded = manifest.get('hyperparameters') or {}
-    results = manifest.get('results') or {}
+    recorded = manifest.get('hyperparameters')
+    recorded = recorded if isinstance(recorded, dict) else {}
+    results = manifest.get('results')
+    results = results if isinstance(results, dict) else {}
     missing = object()
     mismatches = {}
     for key, wanted in expected['hyperparameters'].items():
@@ -274,7 +276,17 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                     reject_reason = ('recorded recipe/shape differs from this sweep: '
                                      + json.dumps(mismatches, sort_keys=True))
         if reject_reason is None and isinstance(manifest, dict):
-            step_results = manifest.get('results') or {}
+            raw_results = manifest.get('results')
+            if raw_results is not None and not isinstance(raw_results, dict):
+                # A truthy non-object results block (list/str/number) is a
+                # malformed manifest, not an empty one: reject it before any
+                # `.get()` touches it, so the cell is never aggregated or
+                # crashed on with a traceback.
+                reject_reason = (
+                    'run_manifest.json results block is '
+                    f'{type(raw_results).__name__}, not an object; the '
+                    'fixed-step comparison cannot be certified')
+            step_results = raw_results if isinstance(raw_results, dict) else {}
             # `final_val_loss` is only comparable at the fixed final step.
             # A value from an earlier validation pass (e.g. max_steps=1200
             # with val_every=500 ends at final_val_step=1000) would be
@@ -321,7 +333,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                              'reason': reject_reason})
         elif isinstance(manifest, dict):
             data_version = _manifest_data_version(manifest)
-            results = manifest.get('results') or {}
+            raw_results = manifest.get('results')
+            results = raw_results if isinstance(raw_results, dict) else {}
             best = results.get('best_val_loss')
             final = results.get('final_val_loss')
             # Curve, parameter and FLOPs accounting already travel in
