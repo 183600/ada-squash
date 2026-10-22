@@ -819,8 +819,17 @@ def scale_replication_summary(observations: Sequence[dict],
         if not scale:
             excluded.append({'index': index, 'reason': 'missing scale'})
             continue
-        if not (isinstance(delta, (int, float)) and not isinstance(delta, bool)
-                and math.isfinite(float(delta))):
+        if isinstance(delta, bool) or delta is None:
+            excluded.append({'index': index, 'scale': scale, 'metric': metric,
+                             'reason': f'non-finite delta {delta!r}'})
+            continue
+        try:
+            delta_value = float(delta)
+        except (TypeError, ValueError, OverflowError):
+            excluded.append({'index': index, 'scale': scale, 'metric': metric,
+                             'reason': f'non-finite delta {delta!r}'})
+            continue
+        if not math.isfinite(delta_value):
             excluded.append({'index': index, 'scale': scale, 'metric': metric,
                              'reason': f'non-finite delta {delta!r}'})
             continue
@@ -829,7 +838,7 @@ def scale_replication_summary(observations: Sequence[dict],
             'scale': scale,
             'metric': metric,
             'contrast': contrast or None,
-            'delta': float(delta),
+            'delta': delta_value,
             'certified': bool(obs.get('certified')),
             'n_seeds': obs.get('n_seeds'),
             'p': obs.get('p_one_sided', obs.get('p')),
