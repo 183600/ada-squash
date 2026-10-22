@@ -174,8 +174,16 @@ class KurtosisMeter:
 
     def result(self) -> float:
         self._flush()
-        if self.n < 2:
+        if self.n == 0:
+            # No observation at all is the empty aggregate, not a sample whose
+            # spread is zero.
             return 0.0
+        if self.n < 2:
+            # A single observation has no sample variance, hence no
+            # standardized fourth moment. Reporting 0.0 here would label a
+            # one-element activation as exactly Gaussian, the same masking the
+            # constant/non-finite branch below avoids.
+            return float('nan')
         var = self.M2 / self.n
         # Excess kurtosis is scale-invariant. An absolute variance floor (the
         # old `var < 1e-12`) reports heavy-tailed but small-magnitude
