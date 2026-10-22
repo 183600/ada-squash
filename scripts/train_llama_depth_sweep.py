@@ -795,7 +795,7 @@ def cross_depth_trend_analysis(comparison: dict, alpha: float = 0.05) -> dict:
             depths = [float(row['depth']) for row in usable]
             doses = [math.log2(depth) for depth in depths]
             per_seed_values = {
-                str(seed): [float(row['per_seed_delta'][str(seed)])
+                str(seed): [float(row['per_seed_delta'][seed])
                             for row in usable]
                 for seed in sorted(common, key=_seed_sort_key)}
             trend = paired_trend_test(doses, per_seed_values, alpha=alpha)
