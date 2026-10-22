@@ -587,6 +587,51 @@ def _cell_seed_metric(cell: dict, metric: str) -> dict:
             out[int(item['seed'])] = float(value)
     return out
 
+def _cell_step_context(cell: dict):
+    """The fixed training/validation step a cell's losses were measured at.
+
+    Returns ``(final_step, final_val_step)`` when every seed agrees, ``'MIXED'``
+    when the cell itself contains different horizons, and ``None`` when the
+    step identity is not recorded (older/hand-built cells). A pair of cells is
+    only comparable at the fixed-step metric when both contexts are known and
+    equal; unknown stays unknown so older artifacts keep their historical
+    descriptive behavior, while an explicitly different horizon fails closed.
+    """
+    def _positive_int(value) -> bool:
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and value > 0)
+
+    # A cell-level context is enough when the per-seed records do not carry it
+    # (hand-built comparison fixtures); otherwise every seed must agree.
+    cell_step, cell_val_step = cell.get('final_step'), cell.get('final_val_step')
+    cell_context = None
+    if _positive_int(cell_step) and _positive_int(cell_val_step):
+        cell_context = (int(cell_step), int(cell_val_step))
+    per_seed = cell.get('per_seed')
+    if not isinstance(per_seed, list) or not per_seed:
+        return cell_context
+    contexts = set()
+    for item in per_seed:
+        if not isinstance(item, dict):
+            return None
+        step, val_step = item.get('final_step'), item.get('final_val_step')
+        if not _positive_int(step) or not _positive_int(val_step):
+            # If the cell-level context is available, seeds without their own
+            # fields do not contradict it; otherwise the horizon is unknown.
+            if cell_context is None:
+                return None
+            continue
+        contexts.add((int(step), int(val_step)))
+    if not contexts:
+        return cell_context
+    if len(contexts) != 1:
+        return 'MIXED'
+    context = next(iter(contexts))
+    if cell_context is not None and context != cell_context:
+        return 'MIXED'
+    return context
+
+
 def _seed_sort_key(value):
     try:
         return (0, int(value))
@@ -875,6 +920,9 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 'candidate_missing_seeds': None,
                 'reference_missing_seeds': None,
                 'complete': True,
+                'step_identity_consistent': None,
+                'candidate_step_context': None,
+                'reference_step_context': None,
                 # Each side's per-seed curve regimes, parameter count and
                 # FLOPs, so a delta is read next to the regime it was
                 # measured in.
@@ -916,11 +964,26 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
             requested = sorted(set(ref.get('seeds') or []) | set(by_norm[norm].get('seeds') or []))
             entry['candidate_missing_seeds'] = [s for s in requested if s not in cand_seeds]
             entry['reference_missing_seeds'] = [s for s in requested if s not in ref_seeds]
+            # `final_val_loss` is only a fixed-step estimate when both cells
+            # stopped at the same training step. `aggregate_sweep_cell`
+            # enforces that within a cell; the pair check has to happen here.
+            # An unknown horizon stays descriptive (older fixtures), while an
+            # explicit mismatch or an internally mixed cell fails closed.
+            cand_step_ctx = _cell_step_context(by_norm[norm])
+            ref_step_ctx = _cell_step_context(ref)
+            entry['candidate_step_context'] = cand_step_ctx
+            entry['reference_step_context'] = ref_step_ctx
+            if cand_step_ctx == 'MIXED' or ref_step_ctx == 'MIXED':
+                entry['step_identity_consistent'] = False
+            elif cand_step_ctx is not None and ref_step_ctx is not None:
+                entry['step_identity_consistent'] = bool(
+                    cand_step_ctx == ref_step_ctx)
             entry['complete'] = (
                 not entry['candidate_missing_seeds']
                 and not entry['reference_missing_seeds']
                 and ref.get('complete') is True
-                and by_norm[norm].get('complete') is True)
+                and by_norm[norm].get('complete') is True
+                and entry['step_identity_consistent'] is not False)
             if len(common) >= 2:
                 a = [cand_seeds[s] for s in common]
                 b = [ref_seeds[s] for s in common]
@@ -961,7 +1024,11 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 entry['complete'] and len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
                 and entry['cost_matched_within_25pct'] is True)
             if entry['p_one_sided'] is not None and not entry['certifiable']:
-                if entry['cost_matched_within_25pct'] is False:
+                if entry['step_identity_consistent'] is False:
+                    reason = ('the candidate and reference cells were not evaluated at the '
+                              'same final training step, so their final_val_loss values are '
+                              'different training horizons rather than one fixed-step delta')
+                elif entry['cost_matched_within_25pct'] is False:
                     reason = ('the params/FLOPs ratio exceeds the 25% match tolerance, so the '
                               'delta is confounded with cost')
                 elif entry['cost_matched_within_25pct'] is None:
