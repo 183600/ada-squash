@@ -221,8 +221,7 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     }
 
 
-_LATENCY_MEAN_KEYS = ('forward_latency_ms_per_token', 'training_latency_ms_per_token',
-                      'forward_tokens_per_second', 'training_tokens_per_second')
+_LATENCY_MEAN_KEYS = ('forward_latency_ms_per_token', 'training_latency_ms_per_token')
 
 
 def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
@@ -274,6 +273,16 @@ def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
                                      'forward_ms': r['forward_latency_ms'],
                                      'training_ms': r['training_latency_ms']}
                                     for r in norm_rows]
+        # Throughput is a derived rate: averaging per-round tokens/sec gives a
+        # different (and latency-inconsistent) number than the rate implied by
+        # the averaged latency. Recompute it from the aggregate, so the
+        # reported tok/s and ms/token describe the same measurement.
+        base['forward_tokens_per_second'] = (
+            1000.0 / base['forward_latency_ms_per_token']
+            if base['forward_latency_ms_per_token'] > 0.0 else float('inf'))
+        base['training_tokens_per_second'] = (
+            1000.0 / base['training_latency_ms_per_token']
+            if base['training_latency_ms_per_token'] > 0.0 else float('inf'))
         base['peak_inference_memory_mb'] = norm_rows[0]['peak_inference_memory_mb']
         base['peak_training_memory_mb'] = norm_rows[0]['peak_training_memory_mb']
         out.append(base)
