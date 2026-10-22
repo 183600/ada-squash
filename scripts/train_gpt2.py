@@ -24,7 +24,9 @@ from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import mean_ci, mean_std_stderr
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.norms import NORM_REGISTRY
-from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds, training_recipe_mismatches
+from adasquash.repro import (TRAINING_RECIPE_KEYS, artifact_record, collect_run_metadata,
+                             file_fingerprint, finish_metadata, save_run_manifest,
+                             set_all_seeds, training_recipe_mismatches)
 from scripts.data_pipeline import build_dataloader, configure_data_options, _is_pinned_revision
 
 def load_yaml_config(path: str) -> dict:
@@ -240,6 +242,11 @@ _MONITOR_ARGS = ('val_every', 'val_batches', 'early_stop_patience')
 _ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'no_learnable_delta', 'beta', 'alpha_0', 'k_init', 'alpha_init', 'p_init', 'alpha_jitter', 'gradient_checkpointing')
 _NUMERIC_ARGS = ('compile', 'compile_mode', 'no_bf16')
 _RESUME_RUN_ARGS = _ARCH_ARGS + _NUMERIC_ARGS
+# A within-arm aggregation must compare the whole run identity, not only the
+# optimizer/data recipe: two seeds that trained the same shape with different
+# alpha/k/p init or a different compile path are not replications of one arm.
+_WITHIN_ARM_PROTOCOL_KEYS = tuple(dict.fromkeys(
+    TRAINING_RECIPE_KEYS + _RESUME_RUN_ARGS))
 
 def _restore_run_args(args, ckpt_args: dict, names, explicit: frozenset=frozenset()) -> list:
     changed = []
@@ -678,6 +685,31 @@ def _manifest_data_version(manifest: dict):
         'tokenizer_revision_resolved': tokenizer_resolved,
     }
 
+def _manifest_ledger_fingerprints(manifest: dict):
+    """Content identity of the cross-split ledgers a seed's run manifest records.
+
+    A path alone cannot prove that two seeds excluded the same held-out
+    documents: a ledger file can be regenerated at the same path between runs.
+    Missing/malformed records return ``None`` so they fail closed rather than
+    comparing two unknowns as equal.
+    """
+    data = manifest.get('data') if isinstance(manifest, dict) else None
+    if not isinstance(data, dict):
+        return None
+    out = {}
+    for name in _LEDGER_ARGS:
+        if name not in data:
+            return None
+        value = data.get(name)
+        if value is None:
+            out[name] = None
+        elif isinstance(value, dict):
+            out[name] = {key: value.get(key)
+                         for key in ('path', 'exists', 'sha256', 'bytes')}
+        else:
+            return None
+    return out
+
 def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     """Pool per-seed runs into one Mean +/- Std record (Phase 1 statistics).
 
@@ -702,6 +734,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     rejections = []
     reference_recipe = None
     reference_context = None
+    reference_ledgers = None
     for seed in seeds:
         run_dir = seed_run_dir(base_dir, seed)
         record = {
@@ -712,7 +745,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             'n_loss_spikes': None, 'n_nonfinite_losses': None,
             'n_nonfinite_gradients': None, 'n_nonfinite_val_losses': None,
             'curve_classification': None, 'curve_generalization_gap': None,
-            'test_loss': None, 'data_version': None,
+            'test_loss': None, 'data_version': None, 'data_ledgers': None,
             'tokens_per_second': None, 'peak_device_memory_mb': None,
         }
         reject_reason = None
@@ -750,11 +783,27 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                     reject_reason = ('run_manifest.json has no results block; a finished '
                                      'run must record its results')
                 if reject_reason is None and reference_recipe is not None:
-                    recipe_mismatches = training_recipe_mismatches(reference_recipe, recorded)
+                    recipe_mismatches = training_recipe_mismatches(
+                        reference_recipe, recorded, keys=_WITHIN_ARM_PROTOCOL_KEYS)
                     if recipe_mismatches:
                         reject_reason = ('recorded training recipe differs from seed '
                                          f'{reference_recipe.get("seed")}: '
                                          + json.dumps(recipe_mismatches, sort_keys=True))
+                if reject_reason is None:
+                    ledgers = _manifest_ledger_fingerprints(manifest)
+                    if ledgers is None:
+                        reject_reason = ('run_manifest.json has no complete ledger '
+                                         'identity; the held-out document set cannot be '
+                                         'compared with the other seed runs')
+                    elif reference_ledgers is None:
+                        reference_ledgers = ledgers
+                    elif ledgers != reference_ledgers:
+                        reject_reason = ('recorded cross-split ledger content differs from '
+                                         'the other seed runs; a different exclusion set '
+                                         'means the pooled losses are not one protocol: '
+                                         + json.dumps({'this': ledgers,
+                                                       'reference': reference_ledgers},
+                                                      sort_keys=True))
                 if reject_reason is None:
                     # A missing step is unknown, not evidence that every seed
                     # stopped at the same fixed step. Without both numbers the
@@ -811,6 +860,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             record['dim'] = results.get('dim')
             record['n_heads'] = results.get('n_heads')
             record['data_version'] = _manifest_data_version(manifest)
+            record['data_ledgers'] = ledgers
             record['n_loss_spikes'] = results.get('n_loss_spikes')
             record['n_nonfinite_losses'] = results.get('n_nonfinite_losses')
             record['n_nonfinite_gradients'] = results.get('n_nonfinite_gradients')
@@ -898,6 +948,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'invalid_seeds': invalid,
         'manifest_rejections': rejections,
         'data_versions_by_seed': data_versions_by_seed,
+        'data_ledgers_by_seed': {int(r['seed']): r.get('data_ledgers')
+                                 for r in per_seed},
         'unknown_data_version_seeds': unknown_data_version_seeds,
         'data_versions_complete': data_versions_complete,
         'data_versions_consistent': data_versions_consistent,
