@@ -223,6 +223,13 @@ def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index
     if logits.dim() > 2:
         logits = logits.reshape(-1, logits.size(-1))
         targets = targets.reshape(-1)
+    elif logits.dim() == 1:
+        # `F.cross_entropy` accepts a single (V,) logit vector with a scalar
+        # target. The chunked node slices the leading dimension and passes the
+        # target slice to `nll_loss`, so normalize that documented form to one
+        # explicit row instead of slicing a 0-dim target (IndexError).
+        logits = logits.unsqueeze(0)
+        targets = targets.reshape(-1)
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(logits.size(-1))
     if logits.size(0) == 0:
