@@ -2378,6 +2378,10 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
     deltas = [entry['delta_candidate_minus_reference'] for entry in replicated_qk]
     signs = {('negative' if delta < 0 else 'positive' if delta > 0 else 'zero')
              for delta in deltas}
+    # An all-zero set is a null result, not a replicated direction: no host
+    # shows a QK effect, so there is no sign to agree on.
+    direction_consistent = (len(signs) == 1 and bool(deltas)
+                            and next(iter(signs)) in ('negative', 'positive'))
     certified_hosts = sorted(entry['host'] for entry in replicated_qk
                              if entry['effect_helps_significantly'])
     cross_host = {
@@ -2385,10 +2389,10 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
         'host_deltas': {entry['host']: entry['delta_candidate_minus_reference']
                         for entry in replicated_qk},
         'direction_signs': sorted(signs),
-        'direction_consistent_across_hosts': len(signs) == 1 and bool(deltas),
+        'direction_consistent_across_hosts': direction_consistent,
         'hosts_certified_individually': certified_hosts,
         'certified_at_multiple_hosts': (len(certified_hosts) >= 2
-                                        and len(signs) == 1),
+                                        and direction_consistent),
         'reading': ('the attention-logits axis is independent of the norm family: a QK effect '
                     'claimed as general must have the same direction on at least two hosts, and '
                     'is only certified at multiple hosts when >= 2 hosts pass the Holm-adjusted '
