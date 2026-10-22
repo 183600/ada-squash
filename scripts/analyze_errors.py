@@ -1022,8 +1022,39 @@ def main():
     p.add_argument('--allow-sealed-test', action='store_true', help="permit inspecting the sealed test split; reading its error cases and iterating turns test into an implicit validation set, so use --split validation unless this is the single final diagnosis")
     args = p.parse_args()
     args.topk = max(1, int(args.topk))
-    if args.n_batches < 1:
-        p.error(f'--n-batches {args.n_batches} must be >= 1')
+    for name, value, minimum in (
+        ('--n-batches', args.n_batches, 1),
+        ('--batch-size', args.batch_size, 1),
+        ('--seq-len', args.seq_len, 1),
+        ('--eval-chunk', args.eval_chunk, 1),
+        ('--forward-batch-chunk', args.forward_batch_chunk, 0),
+        ('--rank-clip', args.rank_clip, 1),
+        ('--context-tokens', args.context_tokens, 0),
+        ('--max-scan-errors', args.max_scan_errors, 0),
+        ('--max-examples', args.max_examples, 0),
+        ('--auc-classes', args.auc_classes, 0),
+        ('--auc-max-tokens', args.auc_max_tokens, 0),
+        ('--num-workers', args.num_workers, 0),
+        ('--min-doc-chars', args.min_doc_chars, 0),
+        ('--max-doc-chars', args.max_doc_chars, 0),
+    ):
+        if value < minimum:
+            p.error(f'{name} {value} must be >= {minimum}')
+    if args.num_documents is not None and args.num_documents < 1:
+        p.error(f'--num-documents {args.num_documents} must be >= 1')
+    if args.max_doc_chars and args.min_doc_chars > args.max_doc_chars:
+        p.error(f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
+                f'{args.max_doc_chars}; no document could pass the cleaner')
+    for name, value, upper in (('--confidence', args.confidence, 1.0),
+                               ('--rare-quantile', args.rare_quantile, 1.0)):
+        if not math.isfinite(value) or not 0.0 <= value <= upper:
+            p.error(f'{name} {value} must be finite and in [0, {upper:g}]')
+    for name, value in (('--val-frac', args.val_frac), ('--test-frac', args.test_frac)):
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            p.error(f'{name} {value} must be finite and in [0, 1)')
+    if args.val_frac + args.test_frac >= 1.0:
+        p.error(f'--val-frac {args.val_frac} + --test-frac {args.test_frac} leaves no '
+                'training stream; the split fractions must sum to less than 1')
     if args.corpus == 'dataset' and args.split == 'test' and (not args.allow_sealed_test):
         p.error("--corpus dataset --split test inspects the sealed test split; reading its "
                 "error cases and iterating turns test into an implicit validation set. Use "
