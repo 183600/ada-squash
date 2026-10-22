@@ -2770,9 +2770,13 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         if name in baseline_set:
             continue
         if not str(hypotheses.get(name) or '').strip():
-            # `validate_matrix` already rejects this, but the plan must not
-            # silently drop a row if it is ever called directly.
-            continue
+            # `validate_matrix` already rejects this, but a direct call must
+            # not silently drop a contrast from the pre-registration: a plan
+            # that omits a row would let the missing hypothesis disappear and
+            # later be reported as unregistered rather than as an error.
+            raise ValueError(
+                f"ablation row '{name}' has no stated scientific hypothesis; "
+                "the analysis plan must not silently omit it")
         _add({
             'id': f'baseline:{name}',
             'family': 'baseline',
