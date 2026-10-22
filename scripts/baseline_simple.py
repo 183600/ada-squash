@@ -461,6 +461,17 @@ def _mde_from_test(test: dict | None, alpha: float = 0.05, power: float = 0.8):
              + student_t_ppf(power, float(test['df']))) * stderr)
 
 
+def _row_run_identity(row: dict, parent_of: dict) -> str:
+    name = row.get('name')
+    seen = set()
+    while isinstance(name, str) and name not in seen:
+        seen.add(name)
+        parent = parent_of.get(name)
+        if not isinstance(parent, str):
+            return name
+        name = parent
+    return row.get('name')
+
 def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_ce,
                             log_vocab, tuned_predictor: str | None = None,
                             records: list | None = None, alpha: float = 0.05) -> list:
@@ -481,11 +492,23 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
     as `beats_tuned_simple_baseline=True, beats_tuned_simple_significantly=False`.
     """
     out = []
+    parent_of = {row.get('name'): row.get('reused_from') for row in rows
+                 if isinstance(row, dict) and isinstance(row.get('name'), str)
+                 and isinstance(row.get('reused_from'), str)}
+    seen_runs: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
         val_loss = row.get('val_loss')
-        entry = {'name': row.get('name'), 'val_loss': val_loss, 'n_seeds': row.get('n_seeds')}
+        identity = _row_run_identity(row, parent_of)
+        canonical = seen_runs.get(identity)
+        if canonical is None:
+            seen_runs[identity] = row.get('name')
+        entry = {'name': row.get('name'), 'val_loss': val_loss, 'n_seeds': row.get('n_seeds'),
+                 'run_identity': identity,
+                 'excluded_from_family': (None if canonical is None else
+                                          f'duplicate run of {canonical} '
+                                          '(reused summary, not independent evidence)')}
         if isinstance(val_loss, (int, float)):
             entry['excess_over_bayes_floor_nats'] = val_loss - memoryless_floor
             if ceiling is not None:
@@ -533,7 +556,8 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
             entry['simple_baseline_test_basis'] = 'no_shared_seeds'
         out.append(entry)
     family = [entry for entry in out if entry.get('replicated_across_seeds')
-              and entry.get('p_one_sided_tuned_simple') is not None]
+              and entry.get('p_one_sided_tuned_simple') is not None
+              and entry.get('excluded_from_family') is None]
     adjusted = holm_adjust([entry['p_one_sided_tuned_simple'] for entry in family])
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_tuned_simple_holm'] = p_holm

@@ -1734,7 +1734,8 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
         annotated.append(entry)
     family = [entry for entry in annotated
               if entry.get('n_paired_seeds_tuned_simple', 0) >= MIN_SEEDS_FOR_SIGNIFICANCE
-              and entry.get('p_one_sided_tuned_simple') is not None]
+              and entry.get('p_one_sided_tuned_simple') is not None
+              and entry.get('excluded_from_family') is None]
     adjusted = holm_adjust([entry['p_one_sided_tuned_simple'] for entry in family])
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_tuned_simple_holm'] = p_holm
