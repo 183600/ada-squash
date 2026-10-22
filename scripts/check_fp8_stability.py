@@ -709,7 +709,7 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                                              + json.dumps(protocol_mismatches, sort_keys=True))})
                         tests.append(t)
                         continue
-                if len(shared_train) >= 2:
+                if trained and len(shared_train) >= 2:
                     t['basis'] = 'train_seed_means'
                     t['certifiable'] = len(shared_train) >= MIN_SEEDS_FOR_SIGNIFICANCE
                     t['n_shared_train_seeds'] = len(shared_train)
