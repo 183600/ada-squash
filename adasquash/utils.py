@@ -172,7 +172,11 @@ class KurtosisMeter:
         if self.n < 2:
             return 0.0
         var = self.M2 / self.n
-        if var < 1e-12:
+        # Excess kurtosis is scale-invariant. An absolute variance floor (the
+        # old `var < 1e-12`) reports heavy-tailed but small-magnitude
+        # activations as perfectly Gaussian; only a zero/non-finite variance
+        # has no standardized fourth moment.
+        if not math.isfinite(var) or var == 0.0:
             return 0.0
         return self.M4 / self.n / (var * var) - 3.0
 
