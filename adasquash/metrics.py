@@ -92,16 +92,37 @@ MIN_SEEDS_FOR_SIGNIFICANCE = 3
 _EXTREME_IMBALANCE = 1000.0
 
 
+def _strict_int(value, name: str, minimum: Optional[int] = None) -> int:
+    """An integer-valued count/id, rejecting bools and fractional values.
+
+    ``int(1.5)`` silently changes a sample count or class id while the report
+    still looks like it describes the requested measurement. Bools are not
+    counts either; a caller passing ``True`` almost certainly has a bug.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got bool {value!r}")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    if converted != value:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if minimum is not None and converted < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {converted}")
+    return converted
+
+
 def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[float, float]:
     """Wilson score interval for a binomial proportion.
 
     Preferred over the normal approximation for the small trial counts used
     by the needle evaluation, and for proportions near 0 or 1.
     """
-    n_total = int(n_total)
-    if n_total <= 0:
-        raise ValueError("wilson_interval needs n_total >= 1")
-    n_success = min(max(int(n_success), 0), n_total)
+    n_total = _strict_int(n_total, "n_total", minimum=1)
+    # `n_success` is still clamped to the trial count (the documented
+    # behaviour for inconsistent callers), but a fractional/bool count is not
+    # a measurement and must not be silently rounded first.
+    n_success = min(max(_strict_int(n_success, "n_success", minimum=0), 0), n_total)
     p = n_success / n_total
     z2 = z * z
     denom = 1.0 + z2 / n_total
@@ -135,10 +156,8 @@ def mcnemar_test(n_fixed: int, n_broke: int) -> dict:
     sample, so there is no evidence either way and both p-values are `None`
     (not 1.0, which would read as "no difference").
     """
-    n_fixed = int(n_fixed)
-    n_broke = int(n_broke)
-    if n_fixed < 0 or n_broke < 0:
-        raise ValueError(f"mcnemar_test needs non-negative counts, got {n_fixed} and {n_broke}")
+    n_fixed = _strict_int(n_fixed, "n_fixed", minimum=0)
+    n_broke = _strict_int(n_broke, "n_broke", minimum=0)
     n = n_fixed + n_broke
     out = {
         "n_fixed": n_fixed,
@@ -1005,9 +1024,7 @@ def scale_replication_summary(observations: Sequence[dict],
     Records with a non-finite delta are excluded from the sign vote but kept
     in `excluded` so a failed scale is visible rather than silently dropped.
     """
-    min_scales = int(min_scales)
-    if min_scales < 2:
-        raise ValueError('min_scales must be >= 2; one scale cannot replicate')
+    min_scales = _strict_int(min_scales, "min_scales", minimum=2)
     by_metric: dict[str, dict[tuple[str, str, str], dict]] = {}
     duplicates: list[dict] = []
     excluded: list[dict] = []
@@ -1049,7 +1066,10 @@ def scale_replication_summary(observations: Sequence[dict],
             'metric': metric,
             'contrast': contrast or None,
             'delta': delta_value,
-            'certified': bool(obs.get('certified')),
+            # Only an explicit boolean True certifies a scale. `bool("False")`
+            # is True, so a malformed/legacy string must not be promoted into
+            # a multi-scale certification.
+            'certified': obs.get('certified') is True,
             'n_seeds': obs.get('n_seeds'),
             'p': obs.get('p_one_sided', obs.get('p')),
         }
@@ -1157,9 +1177,10 @@ def f1_from_counts(
     With class imbalance macro and micro can rank models differently, so call
     sites report the metric by name.
     """
-    gold_counts = [int(v) for v in gold_counts]
-    pred_counts = [int(v) for v in pred_counts]
-    correct_counts = [int(v) for v in correct_counts]
+    gold_counts = [_strict_int(v, "gold_counts", minimum=0) for v in gold_counts]
+    pred_counts = [_strict_int(v, "pred_counts", minimum=0) for v in pred_counts]
+    correct_counts = [_strict_int(v, "correct_counts", minimum=0)
+                      for v in correct_counts]
     if not (len(gold_counts) == len(pred_counts) == len(correct_counts)):
         raise ValueError(
             "gold/pred/correct count vectors must have the same length, got "
@@ -1233,11 +1254,9 @@ def macro_weighted_f1(pred: Sequence[int], gold: Sequence[int], num_classes: int
     full prediction/target lists (small batches); see that function for the
     macro/weighted/micro semantics.
     """
-    num_classes = int(num_classes)
-    if num_classes <= 0:
-        raise ValueError("num_classes must be positive")
-    pred = [int(p) for p in pred]
-    gold = [int(g) for g in gold]
+    num_classes = _strict_int(num_classes, "num_classes", minimum=1)
+    pred = [_strict_int(p, "pred class id") for p in pred]
+    gold = [_strict_int(g, "gold class id") for g in gold]
     if len(pred) != len(gold):
         raise ValueError(f"pred/gold length mismatch: {len(pred)} vs {len(gold)}")
     gold_counts = [0] * num_classes
@@ -1265,7 +1284,10 @@ def imbalance_report(counts: Sequence[int]) -> dict:
     positive rate has a huge negative denominator and therefore rises too
     slowly to expose the collapse.
     """
-    positives = [int(c) for c in counts if int(c) > 0]
+    # A class count is a non-negative integer; a negative/fractional/bool
+    # value is a malformed distribution, not a class to silently drop.
+    all_counts = [_strict_int(c, "class count", minimum=0) for c in counts]
+    positives = [c for c in all_counts if c > 0]
     if not positives:
         return {
             "n_classes_with_support": 0,
@@ -1429,8 +1451,8 @@ def binary_auc_report(
     any evaluated class) sets `prefer_pr_auc`; in that regime ROC-AUC is
     optimistic and PR-AUC is the metric to read.
     """
-    classes = [int(c) for c in classes]
-    gold = [int(g) for g in gold]
+    classes = [_strict_int(c, "class id") for c in classes]
+    gold = [_strict_int(g, "gold class id") for g in gold]
     rows = list(scores)
     if len(rows) != len(gold):
         raise ValueError(f"score-row/gold length mismatch: {len(rows)} vs {len(gold)}")
@@ -1537,11 +1559,9 @@ def recall_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int
     relevant = list(relevant)
     if len(ranked) != len(relevant):
         raise ValueError(f"ranked/relevant query count mismatch: {len(ranked)} vs {len(relevant)}")
-    k = int(k)
-    if k < 1:
-        # Keep the reported depth honest: silently clamping top-0 to top-1
-        # reports a retrieval result that was not requested.
-        raise ValueError(f"recall_at_k needs k >= 1, got {k}")
+    # Keep the reported depth honest: silently clamping top-0/1.5 to top-1
+    # reports a retrieval result that was not requested.
+    k = _strict_int(k, "recall_at_k k", minimum=1)
     if not ranked:
         return None
     recalls = []
@@ -1567,10 +1587,9 @@ def ndcg_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]]
     relevant = list(relevant)
     if len(ranked) != len(relevant):
         raise ValueError(f"ranked/relevant query count mismatch: {len(ranked)} vs {len(relevant)}")
-    k = int(k)
-    if k < 1:
-        # top-0 is not an evaluated depth; do not silently report top-1.
-        raise ValueError(f"ndcg_at_k needs k >= 1, got {k}")
+    # top-0 (or a fractional depth) is not an evaluated depth; do not
+    # silently report a different one.
+    k = _strict_int(k, "ndcg_at_k k", minimum=1)
     if not ranked:
         return None
     if not any(rel for rel in relevant):
