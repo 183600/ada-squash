@@ -205,8 +205,12 @@ class AdaSquashLM:
             context, gen_kwargs = req.args[:2]
             if not isinstance(gen_kwargs, dict):
                 gen_kwargs = {}
-            until = list(gen_kwargs.get('until', [])) + [
+            raw_until = list(gen_kwargs.get('until', [])) + [
                 s for s in stops if s not in gen_kwargs.get('until', [])]
+            # An empty stop string is a no-op in the final trimming loop; it
+            # must not count as "already generated the stop" on the first
+            # token and truncate the generation to length one.
+            until = [s for s in raw_until if isinstance(s, str) and s]
             max_toks = int(gen_kwargs.get('max_gen_toks', self.max_gen_toks))
             # A request for more tokens than the positional table can hold is
             # capped, not allowed to run past `max_seq_len` and crash on the
