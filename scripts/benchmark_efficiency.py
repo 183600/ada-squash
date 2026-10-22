@@ -72,9 +72,30 @@ def _sync(device: str) -> None:
         torch.cuda.synchronize(device)
 
 
+def _count_option(value, name: str, minimum: int) -> int:
+    """Validate an iteration/round count instead of silently clamping it.
+
+    ``max(1, iters)`` turns a requested zero-iteration measurement into one
+    timing and a fractional count into a different protocol than the report
+    names. A benchmark cannot certify a protocol it did not run.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got bool {value!r}")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    if converted != value:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if converted < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {converted}")
+    return converted
+
+
 def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
-    n_iters = max(1, iters)
-    for _ in range(max(0, warmup)):
+    n_iters = _count_option(iters, "iters", 1)
+    warmup = _count_option(warmup, "warmup", 0)
+    for _ in range(warmup):
         fn()
     if _is_cuda(device):
     # CUDA events around each iteration; one sync at the end.
@@ -214,9 +235,12 @@ def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
     iterations; `latency_by_round` is retained so the raw spread can be
     audited instead of hidden behind the cross-round mean.
     """
+    rounds = _count_option(rounds, "rounds", 1)
+    if not isinstance(norms, list) or not norms:
+        raise ValueError("norms must be a non-empty list")
     out = []
     for norm in norms:
-        norm_rows = [r for r in rows if r['norm'] == norm]
+        norm_rows = [r for r in rows if isinstance(r, dict) and r.get('norm') == norm]
         if len(norm_rows) != rounds:
             raise ValueError(
                 f'norm {norm!r} has {len(norm_rows)} measured round(s), expected {rounds}; '
