@@ -138,10 +138,14 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     by the needle evaluation, and for proportions near 0 or 1.
     """
     n_total = _strict_int(n_total, "n_total", minimum=1)
-    # `n_success` is still clamped to the trial count (the documented
-    # behaviour for inconsistent callers), but a fractional/bool count is not
-    # a measurement and must not be silently rounded first.
-    n_success = min(max(_strict_int(n_success, "n_success", minimum=0), 0), n_total)
+    n_success = _strict_int(n_success, "n_success", minimum=0)
+    if n_success > n_total:
+        # 150 successes out of 100 trials is impossible evidence, not a
+        # proportion to clamp to 1. Clamping produced a valid-looking
+        # interval (0.963, 1.0) for a count that never existed.
+        raise ValueError(
+            f"wilson_interval needs 0 <= n_success <= n_total, got "
+            f"{n_success} successes out of {n_total} trials")
     p = n_success / n_total
     z2 = z * z
     denom = 1.0 + z2 / n_total
@@ -1211,6 +1215,13 @@ def f1_from_counts(
                 f"inconsistent counts for class {i}: gold={g}, pred={p}, "
                 f"correct={t} (need 0 <= correct <= min(gold, pred))"
             )
+    if sum(gold_counts) != sum(pred_counts):
+        # The three vectors are marginals of one confusion matrix, so a
+        # single-label prediction cannot add or drop examples. Unequal totals
+        # make micro_f1 (= accuracy) meaningless while still looking plausible.
+        raise ValueError(
+            "gold/pred count vectors must describe the same examples, got "
+            f"sum(gold)={sum(gold_counts)} vs sum(pred)={sum(pred_counts)}")
     tp = correct_counts
     fp = [p - t for p, t in zip(pred_counts, correct_counts)]
     fn = [g - t for g, t in zip(gold_counts, correct_counts)]
