@@ -579,6 +579,14 @@ def main():
             p.error(f'{flag} {value} must be >= 1')
     if args.num_workers < 0:
         p.error(f'--num-workers {args.num_workers} must be >= 0')
+    if args.n_states < 2:
+        p.error(f'--n-states {args.n_states} must be >= 2: a one-state probe has a '
+                'deterministic successor and measures no next-token structure')
+    if (not math.isfinite(args.max_probe_coverage)
+            or not 0.0 < args.max_probe_coverage <= 1.0):
+        p.error(f'--max-probe-coverage {args.max_probe_coverage} must be finite and in (0, 1]')
+    if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
+        p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seeds[0])
 
@@ -594,6 +602,14 @@ def main():
     ckpt_groups = [[path for path in str(entry).split(',') if path] for entry in args.ckpts]
     if any(not group for group in ckpt_groups):
         p.error('--ckpts entries must not be empty')
+    for group in ckpt_groups:
+        if len(set(group)) != len(group):
+            p.error(f'--ckpts arm {group} repeats a checkpoint; a repeated path is the '
+                    'same trained run and would be weighted twice instead of adding evidence')
+    normalized_groups = [tuple(sorted(group)) for group in ckpt_groups]
+    if len(set(normalized_groups)) != len(normalized_groups):
+        p.error('--ckpts contains the same checkpoint set as two arms; a self-comparison '
+                'has no treatment difference to certify')
     results = []
     dataset_probe_reports = []
     for group in ckpt_groups:
