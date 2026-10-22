@@ -1447,6 +1447,11 @@ def main():
                     'Restore the original ledger files or start a fresh run with '
                     'the new split protocol.')
             print('[resume] cross-split ledger fingerprints match the checkpoint')
+    # Snapshot the ledger content that defines this run's held-out documents
+    # *once*, before the loader is built. Recomputing it at every checkpoint
+    # would let a ledger replaced mid-run be recorded as if the original
+    # stream had used the new content, defeating the resume identity check.
+    run_ledgers = _data_ledger_fingerprints(args)
     data_reports: dict = {}
     loader = open_data_split('train', args)
     data_iter = iter(loader)
@@ -1748,11 +1753,11 @@ def main():
             'tokenizer': args.tokenizer,
             'tokenizer_revision': args.tokenizer_revision,
             'split_reports': data_reports,
-            'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if args.exclude_hash_file else None,
-            'exclude_test_hash_file': file_fingerprint(args.exclude_test_hash_file) if args.exclude_test_hash_file else None,
+            'exclude_hash_file': run_ledgers['exclude_hash_file'],
+            'exclude_test_hash_file': run_ledgers['exclude_test_hash_file'],
             'group_key': args.group_key,
-            'exclude_group_file': file_fingerprint(args.exclude_group_file) if args.exclude_group_file else None,
-            'exclude_test_group_file': file_fingerprint(args.exclude_test_group_file) if args.exclude_test_group_file else None,
+            'exclude_group_file': run_ledgers['exclude_group_file'],
+            'exclude_test_group_file': run_ledgers['exclude_test_group_file'],
             'config_file': file_fingerprint(args.config) if args.config else None,
         }
         if sanity_report_path is not None:
@@ -1887,7 +1892,7 @@ def main():
                 'n_nonfinite_val_losses': int(n_nonfinite_val_losses),
                 'nonfinite_streak': int(nonfinite_streak),
                 'nonfinite_val_streak': int(nonfinite_val_streak),
-                'data_ledgers': _data_ledger_fingerprints(args),
+                'data_ledgers': run_ledgers,
             }
 
         def _triage_nonfinite(kind: str, step: int, x_bad, y_bad, bad_value: float,
