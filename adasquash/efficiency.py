@@ -361,8 +361,13 @@ def efficiency_verdict(
     verdict["gain_meaningful"] = gain >= float(min_loss_gain)
     ci_upper = (None if verdict["cost_ratio_ci_95"] is None
                 else float(verdict["cost_ratio_ci_95"][1]))
+    # A missing CI is only acceptable when no uncertainty measurement was
+    # claimed at all (the legacy point-estimate path). If a round count or a
+    # malformed stderr explicitly failed uncertainty certification, the cost
+    # cannot simultaneously be reported as confidently acceptable.
     verdict["cost_confidently_acceptable"] = bool(
-        ci_upper is None or ci_upper <= float(max_cost_ratio))
+        verdict["cost_uncertainty_certified"] is not False
+        and (ci_upper is None or ci_upper <= float(max_cost_ratio)))
     verdict["cost_acceptable"] = bool(
         cost <= float(max_cost_ratio)
         and verdict["cost_confidently_acceptable"]
