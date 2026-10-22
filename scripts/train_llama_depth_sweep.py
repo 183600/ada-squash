@@ -136,9 +136,16 @@ def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
     """Fields where a child manifest disagrees with this sweep invocation."""
     recorded = manifest.get('hyperparameters') or {}
     results = manifest.get('results') or {}
+    missing = object()
     mismatches = {}
     for key, wanted in expected['hyperparameters'].items():
-        actual = recorded.get(key)
+        actual = recorded.get(key, missing)
+        if actual is missing:
+            # An omitted optional key (often expected to be None) is unknown,
+            # not a match: the manifest cannot prove the child used the same
+            # recipe.
+            mismatches[key] = [wanted, '<missing>']
+            continue
         if key in _REVISION_PROTOCOL_KEYS and actual is not None and actual != wanted:
             # `train_gpt2` replaces the requested revision (a branch, tag or
             # "latest") with the concrete commit it resolved before writing
@@ -152,8 +159,11 @@ def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
         if actual != wanted:
             mismatches[key] = [wanted, actual]
     for key, wanted in expected['shape'].items():
-        if results.get(key) != wanted:
-            mismatches[f'results.{key}'] = [wanted, results.get(key)]
+        actual = results.get(key, missing)
+        if actual is missing:
+            mismatches[f'results.{key}'] = [wanted, '<missing>']
+        elif actual != wanted:
+            mismatches[f'results.{key}'] = [wanted, actual]
     return mismatches
 
 
