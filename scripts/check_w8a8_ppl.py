@@ -45,6 +45,10 @@ def _explicit_cli_names(argv, parser=None) -> set:
     """
     names = set()
     for token in argv:
+        if token == '--':
+            # Everything after the separator is a positional value, never an
+            # explicit option spelling.
+            break
         if token.startswith('--') and len(token) > 2:
             option = token[2:].split('=', 1)[0]
             if parser is not None:
