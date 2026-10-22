@@ -487,6 +487,14 @@ def tensor_finite_report(t: torch.Tensor) -> dict:
             out["finite"] = False
             out["n_nan"] = n_nan
             out["n_inf"] = n_inf
+    else:
+        # Integer/bool tensors cannot be NaN/Inf, but the report promises the
+        # range for them too. Use Python ints so the min/max abs never
+        # overflows the tensor's own fixed-width dtype.
+        td = t.detach()
+        lo = int(td.min().item())
+        hi = int(td.max().item())
+        out["abs_max"] = max(abs(lo), abs(hi))
     return out
 
 
