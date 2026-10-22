@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -408,6 +409,20 @@ def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
         'command': cmd,
     }
 
+def _heldout_batch_fingerprint(x) -> bytes:
+    """Content digest of one held-out batch's input tokens.
+
+    The held-out loaders are deterministic and never shuffle, so a repeated
+    packed window produces exactly the same input tokens. Fingerprinting the
+    full batch therefore lets `evaluate_heldout` count *distinct* held-out
+    windows instead of trusting the requested batch count; hashing the
+    small input tensor is negligible next to a model forward pass.
+    """
+    hasher = hashlib.blake2b(digest_size=16)
+    hasher.update(str(tuple(x.shape)).encode('ascii'))
+    hasher.update(x.detach().cpu().contiguous().numpy().tobytes())
+    return hasher.digest()
+
 def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, collect: list | None = None, cycle: bool = True) -> float | None:
     """Mean loss over held-out batches; `state['iter']` carries the position.
 
@@ -422,6 +437,14 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     never counted twice. `state['batches_consumed']` counts every fetched
     batch across passes, so a checkpoint can restore this cursor instead of
     silently scoring an earlier held-out slice after a resume.
+
+    The pass also records its own data budget in `state`:
+    `last_eval_requested_batches`, `last_eval_unique_batches`,
+    `last_eval_cycled`, `last_eval_reused` and `last_eval_shortfall`. A
+    validation loader with fewer distinct batches than requested is cycled,
+    so its collected losses are not independent draws; the training loop uses
+    these fields to expose that pseudo-replication instead of averaging it
+    away.
     """
     # With dropout at its default 0 the module-mode switch changes no
     # numerics, so skip it; inference_mode already blocks grads. `training`
@@ -435,11 +458,20 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     it = state.get('iter')
     total = None
     n = 0
+    requested = max(0, int(n_batches))
+    seen = 0
+    seen_batches: set = set()
+    repeated_batches = 0
+    state['last_eval_requested_batches'] = requested
+    state['last_eval_unique_batches'] = None
+    state['last_eval_cycled'] = False
+    state['last_eval_reused'] = False
+    state['last_eval_shortfall'] = 0
     terms: list = [] if collect is not None else None
     # A previous non-finite hold must not be attributed to this pass.
     state.pop('nonfinite_batch', None)
     with torch.inference_mode():
-        for _ in range(max(0, int(n_batches))):
+        for _ in range(requested):
             if it is None:
                 it = iter(loader)
                 state['iter'] = it
@@ -447,17 +479,28 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
                 batch = next(it)
             except StopIteration:
                 if not cycle:
+                    state['last_eval_shortfall'] = requested - seen
                     break
+                state['last_eval_cycled'] = True
                 it = iter(loader)
                 state['iter'] = it
                 try:
                     batch = next(it)
                 except StopIteration:
                     break
+            seen += 1
             state['batches_consumed'] = int(state.get('batches_consumed', 0)) + 1
             x, y = batch
+            # Fingerprint on the loader's (host) tensor before the device
+            # transfer: this avoids a per-batch device->host copy and keeps the
+            # validation data budget independent of the compute device.
+            fingerprint = _heldout_batch_fingerprint(x)
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            if fingerprint in seen_batches:
+                repeated_batches += 1
+            else:
+                seen_batches.add(fingerprint)
             with ctx:
                 loss = model(x, y, return_logits=False)[1]
             # Accumulate in a device fp64 scalar; fp64 keeps the sequential
@@ -474,6 +517,8 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
             n += 1
     if toggle_mode:
         model.train(was_training)
+    state['last_eval_unique_batches'] = len(seen_batches)
+    state['last_eval_reused'] = repeated_batches > 0
     if collect is not None and terms:
         # `.tolist()` yields the same Python doubles in the same batch order,
         # so the returned mean and the collected series are unchanged.
@@ -1067,6 +1112,7 @@ def main():
     p.add_argument('--val-every', type=int, default=500, help='run a held-out validation pass every N optimizer steps (0 disables; 0 is not recommended)')
     p.add_argument('--val-batches', type=int, default=10, help='batches per held-out validation pass')
     p.add_argument('--early-stop-patience', type=int, default=0, help='stop after this many validation passes without improvement (0 = off)')
+    p.add_argument('--fail-on-eval-reuse', action='store_true', help='abort on the first validation pass that has to cycle the held-out loader (fewer distinct batches than --val-batches); repeated batches would make the validation stderr look more precise than it is and turn checkpoint selection into a maximum over reused data')
     p.add_argument('--nonfinite-policy', choices=['abort', 'skip'], default='abort', help='what to do when a training loss is NaN/Inf: abort (default) runs the ordered data->math->precision->gradient triage and stops; skip runs the triage and discards only that step (5 consecutive non-finite steps still abort)')
     p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first); per-batch losses and the data-pairing block are stored in test_results.json so scripts/compare_sealed_tests.py can test two arms on the shared sealed batches')
     p.add_argument('--allow-test-rerun', action='store_true', help='permit a second one-shot evaluation of the sealed test split in the same output dir (breaks the seal: the test set becomes an implicit validation set)')
@@ -1377,6 +1423,7 @@ def main():
     last_val_step = None
     last_val_stderr = None
     last_val_batches: list = []
+    val_reuse_events = 0
     last_train_loss = None
     start_step = 0
     if resume_ckpt is not None:
@@ -1962,6 +2009,30 @@ def main():
                     _fast_forward_validation_stream(val_loader, val_state)
                 val_batch_losses: list = []
                 val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device, collect=val_batch_losses)
+                reused = val_state.get('last_eval_reused')
+                if reused:
+                    # The pass re-measured at least one held-out window, so
+                    # its collected losses are not independent draws. Keep the
+                    # measurement but make the pseudo-replication explicit
+                    # (and optionally fatal); selecting the minimum over
+                    # repeated passes also turns best_val_loss into a maximum
+                    # over reused data.
+                    val_reuse_events += 1
+                    unique = val_state.get('last_eval_unique_batches')
+                    message = (
+                        f'[val][warn] step={step} requested {args.val_batches} '
+                        f'held-out batches but the loader revisited a window: '
+                        f'only {unique} distinct batch(es) were seen. The '
+                        'per-batch stderr and the selected-checkpoint minimum '
+                        'are therefore optimistic. Lower --val-batches or '
+                        'enlarge the validation slice')
+                    if args.fail_on_eval_reuse:
+                        raise SystemExit(
+                            f'{message} (--fail-on-eval-reuse). Run '
+                            f'scripts/audit_data.py --fail-on-eval-reuse with the '
+                            'same split/eval settings before the next run.')
+                    if val_reuse_events == 1:
+                        print(message, file=sys.stderr)
                 if val_loss is None:
                     # The loader yielded zero batches: the held-out slice is empty.
                     # Silently continuing would train with no selection signal (and
@@ -2115,6 +2186,19 @@ def main():
         _atomic_torch_save(ckpt, path)
         print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
         run_manifest['data']['split_reports'] = data_reports
+        # Data-budget provenance for the held-out evaluation: a validation
+        # stderr is only interpretable if the pass saw as many distinct
+        # batches as it advertises. `unique < requested` means the loader
+        # cycled and the collected losses are not independent draws.
+        run_manifest['data']['heldout_eval'] = {
+            'validation_batches_requested': int(args.val_batches),
+            'validation_batches_unique_last_pass': val_state.get('last_eval_unique_batches'),
+            'validation_batches_cycled_last_pass': bool(val_state.get('last_eval_cycled')),
+            'validation_batches_reused_last_pass': val_state.get('last_eval_reused'),
+            'validation_batch_reuse_events': int(val_reuse_events),
+            'validation_passes': len(curve_val),
+            'validation_every_steps': int(args.val_every),
+        }
         run_manifest['status'] = 'finished'
         run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
@@ -2165,6 +2249,12 @@ def main():
             # interval are the resolution of the number quoted above. A delta
             # smaller than the stderr is not evidence of a difference.
             'final_val_loss_n_batches': len(last_val_batches),
+            # How many of those batch losses were distinct held-out windows:
+            # when this is below `final_val_loss_n_batches` the stderr above
+            # treats repeated windows as independent draws.
+            'final_val_loss_unique_batches': val_state.get('last_eval_unique_batches'),
+            'final_val_loss_reused_batches': val_state.get('last_eval_reused'),
+            'validation_batch_reuse_events': val_reuse_events,
             'final_val_loss_std': final_val_stats['std'] if final_val_stats else None,
             'final_val_loss_stderr': final_val_stats['stderr'] if final_val_stats else None,
             'final_val_loss_ci_level': final_val_stats['ci_level'] if final_val_stats else None,
@@ -2356,11 +2446,18 @@ def main():
                 'num_workers': (rtest or {}).get('num_workers', getattr(args, 'num_workers', None)),
                 'batch_size': args.batch_size, 'seq_len': args.seq_len,
             }
-            results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if has_best_val else None, 'best_val_loss': best_val_loss if has_best_val else None, 'final_val_loss': last_val_loss, 'final_val_step': last_val_step, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file, 'exclude_test_hash_file': args.exclude_test_hash_file, 'group_key': args.group_key, 'exclude_group_file': args.exclude_group_file, 'exclude_test_group_file': args.exclude_test_group_file}
+            results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if has_best_val else None, 'best_val_loss': best_val_loss if has_best_val else None, 'final_val_loss': last_val_loss, 'final_val_step': last_val_step, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batches_shortfall': max(0, int(args.test_batches) - len(test_batch_losses)), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file, 'exclude_test_hash_file': args.exclude_test_hash_file, 'group_key': args.group_key, 'exclude_group_file': args.exclude_group_file, 'exclude_test_group_file': args.exclude_test_group_file}
             with open(out_path, 'w') as f:
                 json.dump(results, f, indent=2)
             run_manifest.setdefault('artifacts', {})['test_results'] = file_fingerprint(out_path)
             run_manifest['data']['split_reports'] = data_reports
+            run_manifest['data'].setdefault('heldout_eval', {}).update({
+                'test_batches_requested': int(args.test_batches),
+                'test_batches_observed': len(test_batch_losses),
+                'test_batches_shortfall': max(0, int(args.test_batches) - len(test_batch_losses)),
+                # The sealed pass never cycles, so observed == unique.
+                'test_batches_unique': len(test_batch_losses),
+            })
             run_manifest['results']['test_loss'] = test_loss
             run_manifest['results']['test_loss_n_batches'] = len(test_batch_losses)
             run_manifest['results']['test_loss_stderr'] = test_stats['stderr']

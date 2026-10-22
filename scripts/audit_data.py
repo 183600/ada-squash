@@ -47,7 +47,16 @@ Reads a bounded sample of the train / validation / test splits produced by
   compared with `--scheduled-train-tokens` (= steps x batch x grad-accum x
   seq-len).  A loader that runs out of unique documents silently starts
   another epoch, so `--fail-on-train-wrap` refuses a run whose advertised
-  token budget is really a repeated pass over the same corpus.
+  token budget is really a repeated pass over the same corpus;
+* evaluation budget: the number of distinct packed batches behind each
+  held-out split, compared with the `--val-batches` / `--test-batches` the
+  protocol requests.  A validation pass that asks for more batches than the
+  split holds cycles the loader, so the same held-out windows are scored
+  repeatedly and the per-batch standard error treats them as independent.
+  With `--val-every` and `--max-steps`, the audit also reports how often
+  each distinct validation batch is reused during checkpoint selection.
+  `--fail-on-eval-reuse` / `--fail-on-eval-shortfall` turn those findings
+  into failures instead of notes.
 
 `--write-train-hash-file` emits the training-document hash ledger (exact and
 canonical digests) consumed by `--exclude-hash-file` in the trainers, so
@@ -749,6 +758,178 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
     return result
 
 
+def packed_window_count(tokens, seq_len: int) -> int | None:
+    """Number of fixed-length LM windows a split with `tokens` tokens can emit.
+
+    `PackedStream` advances by `seq_len` tokens per window and needs
+    `seq_len + 1` tokens to produce the next label, so a split with T usable
+    tokens yields ``floor((T - 1) / seq_len)`` windows.  Those are the *unique*
+    held-out windows: an evaluation that asks for more batches than this
+    necessarily revisits earlier windows.  `None` means the token count is
+    unknown; 0 means no window can be formed.
+    """
+    if tokens is None:
+        return None
+    try:
+        tokens = int(math.floor(float(tokens)))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"token count must be numeric or None, got {tokens!r}") from None
+    try:
+        seq_len = int(seq_len)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"seq_len must be an integer, got {seq_len!r}") from None
+    if seq_len < 1:
+        raise ValueError(f"seq_len must be >= 1, got {seq_len}")
+    if tokens < 1:
+        return 0
+    return (tokens - 1) // seq_len
+
+
+def eval_batch_capacity(budget: dict | None, seq_len: int, batch_size: int) -> dict:
+    """How many distinct evaluation batches the effective held-out tokens hold.
+
+    The held-out token budget is a token count, while the evaluation protocol
+    asks for a number of *batches*.  Converting one into the other makes the
+    pseudo-replication visible: when the requested batch count is larger than
+    the distinct capacity, a validation loader cycles and the same held-out
+    tokens are scored more than once.  The result keeps the budget `basis`
+    next to the capacity, because a capacity extrapolated from a sampled
+    prefix is an estimate, not an exact count.
+    """
+    try:
+        seq_len = int(seq_len)
+        batch_size = int(batch_size)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"seq_len/batch_size must be integers, got {seq_len!r}/{batch_size!r}") from None
+    if seq_len < 1:
+        raise ValueError(f"seq_len must be >= 1, got {seq_len}")
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    budget = budget or {}
+    tokens = budget.get('estimated_effective_tokens')
+    if tokens is not None:
+        try:
+            tokens = float(tokens)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"estimated_effective_tokens must be numeric or None, got {tokens!r}") from None
+        if not math.isfinite(tokens) or tokens < 0:
+            raise ValueError(
+                f"estimated_effective_tokens must be finite and >= 0, got {tokens!r}")
+    windows = packed_window_count(tokens, seq_len)
+    unique_batches = None if windows is None else windows // batch_size
+    basis = budget.get('basis')
+    return {
+        'estimated_effective_tokens': tokens,
+        'packed_windows': windows,
+        'unique_batches': unique_batches,
+        'seq_len': seq_len,
+        'batch_size': batch_size,
+        'tokens_per_batch': seq_len * batch_size,
+        'basis': basis,
+        'exhaustive': budget.get('exhaustive'),
+        'approximate': basis not in (None, 'observed'),
+    }
+
+
+def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
+                            split: str, val_every: int = 0,
+                            max_steps: int = 0) -> dict:
+    """Does one evaluation pass consume more batches than the split holds?
+
+    Validation cycles its loader (`evaluate_heldout(..., cycle=True)`), so a
+    pass that requests more batches than the split has distinct batches
+    re-measures earlier held-out windows.  The per-batch standard error then
+    treats repeated windows as independent observations, which understates
+    the uncertainty.  The sealed test pass uses `cycle=False`, so it instead
+    *truncates*: its mean rests on fewer batches than requested.
+
+    `val_every` / `max_steps` additionally describe checkpoint selection:
+    every validation pass looks at the same finite held-out set again, so
+    the selection statistic is the maximum over many noisy draws on reused
+    data.  `selection_reuse_factor` counts how many times each distinct
+    held-out batch is evaluated across all passes (None when either the
+    frequency or the batch capacity is unknown).
+    """
+    if split not in ('validation', 'test'):
+        raise ValueError(f"split must be validation/test, got {split!r}")
+    try:
+        requested_batches = int(requested_batches)
+        val_every = int(val_every)
+        max_steps = int(max_steps)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            "requested_batches/val_every/max_steps must be integers, got "
+            f"{requested_batches!r}/{val_every!r}/{max_steps!r}") from None
+    if requested_batches < 1:
+        raise ValueError(f"requested_batches must be >= 1, got {requested_batches}")
+    if val_every < 0:
+        raise ValueError(f"val_every must be >= 0, got {val_every}")
+    if max_steps < 0:
+        raise ValueError(f"max_steps must be >= 0, got {max_steps}")
+    capacity = capacity or {}
+    unique = capacity.get('unique_batches')
+    if unique is not None:
+        if isinstance(unique, bool) or not isinstance(unique, int) or unique < 0:
+            raise ValueError(f"unique_batches must be a non-negative int or None, got {unique!r}")
+    tokens = capacity.get('estimated_effective_tokens')
+    tokens_per_batch = capacity.get('tokens_per_batch')
+    if tokens is not None:
+        tokens = float(tokens)
+    if tokens_per_batch is not None:
+        tokens_per_batch = int(tokens_per_batch)
+    distinct = None if unique is None else min(requested_batches, unique)
+    planned_tokens = (None if tokens_per_batch is None
+                      else requested_batches * tokens_per_batch)
+    token_coverage = (
+        None if tokens is None or not planned_tokens else tokens / planned_tokens)
+    if split == 'validation':
+        reuses = None if unique is None else requested_batches > unique
+        cycled = requested_batches - unique if reuses else 0
+        cycles = (None if unique in (None, 0)
+                  else ((requested_batches + unique - 1) // unique if reuses else 1))
+        truncated = False
+        shortfall = 0
+    else:
+        # The sealed pass never cycles; it consumes the unique batches once.
+        reuses = False
+        cycled = 0
+        cycles = None
+        truncated = None if unique is None else requested_batches > unique
+        shortfall = requested_batches - unique if truncated else 0
+    passes = None
+    if split == 'validation' and val_every > 0 and max_steps > 0:
+        # The trainer validates when step % val_every == 0, so a run of
+        # max_steps optimizer steps makes floor(max_steps / val_every) passes
+        # (not ceil: a partial final interval gets no validation at its end).
+        passes = max_steps // val_every
+    selection_draws = None if passes is None else passes * requested_batches
+    selection_reuse_factor = (
+        None if selection_draws is None or not unique else selection_draws / unique)
+    return {
+        'split': split,
+        'requested_batches': requested_batches,
+        'unique_batches': unique,
+        'distinct_batches_per_pass': distinct,
+        'distinct_fraction': None if distinct is None else distinct / requested_batches,
+        'reuses_batches': reuses,
+        'cycled_batches': cycled,
+        'cycles_per_pass': cycles,
+        'truncated': truncated,
+        'shortfall_batches': shortfall,
+        'planned_eval_tokens': planned_tokens,
+        'token_coverage_ratio': token_coverage,
+        'validation_passes': passes,
+        'selection_batch_draws': selection_draws,
+        'selection_reuse_factor': selection_reuse_factor,
+        'selection_reuses_batches': (
+            None if selection_reuse_factor is None else selection_reuse_factor > 1.0),
+        'basis': capacity.get('basis'),
+        'approximate': bool(capacity.get('approximate', False)),
+    }
+
+
 def _chronology_problems(reports: dict) -> list:
     """Verify the enabled split reports tile the stream in time order.
 
@@ -903,6 +1084,14 @@ def main():
     p.add_argument('--min-eval-docs', type=int, default=0, help='fail when the estimated effective document count of validation or test falls below this floor (0 = report only)')
     p.add_argument('--scheduled-train-tokens', type=int, default=0, help='planned unique training tokens (max_steps * batch_size * grad_accum * seq_len); when > 0, compare it with the estimated effective train-split budget so a silently recycled training stream is visible')
     p.add_argument('--fail-on-train-wrap', action='store_true', help='fail the audit when the scheduled training tokens exceed the estimated effective train split (the loader would start a second pass over already-seen documents)')
+    p.add_argument('--seq-len', type=int, default=1024, help='packed sequence length used by the training/evaluation loaders (for the held-out batch-budget check; must match the run)')
+    p.add_argument('--eval-batch-size', type=int, default=32, help='per-device batch size used by evaluation (for the held-out batch-budget check; must match the run)')
+    p.add_argument('--val-batches', type=int, default=10, help='batches per validation pass requested by the run (for the held-out batch-budget check)')
+    p.add_argument('--test-batches', type=int, default=20, help='batches requested by the one-shot sealed test pass (for the held-out batch-budget check)')
+    p.add_argument('--val-every', type=int, default=500, help='validation frequency in optimizer steps (0 = unknown); with --max-steps it counts how often the same held-out batches are reused for checkpoint selection')
+    p.add_argument('--max-steps', type=int, default=0, help='planned optimizer steps (0 = unknown); with --val-every it counts checkpoint-selection passes over the held-out data')
+    p.add_argument('--fail-on-eval-reuse', action='store_true', help='fail when a validation pass must cycle over fewer distinct held-out batches than requested (repeated batches are then treated as independent by the per-batch stderr)')
+    p.add_argument('--fail-on-eval-shortfall', action='store_true', help='fail when the sealed test pass requests more distinct batches than its held-out split contains (the test mean would rest on fewer batches than advertised)')
     p.add_argument('--output', default='runs/data_audit.json')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this audit tests; recorded in the report and manifest so the result is auditable as a test of a claim rather than a fishing trip')
     args = p.parse_args()
@@ -938,6 +1127,12 @@ def main():
                                  ('--near-dup-max-shingles', args.near_dup_max_shingles, 1),
                                  ('--min-eval-tokens', args.min_eval_tokens, 0),
                                  ('--min-eval-docs', args.min_eval_docs, 0),
+                                 ('--seq-len', args.seq_len, 1),
+                                 ('--eval-batch-size', args.eval_batch_size, 1),
+                                 ('--val-batches', args.val_batches, 1),
+                                 ('--test-batches', args.test_batches, 1),
+                                 ('--val-every', args.val_every, 0),
+                                 ('--max-steps', args.max_steps, 0),
                                  ('--scheduled-train-tokens', args.scheduled_train_tokens, 0)):
         if value < minimum:
             raise SystemExit(f'{flag} {value} must be >= {minimum}')
@@ -1104,6 +1299,24 @@ def main():
                     if 'train' in splits else None)
     scheduled_train_tokens = int(args.scheduled_train_tokens or 0)
     train_wrap = train_wrap_status(train_budget, scheduled_train_tokens)
+    # Evaluation-budget: the held-out token budget is not directly the number
+    # of evaluation batches the protocol will see.  Convert it through the
+    # packed-window geometry and compare with the requested pass size; this is
+    # where a validation loader that cycles (and therefore double-counts the
+    # same held-out windows in its per-batch stderr) becomes visible.
+    held_out_eval = {}
+    for name, requested in (('validation', args.val_batches),
+                            ('test', args.test_batches)):
+        if name not in token_budgets:
+            continue
+        capacity = eval_batch_capacity(token_budgets[name], args.seq_len,
+                                       args.eval_batch_size)
+        held_out_eval[name] = {
+            'capacity': capacity,
+            'pass': evaluation_reuse_status(
+                capacity, requested, split=name,
+                val_every=args.val_every, max_steps=args.max_steps),
+        }
     if args.near_dup:
         near_dup_report = near_duplicate_leakage(
             near_records, threshold=args.near_dup_threshold,
@@ -1131,6 +1344,7 @@ def main():
            'split_reports': reports, 'split_chronology_problems': chronology,
            'cleaning_and_sanity': splits, 'distribution_shift': shift,
            'held_out_token_budget': token_budgets,
+           'held_out_eval_budget': held_out_eval,
            'train_token_budget': train_budget,
            'train_stream_wrap': train_wrap,
            'near_duplicate_leakage': near_dup_report,
@@ -1187,6 +1401,37 @@ def main():
               f"{_fmt_budget(budget['estimated_effective_tokens'])} effective tokens over ~"
               f"{_fmt_budget(budget['estimated_effective_documents'])} documents "
               f"({budget['basis']}; {budget['sampled_effective_tokens']} sampled)")
+    for name, block in held_out_eval.items():
+        capacity, status = block['capacity'], block['pass']
+        unique = capacity['unique_batches']
+        if unique is None:
+            print(f"[audit] {name} eval budget: unknown (the held-out token count "
+                  f"could not be estimated), so a {status['requested_batches']}-batch "
+                  f"pass cannot be checked against the split capacity")
+            continue
+        mark = '~' if capacity['approximate'] else ''
+        coverage = status['distinct_fraction']
+        print(f"[audit] {name} eval budget: {mark}{unique} distinct batch(es) of "
+              f"{capacity['batch_size']}x{capacity['seq_len']} tokens for "
+              f"{status['requested_batches']} requested "
+              f"({coverage:.0%} of the request is unique data)")
+        if status['reuses_batches']:
+            print(f"[audit] NOTE: the {name} loader only holds {mark}{unique} distinct "
+                  f"batch(es), so a {status['requested_batches']}-batch pass cycles the "
+                  f"loader ({status['cycles_per_pass']} pass(es) over the same data); "
+                  "the per-batch stderr then treats repeated windows as independent")
+        if status['truncated']:
+            print(f"[audit] NOTE: the sealed test pass requests "
+                  f"{status['requested_batches']} batches but only {mark}{unique} are "
+                  f"available; test_loss will be computed over {unique} batch(es), a "
+                  f"shortfall of {status['shortfall_batches']}")
+        factor = status['selection_reuse_factor']
+        if factor is not None and factor > 1.0:
+            print(f"[audit] NOTE: {status['validation_passes']} validation pass(es) x "
+                  f"{status['requested_batches']} batches look at {mark}{unique} distinct "
+                  f"batch(es); each held-out batch is evaluated ~{factor:.1f} times during "
+                  "checkpoint selection, so the selected minimum is a noisy maximum over "
+                  "reused data")
     if near_dup_report['enabled']:
         if near_dup_report['pairs']:
             for key, pair in near_dup_report['pairs'].items():
@@ -1343,6 +1588,24 @@ def main():
             f"~{train_wrap['estimated_effective_tokens']:.0f} effective train tokens "
             f"(coverage {train_wrap['coverage_ratio']:.2f}x); the training loader would "
             "reuse documents in a second pass instead of consuming unique data")
+    validation_eval = (held_out_eval.get('validation') or {}).get('pass') or {}
+    test_eval = (held_out_eval.get('test') or {}).get('pass') or {}
+    if args.fail_on_eval_reuse and validation_eval.get('reuses_batches'):
+        problems.append(
+            f"the validation pass requests {validation_eval['requested_batches']} "
+            f"batches but the split holds only {validation_eval['unique_batches']} "
+            f"distinct batch(es) ({validation_eval['distinct_fraction']:.0%} unique); "
+            "the loader would cycle and the per-batch stderr would treat repeated "
+            "held-out windows as independent observations. Lower --val-batches, "
+            "raise the validation token budget, or pass --fail-on-eval-reuse only "
+            "after fixing the split")
+    if args.fail_on_eval_shortfall and test_eval.get('truncated'):
+        problems.append(
+            f"the sealed test pass requests {test_eval['requested_batches']} batches "
+            f"but the split holds only {test_eval['unique_batches']} distinct batch(es), "
+            f"so the test mean would rest on {test_eval['unique_batches']} batch(es) - "
+            f"a shortfall of {test_eval['shortfall_batches']}. Lower --test-batches or "
+            "raise the test token budget so the advertised interval is the one reported")
     problems.extend(near_dup_report.get('problems') or [])
     # The report itself must carry the verdict. It was written before the
     # leakage/sanity checks ran, so a failed audit's data_audit.json used to
@@ -1360,6 +1623,7 @@ def main():
         'options': vars(args),
         'split_reports': reports,
         'held_out_token_budget': token_budgets,
+        'held_out_eval_budget': held_out_eval,
         'train_token_budget': train_budget,
         'train_stream_wrap': train_wrap,
         'near_duplicate_leakage': near_dup_report,

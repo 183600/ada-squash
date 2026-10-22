@@ -120,3 +120,56 @@ per-scale artifacts. A direction is *replicated* only when at least two
 distinct scales agree in sign, and *certified across scales* only when at
 least two scales individually pass their own test. One scale is a
 scope-limited result, never a mechanism claim.
+
+## 7. Held-out evaluation budget and batch reuse
+
+A held-out split can be perfectly disjoint and still be too small for the
+evaluation protocol that consumes it. `scripts/train_gpt2.py` validates every
+`--val-every` optimizer steps over `--val-batches` batches; when the packed
+held-out stream yields fewer distinct batches, `evaluate_heldout` cycles the
+loader and scores the same windows more than once. The per-batch standard
+error then treats repeated windows as independent draws, and taking the
+minimum over many validation passes turns checkpoint selection into a maximum
+over reused data (the winner's curse). The sealed test pass does not cycle:
+it silently truncates, so its mean can rest on fewer batches than the
+protocol advertises.
+
+`scripts/audit_data.py` translates the effective held-out token budget into
+the number of distinct packed batches:
+
+```
+packed_windows = floor((effective_tokens - 1) / seq_len)
+unique_batches = floor(packed_windows / batch_size)
+```
+
+and reports, per held-out split, `unique_batches`, the
+`requested_batches`, `distinct_batches_per_pass`, `cycles_per_pass` and
+`distinct_fraction`. For validation it also computes
+`validation_passes = floor(max_steps / val_every)`, `selection_batch_draws`
+and `selection_reuse_factor` — how many times each distinct held-out batch is
+evaluated while selecting a checkpoint. For the sealed test it reports
+`truncated` / `shortfall_batches`. The capacity carries the token budget's
+`basis`, so a number extrapolated from a sampled prefix is labelled
+approximate rather than presented as exact.
+
+This is a planning and audit check, not a replacement for the cross-split
+hash/group ledgers: those establish that the split is disjoint, this
+establishes that the evaluation can consume the split it promises.
+`--fail-on-eval-reuse` fails an audit whose validation pass must cycle;
+`--fail-on-eval-shortfall` fails one whose sealed-test pass would be scored on
+fewer batches than requested. Pass the run's actual `--seq-len`,
+`--eval-batch-size`, `--val-batches`, `--test-batches`, `--val-every` and
+`--max-steps` to the audit.
+
+The training run itself records the same contract: `evaluate_heldout` hashes
+each held-out batch's input tokens (the held-out loaders are deterministic
+and unshuffled, so a repeated packed window has identical content), counts
+distinct windows in the pass, and stores `last_eval_unique_batches` /
+`last_eval_cycled` / `last_eval_reused` / `last_eval_shortfall` in its state.
+The results carry `final_val_loss_unique_batches`,
+`final_val_loss_reused_batches` and `validation_batch_reuse_events`, and
+`run_manifest.json` gets a `data.heldout_eval` block with the requested /
+unique / reused batch counts (including the sealed-test shortfall). The first
+validation pass whose losses are not all distinct prints a warning;
+`--fail-on-eval-reuse` makes it a hard stop before more compute is spent on a
+validation protocol that cannot support its own error bars.

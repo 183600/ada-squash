@@ -10,7 +10,10 @@ the newer data-quality guarantees:
   precise just because it is disjoint;
 * token-shingle MinHash near-duplicate detection catches cross-split
   contamination that exact/canonical document hashes miss, while still
-  reporting a sampled scan as a lower bound.
+  reporting a sampled scan as a lower bound;
+* the held-out *evaluation* budget is expressed in distinct packed batches,
+  so a validation pass that would cycle its loader (and count repeated
+  windows as independent) is visible before a run.
 """
 from __future__ import annotations
 
@@ -23,9 +26,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.audit_data import (split_token_budget, minhash_signature,
-                                near_duplicate_leakage, near_duplicate_record,
-                                token_shingles, train_wrap_status)
+from scripts.audit_data import (eval_batch_capacity, evaluation_reuse_status,
+                                packed_window_count, split_token_budget,
+                                minhash_signature, near_duplicate_leakage,
+                                near_duplicate_record, token_shingles,
+                                train_wrap_status)
 from scripts.data_pipeline import (configure_data_options, get_data_options,
                                    split_document_boundaries,
                                    validate_data_options)
@@ -256,3 +261,139 @@ def test_split_token_budget_refuses_to_invent_tokens_from_an_empty_split():
         {"count": 10})
     assert budget["estimated_effective_tokens"] is None
     assert budget["basis"] == "no_usable_documents"
+
+
+# ---------------------------------------------------------------------------
+# Held-out evaluation budget and batch reuse
+# ---------------------------------------------------------------------------
+def test_packed_window_count_matches_the_packed_stream_geometry():
+    # PackedStream needs seq_len + 1 tokens and advances by seq_len, so T
+    # tokens yield floor((T - 1) / seq_len) unique windows.
+    assert packed_window_count(None, 1024) is None
+    assert packed_window_count(0, 1024) == 0
+    assert packed_window_count(1024, 1024) == 0
+    assert packed_window_count(1025, 1024) == 1
+    assert packed_window_count(2048, 1024) == 1
+    assert packed_window_count(2049, 1024) == 2
+    with pytest.raises(ValueError):
+        packed_window_count(10, 0)
+
+
+def test_eval_batch_capacity_converts_tokens_to_distinct_batches():
+    capacity = eval_batch_capacity(
+        {"estimated_effective_tokens": 10_000, "basis": "observed"}, 1024, 2)
+    assert capacity["packed_windows"] == (10_000 - 1) // 1024
+    assert capacity["unique_batches"] == capacity["packed_windows"] // 2
+    assert capacity["tokens_per_batch"] == 2048
+    assert capacity["approximate"] is False
+    approximate = eval_batch_capacity(
+        {"estimated_effective_tokens": 10_000,
+         "basis": "extrapolated_from_sampled_prefix"}, 1024, 2)
+    assert approximate["approximate"] is True
+    with pytest.raises(ValueError):
+        eval_batch_capacity({"estimated_effective_tokens": 10}, 0, 1)
+    with pytest.raises(ValueError):
+        eval_batch_capacity({"estimated_effective_tokens": 10}, 1, 0)
+
+
+def test_validation_pass_reuse_is_reported_with_cycles_and_selection_cost():
+    capacity = {
+        "unique_batches": 3, "estimated_effective_tokens": 10_000,
+        "tokens_per_batch": 2048, "basis": "observed", "approximate": False,
+    }
+    status = evaluation_reuse_status(
+        capacity, 10, split="validation", val_every=100, max_steps=1000)
+    assert status["reuses_batches"] is True
+    assert status["distinct_batches_per_pass"] == 3
+    assert status["cycled_batches"] == 7
+    assert status["cycles_per_pass"] == 4
+    assert status["distinct_fraction"] == pytest.approx(0.3)
+    # 1000 steps / 100 = 10 passes, each asking for 10 batches, over only 3
+    # distinct held-out batches.
+    assert status["validation_passes"] == 10
+    assert status["selection_batch_draws"] == 100
+    assert status["selection_reuse_factor"] == pytest.approx(100 / 3)
+    assert status["selection_reuses_batches"] is True
+    assert status["truncated"] is False
+    # A partial final interval gets no validation pass: floor(1050/100) = 10.
+    partial = evaluation_reuse_status(
+        capacity, 10, split="validation", val_every=100, max_steps=1050)
+    assert partial["validation_passes"] == 10
+
+
+def test_sealed_test_shortfall_is_truncation_not_cycling():
+    capacity = {"unique_batches": 3, "estimated_effective_tokens": 10_000,
+                "tokens_per_batch": 2048, "basis": "observed"}
+    status = evaluation_reuse_status(capacity, 10, split="test")
+    assert status["reuses_batches"] is False
+    assert status["truncated"] is True
+    assert status["shortfall_batches"] == 7
+    assert status["distinct_batches_per_pass"] == 3
+    assert status["cycles_per_pass"] is None
+
+
+def test_eval_reuse_status_does_not_invent_a_verdict_when_capacity_is_unknown():
+    status = evaluation_reuse_status({"unique_batches": None}, 10,
+                                     split="validation", val_every=100,
+                                     max_steps=1000)
+    assert status["reuses_batches"] is None
+    assert status["truncated"] is False
+    assert status["distinct_batches_per_pass"] is None
+    assert status["selection_reuse_factor"] is None
+    assert status["selection_reuses_batches"] is None
+
+
+def test_eval_reuse_status_rejects_invalid_requests():
+    capacity = {"unique_batches": 3}
+    for kwargs in ({"requested_batches": 0, "split": "validation"},
+                   {"requested_batches": 10, "split": "dev"}):
+        with pytest.raises(ValueError):
+            evaluation_reuse_status(capacity, **kwargs)
+    with pytest.raises(ValueError):
+        evaluation_reuse_status(capacity, 10, split="validation", val_every=-1)
+
+
+def test_evaluate_heldout_reports_cycle_and_shortfall_without_changing_the_mean():
+    from contextlib import nullcontext
+
+    import torch
+
+    from scripts.train_gpt2 import evaluate_heldout
+
+    class _Cfg:
+        dropout = 0.0
+        gradient_checkpointing = False
+
+    class _Model:
+        cfg = _Cfg()
+        training = False
+
+        def __call__(self, x, y, return_logits=False):
+            return None, torch.zeros((), dtype=torch.float32)
+
+    batch = (torch.zeros((1, 2), dtype=torch.long),
+             torch.zeros((1, 2), dtype=torch.long))
+    loader = [(torch.full((1, 2), i, dtype=torch.long), batch[1])
+              for i in range(3)]
+
+    # Validation cycles: 7 requested losses describe only 3 distinct batches.
+    state = {"iter": None, "batches_consumed": 0}
+    collected: list = []
+    mean = evaluate_heldout(_Model(), loader, state, 7, nullcontext(), "cpu",
+                            collect=collected)
+    assert mean == 0.0 and len(collected) == 7
+    assert state["last_eval_cycled"] is True
+    assert state["last_eval_reused"] is True
+    assert state["last_eval_unique_batches"] == 3
+    assert state["last_eval_shortfall"] == 0
+
+    # The sealed pass never cycles: it truncates and records the shortfall.
+    state = {"iter": None, "batches_consumed": 0}
+    collected = []
+    mean = evaluate_heldout(_Model(), loader, state, 7, nullcontext(), "cpu",
+                            collect=collected, cycle=False)
+    assert mean == 0.0 and len(collected) == 3
+    assert state["last_eval_cycled"] is False
+    assert state["last_eval_reused"] is False
+    assert state["last_eval_unique_batches"] == 3
+    assert state["last_eval_shortfall"] == 4
