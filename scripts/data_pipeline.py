@@ -327,12 +327,13 @@ def split_document_boundaries(num_documents: int, val_frac: float, test_frac: fl
     is the past, validation and test are the future.  They are disjoint by
     construction, so no document (group) can appear on two sides.
     """
-    num_documents = int(num_documents)
-    if num_documents <= 0:
-        raise ValueError(f"num_documents must be positive, got {num_documents}")
-    val_frac, test_frac = float(val_frac), float(test_frac)
-    if not (0.0 <= val_frac < 1.0 and 0.0 <= test_frac < 1.0):
-        raise ValueError(f"val_frac/test_frac must be in [0, 1), got {val_frac}/{test_frac}")
+    # `int(1000.5)`/`int("1000")` silently changes the corpus length the
+    # boundaries are placed over, and a bool is not a document count. Validate
+    # the geometry instead of coercing it, exactly like the data options that
+    # feed this helper.
+    num_documents = _int_option("num_documents", num_documents, 1)
+    val_frac = _fraction_option("val_frac", val_frac)
+    test_frac = _fraction_option("test_frac", test_frac)
     if val_frac + test_frac >= 1.0:
         # Validate the requested fractions before rounding. Banker's rounding
         # can otherwise round both halves down and leave a (small) train
