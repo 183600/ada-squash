@@ -1409,16 +1409,40 @@ def main():
         # `ckpt_best.pt`, which is the checkpoint the final test evaluation
         # restores. Seed it from the historical best instead.
         best_path = Path(args.output_dir) / 'ckpt_best.pt'
+        resume_path = Path(args.resume)
+        resumed_best = (resume_path.resolve() == best_path.resolve()
+                        or resume_path.name == 'ckpt_best.pt')
         best_candidates = []
-        if resume_ckpt.get('val_loss') is not None:
+        if best_path.exists():
+            if resumed_best:
+                # The resumed checkpoint *is* the best checkpoint in this
+                # output directory; its recorded val_loss is the tracker's
+                # seed without a second read.
+                if resume_ckpt.get('val_loss') is not None:
+                    best_candidates.append({'val_loss': float(resume_ckpt['val_loss']),
+                                            'step': int(resume_ckpt.get('step', 0))})
+                else:
+                    prior = _load_checkpoint_cpu(best_path)
+                    best_candidates.append({'val_loss': float(prior['val_loss']),
+                                            'step': int(prior.get('step', 0))})
+                    del prior
+            else:
+                # A separate best file is the verified selection artifact;
+                # only its recorded scalar may seed the tracker.
+                prior = _load_checkpoint_cpu(best_path)
+                best_candidates.append({'val_loss': float(prior['val_loss']),
+                                        'step': int(prior.get('step', 0))})
+                del prior
+        elif resumed_best and resume_ckpt.get('val_loss') is not None:
+            # Resume from a best checkpoint into a fresh output directory:
+            # keep that selection artifact there, otherwise the final test
+            # would silently restore ckpt_final.pt while the manifest still
+            # reported the historical best.
+            best_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_torch_save(resume_ckpt, best_path)
             best_candidates.append({'val_loss': float(resume_ckpt['val_loss']),
                                     'step': int(resume_ckpt.get('step', 0))})
-        if best_path.exists() and Path(args.resume).resolve() != best_path.resolve():
-            # Only the two scalars drive the tracker.
-            prior = _load_checkpoint_cpu(best_path)
-            best_candidates.append({'val_loss': float(prior['val_loss']),
-                                    'step': int(prior.get('step', 0))})
-            del prior
+            print(f'[resume] copied the resumed best checkpoint to {best_path}')
         if best_candidates:
             prior_best = min(best_candidates, key=lambda c: c['val_loss'])
             best_val_loss = float(prior_best['val_loss'])
@@ -1985,6 +2009,15 @@ def main():
                 last_val_loss = float(resumed_val)
                 last_val_step = step
         has_best_val = math.isfinite(best_val_loss)
+        best_ckpt_path = Path(args.output_dir) / 'ckpt_best.pt'
+        if has_best_val and not best_ckpt_path.exists():
+            # A best validation number without the weights it selected cannot
+            # back a test/evaluation restore; report it as missing rather than
+            # letting the final checkpoint masquerade as the best one.
+            print(f'[warn] best_val_loss={best_val_loss:.4f} has no {best_ckpt_path.name} '
+                  'artifact in this output directory; not reporting it as a selected '
+                  'checkpoint', file=sys.stderr)
+            has_best_val = False
         run_manifest['results'] = {
             'final_step': step,
             'last_train_loss': last_train_loss,
@@ -2054,7 +2087,6 @@ def main():
             'train_jsonl': file_fingerprint(log_path),
             'checkpoint_final': artifact_record(Path(args.output_dir) / 'ckpt_final.pt'),
         }
-        best_ckpt_path = Path(args.output_dir) / 'ckpt_best.pt'
         if has_best_val and best_ckpt_path.exists():
             run_manifest['artifacts']['checkpoint_best'] = artifact_record(best_ckpt_path)
         if n_nonfinite_losses or n_nonfinite_gradients or n_nonfinite_val_losses:
