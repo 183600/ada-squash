@@ -213,6 +213,13 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         return (grad_logits, None, None, None)
 
 def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int=-100, chunk_rows: Optional[int]=None) -> torch.Tensor:
+    # `F.cross_entropy` accepts logits of shape (..., V) with matching target
+    # shape (...,). The chunked node slices the leading dimension, so flatten
+    # the leading dims first; otherwise a valid 3-D call is sliced on dim 0
+    # but its targets are not, and nll_loss sees mismatched shapes.
+    if logits.dim() > 2:
+        logits = logits.reshape(-1, logits.size(-1))
+        targets = targets.reshape(-1)
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(logits.size(-1))
     if logits.size(0) == 0:
