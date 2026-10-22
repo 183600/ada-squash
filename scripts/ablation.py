@@ -23,9 +23,19 @@ Comparison protocol (what the runner guarantees, and checks)
   `leave_one_out_comparison` then runs the paired Full-vs-Full-minus-X test
   (Holm-adjusted over mechanisms), so "each axis helps" is a tested claim
   rather than an eyeballed delta. `check_factorial` additionally verifies the
-  four tanh cells of `FACTORIAL_SPEC`, and `factorial_comparison` reports the
-  two main effects and their interaction, so a synergy claim is tested rather
-  than inferred from Full's point estimate.
+  four cells of each `FACTORIAL_SPEC` design, and `factorial_comparison`
+  reports the two main effects and their interaction, so a synergy claim is
+  tested rather than inferred from Full's point estimate.
+* **Cross-axis (2x2x2) interactions and tested orthogonality.**
+  `check_three_way_factorial` verifies the union of the softsign and tanh
+  2x2 designs as one complete 2x2x2 factorial over per-channel, depth and
+  activation. `three_way_factorial_comparison` then estimates the two
+  cross-family two-way interactions and the three-way interaction that the
+  separate 2x2 reports cannot see. Each pairwise interaction gets a TOST
+  equivalence test, so the proposal's "three orthogonal axes" claim is
+  certified only when every interaction is equivalent within a pre-specified
+  loss margin - a non-significant interaction is reported as such, not
+  relabelled as additivity.
 * **Statistical reliability.** Every row is replicated over >= 3 seeds by
   default and reported as mean +/- std across seeds; the row-vs-baseline
   significance test is a one-sided paired Student-t test on the per-seed
@@ -63,9 +73,10 @@ Comparison protocol (what the runner guarantees, and checks)
   refuses to certify an arm left below three analyzable seeds;
   `--require-exclusion-audit` makes that a hard failure.
 * **Pre-registered analysis plan.** `build_analysis_plan` freezes every
-  confirmatory contrast (baseline, leave-one-out, factorial, QK) with a stable
-  id, its stated hypothesis, test direction and a SHA-256 fingerprint before
-  training starts, and writes `analysis_plan.json`. `study_level_tests.json`
+  confirmatory contrast (baseline, leave-one-out, 2x2 factorial, 2x2x2
+  factorial interactions, QK) with a stable id, its stated hypothesis, test
+  direction and a SHA-256 fingerprint before training starts, and writes
+  `analysis_plan.json`. `study_level_tests.json`
   then applies hierarchical Holm gatekeeping: the primary tier (main
   proposal vs best baseline, its leave-one-out mechanisms, the main softsign
   factorial) is corrected first; the secondary tier is tested only if a
@@ -100,6 +111,7 @@ Comparison protocol (what the runner guarantees, and checks)
 import argparse
 import dataclasses
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -505,6 +517,227 @@ FACTORIAL_SPEC = {
     },
 }
 
+# A complete 2x2x2 factorial over the three axes the proposal calls
+# orthogonal: per-channel adaptation, depth conditioning, and the activation
+# family (generalized softsign vs tanh).  The two 2x2 designs above each
+# estimate a per-channel x depth interaction *inside one activation family*;
+# neither can tell whether that interaction is the same under the other
+# family.  This design does, and it is the only place where the "three
+# orthogonal axes" claim is actually tested rather than asserted.
+#
+# The eight cells already exist in the shipped matrix (they are the union of
+# the softsign and tanh 2x2 designs), so the 2x2x2 analysis adds no training
+# cost.  `check_three_way_factorial` verifies that switching one factor
+# changes exactly the declared knobs in every context of the other two.  The
+# per-channel "off" state is implemented as a frozen zero delta buffer in the
+# softsign cells and as the delta-free dytd_tanh class in the tanh cells;
+# those two representations are functionally the same (both contribute
+# exactly alpha_l), and the declared diff sets below record the difference
+# explicitly instead of hiding it.  Likewise the activation switch moves
+# between a fused kernel and its plain-autograd comparator, which the
+# per-parameter kernel tests already pin as numerically equivalent.  The
+# activation factor is the whole squash family: the softsign cells carry the
+# learnable `p`, the tanh cells do not (the `dytcd_fixed_p` leave-one-out row
+# isolates learnable p inside the softsign family), so a cross-family
+# interaction is a statement about the family as deployed, not about tanh
+# with p held fixed.
+#
+# The interaction terms are tested two-sided (a synergy and an antagonism are
+# both findings), and each pairwise interaction also gets a TOST equivalence
+# test.  "The axes are orthogonal" is an equivalence claim: a non-significant
+# interaction is not evidence of additivity, so the orthogonality verdict is
+# only available when a positive `--equivalence-margin` was registered.
+THREE_WAY_FACTORIAL_SPEC = {
+    'per_channel_x_depth_x_activation': {
+        'design_type': '2x2x2',
+        'context': (
+            'all eight cells of the shipped matrix: per-channel x depth under '
+            'generalized softsign and under tanh, same gamma/beta, LayerScale, '
+            'alpha_0/k/p initialization context and optimizer recipe. The '
+            'per-channel-off tanh cells use the delta-free dytd_tanh class; '
+            'the per-channel-off softsign cells use a frozen zero delta buffer. '
+            'The activation factor is the whole squash family, so the softsign '
+            'cells carry the learnable p while the tanh cells do not; the '
+            'separate dytcd_fixed_p row isolates learnable p within softsign.'),
+        'factors': ('per_channel', 'depth', 'activation'),
+        'levels': {
+            'per_channel': ('off', 'on'),
+            'depth': ('off', 'on'),
+            'activation': ('softsign', 'tanh'),
+        },
+        'cells': {
+            'per_channel=off|depth=off|activation=softsign': 'dytcd_no_perchannel_no_depth',
+            'per_channel=on|depth=off|activation=softsign': 'dytcd_k0_no_depth_schedule',
+            'per_channel=off|depth=on|activation=softsign': 'dytcd_no_perchannel',
+            'per_channel=on|depth=on|activation=softsign': 'dytcd_full',
+            'per_channel=off|depth=off|activation=tanh': 'dytd_tanh_k0',
+            'per_channel=on|depth=off|activation=tanh': 'dytc_perchannel_tanh_k0',
+            'per_channel=off|depth=on|activation=tanh': 'dytd_tanh_full',
+            'per_channel=on|depth=on|activation=tanh': 'dytcd_no_softsign',
+        },
+        # Allowed effective-config differences for one factor switch, keyed by
+        # the context of the *other* factors. A context key is a
+        # `|`-separated `factor=level` list; '*' matches every context, and a
+        # partial key matches every context that agrees with it.
+        'diffs': {
+            'per_channel': {
+                'activation=softsign': ('learnable_delta',),
+                'activation=tanh': ('norm_name',),
+            },
+            'depth': {
+                '*': ('k_init', 'learnable_k'),
+            },
+            'activation': {
+                'per_channel=off|depth=off': ('norm_name', 'learnable_delta'),
+                'per_channel=off|depth=on': ('norm_name', 'learnable_delta'),
+                'per_channel=on|depth=off': ('norm_name',),
+                'per_channel=on|depth=on': ('norm_name',),
+            },
+        },
+    },
+}
+
+def _parse_three_way_cell_key(key: str) -> dict:
+    """`'per_channel=on|depth=off|activation=tanh'` -> a plain assignment dict."""
+    assignment = {}
+    for part in str(key).split('|'):
+        if not part:
+            continue
+        name, _, value = part.partition('=')
+        if not name or not value:
+            raise ValueError(f'malformed factorial cell key {key!r}')
+        assignment[name] = value
+    return assignment
+
+def _three_way_cell_key(assignment: dict, factors) -> str:
+    return '|'.join(f'{factor}={assignment[factor]}' for factor in factors)
+
+def _context_matches(context: str, assignment: dict) -> bool:
+    """Whether a partial `factor=level|...` context agrees with `assignment`."""
+    if context == '*':
+        return True
+    for part in str(context).split('|'):
+        if not part:
+            continue
+        name, _, value = part.partition('=')
+        if not name or not value:
+            return False
+        if assignment.get(name) != value:
+            return False
+    return True
+
+def check_three_way_factorial(rows: dict, model_name: str,
+                              spec: dict | None=None) -> dict:
+    """Verify the 2x2x2 design is complete and every factor switch is clean.
+
+    A 2x2x2 interaction is only interpretable when each factor is switched
+    against the same background in every context.  For each factor and each
+    combination of the other two factors this checks that the effective model
+    config changes in exactly one of the declared ways (the implementation of
+    "per-channel off" legitimately differs between the softsign and tanh
+    cells, so the allowed diff is context-dependent), and that all eight
+    cells are present.  A missing or confounded cell is rejected before any
+    training starts, exactly like the 2x2 coverage check.
+    """
+    spec = THREE_WAY_FACTORIAL_SPEC if spec is None else spec
+    problems: list[str] = []
+    report: dict = {}
+    for design_name, design in spec.items():
+        factors = tuple(design.get('factors') or ())
+        levels = design.get('levels') or {}
+        cells = design.get('cells') or {}
+        diffs = design.get('diffs') or {}
+        if len(factors) != 3:
+            problems.append(f"3-way factorial '{design_name}' must declare exactly "
+                            f"three factors, got {list(factors)}")
+            continue
+        missing_levels = [factor for factor in factors
+                          if len(levels.get(factor) or ()) != 2]
+        if missing_levels:
+            problems.append(f"3-way factorial '{design_name}' factor(s) without two "
+                            f"levels: {missing_levels}")
+            continue
+        expected_cells = {
+            _three_way_cell_key(dict(zip(factors, combo)), factors): combo
+            for combo in itertools.product(*(levels[factor] for factor in factors))
+        }
+        missing = sorted(set(expected_cells) - set(cells))
+        extra = sorted(set(cells) - set(expected_cells))
+        if missing or extra:
+            problems.append(
+                f"3-way factorial '{design_name}' does not cover the full 2x2x2: "
+                f"missing {missing}, extra {extra}")
+            continue
+        absent_rows = sorted({row for row in cells.values() if row not in rows})
+        if absent_rows:
+            problems.append(
+                f"3-way factorial '{design_name}' references absent row(s) "
+                f"{absent_rows}")
+            continue
+        cfg_cache: dict[str, dict] = {}
+
+        def _cfg(row_name: str) -> dict:
+            if row_name not in cfg_cache:
+                cfg_cache[row_name] = _effective_cfg(model_name, rows[row_name])
+            return cfg_cache[row_name]
+
+        report[design_name] = {
+            'design_type': design.get('design_type', '2x2x2'),
+            'context': design.get('context'),
+            'factors': list(factors),
+            'levels': {factor: list(levels[factor]) for factor in factors},
+            'cells': dict(cells),
+            'switches': {},
+        }
+        clean = True
+        for factor in factors:
+            others = [name for name in factors if name != factor]
+            allowed_by_context = diffs.get(factor) or {}
+            if not allowed_by_context:
+                problems.append(
+                    f"3-way factorial '{design_name}', factor '{factor}': no "
+                    f"declared effective-config diff")
+                clean = False
+                break
+            switches = {}
+            for combo in itertools.product(*(levels[name] for name in others)):
+                background = dict(zip(others, combo))
+                first, second = levels[factor]
+                first_key = _three_way_cell_key(
+                    dict(background, **{factor: first}), factors)
+                second_key = _three_way_cell_key(
+                    dict(background, **{factor: second}), factors)
+                first_cfg, second_cfg = _cfg(cells[first_key]), _cfg(cells[second_key])
+                actual = {key for key in set(first_cfg) | set(second_cfg)
+                          if first_cfg.get(key) != second_cfg.get(key)}
+                allowed = [set(value) for context, value in allowed_by_context.items()
+                           if _context_matches(context, background)]
+                if not allowed:
+                    problems.append(
+                        f"3-way factorial '{design_name}', factor '{factor}': "
+                        f"context {background} has no declared diff")
+                    clean = False
+                    break
+                if not any(actual == candidate for candidate in allowed):
+                    problems.append(
+                        f"3-way factorial '{design_name}', factor '{factor}' in "
+                        f"{background}: {cells[second_key]} vs {cells[first_key]} "
+                        f"differ in {sorted(actual)}, expected one of "
+                        f"{[sorted(value) for value in allowed]}")
+                    clean = False
+                    break
+                switches[_three_way_cell_key(background, others)] = {
+                    'from': cells[first_key], 'to': cells[second_key],
+                    'diff': sorted(actual),
+                }
+            if not clean:
+                break
+            report[design_name]['switches'][factor] = switches
+    if problems:
+        raise ValueError('3-way factorial coverage is incomplete: '
+                         + '; '.join(problems))
+    return report
+
 def _effective_cfg(model_name: str, cfg_kwargs: dict) -> dict:
     """The full GPTConfig a matrix row builds, as a plain dict."""
     with torch.device('meta'):
@@ -677,6 +910,7 @@ def validate_matrix(rows: dict, hypotheses: dict, model_name: str) -> dict:
     return {'rows': sorted(rows),
             'leave_one_out': check_leave_one_out(rows, model_name),
             'factorial': check_factorial(rows, model_name),
+            'three_way_factorial': check_three_way_factorial(rows, model_name),
             'qk_axis': check_qk_axis(rows, model_name)}
 
 def install_outlier_channel(model, scale: float=25.0) -> int:
@@ -2994,6 +3228,355 @@ def print_factorial_comparison(comparison: dict | None) -> None:
               f"seeds are described but never certified: "
               f"{comparison['rows_tested_descriptively_only']}")
 
+def _factorial_term_coefficients(factors, levels: dict, cells: dict,
+                                 term_factors) -> dict:
+    """Orthogonal (sum-to-zero) coefficients for one factorial term.
+
+    Levels are coded -1 / +1 in declaration order. A term over `t` of the
+    `k` factors multiplies the cell's product code by ``2**-(k-t)``, which
+    averages over the factors not in the term. For a 2x2x2 design the
+    resulting coefficients are the usual ``+1/-1`` contrasts for interactions
+    and ``+/-1/4`` for main effects, without hard-coding each formula.
+    """
+    term = set(term_factors)
+    unknown = term - set(factors)
+    if unknown:
+        raise ValueError(f'factorial term names unknown factor(s) {sorted(unknown)}')
+    if not term:
+        raise ValueError('a factorial term must name at least one factor')
+    scale = 1.0 / (2 ** (len(factors) - len(term)))
+    out = {}
+    for cell_key in cells:
+        assignment = _parse_three_way_cell_key(cell_key)
+        code = 1
+        for factor in term:
+            factor_levels = levels[factor]
+            if assignment.get(factor) not in factor_levels:
+                raise ValueError(
+                    f'factorial cell {cell_key!r} has no valid level for {factor!r}')
+            code *= 1 if assignment[factor] == factor_levels[1] else -1
+        out[cell_key] = code * scale
+    return out
+
+def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
+                                   margin: float=0.0, alpha: float=0.05,
+                                   equivalence_margin: float=0.0) -> dict | None:
+    """Paired main effects and all interactions of a 2x2x2 ablation design.
+
+    The two 2x2 reports estimate per-channel x depth interactions separately
+    under generalized softsign and under tanh. This function pools the eight
+    cells into one 2x2x2 design and reports:
+
+    * the per-channel and depth main effects, averaged over both activation
+      families (more efficient than either 2x2 estimate alone);
+    * all three two-way interactions, including the per-channel x activation
+      and depth x activation terms that no existing report estimates; and
+    * the three-way interaction, i.e. whether the per-channel x depth
+      interaction itself differs between the activation families.
+
+    Every term is a per-seed linear contrast of the eight cell means (levels
+    coded -1/+1), tested with the same paired t reference as the rest of the
+    module; only >= 3 shared seeds can certify. Interactions are two-sided
+    (synergy and antagonism are both findings), and each pairwise interaction
+    also carries a TOST equivalence test. The orthogonality block therefore
+    only returns a verdict when a positive `equivalence_margin` was
+    pre-specified: "no significant interaction" is not evidence that the axes
+    are additive, whereas an equivalence test within a stated loss margin is.
+    """
+    spec = THREE_WAY_FACTORIAL_SPEC if spec is None else spec
+    usable = {r['name']: r for r in summaries
+              if isinstance(r, dict) and 'name' in r
+              and _finite_metric(r.get('val_loss'))}
+    rows: list = []
+    design_reports: dict = {}
+    for design_name, design in spec.items():
+        factors = tuple(design.get('factors') or ())
+        levels = design.get('levels') or {}
+        cells = design.get('cells') or {}
+        base = {'design': design_name, 'factors': list(factors),
+                'design_type': design.get('design_type', '2x2x2'),
+                'context': design.get('context'), 'shared_seeds': []}
+        if len(factors) != 3:
+            rows.append(dict(base, effect=None, kind='design', skipped=(
+                f'design must have exactly three factors, got {list(factors)}')))
+            continue
+        missing = [key for key, row in cells.items() if row not in usable]
+        if missing:
+            rows.append(dict(base, effect=None, kind='design', skipped=(
+                f"cell row(s) {sorted({cells[key] for key in missing})} have no "
+                f"usable val_loss")))
+            continue
+        seed_values = {key: _seed_means(usable[row]) for key, row in cells.items()}
+        common = sorted(set.intersection(
+            *(set(values) for values in seed_values.values())))
+        if len(common) < 2:
+            rows.append(dict(base, effect=None, kind='design',
+                             shared_seeds=common, skipped=(
+                                 f'only {len(common)} seed(s) are shared by all '
+                                 f'eight cells; a paired contrast needs at least 2')))
+            continue
+        design_reports[design_name] = {
+            'design_type': design.get('design_type', '2x2x2'),
+            'factors': list(factors),
+            'levels': {factor: list(levels[factor]) for factor in factors},
+            'cells': dict(cells),
+            'shared_seeds': common,
+        }
+
+        def _term_values(term_factors) -> dict:
+            coefficients = _factorial_term_coefficients(
+                factors, levels, cells, term_factors)
+            return {
+                seed: sum(coefficient * seed_values[key][seed]
+                          for key, coefficient in coefficients.items())
+                for seed in common
+            }
+
+        terms: list[tuple[tuple, str, str]] = []
+        for factor in factors:
+            if factor in ('per_channel', 'depth'):
+                terms.append(((factor,), 'main_effect',
+                              'mean over both levels of the other two factors: '
+                              'on - off'))
+        for first, second in itertools.combinations(factors, 2):
+            others = [name for name in factors if name not in (first, second)]
+            terms.append(((first, second), 'interaction',
+                          f'{first} x {second} interaction, averaged over '
+                          f'{others[0] if others else "the remaining factor"}'))
+        if len(factors) == 3:
+            terms.append((tuple(factors), 'interaction',
+                          'three-way interaction: change in the '
+                          f'{factors[0]} x {factors[1]} interaction between '
+                          f'the two levels of {factors[2]}'))
+        for term_factors, kind, formula in terms:
+            per_seed = _term_values(term_factors)
+            values = [per_seed[seed] for seed in common]
+            test = paired_t_one_sided(values, [0.0] * len(values),
+                                      margin=margin, alpha=alpha)
+            two_sided_test = paired_t_one_sided(
+                values, [0.0] * len(values), margin=0.0, alpha=alpha)
+            p_two_sided = two_sided_p_from_t(
+                two_sided_test['t'], two_sided_test['df'])
+            replicated = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
+            effect = '_x_'.join(term_factors)
+            entry = dict(
+                base, effect=effect, kind=kind, term_factors=list(term_factors),
+                # Only the interaction terms are added to the pre-registered
+                # plan. The pooled main effects are supporting estimates: the
+                # same factors are already pre-registered inside each 2x2
+                # design, and registering a third, highly correlated estimate
+                # would inflate the study family without adding a new claim.
+                analysis_role=('supporting_pooled_main_effect'
+                               if kind == 'main_effect'
+                               else 'cross_axis_interaction'),
+                formula=formula, shared_seeds=common, n_seeds=len(common),
+                delta_seed_mean=sum(values) / len(values),
+                per_seed_delta={str(seed): value
+                                for seed, value in per_seed.items()},
+                n_seeds_favoring=sum(value < 0.0 for value in values),
+                n_seeds_tied=sum(value == 0.0 for value in values),
+                n_seeds_against=sum(value > 0.0 for value in values),
+                effect_helps=bool(sum(values) / len(values) < -margin),
+                effect_helps_significantly=False,
+                test=test['test'],
+                test_basis=('seed_means' if replicated
+                            else f'seed_means_{len(common)}_descriptive'),
+                replicated_across_seeds=replicated,
+                p_one_sided=test['p_one_sided'],
+                p_one_sided_holm=None,
+                p_two_sided=p_two_sided,
+                p_two_sided_holm=None,
+                interaction_direction=None,
+                interaction_differs_significantly=None,
+                orthogonal_within_margin=None,
+                t=test['t'], df=test['df'],
+                delta_ci_95=[test['ci_low'], test['ci_high']],
+                n=test['n'])
+            if kind == 'interaction':
+                delta = entry['delta_seed_mean']
+                if delta < -margin:
+                    entry['interaction_direction'] = 'negative'
+                elif delta > margin:
+                    entry['interaction_direction'] = 'positive'
+                else:
+                    entry['interaction_direction'] = 'additive_or_within_margin'
+            effect_row = {'per_seed': [
+                {'seed': int(seed), 'val_loss': value}
+                for seed, value in per_seed.items()]}
+            zero_row = {'per_seed': [
+                {'seed': int(seed), 'val_loss': 0.0} for seed in per_seed]}
+            entry.update(_paired_effect_summary(
+                effect_row, zero_row, common, test, alpha=alpha, margin=margin))
+            entry.update(_robustness_for_deltas(
+                {str(seed): float(value) for seed, value in per_seed.items()},
+                alpha=alpha, equivalence_margin=equivalence_margin))
+            paired_std = entry.get('paired_delta_std')
+            if (isinstance(paired_std, (int, float)) and paired_std > 0.0
+                    and entry.get('delta_seed_mean') is not None):
+                entry['delta_over_paired_std'] = (
+                    abs(entry['delta_seed_mean']) / paired_std)
+                entry['within_paired_seed_noise'] = bool(
+                    abs(entry['delta_seed_mean']) < paired_std)
+            else:
+                entry['delta_over_paired_std'] = None
+                entry['within_paired_seed_noise'] = None
+            if kind == 'interaction':
+                equivalence = entry.get('equivalence') or {}
+                if equivalence.get('enabled'):
+                    entry['orthogonal_within_margin'] = bool(
+                        equivalence.get('equivalent'))
+            rows.append(entry)
+    if not rows:
+        return None
+    family = [entry for entry in rows
+              if entry.get('replicated_across_seeds') and not entry.get('skipped')]
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['effect_helps_significantly'] = bool(
+            entry['effect_helps'] and p_holm is not None and p_holm < alpha)
+    interaction_family = [entry for entry in family
+                          if entry.get('kind') == 'interaction']
+    interaction_adjusted = holm_adjust(
+        [entry.get('p_two_sided') for entry in interaction_family])
+    for entry, p_holm in zip(interaction_family, interaction_adjusted):
+        entry['p_two_sided_holm'] = p_holm
+        entry['interaction_differs_significantly'] = bool(
+            p_holm is not None and p_holm < alpha)
+    pairwise = [entry for entry in interaction_family
+                if len(entry.get('term_factors') or ()) == 2]
+    triple = [entry for entry in interaction_family
+              if len(entry.get('term_factors') or ()) == 3]
+    interactions_block = {
+        entry['effect']: {
+            'delta_seed_mean': entry['delta_seed_mean'],
+            'interaction_direction': entry['interaction_direction'],
+            'differs_significantly': entry['interaction_differs_significantly'],
+            'equivalent': (entry.get('equivalence') or {}).get('equivalent'),
+            'orthogonal_within_margin': entry.get('orthogonal_within_margin'),
+        }
+        for entry in pairwise + triple
+    }
+    if equivalence_margin and equivalence_margin > 0.0:
+        if pairwise:
+            pairwise_verdict = (
+                all(entry.get('orthogonal_within_margin') is not None
+                    for entry in pairwise)
+                and all(entry.get('orthogonal_within_margin')
+                        for entry in pairwise))
+            orthogonality_note = (
+                'pairwise axes are orthogonal within +/- '
+                f'{equivalence_margin:g} only when every pairwise interaction '
+                'TOST passes; a non-significant interaction alone is not '
+                'equivalence')
+        else:
+            pairwise_verdict = None
+            orthogonality_note = 'no pairwise interaction could be tested'
+        if triple:
+            triple_equiv = (triple[0].get('equivalence') or {}).get('equivalent')
+        else:
+            triple_equiv = None
+    else:
+        pairwise_verdict = None
+        triple_equiv = None
+        orthogonality_note = (
+            'no positive --equivalence-margin was pre-specified, so the axes '
+            'cannot be claimed orthogonal from non-significant interactions; '
+            'the interaction estimates are reported descriptively')
+    tested_descriptively = [entry['effect'] for entry in rows
+                            if entry.get('p_one_sided') is not None
+                            and not entry.get('replicated_across_seeds')]
+    return {
+        'schema': 'adasquash.three_way_factorial.v1',
+        'protocol': (
+            '2x2x2 per-seed orthogonal contrasts on the seeds shared by all '
+            'eight cells; levels coded -1/+1, main effects averaged over the '
+            'other two factors; interactions are two-sided and Holm-corrected '
+            'as their own family. Only >= '
+            f'{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds can certify. The four '
+            'interaction terms are pre-registered; the pooled main effects '
+            'carry analysis_role=supporting_pooled_main_effect and are not '
+            'counted as new confirmatory claims.'),
+        'margin': margin,
+        'alpha': alpha,
+        'equivalence_margin': equivalence_margin,
+        'designs': design_reports,
+        'rows': rows,
+        'multiple_comparison': (
+            f'Holm-Bonferroni over {len(family)} seed-replicated term(s) '
+            'using the one-sided p-value for the directional `helps` claim'),
+        'interaction_multiple_comparison': (
+            f'Holm-Bonferroni over {len(interaction_family)} seed-replicated '
+            'interaction(s) using the two-sided p-value; covers negative and '
+            'positive interactions'),
+        'orthogonality': {
+            'margin': equivalence_margin,
+            'interactions': interactions_block,
+            'axes_orthogonal_within_margin': pairwise_verdict,
+            'three_way_interaction_absent_within_margin': triple_equiv,
+            'note': orthogonality_note,
+        },
+        'reading_guide': (
+            'levels are coded -1/+1 in declaration order (per_channel off/on, '
+            'depth off/on, activation softsign/tanh). A negative main effect '
+            'means switching the factor on lowers val_loss. A negative '
+            'two-way interaction means the combined effect is more negative '
+            'than the sum of the separate effects (synergy); a positive one '
+            'means antagonism. For an interaction involving activation, '
+            'negative means the effect is stronger under tanh than softsign '
+            '(coded +1); for the three-way term, negative means the '
+            'per-channel x depth interaction is more negative under tanh than '
+            'under softsign. `orthogonal_within_margin` is a TOST verdict and '
+            'is None when no positive equivalence margin was registered.'),
+        'rows_tested_descriptively_only': tested_descriptively,
+    }
+
+def print_three_way_factorial_comparison(comparison: dict | None) -> None:
+    if comparison is None:
+        print('[factorial3] no 2x2x2 factorial design declared; '
+              'cross-axis interaction test skipped')
+        return
+    for entry in comparison['rows']:
+        if entry.get('skipped'):
+            print(f"[factorial3] {entry['design']}: SKIPPED ({entry['skipped']})")
+            continue
+        p_str = 'n/a' if entry['p_one_sided'] is None else f"{entry['p_one_sided']:.3g}"
+        p_holm = ('n/a' if entry['p_one_sided_holm'] is None
+                  else f"{entry['p_one_sided_holm']:.3g}")
+        p2 = entry.get('p_two_sided')
+        p2_holm = entry.get('p_two_sided_holm')
+        ci = entry.get('delta_ci_95')
+        ci_str = '' if ci is None else f"ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}] "
+        note = ('' if entry['replicated_across_seeds']
+                else ' [descriptive only, not certified]')
+        interaction = ''
+        if entry.get('kind') == 'interaction':
+            interaction = (
+                f" direction={entry.get('interaction_direction')} "
+                f"p(two-sided)={'n/a' if p2 is None else f'{p2:.3g}'} "
+                f"p2(holm)={'n/a' if p2_holm is None else f'{p2_holm:.3g}'} "
+                f"differs={entry.get('interaction_differs_significantly')} "
+                f"orthogonal_within_margin={entry.get('orthogonal_within_margin')}")
+        print(f"[factorial3] {entry['effect']} ({entry['kind']}): "
+              f"delta={entry['delta_seed_mean']:+.4f} {ci_str}"
+              f"seeds_favoring={entry['n_seeds_favoring']}/{entry['n_seeds']} "
+              f"p(one-sided)={p_str} p(holm)={p_holm} "
+              f"helps={entry['effect_helps']} "
+              f"significant={entry['effect_helps_significantly']}{note}"
+              f"{interaction}{_robustness_note(entry)}")
+    orthogonality = comparison.get('orthogonality') or {}
+    print(f"[factorial3] orthogonality: axes_orthogonal_within_margin="
+          f"{orthogonality.get('axes_orthogonal_within_margin')} "
+          f"three_way_absent_within_margin="
+          f"{orthogonality.get('three_way_interaction_absent_within_margin')} "
+          f"margin={orthogonality.get('margin')}")
+    if orthogonality.get('note'):
+        print(f"[factorial3] note: {orthogonality['note']}")
+    if comparison.get('rows_tested_descriptively_only'):
+        print(f"[factorial3] NOTE: terms with fewer than "
+              f"{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are described but "
+              f"never certified: {comparison['rows_tested_descriptively_only']}")
+
 def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         baseline_names, model_name: str, seeds,
                         alpha: float=0.05, margin: float=0.0,
@@ -3006,8 +3589,9 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     in advance. Discovering an extra row after seeing the results and then
     correcting only the surviving family is a well-known way to manufacture a
     "significant" ablation. This function derives every mechanism / baseline /
-    factorial / QK contrast from the already-validated matrix (so it cannot
-    name a contrast the matrix does not isolate), records the stated
+    factorial / 2x2x2 interaction / QK contrast from the already-validated
+    matrix (so it cannot name a contrast the matrix does not isolate), records
+    the stated
     hypothesis and test direction, and hashes the whole registry. The hash is
     written next to the results; `study_level_correction` only admits tests
     whose id appears here, and everything else is reported as unregistered
@@ -3108,6 +3692,41 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                 'hypothesis': (f'{first} and {second} interact (synergy or '
                                f'antagonism) in {design}'),
             })
+    # The 2x2x2 design adds the two interactions that involve the activation
+    # family and the three-way term. Main effects are deliberately not
+    # re-registered: they are already pre-registered by the two 2x2 designs,
+    # and registering the pooled estimate as well would count the same
+    # mechanism twice in the study-level Holm family. The pooled 2x2x2
+    # interaction terms are different estimands from the within-family 2x2
+    # interactions, so they are new tests, not duplicates.
+    for design, info in sorted(
+            (matrix_report.get('three_way_factorial') or {}).items()):
+        factor_names = list((info or {}).get('factors') or [])
+        for first, second in itertools.combinations(factor_names, 2):
+            _add({
+                'id': f'factorial3:{design}:{first}_x_{second}',
+                'family': 'factorial3',
+                'kind': 'interaction',
+                'design': design,
+                'factor': f'{first}_x_{second}',
+                'metric': 'val_loss',
+                'sided': 'two_sided',
+                'hypothesis': (f'{first} and {second} interact when the third '
+                               f'axis is pooled over in {design}'),
+            })
+        if len(factor_names) == 3:
+            first, second, third = factor_names
+            _add({
+                'id': (f'factorial3:{design}:{first}_x_{second}_x_{third}'),
+                'family': 'factorial3',
+                'kind': 'interaction',
+                'design': design,
+                'factor': f'{first}_x_{second}_x_{third}',
+                'metric': 'val_loss',
+                'sided': 'two_sided',
+                'hypothesis': (f'the {first} x {second} interaction differs '
+                               f'between the two levels of {third} in {design}'),
+            })
     for host, info in sorted((matrix_report.get('qk_axis') or {}).items()):
         info = info or {}
         _add({
@@ -3170,7 +3789,8 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         'row_configs': {name: rows.get(name) for name in sorted(rows)},
         'matrix_cells': {
             key: matrix_report.get(key)
-            for key in ('leave_one_out', 'factorial', 'qk_axis')
+            for key in ('leave_one_out', 'factorial', 'three_way_factorial',
+                        'qk_axis')
         },
         # The randomized execution order is part of the pre-registration: a
         # schedule chosen after seeing which arms look good is a design
@@ -3211,9 +3831,10 @@ def study_level_correction(comparisons: dict, plan: dict | None,
     whole makes all of those claims at once - and they reuse the same seeds,
     so the tests are correlated. This function pools the pre-registered
     confirmatory p-values into a primary tier (the main proposal's superiority,
-    its mechanisms and its factorial) and a secondary tier. The primary tier is
-    Holm-corrected first; the secondary tier is corrected and tested only if at
-    least one primary contrast survives. Gatekeeping controls the study-wide
+    its mechanisms and its main 2x2 factorial) and a secondary tier. The
+    primary tier is Holm-corrected first; the secondary tier (including the
+    cross-axis 2x2x2 interactions) is corrected and tested only if at least
+    one primary contrast survives. Gatekeeping controls the study-wide
     false-positive rate while keeping exploratory single-axis / control / QK
     contrasts from competing with the primary claim for the same alpha budget.
     The family-local adjusted p stays next to the study-level one, and every
@@ -3297,6 +3918,24 @@ def study_level_correction(comparisons: dict, plan: dict | None,
         is_interaction = entry.get('kind') == 'interaction'
         _record(
             f"factorial:{entry['design']}:{entry['effect']}", 'factorial',
+            entry.get('p_two_sided') if is_interaction else entry.get('p_one_sided'),
+            (entry.get('p_two_sided_holm') if is_interaction
+             else entry.get('p_one_sided_holm')),
+            (entry.get('interaction_direction') not in
+             (None, 'additive_or_within_margin'))
+            if is_interaction else entry.get('effect_helps'),
+            (entry.get('interaction_differs_significantly') if is_interaction
+             else entry.get('effect_helps_significantly')),
+            replicated=entry.get('replicated_across_seeds'),
+            test_basis=entry.get('test_basis'),
+            effect=entry.get('delta_seed_mean'))
+    factorial3 = comparisons.get('factorial3') or {}
+    for entry in factorial3.get('rows', []) or []:
+        if entry.get('skipped') or not entry.get('design'):
+            continue
+        is_interaction = entry.get('kind') == 'interaction'
+        _record(
+            f"factorial3:{entry['design']}:{entry['effect']}", 'factorial3',
             entry.get('p_two_sided') if is_interaction else entry.get('p_one_sided'),
             (entry.get('p_two_sided_holm') if is_interaction
              else entry.get('p_one_sided_holm')),
@@ -4091,6 +4730,18 @@ def main():
         with open(base / 'factorial_comparison.json', 'w') as f:
             json.dump(factorial, f, indent=2)
     print_factorial_comparison(factorial)
+    # The fourth report closes the "three orthogonal axes" claim: the two 2x2
+    # designs estimate per-channel x depth separately per activation family,
+    # the 2x2x2 design estimates the cross-family interactions and tests
+    # additivity with TOST instead of inferring it from a null result.
+    three_way = three_way_factorial_comparison(
+        comparable, margin=args.baseline_margin, alpha=args.alpha,
+        equivalence_margin=args.equivalence_margin)
+    if three_way is not None:
+        three_way['rows_excluded_protocol_mismatch'] = stale_rows
+        with open(base / 'three_way_factorial_comparison.json', 'w') as f:
+            json.dump(three_way, f, indent=2)
+    print_three_way_factorial_comparison(three_way)
     # The attention-logits axis (DyT-QK) is independent of the normalization
     # family, so it gets its own per-host attribution and cross-host
     # replication report instead of being folded into the baseline family.
@@ -4108,7 +4759,8 @@ def main():
     # global Holm correction confirms (or demotes).
     study = study_level_correction(
         {'baseline': comparison, 'leave_one_out': loo_comparison,
-         'factorial': factorial, 'qk_axis': qk_axis},
+         'factorial': factorial, 'factorial3': three_way,
+         'qk_axis': qk_axis},
         analysis_plan, alpha=args.alpha)
     if study is not None:
         with open(base / 'study_level_tests.json', 'w') as f:
@@ -4138,6 +4790,7 @@ def main():
     manifest['baseline_comparison'] = comparison
     manifest['leave_one_out_comparison'] = loo_comparison
     manifest['factorial_comparison'] = factorial
+    manifest['three_way_factorial_comparison'] = three_way
     manifest['qk_axis_comparison'] = qk_axis
     manifest['analysis_plan'] = analysis_plan
     manifest['study_level_tests'] = study
@@ -4159,6 +4812,8 @@ def main():
         'baseline_comparison': artifact_record(base / 'baseline_comparison.json'),
         'leave_one_out_comparison': artifact_record(base / 'leave_one_out_comparison.json'),
         'factorial_comparison': artifact_record(base / 'factorial_comparison.json'),
+        'three_way_factorial_comparison': artifact_record(
+            base / 'three_way_factorial_comparison.json'),
         'qk_axis_comparison': artifact_record(base / 'qk_axis_comparison.json'),
         'study_level_tests': artifact_record(base / 'study_level_tests.json'),
         'run_schedule': (artifact_record(base / 'run_schedule.json')
