@@ -103,7 +103,7 @@ def _finite_float(value) -> Optional[float]:
     on conversion to float. Pre-flight reports must classify such a value as
     invalid instead of crashing.
     """
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         return None
     try:
         out = float(value)
