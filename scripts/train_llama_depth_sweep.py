@@ -41,7 +41,8 @@ from adasquash.design import (order_drift_report,
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
                                paired_design_summary, paired_t_one_sided,
                                paired_trend_test, student_t_ppf)
-from adasquash.repro import artifact_record, collect_run_metadata, finish_metadata, save_run_manifest
+from adasquash.repro import (artifact_record, collect_run_metadata, file_fingerprint,
+                             finish_metadata, save_run_manifest)
 from scripts.data_pipeline import _is_pinned_revision
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
@@ -107,6 +108,30 @@ _CHILD_PROTOCOL_KEYS = (
     'group_key', 'exclude_group_file', 'exclude_test_group_file',
 )
 
+_LEDGER_PROTOCOL_KEYS = ('exclude_hash_file', 'exclude_test_hash_file',
+                         'exclude_group_file', 'exclude_test_group_file')
+
+
+def _ledger_fingerprints(args) -> dict:
+    """Content identity of the cross-split ledgers this child will consume.
+
+    The hyperparameter block records the ledger *paths*; two sweeps can point at
+    the same path while the file content (and therefore the held-out exclusion
+    set) has changed. The child manifest carries these fingerprints, so the
+    launch/aggregation protocol must compare them instead of only the paths.
+    """
+    out = {}
+    for name in _LEDGER_PROTOCOL_KEYS:
+        path = getattr(args, name, None)
+        if not path:
+            out[name] = None
+        else:
+            fingerprint = file_fingerprint(path)
+            out[name] = {key: fingerprint.get(key)
+                         for key in ('path', 'exists', 'sha256', 'bytes')}
+    return out
+
+
 def expected_child_protocol(args, depth: int, norm: str, seed: int) -> dict:
     """The controlled recipe and shape a child manifest must record."""
     hyperparameters = {key: getattr(args, key) for key in _CHILD_PROTOCOL_KEYS}
@@ -127,6 +152,7 @@ def expected_child_protocol(args, depth: int, norm: str, seed: int) -> dict:
     return {
         'hyperparameters': hyperparameters,
         'shape': {'n_layers': int(depth), 'dim': int(dim), 'n_heads': int(heads)},
+        'data_ledgers': _ledger_fingerprints(args),
     }
 
 # Revisions are recorded in the child manifest as the concrete commit the
@@ -172,6 +198,20 @@ def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
                 continue
         if actual != wanted:
             mismatches[key] = [wanted, actual]
+    expected_ledgers = expected.get('data_ledgers')
+    if isinstance(expected_ledgers, dict):
+        data = manifest.get('data')
+        data = data if isinstance(data, dict) else {}
+        for key, wanted in expected_ledgers.items():
+            if key not in data:
+                mismatches[f'data.{key}'] = [wanted, '<missing>']
+                continue
+            actual = data.get(key)
+            if isinstance(actual, dict):
+                actual = {name: actual.get(name)
+                          for name in ('path', 'exists', 'sha256', 'bytes')}
+            if actual != wanted:
+                mismatches[f'data.{key}'] = [wanted, actual]
     for key, wanted in expected['shape'].items():
         actual = results.get(key, missing)
         if actual is missing:
