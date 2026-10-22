@@ -72,15 +72,16 @@ def _optional_dest(parser, option: str):
     return dests.pop() if len(dests) == 1 else None
 
 def _explicit_arg_names(argv, parser, config_path=None) -> frozenset:
-    """Names of options the user set (CLI tokens or keys in --config).
+    """Names of options the user typed on the command line.
 
-    Comparing parsed values with parser defaults cannot detect a flag whose
-    value happens to equal the default; on resume that silently loses the
-    override when the checkpoint recorded a different value. Option strings
-    are mapped through the parser so negated aliases such as --no-dedup
-    (dest 'dedup') and --no-beta (dest 'beta') are attributed correctly.
+    `--config` seeds the parser defaults (see `apply_config_to_parser`), so a
+    key in the YAML file is a default, not an explicit override. Counting it
+    here would let a config value silently reshape the schedule of the run it
+    resumes. The `config_path` argument is retained only for callers that
+    still pass it; config keys are never explicit. Option strings are mapped
+    through the parser so negated aliases such as --no-dedup (dest 'dedup')
+    and --no-beta (dest 'beta') are attributed correctly.
     """
-    dests = {action.dest for action in parser._actions}
     names = set()
     for token in argv:
         if token == '--':
@@ -91,11 +92,6 @@ def _explicit_arg_names(argv, parser, config_path=None) -> frozenset:
             # `--val-frac`) and that spelling is just as explicit.
             dest = _optional_dest(parser, token.split('=', 1)[0])
             if dest is not None:
-                names.add(dest)
-    if config_path:
-        for key in load_yaml_config(config_path):
-            dest, _ = _TRAIN_CONFIG_ALIASES.get(key, (key, False))
-            if dest in dests:
                 names.add(dest)
     return frozenset(names)
 
