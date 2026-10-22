@@ -211,6 +211,10 @@ def _arm_issues(name: str, agg: dict, metric: str) -> list[str]:
         issues.append(f"arm {name!r} has invalid seeds {agg['invalid_seeds']}")
     for problem in _seed_record_problems(agg):
         issues.append(f'arm {name!r} has {problem}')
+    if agg.get('complete') is False:
+        issues.append(f"arm {name!r} was not marked complete by its aggregator")
+    if agg.get('data_ledgers_complete') is False:
+        issues.append(f'arm {name!r} mixes missing/known cross-split ledger identities')
     if agg.get('data_versions_consistent') is False:
         issues.append(f'arm {name!r} mixes resolved data versions across seeds')
     if agg.get('shapes_consistent') is False:
