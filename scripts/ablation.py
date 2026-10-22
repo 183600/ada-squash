@@ -1424,6 +1424,10 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'val_loss_std': _row_std(row),
             'n_seeds': row.get('n_seeds', 1),
             'delta_vs_reference': delta,
+            # The paired test is the certifying statistic; its effect is the
+            # shared-seed mean, which can differ from the difference of the
+            # arms' own all-seed means when their seed sets differ.
+            'delta_paired_mean': None,
             # The prompt's scale check: a loss/PPL gap is only readable next
             # to the run-to-run spread it is being compared against. These are
             # descriptive warnings; the paired t-test remains the certification.
@@ -1488,6 +1492,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             entry['t'] = test['t']
             entry['df'] = test['df']
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
+            entry['delta_paired_mean'] = test['mean_delta']
             entry['n'] = test['n']
         entry.update(_paired_effect_summary(row, reference, common, test, alpha=alpha,
                                            margin=margin))
@@ -1541,8 +1546,13 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
+        # Match the effect estimate to the test that produced the p-value:
+        # `delta_paired_mean` is the shared-seed mean, while
+        # `delta_vs_reference` differences the arms' own all-seed means.
+        paired_delta = entry.get('delta_paired_mean')
         entry['beats_reference_significantly'] = bool(
-            entry['beats_reference'] and p_holm is not None and p_holm < alpha
+            paired_delta is not None and paired_delta < -margin
+            and p_holm is not None and p_holm < alpha
         )
     described_only = [entry['name'] for entry in out['rows']
                       if entry['test'] is not None and not entry['replicated_across_seeds']]
@@ -2145,6 +2155,9 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 'run_identity_full': None if full is None else _run_identity(full, parent_of),
                 'run_identity_reference': None if ref is None else _run_identity(ref, parent_of),
                 'delta_full_minus_reference': None,
+                # Shared-seed effect of the paired test (the certifying
+                # statistic); may differ from the all-seed mean difference.
+                'delta_paired_mean': None,
                 'delta_over_max_seed_std': None,
                 'within_seed_noise': None,
                 'ppl_full': None,
@@ -2212,6 +2225,7 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['t'] = test['t']
                 entry['df'] = test['df']
                 entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
+                entry['delta_paired_mean'] = test['mean_delta']
                 entry['n'] = test['n']
             entry.update(_paired_effect_summary(full, ref, common, test, alpha=alpha,
                                                margin=margin))
@@ -2258,8 +2272,10 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
     adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
+        paired_delta = entry.get('delta_paired_mean')
         entry['mechanism_helps_significantly'] = bool(
-            entry['mechanism_helps'] and p_holm is not None and p_holm < alpha
+            paired_delta is not None and paired_delta < -margin
+            and p_holm is not None and p_holm < alpha
         )
     thin = sorted({name for entry in rows for name in (entry['full'], entry['reference_row'])
                    if 1 <= usable.get(name, {}).get('n_seeds', 1) < 3})
@@ -2316,6 +2332,9 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                 'candidate_val_loss': None if cand is None else cand['val_loss'],
                 'reference_val_loss': None if ref is None else ref['val_loss'],
                 'delta_candidate_minus_reference': None,
+                # Shared-seed effect of the paired test (the certifying
+                # statistic); may differ from the all-seed mean difference.
+                'delta_paired_mean': None,
                 'effect_helps': False,
                 'effect_helps_significantly': False,
                 'test': None, 'test_basis': None, 'paired_seeds': [],
@@ -2346,6 +2365,7 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                     'test': test['test'], 'p_one_sided': test['p_one_sided'],
                     't': test['t'], 'df': test['df'],
                     'delta_ci_95': [test['ci_low'], test['ci_high']],
+                    'delta_paired_mean': test['mean_delta'],
                     'n': test['n'],
                 })
             entry.update(_paired_effect_summary(cand, ref, common, test, alpha=alpha,
@@ -2366,8 +2386,10 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
     adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
+        paired_delta = entry.get('delta_paired_mean')
         entry['effect_helps_significantly'] = bool(
-            entry['effect_helps'] and p_holm is not None and p_holm < alpha)
+            paired_delta is not None and paired_delta < -margin
+            and p_holm is not None and p_holm < alpha)
     # Cross-host replication of the QK-on vs QK-off direction. Only hosts
     # with a seed-replicated test count as independent replications; a host
     # tested on one run is reported but cannot make the axis "generalize".
