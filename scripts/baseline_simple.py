@@ -430,20 +430,31 @@ def _finite_number(value) -> bool:
             and math.isfinite(float(value)))
 
 
+def _is_seed_id(value) -> bool:
+    """A seed id is an int; 42.9/True must not become seed 42/1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _row_seed_losses(row: dict) -> dict:
     """Per-seed validation losses of one ablation row, when recorded."""
     out = {}
     per_seed = row.get('per_seed')
     if isinstance(per_seed, list):
         for item in per_seed:
-            if not isinstance(item, dict) or item.get('seed') is None:
+            if not isinstance(item, dict):
+                continue
+            seed = item.get('seed')
+            # A boolean/fractional/string seed is not an independent
+            # replication id; int(True)/int("42") would silently pair this
+            # row with a different ablation run.
+            if not _is_seed_id(seed):
                 continue
             if _finite_number(item.get('val_loss')):
-                out[int(item['seed'])] = float(item['val_loss'])
+                out[seed] = float(item['val_loss'])
         return out
     seed = row.get('seed')
-    if seed is not None and _finite_number(row.get('val_loss')):
-        out[int(seed)] = float(row['val_loss'])
+    if _is_seed_id(seed) and _finite_number(row.get('val_loss')):
+        out[seed] = float(row['val_loss'])
     return out
 
 
@@ -451,11 +462,14 @@ def _count_seed_ce(records: list, predictor: str) -> dict:
     """Per-seed CE of the tuned count model on the shared held-out stream."""
     out = {}
     for record in records or []:
-        if not isinstance(record, dict) or record.get('seed') is None:
+        if not isinstance(record, dict):
+            continue
+        seed = record.get('seed')
+        if not _is_seed_id(seed):
             continue
         value = (record.get('predictors') or {}).get(predictor)
         if _finite_number(value):
-            out[int(record['seed'])] = float(value)
+            out[seed] = float(value)
     return out
 
 
