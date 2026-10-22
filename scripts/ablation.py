@@ -120,7 +120,8 @@ def _safe_exp(value):
 
 
 def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict | None=None,
-                           alpha: float=0.05, power: float=0.8) -> dict:
+                           alpha: float=0.05, power: float=0.8,
+                           margin: float=0.0) -> dict:
     """Seed-level direction and resolution for one comparison.
 
     A p-value alone hides two things a reader needs: how many independent
@@ -165,10 +166,16 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
             # require the test to have been run at this `alpha`; `_paired_row_test`
             # uses its own default, so the inferred stderr would be wrong
             # whenever the caller overrides the significance level.
+            # The test is H1 mean(delta) < -margin, so the raw effect must
+            # clear both the practical margin and the sampling noise. Report
+            # margin + t*stderr; omitting the margin understates the smallest
+            # detectable effect whenever --baseline-margin is non-zero.
             out['minimum_detectable_delta_95_power80'] = (
-                student_t_ppf(1.0 - alpha, float(test['df']))
-                + student_t_ppf(power, float(test['df']))
-            ) * stats['stderr']
+                float(margin)
+                + (student_t_ppf(1.0 - alpha, float(test['df']))
+                   + student_t_ppf(power, float(test['df'])))
+                * stats['stderr']
+            )
     return out
 
 
@@ -1482,7 +1489,8 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             entry['df'] = test['df']
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
-        entry.update(_paired_effect_summary(row, reference, common, test, alpha=alpha))
+        entry.update(_paired_effect_summary(row, reference, common, test, alpha=alpha,
+                                           margin=margin))
         entry.update(_robustness_for_deltas(
             _per_seed_deltas(row, reference, common),
             alpha=alpha, equivalence_margin=equivalence_margin))
@@ -2205,7 +2213,8 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['df'] = test['df']
                 entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
                 entry['n'] = test['n']
-            entry.update(_paired_effect_summary(full, ref, common, test, alpha=alpha))
+            entry.update(_paired_effect_summary(full, ref, common, test, alpha=alpha,
+                                               margin=margin))
             entry.update(_robustness_for_deltas(
                 _per_seed_deltas(full, ref, common),
                 alpha=alpha, equivalence_margin=equivalence_margin))
@@ -2339,7 +2348,8 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                     'delta_ci_95': [test['ci_low'], test['ci_high']],
                     'n': test['n'],
                 })
-            entry.update(_paired_effect_summary(cand, ref, common, test, alpha=alpha))
+            entry.update(_paired_effect_summary(cand, ref, common, test, alpha=alpha,
+                                               margin=margin))
             entry.update(_robustness_for_deltas(
                 _per_seed_deltas(cand, ref, common),
                 alpha=alpha, equivalence_margin=equivalence_margin))
@@ -2618,7 +2628,8 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                                        for seed, value in effect['per_seed_values'].items()]}
             zero_row = {'per_seed': [{'seed': int(seed), 'val_loss': 0.0}
                                      for seed in effect['per_seed_values']]}
-            entry.update(_paired_effect_summary(effect_row, zero_row, common, test, alpha=alpha))
+            entry.update(_paired_effect_summary(effect_row, zero_row, common, test,
+                                              alpha=alpha, margin=margin))
             entry.update(_robustness_for_deltas(
                 {str(seed): float(value)
                  for seed, value in effect['per_seed_values'].items()},
