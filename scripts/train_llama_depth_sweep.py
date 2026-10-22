@@ -1026,8 +1026,6 @@ def main():
             cell_dir, seeds, multi,
             protocol_for_seed=lambda seed, d=depth, n=norm: expected_child_protocol(args, d, n, seed),
             launch_id=sweep_launch_id)
-        with open(cell_dir / 'aggregate.json', 'w') as f:
-            json.dump(agg, f, indent=2)
         aggs_by_depth.setdefault(depth, {})[norm] = agg
         mean = agg['best_val_loss']
         std = agg.get('best_val_loss_std')
@@ -1139,6 +1137,12 @@ def main():
             for agg in by_norm.values():
                 agg['complete'] = False
                 agg['data_version_mismatch_across_cells'] = True
+    # Write the per-cell aggregates only after the cross-cell version audit:
+    # writing them before a later cell demotes every cell would leave
+    # aggregate.json claiming complete=true for a sweep that is not certifiable.
+    for depth, norm, cell_dir in cells:
+        with open(cell_dir / 'aggregate.json', 'w') as f:
+            json.dump(aggs_by_depth[depth][norm], f, indent=2)
     print('[sweep][note] shape covariates: under the equal-parameter scaling dim and n_heads move with '
           'depth by construction, so a cross-depth loss delta confounds depth with width/head count and '
           'must not be read as a pure depth effect (same-depth cross-norm deltas are unaffected); every '
