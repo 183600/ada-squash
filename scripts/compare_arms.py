@@ -99,6 +99,28 @@ def _seed_record_problems(agg: dict) -> list[str]:
         problems.append(f'duplicate per-seed id(s) {sorted(duplicates)}')
     if malformed:
         problems.append(f'malformed per-seed id(s) {malformed}')
+    declared = agg.get('seeds')
+    if declared is not None:
+        if not isinstance(declared, list):
+            problems.append('declared seed list is not a list')
+        else:
+            malformed_declared = [value for value in declared
+                                  if isinstance(value, bool)
+                                  or not isinstance(value, int)]
+            if malformed_declared:
+                problems.append(
+                    f'malformed declared seed id(s) {malformed_declared}')
+            else:
+                declared_set = set(declared)
+                if len(declared_set) != len(declared):
+                    problems.append(
+                        f'duplicate declared seed id(s) {sorted(declared)}')
+                missing = sorted(declared_set - seen)
+                extra = sorted(seen - declared_set)
+                if missing or extra:
+                    problems.append(
+                        'per-seed records do not cover the declared seed set '
+                        f'(missing {missing}, extra {extra})')
     return problems
 
 
