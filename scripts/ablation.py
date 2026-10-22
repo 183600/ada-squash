@@ -91,6 +91,14 @@ def _finite_metric(value) -> bool:
             and math.isfinite(value))
 
 
+def _safe_exp(value):
+    """exp(loss) for PPL reporting; a diverged finite loss must stay visible."""
+    try:
+        return math.exp(float(value))
+    except (OverflowError, ValueError):
+        return math.inf
+
+
 def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict | None=None,
                            alpha: float=0.05, power: float=0.8) -> dict:
     """Seed-level direction and resolution for one comparison.
@@ -1114,8 +1122,13 @@ def _batches_of_seed(row, seed):
     return None
 
 def _row_std(row):
-    """Across-seed std when replicated, within-run batch std otherwise."""
-    if row.get('n_seeds', 1) >= 2:
+    """Across-seed std when replicated, within-run batch std otherwise.
+
+    A replicated row normally carries `val_loss_seed_std`; fall back to the
+    generic `val_loss_std` when an older/cached aggregate only wrote that
+    name, so the delta-vs-seed-noise scale check is not silently disabled.
+    """
+    if row.get('n_seeds', 1) >= 2 and row.get('val_loss_seed_std') is not None:
         return row.get('val_loss_seed_std')
     return row.get('val_loss_std')
 
@@ -1271,6 +1284,15 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'val_loss_std': _row_std(row),
             'n_seeds': row.get('n_seeds', 1),
             'delta_vs_reference': delta,
+            # The prompt's scale check: a loss/PPL gap is only readable next
+            # to the run-to-run spread it is being compared against. These are
+            # descriptive warnings; the paired t-test remains the certification.
+            'delta_over_max_seed_std': None,
+            'within_seed_noise': None,
+            'ppl_reference': _safe_exp(reference['val_loss']),
+            'ppl_row': None,
+            'ppl_delta': None,
+            'ppl_delta_pct': None,
             'beats_reference': bool(delta < -margin),
             'beats_reference_significantly': False,
             'test': None,
@@ -1301,6 +1323,19 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             # itself a property of the norm at the fixed step count.
             'curve_classification_counts': row.get('curve_classification_counts'),
         }
+        row_std = _row_std(row)
+        ref_std = _row_std(reference)
+        seed_stds = [value for value in (row_std, ref_std)
+                     if isinstance(value, (int, float)) and math.isfinite(float(value))]
+        if seed_stds:
+            denom = max(seed_stds)
+            if denom > 0.0:
+                entry['delta_over_max_seed_std'] = abs(delta) / denom
+                entry['within_seed_noise'] = bool(abs(delta) < denom)
+        entry['ppl_row'] = _safe_exp(row['val_loss'])
+        entry['ppl_delta'] = entry['ppl_row'] - entry['ppl_reference']
+        if math.isfinite(entry['ppl_reference']) and entry['ppl_reference'] > 0.0:
+            entry['ppl_delta_pct'] = 100.0 * entry['ppl_delta'] / entry['ppl_reference']
         test, basis, common = _paired_row_test(row, reference, margin=margin)
         entry['test_basis'] = basis
         entry['paired_seeds'] = common
@@ -1413,10 +1448,16 @@ def print_baseline_comparison(comparison: dict | None) -> None:
                 direction += f" tied={entry['n_seeds_tied']}"
         mde = entry.get('minimum_detectable_delta_95_power80')
         mde_str = '' if mde is None else f" mde80={mde:.4f}"
+        ratio = entry.get('delta_over_max_seed_std')
+        ratio_str = '' if ratio is None else f" delta/seed_std={ratio:.2f}"
+        ppl = entry.get('ppl_delta_pct')
+        ppl_str = '' if ppl is None else f" dPPL={ppl:+.2f}%"
         power_warn = ''
+        if entry.get('within_seed_noise'):
+            power_warn += ' [DELTA WITHIN SEED NOISE]'
         if mde is not None and entry.get('delta_vs_reference') is not None:
             if abs(entry['delta_vs_reference']) < mde:
-                power_warn = ' [UNDERPOWERED: |delta| < mde80]'
+                power_warn += ' [UNDERPOWERED: |delta| < mde80]'
         regimes = entry.get('curve_classification_counts')
         regime_note = ''
         if regimes:
@@ -1426,7 +1467,8 @@ def print_baseline_comparison(comparison: dict | None) -> None:
                 regime_note = (f" [curve regimes {off_regime}: the delta was not measured "
                                f"in a healthy falling-falling regime - read the curve block]")
         print(f"[compare] {entry['name']:>32s} val_loss={entry['val_loss']:.4f}{std_str} "
-              f"delta={entry['delta_vs_reference']:+.4f}{ci_str} p(one-sided)={p_str} p(holm)={p_holm_str} "
+              f"delta={entry['delta_vs_reference']:+.4f}{ci_str}{ppl_str}{ratio_str} "
+              f"p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{basis}{direction}{mde_str} "
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}{note}{regime_note}{power_warn}")
