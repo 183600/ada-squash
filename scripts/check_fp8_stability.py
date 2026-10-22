@@ -69,8 +69,10 @@ def to_fp8_e5m2(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
 # The quantizer identity travels with the callable so range diagnostics can ask
 # which format/scaling was actually applied instead of assuming e4m3.
 to_fp8_e4m3.max_val = 448.0
+to_fp8_e4m3.min_normal = fp8_min_normal(4)
 to_fp8_e4m3.scaling = 'none'
 to_fp8_e5m2.max_val = 57344.0
+to_fp8_e5m2.min_normal = fp8_min_normal(5)
 to_fp8_e5m2.scaling = 'none'
 
 def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
@@ -112,6 +114,7 @@ def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
     # rates describe a quantization recipe that was not applied.
     q.scaling = scaling
     q.max_val = maxv
+    q.min_normal = fp8_min_normal(4 if fmt == 'e4m3' else 5)
     return q
 
 # Reusable frexp/mask scratch keyed by (shape, device).
@@ -221,9 +224,9 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
     handles = []
     quant_errors = []
     ranges = []
-    fp8_e4m3_min = fp8_min_normal(4)
     quant = quant or to_fp8_e4m3
     quant_max = float(getattr(quant, 'max_val', FP8_E4M3_MAX))
+    quant_min = float(getattr(quant, 'min_normal', fp8_min_normal(4)))
     quant_dynamic = getattr(quant, 'scaling', None) == 'dynamic-tensor'
 
     def _zero_scalar(device) -> torch.Tensor:
@@ -256,16 +259,16 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
                 threshold_max = quant_max
             else:
                 scaled_abs = abs_out
-                threshold_max = FP8_E4M3_MAX
+                threshold_max = quant_max
             if numel:
                 overflow = torch.count_nonzero(scaled_abs > threshold_max).to(torch.float64) / numel
-                underflow = torch.count_nonzero(scaled_abs < fp8_e4m3_min).to(torch.float64) / numel
+                underflow = torch.count_nonzero(scaled_abs < quant_min).to(torch.float64) / numel
                 # A subnormal is representable but below the min normal; a
                 # quantized zero is a value the format could not represent at
                 # all. Report them separately so "underflow" does not conflate
                 # representable subnormals with a true flush to zero.
                 subnormal = torch.count_nonzero(
-                    (scaled_abs > 0) & (scaled_abs < fp8_e4m3_min)
+                    (scaled_abs > 0) & (scaled_abs < quant_min)
                 ).to(torch.float64) / numel
             else:
                 overflow = underflow = subnormal = zero
