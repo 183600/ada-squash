@@ -27,6 +27,7 @@ hypothesis. For MoE, ``--pair`` names the norm and baseline.
 import argparse
 import json
 import math
+import numbers
 import sys
 from pathlib import Path
 
@@ -37,8 +38,12 @@ from adasquash.metrics import scale_replication_summary
 
 
 def _finite(value) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _reported_p(primary, fallback):
