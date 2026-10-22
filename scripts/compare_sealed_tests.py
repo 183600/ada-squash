@@ -264,14 +264,31 @@ def _ledger_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
                 or not _ledger_verified(a[key])
                 or not _ledger_verified(b[key]))}
 
+def _pinned_revision(value) -> bool:
+    """Whether a resolved dataset/tokenizer revision names a concrete commit."""
+    text = str(value or "")
+    return (7 <= len(text) <= 40
+            and all(ch in "0123456789abcdefABCDEF" for ch in text))
+
 def pairing_mismatches(ref: dict, other: dict) -> dict:
     """Keys whose values differ between the two runs' data-protocol blocks."""
     a, b = ref.get("pairing"), other.get("pairing")
     if not isinstance(a, dict) or not isinstance(b, dict):
         return {"pairing": ["missing in one result file", "missing in the other"]}
     missing = "<missing>"
-    return {k: [a.get(k, missing), b.get(k, missing)] for k in PAIRING_KEYS
-            if k not in a or k not in b or a.get(k) != b.get(k)}
+    out = {k: [a.get(k, missing), b.get(k, missing)] for k in PAIRING_KEYS
+           if k not in a or k not in b or a.get(k) != b.get(k)}
+    # Equal equality is not provenance: when the Hub was unreachable the
+    # loader degrades the *resolved* revision to the requested branch (often
+    # None), so two runs can agree while pointing at different snapshots of a
+    # moving artifact. Only a concrete commit proves the documents/tokenizer
+    # are the same.
+    for key in ("dataset_revision_resolved", "tokenizer_revision_resolved"):
+        if key in out:
+            continue
+        if not _pinned_revision(a.get(key)) or not _pinned_revision(b.get(key)):
+            out[key] = [a.get(key, missing), b.get(key, missing)]
+    return out
 
 
 def _mde(stderr: float, df: float, alpha: float, power: float,
