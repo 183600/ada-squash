@@ -166,7 +166,9 @@ class AdaSquashLM:
             logprobs = self._forward_logprobs(ids)
             start = len(ctx) - 1
             rows = logprobs[start:start + len(cont)]
-            tgt = torch.tensor(cont, device=self.device)
+            # An empty continuation is legal (the score is 0); the explicit
+            # long dtype also keeps `gather` valid for that empty index.
+            tgt = torch.tensor(cont, dtype=torch.long, device=self.device)
             lp = rows.gather(-1, tgt.unsqueeze(-1)).sum().item()
             greedy = bool((rows.argmax(-1) == tgt).all().item())
             out.append((lp, greedy))
@@ -193,7 +195,7 @@ class AdaSquashLM:
                 if len(window) < 2:
                     continue
                 logprobs = self._forward_logprobs(window)
-                tgt = torch.tensor(window[1:], device=self.device)
+                tgt = torch.tensor(window[1:], dtype=torch.long, device=self.device)
                 total += logprobs[:-1].gather(-1, tgt.unsqueeze(-1)).sum().item()
             out.append(total)
         return out
