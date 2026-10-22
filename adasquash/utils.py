@@ -228,10 +228,17 @@ class ActivationStats:
             out[name] = {'max_abs': self.max_abs[name].value, 'excess_kurtosis': self.kurtosis[name].result()}
         if out:
             all_max = [v['max_abs'] for v in out.values() if v['max_abs'] != -float('inf')]
-            all_kurt = [v['excess_kurtosis'] for v in out.values() if math.isfinite(v['excess_kurtosis'])]
+            all_kurt = [v['excess_kurtosis'] for v in out.values()]
             peak = (float('nan') if any(math.isnan(v) for v in all_max)
                     else (max(all_max) if all_max else 0.0))
-            out['__summary__'] = {'mean_max_abs': sum(all_max) / max(1, len(all_max)), 'max_max_abs': peak, 'max_abs_pre_norm': peak, 'mean_excess_kurtosis_pre_norm': sum(all_kurt) / len(all_kurt) if all_kurt else 0.0}
+            # A non-finite kurtosis means the activation had no standardized
+            # fourth moment (NaN/Inf input, or a constant tensor). Averaging
+            # only the finite entries would report a clean number and hide
+            # exactly the corruption the meter exposes.
+            mean_kurt = (float('nan')
+                         if any(not math.isfinite(v) for v in all_kurt)
+                         else (sum(all_kurt) / len(all_kurt) if all_kurt else 0.0))
+            out['__summary__'] = {'mean_max_abs': sum(all_max) / max(1, len(all_max)), 'max_max_abs': peak, 'max_abs_pre_norm': peak, 'mean_excess_kurtosis_pre_norm': mean_kurt}
         return out
 
 def markov_batch(rng: torch.Generator, ignore_index: int, batch_size: int, seq_len: int, device: str, n_states: int=64, outlier_id: Optional[int]=None, max_jump: int=3):
