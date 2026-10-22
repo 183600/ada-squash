@@ -586,7 +586,11 @@ def scale_replication_summary(observations: Sequence[dict],
             ('negative' if record['delta'] < 0.0 else
              'positive' if record['delta'] > 0.0 else 'zero')
             for record in certified}
-        direction_consistent = len(set(signs)) == 1
+        # Zero is a null result, not a direction. An all-zero metric must not
+        # be reported as a "replicated direction": no candidate beat the
+        # reference anywhere, so the sign vote has no winner to replicate.
+        direction_consistent = (len(set(signs)) == 1
+                                and signs[0] in ('negative', 'positive'))
         per_metric[metric] = {
             'scales': sorted(record['scale'] for record in records),
             'n_scales': len(records),
@@ -618,7 +622,8 @@ def scale_replication_summary(observations: Sequence[dict],
         'min_scales_for_replication': min_scales,
         'n_observations': len(all_deltas),
         'direction_signs': sorted(overall_signs),
-        'direction_consistent': len(overall_signs) == 1 and bool(all_deltas),
+        'direction_consistent': (len(overall_signs) == 1 and bool(all_deltas)
+                                 and next(iter(overall_signs)) in ('negative', 'positive')),
         'replicated_metrics': replicated_metrics,
         'multi_scale_certified_metrics': multi_certified,
         'per_metric': per_metric,

@@ -65,6 +65,13 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
         orientation = 'reversed'
     else:
         return None
+    # A cross-scale pair is a deliberately descriptive comparison, not an
+    # observation of the same mechanism at another scale: folding its delta
+    # into the sign vote would let two different architectures masquerade as
+    # two replications. Same for a row the producing script excluded from its
+    # own family.
+    if entry.get('same_scale') is False or entry.get('excluded_from_family') is not None:
+        return None
     delta = entry.get('mean_delta')
     if orientation == 'reversed' and _finite(delta):
         delta = -float(delta)
@@ -95,6 +102,11 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
         elif _matches(row.get('norm'), reference) and _matches(row.get('reference'), candidate):
             orientation = 'reversed'
         else:
+            continue
+        if row.get('same_scale') is False or row.get('excluded_from_family') is not None:
+            # Cross-scale or otherwise excluded rows are not independent
+            # observations of the same-scale effect; including them would
+            # manufacture a replication.
             continue
         delta = row.get('delta_vs_reference')
         if orientation == 'reversed' and _finite(delta):
