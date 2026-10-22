@@ -1102,14 +1102,17 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                     'per_seed_delta': {str(seed): value for seed, value in zip(common, deltas)},
                     'paired_delta_std': None if stats is None else stats['std'],
                 })
-                if test.get('df') and isinstance(test.get('ci_low'), (int, float)):
-                    half = (test['ci_high'] - test['ci_low']) / 2.0
-                    critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
-                    if critical > 0.0:
-                        stderr = half / critical
+                if test.get('df') and stats is not None:
+                    # Use the paired-delta stderr directly instead of inverting
+                    # the CI, and include the practical margin: the test is
+                    # H1 mean(delta) < -margin, so the smallest raw effect that
+                    # clears both the margin and the noise is margin + t*se.
+                    if stats['stderr'] is not None:
                         entry['minimum_detectable_delta_95_power80'] = (
-                            student_t_ppf(1.0 - alpha, float(test['df']))
-                            + student_t_ppf(power, float(test['df']))) * stderr
+                            float(margin)
+                            + (student_t_ppf(1.0 - alpha, float(test['df']))
+                               + student_t_ppf(power, float(test['df'])))
+                            * stats['stderr'])
                 entry['beats_reference'] = bool(entry['delta_vs_reference'] < -margin)
             entry['test_basis'] = ('per-seed paired t' if len(common) >= 2
                                    else f'described only: {len(common)} shared seed(s)')
