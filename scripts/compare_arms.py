@@ -76,9 +76,36 @@ def _safe_exp(value):
         return math.inf
 
 
+def _per_seed_ids(agg: dict) -> set[str]:
+    """Seeds named by the aggregate's per-seed records, normalized to str."""
+    per_seed = agg.get('per_seed') if isinstance(agg, dict) else None
+    out = set()
+    if isinstance(per_seed, list):
+        for record in per_seed:
+            if not isinstance(record, dict):
+                continue
+            seed = record.get('seed')
+            if isinstance(seed, int) and not isinstance(seed, bool):
+                out.add(str(seed))
+    return out
+
+
+def _provenance_covers_seeds(versions: dict, agg: dict) -> bool:
+    """Every measured seed must have an entry; JSON keys may be strings."""
+    seeds = _per_seed_ids(agg)
+    if not seeds:
+        return False
+    return {str(key) for key in versions} == seeds
+
+
 def _data_version_signature(agg: dict):
     versions = agg.get('data_versions_by_seed')
     if not isinstance(versions, dict) or not versions:
+        return None
+    # A partial map is unknown provenance, not a shorter list of versions. The
+    # aggregate writer emits one entry per seed; a stale/hand-written record
+    # must not certify when one seed's snapshot was never resolved.
+    if not _provenance_covers_seeds(versions, agg):
         return None
     values = list(versions.values())
     if any(value is None for value in values):
@@ -89,6 +116,9 @@ def _data_version_signature(agg: dict):
     return next(iter(signatures))
 
 
+_SHAPE_KEYS = ('n_layers', 'dim', 'n_heads')
+
+
 def _shape_signature(agg: dict):
     shapes = agg.get('shapes_by_seed')
     if not isinstance(shapes, dict) or not shapes:
@@ -97,8 +127,11 @@ def _shape_signature(agg: dict):
     # aggregate writer only emits complete shapes, so this is the malformed /
     # stale-record path; it must not compare equal to another unknown shape.
     if any(not isinstance(shape, dict) or not shape
+           or not set(_SHAPE_KEYS).issubset(shape)
            or any(value is None for value in shape.values())
            for shape in shapes.values()):
+        return None
+    if not _provenance_covers_seeds(shapes, agg):
         return None
     signatures = {json.dumps(shape, sort_keys=True) for shape in shapes.values()}
     if len(signatures) != 1:
@@ -175,7 +208,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'values': vals,
             'mean': None if stats is None else stats['mean'],
             'std': None if stats is None or stats['n'] < 2 else stats['std'],
-            'stderr': None if stats is None else stats['stderr'],
+            'stderr': None if stats is None or stats['n'] < 2 else stats['stderr'],
             'n_seeds': len(vals),
             'seeds': sorted(vals),
             'issues': _arm_issues(name, agg, metric),
@@ -364,10 +397,16 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                 'n': test['n'],
             })
             if test.get('df'):
+                # The test is H1 mean(delta) < -margin. The smallest raw
+                # effect that clears both the margin and the noise is
+                # margin + (t_alpha + t_power) * stderr, not the margin-free
+                # MDE (which would understate the required effect).
                 entry['minimum_detectable_delta_95_power80'] = (
-                    student_t_ppf(1.0 - alpha, float(test['df']))
-                    + student_t_ppf(0.8, float(test['df']))
-                ) * delta_stats['stderr']
+                    margin
+                    + (student_t_ppf(1.0 - alpha, float(test['df']))
+                       + student_t_ppf(0.8, float(test['df'])))
+                    * delta_stats['stderr']
+                )
             both_clean = (not cand['issues'] and not ref['issues']
                           and len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE)
             entry['certifiable'] = bool(both_clean and pair_protocol_ok)
