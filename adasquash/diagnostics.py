@@ -538,8 +538,13 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
 
     input_integer_ids = _integer_ids(x)
     target_integer_ids = _integer_ids(y)
-    targets_valid = target_integer_ids
-    if y.numel() and target_integer_ids:
+    # `nn.Embedding` accepts the narrower integer ids, but cross-entropy only
+    # accepts Long/Byte targets. An int32/int16 target is a data-pipeline
+    # dtype bug: without this check the later forward raises and the ordered
+    # triage misclassifies it as an fp32-math failure.
+    target_dtype_ok = y.dtype in (torch.int64, torch.uint8)
+    targets_valid = target_integer_ids and target_dtype_ok
+    if y.numel() and target_integer_ids and target_dtype_ok:
         # A negative id is invalid whether or not the vocabulary upper bound
         # is known; ignore_index is the only negative value the loss accepts.
         in_range = (y == ignore_index) | (y >= 0)
@@ -563,6 +568,7 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
         "vocab_size": vocab_size,
         "input_integer_ids": bool(input_integer_ids),
         "target_integer_ids": bool(target_integer_ids),
+        "target_dtype_valid": bool(target_dtype_ok),
         "targets_valid": bool(targets_valid),
         "input_token_ids_valid": bool(tokens_valid),
         "loss_mask_nonempty": mask_count > 0,
@@ -764,8 +770,13 @@ def classify_nan_stage(evidence: dict) -> dict:
             or evidence.get("loss_denominator_positive") is False
             or evidence.get("loss_mask_nonempty") is False):
         dtype_bad = (evidence.get("input_integer_ids") is False
-                     or evidence.get("target_integer_ids") is False)
-        if dtype_bad:
+                     or evidence.get("target_integer_ids") is False
+                     or evidence.get("target_dtype_valid") is False)
+        if evidence.get("target_dtype_valid") is False:
+            diagnosis = ("the targets are an integer tensor but not Long/Byte, "
+                         "which cross-entropy requires (cast the targets at the "
+                         "data-pipeline boundary)")
+        elif dtype_bad:
             diagnosis = ("the batch's token ids/targets are not an integer dtype "
                          "(floating or boolean tensors cannot index an embedding "
                          "or be used as cross-entropy targets)")
