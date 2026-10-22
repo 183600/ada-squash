@@ -291,8 +291,9 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     if return_counts:
         low, high = wilson_interval(n_correct, n_run)
         return {'accuracy': acc, 'n_correct': n_correct, 'n_trials': n_run,
-                'trial_correct': trial_correct,
+                'trial_correct': trial_correct, 'seed': seed,
                 'ci95_low': low, 'ci95_high': high,
+                'ci_basis': 'wilson_within_single_placement_draw',
                 'failures': failures,
                 'failure_causes': dict(Counter(f['cause'] for f in failures)),
                 'failure_confidence': dict(Counter(f['confidence'] for f in failures))}
@@ -317,6 +318,12 @@ def main():
         # nothing; writing a finished manifest for it would let an empty run
         # be cited as an evaluation.
         p.error('nothing to evaluate: pass --tasks and/or --needle-test')
+    if args.batch_size < 1:
+        p.error(f'--batch-size {args.batch_size} must be >= 1')
+    if args.decode_batch < 1:
+        p.error(f'--decode-batch {args.decode_batch} must be >= 1')
+    if args.needle_context_len is not None and args.needle_context_len < 1:
+        p.error(f'--needle-context-len {args.needle_context_len} must be >= 1')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(args.seed)
     model, model_args = load_ckpt(args.ckpt, device=device)
@@ -383,6 +390,11 @@ def main():
                   f'accuracy', file=sys.stderr)
         needle = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed, return_counts=True, decode_batch=args.decode_batch)
         results['needle_acc'] = needle['accuracy']
+        results['needle_acc_basis'] = 'single_placement_seed'
+        results['needle_acc_note'] = (
+            'accuracy is one placement draw; its Wilson interval covers trial noise within '
+            'that draw, not placement-to-placement variability. Run several --seed values '
+            '(and pair arms by seed) before claiming a placement-level difference.')
         results['needle'] = needle
         results['needle_ctx_len'] = ctx_len
         print(f"[eval] needle-in-haystack accuracy @ {ctx_len} = {needle['accuracy']:.3f} "
@@ -408,7 +420,8 @@ def main():
     manifest['checkpoint'] = file_fingerprint(args.ckpt)
     manifest['results_file'] = file_fingerprint(out)
     manifest['summary'] = {k: results[k] for k in
-                           ('norm', 'tasks_ran', 'needle_acc', 'needle_ctx_len',
+                           ('norm', 'tasks_ran', 'needle_acc', 'needle_acc_basis',
+                            'needle_ctx_len',
                             'needle_ctx_source', 'needle_trained_seq_len',
                             'tokenizer', 'tokenizer_revision',
                             'tokenizer_revision_resolved') if k in results}
