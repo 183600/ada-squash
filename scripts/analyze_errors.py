@@ -173,7 +173,25 @@ def data_protocol_mismatches(args, model_args: dict) -> dict:
         'num_workers': args.num_workers,
     }
     out = {}
+    # Revisions are resolved by the loader: the checkpoint records the
+    # requested value (often None/branch) *and* the concrete commit. `main`
+    # deliberately inherits the resolved commit for the probe, so comparing
+    # it with the checkpoint's requested None produced a false mismatch for
+    # the very run it inherited from. Compare the effective (resolved or
+    # requested) identity on both sides, and still flag a genuinely different
+    # commit.
+    for key in ('dataset_revision', 'tokenizer_revision'):
+        if key not in model_args:
+            out[key] = {'checkpoint': '<missing>', 'analysis': current[key]}
+            continue
+        checkpoint_effective = (model_args.get(key + '_resolved')
+                                or model_args.get(key))
+        if checkpoint_effective != current[key]:
+            out[key] = {'checkpoint': checkpoint_effective,
+                        'analysis': current[key]}
     for key, value in current.items():
+        if key in ('dataset_revision', 'tokenizer_revision'):
+            continue
         # An old checkpoint may predate a split-defining flag. Absence is
         # unknown, not agreement: silently skipping it would pair an analysis
         # on one data protocol with a checkpoint trained on another.
