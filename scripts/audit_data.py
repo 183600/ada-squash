@@ -763,7 +763,9 @@ def _chronology_problems(reports: dict) -> list:
         return []
     if not all(
             isinstance(r, dict) and isinstance(r.get('start'), int)
-            and isinstance(r.get('count'), int) for r in active):
+            and not isinstance(r.get('start'), bool)
+            and isinstance(r.get('count'), int)
+            and not isinstance(r.get('count'), bool) for r in active):
         # Train-only with count=None is the legitimate "held-out splits
         # disabled" shape. With more than one active split, missing
         # start/count means the tiling cannot be verified at all; reporting
@@ -789,6 +791,10 @@ def _chronology_problems(reports: dict) -> list:
                 f"{known_totals}"]
     total = active[0].get('num_documents')
     last_name, _, last_end = ranges[-1]
+    if total is not None and (not isinstance(total, int)
+                              or isinstance(total, bool)):
+        return [f"num_documents {total!r} is not an integer document total; "
+                "the split tiling cannot be verified"]
     if isinstance(total, int) and last_end != total:
         return [f"split ranges do not cover the full document stream: "
                 f"{last_name} ends at {last_end} but num_documents={total}"]
