@@ -58,6 +58,12 @@ TRAINING_PROTOCOL_KEYS = (
     'test_batches',
 )
 
+def _is_pinned_revision(value) -> bool:
+    """A concrete 40-hex Hub commit, not None/a branch/tag/ambiguous prefix."""
+    if not isinstance(value, str) or len(value) != 40:
+        return False
+    return all(ch in '0123456789abcdefABCDEF' for ch in value)
+
 def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dict:
     """Check that two checkpoints were trained under one comparable recipe.
 
@@ -85,17 +91,37 @@ def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dic
         if candidate_value != reference_value:
             mismatches[key] = {'candidate': candidate_value,
                                'reference': reference_value}
-    for key in RESOLVED_PROTOCOL_KEYS:
-        if key not in candidate_args and key not in reference_args:
+    for prefix in ('dataset', 'tokenizer'):
+        resolved_key = prefix + '_revision_resolved'
+        requested_key = prefix + '_revision'
+        resolved_present = (resolved_key in candidate_args
+                            or resolved_key in reference_args)
+        if resolved_present:
+            # When the resolved fields exist they are the actual snapshot; only
+            # two identical concrete commits prove it. Two unknown/None values
+            # are not evidence of one snapshot.
+            candidate_value = candidate_args.get(resolved_key)
+            reference_value = reference_args.get(resolved_key)
+            if not (_is_pinned_revision(candidate_value)
+                    and _is_pinned_revision(reference_value)
+                    and candidate_value == reference_value):
+                mismatches.setdefault(resolved_key, {
+                    'candidate': candidate_value,
+                    'reference': reference_value,
+                })
             continue
-        candidate_value = candidate_args.get(key, missing)
-        reference_value = reference_args.get(key, missing)
-        if candidate_value != reference_value:
-            # A concrete commit on one side and none (or a different commit)
-            # on the other means the data/tokenizer identity is not proven
-            # equal, even when both requested revisions were None.
-            mismatches[key] = {'candidate': candidate_value,
-                               'reference': reference_value}
+        # Older checkpoints may only record the requested revision. A concrete
+        # pinned commit on both sides still proves the snapshot; two None
+        # values (the mutable default branch) do not.
+        candidate_value = candidate_args.get(requested_key)
+        reference_value = reference_args.get(requested_key)
+        if not (_is_pinned_revision(candidate_value)
+                and _is_pinned_revision(reference_value)
+                and candidate_value == reference_value):
+            mismatches[requested_key] = {
+                'candidate': candidate_value,
+                'reference': reference_value,
+            }
     candidate_step = candidate_args.get('_checkpoint_step')
     reference_step = reference_args.get('_checkpoint_step')
     steps_known = candidate_step is not None and reference_step is not None
