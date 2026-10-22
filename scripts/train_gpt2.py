@@ -933,7 +933,10 @@ def launch_multi_seed(args, seeds) -> None:
             (out_dir / stale).unlink(missing_ok=True)
         print(f'[seeds] launching seed={seed} -> {out_dir}', flush=True)
         env = dict(os.environ)
-        env['PYTHONHASHSEED'] = str(seed)
+        # PYTHONHASHSEED only accepts [0, 2**32); a negative or larger seed
+        # would kill the child before Python starts. Match `set_all_seeds`,
+        # which folds the same seed into that range for this process.
+        env['PYTHONHASHSEED'] = str(int(seed) % (2 ** 32))
         cmd = [sys.executable, script, *child_argv, '--seeds', str(seed), '--output-dir', str(out_dir)]
         rc = subprocess.run(cmd, env=env).returncode
         if rc != 0:
