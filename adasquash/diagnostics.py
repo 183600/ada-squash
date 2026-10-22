@@ -924,7 +924,11 @@ def triage_nonfinite(
             model.train()
         evidence["autocast_forward_finite"] = None
         evidence["gradients_finite"] = None
-        evidence["stages_skipped"] = ["fp32_math", "mixed_precision", "gradients"]
+        # The corruption is classified under the gradient/optimizer stage
+        # (that is where an update can corrupt weights), so it is the stage
+        # being reported - it cannot also be listed as skipped. Only the
+        # forward/mixed-precision probes are actually skipped here.
+        evidence["stages_skipped"] = ["fp32_math", "mixed_precision"]
         verdict = classify_nan_stage(evidence)
         return {"evidence": evidence, **verdict}
 
