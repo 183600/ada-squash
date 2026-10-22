@@ -910,6 +910,10 @@ def main():
     p.add_argument('--threads-per-run', type=int, default=1, help='OMP/MKL/OpenBLAS/etc thread cap for each child (0 = inherit the parent environment); 1 avoids oversubscription when cells share a host, raise it for a single serial run')
     apply_config_to_parser(p, known.config, _SWEEP_CONFIG_ALIASES)
     args = p.parse_args()
+    if not args.depths:
+        p.error('--depths must not be empty: a sweep with no depth has no cells to run')
+    if not args.norms:
+        p.error('--norms must not be empty: a sweep with no norm has no cells to run')
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [42])
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
