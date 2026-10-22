@@ -482,9 +482,69 @@ def _row_run_identity(row: dict, parent_of: dict) -> str:
         name = parent
     return row.get('name')
 
+# The synthetic corpus and validation stream have to match the count model's
+# for its CE to be a paired baseline. These are the fields the ablation runner
+# records in each row's `controls` block; missing/unknown values never count
+# as a match.
+_CALIBRATION_MODEL_VOCAB = {'gpt2-124m': 50304, 'gpt2-350m': 50304,
+                            'llama-1b': 32000}
+_CALIBRATION_PROTOCOL_KEYS = (
+    'generator', 'n_states', 'max_jump', 'vocab_size', 'batch_size', 'seq_len',
+    'outlier_id', 'val_seed_offset', 'val_batches',
+)
+
+def _calibration_protocol(args, outlier_id) -> dict:
+    """The held-out corpus protocol this calibration run actually uses."""
+    return {
+        'generator': 'markov_batch',
+        # `ablation.run_one` calls `markov_batch` with its defaults; a
+        # non-default calibration corpus is a different experiment.
+        'n_states': int(args.n_states),
+        'max_jump': int(args.max_jump),
+        'vocab_size': int(args.vocab_size),
+        'batch_size': int(args.batch_size),
+        'seq_len': int(args.seq_len),
+        'outlier_id': outlier_id,
+        'val_seed_offset': 1,
+        'val_batches': int(args.val_batches),
+    }
+
+def _row_calibration_protocol(row: dict) -> dict | None:
+    """The corpus protocol recorded by one ablation row, or None when unknown."""
+    controls = row.get('controls')
+    if not isinstance(controls, dict):
+        return None
+    data = controls.get('data')
+    if not isinstance(data, dict):
+        return None
+    generator = data.get('generator')
+    # `markov_batch` defaults used by the ablation runner. n_states/max_jump
+    # are not separately recorded, so only a recorded markov_batch generator
+    # can establish them.
+    known_defaults = generator == 'markov_batch'
+    return {
+        'generator': generator,
+        'n_states': 64 if known_defaults else None,
+        'max_jump': 3 if known_defaults else None,
+        'vocab_size': _CALIBRATION_MODEL_VOCAB.get(row.get('model')),
+        'batch_size': data.get('batch_size'),
+        'seq_len': data.get('seq_len'),
+        'outlier_id': data.get('outlier_id'),
+        'val_seed_offset': data.get('val_seed_offset'),
+        'val_batches': data.get('val_batches'),
+    }
+
+def _calibration_protocol_mismatches(row_protocol: dict | None,
+                                     expected: dict) -> list:
+    if row_protocol is None:
+        return list(_CALIBRATION_PROTOCOL_KEYS)
+    return [key for key in _CALIBRATION_PROTOCOL_KEYS
+            if row_protocol.get(key) != expected.get(key)]
+
 def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_ce,
                             log_vocab, tuned_predictor: str | None = None,
-                            records: list | None = None, alpha: float = 0.05) -> list:
+                            records: list | None = None, alpha: float = 0.05,
+                            protocol: dict | None = None) -> list:
     """Join ablation val_losses with their distance to the task's limits.
 
     `excess_over_bayes_ceiling_nats` is the gap to the best possible full-context
@@ -500,6 +560,13 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
     a one-sided paired t-test over shared seeds (>= 3) after a Holm correction
     across the rows; a point-estimate win inside the seed noise stays visible
     as `beats_tuned_simple_baseline=True, beats_tuned_simple_significantly=False`.
+
+    When `protocol` is supplied it is the calibration corpus's held-out
+    protocol (`batch_size`, `seq_len`, `outlier_id`, validation generator and
+    batch count, ...). Rows whose recorded `controls` block cannot prove that
+    same protocol are annotated and kept out of the Holm family: the
+    summaries file deliberately accumulates rows across invocations, and a
+    stale row's CE is not paired with this calibration's count-model CE.
     """
     out = []
     parent_of = {row.get('name'): row.get('reused_from') for row in rows
@@ -513,6 +580,16 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
         entry = {'name': row.get('name'), 'val_loss': val_loss, 'n_seeds': row.get('n_seeds'),
                  'run_identity': identity,
                  'excluded_from_family': None}
+        if protocol is not None:
+            mismatches = _calibration_protocol_mismatches(
+                _row_calibration_protocol(row), protocol)
+            entry['protocol_matches'] = not mismatches
+            entry['protocol_mismatches'] = mismatches
+            entry['recorded_protocol'] = _row_calibration_protocol(row)
+            if mismatches:
+                entry['excluded_from_family'] = (
+                    'trained/validated under a different corpus protocol than this '
+                    f"calibration: {', '.join(mismatches)}")
         if isinstance(val_loss, (int, float)):
             entry['excess_over_bayes_floor_nats'] = val_loss - memoryless_floor
             if ceiling is not None:
@@ -574,6 +651,7 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
             aliases,
             key=lambda entry: (
                 0 if _finite_number(entry.get('val_loss')) else 1,
+                0 if entry.get('protocol_matches', True) else 1,
                 0 if entry.get('replicated_across_seeds') else 1,
                 -int(entry.get('n_seeds') or 0),
                 0 if entry.get('p_one_sided_tuned_simple') is not None else 1,
@@ -694,14 +772,17 @@ def main():
         None if not tuned_baseline else tuned_baseline['mean_ce_nats'],
         math.log(args.vocab_size),
         tuned_predictor=None if not tuned_baseline else tuned_baseline['predictor'],
-        records=records)
+        records=records,
+        protocol=_calibration_protocol(args, outlier_id))
     if ablation_rows:
         above = sum(1 for row in ablation_rows if row.get('beats_tuned_simple_baseline'))
         certified = sum(1 for row in ablation_rows if row.get('beats_tuned_simple_significantly'))
+        mismatched = sum(1 for row in ablation_rows if row.get('protocol_matches') is False)
         print(f"[baseline] ablation rows from {summaries_path}: {above}/{len(ablation_rows)} beat the tuned "
               f"count model on the point estimate, {certified}/{len(ablation_rows)} significantly "
-              f"(paired t, Holm, >=3 shared seeds); every row is annotated with "
-              f"excess_over_bayes_floor_nats and excess_over_bayes_ceiling_nats")
+              f"(paired t, Holm, >=3 shared seeds); {mismatched} row(s) were excluded as "
+              f"trained/validated under a different corpus protocol; every row is annotated "
+              f"with excess_over_bayes_floor_nats and excess_over_bayes_ceiling_nats")
     report = {
         'hypothesis': args.hypothesis,
         'protocol': {
