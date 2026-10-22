@@ -198,15 +198,21 @@ def _manifest_replication_problem(agg: dict, manifest: dict | None) -> str | Non
     aggregate_seeds = agg.get('seeds') if isinstance(agg, dict) else None
     if not isinstance(recorded_seeds, list) or not isinstance(aggregate_seeds, list):
         return 'run_manifest.json does not record the replicated seed set'
-    try:
-        manifest_seed_set = sorted(int(seed) for seed in recorded_seeds
-                                   if not isinstance(seed, bool))
-        aggregate_seed_set = sorted(int(seed) for seed in aggregate_seeds
-                                    if not isinstance(seed, bool))
-    except (TypeError, ValueError, OverflowError):
-        return 'run_manifest.json has a malformed seed list'
-    if (len(manifest_seed_set) != len(recorded_seeds)
-            or len(aggregate_seed_set) != len(aggregate_seeds)):
+    def _strict_seed_list(values):
+        out = []
+        for seed in values:
+            # A JSON float/bool is not a seed id; `int(42.5)` would silently
+            # truncate it and `int(True)` would accept a boolean as one seed.
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                return None
+            out.append(int(seed))
+        if len(set(out)) != len(out):
+            return None
+        return sorted(out)
+
+    manifest_seed_set = _strict_seed_list(recorded_seeds)
+    aggregate_seed_set = _strict_seed_list(aggregate_seeds)
+    if manifest_seed_set is None or aggregate_seed_set is None:
         return 'run_manifest.json has a malformed seed list'
     if manifest_seed_set != aggregate_seed_set:
         return (f'run_manifest.json seeds {manifest_seed_set} differ from the '
