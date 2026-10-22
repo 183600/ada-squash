@@ -7,6 +7,10 @@
 # Every row runs under the identical optimizer/schedule/data recipe above;
 # rows may only set architectural / initialization knobs and the loader
 # rejects any row that tries to change lr, weight_decay, batch_size, ...
+# `python3 scripts/ablation.py --config configs/ablation-matrix.yaml
+# --check-matrix` additionally validates both 2x2 factorials (the main
+# softsign arm and the tanh control), the leave-one-out set, and the
+# independent QK-compression triple on every host norm.
 # Each row is replicated over `seeds` (>= 3) and reported as mean +/- std
 # across seeds, so a claim is not built on a single lucky run.
 model: gpt2-124m
