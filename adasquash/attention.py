@@ -241,6 +241,12 @@ class CausalSelfAttention(nn.Module):
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
         cache = self._rope_cache
         entry = cache[1] if cache is not None and cache[0] == key else None
+        if entry is not None and entry[4] != freqs_cis._version:
+            # The caller updated the same buffer in place (a context-extension
+            # or reset is a normal operation). The key D6 fixes is intentionally
+            # unchanged; the stored table's source version is what proves the
+            # cached cos/sin still match its content.
+            entry = None
         if entry is not None and entry[1].is_inference() and (not torch.is_inference_mode_enabled()):
             # A table built under `inference_mode` cannot be saved for
             # backward; a later grad-mode forward through this module has to
@@ -271,6 +277,11 @@ def _rope_table_entry(freqs_cis: torch.Tensor):
     """
     key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
     entry = _ROPE_TABLE_CACHE.get(key)
+    if entry is not None and entry[4] != freqs_cis._version:
+        # An in-place update of the same buffer (e.g. `freqs_cis.copy_(new)`)
+        # must invalidate the cached cos/sin even though the D6 storage-pointer
+        # key is unchanged.
+        entry = None
     if entry is not None and entry[1].is_inference() and (not torch.is_inference_mode_enabled()):
         # Inference-mode tables are immutable constants: they cannot be saved
         # for backward, so grad-mode callers need a normal rebuild (the key
@@ -279,7 +290,7 @@ def _rope_table_entry(freqs_cis: torch.Tensor):
     if entry is None:
         cos = freqs_cis.real.unsqueeze(0).unsqueeze(0).contiguous()
         sin = freqs_cis.imag.unsqueeze(0).unsqueeze(0).contiguous()
-        entry = (freqs_cis, cos, sin, {})
+        entry = (freqs_cis, cos, sin, {}, freqs_cis._version)
         if len(_ROPE_TABLE_CACHE) >= _CACHE_MAX_ENTRIES:
             _ROPE_TABLE_CACHE.popitem(last=False)
         _ROPE_TABLE_CACHE[key] = entry
