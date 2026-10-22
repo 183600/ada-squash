@@ -986,6 +986,22 @@ def main():
         p.error('--depths must not be empty: a sweep with no depth has no cells to run')
     if not args.norms:
         p.error('--norms must not be empty: a sweep with no norm has no cells to run')
+    if any(int(depth) < 1 for depth in args.depths):
+        p.error(f'--depths entries must be >= 1, got {list(args.depths)}')
+    raw_depths = [int(depth) for depth in args.depths]
+    args.depths = list(dict.fromkeys(raw_depths))
+    if len(args.depths) != len(raw_depths):
+        print(f'[sweep][warn] duplicate depths removed: {raw_depths} -> {args.depths} '
+              '(a repeated depth would launch the same cell twice, racing on one output directory)')
+    raw_norms = list(args.norms)
+    args.norms = list(dict.fromkeys(raw_norms))
+    if len(args.norms) != len(raw_norms):
+        print(f'[sweep][warn] duplicate norms removed: {raw_norms} -> {args.norms} '
+              '(a repeated norm is the same cell, not an independent comparison)')
+    if args.max_parallel < 1:
+        p.error(f'--max-parallel {args.max_parallel} must be >= 1')
+    if args.threads_per_run < 0:
+        p.error(f'--threads-per-run {args.threads_per_run} must be >= 0')
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [42])
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
