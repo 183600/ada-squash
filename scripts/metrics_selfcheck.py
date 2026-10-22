@@ -173,7 +173,7 @@ def check_f1():
     close(from_counts['macro_f1'], macro, label='f1_from_counts macro')
     close(from_counts['weighted_f1'], weighted, label='f1_from_counts weighted')
     close(from_counts['micro_f1'], micro, label='f1_from_counts micro')
-    close(from_counts['macro_recall'], (2 / 3 + 1.0 + 1 / 3) / 3,
+    close(from_counts['macro_recall'], (2 / 3 + 2 / 3 + 2 / 3) / 3,
           label='macro_recall')
 
 

@@ -1552,12 +1552,17 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
         return None
     # Rank by the confirm split when every candidate has one, otherwise by the
     # selection grid mean (the same preference tune.py itself uses).
-    rank_key = ((lambda entry: entry['confirm_val_loss'])
-                if all(entry['confirm_complete'] and _finite_metric(entry['confirm_val_loss'])
-                       for entry in found)
-                else (lambda entry: entry['selected_val_loss']))
-    best_row = min(found, key=rank_key)['row']
-    all_at_recipe = all(entry['recipe_is_selected_cell'] for entry in found)
+    if all(entry['confirm_complete'] and _finite_metric(entry['confirm_val_loss'])
+           for entry in found):
+        best_row = min(found, key=lambda entry: entry['confirm_val_loss'])['row']
+    else:
+        best_row = min(found, key=lambda entry: (entry['selected_val_loss']
+                                                 if _finite_metric(entry['selected_val_loss'])
+                                                 else float('inf')))['row']
+    missing_baselines = sorted(entry['row'] for entry in per_baseline.values()
+                               if not entry['found'])
+    all_at_recipe = (not missing_baselines
+                     and all(entry['recipe_is_selected_cell'] for entry in found))
     block = {
         'source': str(path),
         'protocol_checked': True,
@@ -1570,6 +1575,7 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
         'tuning_confirmed_on_held_back_seeds': tuning_confirmed,
         'per_baseline': per_baseline,
         'best_tuned_baseline_row': best_row,
+        'missing_baseline_arms': missing_baselines,
         'all_baselines_selected_this_recipe': all_at_recipe,
         'certified': bool(recipe_in_grid and tuning_confirmed and all_at_recipe),
         'reading': ('a matrix at one fixed recipe may claim a win over a tuned baseline only '
@@ -1584,7 +1590,9 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
             reasons.append('the matrix recipe is not in the tuning grid')
         if not tuning_confirmed:
             reasons.append('tune.py did not certify on held-back --confirm-seeds')
-        if not all_at_recipe:
+        if missing_baselines:
+            reasons.append(f'no tuned arm for baseline(s) {missing_baselines}')
+        if not all_at_recipe and not missing_baselines:
             reasons.append('at least one baseline selected a different (lr, weight_decay) cell')
         block['why_not_certified'] = reasons
         print(f'[tune-cert] WARNING: {path} does not certify the fixed recipe: '
