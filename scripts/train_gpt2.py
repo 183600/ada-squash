@@ -697,9 +697,15 @@ def _manifest_ledger_fingerprints(manifest: dict):
     if not isinstance(data, dict):
         return None
     out = {}
+    present = False
     for name in _LEDGER_ARGS:
         if name not in data:
-            return None
+            # A partial legacy record is still comparable as long as every seed
+            # omits the same role; an explicit value on one side versus this
+            # sentinel on the other is a mismatch.
+            out[name] = '<missing>'
+            continue
+        present = True
         value = data.get(name)
         if value is None:
             out[name] = None
@@ -708,7 +714,7 @@ def _manifest_ledger_fingerprints(manifest: dict):
                          for key in ('path', 'exists', 'sha256', 'bytes')}
         else:
             return None
-    return out
+    return out if present else None
 
 def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     """Pool per-seed runs into one Mean +/- Std record (Phase 1 statistics).
