@@ -261,25 +261,56 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         raise ValueError('schedule must be the dict returned by block_randomized_schedule')
     resolve = _arm_resolver(arm_of)
     entries = schedule['entries']
-    positions = [entry.get('position') for entry in entries]
     structural: list[str] = []
     if len(entries) != schedule.get('n_units'):
         structural.append('entry count does not match n_units')
-    if sorted(positions) != list(range(len(entries))):
+    # Positions are the structural contract of the schedule. A malformed
+    # record must produce a warning instead of a KeyError/TypeError: this
+    # report is the pre-flight check that is supposed to expose a broken
+    # schedule, not crash on it.
+    positions: list[int] = []
+    positions_valid = True
+    for entry in entries:
+        if not isinstance(entry, dict):
+            positions_valid = False
+            continue
+        position = entry.get('position')
+        if (isinstance(position, bool) or not isinstance(position, int)
+                or position < 0):
+            positions_valid = False
+        else:
+            positions.append(position)
+    if not positions_valid:
+        structural.append('positions are not a contiguous 0..n-1 range '
+                          '(missing or non-integer position)')
+    elif sorted(positions) != list(range(len(entries))):
         structural.append('positions are not a contiguous 0..n-1 range')
-    units = [entry.get('run_id', entry.get('unit')) for entry in entries]
+    units = [entry.get('run_id', entry.get('unit'))
+             if isinstance(entry, dict) else None for entry in entries]
     if len(set(units)) != len(units):
         structural.append('duplicate run ids in the realized order')
 
     per_arm: dict[str, dict] = {}
+    blocks_valid = True
     for entry in entries:
-        arm = str(resolve(entry.get('run_id', entry['unit'])))
+        if not isinstance(entry, dict):
+            continue
+        arm = str(resolve(entry.get('run_id', entry.get('unit'))))
         bucket = per_arm.setdefault(arm, {
             'count': 0, 'positions': [], 'blocks': set(), 'early': 0, 'late': 0,
         })
         bucket['count'] += 1
-        bucket['positions'].append(entry['position'])
-        bucket['blocks'].add(entry['block'])
+        position = entry.get('position')
+        if (not isinstance(position, bool) and isinstance(position, int)
+                and position >= 0):
+            bucket['positions'].append(position)
+        block = entry.get('block')
+        if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+            blocks_valid = False
+        else:
+            bucket['blocks'].add(block)
+    if not blocks_valid:
+        structural.append('one or more entries have a missing or non-integer block')
     n = len(entries)
     overall_mean = (n - 1) / 2.0 if n else None
     extreme_counts: dict[str, int] = {}
@@ -466,7 +497,11 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
             rho_samples.append(permuted)
     extreme = sum(1 for sample in rho_samples if abs(sample) >= abs(rho))
     p_two_sided = (1.0 + extreme) / (1.0 + len(rho_samples))
-    decline = sum(1 for sample in rho_samples if sample <= rho)
+    # `drift_detected` orients a positive rho as "later runs worse": the
+    # one-sided p for that alternative is the upper tail, not the lower tail.
+    # The old lower-tail count returned ~1.0 for the very trend the report
+    # labels later_runs_worse.
+    decline = sum(1 for sample in rho_samples if sample >= rho)
     p_one_sided_decline = (1.0 + decline) / (1.0 + len(rho_samples))
 
     per_arm = []
@@ -524,6 +559,11 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         checks.append({'id': check_id, 'status': status, 'detail': detail})
 
     seeds = list(seeds or [])
+    # The power check must use the number of *distinct* observations the
+    # paired test will actually have, not the raw list length (duplicate seeds
+    # are the same run and the replication check above rejects them).
+    n_pairs = len({seed for seed in seeds
+                   if isinstance(seed, int) and not isinstance(seed, bool)})
     if (len(seeds) < min_seeds or len(set(seeds)) != len(seeds)
             or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds)):
         add('replication', 'fail',
@@ -578,17 +618,24 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             add('power', 'warn',
                 'a paired SD was supplied but no positive margin defines the effect '
                 'to power for')
+        elif n_pairs < 2:
+            # A paired design needs at least two distinct observations before
+            # its power can be estimated. Reporting a crash here would turn a
+            # failed pre-flight check into an unusable audit.
+            add('power', 'fail',
+                f'{n_pairs} distinct seed(s): at least 2 paired observations are '
+                f'needed to estimate power for margin={target:g}')
         else:
-            design = paired_design_summary(sd, len(seeds), margin=target,
+            design = paired_design_summary(sd, n_pairs, margin=target,
                                            alpha=float(alpha), power=float(target_power))
             if design.get('adequately_powered_for_margin') is True:
                 add('power', 'pass',
-                    f'{len(seeds)} pairs at paired SD={sd:g} reach the '
+                    f'{n_pairs} pairs at paired SD={sd:g} reach the '
                     f'{target:g} target (required '
                     f'{design.get("required_pairs_for_margin")})')
             elif design.get('adequately_powered_for_margin') is False:
                 add('power', 'fail',
-                    f'{len(seeds)} pairs at paired SD={sd:g} are underpowered for '
+                    f'{n_pairs} pairs at paired SD={sd:g} are underpowered for '
                     f'margin={target:g}; need {design.get("required_pairs_for_margin")}')
             else:
                 add('power', 'warn',
