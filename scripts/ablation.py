@@ -2148,7 +2148,9 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
     annotated = []
     for entry in comparison['rows']:
         val_loss = entry.get('val_loss')
-        if not isinstance(val_loss, (int, float)):
+        if not _finite_metric(val_loss):
+            # NaN/Inf/bool is not a measured held-out loss; annotating it
+            # would turn an invalid row into a finite-looking Bayes gap.
             continue
         entry['excess_over_bayes_floor_nats'] = val_loss - floor
         if ceiling is not None:

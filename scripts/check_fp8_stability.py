@@ -411,7 +411,7 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
     agg['seeds'] = [r.get('seed') for r in per_seed]
     agg['n_seeds'] = len(per_seed)
     for key in _FP8_SEED_METRIC_KEYS:
-        vals = [r[key] for r in per_seed if isinstance(r.get(key), (int, float))]
+        vals = [r[key] for r in per_seed if _finite_metric(r.get(key))]
         stats = mean_std_stderr(vals)
         if stats is None:
             # Every probe draw was non-finite: report "unmeasured" instead of
@@ -431,9 +431,11 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
         if stats['n_nonfinite']:
             agg.setdefault('nonfinite_metric_counts', {})[key] = stats['n_nonfinite']
     nonfinite = [r['first_nonfinite_layer'] for r in per_seed
-                 if isinstance(r.get('first_nonfinite_layer'), int)]
+                 if isinstance(r.get('first_nonfinite_layer'), int)
+                 and not isinstance(r.get('first_nonfinite_layer'), bool)]
     overflowing = [r['first_overflow_layer'] for r in per_seed
-                   if isinstance(r.get('first_overflow_layer'), int)]
+                   if isinstance(r.get('first_overflow_layer'), int)
+                   and not isinstance(r.get('first_overflow_layer'), bool)]
     agg['first_nonfinite_layer'] = min(nonfinite) if nonfinite else None
     agg['first_nonfinite_layer_earliest'] = agg['first_nonfinite_layer']
     agg['first_overflow_layer'] = min(overflowing) if overflowing else None

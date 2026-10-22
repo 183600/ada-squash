@@ -305,7 +305,7 @@ def aggregate_w8a8_seed_rows(ckpt_path: str, per_seed: list) -> dict:
     agg['seeds'] = [r['seed'] for r in per_seed]
     agg['n_seeds'] = len(per_seed)
     for key in _W8A8_SEED_METRIC_KEYS:
-        vals = [r[key] for r in per_seed if isinstance(r.get(key), (int, float))]
+        vals = [r[key] for r in per_seed if _finite_metric(r.get(key))]
         stats = mean_std_stderr(vals)
         if stats is None:
             # Every probe draw was non-finite: report "unmeasured", never keep
