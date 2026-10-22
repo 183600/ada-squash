@@ -709,6 +709,18 @@ def main():
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check')
     p.add_argument('--force', action='store_true', help='rerun trials even if a summary already exists')
     args = p.parse_args()
+    if not args.arms:
+        p.error('--arms must not be empty')
+    if len(set(args.arms)) != len(args.arms):
+        p.error(f'--arms contains duplicates: {args.arms}; a repeated arm reruns the '
+                'same grid and overwrites itself instead of adding evidence')
+    if len(set(args.baselines)) != len(args.baselines):
+        p.error(f'--baselines contains duplicates: {args.baselines}; a baseline is one '
+                'reference arm, not repeated evidence')
+    if not math.isfinite(args.margin) or args.margin < 0.0:
+        p.error(f'--margin {args.margin} must be finite and >= 0')
+    if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
+        p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
     for flag, value in (('--max-steps', args.max_steps),
                         ('--batch-size', args.batch_size),
                         ('--seq-len', args.seq_len),
