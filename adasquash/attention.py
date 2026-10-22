@@ -180,7 +180,7 @@ class CausalSelfAttention(nn.Module):
         budget_rows = max(1, self._LOGITS_CHUNK_BYTES // max(1, B * H * T * row_bytes))
         rows = min(T, self._LOGITS_BLOCK_ROWS, budget_rows)
         n_valid = B * H * (T * (T + 1) // 2)
-        if n_valid <= 1:
+        if n_valid == 0:
             return {'logit_abs_mean': 0.0, 'logit_abs_max': 0.0, 'logit_std': 0.0}
         acc_abs = torch.zeros((), dtype=torch.float64, device=device)
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
@@ -224,7 +224,8 @@ class CausalSelfAttention(nn.Module):
         total, signed, sq, peak_v = torch.stack(
             (acc_abs, acc_x, acc_sq, peak.to(torch.float64))).tolist()
         mean_abs = total / n_valid
-        var = (sq - signed * signed / n_valid) / (n_valid - 1)
+        var = ((sq - signed * signed / n_valid) / (n_valid - 1)
+               if n_valid > 1 else 0.0)
         return {'logit_abs_mean': mean_abs, 'logit_abs_max': peak_v, 'logit_std': math.sqrt(var) if var > 0.0 else 0.0}
 
     def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
