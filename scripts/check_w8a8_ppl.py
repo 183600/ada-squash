@@ -567,6 +567,13 @@ def main():
               f'(a repeated seed reruns the identical probe, not an independent sample)')
     if len(seeds) < 3:
         print(f'[w8a8][warn] {len(seeds)} seed(s): one probe draw is one sample; use >= 3 independent probes before treating a PPL-drop difference as real')
+    for flag, value in (('--batch-size', args.batch_size),
+                        ('--seq-len', args.seq_len),
+                        ('--n-batches', args.n_batches)):
+        if value < 1:
+            p.error(f'{flag} {value} must be >= 1')
+    if args.num_workers < 0:
+        p.error(f'--num-workers {args.num_workers} must be >= 0')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seeds[0])
 
@@ -616,7 +623,7 @@ def main():
                 model.eval()
                 rng = torch.Generator(device=device).manual_seed(seed)
                 batches = []
-                for _ in range(max(1, args.n_batches)):
+                for _ in range(args.n_batches):
                     x = make_probe(rng, model.cfg, dataset_probe)
                     batches.append(x)
                 # The targets are a pure function of the probe; build them once
