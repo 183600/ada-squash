@@ -194,7 +194,8 @@ def _final_step(agg: dict):
     if len(steps) != 1:
         return None
     step = next(iter(steps))
-    return step if isinstance(step, int) and not isinstance(step, bool) else None
+    return (step if isinstance(step, int) and not isinstance(step, bool)
+            and step > 0 else None)
 
 
 def _arm_issues(name: str, agg: dict, metric: str) -> list[str]:
