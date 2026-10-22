@@ -180,9 +180,11 @@ class KurtosisMeter:
         # Excess kurtosis is scale-invariant. An absolute variance floor (the
         # old `var < 1e-12`) reports heavy-tailed but small-magnitude
         # activations as perfectly Gaussian; only a zero/non-finite variance
-        # has no standardized fourth moment.
+        # has no standardized fourth moment. Returning 0.0 there labelled a
+        # NaN/Inf activation (and a constant one) as exactly Gaussian, hiding
+        # the corruption this meter exists to expose.
         if not math.isfinite(var) or var == 0.0:
-            return 0.0
+            return float('nan')
         return self.M4 / self.n / (var * var) - 3.0
 
 class ActivationStats:
