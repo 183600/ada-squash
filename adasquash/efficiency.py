@@ -15,6 +15,7 @@ The functions are pure (config/model in, dict out) so ablation and sweep
 runners can attach the numbers to their summaries.
 """
 import math
+import numbers
 from collections import defaultdict
 from typing import Optional
 
@@ -67,7 +68,7 @@ def _positive_int(value, name: str) -> int:
 
 def _positive_real(value, name: str) -> float:
     """A finite strictly-positive real (a ratio/scale, not a count)."""
-    if _is_boolean_value(value) or value is None:
+    if _is_boolean_value(value) or not isinstance(value, numbers.Real):
         raise ValueError(f"{name} must be a positive number, got {value!r}")
     try:
         converted = float(value)
@@ -75,6 +76,19 @@ def _positive_real(value, name: str) -> float:
         raise ValueError(f"{name} must be a positive number, got {value!r}") from None
     if not math.isfinite(converted) or converted <= 0.0:
         raise ValueError(f"{name} must be finite and > 0, got {value!r}")
+    return converted
+
+
+def _nonnegative_real(value, name: str) -> float:
+    """A finite non-negative real threshold, without truthiness coercion."""
+    if _is_boolean_value(value) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be a non-negative number, got {value!r}")
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a non-negative number, got {value!r}") from None
+    if not math.isfinite(converted) or converted < 0.0:
+        raise ValueError(f"{name} must be finite and >= 0, got {value!r}")
     return converted
 
 
@@ -274,14 +288,18 @@ def efficiency_verdict(
     the same for cost: a measurement taken on a different architecture cannot
     certify the candidate's cost.
     """
+    min_gain_value = _nonnegative_real(min_loss_gain, "min_loss_gain")
+    max_cost_value = _nonnegative_real(max_cost_ratio, "max_cost_ratio")
+    max_component_value = (max_cost_value if max_component_ratio is None
+                           else _nonnegative_real(max_component_ratio,
+                                                  "max_component_ratio"))
     verdict = {
         "loss_improvement": loss_improvement,
         "cost_ratio": cost_ratio,
         "cost_name": cost_name,
-        "min_loss_gain": float(min_loss_gain),
-        "max_cost_ratio": float(max_cost_ratio),
-        "max_component_ratio": (float(max_cost_ratio) if max_component_ratio is None
-                                else float(max_component_ratio)),
+        "min_loss_gain": min_gain_value,
+        "max_cost_ratio": max_cost_value,
+        "max_component_ratio": max_component_value,
         "statistically_significant": statistically_significant,
         "significance_status": (
             "certified" if statistically_significant is True
