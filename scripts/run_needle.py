@@ -136,9 +136,15 @@ def _print_protocol_guard(guard: dict) -> None:
               'comparison requires both steps to be known', file=sys.stderr)
 
 def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
-    """The tokenizer identity the checkpoint was trained with, else the CLI default."""
+    """The tokenizer identity the checkpoint was trained with, else the CLI default.
+
+    Use the concrete commit recorded at training time when present: loading
+    the mutable requested branch could tokenize the needle differently from
+    the run that produced the weights.
+    """
     name = ckpt_args.get('tokenizer') or fallback_name
-    revision = ckpt_args.get('tokenizer_revision')
+    revision = (ckpt_args.get('tokenizer_revision_resolved')
+                or ckpt_args.get('tokenizer_revision'))
     return name, revision
 
 def evaluate_model(model, tok, args, device, seeds, trained_seq_len):

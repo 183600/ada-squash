@@ -98,9 +98,15 @@ DEFAULT_QUESTION = '\n\nWhat is the magic number? The magic number is'
 DEFAULT_HAYSTACK = 'Many sentences follow. '
 
 def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
-    """The tokenizer identity the checkpoint was trained with, else the fallback."""
+    """The tokenizer identity the checkpoint was trained with, else the fallback.
+
+    Prefer the concrete commit recorded at training time over the mutable
+    branch/tag the user requested; otherwise a moved branch silently
+    tokenizes the evaluation differently from training.
+    """
     name = ckpt_args.get('tokenizer') or fallback_name
-    revision = ckpt_args.get('tokenizer_revision')
+    revision = (ckpt_args.get('tokenizer_revision_resolved')
+                or ckpt_args.get('tokenizer_revision'))
     return name, revision
 
 
@@ -350,8 +356,10 @@ def main():
             # checkpoint may have been trained with a different vocabulary and
             # silently overriding the flag evaluates a different model.
             tok_name = args.tokenizer
-            recorded_revision = (model_args.get('tokenizer_revision')
-                                 if model_args.get('tokenizer') == args.tokenizer else None)
+            recorded_revision = (
+                (model_args.get('tokenizer_revision_resolved')
+                 or model_args.get('tokenizer_revision'))
+                if model_args.get('tokenizer') == args.tokenizer else None)
         else:
             tok_name, recorded_revision = _checkpoint_tokenizer(model_args, 'gpt2')
         tok_revision = (args.tokenizer_revision if args.tokenizer_revision is not None
