@@ -477,8 +477,8 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
         position = record.get('position')
         value = record.get('value')
         if (not isinstance(arm, str) or not arm
-                or isinstance(position, bool) or not isinstance(position, (int, float))
-                or not isinstance(value, (int, float)) or isinstance(value, bool)):
+                or isinstance(position, bool) or not isinstance(position, numbers.Real)
+                or not isinstance(value, numbers.Real) or isinstance(value, bool)):
             excluded['malformed'] += 1
             continue
         position_value = _finite_float(position)
