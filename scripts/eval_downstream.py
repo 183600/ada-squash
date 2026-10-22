@@ -130,8 +130,17 @@ class AdaSquashLM:
 
         Tokenize the concatenation, then keep whatever the tokenizer produced
         beyond the context prefix. Tokenizing the continuation on its own can
-        turn a leading space into a different token.
+        turn a leading space into a different token. Trailing whitespace in
+        the context is moved into the continuation first: otherwise the
+        tokenizer can encode `context + continuation` without the standalone
+        trailing-space token that `context` alone produced, so the prefix
+        length drops and `whole[len(ctx):]` is empty even though the
+        continuation is non-empty (the lm-eval convention).
         """
+        n_spaces = len(context) - len(context.rstrip())
+        if continuation and n_spaces > 0:
+            continuation = context[-n_spaces:] + continuation
+            context = context.rstrip()
         whole = self.tok_encode(context + continuation)
         ctx = self.tok_encode(context)
         if not ctx:
