@@ -1921,16 +1921,11 @@ def _baseline_tuning_protocol_mismatches(protocol: dict, args, seeds) -> list:
                   for key, want in expected.items() if protocol.get(key) != want]
     recorded = protocol.get('selection_seeds')
     normalized = None
-    if isinstance(recorded, list):
-        try:
-            normalized = [int(seed) for seed in recorded
-                          if not isinstance(seed, bool)]
-            if len(normalized) != len(recorded):
-                normalized = None
-        except (TypeError, ValueError, OverflowError):
-            normalized = None
-    expected = sorted(int(seed) for seed in seeds)
-    if (normalized is None
+    if isinstance(recorded, list) and all(_is_seed_id(seed) for seed in recorded):
+        normalized = [int(seed) for seed in recorded]
+    expected = (sorted(int(seed) for seed in seeds)
+                if all(_is_seed_id(seed) for seed in seeds) else None)
+    if (normalized is None or expected is None
             or len(set(normalized)) != len(normalized)
             or sorted(normalized) != expected):
         mismatches.append(f'selection_seeds={recorded!r} != {expected!r} '
