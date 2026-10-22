@@ -339,9 +339,8 @@ def _describe_paired_effect(entry: dict, arm_vals, ref_vals, common, test,
         return
     if stats['stderr'] is None:
         return
-    # Use the delta stderr directly: `compare` runs `paired_t_one_sided` with
-    # its own default alpha, so inverting the CI at this `alpha` would report
-    # a wrong MDE whenever the two differ. The test is H1
+    # Use the delta stderr directly: `compare` runs `paired_t_one_sided` at
+    # this same alpha, so inverting the CI is unnecessary. The test is H1
     # mean(delta) < -margin, so the smallest raw effect that clears both the
     # practical margin and the sampling noise includes that margin.
     entry['minimum_detectable_delta_95_power80'] = (
@@ -525,7 +524,8 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
         }
         test = None
         if len(common) >= 2:
-            test = paired_t_one_sided(arm_vals, ref_vals, margin=margin)
+            test = paired_t_one_sided(arm_vals, ref_vals, margin=margin,
+                                      alpha=alpha)
             entry['test_basis'] = 'seed_means'
             entry['replicated_across_seeds'] = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
         elif len(common) == 1:
@@ -545,9 +545,11 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             if (isinstance(a_batches, list) and isinstance(b_batches, list)
                     and len(a_batches) >= 2 and len(b_batches) >= 2):
                 if len(a_batches) == len(b_batches):
-                    test = paired_t_one_sided(a_batches, b_batches, margin=margin)
+                    test = paired_t_one_sided(a_batches, b_batches, margin=margin,
+                                              alpha=alpha)
                 else:
-                    test = welch_t_one_sided(a_batches, b_batches, margin=margin)
+                    test = welch_t_one_sided(a_batches, b_batches, margin=margin,
+                                             alpha=alpha)
                     entry['test_basis'] = f'val_batches_single_seed{seed}_unpaired'
             entry['significance_basis'] = (
                 'descriptive only: one shared seed, so the batch-level test cannot separate '
@@ -562,6 +564,11 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             entry['df'] = test['df']
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
+            # Certification compares the paired test's effect with the same
+            # margin; using the all-seed mean here could suppress (or invent)
+            # a win when the arm and reference have different seed sets.
+            if test['mean_delta'] is not None:
+                entry['beats_reference'] = bool(test['mean_delta'] < -margin)
         _describe_paired_effect(entry, arm_vals, ref_vals, common, test, alpha,
                                 margin=margin)
         if (entry['test'] is not None and not entry['replicated_across_seeds']

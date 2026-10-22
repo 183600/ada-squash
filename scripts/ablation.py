@@ -1394,7 +1394,8 @@ def _row_std(row):
         return row.get('val_loss_seed_std')
     return row.get('val_loss_std')
 
-def _paired_row_test(row: dict, reference: dict, margin: float=0.0):
+def _paired_row_test(row: dict, reference: dict, margin: float=0.0,
+                     alpha: float=0.05):
     """One-sided paired Student-t test of `row` vs `reference`, seed-paired.
 
     Every comparison in this module must run through the *same* test logic,
@@ -1418,7 +1419,8 @@ def _paired_row_test(row: dict, reference: dict, margin: float=0.0):
     common = sorted(set(row_seeds) & set(ref_seeds))
     if len(common) >= 2:
         test = paired_t_one_sided([row_seeds[s] for s in common],
-                                  [ref_seeds[s] for s in common], margin=margin)
+                                  [ref_seeds[s] for s in common], margin=margin,
+                                  alpha=alpha)
         return test, 'seed_means', common
     if len(common) == 1:
         seed = common[0]
@@ -1427,9 +1429,11 @@ def _paired_row_test(row: dict, reference: dict, margin: float=0.0):
         if (isinstance(row_batches, list) and isinstance(ref_batches, list)
                 and len(row_batches) >= 2 and len(ref_batches) >= 2):
             if len(row_batches) == len(ref_batches):
-                test = paired_t_one_sided(row_batches, ref_batches, margin=margin)
+                test = paired_t_one_sided(row_batches, ref_batches, margin=margin,
+                                          alpha=alpha)
                 return test, f'val_batches_single_seed{seed}', common
-            test = welch_t_one_sided(row_batches, ref_batches, margin=margin)
+            test = welch_t_one_sided(row_batches, ref_batches, margin=margin,
+                                     alpha=alpha)
             return test, f'val_batches_single_seed{seed}_unpaired', common
     basis = 'no_shared_seeds' if (row_seeds and ref_seeds) else 'insufficient_seeds'
     return None, basis, common
@@ -1606,7 +1610,8 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         entry['ppl_delta'] = entry['ppl_row'] - entry['ppl_reference']
         if math.isfinite(entry['ppl_reference']) and entry['ppl_reference'] > 0.0:
             entry['ppl_delta_pct'] = 100.0 * entry['ppl_delta'] / entry['ppl_reference']
-        test, basis, common = _paired_row_test(row, reference, margin=margin)
+        test, basis, common = _paired_row_test(row, reference, margin=margin,
+                                               alpha=alpha)
         entry['test_basis'] = basis
         entry['paired_seeds'] = common
         entry['replicated_across_seeds'] = _basis_counted_in_family(basis, len(common))
@@ -2350,7 +2355,8 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                     entry['within_seed_noise'] = bool(
                         abs(entry['delta_full_minus_reference']) < denom)
             entry['mechanism_helps'] = bool(entry['delta_full_minus_reference'] < -margin)
-            test, basis, common = _paired_row_test(full, ref, margin=margin)
+            test, basis, common = _paired_row_test(full, ref, margin=margin,
+                                                   alpha=alpha)
             entry['test_basis'] = basis
             entry['paired_seeds'] = common
             entry['replicated_across_seeds'] = _basis_counted_in_family(basis, len(common))
@@ -2495,7 +2501,8 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                 continue
             entry['delta_candidate_minus_reference'] = cand['val_loss'] - ref['val_loss']
             entry['effect_helps'] = bool(entry['delta_candidate_minus_reference'] < -margin)
-            test, basis, common = _paired_row_test(cand, ref, margin=margin)
+            test, basis, common = _paired_row_test(cand, ref, margin=margin,
+                                                   alpha=alpha)
             entry['test_basis'] = basis
             entry['paired_seeds'] = common
             entry['replicated_across_seeds'] = _basis_counted_in_family(basis, len(common))

@@ -924,7 +924,7 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
             if len(common) >= 2:
                 a = [cand_seeds[s] for s in common]
                 b = [ref_seeds[s] for s in common]
-                test = paired_t_one_sided(a, b, margin=margin)
+                test = paired_t_one_sided(a, b, margin=margin, alpha=alpha)
                 entry['mean_delta'] = test['mean_delta']
                 entry['t'] = test['t']
                 entry['df'] = test['df']
@@ -939,13 +939,11 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 entry['per_seed_delta'] = {
                     str(seed): float(cand_seeds[seed] - ref_seeds[seed])
                     for seed in common}
-                # The MDE must use the paired-delta stderr directly. Inverting
-                # the reported CI would silently assume the test was run at
-                # `alpha`, but `paired_t_one_sided` above uses its own default
-                # 0.05; if a caller passes another alpha the inferred stderr
-                # would be scaled wrong. The test is H1 mean(delta) < -margin,
-                # so the smallest raw effect that clears both margin and noise
-                # includes that margin.
+                # The MDE uses the paired-delta stderr directly. Inverting the
+                # reported CI would be a second, implicit derivation; the
+                # paired test above is run at this same `alpha`, and the MDE
+                # is H1 mean(delta) < -margin, so the smallest raw effect that
+                # clears both margin and noise includes that margin.
                 delta_stats = mean_std_stderr([x - y for x, y in zip(a, b)])
                 if delta_stats['stderr'] is not None:
                     entry['minimum_detectable_delta_95_power80'] = (
