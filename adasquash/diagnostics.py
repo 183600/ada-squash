@@ -177,8 +177,28 @@ def diagnose_train_val_curve(
     if val_stderr is not None:
         if len(val_stderr) != len(val_losses):
             raise ValueError("val_stderr must be parallel to val_losses")
+
+        def _validated_stderr(value):
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"val_stderr must be a finite non-negative number or None, "
+                    f"got bool {value!r}")
+            try:
+                converted = float(value)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    f"val_stderr must be a finite non-negative number or None, "
+                    f"got {value!r}") from None
+            if not math.isfinite(converted) or converted < 0.0:
+                raise ValueError(
+                    f"val_stderr must be a finite non-negative number or None, "
+                    f"got {value!r}")
+            return converted
+
         val_stderr_series = [
-            None if se is None else float(se)
+            _validated_stderr(se)
             for v, se in zip(val_losses, val_stderr)
             if v is not None and math.isfinite(float(v))
         ]
