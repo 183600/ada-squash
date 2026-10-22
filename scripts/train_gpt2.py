@@ -1026,12 +1026,14 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'n_nonfinite_val_losses': sum(r['n_nonfinite_val_losses'] or 0 for r in per_seed
                                       if isinstance(r.get('n_nonfinite_val_losses'), (int, float))),
         'certified': len(final_vals) >= 3 and pool_ok,
-        'certification_basis': ('certified: >= 3 seeds with finite final_val_loss, no missing/invalid seeds, and one resolved data version'
+        'certification_basis': ('certified: >= 3 seeds with finite final_val_loss, no missing/invalid seeds, one cross-split ledger identity, and one resolved data version'
                                 if len(final_vals) >= 3 and pool_ok
                                 else 'not certified: ' + (
                                     f'{len(final_vals)} seeds (< 3)' if len(final_vals) < 3 else
                                     f'missing seeds: {missing}' if missing else
                                     f'invalid seeds: {invalid}' if invalid else
+                                    'seeds do not record one cross-split ledger identity'
+                                    if not ledger_identity_complete else
                                     f'unknown data version for seeds: {unknown_data_version_seeds}'
                                     if not data_versions_complete else
                                     'seeds trained on different resolved data versions'
