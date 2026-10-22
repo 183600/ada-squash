@@ -1144,7 +1144,11 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     # either.  Both are never applied to train (they are derived from earlier
     # splits; excluding them there would throw the split away).
     applied_train_ledger = opts.get("exclude_hash_file") if opts["split"] != "train" else None
-    applied_test_ledger = opts.get("exclude_test_hash_file") if opts["split"] == "test" else None
+    # The validation-document ledger has no source side when there is no
+    # validation split; applying it to test would drop documents by hashes
+    # that cannot correspond to this run's selection split.
+    applied_test_ledger = (opts.get("exclude_test_hash_file")
+                           if opts["split"] == "test" and has_val_split else None)
     exclude_files = [p for p in (applied_train_ledger, applied_test_ledger) if p]
     exclude_hashes: set = set()
     for path in exclude_files:
