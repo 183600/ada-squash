@@ -1206,6 +1206,32 @@ def main():
     args = p.parse_args()
     if args.n_experts < 1:
         p.error(f'--n-experts {args.n_experts} must be >= 1')
+    for name, value, minimum in (
+        ('--dim', args.dim, 1),
+        ('--n-layers', args.n_layers, 1),
+        ('--n-heads', args.n_heads, 1),
+        ('--seq-len', args.seq_len, 1),
+        ('--batch-size', args.batch_size, 1),
+        ('--curve-batches', args.curve_batches, 1),
+        ('--train-shuffle-buffer', args.train_shuffle_buffer, 0),
+        ('--min-doc-chars', args.min_doc_chars, 0),
+        ('--max-doc-chars', args.max_doc_chars, 0),
+    ):
+        if value < minimum:
+            p.error(f'{name} {value} must be >= {minimum}')
+    if args.dim % args.n_heads:
+        p.error(f'--dim {args.dim} is not divisible by --n-heads {args.n_heads}')
+    if args.num_documents is not None and args.num_documents < 1:
+        p.error(f'--num-documents {args.num_documents} must be >= 1')
+    if args.max_doc_chars and args.min_doc_chars > args.max_doc_chars:
+        p.error(f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
+                f'{args.max_doc_chars}; no document could pass the cleaner')
+    for name, value in (('--val-frac', args.val_frac), ('--test-frac', args.test_frac)):
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            p.error(f'{name} {value} must be finite and in [0, 1)')
+    if args.val_frac + args.test_frac >= 1.0:
+        p.error(f'--val-frac {args.val_frac} + --test-frac {args.test_frac} leaves no '
+                'training stream; the split fractions must sum to less than 1')
     if args.log_every < 1:
         p.error(f'--log-every {args.log_every} must be >= 1')
     if args.stats_every < 1:
