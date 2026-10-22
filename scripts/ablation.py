@@ -1964,6 +1964,11 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 'run_identity_full': None if full is None else _run_identity(full, parent_of),
                 'run_identity_reference': None if ref is None else _run_identity(ref, parent_of),
                 'delta_full_minus_reference': None,
+                'delta_over_max_seed_std': None,
+                'within_seed_noise': None,
+                'ppl_full': None,
+                'ppl_reference': None,
+                'ppl_delta_pct': None,
                 'mechanism_helps': False,
                 'mechanism_helps_significantly': False,
                 'test': None,
@@ -1998,6 +2003,21 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 rows.append(entry)
                 continue
             entry['delta_full_minus_reference'] = full['val_loss'] - ref['val_loss']
+            entry['ppl_full'] = _safe_exp(full['val_loss'])
+            entry['ppl_reference'] = _safe_exp(ref['val_loss'])
+            if (math.isfinite(entry['ppl_full']) and math.isfinite(entry['ppl_reference'])
+                    and entry['ppl_reference'] > 0.0):
+                entry['ppl_delta_pct'] = (100.0 * (entry['ppl_full'] - entry['ppl_reference'])
+                                          / entry['ppl_reference'])
+            seed_stds = [value for value in (_row_std(full), _row_std(ref))
+                         if isinstance(value, (int, float)) and math.isfinite(float(value))]
+            if seed_stds:
+                denom = max(seed_stds)
+                if denom > 0.0:
+                    entry['delta_over_max_seed_std'] = (
+                        abs(entry['delta_full_minus_reference']) / denom)
+                    entry['within_seed_noise'] = bool(
+                        abs(entry['delta_full_minus_reference']) < denom)
             entry['mechanism_helps'] = bool(entry['delta_full_minus_reference'] < -margin)
             test, basis, common = _paired_row_test(full, ref, margin=margin)
             entry['test_basis'] = basis
@@ -2236,10 +2256,16 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
                 direction += f" tied={entry['n_seeds_tied']}"
         mde = entry.get('minimum_detectable_delta_95_power80')
         mde_str = '' if mde is None else f" mde80={mde:.4f}"
+        ratio = entry.get('delta_over_max_seed_std')
+        ratio_str = '' if ratio is None else f" delta/seed_std={ratio:.2f}"
+        ppl = entry.get('ppl_delta_pct')
+        ppl_str = '' if ppl is None else f" dPPL={ppl:+.2f}%"
         power_warn = ''
+        if entry.get('within_seed_noise'):
+            power_warn += ' [DELTA WITHIN SEED NOISE]'
         if mde is not None and entry.get('delta_full_minus_reference') is not None:
             if abs(entry['delta_full_minus_reference']) < mde:
-                power_warn = ' [UNDERPOWERED: |delta| < mde80]'
+                power_warn += ' [UNDERPOWERED: |delta| < mde80]'
         regime_note = ''
         for label, key in (('full', 'full_curve_classification_counts'),
                            ('ref', 'reference_curve_classification_counts')):
@@ -2252,7 +2278,7 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
               f"val_loss={entry['full_val_loss']:.4f}{full_std_str} vs "
               f"{entry['reference_row']} val_loss={entry['reference_val_loss']:.4f}{ref_std_str} "
               f"delta(full-ref)={entry['delta_full_minus_reference']:+.4f} {ci_str}"
-              f"p(one-sided)={p_str} p(holm)={p_holm_str} "
+              f"{ppl_str}{ratio_str} p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{entry.get('test_basis') or '-'}{direction}{mde_str} "
               f"removing_hurts={entry['mechanism_helps']} "
               f"significant={entry['mechanism_helps_significantly']}{note}{regime_note}{power_warn}")
@@ -2371,6 +2397,16 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
             zero_row = {'per_seed': [{'seed': int(seed), 'val_loss': 0.0}
                                      for seed in effect['per_seed_values']]}
             entry.update(_paired_effect_summary(effect_row, zero_row, common, test, alpha=alpha))
+            paired_std = entry.get('paired_delta_std')
+            if (isinstance(paired_std, (int, float)) and paired_std > 0.0
+                    and entry.get('delta_seed_mean') is not None):
+                entry['delta_over_paired_std'] = (abs(entry['delta_seed_mean'])
+                                                 / paired_std)
+                entry['within_paired_seed_noise'] = bool(
+                    abs(entry['delta_seed_mean']) < paired_std)
+            else:
+                entry['delta_over_paired_std'] = None
+                entry['within_paired_seed_noise'] = None
             if 'arm_effects' in effect:
                 entry['arm_effects'] = effect['arm_effects']
             rows.append(entry)
@@ -2416,15 +2452,19 @@ def print_factorial_comparison(comparison: dict | None) -> None:
         ci_str = '' if ci is None else f"ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}] "
         mde = entry.get('minimum_detectable_delta_95_power80')
         mde_str = '' if mde is None else f"mde80={mde:.4f} "
+        ratio = entry.get('delta_over_paired_std')
+        ratio_str = '' if ratio is None else f"delta/paired_std={ratio:.2f} "
         power_warn = ''
+        if entry.get('within_paired_seed_noise'):
+            power_warn += ' [DELTA WITHIN PAIRED SEED NOISE]'
         if mde is not None and entry.get('delta_seed_mean') is not None:
             if abs(entry['delta_seed_mean']) < mde:
-                power_warn = ' [UNDERPOWERED: |delta| < mde80]'
+                power_warn += ' [UNDERPOWERED: |delta| < mde80]'
         note = '' if entry['replicated_across_seeds'] else ' [descriptive only, not certified]'
         print(f"[factorial] {entry['design']} {entry['kind']} {entry['effect']}: "
               f"delta={entry['delta_seed_mean']:+.4f} {ci_str}"
               f"seeds_favoring={entry['n_seeds_favoring']}/{entry['n_seeds']} "
-              f"p(one-sided)={p_str} p(holm)={p_holm_str} {mde_str}"
+              f"p(one-sided)={p_str} p(holm)={p_holm_str} {mde_str}{ratio_str}"
               f"helps={entry['effect_helps']} "
               f"significant={entry['effect_helps_significantly']}{note}{power_warn}")
     if comparison.get('rows_tested_descriptively_only'):
