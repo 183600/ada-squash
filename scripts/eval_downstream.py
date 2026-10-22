@@ -86,6 +86,124 @@ def load_ckpt(path: str, device: str='cuda'):
     clear_cast_weight_cache()
     return (model, args)
 
+class AdaSquashLM:
+    """Minimal lm-eval wrapper around the raw GPT module.
+
+    Implements the three primitives lm-eval-harness tasks need - token
+    loglikelihood (multiple-choice / completion tasks), rolling loglikelihood
+    (perplexity tasks) and greedy ``generate_until`` (generation tasks) - with
+    no dependence on ``transformers`` model wrappers. Scoring is one sequence
+    at a time (``batch_size`` is accepted for interface compatibility).
+    """
+
+    def __init__(self, model, tokenizer, batch_size: int=1, max_gen_toks: int=256):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.batch_size = int(batch_size)
+        self.max_gen_toks = int(max_gen_toks)
+        self.device = next(model.parameters()).device
+        cfg = getattr(model, 'cfg', None)
+        self.max_length = int(getattr(cfg, 'max_seq_len', 2048))
+        self.apply_chat_template = False
+
+    def tok_encode(self, string: str, add_special_tokens: bool=False,
+                   left_truncate_len: int | None=None) -> list:
+        ids = self.tokenizer(string, add_special_tokens=False)['input_ids']
+        if left_truncate_len is not None and len(ids) > left_truncate_len:
+            ids = ids[len(ids) - left_truncate_len:]
+        return list(ids)
+
+    def _encode_pair(self, context: str, continuation: str) -> tuple[list, list]:
+        """Whitespace-safe context/continuation split.
+
+        Tokenize the concatenation, then keep whatever the tokenizer produced
+        beyond the context prefix. Tokenizing the continuation on its own can
+        turn a leading space into a different token.
+        """
+        whole = self.tok_encode(context + continuation)
+        ctx = self.tok_encode(context)
+        if not ctx:
+            ctx = [self.tokenizer.eos_token_id]
+        cont = whole[len(ctx):]
+        return (ctx, cont)
+
+    def _forward_logprobs(self, ids: list) -> torch.Tensor:
+        x = torch.tensor([ids], dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            logits = self.model(x)[0]
+        return torch.log_softmax(logits[0].float(), dim=-1)
+
+    def loglikelihood(self, requests, **kwargs):
+        out = []
+        for req in requests:
+            context, continuation = req.args[:2]
+            ctx, cont = self._encode_pair(context, continuation)
+            budget = self.max_length - len(cont)
+            if budget < 1:
+                ctx, cont = (ctx[:1], cont[:self.max_length - 1])
+                budget = 1
+            if len(ctx) > budget:
+                ctx = ctx[len(ctx) - budget:]
+            ids = ctx + cont
+            logprobs = self._forward_logprobs(ids)
+            start = len(ctx) - 1
+            rows = logprobs[start:start + len(cont)]
+            tgt = torch.tensor(cont, device=self.device)
+            lp = rows.gather(-1, tgt.unsqueeze(-1)).sum().item()
+            greedy = bool((rows.argmax(-1) == tgt).all().item())
+            out.append((lp, greedy))
+        return out
+
+    def loglikelihood_rolling(self, requests, **kwargs):
+        out = []
+        for req in requests:
+            (text,) = req.args[:1]
+            ids = self.tok_encode(text)
+            if not ids:
+                out.append(0.0)
+                continue
+            ids = [self.tokenizer.eos_token_id] + ids
+            total = 0.0
+            for start in range(0, len(ids), self.max_length):
+                window = ids[start:start + self.max_length]
+                if len(window) < 2:
+                    continue
+                logprobs = self._forward_logprobs(window)
+                tgt = torch.tensor(window[1:], device=self.device)
+                total += logprobs[:-1].gather(-1, tgt.unsqueeze(-1)).sum().item()
+            out.append(total)
+        return out
+
+    def generate_until(self, requests, stop=None):
+        stops = list(stop) if stop else []
+        out = []
+        for req in requests:
+            context, gen_kwargs = req.args[:2]
+            if not isinstance(gen_kwargs, dict):
+                gen_kwargs = {}
+            until = list(gen_kwargs.get('until', [])) + [
+                s for s in stops if s not in gen_kwargs.get('until', [])]
+            max_toks = int(gen_kwargs.get('max_gen_toks', self.max_gen_toks))
+            budget = max(1, self.max_length - max_toks)
+            ids = self.tok_encode(context, left_truncate_len=budget)
+            generated: list = []
+            with torch.no_grad():
+                for _ in range(max_toks):
+                    x = torch.tensor([ids], dtype=torch.long, device=self.device)
+                    logits = self.model(x)[0]
+                    nxt = int(logits[0, -1].argmax(-1).item())
+                    ids.append(nxt)
+                    generated.append(nxt)
+                    text = self.tokenizer.decode(ids[len(ids) - len(generated):])
+                    if any((s in text) for s in until):
+                        break
+            text = self.tokenizer.decode(generated)
+            for s in until:
+                if s and s in text:
+                    text = text.split(s)[0]
+            out.append(text)
+        return out
+
 def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16, tokenizer: str | None=None):
     try:
         import lm_eval
