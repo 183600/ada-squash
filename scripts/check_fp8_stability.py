@@ -570,11 +570,27 @@ def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
     shape_a = a.get('shape') or {}
     shape_b = b.get('shape') or {}
     for key in ('model', 'n_layers', 'dim', 'n_heads'):
-        if shape_a.get(key) != shape_b.get(key):
-            out[f'shape.{key}'] = [shape_a.get(key), shape_b.get(key)]
+        value_a = shape_a.get(key)
+        value_b = shape_b.get(key)
+        if key == 'model':
+            valid_a = isinstance(value_a, str) and bool(value_a.strip())
+            valid_b = isinstance(value_b, str) and bool(value_b.strip())
+        else:
+            valid_a = (isinstance(value_a, int) and not isinstance(value_a, bool)
+                       and value_a > 0)
+            valid_b = (isinstance(value_b, int) and not isinstance(value_b, bool)
+                       and value_b > 0)
+        # Unknown is not equal: two arms that both omit a shape field have
+        # not proven that they share an architecture.
+        if not valid_a or not valid_b or value_a != value_b:
+            out[f'shape.{key}'] = [value_a, value_b]
     step_a = (a.get('checkpoint') or {}).get('step')
     step_b = (b.get('checkpoint') or {}).get('step')
-    if step_a is None or step_b is None or step_a != step_b:
+    valid_step_a = (isinstance(step_a, int) and not isinstance(step_a, bool)
+                    and step_a >= 0)
+    valid_step_b = (isinstance(step_b, int) and not isinstance(step_b, bool)
+                    and step_b >= 0)
+    if not valid_step_a or not valid_step_b or step_a != step_b:
         out['checkpoint.step'] = [step_a, step_b]
     return out
 
