@@ -211,7 +211,10 @@ def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
         if has_expected_ledger or has_recorded_ledger:
             for key, wanted in expected_ledgers.items():
                 if key not in data:
-                    mismatches[f'data.{key}'] = [wanted, '<missing>']
+                    # An absent role matches an expectation of "no ledger";
+                    # a ledger that was actually expected must be recorded.
+                    if wanted is not None:
+                        mismatches[f'data.{key}'] = [wanted, '<missing>']
                     continue
                 actual = data.get(key)
                 if isinstance(actual, dict):
