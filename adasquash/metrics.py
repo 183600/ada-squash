@@ -55,6 +55,7 @@ in a minimal environment.
 """
 import functools
 import math
+import numbers
 from typing import Optional, Sequence
 
 __all__ = [
@@ -105,6 +106,21 @@ def _is_boolean_value(value) -> bool:
         return True
     cls = type(value)
     return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
+def _as_real(value) -> Optional[float]:
+    """A Python/NumPy real scalar as a float, or None for non-numbers/bools.
+
+    The helpers below must accept every real numeric scalar the analysis
+    scripts can produce (NumPy integer/float scalars included) without
+    admitting a boolean as 0/1 or crashing on an overflowing integer.
+    """
+    if _is_boolean_value(value) or not isinstance(value, numbers.Real):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _strict_int(value, name: str, minimum: Optional[int] = None) -> int:
@@ -566,11 +582,11 @@ def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[floa
     """
     if t is None or df is None:
         return None
-    if not isinstance(t, (int, float)) or _is_boolean_value(t):
+    t_value = _as_real(t)
+    df_value = _as_real(df)
+    if t_value is None or df_value is None:
         return None
-    if not isinstance(df, (int, float)) or _is_boolean_value(df):
-        return None
-    t, df = float(t), float(df)
+    t, df = t_value, df_value
     if math.isnan(t) or math.isnan(df) or df <= 0.0:
         return None
     if math.isinf(t):
@@ -767,12 +783,12 @@ def tost_paired(
         raise ValueError(f"TOST needs equal lengths, got {len(a)} vs {len(b)}")
     n = len(a)
     out["n"] = n
-    if not (isinstance(margin, (int, float)) and not _is_boolean_value(margin)
-            and math.isfinite(float(margin)) and float(margin) > 0.0):
+    margin_value = _as_real(margin)
+    if margin_value is None or not math.isfinite(margin_value) or margin_value <= 0.0:
         out["note"] = ("equivalence margin must be a positive finite number; "
                        "pass an explicit scientific margin to enable TOST")
         return out
-    margin = float(margin)
+    margin = margin_value
     out["margin"] = margin
     if n < 2:
         out["note"] = "TOST needs at least 2 paired observations"
@@ -1004,10 +1020,10 @@ def paired_trend_test(
     alpha = _validate_alpha(alpha)
     dose_values = []
     for dose in raw_doses:
-        if (not isinstance(dose, (int, float)) or _is_boolean_value(dose)
-                or not math.isfinite(float(dose))):
+        value = _as_real(dose)
+        if value is None or not math.isfinite(value):
             raise ValueError(f"trend doses must be finite numbers, got {dose!r}")
-        dose_values.append(float(dose))
+        dose_values.append(value)
     distinct_doses = sorted(set(dose_values))
     n_doses = len(distinct_doses)
 
@@ -1059,9 +1075,9 @@ def paired_trend_test(
         pairs = []
         dropped = []
         for position, (x, y) in enumerate(zip(dose_values, values)):
-            if (isinstance(y, (int, float)) and not _is_boolean_value(y)
-                    and math.isfinite(float(y))):
-                pairs.append((x, float(y)))
+            value = _as_real(y)
+            if value is not None and math.isfinite(value):
+                pairs.append((x, value))
             else:
                 dropped.append(position)
         if dropped:
