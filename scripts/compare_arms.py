@@ -436,7 +436,11 @@ def print_comparison(comparison: dict) -> None:
           f"+/- {comparison['reference_std'] if comparison['reference_std'] is not None else 'n/a'}")
     protocol = comparison['protocol']
     if not protocol['ok']:
-        print('[arms] WARNING: protocol mismatch across arms; no certification is possible: '
+        # Certification is decided per reference/candidate pair. A third arm
+        # at another scale can make the cross-arm view inconsistent without
+        # invalidating a clean pair, so do not claim that no row can certify.
+        print('[arms] WARNING: cross-arm protocol mismatch; only pairs that share '
+              'every controlled field can certify: '
               + '; '.join(protocol['problems']))
     for entry in comparison['rows']:
         delta = entry['delta_vs_reference']
