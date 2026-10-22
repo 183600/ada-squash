@@ -535,7 +535,7 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
         if len(common) >= 2:
             row_vals = [entry['per_seed_val_loss'][seed] for seed in common]
             ref_vals = [seed_ce[seed] for seed in common]
-            test = paired_t_one_sided(row_vals, ref_vals)
+            test = paired_t_one_sided(row_vals, ref_vals, alpha=alpha)
             entry.update({
                 'p_one_sided_tuned_simple': test['p_one_sided'],
                 'delta_seed_mean_tuned_simple': test['mean_delta'],

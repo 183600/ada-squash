@@ -334,16 +334,17 @@ def _describe_paired_effect(entry: dict, arm_vals, ref_vals, common, test,
         'per_seed_delta': {str(seed): value for seed, value in zip(common, deltas)},
         'paired_delta_std': None if stats is None else stats['std'],
     })
-    if test is None or not test.get('df') or test.get('ci_low') is None:
+    if test is None or not test.get('df') or stats is None:
         return
-    half = (test['ci_high'] - test['ci_low']) / 2.0
-    critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
-    if critical > 0.0:
-        stderr = half / critical
-        entry['minimum_detectable_delta_95_power80'] = (
-            student_t_ppf(1.0 - alpha, float(test['df']))
-            + student_t_ppf(power, float(test['df']))
-        ) * stderr
+    if stats['stderr'] is None:
+        return
+    # Use the delta stderr directly: `compare` runs `paired_t_one_sided` with
+    # its own default alpha, so inverting the CI at this `alpha` would report
+    # a wrong MDE whenever the two differ.
+    entry['minimum_detectable_delta_95_power80'] = (
+        student_t_ppf(1.0 - alpha, float(test['df']))
+        + student_t_ppf(power, float(test['df']))
+    ) * stats['stderr']
 
 
 def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bool = True) -> dict | None:
