@@ -448,6 +448,15 @@ def _protocol_record(ckpt_args: dict, model) -> dict:
     """Training recipe and shape recorded by one checkpoint."""
     return {
         'hyperparameters': {key: ckpt_args.get(key) for key in TRAINING_RECIPE_KEYS},
+        # The requested dataset/tokenizer revision may be None/branch while
+        # the loader actually resolved a concrete commit. Each checkpoint's
+        # probe is built from its own resolved revision, so the protocol guard
+        # must compare these too: otherwise probes from different corpora are
+        # paired as if they were identical.
+        'resolved_revisions': {
+            'dataset_revision_resolved': ckpt_args.get('dataset_revision_resolved'),
+            'tokenizer_revision_resolved': ckpt_args.get('tokenizer_revision_resolved'),
+        },
         'shape': {'model': ckpt_args.get('model'),
                   'n_layers': int(getattr(model.cfg, 'n_layers', 0)),
                   'dim': int(getattr(model.cfg, 'dim', 0)),
@@ -460,6 +469,13 @@ def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
     if not isinstance(a, dict) or not isinstance(b, dict):
         return {'protocol': ['<missing>', '<missing>']}
     out = training_recipe_mismatches(a.get('hyperparameters'), b.get('hyperparameters'))
+    revisions_a = a.get('resolved_revisions') or {}
+    revisions_b = b.get('resolved_revisions') or {}
+    for key in ('dataset_revision_resolved', 'tokenizer_revision_resolved'):
+        value_a = revisions_a.get(key, a.get(key))
+        value_b = revisions_b.get(key, b.get(key))
+        if value_a != value_b:
+            out[f'data.{key}'] = [value_a, value_b]
     shape_a = a.get('shape') or {}
     shape_b = b.get('shape') or {}
     for key in ('model', 'n_layers', 'dim', 'n_heads'):
