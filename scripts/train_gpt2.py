@@ -999,20 +999,25 @@ def launch_multi_seed(args, seeds) -> None:
             },
         },
     )
-    if failed_seeds:
+    incomplete_seeds = sorted(set(int(s) for s in failed_seeds)
+                              | set(agg.get('missing_seeds') or [])
+                              | set(agg.get('invalid_seeds') or []))
+    if incomplete_seeds:
         manifest['status'] = 'failed'
         manifest['failed_seeds'] = [int(s) for s in failed_seeds]
+        manifest['incomplete_seeds'] = incomplete_seeds
     save_run_manifest(base / 'run_manifest.json', manifest)
-    if failed_seeds:
+    if incomplete_seeds:
         # A multi-seed invocation is a replication study: a failed child is
         # not a valid draw, and exiting 0 would let CI/orchestration treat
         # the pooled mean as a clean result while it silently covers fewer
         # seeds than requested. The artifacts above are already on disk.
         raise SystemExit(
-            f'[seeds] {len(failed_seeds)}/{len(seeds)} seed run(s) failed {failed_seeds}: the '
-            f'aggregate covers {agg["n_seeds"]} of {agg["n_seeds_requested"]} requested seeds, '
-            'so this invocation is not a clean replication. Fix the failures (each seed writes '
-            'its own run_manifest.json) and re-run before quoting the pooled numbers.')
+            f'[seeds] {len(incomplete_seeds)}/{len(seeds)} seed run(s) are incomplete '
+            f'{incomplete_seeds}: the aggregate covers {agg["n_seeds"]} of '
+            f'{agg["n_seeds_requested"]} requested seeds, so this invocation is not a clean '
+            'replication. Fix the failures (each seed writes its own run_manifest.json) and '
+            're-run before quoting the pooled numbers.')
 
 def main():
     pre = argparse.ArgumentParser(add_help=False)
