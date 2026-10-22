@@ -829,6 +829,7 @@ def run_exclusion_audit(runs: Sequence[Mapping],
     duplicate_ids: list[str] = []
     seen_seed_keys: set[tuple] = set()
     duplicate_seeds: list[str] = []
+    invalid_seed_ids: list[str] = []
     by_reason: dict[str, int] = {}
     by_status: dict[str, int] = {'analyzed': 0, 'sensitivity': 0, 'excluded': 0}
     per_arm: dict[str, dict] = {}
@@ -841,7 +842,14 @@ def run_exclusion_audit(runs: Sequence[Mapping],
             duplicate_ids.append(run_id)
         seen_ids.add(run_id)
         seed = record.get('seed')
-        if seed is not None:
+        # A boolean/float/string is not an independent replication id. It
+        # must not inflate the per-arm seed count just because it can be
+        # stringified; treat it as a structural failure instead.
+        valid_seed = (seed is None
+                      or (isinstance(seed, int) and not isinstance(seed, bool)))
+        if seed is not None and not valid_seed:
+            invalid_seed_ids.append(f'{record["arm"]}::seed={seed!r}')
+        if seed is not None and valid_seed:
             key = (record['arm'], str(seed))
             if key in seen_seed_keys:
                 duplicate_seeds.append(f'{record["arm"]}::seed={seed}')
@@ -858,7 +866,7 @@ def run_exclusion_audit(runs: Sequence[Mapping],
         bucket['planned'] += 1
         if status != 'excluded':
             bucket['analyzed'] += 1
-            if seed is not None:
+            if valid_seed and seed is not None:
                 bucket['seeds'].add(str(seed))
         if status == 'analyzed':
             bucket['clean'] += 1
@@ -883,6 +891,10 @@ def run_exclusion_audit(runs: Sequence[Mapping],
         violations.append(f'duplicate run id(s): {sorted(set(duplicate_ids))}')
     if duplicate_seeds:
         violations.append(f'duplicate seed(s) within an arm: {sorted(set(duplicate_seeds))}')
+    if invalid_seed_ids:
+        violations.append(
+            'invalid seed id(s) (seed must be an integer): '
+            f'{sorted(set(invalid_seed_ids))}')
     if unknown_reasons:
         warnings.append(
             'run fact(s) with no policy rule, treated as no exclusion: '
