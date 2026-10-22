@@ -43,7 +43,12 @@ honest:
   tests and reports the matching interval. A small-seed effect is also
   checked for being carried by a single observation with
   `leave_one_out_jackknife`, and a factorial interaction is evaluated
-  two-sided (`two_sided_p_from_t`) because antagonism is a finding too.
+  two-sided (`two_sided_p_from_t`) because antagonism is a finding too;
+* a dose-response claim ("the advantage grows with depth") is tested as a
+  trend, not inferred from a row of significant per-depth deltas:
+  `paired_trend_test` fits one slope per seed on the paired deltas and tests
+  the mean slope one-sided, so repeated depths within a seed are not
+  pseudo-replicated and a flat advantage is not mistaken for growth.
 
 Everything is pure `math` (no scipy/sklearn), so the training scripts can run
 in a minimal environment.
@@ -65,6 +70,7 @@ __all__ = [
     "mean_ci",
     "mean_std_stderr",
     "paired_t_one_sided",
+    "paired_trend_test",
     "paired_z_one_sided",
     "roc_auc",
     "scale_replication_summary",
@@ -700,6 +706,205 @@ def leave_one_out_jackknife(
                  "descriptive robustness check; dropping one observation is "
                  "not an independent replication and never certifies a result"),
     }
+
+
+def _ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
+    """Least-squares slope of ``ys`` on ``xs`` plus the fit's R-squared.
+
+    Returns ``None`` when every ``x`` is identical (the slope is undefined).
+    R-squared is clamped to [0, 1] so a tiny negative value from floating
+    point cancellation is not reported as a nonsensical fit quality.
+    """
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0.0:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    slope = sxy / sxx
+    intercept = my - slope * mx
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    ss_res = sum((y - (intercept + slope * x)) ** 2
+                 for x, y in zip(xs, ys))
+    if ss_tot == 0.0:
+        r2 = 1.0 if ss_res == 0.0 else 0.0
+    else:
+        r2 = min(1.0, max(0.0, 1.0 - ss_res / ss_tot))
+    return slope, r2
+
+
+def paired_trend_test(
+    doses: Sequence[float],
+    per_seed_values: dict,
+    alpha: float = 0.05,
+) -> dict:
+    """Seed-level test of a dose-response trend in paired deltas.
+
+    A depth sweep tests each ``(depth, norm)`` cell against the reference and
+    corrects those per-depth p-values, but a row of separately significant
+    deltas does not establish the sweep's actual scientific claim: that the
+    advantage *grows with depth*. This function tests that claim directly.
+
+    ``doses`` are the predictor values (e.g. ``log2(depth)``) and
+    ``per_seed_values`` maps a seed to its paired delta
+    (candidate - reference) at each dose, aligned with ``doses``. For every
+    seed with at least two distinct finite dose points, one least-squares
+    slope is fitted. The seed is the unit of replication, so the slopes - not
+    the pooled seed x dose points - are the observations of a one-sided
+    Student-t test of H1: mean slope < 0 (the delta becomes more negative as
+    the dose rises, i.e. the candidate's advantage grows).
+
+    Pooling all points would pseudo-replicate the repeated doses within a
+    seed and shrink the standard error. Fitting one slope per seed keeps the
+    n = number of seeds and the df = n - 1 the repo's other comparisons use;
+    at three seeds the one-sided 5% critical value remains t = 2.92. The
+    slopes are most comparable when every seed covers the same dose grid; a
+    caller with missing depths should intersect the seeds first (the depth
+    sweep does), otherwise a seed fitted over a different range contributes a
+    slope that is not on the same scale.
+
+    A slope with two doses is a difference-in-differences, not evidence of
+    linearity; the result records ``n_doses`` so that distinction is visible.
+    A leave-one-seed-out jackknife of the slopes shows whether one seed
+    carries the trend. ``certifiable`` is False below
+    ``MIN_SEEDS_FOR_SIGNIFICANCE`` seeds or below two distinct doses, even
+    when a p-value is computable (matching the rest of the repo: two seeds
+    are descriptive only).
+
+    Returns a dict with ``mean_slope_per_dose``, its two-sided
+    ``slope_ci_95``, ``t``/``df``/``p_one_sided``, the per-seed slopes,
+    ``n_seeds``/``n_doses``, the jackknife, and the smallest slope the design
+    could detect at 80% power. Mismatched lengths or a non-finite dose raise
+    ``ValueError`` (a programming error); non-finite *deltas* are dropped and
+    reported in ``excluded_seeds``.
+    """
+    raw_doses = list(doses)
+    dose_values = []
+    for dose in raw_doses:
+        if (not isinstance(dose, (int, float)) or isinstance(dose, bool)
+                or not math.isfinite(float(dose))):
+            raise ValueError(f"trend doses must be finite numbers, got {dose!r}")
+        dose_values.append(float(dose))
+    distinct_doses = sorted(set(dose_values))
+    n_doses = len(distinct_doses)
+
+    out = {
+        "test": "paired_trend",
+        "alternative": ("mean per-seed slope < 0: the candidate-reference "
+                        "delta falls as the dose rises (the advantage grows)"),
+        "n_doses": n_doses,
+        "doses": dose_values,
+        "n_seeds": 0,
+        "seeds_used": [],
+        "per_seed_slopes": {},
+        "per_seed_r_squared": {},
+        "excluded_seeds": {},
+        "mean_slope_per_dose": None,
+        "slope_std": None,
+        "slope_ci_95": [None, None],
+        "ci_level": 1.0 - float(alpha),
+        "t": None,
+        "df": None,
+        "p_one_sided": None,
+        "minimum_detectable_slope_95_power80": None,
+        "mean_r_squared": None,
+        "n_seeds_with_negative_slope": None,
+        "n_seeds_with_positive_slope": None,
+        "advantage_grows_with_dose": None,
+        "certifiable": False,
+        "seed_jackknife": None,
+        "note": None,
+    }
+    if n_doses < 2:
+        out["note"] = ("a trend needs at least two distinct doses; with one "
+                       "dose there is no slope to estimate")
+        return out
+
+    labels = sorted((per_seed_values or {}), key=str)
+    slopes = []
+    used = []
+    for label in labels:
+        try:
+            values = list(per_seed_values[label])
+        except TypeError:
+            out["excluded_seeds"][str(label)] = "not an iterable sequence"
+            continue
+        if len(values) != len(dose_values):
+            raise ValueError(
+                f"trend values for seed {label!r} need {len(dose_values)} "
+                f"entries, got {len(values)}")
+        pairs = []
+        for x, y in zip(dose_values, values):
+            if (isinstance(y, (int, float)) and not isinstance(y, bool)
+                    and math.isfinite(float(y))):
+                pairs.append((x, float(y)))
+        if len({x for x, _ in pairs}) < 2:
+            out["excluded_seeds"][str(label)] = (
+                "fewer than two distinct doses with finite deltas")
+            continue
+        fit = _ols_slope_and_r2([x for x, _ in pairs],
+                                [y for _, y in pairs])
+        if fit is None:
+            out["excluded_seeds"][str(label)] = "undefined slope"
+            continue
+        slopes.append(fit[0])
+        used.append(label)
+        out["per_seed_slopes"][str(label)] = fit[0]
+        out["per_seed_r_squared"][str(label)] = fit[1]
+
+    n = len(slopes)
+    out["n_seeds"] = n
+    out["seeds_used"] = used
+    out["n_seeds_with_negative_slope"] = sum(1 for b in slopes if b < 0.0)
+    out["n_seeds_with_positive_slope"] = sum(1 for b in slopes if b > 0.0)
+    out["certifiable"] = bool(n >= MIN_SEEDS_FOR_SIGNIFICANCE and n_doses >= 2)
+    if n == 0:
+        out["note"] = ("no seed has two distinct, finite dose points; the "
+                       "trend is undefined")
+        return out
+    stats = mean_std_stderr(slopes)
+    out["mean_slope_per_dose"] = stats["mean"]
+    out["slope_std"] = stats["std"]
+    out["mean_r_squared"] = (
+        sum(out["per_seed_r_squared"].values()) / n
+        if out.get("per_seed_r_squared") else None)
+    out["seed_jackknife"] = leave_one_out_jackknife(
+        slopes, labels=[str(label) for label in used])
+    if n < 2:
+        out["note"] = ("one usable seed: a slope is computable but its "
+                       "sampling uncertainty is not; descriptive only")
+        return out
+    test = paired_t_one_sided(slopes, [0.0] * n, alpha=alpha)
+    out.update({
+        "mean_slope_per_dose": test["mean_delta"],
+        "t": test["t"],
+        "df": test["df"],
+        "p_one_sided": test["p_one_sided"],
+        "slope_ci_95": [test["ci_low"], test["ci_high"]],
+        "ci_level": test["ci_level"],
+    })
+    if stats is not None and stats["stderr"] is not None and test["df"]:
+        out["minimum_detectable_slope_95_power80"] = (
+            (student_t_ppf(1.0 - float(alpha), float(test["df"]))
+             + student_t_ppf(0.8, float(test["df"]))) * stats["stderr"])
+    out["advantage_grows_with_dose"] = bool(
+        out["certifiable"] and out["mean_slope_per_dose"] is not None
+        and out["mean_slope_per_dose"] < 0.0
+        and out["p_one_sided"] is not None
+        and out["p_one_sided"] < alpha)
+    if not out["certifiable"]:
+        out["note"] = (f"only {n} usable seed(s), fewer than the required "
+                       f"{MIN_SEEDS_FOR_SIGNIFICANCE}: the trend is "
+                       "descriptive and cannot certify a dose-response claim")
+    elif n_doses == 2:
+        out["note"] = ("two doses: the slope is a difference-in-differences "
+                       "of the two deltas, not evidence of a linear trend")
+    else:
+        out["note"] = ("one-sided t-test on the per-seed slopes; a "
+                       "significant negative mean slope means the candidate's "
+                       "advantage grows with the dose under this protocol")
+    return out
 
 
 def welch_z_one_sided(

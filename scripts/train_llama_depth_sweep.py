@@ -36,7 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
-                               paired_t_one_sided, student_t_ppf)
+                               paired_t_one_sided, paired_trend_test, student_t_ppf)
 from adasquash.repro import artifact_record, collect_run_metadata, finish_metadata, save_run_manifest
 from scripts.data_pipeline import _is_pinned_revision
 
@@ -562,6 +562,236 @@ def _cell_seed_metric(cell: dict, metric: str) -> dict:
             out[int(item['seed'])] = float(value)
     return out
 
+def _seed_sort_key(value):
+    try:
+        return (0, int(value))
+    except (TypeError, ValueError):
+        return (1, str(value))
+
+def cross_depth_trend_analysis(comparison: dict, alpha: float = 0.05) -> dict:
+    """Test whether each norm's advantage *grows* with depth.
+
+    `compare_sweep_cells` certifies one delta per `(depth, norm)` cell. That
+    answers "is the candidate better at this depth", but the sweep's central
+    claim is a dose-response: the depth-conditioned variants should gain
+    relative to the reference as depth increases. A row of separately
+    significant per-depth deltas does not test that claim, and reading the
+    p-values by eye ("significant at 48 and 96, so it grows") is exactly the
+    kind of informal pattern-matching multiplicity correction exists to
+    prevent.
+
+    This block takes the per-seed paired deltas already stored on each
+    comparison row (`per_seed_delta`), regresses each seed's delta on
+    `log2(depth)`, and tests the mean per-seed slope one-sided (H1: slope <
+    0, i.e. the advantage grows per doubling of depth) with
+    `adasquash.metrics.paired_trend_test`. Seeds are the unit of
+    replication, so the repeated depths within a seed are not
+    pseudo-replicated. Only depths whose cell pair is complete and
+    cost-matched enter the trend; incomplete or cost-mismatched cells are
+    listed in `excluded_depths` and make the trend descriptive rather than
+    certifiable. The candidate trends are Holm-adjusted as a family, so the
+    number of candidate norms does not inflate the chance of calling a
+    slope significant.
+
+    This is a *differential* trend: because the candidate and reference run
+    at the same depth, the depth/width main effect common to both cancels in
+    the delta. It does not turn the delta into a pure depth effect (the norm
+    may interact with the width scaling), but a growing delta is the
+    depth-conditioning hypothesis, whereas a flat delta of equal size is
+    evidence against it.
+    """
+    rows = [row for row in (comparison.get('rows') or [])
+            if isinstance(row, dict) and row.get('norm') is not None]
+    by_norm: dict = {}
+    for row in rows:
+        by_norm.setdefault(row['norm'], []).append(row)
+    trends = []
+    for norm in sorted(by_norm, key=str):
+        norm_rows = sorted(
+            by_norm[norm],
+            key=lambda row: (float(row.get('depth'))
+                             if _finite(row.get('depth')) else float('inf')))
+        usable = []
+        excluded = []
+        for row in norm_rows:
+            depth = row.get('depth')
+            if not _finite(depth) or float(depth) <= 0.0:
+                excluded.append({'depth': depth,
+                                 'reason': 'depth is not a positive number'})
+                continue
+            if row.get('complete') is False:
+                excluded.append({'depth': depth,
+                                 'reason': ('the candidate/reference cell pair '
+                                            'is incomplete or its data revision '
+                                            'could not be verified')})
+                continue
+            if row.get('cost_matched_within_25pct') is False:
+                excluded.append({'depth': depth,
+                                 'reason': ('the params/FLOPs ratio is outside '
+                                            'the 25% match tolerance, so the '
+                                            'delta is confounded with cost')})
+                continue
+            if not row.get('per_seed_delta'):
+                excluded.append({'depth': depth,
+                                 'reason': 'no per-seed paired delta recorded'})
+                continue
+            usable.append(row)
+        entry = {
+            'norm': norm,
+            'depth_unit': 'layers',
+            'dose': 'log2(depth)',
+            'depths': [row.get('depth') for row in usable],
+            'n_depths': len(usable),
+            'excluded_depths': excluded,
+            'advantage_grows_with_depth': False,
+            'p_one_sided_holm': None,
+            'depth_values_note': ('one slope unit is a doubling of depth; the '
+                                  'depth/width main effect cancels in the '
+                                  'candidate-reference delta, but a norm x '
+                                  'width interaction is still possible'),
+        }
+        seed_sets = [set((row.get('per_seed_delta') or {}).keys())
+                     for row in usable]
+        common = set.intersection(*seed_sets) if seed_sets else set()
+        all_seeds = set().union(*seed_sets) if seed_sets else set()
+        entry['n_balanced_seeds'] = len(common)
+        entry['n_seeds_dropped_for_balance'] = len(all_seeds - common)
+        entry['seeds_dropped_for_balance'] = sorted(
+            all_seeds - common, key=_seed_sort_key)
+        if len(usable) >= 2 and common:
+            depths = [float(row['depth']) for row in usable]
+            doses = [math.log2(depth) for depth in depths]
+            per_seed_values = {
+                str(seed): [float(row['per_seed_delta'][str(seed)])
+                            for row in usable]
+                for seed in sorted(common, key=_seed_sort_key)}
+            trend = paired_trend_test(doses, per_seed_values, alpha=alpha)
+            entry.update(trend)
+            # `paired_trend_test` names its generic verdict for a dose axis;
+            # in this report the only dose is depth, and the wrapper below
+            # replaces the raw verdict with the Holm-gated one. Drop the
+            # duplicate so the artifact has a single answer to "does it
+            # grow?".
+            entry.pop('advantage_grows_with_dose', None)
+            # Certification also needs every depth to be complete and
+            # cost-matched: dropping a failed cell changes the dose range and
+            # which runs survive is itself a selection effect.
+            all_cells_ok = (
+                not excluded
+                and all(row.get('cost_matched_within_25pct') is True
+                        for row in usable))
+            entry['all_depths_complete_and_cost_matched'] = all_cells_ok
+            entry['certifiable'] = bool(trend.get('certifiable')
+                                        and all_cells_ok)
+            if not entry['certifiable']:
+                entry['note'] = (
+                    (entry.get('note') or '')
+                    + ('' if not entry.get('note') else '; ')
+                    + ('the trend is descriptive because at least one depth '
+                       'is excluded or its compute match is unverified'
+                       if not all_cells_ok else
+                       'the trend is descriptive only at this replication '
+                       'level'))
+            # A slope over four depths can still be carried by one point.
+            # Dropping each depth in turn shows whether the sign is a
+            # property of the whole sweep or of one cell (the depth analogue
+            # of the seed jackknife already reported per contrast).
+            if len(usable) >= 3:
+                full_slope = entry.get('mean_slope_per_dose')
+
+                def _slope_sign(value):
+                    if value is None:
+                        return None
+                    return ('negative' if value < 0.0
+                            else ('positive' if value > 0.0 else 'zero'))
+
+                full_sign = _slope_sign(full_slope)
+                per_drop = []
+                for index, row in enumerate(usable):
+                    keep = [j for j in range(len(usable)) if j != index]
+                    sub_doses = [doses[j] for j in keep]
+                    sub_values = {
+                        seed: [values[j] for j in keep]
+                        for seed, values in per_seed_values.items()}
+                    sub = paired_trend_test(sub_doses, sub_values, alpha=alpha)
+                    sub_sign = _slope_sign(sub.get('mean_slope_per_dose'))
+                    keeps = (None if full_sign in (None, 'zero')
+                             else sub_sign == full_sign)
+                    per_drop.append({
+                        'dropped_depth': row.get('depth'),
+                        'mean_slope_per_dose': sub.get('mean_slope_per_dose'),
+                        'sign': sub_sign,
+                        'keeps_full_sign': keeps,
+                    })
+                influential = [item['dropped_depth'] for item in per_drop
+                               if item['keeps_full_sign'] is False]
+                entry['leave_one_depth_out'] = {
+                    'test': 'leave_one_depth_out',
+                    'full_mean_slope_per_dose': full_slope,
+                    'full_sign': full_sign,
+                    'sign_stable': (None if full_sign in (None, 'zero')
+                                    else not influential),
+                    'influential_depths': influential,
+                    'per_drop': per_drop,
+                    'note': ('descriptive robustness check; dropping one '
+                             'depth is not an independent replication and '
+                             'never certifies a trend'),
+                }
+        else:
+            entry.update({
+                'certifiable': False,
+                'p_one_sided': None,
+                'mean_slope_per_dose': None,
+                'slope_ci_95': [None, None],
+                'note': ('a trend needs at least two usable depths and one '
+                         'seed present at all of them'),
+            })
+        trends.append(entry)
+    family = [entry for entry in trends
+              if entry.get('certifiable') and entry.get('p_one_sided') is not None]
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['advantage_grows_with_depth'] = bool(
+            entry.get('mean_slope_per_dose') is not None
+            and entry['mean_slope_per_dose'] < 0.0
+            and p_holm is not None and p_holm < alpha)
+    # A trend excluded from the Holm family is never a confirmed claim, even
+    # if its raw per-seed slopes are all in the expected direction.
+    for entry in trends:
+        if not entry.get('certifiable'):
+            entry['advantage_grows_with_depth'] = False
+    return {
+        'schema': 'adasquash.cross_depth_trends.v1',
+        'reference_norm': comparison.get('reference_norm'),
+        'metric': comparison.get('metric'),
+        'dose': 'log2(depth)',
+        'alpha': alpha,
+        'family_size': len(family),
+        'multiple_comparison': (
+            f'Holm-Bonferroni over the {len(family)} candidate norm trend(s) '
+            'that are complete, cost-matched and replicated at >= '
+            f'{MIN_SEEDS_FOR_SIGNIFICANCE} seeds; `advantage_grows_with_depth` '
+            'uses the adjusted p-value. Trends over fewer seeds, incomplete '
+            'depth sets, or unverified compute matches are descriptive only.'),
+        'trends': trends,
+        'norms_without_usable_trend': [
+            entry['norm'] for entry in trends
+            if entry.get('mean_slope_per_dose') is None],
+        'reading_guide': (
+            'per-seed OLS slope of (candidate - reference) on log2(depth), '
+            'then a one-sided t-test on the slopes (H1 mean slope < 0). A '
+            'significant negative slope is the dose-response claim: the '
+            'advantage grows with depth. A flat slope is evidence against the '
+            'depth-conditioning mechanism even when every per-depth delta has '
+            'the same sign; a row of individually significant per-depth '
+            'deltas is not a trend test. Read `n_balanced_seeds`, '
+            '`slope_ci_95`, `minimum_detectable_slope_95_power80`, the '
+            'seed jackknife and `leave_one_depth_out` before treating a slope '
+            'as real: a trend that flips when a single depth is dropped is a '
+            'property of that cell, not a dose-response.'),
+    }
+
 def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='final_val_loss', margin: float=0.0, alpha: float=0.05) -> dict:
     """One-sided paired comparison of every norm against `reference_norm` per depth.
 
@@ -668,6 +898,13 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 entry['p_one_sided'] = test['p_one_sided']
                 entry['n_seeds_favoring'] = sum(1 for x, y in zip(a, b) if x < y)
                 entry['n_seeds_tied'] = sum(1 for x, y in zip(a, b) if x == y)
+                # Per-seed paired deltas are the raw material of the
+                # cross-depth trend test: storing them (instead of only the
+                # mean) lets a reader recompute the slope and keeps the
+                # trend analysis auditable after the fact.
+                entry['per_seed_delta'] = {
+                    str(seed): float(cand_seeds[seed] - ref_seeds[seed])
+                    for seed in common}
                 # The MDE must use the paired-delta stderr directly. Inverting
                 # the reported CI would silently assume the test was run at
                 # `alpha`, but `paired_t_one_sided` above uses its own default
@@ -713,7 +950,7 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
          'reference_missing_seeds': r['reference_missing_seeds']}
         for r in rows if not r['complete']
     ]
-    return {
+    result = {
         'reference_norm': reference_norm,
         'metric': metric,
         'margin': margin,
@@ -744,8 +981,15 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                           'Rows also carry both sides\' `*_shape` (n_layers/dim/n_heads): with the equal-parameter '
                           'scaling a deeper cell is also narrower, so `candidate_shape.dim` (and n_heads) differ '
                           'across depths by construction - a same-depth cross-norm delta is a norm claim, a '
-                          'cross-depth delta is depth *and* width/head count, never depth alone.'),
+                          'cross-depth delta is depth *and* width/head count, never depth alone. '
+                          '`cross_depth_trends` adds the dose-response test: per-seed slope of the delta on '
+                          'log2(depth), so a row of significant per-depth deltas is not mistaken for a growing '
+                          'advantage.'),
     }
+    # The trend block consumes the rows just built; attach it last so every
+    # report path (JSON, printer, tests) sees the same comparison object.
+    result['cross_depth_trends'] = cross_depth_trend_analysis(result, alpha=alpha)
+    return result
 
 def print_sweep_comparisons(comparison: dict) -> None:
     if not comparison['rows']:
@@ -806,6 +1050,47 @@ def print_sweep_comparisons(comparison: dict) -> None:
         print(f"[compare] WARNING: {len(comparison['incomplete_cells'])} comparison(s) involve a cell "
               f"with missing seed runs; significance is withheld there: "
               f"{comparison['incomplete_cells']}")
+
+def print_cross_depth_trends(comparison: dict) -> None:
+    """One line per candidate: does its advantage grow per doubling of depth?"""
+    block = comparison.get('cross_depth_trends') or {}
+    trends = block.get('trends') or []
+    if not trends:
+        print('[trend] no candidate norm comparison; cross-depth trend analysis skipped')
+        return
+    print(f"[trend] dose-response of (candidate - {block.get('reference_norm')}) on "
+          f"log2(depth); H1 slope < 0 = the advantage grows with depth:")
+    for entry in trends:
+        depths = entry.get('depths') or []
+        if entry.get('mean_slope_per_dose') is None:
+            print(f"[trend] {entry['norm']}: no usable trend over depths {depths} "
+                  f"[{entry.get('note')}]")
+            continue
+        slope = entry['mean_slope_per_dose']
+        ci = entry.get('slope_ci_95') or [None, None]
+        ci_str = ('' if ci[0] is None
+                  else f" ci95=[{ci[0]:+.5f}, {ci[1]:+.5f}]")
+        p_holm = entry.get('p_one_sided_holm')
+        p_str = 'n/a' if p_holm is None else f'{p_holm:.4g}'
+        jack = entry.get('seed_jackknife') or {}
+        jack_str = ''
+        if jack.get('sign_stable') is False:
+            jack_str = (f" [SEED-SENSITIVE: dropping {jack.get('influential_labels')} "
+                        f"flips the slope sign]")
+        elif jack.get('sign_stable') is True:
+            jack_str = ' [seed-robust slope sign]'
+        print(f"[trend] {entry['norm']}: slope={slope:+.5f}/doubling{ci_str} "
+              f"seeds={entry.get('n_seeds')}/{entry.get('n_balanced_seeds')} "
+              f"depths={depths} p_holm={p_str} "
+              f"grows_with_depth={entry.get('advantage_grows_with_depth')}"
+              f"{jack_str}")
+        if entry.get('excluded_depths'):
+            print(f"[trend] {entry['norm']}: WARNING excluded depth(s) "
+                  f"{entry['excluded_depths']}; the trend is descriptive only")
+        depth_jack = entry.get('leave_one_depth_out') or {}
+        if depth_jack.get('sign_stable') is False:
+            print(f"[trend] {entry['norm']}: WARNING depth-sensitive: dropping "
+                  f"{depth_jack.get('influential_depths')} flips the slope sign")
 
 def _child_env(args, gpu=None, seed=None) -> dict:
     """Environment for one training child.
@@ -1284,6 +1569,7 @@ def main():
           'comparison row records both sides\' shape.')
     comparison = compare_sweep_cells(aggs_by_depth, args.reference_norm)
     print_sweep_comparisons(comparison)
+    print_cross_depth_trends(comparison)
     comp_path = base / 'sweep_comparisons.json'
     with open(comp_path, 'w') as f:
         json.dump(comparison, f, indent=2)

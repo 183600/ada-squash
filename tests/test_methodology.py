@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import (leave_one_out_jackknife, tost_paired,
-                               two_sided_p_from_t)
+from adasquash.metrics import (leave_one_out_jackknife, paired_trend_test,
+                               tost_paired, two_sided_p_from_t)
 from scripts.ablation import (baseline_comparison, build_analysis_plan,
                               factorial_comparison,
                               study_level_correction)
@@ -448,3 +448,162 @@ def test_compare_arms_reports_equivalence_and_jackknife():
     row = out['rows'][0]
     assert row['equivalence']['equivalent'] is False
     assert row['seed_jackknife']['sign_stable'] is True
+
+
+# ---------------------------------------------------------------------------
+# Cross-depth dose-response (trend) analysis
+# ---------------------------------------------------------------------------
+def test_paired_trend_detects_a_growing_advantage():
+    doses = [1.0, 2.0, 3.0, 4.0]
+    deltas = {
+        42: [0.000, -0.010, -0.020, -0.030],
+        43: [0.000, -0.012, -0.021, -0.033],
+        44: [0.000, -0.008, -0.019, -0.028],
+    }
+    out = paired_trend_test(doses, deltas)
+    assert out['n_seeds'] == 3
+    assert out['n_doses'] == 4
+    assert out['mean_slope_per_dose'] < 0.0
+    assert out['p_one_sided'] < 0.05
+    assert out['certifiable'] is True
+    assert out['advantage_grows_with_dose'] is True
+    # Every seed's slope is negative, so no single seed carries the sign.
+    assert out['seed_jackknife']['sign_stable'] is True
+    assert out['minimum_detectable_slope_95_power80'] is not None
+
+
+def test_paired_trend_rejects_a_flat_delta_as_no_trend():
+    flat = {seed: [-0.02, -0.02, -0.02, -0.02] for seed in (42, 43, 44)}
+    out = paired_trend_test([1.0, 2.0, 3.0, 4.0], flat)
+    assert out['mean_slope_per_dose'] == pytest.approx(0.0)
+    assert out['advantage_grows_with_dose'] is False
+    assert out['n_seeds_with_negative_slope'] == 0
+    # A constant advantage is not a dose-response, so a row of equally large
+    # per-depth deltas must not be reported as "growing with depth".
+    assert out['seed_jackknife']['sign'] == 'zero'
+
+
+def test_paired_trend_treats_a_shrinking_advantage_one_sidedly():
+    shrinking = {seed: [0.0, 0.01, 0.02, 0.03] for seed in (42, 43, 44)}
+    out = paired_trend_test([1.0, 2.0, 3.0, 4.0], shrinking)
+    assert out['mean_slope_per_dose'] > 0.0
+    assert out['p_one_sided'] > 0.95
+    assert out['advantage_grows_with_dose'] is False
+
+
+def test_paired_trend_needs_replication_and_two_doses():
+    one_seed = paired_trend_test([1.0, 2.0, 3.0], {42: [0.0, -0.1, -0.2]})
+    assert one_seed['mean_slope_per_dose'] < 0.0
+    assert one_seed['p_one_sided'] is None
+    assert one_seed['certifiable'] is False
+    assert 'descriptive' in one_seed['note']
+
+    one_dose = paired_trend_test([1.0], {42: [0.0], 43: [0.0]})
+    assert one_dose['n_doses'] == 1
+    assert one_dose['p_one_sided'] is None
+    assert 'two distinct doses' in one_dose['note']
+
+
+def test_paired_trend_reports_excluded_seeds_and_bad_input():
+    out = paired_trend_test([1.0, 2.0, 3.0], {
+        42: [0.0, -0.01, -0.02],
+        43: [0.0, -0.012, -0.021],
+        44: [0.0, float('nan'), float('nan')],  # only one finite distinct dose
+    })
+    assert out['n_seeds'] == 2
+    assert '44' in out['excluded_seeds']
+    assert out['certifiable'] is False
+    with pytest.raises(ValueError):
+        paired_trend_test([1.0, 2.0], {42: [0.0]})
+    with pytest.raises(ValueError):
+        paired_trend_test([1.0, float('nan')], {42: [0.0, -0.1]})
+
+
+def _trend_cell(values, **extra):
+    items = sorted(values.items())
+    mean = sum(value for _, value in items) / len(items)
+    cell = {
+        'seeds': list(values),
+        'per_seed': [{'seed': seed, 'final_val_loss': value}
+                     for seed, value in items],
+        'final_val_loss': mean,
+        'complete': True,
+        'n_params': 1_000_000_000,
+        'flops_per_token_forward': 1_000_000_000,
+    }
+    cell.update(extra)
+    return cell
+
+
+def test_sweep_trend_is_attached_and_reads_per_seed_deltas():
+    from scripts.train_llama_depth_sweep import compare_sweep_cells
+
+    reference = {42: 2.0, 43: 2.0, 44: 2.0}
+    # Candidate advantage grows per doubling of depth: 0.00 / 0.01 / 0.02 /
+    # 0.03 nats at 12 / 24 / 48 / 96 layers, with a little seed noise.
+    cells = {}
+    for depth, delta, noise in ((12, 0.00, 0.001), (24, 0.01, 0.001),
+                                (48, 0.02, 0.002), (96, 0.03, 0.002)):
+        cells[depth] = {
+            'rmsnorm': _trend_cell(reference),
+            'dytcd': _trend_cell({
+                42: 2.0 - delta,
+                43: 2.0 - delta + noise,
+                44: 2.0 - delta - noise,
+            }),
+        }
+    comparison = compare_sweep_cells(cells, 'rmsnorm')
+    for row in comparison['rows']:
+        assert set(row['per_seed_delta']) == {'42', '43', '44'}
+    block = comparison['cross_depth_trends']
+    entry = [item for item in block['trends']
+             if item['norm'] == 'dytcd'][0]
+    assert entry['depths'] == [12, 24, 48, 96]
+    assert entry['n_seeds'] == 3
+    assert entry['mean_slope_per_dose'] < 0.0
+    assert entry['advantage_grows_with_depth'] is True
+    # The trend survives dropping any single depth in this linear example.
+    assert entry['leave_one_depth_out']['sign_stable'] is True
+    assert entry['leave_one_depth_out']['influential_depths'] == []
+
+
+def test_sweep_trend_reports_a_single_depth_carrying_the_slope():
+    from scripts.train_llama_depth_sweep import compare_sweep_cells
+
+    reference = {42: 2.0, 43: 2.0, 44: 2.0}
+    cells = {}
+    # Flat deltas at the first three depths, then a large gain only at 96:
+    # the negative slope is a property of the deepest cell, not a trend.
+    for depth, delta in ((12, 0.00), (24, 0.00), (48, 0.00), (96, 0.10)):
+        cells[depth] = {
+            'rmsnorm': _trend_cell(reference),
+            'dytcd': _trend_cell({42: 2.0 - delta, 43: 2.0 - delta,
+                                  44: 2.0 - delta}),
+        }
+    comparison = compare_sweep_cells(cells, 'rmsnorm')
+    entry = [item for item in comparison['cross_depth_trends']['trends']
+             if item['norm'] == 'dytcd'][0]
+    jack = entry['leave_one_depth_out']
+    assert jack['sign_stable'] is False
+    assert jack['influential_depths'] == [96]
+
+
+def test_sweep_trend_is_descriptive_when_a_depth_is_incomplete():
+    from scripts.train_llama_depth_sweep import compare_sweep_cells
+
+    reference = {42: 2.0, 43: 2.0, 44: 2.0}
+    cells = {}
+    for depth, delta in ((12, 0.00), (24, 0.01), (48, 0.02), (96, 0.03)):
+        cells[depth] = {
+            'rmsnorm': _trend_cell(reference),
+            'dytcd': _trend_cell({42: 2.0 - delta, 43: 2.0 - delta,
+                                  44: 2.0 - delta},
+                                 complete=depth != 96),
+        }
+    comparison = compare_sweep_cells(cells, 'rmsnorm')
+    entry = [item for item in comparison['cross_depth_trends']['trends']
+             if item['norm'] == 'dytcd'][0]
+    assert entry['excluded_depths']
+    assert entry['certifiable'] is False
+    assert entry['advantage_grows_with_depth'] is False
+    assert 'descriptive' in entry['note']

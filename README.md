@@ -155,6 +155,19 @@ ADASQUASH_DIM_OVERRIDE=1536 ADASQUASH_HEADS_OVERRIDE=12 \
 Pass `--no-dim-scaling` to the sweep launcher to keep `dim` fixed across
 depths instead.
 
+The per-depth comparisons answer "is the candidate better at this depth".
+`sweep_comparisons.json` also carries a cross-depth dose-response block for
+the depth-conditioning claim itself: each seed's paired delta (candidate -
+reference) is regressed on `log2(depth)`, and the per-seed slopes are tested
+one-sided (H1: mean slope < 0, the advantage grows per doubling of depth),
+Holm-corrected across candidate norms. Incomplete or cost-mismatched cells
+make the trend descriptive only, and a leave-one-seed-out jackknife plus a
+leave-one-depth-out check report whether one seed or one depth carries it. A
+flat advantage - significant at every depth but
+not growing - is evidence against the depth-conditioning mechanism, which a
+row of separately significant per-depth deltas cannot distinguish from a
+genuine dose-response.
+
 ### Phase 3: special experiments
 
 ```bash

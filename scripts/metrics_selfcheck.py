@@ -27,6 +27,7 @@ from adasquash.metrics import (
     mean_std_stderr,
     ndcg_at_k,
     paired_t_one_sided,
+    paired_trend_test,
     recall_at_k,
     roc_auc,
     student_t_ppf,
@@ -208,6 +209,19 @@ def check_statistics():
     welch = welch_t_one_sided([1.0, 2.0, 3.0], [0.0, 1.0, -1.0])
     close(welch['mean_delta'], 2.0, label='welch mean')
     close(welch['df'], 4.0, label='welch df equal variance')
+
+    # Each seed gets its own OLS slope; the trend test averages those
+    # slopes, not the six pooled (seed, dose) points.
+    trend = paired_trend_test([0.0, 1.0, 2.0], {
+        'a': [0.0, -1.0, -2.0],
+        'b': [0.0, -1.1, -2.2],
+        'c': [0.0, -0.9, -1.8],
+    })
+    close(trend['per_seed_slopes']['a'], -1.0, label='trend slope a')
+    close(trend['per_seed_slopes']['b'], -1.1, label='trend slope b')
+    close(trend['mean_slope_per_dose'], -1.0, label='trend mean slope')
+    equal(trend['n_seeds'], 3, label='trend seed count')
+    equal(trend['certifiable'], True, label='trend certifiable')
 
     stats = mean_std_stderr([1.0, 2.0, 3.0])
     close(stats['mean'], 2.0, label='mean_std_stderr mean')
