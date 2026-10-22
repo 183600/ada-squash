@@ -692,12 +692,17 @@ def split_token_budget(stats: dict, report: dict) -> dict:
     document is extrapolated to the nominal split size and the basis is
     recorded (never presented as an exact count).
     """
-    sampled = int(stats.get('documents_sampled') or 0)
+    if not isinstance(stats, dict) or not isinstance(report, dict):
+        raise ValueError('split_token_budget needs the stats and report mappings')
+    sampled = _strict_int_option(
+        stats.get('documents_sampled') or 0, 'documents_sampled', 0)
     effective_documents = stats.get('effective_documents_kept')
     if effective_documents is None:
         effective_documents = stats.get('documents_kept', 0)
-    effective_documents = int(effective_documents or 0)
-    tokens = int(stats.get('tokens_total_effective') or 0)
+    effective_documents = _strict_int_option(
+        effective_documents or 0, 'effective_documents_kept', 0)
+    tokens = _strict_int_option(
+        stats.get('tokens_total_effective') or 0, 'tokens_total_effective', 0)
     nominal = report.get('count')
     nominal = int(nominal) if isinstance(nominal, int) and not isinstance(nominal, bool) else None
     result = {
