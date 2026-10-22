@@ -1378,6 +1378,22 @@ def _batches_of_seed(row, seed):
     by_seed = row.get('val_losses_by_seed')
     if isinstance(by_seed, dict) and isinstance(by_seed.get(str(seed)), list):
         return by_seed[str(seed)]
+    # The legacy fallback below uses the row's pooled `val_losses`. That list
+    # is one run's batches only when the row itself represents one run: a
+    # `per_seed` record with several seeds (even if only one has a finite mean)
+    # or a declared multi-seed row must never be zipped as if it were seed
+    # `seed` alone. Batch k of another seed would otherwise be paired with
+    # batch k of this one.
+    per_seed = row.get('per_seed')
+    if isinstance(per_seed, list) and len(per_seed) != 1:
+        return None
+    declared_seeds = row.get('seeds')
+    if isinstance(declared_seeds, list) and len(declared_seeds) > 1:
+        return None
+    declared_n = row.get('n_seeds')
+    if (isinstance(declared_n, (int, float)) and not isinstance(declared_n, bool)
+            and float(declared_n) > 1.0):
+        return None
     means = _seed_means(row)
     if len(means) == 1 and seed in means and isinstance(row.get('val_losses'), list):
         return row['val_losses']
@@ -1904,8 +1920,20 @@ def _baseline_tuning_protocol_mismatches(protocol: dict, args, seeds) -> list:
     mismatches = [f'{key}={protocol.get(key)!r} != {want!r}'
                   for key, want in expected.items() if protocol.get(key) != want]
     recorded = protocol.get('selection_seeds')
-    if not isinstance(recorded, list) or set(int(seed) for seed in recorded) != set(seeds):
-        mismatches.append(f'selection_seeds={recorded!r} != {sorted(seeds)!r} '
+    normalized = None
+    if isinstance(recorded, list):
+        try:
+            normalized = [int(seed) for seed in recorded
+                          if not isinstance(seed, bool)]
+            if len(normalized) != len(recorded):
+                normalized = None
+        except (TypeError, ValueError, OverflowError):
+            normalized = None
+    expected = sorted(int(seed) for seed in seeds)
+    if (normalized is None
+            or len(set(normalized)) != len(normalized)
+            or sorted(normalized) != expected):
+        mismatches.append(f'selection_seeds={recorded!r} != {expected!r} '
                           '(the baseline lr must be selected on the same independent runs)')
     return mismatches
 
