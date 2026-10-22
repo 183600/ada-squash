@@ -389,7 +389,8 @@ def main():
     p.add_argument('--ctx-lens', nargs='+', type=int, default=[512, 1024, 2048, 4096])
     p.add_argument('--trials', type=int, default=20, help='independent placements per seed; the Wilson interval covers these trials only, the cross-seed Mean +/- Std covers placement draws')
     p.add_argument('--decode-batch', type=int, default=8, help='independent trials decoded per forward pass (the per-trial prefix is still recomputed every step)')
-    p.add_argument('--tokenizer', default='gpt2')
+    p.add_argument('--tokenizer', default=None, help="tokenizer name; default: the checkpoint's recorded tokenizer, else gpt2. An explicit flag wins, exactly as in eval_downstream.py")
+    p.add_argument('--tokenizer-revision', default=None, help="tokenizer revision; default: the checkpoint's resolved/recorded revision (an explicit flag wins)")
     p.add_argument('--secret', default='The magic number is 98765.')
     p.add_argument('--output', default=None)
     p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; when given it overrides --seeds (one placement draw - the Wilson interval then says nothing about placement variability)')
@@ -438,7 +439,20 @@ def main():
         print('[needle][warn] checkpoint args carry no seq_len: whether a context length was inside '
               'the training distribution cannot be checked')
     from transformers import AutoTokenizer
-    tok_name, tok_revision = _checkpoint_tokenizer(model_args, args.tokenizer)
+    # An explicit tokenizer flag is the user's choice, not a hint: the
+    # checkpoint may have been trained with a different vocabulary and
+    # silently overriding the flag evaluates a different model. Otherwise
+    # use the tokenizer identity the checkpoint recorded.
+    if args.tokenizer is not None:
+        tok_name = args.tokenizer
+        recorded_revision = (
+            (model_args.get('tokenizer_revision_resolved')
+             or model_args.get('tokenizer_revision'))
+            if model_args.get('tokenizer') == args.tokenizer else None)
+    else:
+        tok_name, recorded_revision = _checkpoint_tokenizer(model_args, 'gpt2')
+    tok_revision = (args.tokenizer_revision if args.tokenizer_revision is not None
+                    else recorded_revision)
     tok = AutoTokenizer.from_pretrained(tok_name, revision=tok_revision)
     tok_revision_resolved = getattr(tok, '_commit_hash', None) or tok_revision
     results, skipped = evaluate_model(model, tok, args, device, seeds, trained_seq_len)
@@ -456,7 +470,17 @@ def main():
         ref_trained_seq_len = ref_args.get('seq_len')
         ref_trained_seq_len = (int(ref_trained_seq_len)
                                if isinstance(ref_trained_seq_len, int) else None)
-        ref_tok_name, ref_tok_revision = _checkpoint_tokenizer(ref_args, args.tokenizer)
+        if args.tokenizer is not None:
+            ref_tok_name = args.tokenizer
+            ref_recorded_revision = (
+                (ref_args.get('tokenizer_revision_resolved')
+                 or ref_args.get('tokenizer_revision'))
+                if ref_args.get('tokenizer') == args.tokenizer else None)
+        else:
+            ref_tok_name, ref_recorded_revision = _checkpoint_tokenizer(ref_args, 'gpt2')
+        ref_tok_revision = (args.tokenizer_revision
+                            if args.tokenizer_revision is not None
+                            else ref_recorded_revision)
         if (ref_tok_name, ref_tok_revision) != (tok_name, tok_revision):
             raise SystemExit(
                 f'[needle] tokenizer mismatch: candidate uses {tok_name!r}@{tok_revision!r}, '
