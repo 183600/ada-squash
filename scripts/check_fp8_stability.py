@@ -411,8 +411,15 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
     agg['seeds'] = [r.get('seed') for r in per_seed]
     agg['n_seeds'] = len(per_seed)
     for key in _FP8_SEED_METRIC_KEYS:
-        vals = [r[key] for r in per_seed if _finite_metric(r.get(key))]
-        stats = mean_std_stderr(vals)
+        # Keep the numeric draws (including non-finite ones) for the census;
+        # `mean_std_stderr` filters non-finite values itself. Filtering them
+        # out here first made `_n_nonfinite` and `nonfinite_metric_counts`
+        # always zero, silently hiding the diverged probes the aggregate is
+        # supposed to expose.
+        raw = [r.get(key) for r in per_seed
+               if isinstance(r.get(key), (int, float))
+               and not isinstance(r.get(key), bool)]
+        stats = mean_std_stderr(raw)
         if stats is None:
             # Every probe draw was non-finite: report "unmeasured" instead of
             # leaving the first seed's NaN in the aggregate. A probe that
@@ -420,9 +427,9 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
             agg[key] = None
             agg[key + '_std'] = None
             agg[key + '_n_finite'] = 0
-            agg[key + '_n_nonfinite'] = len(vals)
-            if vals:
-                agg.setdefault('nonfinite_metric_counts', {})[key] = len(vals)
+            agg[key + '_n_nonfinite'] = len(raw)
+            if raw:
+                agg.setdefault('nonfinite_metric_counts', {})[key] = len(raw)
             continue
         agg[key] = stats['mean']
         agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
