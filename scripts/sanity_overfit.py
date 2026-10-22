@@ -201,7 +201,10 @@ def next_token_metrics(model, x, y, topk: int = 3, ctx=None) -> dict:
         torch.bincount(pred, minlength=vocab).tolist(),
         torch.bincount(gold[pred == gold], minlength=vocab).tolist(),
     )
-    k = max(1, min(int(topk), vocab))
+    # top-k over the whole vocabulary always contains the gold token, so a
+    # k >= vocab result is a constant 1.0 and measures nothing. Match the
+    # error-analysis report's radius clamp to the meaningful V-1 ceiling.
+    k = max(1, min(int(topk), max(1, vocab - 1)))
     top = logits.topk(k, dim=-1).indices[mask]
     topk_accuracy = float((top == gold.unsqueeze(-1)).any(dim=-1).float().mean().item())
     copy_input = None
