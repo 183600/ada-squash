@@ -531,6 +531,31 @@ def install_outlier_channel(model, scale: float=25.0) -> int:
         model.tok_emb.weight[oid] *= scale
     return oid
 
+def install_residual_outlier(model, layer_idx: int | None=None,
+                             channel: int | None=None, scale: float=25.0):
+    """Amplify one residual-stream channel after a mid layer, for the whole run.
+
+    This is the preferred probe: unlike inflating a token-embedding row, it
+    does not touch any parameter (with tied embeddings that row is also an
+    output-classifier row, so the old probe was confounded with an output-side
+    pathology). A persistent forward hook scales the chosen channel of the
+    residual stream after ``layer_idx``, giving every downstream layer the
+    classic persistent-channel outlier without changing the weights.
+    """
+    n_layers = int(getattr(model.cfg, 'n_layers', 12))
+    dim = int(getattr(model.cfg, 'dim', 768))
+    layer_idx = n_layers // 2 if layer_idx is None else int(layer_idx)
+    channel = dim // 2 if channel is None else int(channel)
+    block = model.blocks[layer_idx]
+
+    def hook(module, inp, out):
+        y = out[0] if isinstance(out, tuple) else out
+        y[..., channel].mul_(scale)
+        return out
+    block.register_forward_hook(hook)
+    return {'kind': 'residual_channel', 'layer_idx': layer_idx,
+            'channel': channel, 'scale': scale}
+
 def load_ablations_from_config(path: str, include_metadata: bool = False) -> dict:
     """Load the ablation matrix from YAML.
 
