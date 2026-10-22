@@ -672,13 +672,17 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 # the reported CI would silently assume the test was run at
                 # `alpha`, but `paired_t_one_sided` above uses its own default
                 # 0.05; if a caller passes another alpha the inferred stderr
-                # would be scaled wrong.
+                # would be scaled wrong. The test is H1 mean(delta) < -margin,
+                # so the smallest raw effect that clears both margin and noise
+                # includes that margin.
                 delta_stats = mean_std_stderr([x - y for x, y in zip(a, b)])
                 if delta_stats['stderr'] is not None:
                     entry['minimum_detectable_delta_95_power80'] = (
-                        student_t_ppf(1.0 - alpha, float(test['df']))
-                        + student_t_ppf(0.8, float(test['df']))
-                    ) * delta_stats['stderr']
+                        float(margin)
+                        + (student_t_ppf(1.0 - alpha, float(test['df']))
+                           + student_t_ppf(0.8, float(test['df'])))
+                        * delta_stats['stderr']
+                    )
             elif common:
                 entry['mean_delta'] = cand_seeds[common[0]] - ref_seeds[common[0]]
             entry['certifiable'] = bool(
