@@ -1,3 +1,25 @@
+"""Tiny MoE study for the DyT++ / AdaSquash normalization comparison.
+
+The scientific unit is a seed-paired contrast between normalization layers.
+That design is only valid if the seed fixes every non-treatment parameter:
+the transformer weights, router and expert banks must be identical across
+norm arms, so a loss difference can be attributed to the norm rather than to
+a different initialization stream. Norm constructors may draw from the global
+RNG (DyT-C's alpha jitter does), and the expert banks are raw Parameters that
+the generic Linear/Embedding initialization does not cover. The runner
+therefore builds the model with ``init=False`` and calls
+``MoEGPT.reset_parameters(seed)`` once, after all norm modules exist; the
+reset also covers the expert banks. ``tests/test_moe_init.py`` pins this
+invariant.
+
+The comparison metric is held-out cross-entropy (``val_ce``), not the combined
+training objective: the router's load-balancing penalty is a property of the
+routing mechanism, and scoring it as predictive quality would confound the
+norm effect with expert usage. ``val_loss`` / ``val_aux`` are reported next to
+it for transparency. Training seeds are the replication unit, and a cell is
+only certified when it is seed-complete, shares the reference's recipe and
+data snapshot, and passes the paired Student-t with Holm correction.
+"""
 from __future__ import annotations
 import argparse
 import copy
@@ -17,7 +39,8 @@ from adasquash import build_norm, markov_batch
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.attention import CausalSelfAttention, clear_logit_scratch_cache
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
-                               mean_std_stderr, paired_t_one_sided, student_t_ppf,
+                               mean_std_stderr, paired_design_summary,
+                               paired_t_one_sided, student_t_ppf,
                                scale_replication_summary)
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, clear_cast_weight_cache, _LayerScaleResidual
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
@@ -156,7 +179,7 @@ class MoEGPT(nn.Module):
     # not of language modelling.
     AUX_LOSS_COEF = 0.001
 
-    def __init__(self, cfg: GPTConfig, n_experts: int=8):
+    def __init__(self, cfg: GPTConfig, n_experts: int=8, init: bool=True):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
@@ -168,7 +191,8 @@ class MoEGPT(nn.Module):
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
         self.register_buffer('_pos_ids', torch.arange(cfg.max_seq_len), persistent=False)
-        self.apply(self._init_weights)
+        if init:
+            self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -181,6 +205,34 @@ class MoEGPT(nn.Module):
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
+        elif isinstance(m, MoELayer):
+            # Expert banks are raw Parameters, not Linear modules, so the
+            # branches above never reach them. Re-initialize them here too:
+            # otherwise a post-construction reset leaves the expert banks at
+            # whatever RNG state the norm constructors happened to leave. A
+            # jittered DyT-C norm draws randn at build time, so without this
+            # the "same seed" pair no longer shares its non-treatment
+            # initialization across norm arms.
+            for p in (m.experts_w1, m.experts_w2, m.experts_w3):
+                nn.init.normal_(p, mean=0.0, std=0.02)
+
+    @torch.no_grad()
+    def reset_parameters(self, seed=None):
+        """Initialize every non-norm parameter from one controlled seed.
+
+        The norm parameters are the treatment and keep the values their
+        constructor gave them. Everything else must be identical across norm
+        arms that share a seed, so a comparison differs only in the norm. The
+        constructor's own pass is skipped by `init=False`; this is the single
+        initialization pass, mirroring `GPT.reset_parameters` for the dense
+        model. Expert banks are included through `_init_weights`.
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        self.apply(self._init_weights)
+        return self
 
     def forward(self, x, y=None, return_aux=False, return_logits=True):
         B, T = x.shape
@@ -241,7 +293,15 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                                  '--use-layerscale', '--no-bf16'])
         sanity_report_path = output_dir / 'sanity_overfit.json'
     cfg = GPTConfig(vocab_size=50304, dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads, max_seq_len=args.seq_len, mlp_ratio=4.0, norm_name=args.norm)
-    model = MoEGPT(cfg, n_experts=args.n_experts).to(device)
+    # Build without the constructor's initialization pass and initialize every
+    # non-norm parameter once, after all norm modules (the treatment) exist.
+    # This is what makes the same seed a true block: a norm whose constructor
+    # draws RNG (DyT-C's alpha jitter) must not perturb the transformer/expert
+    # initialization of the arm it is compared against.
+    with torch.device(device):
+        model = MoEGPT(cfg, n_experts=args.n_experts, init=False)
+    model.reset_parameters(seed)
+    model.to(device)
     print(f'[moe] total params = {count_parameters(model) / 1000000.0:.2f}M')
     from scripts.train_gpt2 import build_optimizer, open_data_split
     opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
@@ -667,6 +727,13 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             'final_expert_cv': (float(history[-1]['expert_cv_t'][-1])
                                 if history and history[-1]['expert_cv_t'].numel() else None),
             'n_params': count_parameters(model),
+            'init_control': {
+                'controlled_reset_after_build': True,
+                'seed': seed,
+                'non_norm_parameters': ('re-initialized once from the run seed after '
+                                        'all norm modules were constructed'),
+                'norm_parameters': 'treatment values from the norm constructor',
+            },
             'val_loss': val_loss,
             'val_ce': val_ce,
             'val_ce_stderr': val_ce_stderr,
@@ -1080,6 +1147,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 'per_seed_delta': None,
                 'paired_delta_std': None,
                 'minimum_detectable_delta_95_power80': None,
+                'design_power': None,
             }
             cand_params = cell.get('n_params')
             ref_params = reference_cell.get('n_params')
@@ -1113,6 +1181,9 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                             + (student_t_ppf(1.0 - alpha, float(test['df']))
                                + student_t_ppf(power, float(test['df'])))
                             * stats['stderr'])
+                        entry['design_power'] = paired_design_summary(
+                            stats['std'], len(common), margin=margin,
+                            alpha=alpha, power=power)
                 entry['beats_reference'] = bool(entry['delta_vs_reference'] < -margin)
             entry['test_basis'] = ('per-seed paired t' if len(common) >= 2
                                    else f'described only: {len(common)} shared seed(s)')

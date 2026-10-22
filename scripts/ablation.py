@@ -92,7 +92,8 @@ from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_std_stderr,
-                               paired_t_one_sided, student_t_ppf, tost_paired,
+                               paired_design_summary, paired_t_one_sided,
+                               student_t_ppf, tost_paired,
                                two_sided_p_from_t, welch_t_one_sided)
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
@@ -138,6 +139,7 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
         'per_seed_delta': None,
         'paired_delta_std': None,
         'minimum_detectable_delta_95_power80': None,
+        'design_power': None,
     }
     common = list(common_seeds or [])
     if len(common) >= 2:
@@ -176,6 +178,15 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
                    + student_t_ppf(power, float(test['df'])))
                 * stats['stderr']
             )
+            # Prospective sample-size check against the pre-specified margin.
+            # It uses the observed paired SD (the best available planning
+            # value) but the *scientific* margin, not the observed delta, so a
+            # null result can be read as underpowered rather than as evidence
+            # of no effect. With margin=0 the block explicitly says no target
+            # was registered instead of inventing one post hoc.
+            out['design_power'] = paired_design_summary(
+                stats['std'], int(test['n']), margin=margin,
+                alpha=alpha, power=power)
     return out
 
 

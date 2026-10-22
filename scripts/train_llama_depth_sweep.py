@@ -36,7 +36,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
-                               paired_t_one_sided, paired_trend_test, student_t_ppf)
+                               paired_design_summary, paired_t_one_sided,
+                               paired_trend_test, student_t_ppf)
 from adasquash.repro import artifact_record, collect_run_metadata, finish_metadata, save_run_manifest
 from scripts.data_pipeline import _is_pinned_revision
 
@@ -846,6 +847,7 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                 'df': None,
                 'delta_ci_95': None,
                 'minimum_detectable_delta_95_power80': None,
+                'design_power': None,
                 'candidate_missing_seeds': None,
                 'reference_missing_seeds': None,
                 'complete': True,
@@ -928,6 +930,9 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str='
                            + student_t_ppf(0.8, float(test['df'])))
                         * delta_stats['stderr']
                     )
+                    entry['design_power'] = paired_design_summary(
+                        delta_stats['std'], len(common), margin=margin,
+                        alpha=alpha, power=0.8)
             elif common:
                 entry['mean_delta'] = cand_seeds[common[0]] - ref_seeds[common[0]]
             entry['certifiable'] = bool(

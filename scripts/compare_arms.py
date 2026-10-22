@@ -40,7 +40,8 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_std_stderr,
-                               paired_t_one_sided, student_t_ppf, tost_paired)
+                               paired_design_summary, paired_t_one_sided,
+                               student_t_ppf, tost_paired)
 from adasquash.repro import training_recipe_mismatches
 
 _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
@@ -394,6 +395,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'n_seeds_against': None,
             'per_seed_delta': None,
             'minimum_detectable_delta_95_power80': None,
+            'design_power': None,
             'seed_jackknife': None,
             'equivalence': {
                 'enabled': False, 'test': 'tost_paired', 'margin': None,
@@ -458,6 +460,13 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                        + student_t_ppf(0.8, float(test['df'])))
                     * delta_stats['stderr']
                 )
+                # Prospective design check against the pre-specified margin.
+                # The observed paired SD is the planning value; the target is
+                # the scientific margin, not the observed delta, so this does
+                # not turn a null result into a post-hoc claim.
+                entry['design_power'] = paired_design_summary(
+                    delta_stats['std'], len(common), margin=margin,
+                    alpha=alpha, power=0.8)
             both_clean = (not cand['issues'] and not ref['issues']
                           and len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE)
             entry['certifiable'] = bool(both_clean and pair_protocol_ok)

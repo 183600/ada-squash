@@ -116,7 +116,10 @@ def build_model(args, cfg: GPTConfig):
     if args.model == "moe":
         from scripts.train_moe_tiny import MoEGPT
 
-        return MoEGPT(cfg, n_experts=args.n_experts)
+        # Callers reset with the run seed right after building (see below), so
+        # skip the constructor pass for the MoE model too. Its reset now also
+        # covers the raw expert banks.
+        return MoEGPT(cfg, n_experts=args.n_experts, init=False)
     # Callers reset with the run seed right after building; skip the
     # constructor's init pass so the parameters are initialized exactly once.
     return GPT(cfg, init=False)

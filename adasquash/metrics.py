@@ -69,6 +69,8 @@ __all__ = [
     "mcnemar_test",
     "mean_ci",
     "mean_std_stderr",
+    "paired_design_summary",
+    "paired_required_n",
     "paired_t_one_sided",
     "paired_trend_test",
     "paired_z_one_sided",
@@ -539,6 +541,143 @@ def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[floa
         return 0.0
     lower = student_t_cdf(t, df)
     return min(1.0, 2.0 * min(lower, 1.0 - lower))
+
+
+def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
+    """One-sided paired-t minimum detectable effect (same formula as reports).
+
+    ``(t_{1-alpha, n-1} + t_{power, n-1}) * std / sqrt(n)``. This is the
+    standard two-point t approximation used by the comparison scripts; keeping
+    one implementation means a power plan and a reported MDE never disagree.
+    """
+    df = float(n - 1)
+    return ((student_t_ppf(1.0 - alpha, df) + student_t_ppf(power, df))
+            * std / math.sqrt(n))
+
+
+def _validate_design_inputs(std, alpha: float, power: float) -> tuple[float, float, float]:
+    if isinstance(std, bool) or std is None:
+        raise ValueError(f"paired standard deviation must be a number, got {std!r}")
+    try:
+        std = float(std)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"paired standard deviation must be a number, got {std!r}") from None
+    if not math.isfinite(std) or std < 0.0:
+        raise ValueError(
+            f"paired standard deviation must be finite and >= 0, got {std!r}")
+    for name, value in (("alpha", alpha), ("power", power)):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a probability, got {value!r}")
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{name} must be a probability, got {value!r}") from None
+        if not math.isfinite(value) or not 0.0 < value < 1.0:
+            raise ValueError(f"{name} must be strictly between 0 and 1, got {value!r}")
+    return std, float(alpha), float(power)
+
+
+def paired_required_n(std: float, effect: float, alpha: float = 0.05,
+                      power: float = 0.8, max_n: int = 100000) -> Optional[int]:
+    """Prospective paired-sample size for a pre-specified effect size.
+
+    Answers the design question *before* a run: with a paired-difference
+    standard deviation ``std``, how many paired observations (seeds, or
+    paired batches) are needed for the one-sided paired t-test to detect an
+    effect of size ``effect`` at the requested ``power`` and ``alpha``? It
+    uses the same t-critical approximation as the MDE fields in the reports,
+    so the plan and the reported resolution are consistent.
+
+    ``effect`` is the *smallest effect of scientific interest* fixed before
+    the experiment, not the observed effect. A post-hoc "n needed to detect
+    what we happened to see" is not a design justification; the companion
+    ``paired_design_summary`` keeps the current n and the required n side by
+    side instead.
+
+    Returns the smallest integer ``n >= 2``, or ``None`` when the effect is
+    too small to detect within ``max_n`` pairs. A zero-variance paired
+    difference needs only the minimum two observations (the test is
+    deterministic).
+    """
+    std, alpha, power = _validate_design_inputs(std, alpha, power)
+    if isinstance(effect, bool) or effect is None:
+        raise ValueError(f"effect must be a positive number, got {effect!r}")
+    try:
+        effect = float(effect)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"effect must be a positive number, got {effect!r}") from None
+    if not math.isfinite(effect) or effect <= 0.0:
+        raise ValueError(f"effect must be finite and > 0, got {effect!r}")
+    max_n = _strict_int(max_n, "max_n", minimum=2)
+    if std == 0.0:
+        return 2
+    if _paired_mde(std, max_n, alpha, power) > effect:
+        return None
+    if max_n == 2:
+        return 2
+    # The MDE decreases monotonically in n; bracket the answer, then bisect.
+    lo, hi = 2, min(max_n, 4)
+    while hi < max_n and _paired_mde(std, hi, alpha, power) > effect:
+        lo = hi + 1
+        hi = min(max_n, hi * 2)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _paired_mde(std, mid, alpha, power) <= effect:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def paired_design_summary(std: float, n: int, margin: float = 0.0,
+                          alpha: float = 0.05, power: float = 0.8) -> dict:
+    """Prospective design check for one achieved paired comparison.
+
+    The comparison reports already carry the *observed* MDE. This block adds
+    the question a reader of a null result needs: with the observed paired
+    standard deviation, how many pairs would the pre-specified ``margin``
+    have required, and was the achieved ``n`` enough? It never changes the
+    significance verdict; it only makes underpowered designs visible.
+
+    ``margin <= 0`` means no smallest effect was pre-specified, so the
+    required-n fields stay ``None`` rather than inventing a target from the
+    observed delta.
+    """
+    std, alpha, power = _validate_design_inputs(std, alpha, power)
+    n = _strict_int(n, "n", minimum=2)
+    out = {
+        "paired_sd": std,
+        "n": n,
+        "alpha": float(alpha),
+        "power_target": float(power),
+        "minimum_detectable_delta_95_power80": _paired_mde(std, n, alpha, power),
+        "margin": None,
+        "required_pairs_for_margin": None,
+        "adequately_powered_for_margin": None,
+        "note": ("pass a positive pre-specified margin to compute the pairs "
+                 "needed for that smallest effect of interest"),
+    }
+    if isinstance(margin, bool) or margin is None:
+        return out
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError, OverflowError):
+        return out
+    if not math.isfinite(margin) or margin <= 0.0:
+        return out
+    required = paired_required_n(std, margin, alpha=alpha, power=power)
+    out.update({
+        "margin": margin,
+        "required_pairs_for_margin": required,
+        "adequately_powered_for_margin": (
+            None if required is None else bool(n >= required)),
+        "note": ("this design reaches the margin" if required is not None
+                 and n >= required else
+                 "underpowered for the pre-specified margin" if required is not None
+                 else "the margin is not detectable within the search cap"),
+    })
+    return out
 
 
 def tost_paired(
