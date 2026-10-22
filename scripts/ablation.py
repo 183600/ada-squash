@@ -2407,11 +2407,18 @@ def _count_seed_ce(records: list, predictor: str | None) -> dict:
     if not predictor:
         return out
     for record in records or []:
-        if not isinstance(record, dict) or record.get('seed') is None:
+        if not isinstance(record, dict):
+            continue
+        seed = record.get('seed')
+        # A boolean/fractional/string seed is not an independent replication
+        # id; ``int(True)``/``int(42.9)`` would silently pair the count model
+        # with a different ablation run (and can overwrite a real seed's
+        # entry after coercion).
+        if not _is_seed_id(seed):
             continue
         value = (record.get('predictors') or {}).get(predictor)
         if _finite_metric(value):
-            out[int(record['seed'])] = float(value)
+            out[int(seed)] = float(value)
     return out
 
 
