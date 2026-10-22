@@ -205,12 +205,28 @@ class AdaSquashLM:
         return out
 
 def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16, tokenizer: str | None=None):
+    """Run lm-evaluation-harness tasks against the raw GPT module.
+
+    Uses ``AdaSquashLM`` (loglikelihood + rolling + greedy generation), so no
+    HF-compat export is needed. Returns ``{task: {metric: value}}`` with every
+    numeric metric the harness reports for the task.
+    """
     try:
-        import lm_eval
-        from lm_eval.models.huggingface import HFLM
+        import lm_eval  # noqa: F401
+        from lm_eval import simple_evaluate
     except ImportError as e:
         raise RuntimeError('lm-eval not installed. `pip install lm-eval`.') from e
-    raise NotImplementedError('Use the HF-compat exporter + `lm_eval --model hf` for this step. See README for the exact recipe.')
+    if tokenizer is None or isinstance(tokenizer, str):
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer or 'gpt2')
+    lm_obj = AdaSquashLM(model, tokenizer, batch_size=batch_size)
+    report = simple_evaluate(model=lm_obj, tasks=list(tasks), batch_size=batch_size,
+                             bootstrap_iters=0)
+    results = {}
+    for task, metrics in (report.get('results') or {}).items():
+        results[task] = {k: v for k, v in metrics.items()
+                         if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    return results
 DEFAULT_NEEDLE = 'The magic number is 12345.'
 DEFAULT_QUESTION = '\n\nWhat is the magic number? The magic number is'
 DEFAULT_HAYSTACK = 'Many sentences follow. '
