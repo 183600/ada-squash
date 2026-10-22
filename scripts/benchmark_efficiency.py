@@ -472,6 +472,38 @@ def main():
         # silently substituting the model.
         by_norm = {r['norm']: r for r in results}
         cand_cfgs = load_row_cfgs(args.summaries)
+        # The loss delta uses --reference-name while the cost ratio uses
+        # --reference. Those must identify the same norm/architecture, or the
+        # tradeoff mixes a gain against one model with a cost against
+        # another. A missing reference cfg is unknown, not a match.
+        ref_cfg = cand_cfgs.get(args.reference_name)
+        if not isinstance(ref_cfg, dict) or not ref_cfg.get('norm_name'):
+            print(f"[tradeoff] FAIL: reference row '{args.reference_name}' has no recorded "
+                  f"cfg/norm_name in {args.summaries}; the cost reference cannot be "
+                  f"tied to the loss reference", file=sys.stderr)
+            raise SystemExit(1)
+        ref_norm = str(ref_cfg['norm_name'])
+        if ref_norm != args.reference:
+            print(f"[tradeoff] FAIL: loss reference row '{args.reference_name}' is norm "
+                  f"'{ref_norm}' but the cost reference is '{args.reference}'; this "
+                  "would mix a gain against one model with a cost against another",
+                  file=sys.stderr)
+            raise SystemExit(1)
+
+        def _cfg_is_proxy(cfg, norm):
+            if not isinstance(cfg, dict):
+                return True
+            try:
+                return (_cfg_key(args.model, cfg)
+                        != _cfg_key(args.model, {'norm_name': norm}))
+            except Exception:
+                return bool(set(cfg) - {'norm_name'})
+
+        ref_cost_is_proxy = _cfg_is_proxy(ref_cfg, ref_norm)
+        if ref_cost_is_proxy:
+            print(f"[tradeoff][warn] reference row '{args.reference_name}' has an "
+                  f"architecture beyond the benchmarked base '{ref_norm}'; its cost is "
+                  "a proxy measurement")
         rows = []
         for cand in args.candidate:
             cand_loss = losses.get(cand)
@@ -486,24 +518,29 @@ def main():
                 rows.append({'candidate': cand, 'error': f'missing benchmark for norm {cand_norm!r} or reference {args.reference!r}'})
                 continue
             cand_cfg = cand_cfgs.get(cand)
-            if isinstance(cand_cfg, dict):
-                try:
-                    cost_is_proxy = (_cfg_key(args.model, cand_cfg)
-                                     != _cfg_key(args.model, {'norm_name': cand_norm}))
-                except Exception:
-                    cost_is_proxy = bool(set(cand_cfg) - {'norm_name'})
-            else:
-                # Without the row's cfg the benchmark cannot prove that the
-                # base-norm measurement matches the trained architecture. An
-                # unknown config must not be treated as a match.
-                cost_is_proxy = True
+            # Without the row's cfg the benchmark cannot prove that the
+            # base-norm measurement matches the trained architecture. An
+            # unknown config must not be treated as a match. A proxy cost on
+            # either side of the ratio makes the whole ratio a proxy.
+            cost_is_proxy = (_cfg_is_proxy(cand_cfg, cand_norm)
+                             or ref_cost_is_proxy)
             if cost_is_proxy:
-                print(f"[tradeoff][warn] {cand}: the benchmark has no row for its exact "
-                      f"architecture; cost is measured on the base '{cand_norm}' model "
+                owner = 'candidate' if _cfg_is_proxy(cand_cfg, cand_norm) else 'reference'
+                print(f"[tradeoff][warn] {cand}: the benchmark has no row for the exact "
+                      f"{owner} architecture; cost is measured on the base model "
                       f"(proxy cost)")
             loss_improvement = losses[args.reference_name] - cand_loss
-            cost_ratio = cand_bench['training_latency_ms_per_token'] / ref_bench['training_latency_ms_per_token']
+            cost_ratio_of_means = (
+                cand_bench['training_latency_ms_per_token']
+                / ref_bench['training_latency_ms_per_token'])
             cost_stats = paired_training_cost_stats(cand_bench, ref_bench)
+            # Use the paired per-round ratio as the point estimate whenever
+            # it exists: the stderr below is the stderr of *that* estimator.
+            # Centering a ratio-of-means with the stderr of the mean per-round
+            # ratio would mix two different quantities in one interval.
+            cost_ratio = (cost_stats['mean_ratio']
+                          if cost_stats.get('mean_ratio') is not None
+                          else cost_ratio_of_means)
 
             def _ratio(key):
                 a, b = cand_bench.get(key), ref_bench.get(key)
@@ -555,7 +592,9 @@ def main():
                 'reference_val_loss': losses[args.reference_name],
                 'significance': sig,
                 'cost_ratio_per_round': cost_stats,
+                'cost_ratio_of_means': cost_ratio_of_means,
                 'cost_model_norm': cand_norm,
+                'reference_cost_is_proxy': ref_cost_is_proxy,
                 'cost_is_proxy': cost_is_proxy,
                 'verdict': verdict,
             })
