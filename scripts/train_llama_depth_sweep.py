@@ -257,7 +257,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         final_val_step = None
         expected = protocol_for_seed(seed) if protocol_for_seed is not None else None
         reject_reason = None
-        if launch_id is not None:
+        if reject_reason is None and launch_id is not None:
             spec = _load_launch_spec(path.with_name('launch_spec.json'))
             if spec is None:
                 reject_reason = ('no launch spec from this sweep invocation: the manifest '
@@ -272,7 +272,11 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
             manifest = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             pass
-        if reject_reason is None and launch_id is not None:
+        # A finished, readable manifest and the requested protocol are part of
+        # the aggregation contract regardless of whether this call has a
+        # launch id. A missing/legacy manifest is unknown, not an empty run,
+        # and an unfinished one must never enter a pooled mean.
+        if reject_reason is None:
             if not isinstance(manifest, dict):
                 reject_reason = 'run_manifest.json is missing or unreadable'
             elif manifest.get('status') != 'finished':
