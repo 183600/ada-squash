@@ -1594,7 +1594,11 @@ def cached_seed_matches(summary: dict, name: str, cfg_kwargs: dict, args, seed: 
     if recorded is None:
         seeds = summary.get('seeds')
         recorded = seeds[0] if isinstance(seeds, list) and seeds else None
-    return recorded is not None and int(recorded) == int(seed)
+    # A malformed cached seed is unknown, not another spelling of `seed`:
+    # `int(True)`/`int(42.9)` used to reuse a run that was never seeded 1/42.
+    if not _is_seed_id(recorded) or not _is_seed_id(seed):
+        return False
+    return recorded == seed
 
 def merge_summaries(previous: list, fresh: list) -> list:
     merged: dict[str, dict] = {}
