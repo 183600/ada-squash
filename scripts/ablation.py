@@ -1186,6 +1186,10 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'per_seed_delta': None,
             'paired_delta_std': None,
             'minimum_detectable_delta_95_power80': None,
+            # Per-seed held-out losses let the calibrated count-model
+            # comparison test the same seeds (the count model is fitted on
+            # seed s and scored on the seed s+1 stream, exactly like the row).
+            'per_seed_val_loss': _seed_means(row),
             # Curve regimes of the row's seeds (None for pre-monitoring
             # summaries): a delta measured while one arm is underfit or
             # overfitting is annotated, so it cannot be read as pure norm
@@ -1333,8 +1337,19 @@ def _simple_baseline_protocol_mismatches(protocol, args) -> list:
         'seq_len': args.seq_len,
         'val_batches': max(1, int(getattr(args, 'val_batches', 20))),
     }
-    return [f'{key}={protocol.get(key)!r} != {want!r}'
-            for key, want in expected.items() if protocol.get(key) != want]
+    mismatches = [f'{key}={protocol.get(key)!r} != {want!r}'
+                  for key, want in expected.items() if protocol.get(key) != want]
+    # Seeds are the pairing unit of the count-model test: a calibration fitted
+    # on different seeds cannot be paired with these rows even when the task
+    # and stream offsets are identical.
+    recorded_seeds = protocol.get('seeds')
+    current_seeds = getattr(args, 'seeds', None)
+    if current_seeds is not None:
+        recorded = set(recorded_seeds) if isinstance(recorded_seeds, list) else None
+        current = set(int(seed) for seed in current_seeds)
+        if recorded != current:
+            mismatches.append(f'seeds={recorded_seeds!r} != {sorted(current)!r}')
+    return mismatches
 
 def load_simple_baselines(path, args=None) -> dict | None:
     """Load the Bayes-limit calibration written by scripts/baseline_simple.py.
@@ -1410,7 +1425,34 @@ def run_simple_baseline_calibration(path, seeds, args) -> dict | None:
     return data
 
 
-def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, source) -> dict:
+def _count_seed_ce(records: list, predictor: str | None) -> dict:
+    """Per-seed CE of the tuned count model on the shared held-out stream."""
+    out = {}
+    if not predictor:
+        return out
+    for record in records or []:
+        if not isinstance(record, dict) or record.get('seed') is None:
+            continue
+        value = (record.get('predictors') or {}).get(predictor)
+        if _finite_metric(value):
+            out[int(record['seed'])] = float(value)
+    return out
+
+
+def _mde_from_test(test: dict | None, alpha: float = 0.05, power: float = 0.8):
+    if test is None or not test.get('df') or not _finite_metric(test.get('ci_low')):
+        return None
+    half = (test['ci_high'] - test['ci_low']) / 2.0
+    critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
+    if critical <= 0.0:
+        return None
+    stderr = half / critical
+    return ((student_t_ppf(1.0 - alpha, float(test['df']))
+             + student_t_ppf(power, float(test['df']))) * stderr)
+
+
+def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, source,
+                                       alpha: float = 0.05) -> dict:
     """Annotate every comparison row with its distance to the task's Bayes limits.
 
     `baseline_comparison` answers "which row is best among these
@@ -1424,6 +1466,13 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
     `excess_over_tuned_simple_nats` = distance to the tuned count model, and
     `signal_captured_fraction` rescales the remaining gap against the
     uniform-over-vocabulary strawman.
+
+    The count model and the transformer consume the same generator stream for
+    each seed (fit on s, scored on s+1), so their per-seed CEs are paired:
+    `beats_tuned_simple_significantly` is set only by a one-sided paired
+    t-test over shared seeds (>= 3) after a Holm correction across rows. A
+    point-estimate win inside the seed noise remains visible as
+    `beats_tuned_simple_baseline=True, beats_tuned_simple_significantly=False`.
     """
     limits = floor_data['bayes_limits']
     floor = float(limits['memoryless_nats'])
@@ -1431,9 +1480,12 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
     ceiling = float(ceiling) if isinstance(ceiling, (int, float)) else None
     tuned = floor_data['tuned_count_baseline']
     tuned_ce = float(tuned['mean_ce_nats'])
+    tuned_predictor = tuned.get('predictor')
+    seed_ce = _count_seed_ce(floor_data.get('per_seed') or [], tuned_predictor)
     protocol = floor_data.get('protocol') or {}
     vocab_size = protocol.get('vocab_size')
     log_vocab = math.log(vocab_size) if isinstance(vocab_size, (int, float)) and vocab_size > 0 else None
+    annotated = []
     for entry in comparison['rows']:
         val_loss = entry.get('val_loss')
         if not isinstance(val_loss, (int, float)):
@@ -1445,24 +1497,76 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
         entry['beats_tuned_simple_baseline'] = bool(val_loss < tuned_ce)
         if log_vocab is not None and ceiling is not None and log_vocab > ceiling:
             entry['signal_captured_fraction'] = (log_vocab - val_loss) / (log_vocab - ceiling)
-    annotated = [entry for entry in comparison['rows'] if isinstance(entry.get('val_loss'), (int, float))]
+        row_seeds = {int(seed): float(value)
+                     for seed, value in (entry.get('per_seed_val_loss') or {}).items()
+                     if _finite_metric(value)}
+        common = sorted(set(row_seeds) & set(seed_ce))
+        test = None
+        entry.update({
+            'beats_tuned_simple_significantly': False,
+            'n_paired_seeds_tuned_simple': len(common),
+            'p_one_sided_tuned_simple': None,
+            'p_one_sided_tuned_simple_holm': None,
+            'delta_seed_mean_tuned_simple': None,
+            'delta_ci_95_tuned_simple': None,
+            'minimum_detectable_delta_tuned_simple': None,
+            'simple_baseline_test_basis': None,
+        })
+        if len(common) >= 2:
+            test = paired_t_one_sided([row_seeds[seed] for seed in common],
+                                      [seed_ce[seed] for seed in common])
+            entry.update({
+                'p_one_sided_tuned_simple': test['p_one_sided'],
+                'delta_seed_mean_tuned_simple': test['mean_delta'],
+                'delta_ci_95_tuned_simple': [test['ci_low'], test['ci_high']],
+                'minimum_detectable_delta_tuned_simple': _mde_from_test(test, alpha=alpha),
+                'simple_baseline_test_basis': (
+                    'seed_means' if len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
+                    else f'descriptive only: {len(common)} shared seeds, fewer than the '
+                         f'required {MIN_SEEDS_FOR_SIGNIFICANCE}'),
+            })
+        elif len(common) == 1:
+            entry['simple_baseline_test_basis'] = (
+                'descriptive only: one shared seed, so a paired count-model test '
+                'cannot separate an arm effect from run-to-run noise')
+        else:
+            entry['simple_baseline_test_basis'] = 'no_shared_seeds'
+        annotated.append(entry)
+    family = [entry for entry in annotated
+              if entry.get('n_paired_seeds_tuned_simple', 0) >= MIN_SEEDS_FOR_SIGNIFICANCE
+              and entry.get('p_one_sided_tuned_simple') is not None]
+    adjusted = holm_adjust([entry['p_one_sided_tuned_simple'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
+        entry['p_one_sided_tuned_simple_holm'] = p_holm
+        entry['beats_tuned_simple_significantly'] = bool(
+            entry.get('beats_tuned_simple_baseline')
+            and p_holm is not None and p_holm < alpha)
     block = {
         'source': str(source),
         'memoryless_floor_nats': floor,
         'full_context_ceiling_nats': ceiling,
-        'tuned_simple_predictor': tuned.get('predictor'),
+        'tuned_simple_predictor': tuned_predictor,
         'tuned_simple_ce_nats': tuned_ce,
         'tuned_simple_std_ce_nats': tuned.get('std_ce_nats'),
         'uniform_vocab_strawman_nats': log_vocab,
         'calibration_seeds': protocol.get('seeds'),
         'hypothesis': floor_data.get('hypothesis'),
+        'paired_test': ('one-sided paired t-test over the seeds shared by the row and the '
+                        'tuned count model; only >= '
+                        f'{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds enter the Holm family'),
         'reading': ('excess_over_bayes_ceiling_nats is the gap to the exact full-context Bayes predictor '
                     '(hmm_bayes) and the number that says whether a row learned the task; '
-                    'beats_tuned_simple_baseline only says it beat a tuned count model, and '
+                    'beats_tuned_simple_baseline only says it beat a tuned count model on the point '
+                    'estimate, beats_tuned_simple_significantly is the seed-paired test, and '
                     'signal_captured_fraction rescales the gap against uniform-over-vocab'),
         'rows': [{key: entry.get(key) for key in (
             'name', 'val_loss', 'excess_over_bayes_ceiling_nats', 'excess_over_bayes_floor_nats',
-            'excess_over_tuned_simple_nats', 'beats_tuned_simple_baseline', 'signal_captured_fraction',
+            'excess_over_tuned_simple_nats', 'beats_tuned_simple_baseline',
+            'beats_tuned_simple_significantly', 'n_paired_seeds_tuned_simple',
+            'p_one_sided_tuned_simple', 'p_one_sided_tuned_simple_holm',
+            'delta_seed_mean_tuned_simple', 'delta_ci_95_tuned_simple',
+            'minimum_detectable_delta_tuned_simple', 'simple_baseline_test_basis',
+            'signal_captured_fraction',
         )} for entry in annotated],
     }
     if annotated:
@@ -1472,9 +1576,11 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
         best_str = 'n/a' if best_gap is None else f"{best_gap:+.4f}"
         print(f"[compare] Bayes calibration ({source}): memoryless floor {floor:.4f} nats, full-context "
               f"ceiling {ceiling_str} nats, tuned simple baseline {tuned_ce:.4f} nats "
-              f"({tuned.get('predictor')}); closest row to the ceiling: {best['name']} "
+              f"({tuned_predictor}); closest row to the ceiling: {best['name']} "
               f"{best_str} nats; rows beating the tuned simple baseline: "
-              f"{sum(1 for entry in annotated if entry.get('beats_tuned_simple_baseline'))}/{len(annotated)}")
+              f"{sum(1 for entry in annotated if entry.get('beats_tuned_simple_baseline'))}/{len(annotated)} "
+              f"(significantly: "
+              f"{sum(1 for entry in annotated if entry.get('beats_tuned_simple_significantly'))})")
     return block
 
 def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: float=0.0, alpha: float=0.05) -> dict | None:
@@ -1903,6 +2009,10 @@ def main():
             p.error(f'{flag} {value} must be >= 1')
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or DEFAULT_SEEDS)
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
+    # Keep `args.seeds` equal to the resolved set: protocol checks (e.g. the
+    # simple-baseline calibration) must compare against the seeds actually
+    # run, not the parser default when the deprecated --seed shorthand was used.
+    args.seeds = list(seeds)
     if len(seeds) != len(raw_seeds):
         print(f'[warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
               f'(a repeated seed is the same run, not an independent replication)')
@@ -2034,7 +2144,8 @@ def main():
             and args.simple_baselines_enabled and args.auto_simple_baselines):
         floor_data = run_simple_baseline_calibration(simple_path, seeds, args)
     if comparison is not None and floor_data is not None:
-        comparison['simple_baseline'] = attach_simple_baseline_calibration(comparison, floor_data, simple_path)
+        comparison['simple_baseline'] = attach_simple_baseline_calibration(
+            comparison, floor_data, simple_path, alpha=args.alpha)
         comparison['calibration_status'] = 'attached'
     elif comparison is not None and not args.simple_baselines_enabled:
         # The opt-out must be visible in the artifact, not just on stdout: a

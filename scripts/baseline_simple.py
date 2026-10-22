@@ -69,7 +69,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
-from adasquash.metrics import mean_std_stderr
+from adasquash.metrics import (holm_adjust, mean_std_stderr, paired_t_one_sided,
+                               student_t_ppf)
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import markov_batch
 DEFAULT_SEEDS = (42, 43, 44)
@@ -414,7 +415,55 @@ def load_ablation_rows(path) -> list:
         return []
     return data if isinstance(data, list) else []
 
-def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_ce, log_vocab) -> list:
+def _finite_number(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)))
+
+
+def _row_seed_losses(row: dict) -> dict:
+    """Per-seed validation losses of one ablation row, when recorded."""
+    out = {}
+    per_seed = row.get('per_seed')
+    if isinstance(per_seed, list):
+        for item in per_seed:
+            if not isinstance(item, dict) or item.get('seed') is None:
+                continue
+            if _finite_number(item.get('val_loss')):
+                out[int(item['seed'])] = float(item['val_loss'])
+        return out
+    seed = row.get('seed')
+    if seed is not None and _finite_number(row.get('val_loss')):
+        out[int(seed)] = float(row['val_loss'])
+    return out
+
+
+def _count_seed_ce(records: list, predictor: str) -> dict:
+    """Per-seed CE of the tuned count model on the shared held-out stream."""
+    out = {}
+    for record in records or []:
+        if not isinstance(record, dict) or record.get('seed') is None:
+            continue
+        value = (record.get('predictors') or {}).get(predictor)
+        if _finite_number(value):
+            out[int(record['seed'])] = float(value)
+    return out
+
+
+def _mde_from_test(test: dict | None, alpha: float = 0.05, power: float = 0.8):
+    if test is None or not test.get('df') or not _finite_number(test.get('ci_low')):
+        return None
+    half = (test['ci_high'] - test['ci_low']) / 2.0
+    critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
+    if critical <= 0.0:
+        return None
+    stderr = half / critical
+    return ((student_t_ppf(1.0 - alpha, float(test['df']))
+             + student_t_ppf(power, float(test['df']))) * stderr)
+
+
+def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_ce,
+                            log_vocab, tuned_predictor: str | None = None,
+                            records: list | None = None, alpha: float = 0.05) -> list:
     """Join ablation val_losses with their distance to the task's limits.
 
     `excess_over_bayes_ceiling_nats` is the gap to the best possible full-context
@@ -422,6 +471,14 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
     memoryless floor, `beats_tuned_simple_baseline` whether the transformer is
     ahead of a tuned count model, and `signal_captured_fraction` rescales the
     remaining distance against the uniform-over-vocab strawman.
+
+    When `tuned_predictor` and the per-seed `records` are supplied, the point
+    estimate is extended with the test the claim actually needs: the ablation
+    seed and the count-model seed see the identical held-out stream, so their
+    per-seed CEs are paired. `beats_tuned_simple_significantly` is set only by
+    a one-sided paired t-test over shared seeds (>= 3) after a Holm correction
+    across the rows; a point-estimate win inside the seed noise stays visible
+    as `beats_tuned_simple_baseline=True, beats_tuned_simple_significantly=False`.
     """
     out = []
     for row in rows:
@@ -438,7 +495,51 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
                 entry['beats_tuned_simple_baseline'] = bool(val_loss < tuned_ce)
             if log_vocab is not None and ceiling is not None and log_vocab > ceiling:
                 entry['signal_captured_fraction'] = (log_vocab - val_loss) / (log_vocab - ceiling)
+        entry.update({
+            'beats_tuned_simple_significantly': False,
+            'per_seed_val_loss': _row_seed_losses(row),
+            'n_paired_seeds': 0,
+            'p_one_sided_tuned_simple': None,
+            'p_one_sided_tuned_simple_holm': None,
+            'delta_seed_mean_tuned_simple': None,
+            'delta_ci_95_tuned_simple': None,
+            'minimum_detectable_delta_tuned_simple': None,
+            'simple_baseline_test_basis': None,
+        })
+        seed_ce = _count_seed_ce(records, tuned_predictor) if tuned_predictor else {}
+        common = sorted(set(entry['per_seed_val_loss']) & set(seed_ce))
+        entry['n_paired_seeds'] = len(common)
+        if len(common) >= 2:
+            row_vals = [entry['per_seed_val_loss'][seed] for seed in common]
+            ref_vals = [seed_ce[seed] for seed in common]
+            test = paired_t_one_sided(row_vals, ref_vals)
+            entry.update({
+                'p_one_sided_tuned_simple': test['p_one_sided'],
+                'delta_seed_mean_tuned_simple': test['mean_delta'],
+                'delta_ci_95_tuned_simple': [test['ci_low'], test['ci_high']],
+                'minimum_detectable_delta_tuned_simple': _mde_from_test(test, alpha=alpha),
+                'simple_baseline_test_basis': 'seed_means',
+                'replicated_across_seeds': len(common) >= 3,
+            })
+            if len(common) < 3:
+                entry['simple_baseline_test_basis'] = (
+                    f'descriptive only: {len(common)} shared seeds, fewer than the '
+                    'required 3')
+        elif len(common) == 1:
+            entry['simple_baseline_test_basis'] = (
+                'descriptive only: one shared seed, so a paired count-model test '
+                'cannot separate an arm effect from run-to-run noise')
+        elif tuned_predictor:
+            entry['simple_baseline_test_basis'] = 'no_shared_seeds'
         out.append(entry)
+    family = [entry for entry in out if entry.get('replicated_across_seeds')
+              and entry.get('p_one_sided_tuned_simple') is not None]
+    adjusted = holm_adjust([entry['p_one_sided_tuned_simple'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
+        entry['p_one_sided_tuned_simple_holm'] = p_holm
+        entry['beats_tuned_simple_significantly'] = bool(
+            entry.get('beats_tuned_simple_baseline')
+            and p_holm is not None and p_holm < alpha)
     return out
 
 def main():
@@ -526,14 +627,19 @@ def main():
               'calibrate against these limits until the discrepancy is explained')
     ceiling = None if not full_context else full_context['mean_ce_nats']
     summaries_path = Path(args.ablation_summaries) if args.ablation_summaries else Path(args.output).with_name('all_summaries.json')
-    ablation_rows = calibrate_ablation_rows(load_ablation_rows(summaries_path), memoryless_floor, ceiling,
-                                            None if not tuned_baseline else tuned_baseline['mean_ce_nats'],
-                                            math.log(args.vocab_size))
+    ablation_rows = calibrate_ablation_rows(
+        load_ablation_rows(summaries_path), memoryless_floor, ceiling,
+        None if not tuned_baseline else tuned_baseline['mean_ce_nats'],
+        math.log(args.vocab_size),
+        tuned_predictor=None if not tuned_baseline else tuned_baseline['predictor'],
+        records=records)
     if ablation_rows:
         above = sum(1 for row in ablation_rows if row.get('beats_tuned_simple_baseline'))
+        certified = sum(1 for row in ablation_rows if row.get('beats_tuned_simple_significantly'))
         print(f"[baseline] ablation rows from {summaries_path}: {above}/{len(ablation_rows)} beat the tuned "
-              f"count model; every row is annotated with excess_over_bayes_floor_nats and "
-              f"excess_over_bayes_ceiling_nats")
+              f"count model on the point estimate, {certified}/{len(ablation_rows)} significantly "
+              f"(paired t, Holm, >=3 shared seeds); every row is annotated with "
+              f"excess_over_bayes_floor_nats and excess_over_bayes_ceiling_nats")
     report = {
         'hypothesis': args.hypothesis,
         'protocol': {
