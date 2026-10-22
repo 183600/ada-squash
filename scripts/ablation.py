@@ -2204,6 +2204,14 @@ def main():
                 '--auto-simple-baselines or --require-simple-baselines: the '
                 'calibration is explicitly disabled, so those requests cannot '
                 'be honored')
+    if not math.isfinite(args.lr) or args.lr <= 0.0:
+        p.error(f'--lr {args.lr} must be finite and positive')
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0.0:
+        p.error(f'--weight-decay {args.weight_decay} must be finite and >= 0')
+    if not math.isfinite(args.baseline_margin) or args.baseline_margin < 0.0:
+        p.error(f'--baseline-margin {args.baseline_margin} must be finite and >= 0')
+    if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
+        p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
     for flag, value in (('--max-steps', args.max_steps),
                         ('--batch-size', args.batch_size),
                         ('--seq-len', args.seq_len),
