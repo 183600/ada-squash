@@ -375,7 +375,12 @@ def main():
             ctx_len = args.needle_context_len
             ctx_source = 'cli'
         elif trained_seq_len is not None:
-            ctx_len = max(1, min(trained_seq_len, max_scoreable))
+            # Scoring needs `needle_overhead` extra forward positions beyond
+            # the prompt, so the prompt default must leave that room inside
+            # the trained context; otherwise the script's own default is
+            # already an extrapolation and trips the warning below.
+            ctx_len = max(1, min(trained_seq_len - needle_overhead,
+                                 max_scoreable))
             ctx_source = 'trained_seq_len'
         else:
             ctx_len = max_scoreable
