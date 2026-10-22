@@ -401,6 +401,13 @@ def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets
     n = targets.numel()
     if hidden.dim() != 2 or hidden.size(0) != n:
         hidden = hidden.reshape(n, -1)
+    # `F.cross_entropy`/`nll_loss` expect a 1-D target whose length matches
+    # the flattened rows. The logits-path wrapper flattens leading dims, and
+    # the fused path must do the same: `hidden` is reshaped above, but a 2-D
+    # target left as-is made the chunked nll_loss reject the batch even though
+    # the same call is valid through `cross_entropy_mean`.
+    if targets.dim() != 1:
+        targets = targets.reshape(-1)
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(weight.size(0))
     # The plain pair is taken only when the whole block fits in a single
