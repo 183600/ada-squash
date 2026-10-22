@@ -1618,6 +1618,12 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['delta_paired_mean'] = test['mean_delta']
             entry['n'] = test['n']
+            # The direction must come from the same paired shared-seed
+            # estimate as the p-value. The all-seed mean can have the
+            # opposite sign when the arms have different seed sets, which
+            # made a row both "does not beat" and "significantly beats".
+            if test['mean_delta'] is not None:
+                entry['beats_reference'] = bool(test['mean_delta'] < -margin)
         entry.update(_paired_effect_summary(row, reference, common, test, alpha=alpha,
                                            margin=margin))
         entry.update(_robustness_for_deltas(
@@ -2189,8 +2195,13 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
     adjusted = holm_adjust([entry['p_one_sided_tuned_simple'] for entry in family])
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_tuned_simple_holm'] = p_holm
+        # The certifying test is paired on the shared seeds, so its direction
+        # must come from that paired delta, not the all-seed point estimate
+        # (an extra seed can move the pooled mean across the tuned CE and
+        # suppress a genuine paired win).
+        paired_delta = entry.get('delta_seed_mean_tuned_simple')
         entry['beats_tuned_simple_significantly'] = bool(
-            entry.get('beats_tuned_simple_baseline')
+            paired_delta is not None and paired_delta < 0.0
             and p_holm is not None and p_holm < alpha)
     block = {
         'source': str(source),
@@ -2351,6 +2362,10 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
                 entry['delta_paired_mean'] = test['mean_delta']
                 entry['n'] = test['n']
+                # Keep the mechanism direction on the same shared-seed
+                # estimate the p-value tests, not the all-seed mean.
+                if test['mean_delta'] is not None:
+                    entry['mechanism_helps'] = bool(test['mean_delta'] < -margin)
             entry.update(_paired_effect_summary(full, ref, common, test, alpha=alpha,
                                                margin=margin))
             entry.update(_robustness_for_deltas(
@@ -2916,8 +2931,20 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     """
     baseline_set = set(baseline_names or [])
     contrasts: list = []
+    seen_directional_pairs: set[tuple] = set()
 
     def _add(entry: dict) -> None:
+        # The same candidate/reference contrast can be described by more than
+        # one report family (the QK axis is both a leave-one-out removal and a
+        # host-level QK contrast). It is one test, so the pre-registration and
+        # the study-level Holm family must count it once; otherwise the
+        # duplicated p-value doubles its weight and inflates the family size.
+        if entry.get('kind') in ('superiority', 'mechanism_removal'):
+            pair = (entry.get('candidate'), entry.get('reference'))
+            if pair[0] is not None and pair[1] is not None:
+                if pair in seen_directional_pairs:
+                    return
+                seen_directional_pairs.add(pair)
         contrasts.append(entry)
 
     for name in sorted(rows):
@@ -2941,9 +2968,18 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
             'sided': 'one_sided',
             'hypothesis': hypotheses.get(name),
         })
+    qk_axis_report = matrix_report.get('qk_axis') or {}
+    qk_on_off_pairs = {
+        (info.get('on'), info.get('off')) for info in qk_axis_report.values()
+        if isinstance(info, dict)}
     for full_name, mechanisms in sorted(
             (matrix_report.get('leave_one_out') or {}).items()):
         for mechanism, reference in sorted((mechanisms or {}).items()):
+            if (full_name, reference) in qk_on_off_pairs:
+                # Canonicalised by the host-level QK-axis contrast below: the
+                # LOO report still describes the same test, but the plan must
+                # not pre-register it twice.
+                continue
             _add({
                 'id': f'loo:{full_name}:{mechanism}',
                 'family': 'leave_one_out',
@@ -3135,7 +3171,12 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             hypothesis=entry.get('hypothesis'),
             replicated=entry.get('replicated_across_seeds'),
             test_basis=entry.get('test_basis'),
-            effect=entry.get('delta_vs_reference'),
+            # The certifying p-value is the paired shared-seed test, so the
+            # study-level effect must be that same paired delta. Falling back
+            # to the all-seed difference can even reverse its sign.
+            effect=(entry.get('delta_paired_mean')
+                    if entry.get('delta_paired_mean') is not None
+                    else entry.get('delta_vs_reference')),
             excluded_reason=entry.get('excluded_from_family'))
     loo = comparisons.get('leave_one_out') or {}
     for entry in loo.get('rows', []) or []:
@@ -3148,7 +3189,9 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             entry.get('mechanism_helps_significantly'),
             replicated=entry.get('replicated_across_seeds'),
             test_basis=entry.get('test_basis'),
-            effect=entry.get('delta_full_minus_reference'),
+            effect=(entry.get('delta_paired_mean')
+                    if entry.get('delta_paired_mean') is not None
+                    else entry.get('delta_full_minus_reference')),
             excluded_reason=entry.get('excluded_from_family'))
     factorial = comparisons.get('factorial') or {}
     for entry in factorial.get('rows', []) or []:
@@ -3545,10 +3588,13 @@ def main():
     if run_schedule is not None:
         design_readiness['schedule_balance'] = schedule_balance_report(
             run_schedule, arm_of=schedule_arm_of)
-    if (args.assumed_paired_sd is not None and args.baseline_margin > 0.0):
+    if (args.assumed_paired_sd is not None and args.baseline_margin > 0.0
+            and len(seeds) >= 2):
         # Calibrate the actual paired-test code against the pre-run assumption:
         # under the alternative the planned effect is -margin (candidate lower
-        # loss). This is a preparation check, not a result.
+        # loss). This is a preparation check, not a result. A one-seed
+        # --allow-uncertified run has no paired test to calibrate, and the
+        # replication/power checks already record that failure.
         design_readiness['simulated_power_check'] = simulate_paired_design(
             n_pairs=len(seeds), effect=-float(args.baseline_margin),
             paired_sd=float(args.assumed_paired_sd), reps=1000,

@@ -576,10 +576,18 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
         if not isinstance(row, dict):
             continue
         val_loss = row.get('val_loss')
+        valid_loss = _finite_number(val_loss)
         identity = _row_run_identity(row, parent_of)
-        entry = {'name': row.get('name'), 'val_loss': val_loss, 'n_seeds': row.get('n_seeds'),
+        entry = {'name': row.get('name'),
+                 'val_loss': float(val_loss) if valid_loss else None,
+                 'n_seeds': row.get('n_seeds'),
                  'run_identity': identity,
                  'excluded_from_family': None}
+        if val_loss is not None and not valid_loss:
+            # NaN/Inf and bools are not measurements. Keeping the raw value in
+            # `val_loss` made a bool loss compute a finite excess and even
+            # "beat" the tuned count model.
+            entry['invalid_val_loss'] = repr(val_loss)
         if protocol is not None:
             mismatches = _calibration_protocol_mismatches(
                 _row_calibration_protocol(row), protocol)
@@ -590,7 +598,7 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
                 entry['excluded_from_family'] = (
                     'trained/validated under a different corpus protocol than this '
                     f"calibration: {', '.join(mismatches)}")
-        if isinstance(val_loss, (int, float)):
+        if valid_loss:
             entry['excess_over_bayes_floor_nats'] = val_loss - memoryless_floor
             if ceiling is not None:
                 entry['excess_over_bayes_ceiling_nats'] = val_loss - ceiling
@@ -670,8 +678,11 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
     adjusted = holm_adjust([entry['p_one_sided_tuned_simple'] for entry in family])
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_tuned_simple_holm'] = p_holm
+        # The certifying test is paired on the shared seeds, so its direction
+        # comes from that paired delta, not the all-seed point estimate.
+        paired_delta = entry.get('delta_seed_mean_tuned_simple')
         entry['beats_tuned_simple_significantly'] = bool(
-            entry.get('beats_tuned_simple_baseline')
+            paired_delta is not None and paired_delta < 0.0
             and p_holm is not None and p_holm < alpha)
     return out
 
