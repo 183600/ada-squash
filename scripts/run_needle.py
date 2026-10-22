@@ -293,6 +293,30 @@ def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
         results.append(record)
     return results, skipped
 
+def _placement_seed_map(result: dict):
+    """``{seed: record}`` with duplicate/malformed placement seeds rejected.
+
+    Two records for one placement seed are the same draw, not two independent
+    replications; counting them twice could lift a one-seed evaluation over
+    the three-shared-seed certification threshold.
+    """
+    out = {}
+    problems = []
+    for record in result.get('per_seed') or []:
+        if not isinstance(record, dict):
+            problems.append(f'malformed record {record!r}')
+            continue
+        seed = record.get('seed')
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            problems.append(f'malformed seed {seed!r}')
+            continue
+        if seed in out:
+            problems.append(f'duplicate seed {seed}')
+            continue
+        out[seed] = record
+    return out, problems
+
+
 def compare_needle(results, reference_results, alpha=0.05, protocol=None):
     """Paired candidate-vs-reference tests on the shared placements.
 
@@ -318,12 +342,23 @@ def compare_needle(results, reference_results, alpha=0.05, protocol=None):
             tests.append({'ctx_len': cand['ctx_len'], 'testable': False,
                           'reason': 'context length was not evaluated for the reference'})
             continue
-        ref_seeds = {r['seed']: r for r in ref['per_seed']}
+        ref_seeds, ref_problems = _placement_seed_map(ref)
+        cand_seeds, cand_problems = _placement_seed_map(cand)
+        if ref_problems or cand_problems:
+            tests.append({
+                'ctx_len': cand['ctx_len'], 'testable': False,
+                'paired_seeds': [], 'unpaired_seeds': [],
+                'candidate_acc': cand.get('acc'), 'reference_acc': ref.get('acc'),
+                'mcnemar': mcnemar_test(0, 0),
+                'reason': ('placement seeds are not unique/valid: '
+                           f'candidate={cand_problems}, reference={ref_problems}'),
+            })
+            continue
         n_fixed = n_broke = 0
         paired_accs = []
         paired_seeds = []
         unpaired = []
-        for cand_seed in cand['per_seed']:
+        for cand_seed in cand_seeds.values():
             ref_seed = ref_seeds.get(cand_seed['seed'])
             if ref_seed is None:
                 unpaired.append(cand_seed['seed'])
