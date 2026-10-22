@@ -132,7 +132,10 @@ def _shape_signature(agg: dict):
     # variants (DyT-CD has a few more parameters). Folding it into the
     # signature would reject every cross-norm comparison as a "shape" change.
     if any(not isinstance(shape, dict)
-           or any(shape.get(key) is None for key in _SHAPE_KEYS)
+           or any(not isinstance(shape.get(key), int)
+                  or isinstance(shape.get(key), bool)
+                  or shape.get(key) <= 0
+                  for key in _SHAPE_KEYS)
            for shape in shapes.values()):
         return None
     if not _provenance_covers_seeds(shapes, agg):
