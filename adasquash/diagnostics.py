@@ -25,6 +25,7 @@ plain dicts/lists and are unit-testable without a model.
 """
 import bisect
 import math
+from collections.abc import Mapping
 from typing import Optional, Sequence
 
 import torch
@@ -69,6 +70,30 @@ def _is_boolean_scalar(value) -> bool:
         return True
     cls = type(value)
     return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
+def _threshold_int(value, name: str, minimum: int) -> int:
+    if _is_boolean_scalar(value) or value is None:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    if converted != value or converted < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    return converted
+
+
+def _threshold_float(value, name: str, minimum: float = 0.0) -> float:
+    if _is_boolean_scalar(value) or value is None:
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a finite number, got {value!r}") from None
+    if not math.isfinite(converted) or converted < minimum:
+        raise ValueError(f"{name} must be finite and >= {minimum}, got {value!r}")
+    return converted
 
 
 def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]:
@@ -170,12 +195,17 @@ def diagnose_train_val_curve(
     Returns a JSON-serializable dict; every number the verdict used is kept
     under ``evidence``.
     """
+    if thresholds is not None and not isinstance(thresholds, Mapping):
+        raise ValueError('curve thresholds must be a mapping')
     thresholds = {**DEFAULT_CURVE_THRESHOLDS, **(thresholds or {})}
-    window = int(thresholds["window"])
-    min_imp = float(thresholds["min_rel_improvement"])
-    worsen = float(thresholds["worsen_rel_tolerance"])
-    gap_widen = float(thresholds["gap_widen_rel"])
-    noise_z = float(thresholds["noise_z"])
+    window = _threshold_int(thresholds.get("window"), "window", 1)
+    min_imp = _threshold_float(
+        thresholds.get("min_rel_improvement"), "min_rel_improvement", 0.0)
+    worsen = _threshold_float(
+        thresholds.get("worsen_rel_tolerance"), "worsen_rel_tolerance", 0.0)
+    gap_widen = _threshold_float(
+        thresholds.get("gap_widen_rel"), "gap_widen_rel", 0.0)
+    noise_z = _threshold_float(thresholds.get("noise_z"), "noise_z", 0.0)
 
     n_train_input = len(train_losses)
     n_val_input = len(val_losses)
