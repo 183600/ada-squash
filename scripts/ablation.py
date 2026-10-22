@@ -1760,6 +1760,25 @@ def _batches_of_seed(row, seed):
         return row['val_losses']
     return None
 
+def _row_n_seeds(row) -> int:
+    """Usable replication count of a row, deriving it from its per-seed means.
+
+    `n_seeds` can be absent or malformed on a hand-built/legacy aggregate
+    even though `per_seed` carries three pairable runs. Reporting that row as
+    a one-seed study while the paired test certifies it on three means is an
+    internal contradiction (and would show it in the "thin" warning).
+    """
+    if not isinstance(row, dict):
+        return 1
+    means = _seed_means(row)
+    if means:
+        return len(means)
+    declared = row.get('n_seeds')
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 0:
+        return declared
+    return 1
+
+
 def _row_std(row):
     """Across-seed std when replicated, within-run batch std otherwise.
 
@@ -1767,7 +1786,7 @@ def _row_std(row):
     generic `val_loss_std` when an older/cached aggregate only wrote that
     name, so the delta-vs-seed-noise scale check is not silently disabled.
     """
-    if row.get('n_seeds', 1) >= 2 and row.get('val_loss_seed_std') is not None:
+    if _row_n_seeds(row) >= 2 and row.get('val_loss_seed_std') is not None:
         return row.get('val_loss_seed_std')
     return row.get('val_loss_std')
 
@@ -1887,7 +1906,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         'reference_val_loss': reference['val_loss'],
         'reference_val_loss_std': _row_std(reference),
         'reference_val_loss_stderr': ref_stderr,
-        'reference_n_seeds': reference.get('n_seeds', 1),
+        'reference_n_seeds': _row_n_seeds(reference),
         'reference_seeds': sorted(ref_seeds),
         'reference_excluded_seeds': reference.get('excluded_seeds') or [],
         'reference_n_seeds_excluded': reference.get('n_seeds_excluded', 0),
@@ -1906,7 +1925,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         'point_estimate_best_baseline': {
             'name': point_best['name'],
             'val_loss': point_best['val_loss'],
-            'n_seeds': point_best.get('n_seeds', 1),
+            'n_seeds': _row_n_seeds(point_best),
             'seeds': sorted(_seed_means(point_best)),
         },
         'baseline_rows': {r['name']: r['val_loss'] for r in baselines},
@@ -1931,7 +1950,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'run_identity': _run_identity(row, parent_of),
             'val_loss': row['val_loss'],
             'val_loss_std': _row_std(row),
-            'n_seeds': row.get('n_seeds', 1),
+            'n_seeds': _row_n_seeds(row),
             'excluded_seeds': row.get('excluded_seeds') or [],
             'n_seeds_excluded': row.get('n_seeds_excluded', 0),
             'exclusion_status_by_seed': row.get('exclusion_status_by_seed'),
@@ -2082,7 +2101,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         f'Single-run batch-level tests are descriptive only ('
         f'{described_only}) and duplicates/aliases are counted once.'
     )
-    thin = {r['name'] for r in [reference, *baselines] if r.get('n_seeds', 1) < 3}
+    thin = {r['name'] for r in [reference, *baselines] if _row_n_seeds(r) < 3}
     out['rows_with_fewer_than_3_seeds'] = sorted(thin | {e['name'] for e in out['rows'] if e['n_seeds'] < 3})
     return out
 
@@ -2246,6 +2265,18 @@ def load_simple_baselines(path, args=None) -> dict | None:
     if not isinstance(tuned, dict) or not _finite_metric(tuned.get('mean_ce_nats')):
         print(f"[compare] WARNING: ignoring simple-baseline file {path}: missing tuned_count_baseline.mean_ce_nats")
         return None
+    ceiling = limits.get('full_context_nats')
+    if ceiling is not None and not _finite_metric(ceiling):
+        print(f"[compare] WARNING: ignoring simple-baseline file {path}: "
+              f"bayes_limits.full_context_nats is not finite")
+        return None
+    predictor = tuned.get('predictor')
+    if predictor is not None and not isinstance(predictor, str):
+        # The predictor is a dict key into each seed record; a list/dict would
+        # make `_count_seed_ce` raise on an unhashable lookup.
+        print(f"[compare] WARNING: ignoring simple-baseline file {path}: "
+              f"tuned_count_baseline.predictor is not a string")
+        return None
     if args is not None:
         mismatches = _simple_baseline_protocol_mismatches(data.get('protocol'), args)
         if mismatches:
@@ -2383,7 +2414,11 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
     for row_name in args.baselines:
         norm_name = (rows.get(row_name) or {}).get('norm_name')
         arm = arms.get(norm_name) if norm_name else None
-        best = (arm or {}).get('best') if isinstance(arm, dict) else None
+        # A malformed arm (list/string) is treated like a missing one; the
+        # guarded `best` read alone still left `.get` calls in the entry
+        # builder crashing on a truthy non-dict.
+        arm = arm if isinstance(arm, dict) else {}
+        best = arm.get('best')
         entry = {
             'row': row_name,
             'norm': norm_name,
@@ -2716,8 +2751,8 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 'full_val_loss_std': None if full is None else _row_std(full),
                 'reference_val_loss': None if ref is None else ref['val_loss'],
                 'reference_val_loss_std': None if ref is None else _row_std(ref),
-                'n_seeds_full': None if full is None else full.get('n_seeds', 1),
-                'n_seeds_reference': None if ref is None else ref.get('n_seeds', 1),
+                'n_seeds_full': None if full is None else _row_n_seeds(full),
+                'n_seeds_reference': None if ref is None else _row_n_seeds(ref),
                 'full_curve_classification_counts': None if full is None else full.get('curve_classification_counts'),
                 'reference_curve_classification_counts': None if ref is None else ref.get('curve_classification_counts'),
                 'run_identity_full': None if full is None else _run_identity(full, parent_of),
@@ -2851,7 +2886,7 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
             and p_holm is not None and p_holm < alpha
         )
     thin = sorted({name for entry in rows for name in (entry['full'], entry['reference_row'])
-                   if 1 <= usable.get(name, {}).get('n_seeds', 1) < 3})
+                   if 1 <= _row_n_seeds(usable.get(name, {})) < 3})
     tested_descriptively = [entry['mechanism'] for entry in rows
                             if entry['test'] is not None and not entry['replicated_across_seeds']]
     return {
@@ -3886,9 +3921,17 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     # be dropped changes the analysed sample, so it belongs in the same
     # fingerprint as the contrasts and the randomized schedule.
     exclusion_policy = normalize_exclusion_policy(exclusion_policy)
+    seeds = list(seeds or [])
+    if not all(_is_seed_id(seed) for seed in seeds):
+        raise ValueError(
+            f'analysis-plan seeds must be integer ids, got {seeds!r}')
+    normalized_seeds = [int(seed) for seed in seeds]
+    if len(set(normalized_seeds)) != len(normalized_seeds):
+        raise ValueError(
+            f'analysis-plan seeds must be unique, got {seeds!r}')
     payload = {
         'model': model_name,
-        'seeds': [int(seed) for seed in seeds],
+        'seeds': normalized_seeds,
         'alpha': float(alpha),
         'margin': float(margin),
         'equivalence_margin': float(equivalence_margin),

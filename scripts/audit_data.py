@@ -857,6 +857,15 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             _flush_tokens(text_batch, 'raw')
         if len(text_batch_effective) >= 256:
             _flush_tokens(text_batch_effective, 'effective')
+    # Reaching the cap does not by itself prove there is more stream: when
+    # the split reports exactly the number of documents read, the bounded
+    # audit has covered the whole split and its ledger is exhaustive. This
+    # recovers the old for-loop result without pulling an extra document.
+    nominal_count = report.get('count')
+    if (capped
+            and isinstance(nominal_count, int) and not isinstance(nominal_count, bool)
+            and documents_read == nominal_count):
+        capped = False
     _flush_tokens(text_batch, 'raw')
     _flush_tokens(text_batch_effective, 'effective')
     if count_bufs['raw'] is not None:

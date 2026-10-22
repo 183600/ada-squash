@@ -931,8 +931,10 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
         and agg['n_params_consistent']
         and agg['data_versions_complete']
         and agg['data_versions_consistent'])
-    agg['n_loss_spikes_total'] = sum(r['n_loss_spikes'] or 0 for r in results
-                                     if isinstance(r.get('n_loss_spikes'), (int, float)))
+    # Sum only measured finite events: a NaN spike count must not turn the
+    # cell's numerical-health total into NaN, and a bool is not an event.
+    agg['n_loss_spikes_total'] = sum(r['n_loss_spikes'] for r in results
+                                     if _moe_finite(r.get('n_loss_spikes')))
     # The pooled val_ce can hide that a seed was still over/underfitting at the
     # fixed step count. Surface the per-seed curve regimes next to the mean.
     agg['curve_classification_counts'] = dict(Counter(
@@ -1615,9 +1617,15 @@ def _expert_cv_per_block(tpe_list) -> torch.Tensor:
     if not any(t is not None for t in present):
         return torch.zeros(n)
     stacked = torch.cat([t for t in present if t is not None], dim=0)
-    std = (torch.zeros(stacked.size(0), dtype=stacked.dtype, device=stacked.device)
-           if stacked.size(-1) < 2 else stacked.std(dim=-1))
-    vals = std / (stacked.mean(dim=-1) + 1e-06)
+    # Integer expert counts cannot feed std/mean directly, and a block with
+    # fewer than two experts has no load spread: report zero CV (as the
+    # scalar `_expert_cv` does) instead of dividing an empty mean into NaN.
+    if stacked.size(-1) < 2:
+        vals = torch.zeros(stacked.size(0), dtype=torch.float32,
+                           device=stacked.device)
+    else:
+        stacked = stacked.to(torch.float32)
+        vals = stacked.std(dim=-1) / (stacked.mean(dim=-1) + 1e-06)
     if n == vals.numel():
         return vals
     out = torch.zeros(n, dtype=vals.dtype, device=vals.device)
