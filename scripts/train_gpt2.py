@@ -443,7 +443,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     # A previous non-finite hold must not be attributed to this pass.
     state.pop('nonfinite_batch', None)
     with torch.inference_mode():
-        for _ in range(max(1, int(n_batches))):
+        for _ in range(max(0, int(n_batches))):
             if it is None:
                 it = iter(loader)
                 state['iter'] = it
@@ -1049,6 +1049,8 @@ def main():
         ('--batch-size', args.batch_size, 1),
         ('--seq-len', args.seq_len, 1),
         ('--grad-accum', args.grad_accum, 1),
+        ('--val-batches', args.val_batches, 1),
+        ('--test-batches', args.test_batches, 1),
         ('--log-every', args.log_every, 1),
         ('--stats-every', args.stats_every, 1),
         ('--save-every', args.save_every, 1),
