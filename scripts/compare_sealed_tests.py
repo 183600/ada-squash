@@ -214,19 +214,22 @@ def _evaluated_checkpoint_step(results: dict):
         return final
     return None
 
-def _shape_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
+def _shape_mismatches(ref_manifest: dict, other_manifest: dict,
+                      compare_evaluated_step: bool = True) -> dict:
     a = ref_manifest.get("results") or {}
     b = other_manifest.get("results") or {}
     missing = "<missing>"
     out = {f"results.{key}": [a.get(key, missing), b.get(key, missing)]
            for key in ("n_layers", "dim", "n_heads", "final_step")
            if key not in a or key not in b or a.get(key) != b.get(key)}
-    ref_step = _evaluated_checkpoint_step(a)
-    other_step = _evaluated_checkpoint_step(b)
-    # Unknown is not equal: an old manifest that cannot say which checkpoint
-    # was scored cannot certify that the comparison used the same weights.
-    if ref_step is None or other_step is None or ref_step != other_step:
-        out["results.evaluated_checkpoint_step"] = [ref_step, other_step]
+    if compare_evaluated_step:
+        ref_step = _evaluated_checkpoint_step(a)
+        other_step = _evaluated_checkpoint_step(b)
+        # Unknown is not equal: an old manifest that cannot say which
+        # checkpoint was scored cannot certify that the comparison used the
+        # same weights.
+        if ref_step is None or other_step is None or ref_step != other_step:
+            out["results.evaluated_checkpoint_step"] = [ref_step, other_step]
     return out
 
 def _manifest_ledger_content(manifest: dict):
@@ -450,7 +453,14 @@ def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
             manifest = run["manifest"]
             mismatches = training_recipe_mismatches(
                 ref_manifest.get("hyperparameters"), manifest.get("hyperparameters"))
-            mismatches.update(_shape_mismatches(ref_manifest, manifest))
+            # The evaluated checkpoint step is a per-seed choice (early
+            # stopping / best-val selection): only the same-seed pair must
+            # agree on it. Requiring every cross-seed pair to match would
+            # reject a perfectly paired comparison just because seed 42
+            # stopped at step 100 while seed 43 stopped at 110.
+            mismatches.update(_shape_mismatches(
+                ref_manifest, manifest,
+                compare_evaluated_step=(run.get("seed") == ref_run.get("seed"))))
             if mismatches:
                 recipe_problems.append(
                     f"{ref_run['path']} vs {run['path']}: "
