@@ -990,12 +990,18 @@ def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
             # Missing provenance is not a synthetic run: it is an unauditable
             # one, so fail closed instead of treating every absent record as
             # "no external snapshot to pin".
-            if not isinstance(provenance, dict):
+            if not isinstance(provenance, dict) or 'dataset' not in provenance:
                 unknown.append((norm, seed))
                 continue
             dataset = provenance.get('dataset')
-            if not dataset:
+            if dataset is None:
+                # The runner's synthetic path records an explicit
+                # ``dataset: None`` entry. An empty/partial provenance dict is
+                # not that: it never said which corpus it used.
                 has_synthetic = True
+                continue
+            if not isinstance(dataset, str) or not dataset.strip():
+                unknown.append((norm, seed))
                 continue
             has_real = True
             versions = {
@@ -1084,6 +1090,10 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
             ref_values = [reference_by_seed[seed] for seed in common]
             ref_protocol = protocols.get(reference)
             cand_protocol = protocols.get(norm)
+            protocol_complete = (
+                isinstance(ref_protocol, dict) and isinstance(cand_protocol, dict)
+                and all(key in ref_protocol for key in _MOE_PROTOCOL_KEYS)
+                and all(key in cand_protocol for key in _MOE_PROTOCOL_KEYS))
             if not isinstance(ref_protocol, dict) or not isinstance(cand_protocol, dict):
                 # A missing protocol is unknown, not equal: without both
                 # recorded recipes the pair cannot be certified as a clean
@@ -1092,22 +1102,32 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                     'reference': ref_protocol if isinstance(ref_protocol, dict) else None,
                     'candidate': cand_protocol if isinstance(cand_protocol, dict) else None,
                 }}
+            elif not protocol_complete:
+                # A partial protocol dict is unknown too: `.get()` would make
+                # every absent key compare equal to the other side's absent
+                # key, and an all-None shape would look like a shared scale.
+                mismatches = {'protocol_incomplete': {
+                    'missing_reference': [key for key in _MOE_PROTOCOL_KEYS
+                                          if key not in ref_protocol],
+                    'missing_candidate': [key for key in _MOE_PROTOCOL_KEYS
+                                          if key not in cand_protocol],
+                }}
             else:
                 mismatches = {
                     key: {'reference': ref_protocol.get(key),
                           'candidate': cand_protocol.get(key)}
                     for key in _MOE_PROTOCOL_KEYS
                     if ref_protocol.get(key) != cand_protocol.get(key)}
-            shape_only_mismatch = bool(mismatches) and set(mismatches) <= _MOE_SHAPE_KEYS
+            shape_only_mismatch = (bool(mismatches) and protocol_complete
+                                   and set(mismatches) <= _MOE_SHAPE_KEYS)
             a_shape = {key: (cand_protocol or {}).get(key) for key in _MOE_SHAPE_KEYS}
             b_shape = {key: (ref_protocol or {}).get(key) for key in _MOE_SHAPE_KEYS}
             # Scale identity is decided by the shape fields alone. A pair can
             # differ in both shape and a non-shape recipe field; that must not
             # be labelled same-scale merely because the mismatch set is not
-            # shape-only. Missing protocols are not evidence of a shared scale.
-            same_scale = (isinstance(ref_protocol, dict)
-                          and isinstance(cand_protocol, dict)
-                          and a_shape == b_shape)
+            # shape-only. Missing/incomplete protocols are not evidence of a
+            # shared scale.
+            same_scale = protocol_complete and a_shape == b_shape
             entry = {
                 'name': f'{norm} vs {reference}',
                 'norm': norm,
