@@ -183,13 +183,36 @@ def _sealed_result_problem(run: dict) -> str | None:
                 return "test_results.json size disagrees with the manifest fingerprint"
     return None
 
+def _evaluated_checkpoint_step(results: dict):
+    """Step of the weights the sealed test actually scored, when recorded.
+
+    `train_gpt2.py` restores `ckpt_best.pt` (the best-validation checkpoint)
+    before the one-shot test, falling back to the final weights only when no
+    best checkpoint exists. Comparing `final_step` alone therefore checks the
+    training length, not the weights that produced the test loss.
+    """
+    best = results.get("best_val_step")
+    if isinstance(best, int) and not isinstance(best, bool) and best > 0:
+        return best
+    final = results.get("final_step")
+    if isinstance(final, int) and not isinstance(final, bool) and final > 0:
+        return final
+    return None
+
 def _shape_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     a = ref_manifest.get("results") or {}
     b = other_manifest.get("results") or {}
     missing = "<missing>"
-    return {f"results.{key}": [a.get(key, missing), b.get(key, missing)]
-            for key in ("n_layers", "dim", "n_heads", "final_step")
-            if key not in a or key not in b or a.get(key) != b.get(key)}
+    out = {f"results.{key}": [a.get(key, missing), b.get(key, missing)]
+           for key in ("n_layers", "dim", "n_heads", "final_step")
+           if key not in a or key not in b or a.get(key) != b.get(key)}
+    ref_step = _evaluated_checkpoint_step(a)
+    other_step = _evaluated_checkpoint_step(b)
+    # Unknown is not equal: an old manifest that cannot say which checkpoint
+    # was scored cannot certify that the comparison used the same weights.
+    if ref_step is None or other_step is None or ref_step != other_step:
+        out["results.evaluated_checkpoint_step"] = [ref_step, other_step]
+    return out
 
 def _manifest_ledger_content(manifest: dict):
     missing = "<missing>"
