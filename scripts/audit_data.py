@@ -1199,6 +1199,9 @@ def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
         requested_batches, "requested_batches", 1)
     val_every = _strict_int_option(val_every, "val_every", 0)
     max_steps = _strict_int_option(max_steps, "max_steps", 0)
+    if capacity is not None and not isinstance(capacity, dict):
+        raise ValueError(
+            f"capacity must be a mapping or None, got {type(capacity).__name__}")
     capacity = capacity or {}
     unique = capacity.get('unique_batches')
     if unique is not None:
