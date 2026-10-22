@@ -283,9 +283,9 @@ def _ledger_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
                 or not _ledger_verified(b[key]))}
 
 def _pinned_revision(value) -> bool:
-    """Whether a resolved dataset/tokenizer revision names a concrete commit."""
+    """Whether a resolved dataset/tokenizer revision is a full 40-hex commit."""
     text = str(value or "")
-    return (7 <= len(text) <= 40
+    return (len(text) == 40
             and all(ch in "0123456789abcdefABCDEF" for ch in text))
 
 def pairing_mismatches(ref: dict, other: dict) -> dict:
