@@ -829,6 +829,15 @@ def check_factorial(rows: dict, model_name: str, spec: dict | None=None) -> dict
         for factor, info in design['factors'].items():
             declared = set(info['diff'])
             clean = True
+            # A 2x2 factor must be switched in both arms of the other factor;
+            # one/no pair is not a factorial contrast (and leaves the
+            # comparison's main-effect mean over an empty list).
+            if len(info['pairs']) != 2:
+                problems.append(
+                    f"factorial '{design_name}', factor '{factor}': expected "
+                    f"exactly 2 on/off pairs, got {len(info['pairs'])}")
+                clean = False
+                continue
             for off_cell, on_cell in info['pairs']:
                 off_cfg, on_cfg = cfgs[off_cell], cfgs[on_cell]
                 actual = {key for key in off_cfg if off_cfg[key] != on_cfg[key]}
@@ -1773,6 +1782,12 @@ def _row_n_seeds(row) -> int:
     means = _seed_means(row)
     if means:
         return len(means)
+    # If the row *has* per-seed/seed data but none of it is pairable (a
+    # duplicate seed, malformed id, or no finite loss), the declared count
+    # cannot turn it into replication; report 0 rather than trusting it.
+    if (isinstance(row.get('per_seed'), list)
+            or isinstance(row.get('seeds'), list)):
+        return 0
     declared = row.get('n_seeds')
     if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 0:
         return declared
@@ -1831,6 +1846,7 @@ def _paired_row_test(row: dict, reference: dict, margin: float=0.0,
             test = welch_t_one_sided(row_batches, ref_batches, margin=margin,
                                      alpha=alpha)
             return test, f'val_batches_single_seed{seed}_unpaired', common
+        return (None, f'single_seed_batches_insufficient{seed}', common)
     basis = 'no_shared_seeds' if (row_seeds and ref_seeds) else 'insufficient_seeds'
     return None, basis, common
 
@@ -2539,6 +2555,7 @@ def _count_seed_ce(records: list, predictor: str | None) -> dict:
     out = {}
     if not predictor:
         return out
+    seen: set[int] = set()
     for record in records or []:
         if not isinstance(record, dict):
             continue
@@ -2549,9 +2566,20 @@ def _count_seed_ce(records: list, predictor: str | None) -> dict:
         # entry after coercion).
         if not _is_seed_id(seed):
             continue
-        value = (record.get('predictors') or {}).get(predictor)
+        seed = int(seed)
+        if seed in seen:
+            # Two records for one seed are the same run; returning a partial
+            # set would understate the pairing denominator.
+            return {}
+        seen.add(seed)
+        predictors = record.get('predictors')
+        if predictors is None:
+            predictors = {}
+        if not isinstance(predictors, dict):
+            continue
+        value = predictors.get(predictor)
         if _finite_metric(value):
-            out[int(seed)] = float(value)
+            out[seed] = float(value)
     return out
 
 
@@ -3186,8 +3214,13 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
             continue
         effects = {}
         for factor in factor_names:
+            pairs = design['factors'][factor].get('pairs') or ()
+            if len(pairs) != 2:
+                raise ValueError(
+                    f"factorial '{design_name}', factor '{factor}': expected "
+                    f"exactly 2 on/off pairs, got {len(pairs)}")
             arm_values = {}
-            for off_cell, on_cell in design['factors'][factor]['pairs']:
+            for off_cell, on_cell in pairs:
                 arm_values[f'{off_cell}->{on_cell}'] = [
                     seed_values[on_cell][seed] - seed_values[off_cell][seed]
                     for seed in common

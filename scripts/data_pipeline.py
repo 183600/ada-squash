@@ -168,6 +168,10 @@ def _fraction_option(name: str, value) -> float:
         converted = float(value)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f"data option {name} must be a fraction, got {value!r}") from None
+    if converted != value:
+        # A quoted/numeric-string fraction is a config error, not a number;
+        # `float("0.5")` used to silently change the split protocol.
+        raise ValueError(f"data option {name} must be a fraction, got {value!r}")
     if not math.isfinite(converted) or not 0.0 <= converted < 1.0:
         raise ValueError(f"data option {name}={converted} must be finite and in [0, 1)")
     return converted
@@ -280,7 +284,8 @@ def infer_num_documents(ds) -> int | None:
     n = getattr(split_info, "num_examples", None) if split_info is not None else None
     # bool is an int subclass; True must not become a one-document stream and
     # silently place the held-out boundary at the wrong place.
-    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+    return (int(n) if isinstance(n, numbers.Integral)
+            and not isinstance(n, bool) and n > 0 else None)
 
 
 _REVISION_CACHE: dict = {}
@@ -690,9 +695,19 @@ class DocumentCleaner:
             self.stats["dropped_unreadable"] += 1
             return None
         text = example.get("text")
-        if text is None or (isinstance(text, float) and math.isnan(text)):
+        if text is None:
             self.stats["dropped_missing_text"] += 1
             return None
+        if isinstance(text, numbers.Real) and not isinstance(text, bool):
+            # A huge int/Fraction has no finite float image; it is simply a
+            # non-string document, not a reason to crash the cleaner.
+            try:
+                is_nan = math.isnan(float(text))
+            except (TypeError, ValueError, OverflowError):
+                is_nan = False
+            if is_nan:
+                self.stats["dropped_missing_text"] += 1
+                return None
         if not isinstance(text, str):
             self.stats["dropped_non_string_text"] += 1
             return None
@@ -789,7 +804,10 @@ class PackedStream(IterableDataset):
                 "the end-of-document separator is appended between documents")
         self.cleaner = cleaner if cleaner is not None else DocumentCleaner()
         self.shuffle_buffer = _int_option("shuffle_buffer", shuffle_buffer or 0, 0)
-        self.seed = int(seed)
+        self.seed = _int_option("seed", seed, -(2 ** 63))
+        if self.seed >= 2 ** 64:
+            raise ValueError(
+                f"PackedStream seed={self.seed} must be < {2 ** 64}")
         # A one-dimensional long tensor plus integer offsets. The tokenizer
         # returns Python ints, so the tensor is filled by copying small
         # per-document chunks; windows are cloned out of it.
@@ -886,7 +904,7 @@ class PackedStream(IterableDataset):
             eos = self.tok.eos_token_id
             flat_ids: list = []
             for ids in token_lists:
-                if not ids:
+                if len(ids) == 0:
                     continue
                 flat_ids.extend(ids)
                 flat_ids.append(eos)

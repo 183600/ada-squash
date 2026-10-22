@@ -229,10 +229,11 @@ def near_duplicate_record(ids, shingle_size: int = 8,
                 raise ValueError(
                     "canonical_digest must be bytes or a hex string, got "
                     f"{canonical_digest!r}") from None
-        if not isinstance(canonical_digest, (bytes, bytearray)) or not canonical_digest:
+        if (not isinstance(canonical_digest, (bytes, bytearray))
+                or len(canonical_digest) != 16):
             raise ValueError(
-                "canonical_digest must be non-empty bytes or a hex string, got "
-                f"{canonical_digest!r}")
+                "canonical_digest must be the 16-byte blake2b digest that "
+                f"DocumentCleaner looks up, got {canonical_digest!r}")
         record["canonical_digest"] = bytes(canonical_digest).hex()
     return record
 
@@ -283,6 +284,14 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
             f"near-duplicate margin must be in [0, 1), got {margin!r}") from None
     if not (math.isfinite(margin) and 0.0 <= margin < 1.0):
         raise ValueError(f"near-duplicate margin must be in [0, 1), got {margin}")
+    shingle_size = _strict_int_option(shingle_size, "shingle_size", 1)
+    max_examples = _strict_int_option(max_examples, "max_examples", 0)
+    if (exhaustive_by_split is not None
+            and not isinstance(exhaustive_by_split, dict)):
+        raise ValueError("exhaustive_by_split must be a mapping or None")
+    if (truncated_by_split is not None
+            and not isinstance(truncated_by_split, dict)):
+        raise ValueError("truncated_by_split must be a mapping or None")
     screening = max(0.0, float(threshold) - margin)
     ordered = [name for name in ("train", "validation", "test")
                if records_by_split.get(name)]
@@ -627,19 +636,25 @@ def near_duplicate_ledger_additions(report: dict) -> dict:
         raise ValueError(f"report must be a mapping, got {type(report).__name__}")
     additions = {"train": set(), "validation": set()}
     by_later = report.get("by_later_split")
-    missing = (sum(int(block.get("missing_digest_documents") or 0)
-                   for block in by_later.values() if isinstance(block, dict))
-               if isinstance(by_later, dict) else 0)
     pairs = report.get("pairs")
+    by_later_blocks = ([block for block in by_later.values()
+                        if isinstance(block, dict)]
+                       if isinstance(by_later, dict) else [])
+    missing = sum(int(block.get("missing_digest_documents") or 0)
+                  for block in by_later_blocks)
     if not isinstance(pairs, dict):
         return {"hashes": additions, "missing_digest_documents": missing}
-    # A pair-only report (or one whose by_later block omits the missing
-    # count) still knows how many flagged documents lacked a digest. Taking
-    # the maximum avoids undercounting when only one of the two views carries
-    # the field, without double-counting a document listed in both.
+    # `by_later_split` is the deduplicated union over earlier splits, but a
+    # partial block may omit the field. In that case fall back to the
+    # pair-level counts rather than adding them on top of an already-union
+    # count (the same held-out document can be flagged by both train and
+    # validation).
     pair_missing = sum(int(pair.get("flagged_later_missing_digest") or 0)
                        for pair in pairs.values() if isinstance(pair, dict))
-    missing = max(missing, pair_missing)
+    blocks_complete = bool(by_later_blocks) and all(
+        "missing_digest_documents" in block for block in by_later_blocks)
+    if not blocks_complete:
+        missing = pair_missing
     for pair in pairs.values():
         if not isinstance(pair, dict):
             continue
@@ -699,10 +714,11 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         if near_dup_docs_seen > int(near_dup_max_docs):
             near_dup_truncated = True
             return
-        if not ids:
+        if len(ids) == 0:
             # A tokenizer that emits no tokens for a document leaves no
             # shingle to compare; an all-max signature would make every such
-            # document look identical to every other one.
+            # document look identical to every other one. Use len(), not
+            # truthiness: a NumPy/torch row is not a bool.
             return
         record = near_duplicate_record(
             ids, near_dup_shingle, near_dup_max_shingles,
@@ -730,7 +746,11 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     group_overlap_extra_groups: set = set()
     group_value_missing = 0
     tokenizer_error_docs: set = set()
-    vocab_size = int(getattr(tokenizer, 'vocab_size', 0) or 0)
+    raw_vocab = getattr(tokenizer, 'vocab_size', 0)
+    try:
+        vocab_size = int(raw_vocab or 0)
+    except (TypeError, ValueError, OverflowError):
+        vocab_size = 0
 
     def _add_ids(ids, which='raw') -> None:
         try:
@@ -954,7 +974,9 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         stats['tokens_total_effective'] / effective_documents
         if effective_documents else None)
     stats['tokenizer_errors'] = len(tokenizer_error_docs)
-    vocab_limit = getattr(tokenizer, 'vocab_size', 2 ** 31)
+    # Use the normalized count from above; a tokenizer whose `vocab_size` is
+    # None must not crash the range check with `t < None`.
+    vocab_limit = vocab_size or 2 ** 31
     stats['token_ids_out_of_range'] = sum(c for t, c in tokens.items() if not 0 <= t < vocab_limit)
     stats['token_ids_out_of_range_effective'] = sum(
         c for t, c in tokens_effective.items() if not 0 <= t < vocab_limit)
@@ -1039,6 +1061,15 @@ def split_token_budget(stats: dict, report: dict) -> dict:
     }
     if sampled <= 0 or effective_documents <= 0 or tokens <= 0:
         return result
+    if effective_documents > sampled:
+        raise ValueError(
+            f"effective_documents_kept={effective_documents} exceeds "
+            f"documents_sampled={sampled}; a kept subset cannot be larger than "
+            "the documents read")
+    if nominal is not None and sampled > nominal:
+        raise ValueError(
+            f"documents_sampled={sampled} exceeds the nominal split size "
+            f"{nominal}; a sampled prefix cannot be longer than its split")
     mean_tokens = tokens / effective_documents
     result['tokens_per_effective_document'] = mean_tokens
     if result['exhaustive']:
@@ -1095,7 +1126,11 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
         'wrap_expected': None,
         'coverage_ratio': None,
     }
-    if scheduled > 0 and estimated is not None:
+    # A `sampled_only` budget is a lower bound on a train split whose nominal
+    # size is unknown; it cannot prove that the schedule exceeds the stream,
+    # so leave the wrap verdict unknown instead of aborting a legitimate run.
+    if (scheduled > 0 and estimated is not None
+            and result['basis'] != 'sampled_only'):
         result['coverage_ratio'] = estimated / scheduled
         result['wrap_expected'] = estimated < scheduled
     return result

@@ -80,6 +80,11 @@ class MoELayer(nn.Module):
         scores.div_(scores.sum(dim=-1, keepdim=True).clamp_min(1e-09))
         n_tokens = x_flat.shape[0]
         n_experts = self.n_experts
+        if n_tokens == 0:
+            # Empty batch: the routing fractions and mean gate are undefined;
+            # return the (empty) hidden state with a zero auxiliary loss
+            # instead of producing a NaN training signal.
+            return (x, x.new_zeros(()), x.new_zeros(n_experts))
         k = self.top_k
         flat_expert = indices.reshape(-1)
         key = (n_tokens, k, x.device)
@@ -812,7 +817,14 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
         return (isinstance(value, (int, float)) and not isinstance(value, bool)
                 and math.isfinite(value))
 
-    agg = {'seeds': [int(s) for s in seeds], 'n_seeds': len(results), 'per_seed': results}
+    seed_values = list(seeds)
+    requested_seed_ids = [_moe_seed_id(seed) for seed in seed_values]
+    if any(seed is None for seed in requested_seed_ids):
+        raise ValueError(f'requested seeds must be integer ids, got {seed_values!r}')
+    if len(set(requested_seed_ids)) != len(requested_seed_ids):
+        raise ValueError(f'requested seeds must be unique, got {seed_values!r}')
+    agg = {'seeds': requested_seed_ids, 'n_seeds': len(results),
+           'per_seed': results}
     provenance_by_seed = {}
     for result in results:
         seed = _moe_seed_id(result.get('seed'))
@@ -1183,12 +1195,23 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                                    and set(mismatches) <= _MOE_SHAPE_KEYS)
             a_shape = {key: (cand_protocol or {}).get(key) for key in _MOE_SHAPE_KEYS}
             b_shape = {key: (ref_protocol or {}).get(key) for key in _MOE_SHAPE_KEYS}
+            # Values, not just keys, must identify a concrete architecture:
+            # two protocols whose shape fields are all None are unknown, not
+            # a shared scale.
+            def _shape_known(shape: dict) -> bool:
+                return all(
+                    isinstance(shape.get(key), int)
+                    and not isinstance(shape.get(key), bool)
+                    and shape.get(key) > 0
+                    for key in _MOE_SHAPE_KEYS)
+
+            shape_known = _shape_known(a_shape) and _shape_known(b_shape)
             # Scale identity is decided by the shape fields alone. A pair can
             # differ in both shape and a non-shape recipe field; that must not
             # be labelled same-scale merely because the mismatch set is not
             # shape-only. Missing/incomplete protocols are not evidence of a
             # shared scale.
-            same_scale = protocol_complete and a_shape == b_shape
+            same_scale = protocol_complete and shape_known and a_shape == b_shape
             entry = {
                 'name': f'{norm} vs {reference}',
                 'norm': norm,
@@ -1269,6 +1292,8 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
             entry['test_basis'] = ('per-seed paired t' if len(common) >= 2
                                    else f'described only: {len(common)} shared seed(s)')
             reasons = []
+            if not shape_known:
+                reasons.append('model shape is unknown/malformed, so the scale is not verifiable')
             if mismatches:
                 if shape_only_mismatch:
                     entry['test_basis'] = 'cross_scale'
@@ -1605,7 +1630,8 @@ def main():
 def _expert_cv(tpe) -> float:
     if not isinstance(tpe, torch.Tensor) or tpe.numel() < 2:
         return 0.0
-    return (tpe.std() / (tpe.mean() + 1e-06)).item()
+    counts = tpe.to(torch.float32)
+    return (counts.std() / (counts.mean() + 1e-06)).item()
 
 def _expert_cv_per_block(tpe_list) -> torch.Tensor:
     """Per-block routed-load CVs as a device tensor.
@@ -1613,7 +1639,12 @@ def _expert_cv_per_block(tpe_list) -> torch.Tensor:
     The host materialization happens when the run history is written.
     """
     n = len(tpe_list)
-    present = [t.detach().reshape(1, -1) if isinstance(t, torch.Tensor) else None for t in tpe_list]
+    # An empty block has no expert counts; treat it like an absent block so
+    # it does not make `torch.cat` fail against a non-empty sibling, and
+    # report its CV as zero below.
+    present = [t.detach().reshape(1, -1)
+               if isinstance(t, torch.Tensor) and t.numel() > 0 else None
+               for t in tpe_list]
     if not any(t is not None for t in present):
         return torch.zeros(n)
     stacked = torch.cat([t for t in present if t is not None], dim=0)
