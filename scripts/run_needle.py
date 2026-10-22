@@ -479,7 +479,9 @@ def main():
         'trials': args.trials,
         'placement_seeds': list(seeds),
         'ctx_lens_requested': requested_ctx_lens,
-        'ctx_lens_evaluated': list(args.ctx_lens),
+        # Only lengths that actually produced a result; skipped lengths are
+        # listed separately and must not look measured in the evaluated set.
+        'ctx_lens_evaluated': [r['ctx_len'] for r in results],
         'runs': results,
         'skipped': skipped,
         'ci_note': ('ci95_low/high are the cross-seed t interval when >= 2 placement seeds are run '
