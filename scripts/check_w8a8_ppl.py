@@ -17,6 +17,7 @@ from adasquash.repro import (TRAINING_RECIPE_KEYS, collect_run_metadata, file_fi
                              finish_metadata, save_run_manifest, set_all_seeds,
                              training_recipe_mismatches)
 from scripts.eval_downstream import load_ckpt
+from scripts.data_pipeline import _is_pinned_revision
 DEFAULT_SEEDS = (42, 43, 44)
 # One probe draw is one sample: the PPL drop is aggregated as Mean +/- Std
 # over the `--seeds` probe replications, with the per-seed records kept so a
@@ -396,7 +397,13 @@ def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
     for key in ('dataset_revision_resolved', 'tokenizer_revision_resolved'):
         value_a = revisions_a.get(key, a.get(key))
         value_b = revisions_b.get(key, b.get(key))
-        if value_a != value_b:
+        # Two unknown revisions are not two equal revisions. Require concrete
+        # pinned commits so a pair probed after the mutable default branch
+        # moved (or while the Hub was unreachable) cannot certify as one
+        # data/tokenizer snapshot.
+        if (not _is_pinned_revision(value_a)
+                or not _is_pinned_revision(value_b)
+                or value_a != value_b):
             out[f'data.{key}'] = [value_a, value_b]
     shape_a = a.get('shape') or {}
     shape_b = b.get('shape') or {}

@@ -18,6 +18,7 @@ from adasquash.repro import (TRAINING_RECIPE_KEYS, collect_run_metadata, file_fi
                              finish_metadata, save_run_manifest, set_all_seeds,
                              training_recipe_mismatches)
 from adasquash.utils import KurtosisMeter, markov_batch
+from scripts.data_pipeline import _is_pinned_revision
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
 # The FP8 probe must not certify a mechanism from one architecture. These are
@@ -514,7 +515,13 @@ def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
     for key in ('dataset_revision_resolved', 'tokenizer_revision_resolved'):
         value_a = revisions_a.get(key, a.get(key))
         value_b = revisions_b.get(key, b.get(key))
-        if value_a != value_b:
+        # Equal is not provenance: two runs on the mutable default branch can
+        # both record None when the Hub was unreachable. Only two identical
+        # concrete commits prove the checkpoints share one data/tokenizer
+        # snapshot; unknown/mismatched revisions cannot certify a norm delta.
+        if (not _is_pinned_revision(value_a)
+                or not _is_pinned_revision(value_b)
+                or value_a != value_b):
             out[f'data.{key}'] = [value_a, value_b]
     shape_a = a.get('shape') or {}
     shape_b = b.get('shape') or {}
