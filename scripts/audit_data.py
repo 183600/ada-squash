@@ -759,6 +759,13 @@ def main():
                 f"{label} distribution shift TVD={value:.4f} after the cross-split "
                 f"ledgers > {flag}={cap}; the effective held-out distribution is the "
                 "one the model is actually selected and reported on")
+    # The report itself must carry the verdict. It was written before the
+    # leakage/sanity checks ran, so a failed audit's data_audit.json used to
+    # look like a clean report with no problems while only the separate
+    # manifest said "failed". Rewrite it now that the complete list exists.
+    out['problems'] = problems
+    out['status'] = 'failed' if problems else 'finished'
+    Path(args.output).write_text(json.dumps(out, indent=2, default=str))
     manifest = {
         'run_metadata': out['run_metadata'],
         'hypothesis': args.hypothesis,
