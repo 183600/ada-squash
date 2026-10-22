@@ -222,9 +222,11 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     stats = cleaner.report()
     # Count every document read from the stream, including dropped ones.
     stats['documents_sampled'] = int(stats.get('documents_read', len(lengths)))
-    if effective_cleaner.report().get('dedup_cap_reached'):
-        # The effective split is the one whose dedup guarantee matters.
-        stats['dedup_cap_reached'] = 1
+    # The effective split is the one whose dedup guarantee matters. Mirror its
+    # cap state explicitly: the raw cleaner may have hit its cap while the
+    # effective cleaner (the split actually consumed) did not.
+    stats['dedup_cap_reached'] = int(bool(
+        effective_cleaner.report().get('dedup_cap_reached')))
     # Whether the counters cover the whole split or only a prefix. A stream
     # that ends naturally before --n-docs is fully read even though n_docs is
     # nonzero, so the cap is tracked by whether the loop actually broke. With
@@ -437,12 +439,12 @@ def main():
             f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
             f'{args.max_doc_chars}; no document could pass the cleaner')
     for flag, value in (('--val-frac', args.val_frac), ('--test-frac', args.test_frac)):
-        if not math.isfinite(value) or value < 0.0:
-            raise SystemExit(f'{flag} {value} must be finite and >= 0')
-    if args.val_frac + args.test_frac > 1.0:
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            raise SystemExit(f'{flag} {value} must be finite and in [0, 1)')
+    if args.val_frac + args.test_frac >= 1.0:
         raise SystemExit(
-            f'--val-frac {args.val_frac} + --test-frac {args.test_frac} exceeds 1.0; '
-            'the splits would overlap instead of tiling the stream')
+            f'--val-frac {args.val_frac} + --test-frac {args.test_frac} leaves no '
+            'training stream; the split fractions must sum to less than 1')
     for flag, value in (('--max-tvd', args.max_tvd),
                         ('--max-test-tvd', args.max_test_tvd),
                         ('--max-val-test-tvd', args.max_val_test_tvd)):
@@ -690,7 +692,11 @@ def main():
     sampled_short = []
     for name, stats in splits.items():
         report_count = (reports.get(name) or {}).get('count')
+        # A bounded `--n-docs` sample is an intentional prefix, not a stream
+        # that ended early: only a naturally exhausted stream that is shorter
+        # than the nominal split size makes the audit non-exhaustive.
         if (isinstance(report_count, int) and not isinstance(report_count, bool)
+                and stats.get('exhaustive', True)
                 and stats.get('documents_sampled', 0) < report_count):
             sampled_short.append(
                 f"{name}: sampled {stats.get('documents_sampled')} of {report_count}")
