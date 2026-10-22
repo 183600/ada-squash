@@ -209,6 +209,12 @@ def validate_data_options(options: dict | None = None) -> dict:
             f"max_doc_chars={opts['max_doc_chars']}; no document could pass the cleaner")
     opts["shuffle_buffer"] = _int_option("shuffle_buffer", opts.get("shuffle_buffer"), 0)
     opts["seed"] = _int_option("seed", opts.get("seed"), -(2 ** 63))
+    if opts["seed"] >= 2 ** 64:
+        # torch.Generator.manual_seed accepts the unsigned 64-bit range but
+        # raises on 2**64; validating here turns a late loader crash into a
+        # configuration error.
+        raise ValueError(
+            f"data option seed={opts['seed']} must be < {2 ** 64}")
     opts["num_workers"] = _int_option("num_workers", opts.get("num_workers"), 0)
     opts["prefetch_factor"] = _int_option("prefetch_factor", opts.get("prefetch_factor"), 1)
     opts["persistent_workers"] = _bool_option(
@@ -578,6 +584,25 @@ def load_hash_file(path) -> set:
     (what the writer emits) is read incrementally; the JSON-list form (which
     must be parsed in one piece) is accepted as well.
     """
+    def _digest(token) -> bytes:
+        """Decode one ledger digest, rejecting malformed/wrong-length entries.
+
+        `DocumentCleaner` looks up 16-byte blake2b digests. A ledger with a
+        different digest width (or a non-hex line) would silently match
+        nothing, making the run claim a cross-split exclusion it never
+        applied; fail closed instead.
+        """
+        try:
+            raw = bytes.fromhex(str(token).strip())
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"hash ledger {path} contains a non-hex digest {token!r}") from None
+        if len(raw) != 16:
+            raise ValueError(
+                f"hash ledger {path} contains a {len(raw)}-byte digest {token!r}; "
+                "expected the 16-byte digest written by scripts/audit_data.py")
+        return raw
+
     out: set = set()
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -587,11 +612,13 @@ def load_hash_file(path) -> set:
             if stripped[0] == "[":
                 f.seek(0)
                 entries = json.loads(f.read())
-                if isinstance(entries, list):
-                    out.update(bytes.fromhex(str(entry).strip()) for entry in entries)
+                if not isinstance(entries, list):
+                    raise ValueError(
+                        f"hash ledger {path} is a JSON object, not a list of digests")
+                out.update(_digest(entry) for entry in entries)
                 return out
             for token in line.split():
-                out.add(bytes.fromhex(token))
+                out.add(_digest(token))
     return out
 
 

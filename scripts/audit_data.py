@@ -600,7 +600,12 @@ def near_duplicate_scan_bound(report: dict, *, confidence: float = 0.95,
         "method": "wilson_score_upper_bound",
         "scope": scope,
         "exhaustive": exhaustive,
-        "certifies_population": bool(exhaustive and bounds),
+        # An empty split computes no upper bound, so it cannot certify a
+        # population rate even though the scan was exhaustive.
+        "certifies_population": bool(
+            exhaustive and bounds
+            and all(block["upper_bound"] is not None
+                    for block in bounds.values())),
         "max_rate": max_rate,
         "by_later_split": bounds,
         "problems": problems,
@@ -730,7 +735,10 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     def _add_ids(ids, which='raw') -> None:
         try:
             arr = np.asarray(ids, dtype=np.int64)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # A token id above int64 is still a token id: count it through
+            # Python's arbitrary-precision Counter so the out-of-range check
+            # can report it instead of aborting the whole audit.
             legacy_bufs[which].update(ids)
             return
         if arr.size == 0:
@@ -785,12 +793,20 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
 
     capped = False
     documents_read = 0
-    for example in stream:
+    stream_iter = iter(stream)
+    while True:
         # `--n-docs` bounds documents *sampled* (read), not documents kept:
         # otherwise a split with many filtered documents would silently read
         # far past the requested sample and claim a prefix it did not use.
+        # Check the cap before pulling the next upstream example, so a bounded
+        # audit never decodes/downloads one extra document just to discover
+        # that the sample is complete.
         if n_docs and documents_read >= n_docs:
             capped = True
+            break
+        try:
+            example = next(stream_iter)
+        except StopIteration:
             break
         documents_read += 1
         doc_index = documents_read - 1
@@ -999,7 +1015,8 @@ def split_token_budget(stats: dict, report: dict) -> dict:
     tokens = _strict_int_option(
         stats.get('tokens_total_effective') or 0, 'tokens_total_effective', 0)
     nominal = report.get('count')
-    nominal = int(nominal) if isinstance(nominal, int) and not isinstance(nominal, bool) else None
+    if nominal is not None:
+        nominal = _strict_int_option(nominal, 'nominal_documents', 0)
     result = {
         'nominal_documents': nominal,
         'documents_sampled': sampled,
@@ -1044,6 +1061,9 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
     """
     scheduled = (0 if scheduled_tokens is None else
                  _strict_int_option(scheduled_tokens, "scheduled_tokens", 0))
+    if budget is not None and not isinstance(budget, dict):
+        raise ValueError(
+            f"budget must be a mapping or None, got {type(budget).__name__}")
     estimated = None if budget is None else budget.get('estimated_effective_tokens')
     if estimated is not None:
         if _is_boolean_scalar(estimated):
@@ -1307,7 +1327,8 @@ def _chronology_problems(reports: dict) -> list:
             start, count = report.get('start'), report.get('count')
             # Older disabled-split reports may omit the implicit train start
             # entirely; accept that legacy shape but not a false/negative one.
-            if (count is None
+            if (names[0] == 'train'
+                    and count is None
                     and (start is None
                          or (isinstance(start, int) and not isinstance(start, bool)
                              and start == 0))):
