@@ -66,6 +66,13 @@ def to_fp8_e4m3(x: torch.Tensor, axis: int=-1, inplace: bool=False) -> torch.Ten
 def to_fp8_e5m2(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
     return simulate_fp8(x, max_val=57344.0, exp_bits=5, mantissa_bits=2, inplace=inplace)
 
+# The quantizer identity travels with the callable so range diagnostics can ask
+# which format/scaling was actually applied instead of assuming e4m3.
+to_fp8_e4m3.max_val = 448.0
+to_fp8_e4m3.scaling = 'none'
+to_fp8_e5m2.max_val = 57344.0
+to_fp8_e5m2.scaling = 'none'
+
 def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
     """Return a quantizer with the requested format and scaling recipe.
 
@@ -216,6 +223,8 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
     ranges = []
     fp8_e4m3_min = fp8_min_normal(4)
     quant = quant or to_fp8_e4m3
+    quant_max = float(getattr(quant, 'max_val', FP8_E4M3_MAX))
+    quant_dynamic = getattr(quant, 'scaling', None) == 'dynamic-tensor'
 
     def _zero_scalar(device) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float64, device=device)
@@ -238,10 +247,13 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
             # thresholds therefore apply to that scaled image; using raw
             # `abs_out` would report 100% underflow for tiny activations even
             # though the applied quantizer loses nothing.
-            if getattr(quant, 'scaling', None) == 'dynamic-tensor' and numel:
+            if quant_dynamic and numel:
                 amax = out.detach().abs().amax().clamp_(min=1e-12)
-                scaled_abs = abs_out * (float(getattr(quant, 'max_val', FP8_E4M3_MAX)) / amax)
-                threshold_max = float(getattr(quant, 'max_val', FP8_E4M3_MAX))
+                # Do the rescale in float64: `448 * (448/448)` in float32 can
+                # round just above the format maximum and report a phantom
+                # overflow on a quantizer that by construction never clips.
+                scaled_abs = abs_out.double() * (quant_max / amax.double())
+                threshold_max = quant_max
             else:
                 scaled_abs = abs_out
                 threshold_max = FP8_E4M3_MAX
@@ -283,8 +295,15 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
             y = out[0] if isinstance(out, tuple) else out
             all_finite = torch.isfinite(y).all()
             first_bad.append((i, all_finite))
-            # max(|y|).
-            first_over.append((i, torch.maximum(y.max(), -y.min())))
+            # Overflow is measured against the range of the quantizer that
+            # actually ran. Dynamic per-tensor scaling first maps the block's
+            # amax into the format range, so the raw max overstates overflow
+            # (in fact it cannot overflow unless the input is non-finite).
+            max_abs = torch.maximum(y.max(), -y.min())
+            if quant_dynamic and y.numel():
+                amax = y.detach().abs().amax().clamp_(min=1e-12)
+                max_abs = max_abs.double() * (quant_max / amax.double())
+            first_over.append((i, max_abs))
         return hook
     with torch.no_grad():
         logits_fp32, _ = model(x)
@@ -310,7 +329,8 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
     bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags) if not ok), None)
-    first_over_idx = next((i for i, v in zip([i for i, _ in first_over], over_vals) if v > FP8_E4M3_MAX), None)
+    first_over_idx = next((i for i, v in zip([i for i, _ in first_over], over_vals)
+                           if v > quant_max), None)
     # Compare against the fp32 logits row-block by row-block.
     max_abs_fp32 = torch.maximum(logits_fp32.max(), -logits_fp32.min()).cpu()
     logits_fp32_cpu = logits_fp32.detach().to('cpu')
