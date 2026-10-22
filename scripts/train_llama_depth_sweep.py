@@ -1001,6 +1001,9 @@ def main():
     if len(args.norms) != len(raw_norms):
         print(f'[sweep][warn] duplicate norms removed: {raw_norms} -> {args.norms} '
               '(a repeated norm is the same cell, not an independent comparison)')
+    if args.reference_norm not in args.norms:
+        p.error(f'--reference-norm {args.reference_norm!r} is not in --norms '
+                f'{args.norms}; no cell could be compared against the baseline')
     if args.max_parallel < 1:
         p.error(f'--max-parallel {args.max_parallel} must be >= 1')
     if args.threads_per_run < 0:
