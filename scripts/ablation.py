@@ -77,7 +77,8 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std
                                paired_t_one_sided, student_t_ppf, welch_t_one_sided)
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
-from scripts.train_gpt2 import apply_config_to_parser, build_optimizer, load_yaml_config
+from scripts.train_gpt2 import (_explicit_arg_names, apply_config_to_parser,
+                                build_optimizer, load_yaml_config)
 
 
 def _finite_metric(value) -> bool:
@@ -2557,7 +2558,14 @@ def main():
                         ('--stats-every', args.stats_every)):
         if value < 1:
             p.error(f'{flag} {value} must be >= 1')
-    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or DEFAULT_SEEDS)
+    # A `seed:` supplied by --config is a parser default, not an explicit CLI
+    # override: an explicit `--seeds 42 43 44` must not be replaced by one
+    # config-seeded value (same precedence rule as train_gpt2.py).
+    seed_names = _explicit_arg_names(sys.argv[1:], p, known.config)
+    if args.seed is not None and ('seed' in seed_names or 'seeds' not in seed_names):
+        raw_seeds = [args.seed]
+    else:
+        raw_seeds = list(args.seeds or DEFAULT_SEEDS)
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     # Keep `args.seeds` equal to the resolved set: protocol checks (e.g. the
     # simple-baseline calibration) must compare against the seeds actually
