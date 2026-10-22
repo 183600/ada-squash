@@ -130,6 +130,11 @@ def measured_forward_flops(fn, tokens: int):
 def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy: bool=True) -> dict:
     # Drop the previous norm's autocast casts before the next model is built.
     clear_cast_weight_cache()
+    # Re-seed per measurement: constructor-side parameter draws (e.g. DyTC's
+    # alpha jitter) happen before `reset_parameters`, so without this the same
+    # norm would get a different initialization in every round and different
+    # norms would be measured on different weights.
+    set_all_seeds(args.seed)
     # Build with the constructor init pass disabled;
     # `reset_parameters(args.seed)` below is the single seeded init.
     with torch.device(device):
