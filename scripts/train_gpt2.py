@@ -1114,6 +1114,42 @@ def main():
     ):
         if value < minimum:
             p.error(f'{name} {value} must be >= {minimum}')
+    if args.max_steps < 1:
+        p.error(f'--max-steps {args.max_steps} must be >= 1')
+    if args.warmup < 0:
+        p.error(f'--warmup {args.warmup} must be >= 0')
+    if not math.isfinite(args.lr) or args.lr <= 0.0:
+        p.error(f'--lr {args.lr} must be finite and positive')
+    if not math.isfinite(args.min_lr_ratio) or not 0.0 <= args.min_lr_ratio <= 1.0:
+        p.error(f'--min-lr-ratio {args.min_lr_ratio} must be finite and in [0, 1]')
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0.0:
+        p.error(f'--weight-decay {args.weight_decay} must be finite and >= 0')
+    for name, value in (('--beta1', args.beta1), ('--beta2', args.beta2)):
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            p.error(f'{name} {value} must be finite and in [0, 1)')
+    if not math.isfinite(args.grad_clip) or args.grad_clip <= 0.0:
+        p.error(f'--grad-clip {args.grad_clip} must be finite and positive')
+    if args.val_every < 0:
+        p.error(f'--val-every {args.val_every} must be >= 0')
+    if args.early_stop_patience < 0:
+        p.error(f'--early-stop-patience {args.early_stop_patience} must be >= 0')
+    if args.num_workers < 0:
+        p.error(f'--num-workers {args.num_workers} must be >= 0')
+    if args.train_shuffle_buffer < 0:
+        p.error(f'--train-shuffle-buffer {args.train_shuffle_buffer} must be >= 0')
+    for name, value in (('--val-frac', args.val_frac), ('--test-frac', args.test_frac)):
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            p.error(f'{name} {value} must be finite and in [0, 1)')
+    if args.val_frac + args.test_frac >= 1.0:
+        p.error(f'--val-frac {args.val_frac} + --test-frac {args.test_frac} leaves no '
+                'training stream; the split fractions must sum to less than 1')
+    for name, value in (('--min-doc-chars', args.min_doc_chars),
+                        ('--max-doc-chars', args.max_doc_chars)):
+        if value < 0:
+            p.error(f'{name} {value} must be >= 0')
+    if args.max_doc_chars and args.min_doc_chars > args.max_doc_chars:
+        p.error(f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
+                f'{args.max_doc_chars}; no document could pass the cleaner')
     seed_explicit = args.seed is not None or args.seeds is not None
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [DEFAULT_SEED])
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
