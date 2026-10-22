@@ -317,8 +317,24 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
                           '(missing or non-integer position)')
     elif sorted(positions) != list(range(len(entries))):
         structural.append('positions are not a contiguous 0..n-1 range')
-    units = [entry.get('run_id', entry.get('unit'))
-             if isinstance(entry, dict) else None for entry in entries]
+    units = []
+    units_valid = True
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            units_valid = False
+            units.append(('invalid-entry', index))
+            continue
+        unit = entry.get('run_id', entry.get('unit'))
+        if not isinstance(unit, str) or not unit.strip():
+            # A non-string run id cannot be compared/paired by the later
+            # reports. It must produce a warning, not an unhashable-type crash
+            # from the duplicate check.
+            units_valid = False
+            units.append(('invalid-unit', index, repr(unit)))
+        else:
+            units.append(('unit', unit))
+    if not units_valid:
+        structural.append('run ids are missing or not non-empty strings')
     if len(set(units)) != len(units):
         structural.append('duplicate run ids in the realized order')
 
@@ -1070,9 +1086,13 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         except ValueError as exc:
             add('schedule', 'fail', f'malformed run schedule: {exc}')
         else:
-            if expected_units is not None:
+            raw_order = schedule.get('order')
+            if not isinstance(raw_order, list):
+                add('schedule', 'fail',
+                    'malformed run schedule: order is not a list of run ids')
+            elif expected_units is not None:
                 expected = {str(unit) for unit in expected_units}
-                realized = {str(unit) for unit in schedule.get('order') or []}
+                realized = {str(unit) for unit in raw_order}
                 if expected != realized:
                     add('schedule', 'fail',
                         f'schedule does not cover the planned runs: missing '
