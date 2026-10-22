@@ -356,7 +356,12 @@ def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
             value = float(p)
         except (TypeError, ValueError, OverflowError):
             continue
-        if math.isfinite(value):
+        # A p-value outside [0, 1] is not a valid test result. Keeping it
+        # would either make a negative value maximally significant (after the
+        # running max) or silently cap one above 1 to a perfect result; both
+        # turn malformed evidence into a claim. Exclude it like a non-finite
+        # p-value, and leave its slot None.
+        if math.isfinite(value) and 0.0 <= value <= 1.0:
             indexed.append((value, i))
     indexed.sort()
     m = len(indexed)
