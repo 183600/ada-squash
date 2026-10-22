@@ -2204,8 +2204,11 @@ def main():
                 '--auto-simple-baselines or --require-simple-baselines: the '
                 'calibration is explicitly disabled, so those requests cannot '
                 'be honored')
-    for flag, value in (('--batch-size', args.batch_size),
+    for flag, value in (('--max-steps', args.max_steps),
+                        ('--batch-size', args.batch_size),
                         ('--seq-len', args.seq_len),
+                        ('--val-batches', args.val_batches),
+                        ('--curve-batches', args.curve_batches),
                         ('--log-every', args.log_every),
                         ('--stats-every', args.stats_every)):
         if value < 1:
