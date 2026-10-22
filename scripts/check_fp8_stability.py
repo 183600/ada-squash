@@ -256,7 +256,11 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
                 # Do the rescale in float64: `448 * (448/448)` in float32 can
                 # round just above the format maximum and report a phantom
                 # overflow on a quantizer that by construction never clips.
-                scaled_abs = abs_out.double() * (quant_max / amax.double())
+                # Clamp the scaled image to the format max for the same reason
+                # in float64: amax*(max/amax) can still round to
+                # 448.00000000000006 and be counted as an overflow.
+                scaled_abs = (abs_out.double()
+                              * (quant_max / amax.double())).clamp_(max=quant_max)
                 threshold_max = quant_max
             else:
                 scaled_abs = abs_out
@@ -306,7 +310,8 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
             max_abs = torch.maximum(y.max(), -y.min())
             if quant_dynamic and y.numel():
                 amax = y.detach().abs().amax().clamp_(min=1e-12)
-                max_abs = max_abs.double() * (quant_max / amax.double())
+                max_abs = (max_abs.double()
+                           * (quant_max / amax.double())).clamp_(max=quant_max)
             first_over.append((i, max_abs))
         return hook
     with torch.no_grad():
