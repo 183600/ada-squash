@@ -674,23 +674,32 @@ def lr_sensitivity(tuned: dict) -> dict:
         noise = max(stds) if stds else None
         best = min(cells.items(), key=lambda item: item[1]['mean'])
         worst = max(cells.items(), key=lambda item: item[1]['mean'])
+        enough_cells = len(cells) >= 2
         per_arm[arm] = {
             'cells': len(cells),
-            'range': spread,
-            'range_over_seed_std': (spread / noise if noise and noise > 0.0 else None),
+            # With one cell there is no lr/weight-decay variation to measure:
+            # a zero range is not evidence that the lr effect stays inside
+            # seed noise.
+            'range': spread if enough_cells else None,
+            'range_over_seed_std': (spread / noise
+                                    if enough_cells and noise and noise > 0.0 else None),
             'lr_effect_exceeds_seed_noise': (bool(spread > noise)
-                                             if noise is not None else None),
+                                             if enough_cells and noise is not None else None),
             'selected': {'lr': best[0][0], 'weight_decay': best[0][1],
                          'val_loss': float(best[1]['mean'])},
             'worst': {'lr': worst[0][0], 'weight_decay': worst[0][1],
                       'val_loss': float(worst[1]['mean'])},
             'val_loss_by_cell': {
-                f'lr={lr:g}|wd={wd:g}': float(cell['mean'])
+                f'lr={_lr_key(lr)}|wd={_lr_key(wd)}': float(cell['mean'])
                 for (lr, wd), cell in sorted(cells.items())},
         }
     common: set[tuple[float, float]] = set()
-    if arm_cells:
-        common = set.intersection(*(set(cells) for cells in arm_cells.values()))
+    # An arm with no complete cell must not erase the shared-cell coverage of
+    # every other arm: intersection over the non-empty sets only.
+    nonempty_arm_cells = [set(cells) for cells in arm_cells.values() if cells]
+    if nonempty_arm_cells:
+        common = set.intersection(*nonempty_arm_cells)
+    excluded_arms = sorted(arm for arm, cells in arm_cells.items() if not cells)
     winner_by_cell = {}
     rank_by_cell = {}
     for cell in sorted(common):
@@ -699,17 +708,20 @@ def lr_sensitivity(tuned: dict) -> dict:
         if len(means) < 2:
             continue
         ranked = sorted(means, key=lambda arm: (means[arm], arm))
-        winner_by_cell[f'lr={cell[0]:g}|wd={cell[1]:g}'] = {
+        cell_key = f'lr={_lr_key(cell[0])}|wd={_lr_key(cell[1])}'
+        winner_by_cell[cell_key] = {
             'winner': ranked[0], 'ranking': ranked,
             'means': means,
         }
-        rank_by_cell[f'lr={cell[0]:g}|wd={cell[1]:g}'] = ranked
+        rank_by_cell[cell_key] = ranked
     winners = {block['winner'] for block in winner_by_cell.values()}
     return {
         'per_arm': per_arm,
         'common_cells': len(common),
+        'arms_without_complete_cells': excluded_arms,
         'winner_by_cell': winner_by_cell,
-        'winner_stable_across_cells': (len(winners) == 1 if winners else None),
+        'winner_stable_across_cells': (len(winners) == 1
+                                       if len(common) >= 2 and winners else None),
         'winners': sorted(winners),
         'reading': ('a norm whose selected cell beats the baseline only at one lr is an '
                     'lr-bonus result, not a mechanism result; the matrix comparison is '
@@ -727,11 +739,14 @@ def print_lr_sensitivity(block: dict | None) -> None:
             continue
         ratio = info.get('range_over_seed_std')
         ratio_str = '' if ratio is None else f' range/seed_std={ratio:.2f}'
+        spread = info.get('range')
+        spread_str = ('range=n/a (need >= 2 cells)' if spread is None
+                      else f'range={spread:.4f}')
         flag = (' [LR EFFECT > SEED NOISE]'
                 if info.get('lr_effect_exceeds_seed_noise') else '')
         print(f"[tune][lr] {arm}: {info['cells']} complete cell(s), selected "
               f"lr={info['selected']['lr']:g} wd={info['selected']['weight_decay']:g} "
-              f"val_loss={info['selected']['val_loss']:.4f}, range={info['range']:.4f}"
+              f"val_loss={info['selected']['val_loss']:.4f}, {spread_str}"
               f"{ratio_str}{flag}")
     if block.get('winner_stable_across_cells') is True:
         print(f"[tune][lr] winner stable across {block['common_cells']} shared cell(s): "
