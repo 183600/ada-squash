@@ -813,9 +813,11 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
                 and math.isfinite(value))
 
     agg = {'seeds': [int(s) for s in seeds], 'n_seeds': len(results), 'per_seed': results}
-    provenance_by_seed = {
-        int(r['seed']): r.get('data_provenance') for r in results
-        if isinstance(r.get('seed'), int)}
+    provenance_by_seed = {}
+    for result in results:
+        seed = _moe_seed_id(result.get('seed'))
+        if seed is not None:
+            provenance_by_seed[seed] = result.get('data_provenance')
     versions_by_seed = {
         seed: (None if not isinstance(prov, dict) else {
             'dataset_revision_resolved': prov.get('dataset_revision_resolved'),
@@ -893,21 +895,21 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
     # pass); it is not a usable replication and is listed rather than silently
     # pooled into the mean.
     agg['invalid_seeds'] = sorted({
-        int(r['seed']) for r in results
-        if isinstance(r.get('seed'), int)
+        _moe_seed_id(r.get('seed')) for r in results
+        if _moe_seed_id(r.get('seed')) is not None
         and any(isinstance(r.get(k), float) and not math.isfinite(r[k])
                 for k in _MOE_SEED_METRIC_KEYS)})
     agg['n_seeds_requested'] = len(agg['seeds'])
     requested_seeds = list(agg['seeds'])
-    result_seeds = [int(r['seed']) for r in results
-                    if isinstance(r.get('seed'), int)
-                    and not isinstance(r.get('seed'), bool)]
+    result_seeds = [seed for seed in
+                    (_moe_seed_id(r.get('seed')) for r in results)
+                    if seed is not None]
     missing_seeds = [s for s in requested_seeds if s not in result_seeds]
     unexpected_seeds = [s for s in result_seeds if s not in requested_seeds]
     duplicate_seeds = sorted({s for s in result_seeds if result_seeds.count(s) > 1})
     seeds_without_val_ce = sorted({
-        int(r['seed']) for r in results
-        if isinstance(r.get('seed'), int) and not isinstance(r.get('seed'), bool)
+        _moe_seed_id(r.get('seed')) for r in results
+        if _moe_seed_id(r.get('seed')) is not None
         and not _usable(r.get('val_ce'))})
     agg['missing_seeds'] = missing_seeds
     agg['unexpected_seeds'] = unexpected_seeds
@@ -966,6 +968,14 @@ def moe_protocol_signature(args) -> dict:
 def _moe_finite(value) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(float(value)))
+
+
+def _moe_seed_id(value):
+    """Canonical int seed id, or None for a bool/fractional/foreign value."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    return None
+
 
 def _moe_seed_metric(cell: dict, metric: str) -> dict:
     values = {}

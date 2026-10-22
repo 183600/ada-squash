@@ -1306,7 +1306,14 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
         p['exclusion_status'] = status.get('status', 'analyzed')
         p['exclusion_reasons'] = status.get('reasons', [])
 
-    agg = dict(summaries[0]) if summaries else {}
+    # Carry a single-run summary's batch-level std/stderr only from a run
+    # whose loss is actually finite. Copying the first raw summary blindly
+    # leaked an excluded (NaN) seed's std/stderr into a row whose pooled
+    # val_loss came from a different seed, or was None entirely.
+    base_summary = next(
+        (s for s in summaries if _finite_metric(s.get('val_loss'))), None)
+    agg = dict(base_summary if base_summary is not None
+               else (summaries[0] if summaries else {}))
     pooled: list = []
     by_seed: dict = {}
     for p in per_seed:
@@ -1336,9 +1343,24 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
         'val_loss': stats['mean'],
         'val_loss_seed_std': stats['std'] if multi else None,
         'val_loss_seed_stderr': stats['stderr'] if multi else None,
-        'val_loss_std': stats['std'] if multi else agg.get('val_loss_std'),
-        'val_loss_stderr': stats['stderr'] if multi else agg.get('val_loss_stderr'),
-        'val_loss_std_basis': 'seeds' if multi else 'val_batches',
+        # A single usable run may contribute its batch-level std/stderr, but
+        # only from the summary that supplied the finite val_loss; an
+        # excluded/NaN seed's uncertainty must not be attached to another
+        # seed's mean (or to a None mean).
+        'val_loss_std': (
+            stats['std'] if multi else
+            (None if base_summary is None
+             or not _finite_metric(base_summary.get('val_loss_std'))
+             else float(base_summary['val_loss_std']))),
+        'val_loss_stderr': (
+            stats['stderr'] if multi else
+            (None if base_summary is None
+             or not _finite_metric(base_summary.get('val_loss_stderr'))
+             else float(base_summary['val_loss_stderr']))),
+        'val_loss_std_basis': (
+            'seeds' if multi else
+            (None if base_summary is None
+             else base_summary.get('val_loss_std_basis', 'val_batches'))),
         'val_losses': pooled,
         'val_losses_by_seed': by_seed,
         'final_loss': _mean_of('final_loss'),
@@ -1668,6 +1690,7 @@ def _seed_means(row) -> dict:
     """
     per = row.get('per_seed')
     out = {}
+    seen: set[int] = set()
     if isinstance(per, list):
         for item in per:
             if not isinstance(item, dict):
@@ -1678,8 +1701,17 @@ def _seed_means(row) -> dict:
                 # unpairable: dropping just this entry would silently pair a
                 # different number of runs than the row reports.
                 return {}
+            seed = int(seed)
+            if seed in seen:
+                # Two records for one seed are the same run, not two
+                # replications; collapsing them would inflate the paired
+                # denominator and can certify an effect resting on a
+                # duplicated observation. Track every occurrence, including a
+                # non-finite first record that never enters `out`.
+                return {}
+            seen.add(seed)
             if _finite_metric(item.get('val_loss')):
-                out[int(seed)] = float(item['val_loss'])
+                out[seed] = float(item['val_loss'])
         return out
     seeds = row.get('seeds') if isinstance(row.get('seeds'), list) else []
     seeds = [s for s in seeds if s is not None] or ([row['seed']] if row.get('seed') is not None else [])
@@ -1690,6 +1722,8 @@ def _seed_means(row) -> dict:
     if not all(_is_seed_id(s) for s in seeds):
         return {}
     unique_seeds = list(dict.fromkeys(int(s) for s in seeds))
+    if len(unique_seeds) != len(seeds):
+        return {}
     if len(unique_seeds) == 1 and _finite_metric(row.get('val_loss')):
         out[unique_seeds[0]] = float(row['val_loss'])
     return out
@@ -2339,7 +2373,12 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
                           for wd in weight_decays)
                       and any(isinstance(lr, (int, float)) and float(lr) == args.lr
                               for lr in (protocol.get('lrs') or [])))
-    tuning_confirmed = bool((data.get('comparison') or {}).get('certified'))
+    # A malformed `comparison` block (list/string/scalar) must not crash the
+    # loader that promises a None/warning for a stale report; only an explicit
+    # boolean True can certify the tuned baseline.
+    comparison = data.get('comparison')
+    tuning_confirmed = bool(
+        isinstance(comparison, dict) and comparison.get('certified') is True)
     per_baseline = {}
     for row_name in args.baselines:
         norm_name = (rows.get(row_name) or {}).get('norm_name')
