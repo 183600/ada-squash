@@ -1193,8 +1193,16 @@ def main():
         },
         artifacts={'sweep_comparisons': artifact_record(comp_path)},
     )
+    all_children_failed = bool(jobs) and len(failed_jobs) == len(jobs)
+    if all_children_failed:
+        # `finish_metadata` marks a completed report; a launcher whose every
+        # child failed produced no usable cell, so the saved manifest must say
+        # so instead of advertising a finished sweep.
+        sweep_manifest['status'] = 'failed'
+        sweep_manifest['error'] = (f'all {len(jobs)} child run(s) failed; '
+                                   'the sweep produced no usable cell')
     save_run_manifest(base / 'run_manifest.json', sweep_manifest)
-    if jobs and len(failed_jobs) == len(jobs):
+    if all_children_failed:
         print(f'[sweep] ERROR: every one of the {len(jobs)} child run(s) failed; '
               'the sweep produced no usable cell. See the per-seed logs above.',
               file=sys.stderr)
