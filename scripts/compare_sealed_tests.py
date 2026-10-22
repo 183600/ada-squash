@@ -162,30 +162,40 @@ def _sealed_result_problem(run: dict) -> str | None:
         return (f"test_results.json test_loss={actual} disagrees with manifest "
                 f"results.test_loss={recorded}; the file does not belong to this run")
     artifacts = manifest.get("artifacts")
-    artifact = artifacts.get("test_results") if isinstance(artifacts, dict) else None
-    if isinstance(artifact, dict):
-        sha = artifact.get("sha256")
-        if artifact.get("exists") is False or not isinstance(sha, str) or not sha:
-            return "manifest artifacts.test_results is missing or has no sha256"
-        path = Path(run["path"])
-        hasher = hashlib.sha256()
+    if not isinstance(artifacts, dict):
+        return ("manifest has no artifacts block, so test_results.json cannot be "
+                "tied to the run that wrote it")
+    artifact = artifacts.get("test_results")
+    if not isinstance(artifact, dict):
+        # A missing/None/string entry is unknown provenance, not a pass: this
+        # is the stale/foreign-result path the fingerprint check exists for.
+        return "manifest artifacts.test_results is missing or malformed"
+    sha = artifact.get("sha256")
+    if artifact.get("exists") is not True or not isinstance(sha, str) or not sha:
+        return "manifest artifacts.test_results is missing or has no sha256"
+    path = Path(run["path"])
+    hasher = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                hasher.update(chunk)
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"cannot read test_results.json for fingerprint verification: {exc}"
+    if hasher.hexdigest() != sha:
+        return "test_results.json content hash disagrees with the manifest fingerprint"
+    expected_bytes = artifact.get("bytes")
+    if expected_bytes is not None:
+        if isinstance(expected_bytes, bool):
+            return "manifest artifacts.test_results has a malformed byte count"
         try:
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    hasher.update(chunk)
-            size = path.stat().st_size
-        except OSError as exc:
-            return f"cannot read test_results.json for fingerprint verification: {exc}"
-        if hasher.hexdigest() != sha:
-            return "test_results.json content hash disagrees with the manifest fingerprint"
-        expected_bytes = artifact.get("bytes")
-        if expected_bytes is not None:
-            try:
-                expected_size = int(expected_bytes)
-            except (TypeError, ValueError):
-                return "manifest artifacts.test_results has a malformed byte count"
-            if size != expected_size:
-                return "test_results.json size disagrees with the manifest fingerprint"
+            expected_size = int(expected_bytes)
+        except (TypeError, ValueError, OverflowError):
+            return "manifest artifacts.test_results has a malformed byte count"
+        if expected_size != expected_bytes:
+            return "manifest artifacts.test_results has a malformed byte count"
+        if size != expected_size:
+            return "test_results.json size disagrees with the manifest fingerprint"
     return None
 
 def _evaluated_checkpoint_step(results: dict):
