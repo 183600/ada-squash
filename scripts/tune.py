@@ -372,9 +372,14 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     # survivor-only confirm mean (a diverged seed silently dropped) would let
     # the arm that diverged look better, the same survivorship bias the lr
     # grid excludes via `complete_coverage`.
-    confirm_ready = {a for a, r in usable.items()
-                     if ((r.get('confirm') or {}).get('stats')
-                         and not (r.get('confirm') or {}).get('missing_seeds'))}
+    confirm_ready = {
+        a for a, r in usable.items()
+        if ((r.get('confirm') or {}).get('stats')
+            and r.get('confirm_trials')
+            # Missing coverage metadata is unknown, not "none missing": an
+            # old/hand-written record must not turn a survivor-only mean into
+            # a certification.
+            and (r.get('confirm') or {}).get('missing_seeds') == [])}
     confirm_ran = {a for a, r in usable.items() if r.get('confirm_trials')}
     confirm_ignored = sorted(confirm_ran - confirm_ready)
     confirm_ignored_missing_seeds = {
