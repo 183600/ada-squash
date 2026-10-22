@@ -1667,6 +1667,13 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
             'selected_lr': None if not isinstance(best, dict) else best.get('lr'),
             'selected_weight_decay': None if not isinstance(best, dict) else best.get('weight_decay'),
             'selected_val_loss': None if not isinstance(best, dict) else best.get('mean'),
+            'selection_pool': None if not isinstance(best, dict) else best.get('selection_pool'),
+            'selection_missing_seeds': (None if not isinstance(best, dict)
+                                        else best.get('missing_seeds')),
+            'selection_complete': bool(
+                isinstance(best, dict)
+                and best.get('selection_pool') == 'complete_coverage'
+                and best.get('missing_seeds') == []),
             'confirm_complete': bool(((arm or {}).get('confirm') or {}).get('complete_coverage')),
             'confirm_val_loss': (((arm or {}).get('confirm') or {}).get('stats') or {}).get('mean'),
             'recipe_in_grid': recipe_in_grid,
@@ -1698,7 +1705,8 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
     missing_baselines = sorted(entry['row'] for entry in per_baseline.values()
                                if not entry['found'])
     all_at_recipe = (not missing_baselines
-                     and all(entry['recipe_is_selected_cell'] for entry in found))
+                     and all(entry['recipe_is_selected_cell'] and entry['selection_complete']
+                             for entry in found))
     block = {
         'source': str(path),
         'protocol_checked': True,
@@ -1729,7 +1737,13 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
         if missing_baselines:
             reasons.append(f'no tuned arm for baseline(s) {missing_baselines}')
         if not all_at_recipe and not missing_baselines:
-            reasons.append('at least one baseline selected a different (lr, weight_decay) cell')
+            incomplete = [entry['row'] for entry in found if not entry['selection_complete']]
+            if incomplete:
+                reasons.append('baseline selection used a partial-coverage (survivor-only) '
+                               f'cell for {incomplete}')
+            if any(not entry['recipe_is_selected_cell'] for entry in found):
+                reasons.append('at least one baseline selected a different '
+                               '(lr, weight_decay) cell')
         block['why_not_certified'] = reasons
         print(f'[tune-cert] WARNING: {path} does not certify the fixed recipe: '
               f'{"; ".join(reasons)}')
