@@ -618,6 +618,21 @@ def main():
     if len(set(normalized_groups)) != len(normalized_groups):
         p.error('--ckpts contains the same checkpoint set as two arms; a self-comparison '
                 'has no treatment difference to certify')
+    # Partial overlap is just as invalid as an identical set: the shared
+    # checkpoint is the same trained run on both sides, so its paired delta is
+    # forced to zero and the treatment contrast is contaminated. Compare
+    # resolved paths so ./a and a are not treated as different runs.
+    seen_paths: dict[str, int] = {}
+    for group_index, group in enumerate(ckpt_groups):
+        for path in group:
+            key = str(Path(path).resolve())
+            previous = seen_paths.get(key)
+            if previous is not None:
+                where = ('within one arm' if previous == group_index
+                         else f'in arms {previous + 1} and {group_index + 1}')
+                p.error(f'--ckpts checkpoint {path} appears more than once ({where}); '
+                        'each training run may contribute to exactly one arm')
+            seen_paths[key] = group_index
     results = []
     dataset_probe_reports = []
     for group in ckpt_groups:

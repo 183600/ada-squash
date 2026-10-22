@@ -591,6 +591,21 @@ def main():
         if len(set(normalized_groups)) != len(normalized_groups):
             p.error('--ckpt contains the same checkpoint set for two norms; the same weights '
                     'cannot support a cross-norm difference')
+        # A partially shared checkpoint set is also a self-comparison on the
+        # shared runs: their paired deltas are exactly zero, which shrinks the
+        # variance estimate and contaminates the cross-norm contrast. Compare
+        # resolved paths so ./a and a count as the same run.
+        seen_paths: dict[str, int] = {}
+        for group_index, group in enumerate(ckpt_groups):
+            for path in group:
+                key = str(Path(path).resolve())
+                previous = seen_paths.get(key)
+                if previous is not None:
+                    where = ('within one norm' if previous == group_index
+                             else f'in norms {previous + 1} and {group_index + 1}')
+                    p.error(f'--ckpt checkpoint {path} appears more than once ({where}); '
+                            'each training run may contribute to exactly one norm')
+                seen_paths[key] = group_index
     results = []
     for i, norm in enumerate(args.norms):
         if not args.ckpt:
