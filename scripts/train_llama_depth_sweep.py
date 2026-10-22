@@ -222,6 +222,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
     seeds = [int(s) for s in seeds]
     per_seed = []
     rejected = []
+    reference_context = None
+    reference_context_seed = None
     for seed in seeds:
         path = seed_dir(cell_dir, seed, multi) / 'run_manifest.json'
         best = None
@@ -241,6 +243,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         n_layers = None
         dim = None
         n_heads = None
+        final_step = None
+        final_val_step = None
         expected = protocol_for_seed(seed) if protocol_for_seed is not None else None
         reject_reason = None
         if launch_id is not None:
@@ -269,6 +273,49 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                 if mismatches:
                     reject_reason = ('recorded recipe/shape differs from this sweep: '
                                      + json.dumps(mismatches, sort_keys=True))
+        if reject_reason is None and isinstance(manifest, dict):
+            step_results = manifest.get('results') or {}
+            # `final_val_loss` is only comparable at the fixed final step.
+            # A value from an earlier validation pass (e.g. max_steps=1200
+            # with val_every=500 ends at final_val_step=1000) would be
+            # pooled under the wrong step name, and seeds ending at
+            # different steps would make the cross-cell delta a mix of
+            # training horizons.
+            if step_results.get('final_val_loss') is not None:
+                step_values = {}
+                for step_key in ('final_step', 'final_val_step'):
+                    step_value = step_results.get(step_key)
+                    if (not isinstance(step_value, int)
+                            or isinstance(step_value, bool) or step_value <= 0):
+                        reject_reason = (
+                            f'run_manifest.json results.{step_key} is '
+                            f'{step_value!r}, not a positive integer step; the '
+                            'fixed-step comparison cannot be certified')
+                        break
+                    step_values[step_key] = step_value
+                if reject_reason is None:
+                    final_step = step_values['final_step']
+                    final_val_step = step_values['final_val_step']
+                    if final_val_step != final_step:
+                        reject_reason = (
+                            f'run_manifest.json results.final_val_step is '
+                            f'{final_val_step!r} but results.final_step is '
+                            f'{final_step!r}; the final held-out pass was not '
+                            'taken at the fixed final step, so the fixed-step '
+                            'comparison cannot be certified')
+                    else:
+                        context = {'final_step': final_step,
+                                   'final_val_step': final_val_step}
+                        if reference_context is None:
+                            reference_context = context
+                            reference_context_seed = int(seed)
+                        elif context != reference_context:
+                            reject_reason = (
+                                'run ended at a different training step than '
+                                f'seed {reference_context_seed}: '
+                                + json.dumps({'recorded': context,
+                                              'reference': reference_context},
+                                             sort_keys=True))
         if reject_reason is not None:
             rejected.append({'seed': int(seed), 'path': str(path),
                              'reason': reject_reason})
@@ -314,6 +361,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
             'n_nonfinite_gradients': nonfinite_grad,
             'n_nonfinite_val_losses': nonfinite_val,
             'data_version': data_version,
+            'final_step': final_step,
+            'final_val_step': final_val_step,
         })
 
     versions_by_seed = {
