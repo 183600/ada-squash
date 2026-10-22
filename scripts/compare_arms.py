@@ -430,9 +430,12 @@ def print_comparison(comparison: dict) -> None:
         ppl_str = '' if ppl is None else f' dPPL={ppl:+.2f}%'
         noise = ' [WITHIN SEED NOISE]' if entry.get('within_seed_noise') else ''
         note = '' if entry.get('certifiable') else f" [{entry.get('certification_basis')}]"
-        print(f"[arms] {entry['name']:>24s} mean={entry['mean']:.4f}"
+        mean_str = ('n/a' if entry.get('mean') is None
+                    else f"{entry['mean']:.4f}")
+        delta_str = ('n/a' if delta is None else f"{delta:+.4f}")
+        print(f"[arms] {entry['name']:>24s} mean={mean_str}"
               + ('' if std is None else f" +/- {std:.4f}")
-              + f" delta={delta:+.4f}{ci_str}{ppl_str}{ratio_str}"
+              + f" delta={delta_str}{ci_str}{ppl_str}{ratio_str}"
               + f" p={p_str} p(holm)={ph_str} certified={entry['certified']}"
               + f"{noise}{note}")
     print('[arms] ' + comparison['multiple_comparison'])
