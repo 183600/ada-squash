@@ -64,6 +64,14 @@ def _seed_values(agg: dict, metric: str) -> dict[int, float]:
     return out
 
 
+def _safe_exp(value):
+    """exp(loss) for PPL reporting; a finite but huge loss stays visible."""
+    try:
+        return math.exp(float(value))
+    except (OverflowError, ValueError):
+        return math.inf
+
+
 def _data_version_signature(agg: dict):
     versions = agg.get('data_versions_by_seed')
     if not isinstance(versions, dict) or not versions:
@@ -71,12 +79,22 @@ def _data_version_signature(agg: dict):
     values = list(versions.values())
     if any(value is None for value in values):
         return None
-    return json.dumps(values[0], sort_keys=True)
+    signatures = {json.dumps(value, sort_keys=True) for value in values}
+    if len(signatures) != 1:
+        return 'MIXED'
+    return next(iter(signatures))
 
 
 def _shape_signature(agg: dict):
     shapes = agg.get('shapes_by_seed')
     if not isinstance(shapes, dict) or not shapes:
+        return None
+    # A shape record with a missing/None field is unknown, not a shape. The
+    # aggregate writer only emits complete shapes, so this is the malformed /
+    # stale-record path; it must not compare equal to another unknown shape.
+    if any(not isinstance(shape, dict) or not shape
+           or any(value is None for value in shape.values())
+           for shape in shapes.values()):
         return None
     signatures = {json.dumps(shape, sort_keys=True) for shape in shapes.values()}
     if len(signatures) != 1:
@@ -263,8 +281,8 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'within_seed_noise': None,
             # The seeds are the run-to-run variance; a loss delta that is
             # smaller than the arms' own spread is not a result.
-            'ppl_reference': None if ref['mean'] is None else math.exp(ref['mean']),
-            'ppl_arm': None if cand['mean'] is None else math.exp(cand['mean']),
+            'ppl_reference': None if ref['mean'] is None else _safe_exp(ref['mean']),
+            'ppl_arm': None if cand['mean'] is None else _safe_exp(cand['mean']),
             'ppl_delta': None,
             'ppl_delta_pct': None,
             'test': None,
