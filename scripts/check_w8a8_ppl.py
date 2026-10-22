@@ -684,8 +684,14 @@ def main():
                 return _checkpoint_defaulted(args, p, ckpt_args, name, explicit_cli)
             # Same precedence for the data version: an explicit flag wins, else
             # the revision the checkpoint recorded, else upstream default branch.
-            dataset_revision = args.dataset_revision if args.dataset_revision is not None else ckpt_args.get('dataset_revision')
-            tokenizer_revision = args.tokenizer_revision if args.tokenizer_revision is not None else ckpt_args.get('tokenizer_revision')
+            dataset_revision = (
+                args.dataset_revision if args.dataset_revision is not None
+                else ckpt_args.get('dataset_revision_resolved')
+                or ckpt_args.get('dataset_revision'))
+            tokenizer_revision = (
+                args.tokenizer_revision if args.tokenizer_revision is not None
+                else ckpt_args.get('tokenizer_revision_resolved')
+                or ckpt_args.get('tokenizer_revision'))
             dataset_probe = make_dataset_probe(split_arg('dataset'), split_arg('dataset_config'), ckpt_args.get('tokenizer') or args.tokenizer, args.batch_size, args.seq_len, split=args.probe_split, val_frac=split_arg('val_frac'), test_frac=split_arg('test_frac'), num_documents=split_arg('num_documents'), dedup=ckpt_args.get('dedup', True), min_doc_chars=ckpt_args.get('min_doc_chars', 0), max_doc_chars=ckpt_args.get('max_doc_chars', 0), exclude_hash_file=ckpt_args.get('exclude_hash_file'), exclude_test_hash_file=ckpt_args.get('exclude_test_hash_file'), group_key=ckpt_args.get('group_key'), exclude_group_file=ckpt_args.get('exclude_group_file'), exclude_test_group_file=ckpt_args.get('exclude_test_group_file'), dataset_revision=dataset_revision, tokenizer_revision=tokenizer_revision, seed=seeds[0], num_workers=args.num_workers) if args.probe == 'dataset' else None
             if dataset_probe is not None:
                 dataset_probe_reports.append({
