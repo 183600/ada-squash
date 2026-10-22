@@ -594,6 +594,32 @@ class GPT(nn.Module):
         else:
             self._pos_ids = None
 
+    def _apply(self, fn, recurse: bool=True):
+        """Move/cast the module while keeping the RoPE table complex.
+
+        `nn.Module.to(dtype)` applies the conversion to every buffer, which
+        turns the complex `freqs_cis` into a real tensor and discards its
+        imaginary part; the next rotary forward then fails at `.imag`. A
+        complex RoPE table is an auxiliary constant, not a model parameter, so
+        hide it from the generic pass and rebuild it from its real/imaginary
+        parts in the destination dtype/device. Non-RoPE models have no such
+        buffer and take the normal path unchanged.
+        """
+        freqs = self._buffers.pop('freqs_cis', None)
+        result = super()._apply(fn, recurse)
+        if freqs is not None:
+            real = fn(freqs.real)
+            imag = fn(freqs.imag)
+            if real.dtype in (torch.bfloat16, torch.float16):
+                # torch.complex has no bfloat16/complex32 support on every
+                # backend; the per-call RoPE cast to the activation dtype
+                # still happens in attention._rope_pair_for_dtype.
+                real = real.float()
+                imag = imag.float()
+            self.register_buffer('freqs_cis', torch.complex(real, imag),
+                                 persistent=False)
+        return result
+
     def _init_weights(self, m: nn.Module):
         if isinstance(m, nn.Linear):
             if m.weight is self.tok_emb.weight:
