@@ -1469,6 +1469,22 @@ def main():
         resumed_best = (resume_path.resolve() == best_path.resolve()
                         or resume_path.name == 'ckpt_best.pt')
         best_candidates = []
+        # Periodic/final checkpoints carry the historical best tracker too, so
+        # resuming one into a fresh output directory does not reset model
+        # selection to `inf` (the next validation would then overwrite the
+        # real best with a worse checkpoint).
+        saved_best_loss = resume_ckpt.get('best_val_loss')
+        saved_best_step = resume_ckpt.get('best_val_step')
+        if (isinstance(saved_best_loss, (int, float))
+                and not isinstance(saved_best_loss, bool)
+                and math.isfinite(float(saved_best_loss))):
+            best_candidates.append({
+                'val_loss': float(saved_best_loss),
+                'step': (int(saved_best_step)
+                         if isinstance(saved_best_step, int)
+                         and not isinstance(saved_best_step, bool) else 0),
+                'source': 'checkpoint_tracker',
+            })
         if best_path.exists():
             if resumed_best:
                 # The resumed checkpoint *is* the best checkpoint in this
@@ -1705,6 +1721,9 @@ def main():
                 'last_val_step': last_val_step,
                 'last_val_stderr': last_val_stderr,
                 'last_val_batches': list(last_val_batches),
+                'best_val_loss': (float(best_val_loss)
+                                  if math.isfinite(best_val_loss) else None),
+                'best_val_step': int(best_val_step),
                 'val_batches_consumed': int(val_state.get('batches_consumed', 0)),
                 'n_nonfinite_losses': int(n_nonfinite_losses),
                 'n_nonfinite_gradients': int(n_nonfinite_gradients),
