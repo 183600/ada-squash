@@ -1156,6 +1156,11 @@ def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
     labels = [int(bool(v)) for v in labels]
     if len(scores) != len(labels):
         raise ValueError(f"score/label length mismatch: {len(scores)} vs {len(labels)}")
+    if any(not math.isfinite(s) for s in scores):
+        # A NaN score has no rank: Python's sort leaves it wherever it landed,
+        # so the same positive/negative pair can produce different AUCs merely
+        # by reversing the input list. Refuse the malformed measurement.
+        raise ValueError("roc_auc scores must be finite numbers; a NaN/Inf score has no rank")
     n = len(scores)
     n_pos = sum(labels)
     n_neg = n - n_pos
@@ -1181,6 +1186,10 @@ def average_precision(scores: Sequence[float], labels: Sequence[int]) -> Optiona
     labels = [int(bool(v)) for v in labels]
     if len(scores) != len(labels):
         raise ValueError(f"score/label length mismatch: {len(scores)} vs {len(labels)}")
+    if any(not math.isfinite(s) for s in scores):
+        # Same order-dependence as roc_auc: NaN has no threshold position.
+        raise ValueError("average_precision scores must be finite numbers; "
+                         "a NaN/Inf score has no rank")
     n_pos = sum(labels)
     if n_pos == 0:
         return None
