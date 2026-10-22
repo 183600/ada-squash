@@ -126,15 +126,21 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
                 'per_seed_delta': {str(seed): value for seed, value in deltas.items()},
                 'paired_delta_std': None if stats is None else stats['std'],
             })
-    if test is not None and test.get('df') and isinstance(test.get('ci_low'), (int, float)):
-        half = (test['ci_high'] - test['ci_low']) / 2.0
-        critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
-        if critical > 0.0:
-            stderr = half / critical
+    if (test is not None and test.get('df') and len(common) >= 2):
+        row_seeds = _seed_means(row)
+        ref_seeds = _seed_means(reference)
+        deltas = [float(row_seeds[seed] - ref_seeds[seed])
+                  for seed in common if seed in row_seeds and seed in ref_seeds]
+        stats = mean_std_stderr(deltas)
+        if stats is not None and stats['stderr'] is not None:
+            # Use the paired-delta stderr directly. Inverting the CI would
+            # require the test to have been run at this `alpha`; `_paired_row_test`
+            # uses its own default, so the inferred stderr would be wrong
+            # whenever the caller overrides the significance level.
             out['minimum_detectable_delta_95_power80'] = (
                 student_t_ppf(1.0 - alpha, float(test['df']))
                 + student_t_ppf(power, float(test['df']))
-            ) * stderr
+            ) * stats['stderr']
     return out
 
 
@@ -1714,7 +1720,8 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
         })
         if len(common) >= 2:
             test = paired_t_one_sided([row_seeds[seed] for seed in common],
-                                      [seed_ce[seed] for seed in common])
+                                      [seed_ce[seed] for seed in common],
+                                      alpha=alpha)
             entry.update({
                 'p_one_sided_tuned_simple': test['p_one_sided'],
                 'delta_seed_mean_tuned_simple': test['mean_delta'],
