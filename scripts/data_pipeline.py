@@ -564,6 +564,28 @@ class DocumentCleaner:
         return dict(self.stats)
 
 
+def _iter_dataset_examples(ds):
+    """Yield one example at a time from a stream without DataLoader sharding.
+
+    HuggingFace `IterableDataset.__iter__` already splits its shards across
+    DataLoader workers. Iterating it directly here and then applying this
+    class's own worker filter would hand each worker only a fraction of its
+    assigned source (and the union would lose documents). `IterableDataset.iter`
+    is the non-worker-sharded iteration API, so flatten its one-example batches
+    back to documents and leave the routing to `PackedStream`.
+    """
+    if not hasattr(ds, 'iter') or not hasattr(ds, '_ex_iterable'):
+        yield from ds
+        return
+    for batch in ds.iter(batch_size=1):
+        if not isinstance(batch, dict) or not batch:
+            yield batch
+            continue
+        columns = list(batch.values())
+        for i in range(len(columns[0])):
+            yield {key: values[i] for key, values in batch.items()}
+
+
 class PackedStream(IterableDataset):
     """Pack cleaned documents of one split into fixed-length LM windows.
 
@@ -683,7 +705,7 @@ class PackedStream(IterableDataset):
 
         shard_by_hash = self.cleaner.dedup and n_workers > 1
         i = 0
-        for ex in self.ds:
+        for ex in _iter_dataset_examples(self.ds):
             ex_hash = None
             if shard_by_hash:
                 ex_hash = _dedup_hash(ex)
