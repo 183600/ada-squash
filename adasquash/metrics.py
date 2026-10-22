@@ -798,7 +798,7 @@ def scale_replication_summary(observations: Sequence[dict],
     min_scales = int(min_scales)
     if min_scales < 2:
         raise ValueError('min_scales must be >= 2; one scale cannot replicate')
-    by_metric: dict[str, dict[tuple[str, str], dict]] = {}
+    by_metric: dict[str, dict[tuple[str, str, str], dict]] = {}
     duplicates: list[dict] = []
     excluded: list[dict] = []
     for index, obs in enumerate(observations or []):
@@ -807,6 +807,14 @@ def scale_replication_summary(observations: Sequence[dict],
             continue
         scale = str(obs.get('scale') or '').strip()
         metric = str(obs.get('metric') or '').strip() or 'default'
+        # A comparison script can emit many pairwise contrasts per scale and
+        # metric (the default FP8 run has 15 pairs). Grouping only by
+        # (scale, metric) overwrites all but the last pair, so the reported
+        # sign can even belong to a different contrast than the certified one.
+        # An explicit `contrast` keeps each pair as its own replication set;
+        # callers without one retain the original (scale, metric) identity.
+        contrast = str(obs.get('contrast') or '').strip()
+        bucket_id = f'{metric} [{contrast}]' if contrast else metric
         delta = obs.get('delta')
         if not scale:
             excluded.append({'index': index, 'reason': 'missing scale'})
@@ -816,18 +824,25 @@ def scale_replication_summary(observations: Sequence[dict],
             excluded.append({'index': index, 'scale': scale, 'metric': metric,
                              'reason': f'non-finite delta {delta!r}'})
             continue
-        key = (scale, metric)
+        key = (scale, metric, contrast)
         record = {
             'scale': scale,
             'metric': metric,
+            'contrast': contrast or None,
             'delta': float(delta),
             'certified': bool(obs.get('certified')),
             'n_seeds': obs.get('n_seeds'),
             'p': obs.get('p_one_sided', obs.get('p')),
         }
-        bucket = by_metric.setdefault(metric, {})
+        bucket = by_metric.setdefault(bucket_id, {})
         if key in bucket:
-            duplicates.append({'scale': scale, 'metric': metric})
+            # A duplicate is one underlying observation, not another scale.
+            # Keep the first and expose both values instead of overwriting.
+            duplicates.append({'scale': scale, 'metric': metric,
+                               'contrast': contrast or None,
+                               'kept_delta': bucket[key]['delta'],
+                               'duplicate_delta': float(delta)})
+            continue
         bucket[key] = record
 
     per_metric: dict[str, dict] = {}
@@ -854,6 +869,8 @@ def scale_replication_summary(observations: Sequence[dict],
         direction_consistent = (len(set(signs)) == 1
                                 and signs[0] in ('negative', 'positive'))
         per_metric[metric] = {
+            'metric': records[0]['metric'] if records else metric,
+            'contrast': records[0]['contrast'] if records else None,
             'scales': sorted(record['scale'] for record in records),
             'n_scales': len(records),
             'deltas': {record['scale']: record['delta'] for record in records},

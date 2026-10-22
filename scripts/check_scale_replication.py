@@ -78,12 +78,15 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
     return {
         'scale': entry.get('a_scale') or entry.get('scale') or 'unknown',
         'metric': entry.get('metric') or metric or 'default',
+        'contrast': f'{a} vs {b}',
         'delta': delta,
         # A reversed pair tests the opposite one-sided hypothesis; keep it as a
         # descriptive sign observation but never inherit its certification.
         'certified': bool(entry.get('significant')) if orientation == 'candidate_vs_reference' else False,
         'p_one_sided': entry.get('p_holm', entry.get('p_one_sided')) if orientation == 'candidate_vs_reference' else None,
-        'n_seeds': entry.get('n_shared_train_seeds') or entry.get('n_seeds'),
+        'n_seeds': (entry.get('n_shared_train_seeds')
+                    if entry.get('n_shared_train_seeds') is not None
+                    else entry.get('n_shared_seeds', entry.get('n_seeds'))),
         'orientation': orientation,
     }
 
@@ -114,6 +117,7 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
         out.append({
             'scale': row.get('scale') or data.get('scale') or 'unknown',
             'metric': row.get('metric') or metric or 'default',
+            'contrast': f"{row.get('norm')} vs {row.get('reference')}",
             'delta': delta,
             'certified': (bool(row.get('beats_reference_significantly'))
                           if orientation == 'candidate_vs_reference' else False),
@@ -143,7 +147,21 @@ def build_observations(kind: str, scales: list[tuple[str, Path]],
                        metric: str | None) -> tuple[list[dict], list[dict]]:
     observations = []
     sources = []
+    seen_labels = set()
+    seen_paths = set()
     for label, path in scales:
+        # Two --scale labels that point at the same file are one underlying
+        # run, not two independent scales. Deduplicate by resolved path (and
+        # label) before the artifact's own scale is prefixed, otherwise the
+        # same result can manufacture a multi-scale replication.
+        resolved = path.resolve()
+        if label in seen_labels or resolved in seen_paths:
+            print(f'[scale] ignoring duplicate scale input {label}={path} '
+                  f'(same label or artifact already provided); one run is one scale',
+                  file=sys.stderr)
+            continue
+        seen_labels.add(label)
+        seen_paths.add(resolved)
         data = load_comparison(kind, path)
         if kind == 'generic':
             records = data.get('observations') if isinstance(data, dict) else data

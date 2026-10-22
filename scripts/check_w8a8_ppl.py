@@ -498,6 +498,7 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
     for t in tests:
         if t.get('same_scale') and t.get('mean_delta') is not None:
             scale_obs.append({'scale': t.get('a_scale'), 'metric': t.get('metric'),
+                              'contrast': f"{t.get('a')} vs {t.get('b')}",
                               'delta': t.get('mean_delta'),
                               'certified': bool(t.get('significant')),
                               'p_one_sided': t.get('p_holm', t.get('p_one_sided')),

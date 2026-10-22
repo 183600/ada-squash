@@ -1133,6 +1133,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 and entry.get('test') is not None
                 and entry.get('excluded_from_family') is None):
             scale_obs.append({'scale': entry.get('scale'), 'metric': entry.get('metric'),
+                              'contrast': entry.get('name'),
                               'delta': entry.get('delta_vs_reference'),
                               'certified': bool(entry.get('beats_reference_significantly')),
                               'p_one_sided': entry.get('p_one_sided_holm',

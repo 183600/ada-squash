@@ -631,6 +631,7 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
     for t in tests:
         if t.get('same_scale') and t.get('mean_delta') is not None:
             scale_obs.append({'scale': t.get('a_scale'), 'metric': t.get('metric'),
+                              'contrast': f"{t.get('a')} vs {t.get('b')}",
                               'delta': t.get('mean_delta'),
                               'certified': bool(t.get('significant')),
                               'p_one_sided': t.get('p_holm', t.get('p_one_sided')),
