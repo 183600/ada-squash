@@ -709,8 +709,11 @@ def main():
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check')
     p.add_argument('--force', action='store_true', help='rerun trials even if a summary already exists')
     args = p.parse_args()
-    for flag, value in (('--batch-size', args.batch_size),
+    for flag, value in (('--max-steps', args.max_steps),
+                        ('--batch-size', args.batch_size),
                         ('--seq-len', args.seq_len),
+                        ('--val-batches', args.val_batches),
+                        ('--curve-batches', args.curve_batches),
                         ('--log-every', args.log_every),
                         ('--stats-every', args.stats_every)):
         if value < 1:
