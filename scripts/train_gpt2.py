@@ -23,7 +23,7 @@ from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import mean_ci, mean_std_stderr
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.norms import NORM_REGISTRY
-from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds, training_recipe_mismatches
 from scripts.data_pipeline import build_dataloader, configure_data_options, _is_pinned_revision
 
 def load_yaml_config(path: str) -> dict:
@@ -655,6 +655,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     seeds = [int(s) for s in seeds]
     per_seed = []
     rejections = []
+    reference_recipe = None
+    reference_context = None
     for seed in seeds:
         run_dir = seed_run_dir(base_dir, seed)
         record = {
@@ -683,12 +685,18 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                                  'the run did not complete')
             else:
                 recorded = manifest.get('hyperparameters')
-                if isinstance(recorded, dict):
+                if not isinstance(recorded, dict):
+                    reject_reason = ('run_manifest.json has no hyperparameters block; a '
+                                     'finished run must record the recipe it trained with')
+                else:
                     expected = {'model': model, 'norm': norm, 'seed': int(seed)}
+                    # A missing key is unknown, not the expected value: a
+                    # manifest that cannot say which model/norm/seed it ran
+                    # cannot certify this aggregate.
                     mismatches = {
                         key: [wanted, recorded.get(key)]
                         for key, wanted in expected.items()
-                        if recorded.get(key) is not None and recorded.get(key) != wanted
+                        if recorded.get(key) != wanted
                     }
                     if mismatches:
                         reject_reason = ('recorded model/norm/seed differs from this aggregate: '
@@ -696,6 +704,27 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                 if reject_reason is None and (not isinstance(results, dict) or not results):
                     reject_reason = ('run_manifest.json has no results block; a finished '
                                      'run must record its results')
+                if reject_reason is None and reference_recipe is not None:
+                    recipe_mismatches = training_recipe_mismatches(reference_recipe, recorded)
+                    if recipe_mismatches:
+                        reject_reason = ('recorded training recipe differs from seed '
+                                         f'{reference_recipe.get("seed")}: '
+                                         + json.dumps(recipe_mismatches, sort_keys=True))
+                if reject_reason is None:
+                    context = {'final_step': results.get('final_step'),
+                               'final_val_step': results.get('final_val_step')}
+                    if reference_context is not None:
+                        context_mismatches = {
+                            key: [reference_context[key], value]
+                            for key, value in context.items()
+                            if reference_context[key] != value}
+                        if context_mismatches:
+                            reject_reason = ('run ended at a different training step than '
+                                             f'seed {reference_recipe.get("seed")}: '
+                                             + json.dumps(context_mismatches, sort_keys=True))
+                    if reject_reason is None and reference_recipe is None:
+                        reference_recipe = recorded
+                        reference_context = context
         if reject_reason is not None:
             record['rejected'] = reject_reason
             rejections.append({'seed': int(seed), 'path': str(run_dir / 'run_manifest.json'),
