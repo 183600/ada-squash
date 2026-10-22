@@ -899,7 +899,8 @@ def _moe_cell_replicated(cell: dict) -> bool:
 
 def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
     """Cross-cell data-snapshot guard for a MoE norm comparison."""
-    synthetic = True
+    has_real = False
+    has_synthetic = False
     keys = set()
     unknown = []
     for norm, cell in cells.items():
@@ -924,8 +925,9 @@ def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
                 continue
             dataset = provenance.get('dataset')
             if not dataset:
+                has_synthetic = True
                 continue
-            synthetic = False
+            has_real = True
             versions = {
                 'dataset_revision_resolved': provenance.get('dataset_revision_resolved'),
                 'tokenizer_revision_resolved': provenance.get('tokenizer_revision_resolved'),
@@ -937,7 +939,11 @@ def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
     if unknown:
         return False, (f'cells {unknown} have missing or unpinned data provenance, '
                        'so the norm contrast is not tied to one snapshot')
-    if synthetic:
+    if has_real and has_synthetic:
+        return False, ('the compared cells mix real-data and synthetic-corpus runs; '
+                       'their losses do not share a data-generating process, so no '
+                       'norm contrast can be certified')
+    if has_synthetic:
         return True, ('synthetic corpus generated deterministically from seed '
                       '(+1 for validation); no external snapshot to pin')
     if len(keys) > 1:
