@@ -1667,16 +1667,25 @@ def main():
             else:
                 print(f'[resume][warn] {best_path} has no finite recorded '
                       'val_loss; it cannot seed checkpoint selection')
-        elif resumed_best and resume_ckpt.get('val_loss') is not None:
+        elif resumed_best:
             # Resume from a best checkpoint into a fresh output directory:
             # keep that selection artifact there, otherwise the final test
             # would silently restore ckpt_final.pt while the manifest still
-            # reported the historical best.
-            best_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_torch_save(resume_ckpt, best_path)
-            best_candidates.append({'val_loss': float(resume_ckpt['val_loss']),
-                                    'step': int(resume_ckpt.get('step', 0))})
-            print(f'[resume] copied the resumed best checkpoint to {best_path}')
+            # reported the historical best. A non-finite/boolean loss is not a
+            # measurement and must not seed selection or be copied as "best".
+            resume_loss = resume_ckpt.get('val_loss')
+            if (isinstance(resume_loss, (int, float))
+                    and not isinstance(resume_loss, bool)
+                    and math.isfinite(float(resume_loss))):
+                best_path.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_torch_save(resume_ckpt, best_path)
+                best_candidates.append({'val_loss': float(resume_loss),
+                                        'step': int(resume_ckpt.get('step', 0))})
+                print(f'[resume] copied the resumed best checkpoint to {best_path}')
+            else:
+                print(f'[resume][warn] {best_path} cannot be seeded from the resumed '
+                      f'best checkpoint: val_loss={resume_loss!r} is not a finite '
+                      'number')
         if best_candidates:
             prior_best = min(best_candidates, key=lambda c: c['val_loss'])
             best_val_loss = float(prior_best['val_loss'])
@@ -2279,7 +2288,9 @@ def main():
             # weights are exactly the ones validated at this step. Keep that
             # known held-out number instead of reporting final_val_loss=None.
             resumed_val = resume_ckpt.get('val_loss')
-            if isinstance(resumed_val, (int, float)) and math.isfinite(float(resumed_val)):
+            if (isinstance(resumed_val, (int, float))
+                    and not isinstance(resumed_val, bool)
+                    and math.isfinite(float(resumed_val))):
                 last_val_loss = float(resumed_val)
                 last_val_step = step
         has_best_val = math.isfinite(best_val_loss)
