@@ -272,17 +272,22 @@ def efficiency_verdict(
     cost_n = None
     invalid_n = None
     if cost_ratio_n is not None:
-        try:
-            candidate_n = int(cost_ratio_n)
-        except (TypeError, ValueError, OverflowError):
+        # Validate integrality on the numeric value, not only on Python float:
+        # Decimal/Fraction/NumPy floats are real measurements too, and
+        # int(2.5) would silently turn a fractional round count into 2 and
+        # let it certify a t-interval.
+        if isinstance(cost_ratio_n, bool):
             invalid_n = repr(cost_ratio_n)
         else:
-            if isinstance(cost_ratio_n, float) and not math.isfinite(cost_ratio_n):
-                invalid_n = repr(cost_ratio_n)
-            elif isinstance(cost_ratio_n, float) and not cost_ratio_n.is_integer():
+            try:
+                candidate_n = float(cost_ratio_n)
+            except (TypeError, ValueError, OverflowError):
                 invalid_n = repr(cost_ratio_n)
             else:
-                cost_n = candidate_n
+                if not math.isfinite(candidate_n) or not candidate_n.is_integer():
+                    invalid_n = repr(cost_ratio_n)
+                else:
+                    cost_n = int(candidate_n)
     enough_rounds = cost_n is None or cost_n >= 2
     if cost_se is not None:
         verdict["cost_ratio_stderr"] = cost_se
