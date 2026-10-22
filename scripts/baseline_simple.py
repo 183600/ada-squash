@@ -362,15 +362,25 @@ def evaluate_seed(seed: int, args, device: str) -> dict:
                                                        args.max_jump, outlier_id)['ce_nats']
     return record
 
+def _perplexity(mean_nats: float) -> float:
+    """exp(CE); a finite but huge CE stays visible instead of crashing."""
+    try:
+        return math.exp(float(mean_nats))
+    except OverflowError:
+        return math.inf
+
+
 def aggregate_records(records: list, names) -> dict:
     out = {}
     for name in names:
-        stats = mean_std_stderr([r['predictors'][name] for r in records
-                                 if isinstance(r['predictors'].get(name), (int, float))])
+        values = [r['predictors'].get(name) for r in records
+                  if isinstance(r.get('predictors'), dict)
+                  and isinstance(r['predictors'].get(name), (int, float))]
+        stats = mean_std_stderr(values)
         out[name] = None if stats is None else {
             'mean_ce_nats': stats['mean'], 'std_ce_nats': stats['std'],
             'stderr_ce_nats': stats['stderr'], 'n_seeds': stats['n'],
-            'perplexity': math.exp(stats['mean']),
+            'perplexity': _perplexity(stats['mean']),
         }
     return out
 
