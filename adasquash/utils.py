@@ -35,8 +35,14 @@ class MaxAbsMeter:
                     # as NaN so the corruption is visible instead of being
                     # masked by a finite running maximum.
                     v = torch.full((), float('nan'), dtype=v.dtype, device=v.device)
+                # A peak tensor created under torch.inference_mode() cannot be
+                # updated in place once the meter is used outside it. Cloning
+                # drops the inference flag while keeping the running maximum.
+                if (self._peak is not None and self._peak.is_inference()
+                        and not torch.is_inference_mode_enabled()):
+                    self._peak = self._peak.clone()
                 if self._peak is None:
-                    self._peak = v.clone() if torch.isfinite(v) else v.clone()
+                    self._peak = v.clone()
                 elif self._peak.dtype != v.dtype or self._peak.device != v.device:
                     self._peak = self._peak.to(dtype=torch.promote_types(self._peak.dtype, v.dtype), device=v.device)
                 torch.maximum(self._peak, v, out=self._peak)
@@ -54,7 +60,12 @@ def release_kurtosis_workspaces() -> None:
 def _kurtosis_workspace_get_or_create(key: tuple, n: int, dtype: torch.dtype, device) -> torch.Tensor:
     """Get or create a workspace buffer with LRU eviction."""
     buf = _KURTOSIS_WORKSPACES.get(key)
-    if buf is None or buf.numel() < n:
+    # A workspace allocated under torch.inference_mode() becomes an inference
+    # tensor; reusing it as an `out=` target outside that mode raises. It is
+    # only scratch, so drop it and allocate a normal buffer instead.
+    stale_inference = (buf is not None and buf.is_inference()
+                       and not torch.is_inference_mode_enabled())
+    if buf is None or buf.numel() < n or stale_inference:
         buf = torch.empty(n, dtype=dtype, device=device)
         if len(_KURTOSIS_WORKSPACES) >= _KURTOSIS_WORKSPACES_MAX_ENTRIES:
             # LRU eviction: remove oldest entry (first inserted)
