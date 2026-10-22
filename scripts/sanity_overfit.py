@@ -532,8 +532,35 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--output", default="runs/sanity_overfit.json")
     args = p.parse_args()
+    for name, value, minimum in (
+        ("--n-experts", args.n_experts, 1),
+        ("--n-layers", args.n_layers, 1),
+        ("--dim", args.dim, 1),
+        ("--n-heads", args.n_heads, 1),
+        ("--seq-len", args.seq_len, 1),
+        ("--batch-size", args.batch_size, 1),
+        ("--num-workers", args.num_workers, 0),
+    ):
+        if value < minimum:
+            p.error(f"{name} {value} must be >= {minimum}")
+    if args.vocab_size is not None and args.vocab_size < 1:
+        p.error(f"--vocab-size {args.vocab_size} must be >= 1")
+    if args.num_documents is not None and args.num_documents < 1:
+        p.error(f"--num-documents {args.num_documents} must be >= 1")
     if args.dim % args.n_heads:
         p.error(f"--dim {args.dim} is not divisible by --n-heads {args.n_heads}")
+    if not math.isfinite(args.lr) or args.lr <= 0.0:
+        p.error(f"--lr {args.lr} must be finite and positive")
+    if not math.isfinite(args.grad_clip) or args.grad_clip < 0.0:
+        p.error(f"--grad-clip {args.grad_clip} must be finite and >= 0")
+    if not math.isfinite(args.baseline_margin) or args.baseline_margin < 0.0:
+        p.error(f"--baseline-margin {args.baseline_margin} must be finite and >= 0")
+    if not math.isfinite(args.alpha_jitter) or args.alpha_jitter < 0.0:
+        p.error(f"--alpha-jitter {args.alpha_jitter} must be finite and >= 0")
+    for name, value in (("--loss-threshold", args.loss_threshold),
+                        ("--acc-threshold", args.acc_threshold)):
+        if value is not None and not math.isfinite(value):
+            p.error(f"{name} {value} must be finite")
     # Step 1 is the initial-loss reference of the whole check, so a run
     # without at least one step has nothing to compare against (`checks
     # ["loss_decreased"]` would compare against None).
