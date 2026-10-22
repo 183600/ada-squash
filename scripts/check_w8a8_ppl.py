@@ -482,10 +482,18 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
         stats = mean_std_stderr(vals)
         train_vals = list(_train_seed_metric_values(r, metric).values())
         train_stats = mean_std_stderr(train_vals)
+        probe_mean = stats['mean'] if stats else None
+        train_mean = train_stats['mean'] if train_stats else None
+        # The headline number must be the sample the p-value/CI is computed
+        # from: with >= 2 training seeds that is the training-seed mean, not
+        # the probe-seed mean (which weights each checkpoint equally).
+        headline_mean = (train_mean if len(train_vals) >= 2 and train_mean is not None
+                         else probe_mean)
         d = {'ckpt': label, 'metric': metric, 'n_seeds': len(vals),
              'n_train_seeds': len(train_vals),
-             'mean_drop_pct': stats['mean'] if stats else None,
-             'mean_drop_pct_across_train_seeds': train_stats['mean'] if train_stats else None,
+             'mean_drop_pct': headline_mean,
+             'mean_drop_pct_across_probe_seeds': probe_mean,
+             'mean_drop_pct_across_train_seeds': train_mean,
              'direction': f'H1: mean({metric}) > 0 (quantization measurably hurts)'}
         if r.get('protocol_consistent') is False:
             d.update({'basis': 'protocol_mismatch', 'certifiable': False,
@@ -796,7 +804,9 @@ def main():
         if not d.get('certifiable'):
             verdict = (f'descriptive only ({d.get("n_train_seeds", 0)} training '
                        'seed(s); >= 3 required)')
-        print(f"[w8a8][compare] {d['ckpt']}: mean drop {d['mean_drop_pct']:.4f}% pts, 95% CI [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}], Holm p={d['p_holm']:.4f} (n={d['n_seeds']}, basis={d['basis']}) -> {verdict}")
+        n_used = (d.get('n_train_seeds') if d.get('basis') == 'train_seed_means'
+                  else d.get('n_seeds'))
+        print(f"[w8a8][compare] {d['ckpt']}: mean drop {d['mean_drop_pct']:.4f}% pts, 95% CI [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}], Holm p={d['p_holm']:.4f} (n={n_used}, basis={d['basis']}) -> {verdict}")
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
     manifest['seeds'] = seeds
