@@ -10,14 +10,24 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided
-from adasquash.model import MLP, build_gpt_124m
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
+                               paired_t_one_sided, scale_replication_summary)
+from adasquash.model import (MLP, build_gpt_124m, build_gpt_350m,
+                             build_llama_tiny_1b)
 from adasquash.repro import (TRAINING_RECIPE_KEYS, collect_run_metadata, file_fingerprint,
                              finish_metadata, save_run_manifest, set_all_seeds,
                              training_recipe_mismatches)
 from adasquash.utils import KurtosisMeter, markov_batch
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
+# The FP8 probe must not certify a mechanism from one architecture. These are
+# the builder targets accepted by --models (random-init mode); each produces a
+# distinct shape label in comparison.json's scale_replication block.
+_FP8_MODEL_BUILDERS = {
+    'gpt2-124m': build_gpt_124m,
+    'gpt2-350m': build_gpt_350m,
+    'llama-1b': build_llama_tiny_1b,
+}
 # One probe draw is one sample: these per-norm quantities are aggregated as
 # Mean +/- Std over the `--seeds` replications, with the per-seed records kept
 # so an unstable seed cannot hide behind a favorable mean.
@@ -400,6 +410,27 @@ def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
         out['checkpoint.step'] = [step_a, step_b]
     return out
 
+def _result_scale(result: dict, index: int) -> str:
+    """A stable architecture label for one probe result.
+
+    Checkpoint probes carry the full protocol shape; random-init probes carry
+    the builder's model name and shape. The label is what the cross-scale
+    summary groups on, so it must distinguish widths/depths without depending
+    on the norm being probed. Results without either (e.g. hand-built test
+    fixtures) share the single `unknown` scale rather than inventing one
+    scale per row.
+    """
+    protocol = result.get('protocol') if isinstance(result, dict) else None
+    shape = protocol.get('shape') if isinstance(protocol, dict) else None
+    shape = shape or (result.get('shape') if isinstance(result, dict) else None)
+    if isinstance(shape, dict) and shape:
+        return json.dumps(shape, sort_keys=True)
+    model = result.get('model') if isinstance(result, dict) else None
+    n_layers = result.get('n_layers') if isinstance(result, dict) else None
+    if model is not None or n_layers is not None:
+        return f"{model or 'model'}:L{n_layers}"
+    return 'unknown'
+
 def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alpha: float=0.05,
                       trained: bool=False) -> dict:
     """Paired, Holm-adjusted significance of one norm's FP8 metrics vs another's.
@@ -431,7 +462,7 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
       shared draws; two (df = 1) are descriptive. The standing caveat is that
       a random init says nothing about trained weights.
     """
-    labels = [str(r.get('norm') or r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
+    labels = [str(r.get('label') or r.get('norm') or r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
     tests = []
     for metric in metrics:
         for i in range(len(results)):
@@ -440,9 +471,28 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                 b_train = _train_seed_metric_values(results[j], metric)
                 shared_train = sorted(set(a_train) & set(b_train))
                 shared, av, bv = _shared_seed_samples(results[i], results[j], metric)
+                a_scale = _result_scale(results[i], i)
+                b_scale = _result_scale(results[j], j)
                 t = {'a': labels[i], 'b': labels[j], 'metric': metric,
+                     'a_scale': a_scale, 'b_scale': b_scale,
+                     'same_scale': a_scale == b_scale,
                      'direction': f'negative mean_delta means A has lower {metric} (more FP8-stable)',
                      'a_train_seeds': sorted(a_train), 'b_train_seeds': sorted(b_train)}
+                if a_scale != b_scale:
+                    # A cross-scale pair confounds the norm with width/depth;
+                    # record the number but never certify it as a norm effect.
+                    t.update({'basis': 'cross_scale', 'certifiable': False,
+                              'significant': False, 'p_one_sided': None,
+                              'mean_delta': ((sum(av) - sum(bv)) / len(shared)
+                                             if shared else None),
+                              'n_shared_seeds': len(shared),
+                              'shared_seeds': shared,
+                              'reason': ('the two arms are different model shapes; a '
+                                         'cross-scale delta is not a same-scale norm effect '
+                                         '(run both norms at each scale and use the '
+                                         'scale_replication block)')})
+                    tests.append(t)
+                    continue
                 if trained:
                     arm_problems = [f'{labels[idx]} mixes training recipes across its checkpoints'
                                     for idx, arm in ((i, results[i]), (j, results[j]))
@@ -516,6 +566,15 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
     for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
         t['p_holm'] = p_adj
         t['significant'] = bool(t.get('certifiable') and p_adj is not None and p_adj < alpha)
+    scale_obs = []
+    for t in tests:
+        if t.get('same_scale') and t.get('mean_delta') is not None:
+            scale_obs.append({'scale': t.get('a_scale'), 'metric': t.get('metric'),
+                              'delta': t.get('mean_delta'),
+                              'certified': bool(t.get('significant')),
+                              'p_one_sided': t.get('p_holm', t.get('p_one_sided')),
+                              'n_seeds': t.get('n_shared_seeds')})
+    scale_replication = scale_replication_summary(scale_obs)
     ranking = {}
     for metric in metrics:
         rows = []
@@ -536,11 +595,18 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
     return {'metrics': list(metrics), 'alpha': alpha, 'trained': trained,
             'pairing': ('probe draws are paired across norms by probe seed and (when available) by training seed; '
                         'certification requires >= 3 shared training seeds per arm and otherwise stays descriptive'),
+            'scale_replication': scale_replication,
             'ranking': ranking, 'tests': tests}
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--norms', nargs='+', default=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
+    p.add_argument('--models', nargs='+', default=['gpt2-124m'],
+                   choices=sorted(_FP8_MODEL_BUILDERS),
+                   help='random-init architectures to probe (one run per model; each norm is '
+                        'measured at every model and comparison.json records whether a '
+                        'cross-norm direction replicated across scales). Not used with --ckpt, '
+                        'where the checkpoint defines the scale.')
     p.add_argument('--probe', default='markov', choices=['markov', 'random'], help="probe corpus. 'random' is uniform token ids: it has no next-token structure, so the activation magnitudes below describe embedding noise rather than a trained model's activations (kept only for parity)")
     p.add_argument('--ckpt', nargs='+', default=None, help='one entry per --norms entry; a plain checkpoint path probes the trained weights instead of a fresh random init. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-norm certification then pairs training seeds, so >= 3 shared training seeds across the compared norms are required for comparison.json to certify a winner')
     p.add_argument('--n-states', type=int, default=64, help="state count of the synthetic 'markov' probe")
@@ -559,6 +625,9 @@ def main():
                 'row and would add duplicate tests to the Holm family')
     if args.ckpt and len(args.ckpt) != len(args.norms):
         p.error(f'--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}')
+    if args.ckpt and len(args.models) > 1:
+        p.error('--models is for random-init probing; with --ckpt the checkpoint defines the '
+                'model shape, so pass at most the default --models value')
     for flag, value in (('--batch-size', args.batch_size), ('--seq-len', args.seq_len)):
         if value < 1:
             p.error(f'{flag} {value} must be >= 1')
@@ -613,9 +682,20 @@ def main():
                             'each training run may contribute to exactly one norm')
                 seen_paths[key] = group_index
     results = []
-    for i, norm in enumerate(args.norms):
+    # Random-init mode can sweep several architectures in one invocation;
+    # checkpoint mode keeps one arm list (the checkpoint defines the scale).
+    model_names = [None] if args.ckpt else list(args.models)
+    multi_model = len(model_names) > 1
+    for arm_index, (model_name, norm) in enumerate(
+            (model_name, norm) for model_name in model_names for norm in args.norms):
+        i = args.norms.index(norm)
+        # A multi-model arm gets a unique label so the comparison cannot
+        # silently pair the same norm name across two architectures.
+        label = f'{norm}@{model_name}' if multi_model else norm
+        arm_model = model_name
+        arm_cfg = None
         if not args.ckpt:
-            print(f'[fp8] WARNING: {norm} probed at a fresh random init. layerscale_init=1e-5 leaves the residual stream at the embedding table, so every norm reports the same pre-norm statistics and this row says nothing about the layer. Pass --ckpt <path> (one per --norms entry) to measure trained weights.', file=sys.stderr)
+            print(f'[fp8] WARNING: {label} probed at a fresh random init. layerscale_init=1e-5 leaves the residual stream at the embedding table, so every norm reports the same pre-norm statistics and this row says nothing about the layer. Pass --ckpt <path> (one per --norms entry) to measure trained weights.', file=sys.stderr)
         else:
             from scripts.eval_downstream import load_ckpt
         per_ckpt = []
@@ -626,6 +706,8 @@ def main():
                 ckpt_model, ckpt_args = load_ckpt(ckpt_path, device=device)
                 raw_seed = (ckpt_args or {}).get('seed')
                 train_seed = int(raw_seed) if isinstance(raw_seed, int) else None
+                arm_model = (ckpt_args or {}).get('model')
+                arm_cfg = getattr(ckpt_model, 'cfg', None)
             per_seed_ckpt = []
             for seed in seeds:
                 set_all_seeds(seed)
@@ -633,8 +715,10 @@ def main():
                 if ckpt_model is not None:
                     model = ckpt_model
                 else:
-                    model = build_gpt_124m(norm_name=norm, init=False).to(device)
+                    model = _FP8_MODEL_BUILDERS[model_name](
+                        norm_name=norm, init=False).to(device)
                     model.reset_parameters(seed)
+                    arm_cfg = model.cfg
                 model.eval()
                 x = make_probe(rng, model.cfg)
                 r = measure_fp8_divergence(model, x, norm)
@@ -683,6 +767,12 @@ def main():
         train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
         r['train_seeds'] = train_seeds
         r['n_train_seeds'] = len(train_seeds)
+        r['label'] = label
+        r['model'] = arm_model
+        if arm_cfg is not None:
+            r['shape'] = {'n_layers': int(arm_cfg.n_layers),
+                          'dim': int(arm_cfg.dim),
+                          'n_heads': int(arm_cfg.n_heads)}
         if args.ckpt:
             r['protocol'] = base_protocol
             r['protocol_consistent'] = not arm_protocol_mismatches
@@ -718,6 +808,20 @@ def main():
     comparison = compare_fp8_norms(results, alpha=args.alpha, trained=bool(args.ckpt))
     comparison_path = out_path.with_name('comparison.json')
     comparison_path.write_text(json.dumps(comparison, indent=2))
+    scale = comparison.get('scale_replication') or {}
+    if scale.get('single_scale_only'):
+        print(f"[fp8][scale] WARNING: this comparison covers {scale.get('n_scales', 0)} "
+              f"model scale(s) ({scale.get('scales')}); a direction that is certified at one "
+              'scale is a scope-limited result, not a multi-scale mechanism claim. Rerun with '
+              '--models at another width/depth (or add checkpoints from another scale) and '
+              'combine the per-scale comparison files.')
+    elif scale.get('multi_scale_certified_metrics'):
+        print(f"[fp8][scale] replicated across scales: "
+              f"{scale.get('multi_scale_certified_metrics')} over {scale.get('scales')}")
+    else:
+        print(f"[fp8][scale] scales={scale.get('scales')} "
+              f"replicated_metrics={scale.get('replicated_metrics')} "
+              f"(no metric certified at >= 2 scales yet)")
     for t in comparison['tests']:
         if t.get('p_one_sided') is None:
             print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: {t['reason']}")

@@ -60,6 +60,7 @@ __all__ = [
     "paired_t_one_sided",
     "paired_z_one_sided",
     "roc_auc",
+    "scale_replication_summary",
     "student_t_cdf",
     "student_t_ppf",
     "welch_t_one_sided",
@@ -515,6 +516,119 @@ def welch_t_one_sided(
     })
     return empty
 
+
+def scale_replication_summary(observations: Sequence[dict],
+                               min_scales: int = 2) -> dict:
+    """Summarise whether an effect replicates across model scales.
+
+    A single-scale result is one observation about one architecture; it is
+    not evidence that the same mechanism wins at another width/depth. This
+    helper is deliberately format-agnostic: callers pass one record per
+    (scale, metric) with the effect sign and whether that scale's test was
+    certified. It reports the direction per scale and only calls an effect
+    replicated when at least `min_scales` distinct scales agree in sign.
+
+    Required keys per observation: `scale` (str), `delta` (finite number)
+    and `certified` (bool). Optional: `metric` (str) and `p`/`p_one_sided`.
+    Records with a non-finite delta are excluded from the sign vote but kept
+    in `excluded` so a failed scale is visible rather than silently dropped.
+    """
+    min_scales = int(min_scales)
+    if min_scales < 2:
+        raise ValueError('min_scales must be >= 2; one scale cannot replicate')
+    by_metric: dict[str, dict[tuple[str, str], dict]] = {}
+    duplicates: list[dict] = []
+    excluded: list[dict] = []
+    for index, obs in enumerate(observations or []):
+        if not isinstance(obs, dict):
+            excluded.append({'index': index, 'reason': 'not an object'})
+            continue
+        scale = str(obs.get('scale') or '').strip()
+        metric = str(obs.get('metric') or '').strip() or 'default'
+        delta = obs.get('delta')
+        if not scale:
+            excluded.append({'index': index, 'reason': 'missing scale'})
+            continue
+        if not (isinstance(delta, (int, float)) and not isinstance(delta, bool)
+                and math.isfinite(float(delta))):
+            excluded.append({'index': index, 'scale': scale, 'metric': metric,
+                             'reason': f'non-finite delta {delta!r}'})
+            continue
+        key = (scale, metric)
+        record = {
+            'scale': scale,
+            'metric': metric,
+            'delta': float(delta),
+            'certified': bool(obs.get('certified')),
+            'n_seeds': obs.get('n_seeds'),
+            'p': obs.get('p_one_sided', obs.get('p')),
+        }
+        bucket = by_metric.setdefault(metric, {})
+        if key in bucket:
+            duplicates.append({'scale': scale, 'metric': metric})
+        bucket[key] = record
+
+    per_metric: dict[str, dict] = {}
+    all_deltas: list[tuple[str, str, float]] = []
+    for metric, bucket in by_metric.items():
+        records = list(bucket.values())
+        signs = []
+        for record in records:
+            if record['delta'] < 0.0:
+                signs.append('negative')
+            elif record['delta'] > 0.0:
+                signs.append('positive')
+            else:
+                signs.append('zero')
+            all_deltas.append((metric, record['scale'], record['delta']))
+        certified = [record for record in records if record['certified']]
+        certified_signs = {
+            ('negative' if record['delta'] < 0.0 else
+             'positive' if record['delta'] > 0.0 else 'zero')
+            for record in certified}
+        direction_consistent = len(set(signs)) == 1
+        per_metric[metric] = {
+            'scales': sorted(record['scale'] for record in records),
+            'n_scales': len(records),
+            'deltas': {record['scale']: record['delta'] for record in records},
+            'signs': {record['scale']: sign for record, sign in zip(records, signs)},
+            'direction_consistent': direction_consistent,
+            'replicated_direction': bool(direction_consistent
+                                         and len(records) >= min_scales),
+            'certified_scales': sorted(record['scale'] for record in certified),
+            'n_certified_scales': len(certified),
+            'multi_scale_certified': bool(direction_consistent
+                                          and len(records) >= min_scales
+                                          and len(certified) >= min_scales
+                                          and len(certified_signs) == 1),
+        }
+
+    scales = sorted({record['scale'] for bucket in by_metric.values()
+                     for record in bucket.values()})
+    overall_signs = {('negative' if delta < 0.0 else 'positive' if delta > 0.0 else 'zero')
+                     for _, _, delta in all_deltas}
+    replicated_metrics = sorted(metric for metric, block in per_metric.items()
+                                if block['replicated_direction'])
+    multi_certified = sorted(metric for metric, block in per_metric.items()
+                             if block['multi_scale_certified'])
+    return {
+        'n_scales': len(scales),
+        'scales': scales,
+        'single_scale_only': len(scales) < min_scales,
+        'min_scales_for_replication': min_scales,
+        'n_observations': len(all_deltas),
+        'direction_signs': sorted(overall_signs),
+        'direction_consistent': len(overall_signs) == 1 and bool(all_deltas),
+        'replicated_metrics': replicated_metrics,
+        'multi_scale_certified_metrics': multi_certified,
+        'per_metric': per_metric,
+        'duplicate_observations': duplicates,
+        'excluded': excluded,
+        'reading': (f'an effect is replicated only when >= {min_scales} distinct model '
+                    'scales agree in sign; it is certified across scales only when >= '
+                    f'{min_scales} scales individually pass their own test. One scale is '
+                    'a scope-limited result, not a mechanism claim.'),
+    }
 
 def f1_from_counts(
     gold_counts: Sequence[int],

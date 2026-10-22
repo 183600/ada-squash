@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import markov_batch
-from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr, paired_t_one_sided
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
+                               paired_t_one_sided, scale_replication_summary)
 from adasquash.model import MLP
 from adasquash.repro import (TRAINING_RECIPE_KEYS, collect_run_metadata, file_fingerprint,
                              finish_metadata, save_run_manifest, set_all_seeds,
@@ -392,6 +393,14 @@ def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
         out['checkpoint.step'] = [step_a, step_b]
     return out
 
+def _result_scale(result: dict, index: int) -> str:
+    """Architecture label for a W8A8 arm from its recorded checkpoint shape."""
+    protocol = result.get('protocol') if isinstance(result, dict) else None
+    shape = protocol.get('shape') if isinstance(protocol, dict) else None
+    if isinstance(shape, dict) and shape:
+        return json.dumps(shape, sort_keys=True)
+    return 'unknown'
+
 def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: float=0.05) -> dict:
     """Paired, Holm-adjusted significance of one checkpoint's PPL drop vs another's.
 
@@ -417,6 +426,7 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
     0.2% drop under a 0.5% seed spread is never sold as a real degradation.
     """
     labels = [str(r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
+    scales = [_result_scale(r, i) for i, r in enumerate(results)]
     tests = []
     for i in range(len(results)):
         for j in range(i + 1, len(results)):
@@ -425,6 +435,8 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
             shared_train = sorted(set(a_train) & set(b_train))
             shared, av, bv = _shared_seed_samples(results[i], results[j], metric)
             t = {'a': labels[i], 'b': labels[j], 'metric': metric,
+                 'a_scale': scales[i], 'b_scale': scales[j],
+                 'same_scale': scales[i] == scales[j],
                  'direction': f'negative mean_delta means A has lower {metric} (more W8A8-robust)',
                  'a_train_seeds': sorted(a_train), 'b_train_seeds': sorted(b_train),
                  'n_shared_train_seeds': len(shared_train), 'shared_train_seeds': shared_train,
@@ -442,12 +454,18 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
             protocol_mismatches = _protocol_pair_mismatches(
                 results[i].get('protocol'), results[j].get('protocol'))
             if protocol_mismatches:
-                t.update({'basis': 'protocol_mismatch', 'certifiable': False,
+                only_shape = all(key.startswith('shape.') for key in protocol_mismatches)
+                t.update({'basis': ('cross_scale' if only_shape else 'protocol_mismatch'),
+                          'certifiable': False,
                           'mean_delta': None, 'p_one_sided': None,
                           'protocol_mismatches': protocol_mismatches,
-                          'reason': ('training recipe/model shape differs between arms, so the '
-                                     'delta is not attributable to the norm/quantization: '
-                                     + json.dumps(protocol_mismatches, sort_keys=True))})
+                          'reason': (('the arms are different model shapes; a cross-scale delta '
+                                      'is not a same-scale norm/quantization effect (add the '
+                                      'same arm pair at each scale and use the '
+                                      'scale_replication block)') if only_shape else
+                                     ('training recipe/model shape differs between arms, so the '
+                                      'delta is not attributable to the norm/quantization: '
+                                      + json.dumps(protocol_mismatches, sort_keys=True)))})
                 tests.append(t)
                 continue
             if len(shared_train) >= 2:
@@ -476,6 +494,16 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
     for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
         t['p_holm'] = p_adj
         t['significant'] = bool(t.get('certifiable') and p_adj is not None and p_adj < alpha)
+    scale_obs = []
+    for t in tests:
+        if t.get('same_scale') and t.get('mean_delta') is not None:
+            scale_obs.append({'scale': t.get('a_scale'), 'metric': t.get('metric'),
+                              'delta': t.get('mean_delta'),
+                              'certified': bool(t.get('significant')),
+                              'p_one_sided': t.get('p_holm', t.get('p_one_sided')),
+                              'n_seeds': t.get('n_shared_train_seeds')
+                              or t.get('n_shared_seeds')})
+    scale_replication = scale_replication_summary(scale_obs)
     degradation = []
     for label, r in zip(labels, results):
         vals = _seed_metric_values(r, metric)
@@ -537,6 +565,7 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
                                                    if train_stats and train_stats['n'] >= 2 else None)})
     ranking.sort(key=lambda row: (row['mean'] is None, row['mean']))
     return {'metric': metric, 'alpha': alpha,
+            'scale_replication': scale_replication,
             'pairing': ('probe batches are paired across arms by probe seed; certification additionally '
                         'requires >= 3 shared training seeds per arm and otherwise stays descriptive'),
             'ranking': ranking, 'pairwise_tests': tests, 'degradation_tests': degradation}
@@ -787,6 +816,19 @@ def main():
     comparison = compare_w8a8_checkpoints(results, alpha=args.alpha)
     comparison_path = out_path.with_name('ppl_comparison.json')
     comparison_path.write_text(json.dumps(comparison, indent=2))
+    scale = comparison.get('scale_replication') or {}
+    if scale.get('single_scale_only'):
+        print(f"[w8a8][scale] WARNING: this comparison covers {scale.get('n_scales', 0)} "
+              f"model scale(s) ({scale.get('scales')}); a certified same-scale result is not a "
+              'multi-scale result. Add an arm pair from another checkpoint shape and rerun, '
+              'or combine the per-scale comparison files.')
+    elif scale.get('multi_scale_certified_metrics'):
+        print(f"[w8a8][scale] replicated across scales: "
+              f"{scale.get('multi_scale_certified_metrics')} over {scale.get('scales')}")
+    else:
+        print(f"[w8a8][scale] scales={scale.get('scales')} "
+              f"replicated_metrics={scale.get('replicated_metrics')} "
+              f"(no metric certified at >= 2 scales yet)")
     for t in comparison['pairwise_tests']:
         if t.get('p_one_sided') is None:
             print(f"[w8a8][compare] {t['a']} vs {t['b']} on {t['metric']}: {t['reason']}")

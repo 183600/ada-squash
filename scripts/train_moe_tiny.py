@@ -17,7 +17,8 @@ from adasquash import build_norm, markov_batch
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.attention import CausalSelfAttention, clear_logit_scratch_cache
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
-                               mean_std_stderr, paired_t_one_sided, student_t_ppf)
+                               mean_std_stderr, paired_t_one_sided, student_t_ppf,
+                               scale_replication_summary)
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, clear_cast_weight_cache, _LayerScaleResidual
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
@@ -861,6 +862,8 @@ _MOE_PROTOCOL_KEYS = (
     'val_batches', 'sanity_check',
 )
 _MOE_COMPARISON_METRICS = ('val_ce', 'final_expert_cv')
+# Shape fields: a mismatch here means a different model scale, not a recipe drift.
+_MOE_SHAPE_KEYS = frozenset({'n_experts', 'dim', 'n_layers', 'n_heads'})
 
 def moe_protocol_signature(args) -> dict:
     """The comparison-relevant slice of the resolved MoE recipe."""
@@ -976,8 +979,10 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
         'data_versions_consistent': None,
         'data_version_basis': None,
         'reference_selection': None,
+        'protocols': protocols,
         'rows': [],
         'multiple_comparison': None,
+        'scale_replication': None,
     }
     replicated_baselines = [
         name for name in out['reference_baselines']
@@ -1015,11 +1020,17 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                       'candidate': protocols.get(norm, {}).get(key)}
                 for key in _MOE_PROTOCOL_KEYS
                 if protocols.get(reference, {}).get(key) != protocols.get(norm, {}).get(key)}
+            shape_only_mismatch = bool(mismatches) and set(mismatches) <= _MOE_SHAPE_KEYS
+            a_shape = {key: protocols.get(norm, {}).get(key) for key in _MOE_SHAPE_KEYS}
+            b_shape = {key: protocols.get(reference, {}).get(key) for key in _MOE_SHAPE_KEYS}
             entry = {
                 'name': f'{norm} vs {reference}',
                 'norm': norm,
                 'reference': reference,
                 'metric': metric,
+                'scale': json.dumps(a_shape, sort_keys=True),
+                'reference_scale': json.dumps(b_shape, sort_keys=True),
+                'same_scale': not shape_only_mismatch,
                 'direction': 'lower_is_better',
                 'val_ce': cell.get('val_ce'),
                 'val_ce_std': cell.get('val_ce_std'),
@@ -1086,8 +1097,13 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                                    else f'described only: {len(common)} shared seed(s)')
             reasons = []
             if mismatches:
-                reasons.append('recipe differs from the reference: '
-                               + ', '.join(sorted(mismatches)))
+                if shape_only_mismatch:
+                    entry['test_basis'] = 'cross_scale'
+                    reasons.append('different model scale, not a same-scale norm effect: '
+                                   + ', '.join(sorted(mismatches)))
+                else:
+                    reasons.append('recipe differs from the reference: '
+                                   + ', '.join(sorted(mismatches)))
             if not data_ok:
                 reasons.append('data snapshot differs/unknown')
             if not _moe_cell_replicated(cell):
@@ -1106,6 +1122,17 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
         entry['p_one_sided_holm'] = p_holm
         entry['beats_reference_significantly'] = bool(
             entry['beats_reference'] and p_holm is not None and p_holm < alpha)
+    scale_obs = []
+    for entry in out['rows']:
+        if (entry.get('same_scale') and entry.get('delta_vs_reference') is not None
+                and entry.get('test') is not None):
+            scale_obs.append({'scale': entry.get('scale'), 'metric': entry.get('metric'),
+                              'delta': entry.get('delta_vs_reference'),
+                              'certified': bool(entry.get('beats_reference_significantly')),
+                              'p_one_sided': entry.get('p_one_sided_holm',
+                                                       entry.get('p_one_sided')),
+                              'n_seeds': len(entry.get('paired_seeds') or [])})
+    out['scale_replication'] = scale_replication_summary(scale_obs)
     out['certified_norms'] = sorted({entry['norm'] for entry in family
                                      if entry['beats_reference_significantly']})
     described = [entry['name'] for entry in out['rows']
@@ -1158,6 +1185,19 @@ def print_moe_norm_comparison(comparison: dict) -> None:
     else:
         print('[moe][compare] no norm certified as beating the reference at '
               f"alpha={comparison['alpha']}")
+    scale = comparison.get('scale_replication') or {}
+    if scale.get('single_scale_only'):
+        print(f"[moe][scale] WARNING: this study covers {scale.get('n_scales', 0)} model "
+              f"scale(s) ({scale.get('scales')}); a MoE norm result at one width/depth/"
+              'expert count is not a multi-scale claim. Rerun at another scale and combine '
+              'the per-scale comparison files before generalizing.')
+    elif scale.get('multi_scale_certified_metrics'):
+        print(f"[moe][scale] replicated across scales: "
+              f"{scale.get('multi_scale_certified_metrics')} over {scale.get('scales')}")
+    else:
+        print(f"[moe][scale] scales={scale.get('scales')} "
+              f"replicated_metrics={scale.get('replicated_metrics')} "
+              f"(no metric certified at >= 2 scales yet)")
 
 def main():
     p = argparse.ArgumentParser()
