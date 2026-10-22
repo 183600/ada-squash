@@ -85,7 +85,11 @@ def _step_aligned_gap_points(train_losses, val_losses, train_steps, val_steps):
     Train and validation are often logged at different cadences, so zipping
     the two lists by position compares losses from different steps. When both
     step arrays are available and parallel to their loss arrays, align them;
-    otherwise return ``None`` so the caller keeps the positional fallback.
+    ``None`` means the step arrays themselves are unusable (the caller may
+    then use the positional fallback). An empty list means the steps were
+    usable but no validation pass had a train loss at or before its step:
+    there is no aligned gap, and inventing a positional pair would compare
+    measurements from different times.
     """
     if (train_steps is None or val_steps is None
             or len(train_steps) != len(train_losses)
@@ -100,14 +104,14 @@ def _step_aligned_gap_points(train_losses, val_losses, train_steps, val_steps):
         if loss is not None and math.isfinite(float(loss))
     )
     if not train_pairs or not val_pairs:
-        return None
+        return []
     train_steps_sorted = [step for step, _ in train_pairs]
     gaps = []
     for val_step, val_loss in val_pairs:
         index = bisect.bisect_right(train_steps_sorted, val_step) - 1
         if index >= 0:
             gaps.append(val_loss - train_pairs[index][1])
-    return gaps or None
+    return gaps
 
 def _trend(rel: Optional[float], min_rel_improvement: float, worsen_rel_tolerance: float) -> str:
     if rel is None:
@@ -304,6 +308,15 @@ def diagnose_train_val_curve(
     gap_tail_len = min(window, len(gap_points))
     gap_change_abs = (gap_points[-1] - gap_points[-gap_tail_len]
                       if gap_tail_len >= 2 else None)
+    # A gap that hovers around zero can flip sign and produce a huge *relative*
+    # change from an absolute move of a few thousandths of a nat. Compare the
+    # absolute move with the loss scale before treating it as gap widening;
+    # this is only a floor on the already-relative statistic, so a genuine
+    # widening keeps its relative magnitude.
+    if (gap_change is not None and gap_change_abs is not None and val_losses):
+        loss_scale = max(abs(val_losses[-1]), 1e-8)
+        if abs(gap_change_abs) < gap_widen * loss_scale:
+            gap_change = 0.0
     gap_change_within_noise = (
         None if val_noise_threshold is None or gap_change_abs is None
         else abs(gap_change_abs) <= val_noise_threshold
@@ -663,10 +676,14 @@ def gradient_health_report(model) -> dict:
     abs_t = []
     sq_t = []
     for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
         if p.grad is None:
-            missing.append(name)
+            # A trainable parameter without a gradient is a wiring failure; a
+            # frozen parameter is not expected to have one, but if a stale or
+            # externally supplied `.grad` exists it is still part of the
+            # census (a non-finite frozen gradient must not be reported as a
+            # clean backward).
+            if p.requires_grad:
+                missing.append(name)
             continue
         g = p.grad.detach()
         n_with_grad += 1
@@ -796,7 +813,8 @@ def classify_nan_stage(evidence: dict) -> dict:
         dtype_bad = (evidence.get("input_integer_ids") is False
                      or evidence.get("target_integer_ids") is False
                      or evidence.get("target_dtype_valid") is False)
-        if evidence.get("target_dtype_valid") is False:
+        if (evidence.get("target_integer_ids") is True
+                and evidence.get("target_dtype_valid") is False):
             diagnosis = ("the targets are an integer tensor but not Long/Byte, "
                          "which cross-entropy requires (cast the targets at the "
                          "data-pipeline boundary)")

@@ -32,6 +32,14 @@ __all__ = [
 DEFAULT_MIN_LOSS_GAIN = 0.01
 DEFAULT_MAX_COST_RATIO = 1.25
 
+
+def _is_boolean_value(value) -> bool:
+    """Python and NumPy booleans (``isinstance(np.bool_, bool)`` is False)."""
+    if isinstance(value, bool):
+        return True
+    cls = type(value)
+    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
 # Two-sided 95% Student-t critical values, by degrees of freedom. Efficiency
 # measurements usually have very few rounds (the benchmark defaults to 3), so
 # the normal 1.96 would report an interval far narrower than the data support.
@@ -266,7 +274,7 @@ def efficiency_verdict(
     if loss_improvement is None or cost_ratio is None:
         verdict["reason"] = "missing loss or cost measurement; nothing to judge"
         return verdict
-    if isinstance(loss_improvement, bool) or isinstance(cost_ratio, bool):
+    if _is_boolean_value(loss_improvement) or _is_boolean_value(cost_ratio):
         verdict["reason"] = (
             "loss improvement/cost ratio is a boolean, not a measurement; "
             "nothing to certify")
@@ -295,7 +303,7 @@ def efficiency_verdict(
         # "no stderr recorded" into an exactly-zero interval and let a noisy
         # benchmark certify a cost it never resolved. Reject it like the
         # boolean gain / component measurements.
-        if isinstance(cost_ratio_stderr, bool):
+        if _is_boolean_value(cost_ratio_stderr):
             invalid_se = repr(cost_ratio_stderr)
             candidate_se = None
         else:
@@ -316,7 +324,7 @@ def efficiency_verdict(
         # Decimal/Fraction/NumPy floats are real measurements too, and
         # int(2.5) would silently turn a fractional round count into 2 and
         # let it certify a t-interval.
-        if isinstance(cost_ratio_n, bool):
+        if _is_boolean_value(cost_ratio_n):
             invalid_n = repr(cost_ratio_n)
         else:
             try:
@@ -373,7 +381,7 @@ def efficiency_verdict(
                 f"{cost_name} cost")
         verdict["component_failures"].append(failure)
     for name, raw_ratio in (cost_components or {}).items():
-        if isinstance(raw_ratio, bool):
+        if _is_boolean_value(raw_ratio):
             verdict["component_costs"][str(name)] = {
                 "ratio": None,
                 "acceptable": False,

@@ -22,6 +22,12 @@ class MaxAbsMeter:
     def _abs_max(x: torch.Tensor) -> torch.Tensor:
         """max(|x|)."""
         lo, hi = torch.aminmax(x)
+        if not x.is_floating_point():
+            # Negating the dtype minimum overflows in place (int8 -128 -> -128,
+            # int64 min -> itself). Promote the extrema before taking the
+            # absolute value; the meter's public value is a Python float.
+            hi_f = hi.to(torch.float64)
+            return torch.maximum(hi_f, -lo.to(torch.float64))
         lo.neg_()
         return torch.maximum(hi, lo, out=hi)
 

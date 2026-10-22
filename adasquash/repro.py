@@ -124,13 +124,25 @@ def deterministic_algorithms_context(mode: str | None = None):
     return _ctx()
 
 
+def _is_boolean_scalar(value) -> bool:
+    """Python and NumPy booleans; both are not seeds/measurements.
+
+    ``isinstance(np.bool_(True), bool)`` is False, so a NumPy boolean would
+    otherwise pass into ``int()`` as 1/0 and silently seed a different run.
+    """
+    if isinstance(value, bool):
+        return True
+    cls = type(value)
+    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
 def _strict_seed(seed) -> int:
     """A seed is an integer; bool/fractional/non-numeric values are rejected.
 
     ``int(1.9)`` silently seeds a different run while the manifest still
     claims the requested seed, defeating the reproducibility contract.
     """
-    if isinstance(seed, bool):
+    if _is_boolean_scalar(seed):
         raise ValueError(f"seed must be an integer, got bool {seed!r}")
     try:
         converted = int(seed)
