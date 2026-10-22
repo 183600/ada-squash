@@ -34,12 +34,31 @@ DEFAULT_SEEDS = (42, 43, 44)
 _W8A8_SEED_METRIC_KEYS = ('ppl_fp', 'ppl_w8a8', 'ppl_drop', 'ppl_drop_pct',
                           'probe_token_coverage')
 
-def _explicit_cli_names(argv) -> set:
-    """Option names typed on the command line (`--val-frac=...` or `--val-frac ...`)."""
+def _explicit_cli_names(argv, parser=None) -> set:
+    """Option names typed on the command line (`--val-frac=...` or `--val-frac ...`).
+
+    argparse accepts unambiguous prefixes (`--val-f` for `--val-frac`); when a
+    parser is supplied those spellings are resolved to the destination name,
+    otherwise the literal normalized spelling is returned.
+    """
     names = set()
     for token in argv:
         if token.startswith('--') and len(token) > 2:
-            names.add(token[2:].split('=', 1)[0].replace('-', '_'))
+            option = token[2:].split('=', 1)[0]
+            if parser is not None:
+                try:
+                    parsed = parser._parse_optional('--' + option)
+                except Exception:
+                    parsed = None
+                if parsed:
+                    entries = parsed if isinstance(parsed, list) else [parsed]
+                    actions = [entry[0] for entry in entries
+                               if entry and entry[0] is not None]
+                    dests = {action.dest for action in actions}
+                    if len(dests) == 1:
+                        names.add(dests.pop())
+                        continue
+            names.add(option.replace('-', '_'))
     return names
 
 def _checkpoint_defaulted(args, parser, ckpt_args: dict, name: str,
@@ -557,7 +576,7 @@ def main():
         if args.probe == 'markov':
             return _probe_markov(rng, args.batch_size, args.seq_len, device, n_states=args.n_states)
         return dataset_probe()
-    explicit_cli = _explicit_cli_names(sys.argv[1:])
+    explicit_cli = _explicit_cli_names(sys.argv[1:], p)
     ckpt_groups = [[path for path in str(entry).split(',') if path] for entry in args.ckpts]
     if any(not group for group in ckpt_groups):
         p.error('--ckpts entries must not be empty')
