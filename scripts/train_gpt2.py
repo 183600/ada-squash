@@ -721,6 +721,19 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                                 'the fixed-step comparison cannot be certified')
                             break
                 if reject_reason is None:
+                    # The comparable number is the held-out pass *at the
+                    # fixed final step*. If validation stopped earlier
+                    # (e.g. --max-steps 1200 with --val-every 500 ends at
+                    # final_val_step=1000), pooling final_val_loss would
+                    # compare an earlier model under the final step's name.
+                    if results.get('final_val_step') != results.get('final_step'):
+                        reject_reason = (
+                            f"run_manifest.json results.final_val_step is "
+                            f"{results.get('final_val_step')!r} but results.final_step is "
+                            f"{results.get('final_step')!r}; the final held-out pass was not "
+                            "taken at the fixed final step, so the fixed-step comparison "
+                            "cannot be certified")
+                if reject_reason is None:
                     context = {'final_step': results.get('final_step'),
                                'final_val_step': results.get('final_val_step')}
                     if reference_context is not None:
