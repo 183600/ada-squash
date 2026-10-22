@@ -97,6 +97,25 @@ def load_result(path) -> dict:
             f"[compare] {p} contains non-numeric per-batch test losses; fix the run first")
     if not all(math.isfinite(v) for v in losses):
         raise SystemExit(f"[compare] {p} contains non-finite per-batch test losses; fix the run first")
+    requested = data.get("test_batches")
+    seen = data.get("test_batches_seen")
+    if (isinstance(requested, bool) or not isinstance(requested, int)
+            or requested < 1):
+        raise SystemExit(
+            f"[compare] {p} has no positive integer 'test_batches': the sealed-test "
+            "protocol was not recorded, so completeness cannot be verified")
+    if isinstance(seen, bool) or not isinstance(seen, int) or seen < 1:
+        raise SystemExit(
+            f"[compare] {p} has no positive integer 'test_batches_seen': the number of "
+            "sealed batches actually scored was not recorded")
+    if seen != requested:
+        raise SystemExit(
+            f"[compare] {p} scored {seen} of {requested} requested sealed batches: a "
+            "truncated test pass is not a complete sealed evaluation and cannot be compared")
+    if len(losses) != seen:
+        raise SystemExit(
+            f"[compare] {p} recorded test_batches_seen={seen} but has {len(losses)} "
+            "per-batch losses; the sealed-test record is internally inconsistent")
     reported = data.get("test_loss")
     mean = sum(losses) / len(losses)
     if not isinstance(reported, (int, float)) or not math.isfinite(reported):
@@ -407,6 +426,14 @@ def main():
     p.add_argument("--hypothesis", default=None, help="the claim this comparison tests, recorded in the output manifest")
     p.add_argument("--output", default=None, help="write the full comparison (rows + manifests) to this JSON file")
     args = p.parse_args()
+    if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
+        p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
+    if not math.isfinite(args.margin) or args.margin < 0.0:
+        p.error(f'--margin {args.margin} must be finite and >= 0')
+    if not math.isfinite(args.power) or not 0.0 < args.power < 1.0:
+        p.error(f'--power {args.power} must be finite and strictly between 0 and 1')
+    if len({Path(c).resolve() for c in args.candidates}) != len(args.candidates):
+        p.error('a candidate path is repeated; each arm must appear once in the comparison')
     reference_path = Path(args.reference)
     ref_arm = load_arm(reference_path)
     ref_seed_means = _seed_means(ref_arm)
