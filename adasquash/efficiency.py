@@ -97,7 +97,7 @@ def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = 
     else:
         raw_len = seq_len
         len_name = "seq_len"
-    if isinstance(raw_len, bool):
+    if _is_boolean_value(raw_len):
         raise ValueError(f"{len_name} must be an integer, got bool {raw_len!r}")
     try:
         T = int(raw_len)
