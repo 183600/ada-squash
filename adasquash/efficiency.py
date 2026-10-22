@@ -77,20 +77,28 @@ def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = 
     n_layers = int(cfg.n_layers)
     vocab = int(cfg.vocab_size)
     h = mlp_hidden_size(d, float(cfg.mlp_ratio))
+    # The default (`cfg.max_seq_len`) is the same kind of context length as an
+    # explicit `seq_len`: a fractional/bool/negative table size cannot be
+    # silently truncated or clamped to a different protocol. `None` means the
+    # config did not record one and keeps the legacy zero-context fallback.
     if seq_len is None:
-        T = int(getattr(cfg, "max_seq_len", 0) or 0)
+        raw_len = getattr(cfg, "max_seq_len", 0)
+        if raw_len is None:
+            raw_len = 0
+        len_name = "cfg.max_seq_len"
     else:
-        if isinstance(seq_len, bool):
-            raise ValueError(f"seq_len must be an integer, got bool {seq_len!r}")
-        try:
-            T = int(seq_len)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f"seq_len must be an integer, got {seq_len!r}") from None
-        if T != seq_len:
-            raise ValueError(f"seq_len must be an integer, got {seq_len!r}")
-        if T < 0:
-            raise ValueError(f"seq_len must be >= 0, got {T}")
-    T = max(0, T)
+        raw_len = seq_len
+        len_name = "seq_len"
+    if isinstance(raw_len, bool):
+        raise ValueError(f"{len_name} must be an integer, got bool {raw_len!r}")
+    try:
+        T = int(raw_len)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{len_name} must be an integer, got {raw_len!r}") from None
+    if T != raw_len:
+        raise ValueError(f"{len_name} must be an integer, got {raw_len!r}")
+    if T < 0:
+        raise ValueError(f"{len_name} must be >= 0, got {T}")
     attn = float(n_layers * 8 * d * d)          # 4 d x d matmuls/token/layer
     attn_scores = float(4 * n_layers * d * T)   # QK^T + AV, 4 d T^2 per layer / T
     mlp = float(n_layers * 6 * d * h)           # 3 d x h matmuls/token/layer
