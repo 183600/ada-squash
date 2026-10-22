@@ -62,7 +62,7 @@ _LEDGER_MANIFEST_KEYS = (
     "exclude_group_file", "exclude_test_group_file",
 )
 
-_SEED_DIR_RE = re.compile(r"seed(\d+)$")
+_SEED_DIR_RE = re.compile(r"^seed(\d+)$")
 
 # A comparison is certifiable only when at least this many training seeds are
 # shared by both arms: with one seed the test would measure the noise of a
