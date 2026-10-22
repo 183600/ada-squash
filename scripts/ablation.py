@@ -279,6 +279,31 @@ LOO_SPEC = {
 # axis without mixing fused vs plain implementations. The interaction term is
 # now unconfounded and can be used to certify synergy.
 FACTORIAL_SPEC = {
+    # The main proposal's own activation family (generalized softsign). The
+    # four cells already exist in the matrix; without this design the runner
+    # only tested the tanh control factorial, so the softsign arm's
+    # interaction was never validated or estimated.
+    'per_channel_x_depth_softsign': {
+        'context': ('generalized-softsign activation family (the main proposal), '
+                    'LayerScale on, same gamma/beta and same alpha_0/k/p '
+                    'initialization context across the four cells.'),
+        'cells': {
+            'neither': 'dytcd_no_perchannel_no_depth',
+            'per_channel': 'dytcd_k0_no_depth_schedule',
+            'depth': 'dytcd_no_perchannel',
+            'both': 'dytcd_full',
+        },
+        'factors': {
+            'per_channel': {
+                'diff': ('learnable_delta',),
+                'pairs': (('neither', 'per_channel'), ('depth', 'both')),
+            },
+            'depth': {
+                'diff': ('k_init', 'learnable_k'),
+                'pairs': (('neither', 'depth'), ('per_channel', 'both')),
+            },
+        },
+    },
     'per_channel_x_depth_tanh': {
         'context': ('tanh activation family, LayerScale on, same gamma/beta and '
                     'same alpha/k initialization context across the four cells. '
