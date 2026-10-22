@@ -126,14 +126,19 @@ def _shape_signature(agg: dict):
     # A shape record with a missing/None field is unknown, not a shape. The
     # aggregate writer only emits complete shapes, so this is the malformed /
     # stale-record path; it must not compare equal to another unknown shape.
-    if any(not isinstance(shape, dict) or not shape
-           or not set(_SHAPE_KEYS).issubset(shape)
-           or any(value is None for value in shape.values())
+    # Only the architecture keys define the controlled shape: `shapes_by_seed`
+    # also carries `n_params`, which legitimately differs between two norm
+    # variants (DyT-CD has a few more parameters). Folding it into the
+    # signature would reject every cross-norm comparison as a "shape" change.
+    if any(not isinstance(shape, dict)
+           or any(shape.get(key) is None for key in _SHAPE_KEYS)
            for shape in shapes.values()):
         return None
     if not _provenance_covers_seeds(shapes, agg):
         return None
-    signatures = {json.dumps(shape, sort_keys=True) for shape in shapes.values()}
+    signatures = {
+        json.dumps({key: shape[key] for key in _SHAPE_KEYS}, sort_keys=True)
+        for shape in shapes.values()}
     if len(signatures) != 1:
         return 'MIXED'
     return next(iter(signatures))
