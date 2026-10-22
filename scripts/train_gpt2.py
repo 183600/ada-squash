@@ -648,7 +648,11 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     batches of a single run. Missing, invalid, and rejected (unfinished or
     mismatched) seed manifests are reported, never silently dropped.
     """
-    seeds = [int(s) for s in seeds]
+    # A seed names one underlying run. Keep one record per seed even when a
+    # direct caller passes a duplicate: reading the same directory twice would
+    # otherwise count the same run as independent replication (and could lift
+    # a two-seed set over the three-seed certification threshold).
+    seeds = list(dict.fromkeys(int(s) for s in seeds))
     per_seed = []
     rejections = []
     reference_recipe = None

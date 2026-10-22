@@ -229,7 +229,9 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
     fields at `None` with `n_seeds_final = 0` instead of silently mixing the
     two statistics.
     """
-    seeds = [int(s) for s in seeds]
+    # One seed is one run; a repeated seed would read the same manifest twice
+    # and inflate the apparent replication count.
+    seeds = list(dict.fromkeys(int(s) for s in seeds))
     per_seed = []
     rejected = []
     reference_context = None
