@@ -307,7 +307,8 @@ def _split_basis(r: dict, use_confirm: bool):
 
 
 def _describe_paired_effect(entry: dict, arm_vals, ref_vals, common, test,
-                            alpha: float, power: float=0.8) -> None:
+                            alpha: float, power: float=0.8,
+                            margin: float=0.0) -> None:
     """Add seed-direction and resolution without changing certification.
 
     Sign counts expose an effect carried by one or two seeds, and the MDE
@@ -340,11 +341,15 @@ def _describe_paired_effect(entry: dict, arm_vals, ref_vals, common, test,
         return
     # Use the delta stderr directly: `compare` runs `paired_t_one_sided` with
     # its own default alpha, so inverting the CI at this `alpha` would report
-    # a wrong MDE whenever the two differ.
+    # a wrong MDE whenever the two differ. The test is H1
+    # mean(delta) < -margin, so the smallest raw effect that clears both the
+    # practical margin and the sampling noise includes that margin.
     entry['minimum_detectable_delta_95_power80'] = (
-        student_t_ppf(1.0 - alpha, float(test['df']))
-        + student_t_ppf(power, float(test['df']))
-    ) * stats['stderr']
+        float(margin)
+        + (student_t_ppf(1.0 - alpha, float(test['df']))
+           + student_t_ppf(power, float(test['df'])))
+        * stats['stderr']
+    )
 
 
 def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bool = True) -> dict | None:
@@ -557,7 +562,8 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             entry['df'] = test['df']
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
-        _describe_paired_effect(entry, arm_vals, ref_vals, common, test, alpha)
+        _describe_paired_effect(entry, arm_vals, ref_vals, common, test, alpha,
+                                margin=margin)
         if (entry['test'] is not None and not entry['replicated_across_seeds']
                 and entry['significance_basis'] is None):
             entry['significance_basis'] = (
