@@ -505,23 +505,14 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
     parent_of = {row.get('name'): row.get('reused_from') for row in rows
                  if isinstance(row, dict) and isinstance(row.get('name'), str)
                  and isinstance(row.get('reused_from'), str)}
-    seen_runs: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
         val_loss = row.get('val_loss')
         identity = _row_run_identity(row, parent_of)
-        canonical = seen_runs.get(identity)
-        # An unusable row is not evidence and must not claim the run identity:
-        # otherwise a later valid alias is marked as its duplicate and its
-        # significant win is dropped from the family.
-        if canonical is None and _finite_number(val_loss):
-            seen_runs[identity] = row.get('name')
         entry = {'name': row.get('name'), 'val_loss': val_loss, 'n_seeds': row.get('n_seeds'),
                  'run_identity': identity,
-                 'excluded_from_family': (None if canonical is None else
-                                          f'duplicate run of {canonical} '
-                                          '(reused summary, not independent evidence)')}
+                 'excluded_from_family': None}
         if isinstance(val_loss, (int, float)):
             entry['excess_over_bayes_floor_nats'] = val_loss - memoryless_floor
             if ceiling is not None:
@@ -568,6 +559,33 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
         elif tuned_predictor:
             entry['simple_baseline_test_basis'] = 'no_shared_seeds'
         out.append(entry)
+    # Alias rows (`reused_from`) are the same underlying run under a second
+    # name. Choose the canonical row by evidence quality, not by summary
+    # order: an under-replicated alias that happens to appear first must not
+    # shadow the replicated source and knock its significant win out of the
+    # Holm family.
+    by_identity: dict[str, list] = {}
+    for entry in out:
+        by_identity.setdefault(entry['run_identity'], []).append(entry)
+    for aliases in by_identity.values():
+        if len(aliases) < 2:
+            continue
+        canonical = min(
+            aliases,
+            key=lambda entry: (
+                0 if _finite_number(entry.get('val_loss')) else 1,
+                0 if entry.get('replicated_across_seeds') else 1,
+                -int(entry.get('n_seeds') or 0),
+                0 if entry.get('p_one_sided_tuned_simple') is not None else 1,
+                -int(entry.get('n_paired_seeds') or 0),
+                str(entry.get('name')),
+            ),
+        )
+        for entry in aliases:
+            if entry is not canonical:
+                entry['excluded_from_family'] = (
+                    f"duplicate run of {canonical.get('name')} "
+                    '(reused summary, not independent evidence)')
     family = [entry for entry in out if entry.get('replicated_across_seeds')
               and entry.get('p_one_sided_tuned_simple') is not None
               and entry.get('excluded_from_family') is None]
