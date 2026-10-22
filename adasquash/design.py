@@ -662,6 +662,17 @@ def normalize_exclusion_policy(policy: Optional[Mapping] = None) -> dict:
         raise ValueError(
             f'exclusion policy is missing mandatory protocol rule(s): {missing}; '
             f'a run may not disappear without a recorded reason')
+    # Keeping the rule id while changing its action to `sensitivity` would
+    # silently stop treating a missing/non-finite run as attrition, so the
+    # mandatory rules must remain `exclude` rules.
+    downgraded = [rule['id'] for rule in rules
+                  if rule['id'] in _REQUIRED_EXCLUSION_RULES
+                  and rule['action'] != 'exclude']
+    if downgraded:
+        raise ValueError(
+            f'mandatory protocol rule(s) {downgraded} must keep action="exclude"; '
+            f'a missing, mismatched or non-finite run may not be retained as a '
+            f'sensitivity case')
     forbidden = policy.get('forbidden_exclusion_criteria', [])
     if (not isinstance(forbidden, Sequence) or isinstance(forbidden, (str, bytes))):
         raise ValueError('forbidden_exclusion_criteria must be a sequence of strings')
@@ -735,20 +746,34 @@ def classify_run_exclusions(runs: Sequence[Mapping],
         if not isinstance(present, bool):
             raise ValueError(f'run record {run_id!r} present must be a boolean, '
                              f'got {present!r}')
+        mismatch = run.get('protocol_mismatch', False)
+        if not isinstance(mismatch, bool):
+            raise ValueError(
+                f'run record {run_id!r} protocol_mismatch must be a boolean, '
+                f'got {mismatch!r}')
         facts: list[str] = []
         if not present:
             facts.append('missing_run')
-        if bool(run.get('protocol_mismatch')):
+        if mismatch:
             facts.append('protocol_mismatch')
         loss = run.get('val_loss')
         if present:
             if loss is None:
                 facts.append('missing_run')
-            elif (isinstance(loss, bool) or not isinstance(loss, numbers.Real)
-                  or not math.isfinite(float(loss))):
-                # A bool, a string or a NaN/Inf all mean the same thing for
-                # the paired contrast: there is no finite loss to analyse.
-                facts.append('non_finite_loss')
+            else:
+                try:
+                    finite = (not isinstance(loss, bool)
+                              and isinstance(loss, numbers.Real)
+                              and math.isfinite(float(loss)))
+                except (TypeError, ValueError, OverflowError):
+                    # An enormous integer is a real number but has no finite
+                    # float representation, so it cannot enter a paired
+                    # contrast either.
+                    finite = False
+                if not finite:
+                    # A bool, a string or a NaN/Inf all mean the same thing for
+                    # the paired contrast: there is no finite loss to analyse.
+                    facts.append('non_finite_loss')
         curve = run.get('curve_classification')
         if isinstance(curve, str) and curve in _DIVERGED_CLASSIFICATIONS:
             facts.append('diverged_curve')
@@ -848,7 +873,7 @@ def run_exclusion_audit(runs: Sequence[Mapping],
         bucket['n_seeds_analyzed'] = len(bucket['seeds'])
         bucket['excluded_fraction'] = (
             bucket['excluded'] / bucket['planned'] if bucket['planned'] else 0.0)
-        if bucket['planned'] >= min_seeds and bucket['n_seeds_analyzed'] < min_seeds:
+        if bucket['n_seeds_analyzed'] < min_seeds:
             violations.append(
                 f'arm {arm!r}: {bucket["n_seeds_analyzed"]} analyzable seed(s) '
                 f'after pre-specified exclusions, below the certification '
