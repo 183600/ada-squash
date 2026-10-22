@@ -319,8 +319,12 @@ def compare_needle(results, reference_results, alpha=0.05, protocol=None):
         tests.append(t)
     paired_holm = holm_adjust([t.get('p_one_sided') for t in tests])
     mcnemar_holm = holm_adjust([t.get('mcnemar', {}).get('p_one_sided') for t in tests])
-    protocol_ok = bool(protocol.get('ok')) if protocol else True
-    steps_verified = bool(protocol.get('checkpoint_steps_known')) if protocol else True
+    # No protocol verdict means the training recipe and checkpoint step were
+    # never verified. That is unknown, not equal: fail closed and report the
+    # comparison descriptively rather than certifying a confounded delta.
+    protocol_ok = bool(protocol.get('ok')) if isinstance(protocol, dict) else False
+    steps_verified = (bool(protocol.get('checkpoint_steps_known'))
+                      if isinstance(protocol, dict) else False)
     for t, p_holm, m_holm in zip(tests, paired_holm, mcnemar_holm):
         n_shared = len(t.get('paired_seeds') or [])
         t['n_shared_placement_seeds'] = n_shared
