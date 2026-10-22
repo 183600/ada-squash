@@ -501,10 +501,16 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
               if entry.get('certifiable') and entry['p_one_sided'] is not None]
     for entry, p_holm in zip(family, holm_adjust([e['p_one_sided'] for e in family])):
         entry['p_one_sided_holm'] = p_holm
+        # The test that produced `p_one_sided` is paired on the *shared* seeds,
+        # so its effect estimate is `delta_paired_mean`. Comparing the adjusted
+        # p-value against the difference of the arms' own all-seed means mixes
+        # two different quantities (and the two can even differ in sign when
+        # the arm seed sets are not identical).
+        paired_delta = entry.get('delta_paired_mean')
         entry['certified'] = bool(
             entry['certifiable']
-            and entry['delta_vs_reference'] is not None
-            and entry['delta_vs_reference'] < -margin
+            and paired_delta is not None
+            and paired_delta < -margin
             and p_holm is not None and p_holm < alpha)
 
     return {
