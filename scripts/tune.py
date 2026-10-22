@@ -576,16 +576,31 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             certified and entry['beats_reference'] and p_holm is not None and p_holm < alpha
         )
         if not certified:
-            if certify:
+            if not certify:
+                entry['significance_basis'] = (
+                    "descriptive only: no --confirm-seeds, so the comparison ran on the seeds "
+                    "the lr was selected on (winner's curse); the p-value is reported but not certified")
+            elif not use_confirm:
                 entry['significance_basis'] = (
                     "descriptive only: --confirm-seeds was provided but unusable for "
                     f"{confirm_ignored or 'the compared arms'} (incomplete or missing confirm "
                     "statistics), so the comparison ran on the seeds the lr was selected on "
                     "(winner's curse); the p-value is reported but not certified")
             else:
+                # The test really ran on held-back confirm seeds. Do not
+                # mislabel it as a selection-split comparison; report the
+                # actual non-certification reason instead.
+                reasons = []
+                if missing_baselines:
+                    reasons.append(
+                        f"requested baseline arm(s) {missing_baselines} were not tuned")
+                if not confirm_seeds_sufficient:
+                    reasons.append(
+                        f"fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} held-back confirm "
+                        f"seed(s) per arm ({confirm_ns})")
                 entry['significance_basis'] = (
-                    "descriptive only: no --confirm-seeds, so the comparison ran on the seeds "
-                    "the lr was selected on (winner's curse); the p-value is reported but not certified")
+                    "descriptive only: the comparison ran on held-back confirm seeds but "
+                    "is not certified" + (f" ({'; '.join(reasons)})" if reasons else ""))
     out['rows_tested_descriptively_only'] = [e['arm'] for e in out['rows']
                                              if e['test'] is not None and not e['replicated_across_seeds']]
     out['multiple_comparison'] = (
