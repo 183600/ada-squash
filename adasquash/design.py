@@ -821,6 +821,7 @@ def run_exclusion_audit(runs: Sequence[Mapping],
     classified = classify_run_exclusions(runs, canonical)
     violations: list[str] = []
     warnings: list[str] = []
+    attrition_balanced = True
     if not classified:
         violations.append('no planned runs were supplied to the attrition audit')
 
@@ -889,6 +890,7 @@ def run_exclusion_audit(runs: Sequence[Mapping],
     if by_status['excluded'] and len(per_arm) > 1:
         fractions = [bucket['excluded_fraction'] for bucket in per_arm.values()]
         if max(fractions) - min(fractions) >= 0.5:
+            attrition_balanced = False
             warnings.append(
                 'differential attrition across arms (excluded fraction range '
                 f'{min(fractions):.2f}-{max(fractions):.2f}); compare the per-arm '
@@ -911,7 +913,7 @@ def run_exclusion_audit(runs: Sequence[Mapping],
         'violations': violations,
         'warnings': warnings,
         'ready': not violations,
-        'attrition_balanced': not warnings,
+        'attrition_balanced': attrition_balanced,
         'protocol': (
             'every planned run is either retained, flagged for a sensitivity '
             'check, or excluded for a pre-specified outcome-blind protocol '
