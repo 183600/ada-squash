@@ -1160,7 +1160,12 @@ def main():
     if args.max_doc_chars and args.min_doc_chars > args.max_doc_chars:
         p.error(f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
                 f'{args.max_doc_chars}; no document could pass the cleaner')
-    seed_explicit = args.seed is not None or args.seeds is not None
+    # A seed supplied by --config is a default, not an explicit CLI override:
+    # otherwise resuming a seed-42 checkpoint with a config (`seed: 7`) keeps
+    # seed 7, reseeds the data stream and fast-forwards `data_position` along
+    # a different stream than the one the checkpoint recorded.
+    seed_explicit = bool(
+        _explicit_arg_names(sys.argv[1:], p, known.config) & {'seed', 'seeds'})
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [DEFAULT_SEED])
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
