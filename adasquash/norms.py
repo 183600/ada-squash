@@ -214,6 +214,12 @@ class _GeneralizedSoftsign(torch.autograd.Function):
         if p_is_tensor:
             p_raw = p
             p = p.clamp(min=_MIN_P)
+        else:
+            # Frozen p (`learnable_p=False`) is stored as a Python float, so
+            # the tensor-only clamp above would let p <= 0 reach the closed
+            # form: p=0 divides by zero and p<0 makes |x|^p explode at zero.
+            # D2's floor applies to every representation of the exponent.
+            p = max(float(p), _MIN_P)
         ctx.p_is_tensor = p_is_tensor
         ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
         saved = [x]
@@ -347,6 +353,9 @@ class _DyTCForward(torch.autograd.Function):
         if p_is_tensor:
             p_raw = p
             p = p.clamp(min=_MIN_P)
+        else:
+            # Frozen p is a Python float; apply the same D2 floor as tensor p.
+            p = max(float(p), _MIN_P)
         phi = _softsign_forward(x, p, alpha)
         if beta is not None:
             out = phi.mul_(gamma).add_(beta)
@@ -591,6 +600,10 @@ class _DyTCDForward(torch.autograd.Function):
         if p_is_tensor:
             p_raw = p
             p = p.clamp(min=_MIN_P)
+        else:
+            # A frozen exponent buffer can still be a plain float on external
+            # call paths; keep the D2 floor for both representations.
+            p = max(float(p), _MIN_P)
         exp_kdr = torch.exp(k.mul(-depth_ratio))
         scale = alpha_0 * exp_kdr
         alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=_MIN_ALPHA)
