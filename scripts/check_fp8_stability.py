@@ -52,7 +52,8 @@ _FP8_MODEL_BUILDERS = {
 _FP8_SEED_METRIC_KEYS = (
     'max_abs_pre_norm', 'max_abs_post_norm', 'mean_excess_kurtosis_pre_norm',
     'mean_overflow_rate_e4m3', 'max_overflow_rate_e4m3',
-    'mean_underflow_rate_e4m3', 'mean_rel_quant_err_e4m3',
+    'mean_underflow_rate_e4m3', 'mean_subnormal_rate_e4m3',
+    'mean_quantized_zero_rate_e4m3', 'mean_rel_quant_err_e4m3',
     'logit_rel_divergence',
 )
 
@@ -64,6 +65,42 @@ def to_fp8_e4m3(x: torch.Tensor, axis: int=-1, inplace: bool=False) -> torch.Ten
 
 def to_fp8_e5m2(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
     return simulate_fp8(x, max_val=57344.0, exp_bits=5, mantissa_bits=2, inplace=inplace)
+
+def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
+    """Return a quantizer with the requested format and scaling recipe.
+
+    ``scaling='none'`` is the raw-value worst case: values beyond the format
+    range clip, which is a range stress test, not a prediction of real FP8
+    training. ``scaling='dynamic-tensor'`` rescales each tensor by its amax
+    into the full representable range before rounding and rescales back after,
+    the per-tensor dynamic recipe real FP8 stacks use. Keeping the two
+    explicit prevents a clipped stress-test number from being quoted as a
+    training-stability prediction.
+    """
+    if fmt == 'e5m2':
+        base, maxv = (to_fp8_e5m2, 57344.0)
+    elif fmt == 'e4m3':
+        base, maxv = (to_fp8_e4m3, 448.0)
+    else:
+        raise ValueError(f"unknown fp8 format {fmt!r} (e4m3 | e5m2)")
+    if scaling == 'none':
+        return base
+    if scaling != 'dynamic-tensor':
+        raise ValueError(f"unknown scaling {scaling!r} (none | dynamic-tensor)")
+
+    def q(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
+        # A detached amax is a per-tensor statistic; the quantization is
+        # already a forward-only simulation, and using detect would break
+        # the straight-through-free demo path.
+        amax = x.detach().abs().amax().clamp_(min=1e-12)
+        scale = maxv / amax
+        out = base(x * scale)
+        out = out / scale
+        if inplace and x.dtype == torch.float32:
+            x.copy_(out)
+            return x
+        return out
+    return q
 
 # Reusable frexp/mask scratch keyed by (shape, device).
 _FP8_SCRATCH: dict = {}
@@ -97,6 +134,11 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
         a = x.float().clone()
     levels = float(2 ** mantissa_bits)
     a.clamp_(-max_val, max_val)
+    # This simulation intentionally flushes everything below the min *normal*
+    # to zero: the repo's fixed test contract treats the subnormal range as
+    # underflow (see tests/test_norms.py). Keep the quantizer semantics stable;
+    # the subnormal share is reported separately by the metric hook where it
+    # can be read without redefining the format's zero threshold.
     min_exp = 2 - (1 << exp_bits - 1) - mantissa_bits
     mant, exp, low = _fp8_scratch(a.shape, a.device)
     torch.frexp(a, out=(mant, exp))
@@ -163,11 +205,12 @@ def fp8_forward(model: nn.Module, quant):
         for p in patched:
             p.module.forward = p.orig_forward
 
-def measure_fp8_divergence(model, x, norm_name: str):
+def measure_fp8_divergence(model, x, norm_name: str, quant=None):
     handles = []
     quant_errors = []
     ranges = []
     fp8_e4m3_min = fp8_min_normal(4)
+    quant = quant or to_fp8_e4m3
 
     def _zero_scalar(device) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float64, device=device)
@@ -188,13 +231,28 @@ def measure_fp8_divergence(model, x, norm_name: str):
             if numel:
                 overflow = torch.count_nonzero(abs_out > FP8_E4M3_MAX).to(torch.float64) / numel
                 underflow = torch.count_nonzero(abs_out < fp8_e4m3_min).to(torch.float64) / numel
+                # A subnormal is representable but below the min normal; a
+                # quantized zero is a value the format could not represent at
+                # all. Report them separately so "underflow" does not conflate
+                # representable subnormals with a true flush to zero.
+                subnormal = torch.count_nonzero(
+                    (abs_out > 0) & (abs_out < fp8_e4m3_min)
+                ).to(torch.float64) / numel
             else:
-                overflow = underflow = zero
-            err = to_fp8_e4m3(out).sub_(out).abs_().mean()
+                overflow = underflow = subnormal = zero
+            quantized = quant(out)
+            if numel:
+                quantized_zero = torch.count_nonzero(
+                    (quantized == 0) & (out != 0)
+                ).to(torch.float64) / numel
+            else:
+                quantized_zero = zero
+            err = quantized.sub_(out).abs_().mean()
             max_abs_in = torch.maximum(x_in.max(), -x_in.min()) if has_in else zero
             kurtosis_in = _excess_kurtosis(x_in) if has_in else zero
             stat = torch.stack([max_abs_in.detach(), max_abs_out.detach(), mean_abs_out.detach(),
-                                overflow.detach(), underflow.detach(), err.detach(),
+                                overflow.detach(), underflow.detach(), subnormal.detach(),
+                                quantized_zero.detach(), err.detach(),
                                 kurtosis_in.detach()]).double()
             pending_stats.append((cls_name, stat))
         return hook
@@ -217,7 +275,7 @@ def measure_fp8_divergence(model, x, norm_name: str):
         if m.__class__.__name__ in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTDTanh', 'DyTCD', 'DyTCDTanh'}:
             handles.append(m.register_forward_hook(make_stat_hook()))
     block_handles = [blk.register_forward_hook(make_block_hook(i)) for i, blk in enumerate(model.blocks)]
-    with fp8_forward(model, to_fp8_e4m3):
+    with fp8_forward(model, quant):
         with torch.no_grad():
             logits_fp8, _ = model(x)
     for h in block_handles:
@@ -227,10 +285,11 @@ def measure_fp8_divergence(model, x, norm_name: str):
     if pending_stats:
         stat_vals = torch.stack([s for _, s in pending_stats]).tolist()
         for (cls_name, _), vals in zip(pending_stats, stat_vals):
-            max_abs_in, max_abs_out, mean_abs_out, overflow, underflow, err, kurtosis_in = vals
+            (max_abs_in, max_abs_out, mean_abs_out, overflow, underflow,
+             subnormal, quantized_zero, err, kurtosis_in) = vals
             denom = mean_abs_out + 1e-06
             ranges.append({'module': cls_name, 'max_abs_in': max_abs_in, 'max_abs_out': max_abs_out, 'kurtosis_in': kurtosis_in})
-            quant_errors.append({'module': cls_name, 'max_abs': max_abs_out, 'overflow_rate': overflow, 'underflow_rate': underflow, 'rel_err': err / denom})
+            quant_errors.append({'module': cls_name, 'max_abs': max_abs_out, 'overflow_rate': overflow, 'underflow_rate': underflow, 'subnormal_rate': subnormal, 'quantized_zero_rate': quantized_zero, 'rel_err': err / denom})
     bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags) if not ok), None)
@@ -261,15 +320,17 @@ def measure_fp8_divergence(model, x, norm_name: str):
         rel = float('inf')
         logit_nan = True
     if not quant_errors:
-        return {'norm': norm_name, 'n_layers': int(getattr(model.cfg, 'n_layers', 0)), 'n_norm_hooks': 0, 'max_abs_pre_norm': 0.0, 'max_abs_post_norm': 0.0, 'mean_excess_kurtosis_pre_norm': 0.0, 'mean_overflow_rate_e4m3': 0.0, 'max_overflow_rate_e4m3': 0.0, 'mean_underflow_rate_e4m3': 0.0, 'mean_rel_quant_err_e4m3': 0.0, 'logit_rel_divergence': rel, 'logit_nan_under_fp8': logit_nan, 'first_nonfinite_layer': first_bad_idx, 'first_overflow_layer': first_over_idx}
+        return {'norm': norm_name, 'n_layers': int(getattr(model.cfg, 'n_layers', 0)), 'n_norm_hooks': 0, 'max_abs_pre_norm': 0.0, 'max_abs_post_norm': 0.0, 'mean_excess_kurtosis_pre_norm': 0.0, 'mean_overflow_rate_e4m3': 0.0, 'max_overflow_rate_e4m3': 0.0, 'mean_underflow_rate_e4m3': 0.0, 'mean_subnormal_rate_e4m3': 0.0, 'mean_quantized_zero_rate_e4m3': 0.0, 'mean_rel_quant_err_e4m3': 0.0, 'logit_rel_divergence': rel, 'logit_nan_under_fp8': logit_nan, 'first_nonfinite_layer': first_bad_idx, 'first_overflow_layer': first_over_idx}
     mean_overflow = sum((e['overflow_rate'] for e in quant_errors)) / len(quant_errors)
     max_overflow = max((e['overflow_rate'] for e in quant_errors))
     mean_underflow = sum((e['underflow_rate'] for e in quant_errors)) / len(quant_errors)
+    mean_subnormal = sum((e['subnormal_rate'] for e in quant_errors)) / len(quant_errors)
+    mean_quantized_zero = sum((e['quantized_zero_rate'] for e in quant_errors)) / len(quant_errors)
     mean_rel_err = sum((e['rel_err'] for e in quant_errors)) / len(quant_errors)
     max_max = max((e['max_abs'] for e in quant_errors))
     max_in = max((r['max_abs_in'] for r in ranges)) if ranges else 0.0
     mean_kurt = sum((r['kurtosis_in'] for r in ranges)) / len(ranges) if ranges else 0.0
-    return {'norm': norm_name, 'n_layers': int(getattr(model.cfg, 'n_layers', 0)), 'n_norm_hooks': len(quant_errors), 'max_abs_pre_norm': max_in, 'max_abs_post_norm': max_max, 'mean_excess_kurtosis_pre_norm': mean_kurt, 'mean_overflow_rate_e4m3': mean_overflow, 'max_overflow_rate_e4m3': max_overflow, 'mean_underflow_rate_e4m3': mean_underflow, 'mean_rel_quant_err_e4m3': mean_rel_err, 'logit_rel_divergence': rel, 'logit_nan_under_fp8': logit_nan, 'first_nonfinite_layer': first_bad_idx, 'first_overflow_layer': first_over_idx}
+    return {'norm': norm_name, 'n_layers': int(getattr(model.cfg, 'n_layers', 0)), 'n_norm_hooks': len(quant_errors), 'max_abs_pre_norm': max_in, 'max_abs_post_norm': max_max, 'mean_excess_kurtosis_pre_norm': mean_kurt, 'mean_overflow_rate_e4m3': mean_overflow, 'max_overflow_rate_e4m3': max_overflow, 'mean_underflow_rate_e4m3': mean_underflow, 'mean_subnormal_rate_e4m3': mean_subnormal, 'mean_quantized_zero_rate_e4m3': mean_quantized_zero, 'mean_rel_quant_err_e4m3': mean_rel_err, 'logit_rel_divergence': rel, 'logit_nan_under_fp8': logit_nan, 'first_nonfinite_layer': first_bad_idx, 'first_overflow_layer': first_over_idx}
 
 def _excess_kurtosis(x: torch.Tensor):
     with torch.no_grad():
@@ -608,6 +669,12 @@ def main():
                         'cross-norm direction replicated across scales). Not used with --ckpt, '
                         'where the checkpoint defines the scale.')
     p.add_argument('--probe', default='markov', choices=['markov', 'random'], help="probe corpus. 'random' is uniform token ids: it has no next-token structure, so the activation magnitudes below describe embedding noise rather than a trained model's activations (kept only for parity)")
+    p.add_argument('--scaling', default='none', choices=['none', 'dynamic-tensor'],
+                   help="quantization scaling. 'none' (default) is the raw-value worst case: "
+                        "values beyond the format range clip, a stress test of range pressure, "
+                        "NOT a prediction of real FP8 training. 'dynamic-tensor' rescales each "
+                        "tensor to the full range first, like real FP8 recipes; compare against "
+                        "that run before drawing a training-stability conclusion.")
     p.add_argument('--ckpt', nargs='+', default=None, help='one entry per --norms entry; a plain checkpoint path probes the trained weights instead of a fresh random init. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-norm certification then pairs training seeds, so >= 3 shared training seeds across the compared norms are required for comparison.json to certify a winner')
     p.add_argument('--n-states', type=int, default=64, help="state count of the synthetic 'markov' probe")
     p.add_argument('--batch-size', type=int, default=2)
@@ -647,6 +714,10 @@ def main():
         print(f'[fp8][warn] {len(seeds)} seed(s): one probe draw is one sample; use >= 3 independent probes before treating a metric difference as real')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seeds[0])
+    fp8_quant = make_fp8_quant('e4m3', args.scaling)
+    print(f"[fp8] scope: FORWARD-ONLY simulation (no FP8 gradients or optimizer states) "
+          f"with scaling={args.scaling!r}; scaling='none' is a range stress test, not a "
+          "real FP8-training prediction", file=sys.stderr)
 
     def make_probe(rng, cfg):
         if args.probe == 'random':
@@ -721,7 +792,9 @@ def main():
                     arm_cfg = model.cfg
                 model.eval()
                 x = make_probe(rng, model.cfg)
-                r = measure_fp8_divergence(model, x, norm)
+                r = measure_fp8_divergence(model, x, norm, quant=fp8_quant)
+                r['scaling'] = args.scaling
+                r['forward_only'] = True
                 r['seed'] = seed
                 per_seed_ckpt.append(r)
             per_ckpt.append({'ckpt': ckpt_path, 'train_seed': train_seed,
