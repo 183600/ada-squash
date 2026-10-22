@@ -88,7 +88,7 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
         'certified': bool(entry.get('significant')) if orientation == 'candidate_vs_reference' else False,
         'p_one_sided': entry.get('p_holm', entry.get('p_one_sided')) if orientation == 'candidate_vs_reference' else None,
         'n_seeds': (entry.get('n_shared_train_seeds')
-                    if entry.get('n_shared_train_seeds') is not None
+                    if entry.get('n_shared_train_seeds') not in (None, 0)
                     else entry.get('n_shared_seeds', entry.get('n_seeds'))),
         'orientation': orientation,
     }
