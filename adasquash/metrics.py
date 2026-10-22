@@ -112,6 +112,25 @@ def _strict_int(value, name: str, minimum: Optional[int] = None) -> int:
     return converted
 
 
+def _binary_labels(labels, name: str = "labels") -> list[int]:
+    """0/1 labels without truthiness coercion.
+
+    ``int(bool("0"))`` is 1, so a malformed string label (or any other
+    non-numeric value) used to turn every row into a positive. Labels must be
+    the documented binary ids; booleans are accepted as their 0/1 values.
+    """
+    out = []
+    for value in labels:
+        if isinstance(value, bool):
+            out.append(int(value))
+            continue
+        converted = _strict_int(value, name)
+        if converted not in (0, 1):
+            raise ValueError(f"{name} must be 0/1, got {value!r}")
+        out.append(converted)
+    return out
+
+
 def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[float, float]:
     """Wilson score interval for a binomial proportion.
 
@@ -1385,7 +1404,7 @@ def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
     use `average_precision` (PR-AUC) there.
     """
     scores = [float(s) for s in scores]
-    labels = [int(bool(v)) for v in labels]
+    labels = _binary_labels(labels)
     if len(scores) != len(labels):
         raise ValueError(f"score/label length mismatch: {len(scores)} vs {len(labels)}")
     if any(not math.isfinite(s) for s in scores):
@@ -1415,7 +1434,7 @@ def average_precision(scores: Sequence[float], labels: Sequence[int]) -> Optiona
     earns no precision credit.
     """
     scores = [float(s) for s in scores]
-    labels = [int(bool(v)) for v in labels]
+    labels = _binary_labels(labels)
     if len(scores) != len(labels):
         raise ValueError(f"score/label length mismatch: {len(scores)} vs {len(labels)}")
     if any(not math.isfinite(s) for s in scores):
