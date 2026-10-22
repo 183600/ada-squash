@@ -742,8 +742,22 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
     smaller than the schedule.  The audit reports the coverage ratio and makes
     the wrap explicit; `--fail-on-train-wrap` decides whether it is fatal.
     """
-    scheduled = int(scheduled_tokens or 0)
+    scheduled = (0 if scheduled_tokens is None else
+                 _strict_int_option(scheduled_tokens, "scheduled_tokens", 0))
     estimated = None if budget is None else budget.get('estimated_effective_tokens')
+    if estimated is not None:
+        if _is_boolean_scalar(estimated):
+            raise ValueError(
+                f"estimated_effective_tokens must be numeric or None, got {estimated!r}")
+        try:
+            estimated = float(estimated)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"estimated_effective_tokens must be numeric or None, got {estimated!r}") from None
+        if not math.isfinite(estimated) or estimated < 0.0:
+            raise ValueError(
+                "estimated_effective_tokens must be finite and >= 0, "
+                f"got {estimated!r}")
     result = {
         'scheduled_tokens': scheduled or None,
         'estimated_effective_tokens': estimated,
