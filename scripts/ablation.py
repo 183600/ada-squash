@@ -2368,7 +2368,10 @@ def _baseline_tuning_protocol_mismatches(protocol: dict, args, seeds) -> list:
 
 def _tuning_cell(arm: dict, lr: float, weight_decay: float):
     """The recorded (lr, wd) cell of a tune.py arm, or None."""
-    for cell in (arm.get('lr_grid') or {}).values():
+    grid = arm.get('lr_grid')
+    if not isinstance(grid, dict):
+        return None
+    for cell in grid.values():
         if (isinstance(cell, dict)
                 and cell.get('lr') == float(lr)
                 and cell.get('weight_decay') == float(weight_decay)):
@@ -2435,6 +2438,10 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
         # builder crashing on a truthy non-dict.
         arm = arm if isinstance(arm, dict) else {}
         best = arm.get('best')
+        confirm = arm.get('confirm')
+        confirm = confirm if isinstance(confirm, dict) else {}
+        confirm_stats = confirm.get('stats')
+        confirm_stats = confirm_stats if isinstance(confirm_stats, dict) else {}
         entry = {
             'row': row_name,
             'norm': norm_name,
@@ -2449,8 +2456,8 @@ def load_baseline_tuning(path, args, rows: dict, seeds) -> dict | None:
                 isinstance(best, dict)
                 and best.get('selection_pool') == 'complete_coverage'
                 and best.get('missing_seeds') == []),
-            'confirm_complete': bool(((arm or {}).get('confirm') or {}).get('complete_coverage')),
-            'confirm_val_loss': (((arm or {}).get('confirm') or {}).get('stats') or {}).get('mean'),
+            'confirm_complete': bool(confirm.get('complete_coverage')),
+            'confirm_val_loss': confirm_stats.get('mean'),
             'recipe_in_grid': recipe_in_grid,
             'fixed_recipe_cell_val_loss': None,
             'recipe_is_selected_cell': False,
@@ -2584,7 +2591,9 @@ def _count_seed_ce(records: list, predictor: str | None) -> dict:
 
 
 def _mde_from_test(test: dict | None, alpha: float = 0.05, power: float = 0.8):
-    if test is None or not test.get('df') or not _finite_metric(test.get('ci_low')):
+    if (test is None or not test.get('df')
+            or not _finite_metric(test.get('ci_low'))
+            or not _finite_metric(test.get('ci_high'))):
         return None
     half = (test['ci_high'] - test['ci_low']) / 2.0
     critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))

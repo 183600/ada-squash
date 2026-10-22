@@ -489,7 +489,9 @@ def _count_seed_ce(records: list, predictor: str) -> dict:
 
 
 def _mde_from_test(test: dict | None, alpha: float = 0.05, power: float = 0.8):
-    if test is None or not test.get('df') or not _finite_number(test.get('ci_low')):
+    if (test is None or not test.get('df')
+            or not _finite_number(test.get('ci_low'))
+            or not _finite_number(test.get('ci_high'))):
         return None
     half = (test['ci_high'] - test['ci_low']) / 2.0
     critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
