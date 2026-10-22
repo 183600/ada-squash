@@ -277,11 +277,20 @@ def efficiency_verdict(
     cost_se = None
     invalid_se = None
     if cost_ratio_stderr is not None:
-        try:
-            candidate_se = float(cost_ratio_stderr)
-        except (TypeError, ValueError):
+        # A bool is not an uncertainty measurement: `float(False)` would turn
+        # "no stderr recorded" into an exactly-zero interval and let a noisy
+        # benchmark certify a cost it never resolved. Reject it like the
+        # boolean gain / component measurements.
+        if isinstance(cost_ratio_stderr, bool):
             invalid_se = repr(cost_ratio_stderr)
+            candidate_se = None
         else:
+            try:
+                candidate_se = float(cost_ratio_stderr)
+            except (TypeError, ValueError):
+                invalid_se = repr(cost_ratio_stderr)
+                candidate_se = None
+        if invalid_se is None:
             if math.isfinite(candidate_se) and candidate_se >= 0.0:
                 cost_se = candidate_se
             else:
