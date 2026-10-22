@@ -226,7 +226,16 @@ class CausalSelfAttention(nn.Module):
         mean_abs = total / n_valid
         var = ((sq - signed * signed / n_valid) / (n_valid - 1)
                if n_valid > 1 else 0.0)
-        return {'logit_abs_mean': mean_abs, 'logit_abs_max': peak_v, 'logit_std': math.sqrt(var) if var > 0.0 else 0.0}
+        # A NaN/Inf variance must not be reported as a perfect zero spread:
+        # this statistics path exists to expose exactly that blow-up. Only the
+        # single-valid-logit case has a genuinely undefined (zero) spread.
+        if n_valid <= 1:
+            logit_std = 0.0
+        elif var >= 0.0:
+            logit_std = math.sqrt(var)
+        else:
+            logit_std = float('nan')
+        return {'logit_abs_mean': mean_abs, 'logit_abs_max': peak_v, 'logit_std': logit_std}
 
     def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
