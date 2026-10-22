@@ -309,9 +309,27 @@ def paired_training_cost_stats(cand_bench: dict, ref_bench: dict) -> dict:
     return out
 
 
+def _summary_rows(summaries_path: str) -> list:
+    """Rows of a summaries JSON, or [] when the file is unusable.
+
+    A malformed root (scalar/null) used to raise `AttributeError`, and a
+    corrupt file raised `JSONDecodeError`; both must be reported as "no usable
+    rows" by the caller, not crash the benchmark after the expensive timings.
+    """
+    try:
+        data = json.loads(Path(summaries_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        rows = data.get('rows') or data.get('summaries') or []
+        return rows if isinstance(rows, list) else []
+    return []
+
+
 def load_losses(summaries_path: str) -> dict:
-    data = json.loads(Path(summaries_path).read_text())
-    rows = data if isinstance(data, list) else (data.get('rows') or data.get('summaries') or [])
+    rows = _summary_rows(summaries_path)
     out = {}
     for row in rows:
         if (isinstance(row, dict) and row.get('name') is not None
@@ -324,8 +342,7 @@ def load_losses(summaries_path: str) -> dict:
 
 def load_row_cfgs(summaries_path: str) -> dict:
     """{row name: builder kwargs} for ablation rows that record their config."""
-    data = json.loads(Path(summaries_path).read_text())
-    rows = data if isinstance(data, list) else (data.get('rows') or data.get('summaries') or [])
+    rows = _summary_rows(summaries_path)
     out = {}
     for row in rows:
         if isinstance(row, dict) and row.get('name') is not None and isinstance(row.get('cfg'), dict):
@@ -359,11 +376,21 @@ def load_significance(comparison_path, expected_reference: str | None = None) ->
     }
     if not comparison_path or not Path(comparison_path).exists():
         return out
-    data = json.loads(Path(comparison_path).read_text())
+    try:
+        data = json.loads(Path(comparison_path).read_text())
+    except (OSError, json.JSONDecodeError):
+        # A corrupt comparison file leaves the significance gate UNVERIFIED;
+        # it must not abort the benchmark that already measured the cost.
+        return out
+    if not isinstance(data, dict):
+        return out
     out['reference'] = data.get('reference')
     if expected_reference is not None:
         out['reference_matches'] = data.get('reference') == expected_reference
-    for row in (data.get('rows') or []):
+    rows = data.get('rows') or []
+    if not isinstance(rows, list):
+        rows = []
+    for row in rows:
         if isinstance(row, dict) and row.get('name') is not None:
             out['rows'][row['name']] = {
                 'beats_reference_significantly': row.get('beats_reference_significantly'),
