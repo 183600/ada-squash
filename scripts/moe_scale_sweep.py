@@ -32,7 +32,7 @@ from scripts.check_scale_replication import build_observations
 
 # Small, scientifically sensible defaults: same expert count, increasing
 # width and depth. The launcher still requires >= 2 scales.
-DEFAULT_SCALES = ('small:256:4:4:4', 'medium:512:8:8:8')
+DEFAULT_SCALES = ('small:256:4:4:4', 'medium:512:8:8:4')
 _SCALE_RE = re.compile(r'^([A-Za-z0-9_.-]+):(\d+):(\d+):(\d+):(\d+)$')
 _FORBIDDEN_PASSTHROUGH = ('--dim', '--n-layers', '--n-heads', '--n-experts',
                           '--output-dir')
@@ -82,7 +82,10 @@ def summarise_scales(scales: list[dict], base: Path, candidate: str,
         'reference': reference,
         'metric': metric,
         'sources': sources,
-        'scales': scales,
+        # `scales` below is the summary's observed scale-id list; keep the
+        # actual (dim/layers/heads/experts) definitions under a distinct key so
+        # the report cannot lose the sweep axis it ran.
+        'requested_scales': scales,
         'observations': observations,
         **summary,
     }
