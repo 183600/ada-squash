@@ -156,9 +156,9 @@ def _bool_option(name: str, value) -> bool:
     flag into the opposite of what the caller wrote (an empty YAML key would
     disable deduplication). Only an actual bool is a boolean measurement here.
     """
-    if not isinstance(value, bool):
+    if not _is_boolean_scalar(value):
         raise ValueError(f"data option {name} must be a bool, got {value!r}")
-    return value
+    return bool(value)
 
 
 def _fraction_option(name: str, value) -> float:
@@ -168,9 +168,10 @@ def _fraction_option(name: str, value) -> float:
         converted = float(value)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f"data option {name} must be a fraction, got {value!r}") from None
-    if converted != value:
+    if isinstance(value, (str, bytes)):
         # A quoted/numeric-string fraction is a config error, not a number;
-        # `float("0.5")` used to silently change the split protocol.
+        # `float("0.5")` used to silently change the split protocol. Exact
+        # rationals (Fraction/Decimal) are legitimate numeric values.
         raise ValueError(f"data option {name} must be a fraction, got {value!r}")
     if not math.isfinite(converted) or not 0.0 <= converted < 1.0:
         raise ValueError(f"data option {name}={converted} must be finite and in [0, 1)")
@@ -758,6 +759,17 @@ class DocumentCleaner:
         return dict(self.stats)
 
 
+def _is_token_row(row) -> bool:
+    """Whether one tokenizer row is a sequence of ids (not a flat scalar id)."""
+    if isinstance(row, (str, bytes)):
+        return False
+    try:
+        len(row)
+    except TypeError:
+        return False
+    return True
+
+
 def _iter_dataset_examples(ds):
     """Yield one example at a time from a stream without DataLoader sharding.
 
@@ -887,12 +899,14 @@ class PackedStream(IterableDataset):
             nonlocal fill
             try:
                 token_lists = self.tok(batch, add_special_tokens=False)["input_ids"]
-                if len(token_lists) != len(batch):
+                if (len(token_lists) != len(batch)
+                        or not all(_is_token_row(row) for row in token_lists)):
                     # A batch tokenizer that returns a different number of
-                    # rows cannot be aligned to the documents; silently
-                    # dropping/pulling tokens would change the corpus.
+                    # rows (or a flat list of scalar ids) cannot be aligned
+                    # to the documents; silently dropping/pulling tokens
+                    # would change the corpus.
                     raise ValueError(
-                        f'tokenizer returned {len(token_lists)} row(s) for '
+                        f'tokenizer returned a non-matrix result for '
                         f'{len(batch)} document(s)')
             except Exception:
                 token_lists = []

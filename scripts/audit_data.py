@@ -81,6 +81,7 @@ This script only *reads* data; it never trains or writes to a split.
 import argparse
 import json
 import math
+import numbers
 import sys
 from array import array
 from collections import Counter
@@ -94,7 +95,8 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import wilson_interval
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
-from scripts.data_pipeline import (DocumentCleaner, canonical_document_hash, document_hash,
+from scripts.data_pipeline import (DocumentCleaner, _is_token_row,
+                                   canonical_document_hash, document_hash,
                                    extract_group_value, group_hash, load_document_stream)
 
 
@@ -208,6 +210,9 @@ def near_duplicate_record(ids, shingle_size: int = 8,
     It is optional so the sketch stays usable on token streams that did not
     come from a text document.
     """
+    # `ids` is documented as a token stream; materialize once so a generator
+    # can be both sketched and counted.
+    ids = list(ids)
     shingles = token_shingles(ids, shingle_size)
     total_shingles = len(shingles)
     limit = _strict_int_option(max_shingles, "max_shingles", 1)
@@ -608,7 +613,7 @@ def near_duplicate_scan_bound(report: dict, *, confidence: float = 0.95,
         # An empty split computes no upper bound, so it cannot certify a
         # population rate even though the scan was exhaustive.
         "certifies_population": bool(
-            exhaustive and bounds
+            bool(report.get("enabled", True)) and exhaustive and bounds
             and all(block["upper_bound"] is not None
                     for block in bounds.values())),
         "max_rate": max_rate,
@@ -753,19 +758,32 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         vocab_size = 0
 
     def _add_ids(ids, which='raw') -> None:
+        ids_list = list(ids)
+        # Only exact integer ids are token ids. `np.asarray([1.9],
+        # dtype=int64)` silently truncates and `["1"]` would later crash the
+        # range check; skip malformed rows rather than inventing an id.
+        if any(not isinstance(value, numbers.Integral)
+               or isinstance(value, bool) for value in ids_list):
+            return
+        ids_list = [int(value) for value in ids_list]
         try:
-            arr = np.asarray(ids, dtype=np.int64)
+            arr = np.asarray(ids_list, dtype=np.int64)
         except (TypeError, ValueError, OverflowError):
             # A token id above int64 is still a token id: count it through
             # Python's arbitrary-precision Counter so the out-of-range check
             # can report it instead of aborting the whole audit.
-            legacy_bufs[which].update(ids)
+            legacy_bufs[which].update(ids_list)
             return
         if arr.size == 0:
             return
         if arr.min() < 0:
             # np.bincount rejects negatives; a tokenizer that emits them
             # still gets counted here (and flagged below).
+            legacy_bufs[which].update(arr.tolist())
+            return
+        if (vocab_size and int(arr.max()) >= vocab_size) or int(arr.max()) >= (1 << 20):
+            # `np.bincount` allocates up to max(id)+1 entries. A large OOV id
+            # must be counted and reported, not turned into a huge allocation.
             legacy_bufs[which].update(arr.tolist())
             return
         bc = np.bincount(arr)
@@ -791,7 +809,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         # A batch tokenizer that returns a different number of rows cannot be
         # aligned to the documents; fall back to one call per document rather
         # than silently sketching/counting the wrong document.
-        if enc is None or len(enc) != len(batch):
+        if (enc is None or len(enc) != len(batch)
+                or not all(_is_token_row(row) for row in enc)):
             for doc_index, text in batch:
                 try:
                     ids = tokenizer(text, add_special_tokens=False)['input_ids']
@@ -883,9 +902,16 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     # recovers the old for-loop result without pulling an extra document.
     nominal_count = report.get('count')
     if (capped
-            and isinstance(nominal_count, int) and not isinstance(nominal_count, bool)
-            and documents_read == nominal_count):
-        capped = False
+            and isinstance(nominal_count, int) and not isinstance(nominal_count, bool)):
+        if documents_read == nominal_count:
+            capped = False
+    elif capped:
+        # The split length is unknown (train-only report): one lookahead is
+        # the only way to distinguish an exactly-sized stream from a prefix.
+        try:
+            next(stream_iter)
+        except StopIteration:
+            capped = False
     _flush_tokens(text_batch, 'raw')
     _flush_tokens(text_batch_effective, 'effective')
     if count_bufs['raw'] is not None:
@@ -1379,6 +1405,12 @@ def _chronology_problems(reports: dict) -> list:
                 return []
         return [f"cannot verify chronological split tiling: invalid start/count "
                 f"in the active split report {report!r}"]
+    if names[0] != 'train':
+        # A held-out report without its train predecessor is not a tiling of
+        # the stream, even if it starts at 0.
+        return [f"chronological split tiling has no train split: {names}"]
+    if any(r['count'] <= 0 for r in active):
+        return [f"a present split has zero/negative documents: {names}"]
     ranges = [(name, r['start'], r['start'] + r['count'])
               for name, r in zip(names, active)]
     if ranges[0][1] != 0:
