@@ -616,12 +616,6 @@ def main():
             # Snapshot the fp32 weights on the host before the in-place
             # quantizer runs; each seed needs them back.
             fp_state = {k: t.detach().to('cpu', copy=True) for k, t in model.state_dict().items()}
-            # The dataset split is read unshuffled, so a loader restarted for
-            # every seed would score the identical first N batches and report
-            # zero probe variance. Draw one non-overlapping block per seed
-            # from the same deterministic probe stream instead; the block for
-            # a given seed is identical across checkpoints, which keeps the
-            # cross-arm pairing intact.
             dataset_probe_batches = None
             if dataset_probe is not None:
                 dataset_probe_batches = [

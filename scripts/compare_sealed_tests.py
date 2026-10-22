@@ -159,9 +159,6 @@ def _shape_mismatches(ref_manifest: dict, other_manifest: dict) -> dict:
     a = ref_manifest.get("results") or {}
     b = other_manifest.get("results") or {}
     missing = "<missing>"
-    # The final step is part of the controlled protocol: early stopping can
-    # end two runs at different points under the same --max-steps, so matching
-    # hyperparameters alone do not show the compared weights saw equal compute.
     return {f"results.{key}": [a.get(key, missing), b.get(key, missing)]
             for key in ("n_layers", "dim", "n_heads", "final_step")
             if key not in a or key not in b or a.get(key) != b.get(key)}
