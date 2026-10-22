@@ -79,7 +79,12 @@ def _kurtosis_workspace_get_or_create(key: tuple, n: int, dtype: torch.dtype, de
 class KurtosisMeter:
     # The per-chunk workspace is bounded and reused across samples.
     _chunk = 1 << 22
-    acc_dtype = torch.float32
+    # Accumulate the moments in float64. The fourth central moment of a small
+    # activation (e.g. randn * 1e-12) underflows float32 to zero while the
+    # variance is still representable, which made the scale-invariant
+    # excess-kurtosis ratio collapse to -3. Float64 keeps both moments for
+    # the full activation-magnitude range the diagnostics see.
+    acc_dtype = torch.float64
 
     def __init__(self):
         self.reset()
