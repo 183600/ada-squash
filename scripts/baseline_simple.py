@@ -502,7 +502,10 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
         val_loss = row.get('val_loss')
         identity = _row_run_identity(row, parent_of)
         canonical = seen_runs.get(identity)
-        if canonical is None:
+        # An unusable row is not evidence and must not claim the run identity:
+        # otherwise a later valid alias is marked as its duplicate and its
+        # significant win is dropped from the family.
+        if canonical is None and _finite_number(val_loss):
             seen_runs[identity] = row.get('name')
         entry = {'name': row.get('name'), 'val_loss': val_loss, 'n_seeds': row.get('n_seeds'),
                  'run_identity': identity,
