@@ -452,12 +452,24 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                            if not _finite(p['final_val_loss'])]
     # A cell is one architecture. Seeds that report different shapes are not
     # independent replications of the same depth/norm cell and must not be
-    # pooled into a certifiable mean.
+    # pooled into a certifiable mean. A seed with a missing/None shape field
+    # is unknown, not a second copy of the others: otherwise one complete
+    # seed plus one legacy shape-less manifest would still certify the cell.
+    shape_keys = ('n_layers', 'dim', 'n_heads')
+    shapes_complete_by_seed = {}
+    unknown_shape_seeds = []
+    for p in per_seed:
+        shape = {key: p.get(key) for key in shape_keys}
+        if all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+               for value in shape.values()):
+            shapes_complete_by_seed[p['seed']] = shape
+        else:
+            unknown_shape_seeds.append(p['seed'])
     shape_signatures = {
-        (p.get('n_layers'), p.get('dim'), p.get('n_heads'))
-        for p in per_seed
-        if any(_finite(p.get(k)) for k in ('n_layers', 'dim', 'n_heads'))}
-    shape_consistent = len(shape_signatures) <= 1
+        tuple(shape[key] for key in shape_keys)
+        for shape in shapes_complete_by_seed.values()}
+    shapes_complete = bool(shapes_complete_by_seed) and not unknown_shape_seeds
+    shape_consistent = shapes_complete and len(shape_signatures) <= 1
     return {
         'cell': cell_dir.name,
         'launch_id': launch_id,
@@ -470,8 +482,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                      and not seeds_without_final
                      and not rejected and data_versions_complete
                      and not data_version_mismatch
-                     and shape_consistent),
-        'manifest_rejections': rejected,
+                     and shape_consistent),        'manifest_rejections': rejected,
         'protocol_verified_by_launch_id': launch_id is not None,
         # A cell is only one data version: if the resolved upstream commits
         # differ across its seeds, the pooled delta mixes snapshots and cannot
@@ -509,6 +520,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         'n_heads': heads[0] if heads else None,
         'shape_by_seed': {p['seed']: {'n_layers': p.get('n_layers'), 'dim': p.get('dim'),
                                       'n_heads': p.get('n_heads')} for p in per_seed},
+        'unknown_shape_seeds': sorted(unknown_shape_seeds),
+        'shapes_complete': shapes_complete,
         'shape_consistent_across_seeds': shape_consistent,
         'norm_share_of_params': (sum(norm_shares) / len(norm_shares)) if norm_shares else None,
         'flops_per_token_forward': (sum(flops_fwd) / len(flops_fwd)) if flops_fwd else None,
