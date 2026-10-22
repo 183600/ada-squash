@@ -279,26 +279,34 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                     borderline_pairs += int(borderline.size)
                     borderline_docs.add(later_i)
                     if len(borderline_examples) < max_examples:
-                        best = int(borderline[int(np.argmax(sims[borderline]))])
-                        earlier_i = int(candidate_ids[best])
+                        # `borderline` holds positions into `sims`, not
+                        # document indices: map the best position through it
+                        # and then through `candidate_ids`, or the example can
+                        # name a different earlier document (and similarity)
+                        # than the pair that triggered it.
+                        best_pos = int(np.argmax(sims[borderline]))
+                        sim_pos = int(borderline[best_pos])
+                        earlier_i = int(candidate_ids[sim_pos])
                         borderline_examples.append({
                             "earlier_document_index": int(earlier_records[earlier_i]["doc_index"]),
                             "later_document_index": int(later_record["doc_index"]),
-                            "estimated_jaccard": round(float(sims[best]), 4),
+                            "estimated_jaccard": round(float(sims[sim_pos]), 4),
                         })
                 if not hits.size:
                     continue
                 n_pairs += int(hits.size)
                 flagged_docs.add(later_i)
                 if len(examples) < max_examples:
-                    best = int(hits[int(np.argmax(sims[hits]))])
-                    earlier_i = int(candidate_ids[best])
+                    # Same indirection as the borderline example above.
+                    best_pos = int(np.argmax(sims[hits]))
+                    sim_pos = int(hits[best_pos])
+                    earlier_i = int(candidate_ids[sim_pos])
                     examples.append({
                         "earlier_split": earlier,
                         "later_split": later,
                         "earlier_document_index": int(earlier_records[earlier_i]["doc_index"]),
                         "later_document_index": int(later_record["doc_index"]),
-                        "estimated_jaccard": round(float(sims[best]), 4),
+                        "estimated_jaccard": round(float(sims[sim_pos]), 4),
                         "earlier_n_tokens": int(earlier_records[earlier_i]["n_tokens"]),
                         "later_n_tokens": int(later_record["n_tokens"]),
                     })
