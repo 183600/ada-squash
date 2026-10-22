@@ -62,7 +62,7 @@ from scripts.data_pipeline import (DocumentCleaner, canonical_document_hash, doc
                                    extract_group_value, group_hash, load_document_stream)
 
 
-def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None):
+def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, known_hashes_exhaustive=True, known_hashes_extra_exhaustive=True, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, known_groups_exhaustive=True, known_groups_extra_exhaustive=True, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     # The pipeline checks the cross-split group/document ledgers *before* the
@@ -97,7 +97,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     group_overlap_groups: set = set()
     group_overlap_extra_groups: set = set()
     group_value_missing = 0
-    tokenizer_errors = 0
+    tokenizer_error_docs: set = set()
     vocab_size = int(getattr(tokenizer, 'vocab_size', 0) or 0)
 
     def _add_ids(ids, which='raw') -> None:
@@ -126,19 +126,22 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         count_bufs[which] = counts
 
     def _flush_tokens(batch: list, which: str) -> None:
-        nonlocal tokenizer_errors
         if not batch:
             return
+        texts = [text for _, text in batch]
         try:
-            enc = tokenizer(batch, add_special_tokens=False)['input_ids']
+            enc = tokenizer(texts, add_special_tokens=False)['input_ids']
         except Exception:
             enc = None
         if enc is None:
-            for t in batch:
+            for doc_index, text in batch:
                 try:
-                    ids = tokenizer(t, add_special_tokens=False)['input_ids']
+                    ids = tokenizer(text, add_special_tokens=False)['input_ids']
                 except Exception:
-                    tokenizer_errors += 1
+                    # The raw and effective passes see the same source
+                    # document; count a document that fails either pass once,
+                    # not once per tokenization pass.
+                    tokenizer_error_docs.add(doc_index)
                     continue
                 _add_ids(ids, which)
         else:
@@ -156,6 +159,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             capped = True
             break
         documents_read += 1
+        doc_index = documents_read - 1
         # Call both cleaners for every example.  The raw cleaner may drop a
         # duplicate that the effective cleaner keeps (the first copy was
         # excluded by a ledger), so its verdict, or the effective verdict,
@@ -185,7 +189,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
                     if known_groups_extra is not None and gh in known_groups_extra:
                         group_overlap_extra += 1
                         group_overlap_extra_groups.add(gh)
-            text_batch.append(text)
+            text_batch.append((doc_index, text))
         if effective_text is not None:
             if collect_hashes:
                 # Both digests, so a held-out formatting variant of a training
@@ -197,7 +201,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
                 value = extract_group_value(example, group_key)
                 if value is not None:
                     groups.add(group_hash(value))
-            text_batch_effective.append(effective_text)
+            text_batch_effective.append((doc_index, effective_text))
         if len(text_batch) >= 256:
             _flush_tokens(text_batch, 'raw')
         if len(text_batch_effective) >= 256:
@@ -238,7 +242,13 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         stats['effective_documents_kept'] = stats.get('documents_kept', len(lengths))
     stats['duplicate_overlap_with_train'] = overlap if known_hashes is not None else None
     stats['duplicate_overlap_with_validation'] = overlap_extra if known_hashes_extra is not None else None
-    stats['duplicate_overlap_is_lower_bound'] = bool(capped) if (known_hashes is not None or known_hashes_extra is not None) else None
+    # A sampled current split *or* a sampled known prefix both make the count
+    # a lower bound: the ledger may simply not contain the later duplicate.
+    stats['duplicate_overlap_is_lower_bound'] = (
+        bool(capped
+             or (known_hashes is not None and not known_hashes_exhaustive)
+             or (known_hashes_extra is not None and not known_hashes_extra_exhaustive))
+        if (known_hashes is not None or known_hashes_extra is not None) else None)
     stats['group_key'] = group_key
     if group_key:
         stats['group_value_missing'] = group_value_missing
@@ -251,7 +261,10 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         stats['group_overlap_with_validation_groups'] = (len(group_overlap_extra_groups)
                                                          if known_groups_extra is not None else None)
         stats['group_overlap_is_lower_bound'] = (
-            bool(capped) if (known_groups is not None or known_groups_extra is not None) else None)
+            bool(capped
+                 or (known_groups is not None and not known_groups_exhaustive)
+                 or (known_groups_extra is not None and not known_groups_extra_exhaustive))
+            if (known_groups is not None or known_groups_extra is not None) else None)
     if lengths:
         stats['doc_chars_mean'] = sum(lengths) / len(lengths)
         stats['doc_chars_min'] = min(lengths)
@@ -267,9 +280,13 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
         stats['doc_chars_mean'] = stats['doc_chars_min'] = stats['doc_chars_max'] = None
         stats['doc_chars_q1'] = stats['doc_chars_q3'] = None
         stats['length_outliers_3iqr'] = None
-    stats['tokenizer_errors'] = tokenizer_errors
-    stats['token_ids_out_of_range'] = sum(c for t, c in tokens.items() if not 0 <= t < getattr(tokenizer, 'vocab_size', 2 ** 31))
+    stats['tokenizer_errors'] = len(tokenizer_error_docs)
+    vocab_limit = getattr(tokenizer, 'vocab_size', 2 ** 31)
+    stats['token_ids_out_of_range'] = sum(c for t, c in tokens.items() if not 0 <= t < vocab_limit)
+    stats['token_ids_out_of_range_effective'] = sum(
+        c for t, c in tokens_effective.items() if not 0 <= t < vocab_limit)
     stats['distinct_token_ids'] = len(tokens)
+    stats['distinct_token_ids_effective'] = len(tokens_effective)
     stats['finite_lengths'] = bool(all(math.isfinite(v) for v in (stats['doc_chars_mean'] or 0.0, stats['doc_chars_min'] or 0.0, stats['doc_chars_max'] or 0.0)))
     return stats, tokens, report, hashes, lengths, groups, tokens_effective
 
@@ -300,27 +317,31 @@ def length_fence(lengths) -> dict:
 
 
 def _chronology_problems(reports: dict) -> list:
-    """Verify the three split reports tile the stream in time order.
+    """Verify the enabled split reports tile the stream in time order.
 
-    train must start at 0, validation must start where train ends and test
-    must start where validation ends; anything else means a document could be
-    counted on two sides (or the split is no longer chronological).
+    train must start at 0 and each later enabled split must start where the
+    previous one ends; anything else means a document could be counted on two
+    sides (or the split is no longer chronological). A disabled split
+    (`--val-frac 0` / `--test-frac 0`) is simply absent.
     """
-    train, validation, test = (reports.get(name) for name in ('train', 'validation', 'test'))
-    if not all(isinstance(r, dict) and isinstance(r.get('start'), int) and isinstance(r.get('count'), int) for r in (train, validation, test)):
+    names = [name for name in ('train', 'validation', 'test') if name in reports]
+    active = [reports[name] for name in names]
+    if not active or not all(
+            isinstance(r, dict) and isinstance(r.get('start'), int)
+            and isinstance(r.get('count'), int) for r in active):
         return []
-    train_end = train['start'] + train['count']
-    validation_end = validation['start'] + validation['count']
-    test_end = test['start'] + test['count']
-    if train['start'] != 0 or validation['start'] != train_end or test['start'] != validation_end:
-        return [f"split ranges are not contiguous chronological slices: train=[{train['start']},{train_end}) validation=[{validation['start']},{validation_end}) test=[{test['start']},{test_end})"]
-    total = train.get('num_documents')
-    if isinstance(total, int):
-        counts_match = all(r.get('num_documents') == total
-                           for r in (validation, test))
-        if not counts_match or test_end != total:
-            return [f"split ranges do not cover the full document stream: "
-                    f"test ends at {test_end} but num_documents={total}"]
+    ranges = [(name, r['start'], r['start'] + r['count'])
+              for name, r in zip(names, active)]
+    if ranges[0][1] != 0:
+        return [f"split ranges are not contiguous chronological slices: {ranges}"]
+    for (_, _, prev_end), (name, start, _) in zip(ranges, ranges[1:]):
+        if start != prev_end:
+            return [f"split ranges are not contiguous chronological slices: {ranges}"]
+    total = active[0].get('num_documents')
+    last_name, _, last_end = ranges[-1]
+    if isinstance(total, int) and last_end != total:
+        return [f"split ranges do not cover the full document stream: "
+                f"{last_name} ends at {last_end} but num_documents={total}"]
     return []
 
 
@@ -431,7 +452,13 @@ def main():
     val_ledger_info = None
     train_group_ledger_info = None
     val_group_ledger_info = None
-    for name in ('train', 'validation', 'test'):
+    # A zero held-out fraction disables that split in the data pipeline; audit
+    # the splits the run actually has instead of requesting empty ones.
+    active_splits = [name for name in ('train', 'validation', 'test')
+                     if (name == 'train'
+                         or (name == 'validation' and args.val_frac > 0.0)
+                         or (name == 'test' and args.test_frac > 0.0))]
+    for name in active_splits:
         # Train/validation hash and group sets are kept (the exclude ledgers
         # and the overlap reference); test only needs to be compared against
         # them.  Test is checked against train *and* validation: a val/test
@@ -453,10 +480,20 @@ def main():
             args.n_docs, args.min_doc_chars, args.max_doc_chars, args.dedup,
             known_hashes=train_hashes,
             known_hashes_extra=(val_hashes if name == 'test' else None),
+            known_hashes_exhaustive=(splits['train']['exhaustive']
+                                     if name in ('validation', 'test') else True),
+            known_hashes_extra_exhaustive=((splits.get('validation') or {})
+                                           .get('exhaustive', True)
+                                           if name == 'test' else True),
             collect_hashes=(name in ('train', 'validation')),
             group_key=args.group_key,
             known_groups=train_groups,
             known_groups_extra=(val_groups if name == 'test' else None),
+            known_groups_exhaustive=(splits['train']['exhaustive']
+                                     if name in ('validation', 'test') else True),
+            known_groups_extra_exhaustive=((splits.get('validation') or {})
+                                           .get('exhaustive', True)
+                                           if name == 'test' else True),
             collect_groups=(name in ('train', 'validation')),
             exclude_hashes=exclude_hashes,
             exclude_group_hashes=exclude_groups)
@@ -490,6 +527,8 @@ def main():
     # against statistics they did not contribute to (no test-set tuning).
     train_fence = length_fence(lengths['train']) if lengths['train'] else None
     for name in ('validation', 'test'):
+        if name not in splits:
+            continue
         if train_fence is not None and lengths[name]:
             splits[name]['length_outliers_train_fence'] = sum(
                 1 for v in lengths[name]
@@ -500,25 +539,36 @@ def main():
             splits[name]['length_outliers_train_fence'] = None
             splits[name]['length_outliers_train_fence_fraction'] = None
     chronology = _chronology_problems(reports)
-    empty_token_splits = [name for name in ('train', 'validation', 'test')
+    empty_token_splits = [name for name in active_splits
                           if not sum(tokens[name].values())]
+
+    def _tvd_pair(a, b, effective=False):
+        if a not in tokens or b not in tokens:
+            return None
+        source = effective_tokens if effective else tokens
+        return _total_variation(source[a], source[b])
+
+    def _top_pair(a, b):
+        if a not in tokens or b not in tokens:
+            return None
+        return _top_shifted(tokens[a], tokens[b])
+
     shift = {
-        'train_vs_validation_tvd': _total_variation(tokens['train'], tokens['validation']),
-        'train_vs_test_tvd': _total_variation(tokens['train'], tokens['test']),
-        'validation_vs_test_tvd': _total_variation(tokens['validation'], tokens['test']),
+        'train_vs_validation_tvd': _tvd_pair('train', 'validation'),
+        'train_vs_test_tvd': _tvd_pair('train', 'test'),
+        'validation_vs_test_tvd': _tvd_pair('validation', 'test'),
         # The same distances over the documents that survive the cross-split
         # ledgers: that is the distribution the trained model is actually
         # selected and reported on, and it can differ from the raw one when a
         # ledger is non-trivial.
-        'train_vs_validation_tvd_effective': _total_variation(
-            effective_tokens['train'], effective_tokens['validation']),
-        'train_vs_test_tvd_effective': _total_variation(
-            effective_tokens['train'], effective_tokens['test']),
-        'validation_vs_test_tvd_effective': _total_variation(
-            effective_tokens['validation'], effective_tokens['test']),
-        'top_shifted_train_vs_validation': _top_shifted(tokens['train'], tokens['validation']),
+        'train_vs_validation_tvd_effective': _tvd_pair('train', 'validation', effective=True),
+        'train_vs_test_tvd_effective': _tvd_pair('train', 'test', effective=True),
+        'validation_vs_test_tvd_effective': _tvd_pair('validation', 'test', effective=True),
+        'top_shifted_train_vs_validation': _top_pair('train', 'validation'),
         'doc_chars_mean_delta_train_validation': (
-            None if splits['train']['doc_chars_mean'] is None or splits['validation']['doc_chars_mean'] is None
+            None if ('validation' not in splits
+                     or splits['train']['doc_chars_mean'] is None
+                     or splits['validation']['doc_chars_mean'] is None)
             else splits['validation']['doc_chars_mean'] - splits['train']['doc_chars_mean']),
     }
     out = {'options': vars(args), 'hypothesis': args.hypothesis, 'run_metadata': collect_run_metadata(),
@@ -545,16 +595,19 @@ def main():
         print(line)
     if args.group_key:
         missing_groups = sum(int(splits[name].get('group_value_missing') or 0)
-                             for name in ('train', 'validation', 'test'))
+                             for name in active_splits)
         if missing_groups:
             print(f"[audit] NOTE: {missing_groups} sampled documents have no '{args.group_key}' value; "
                   "they cannot be tied to a group and are checked for document duplicates only")
-    print(f"[audit] token TVD train-vs-val={shift['train_vs_validation_tvd']:.4f} "
-          f"train-vs-test={shift['train_vs_test_tvd']:.4f} "
-          f"val-vs-test={shift['validation_vs_test_tvd']:.4f}")
-    print(f"[audit] token TVD after ledgers train-vs-val={shift['train_vs_validation_tvd_effective']:.4f} "
-          f"train-vs-test={shift['train_vs_test_tvd_effective']:.4f} "
-          f"val-vs-test={shift['validation_vs_test_tvd_effective']:.4f}")
+    def _fmt_tvd(value):
+        return 'n/a' if value is None else f'{value:.4f}'
+
+    print(f"[audit] token TVD train-vs-val={_fmt_tvd(shift['train_vs_validation_tvd'])} "
+          f"train-vs-test={_fmt_tvd(shift['train_vs_test_tvd'])} "
+          f"val-vs-test={_fmt_tvd(shift['validation_vs_test_tvd'])}")
+    print(f"[audit] token TVD after ledgers train-vs-val={_fmt_tvd(shift['train_vs_validation_tvd_effective'])} "
+          f"train-vs-test={_fmt_tvd(shift['train_vs_test_tvd_effective'])} "
+          f"val-vs-test={_fmt_tvd(shift['validation_vs_test_tvd_effective'])}")
     if args.hypothesis:
         print(f"[audit][hypothesis] {args.hypothesis}")
     print(f"[audit] saved to {args.output}")
@@ -562,7 +615,7 @@ def main():
     if empty_token_splits:
         problems.append('no usable tokens could be sampled from: ' + ', '.join(empty_token_splits)
                         + ' (an empty histogram makes TVD undefined, not zero)')
-    for name in ('train', 'validation', 'test'):
+    for name in active_splits:
         stats = splits[name]
         if stats['length_outliers_3iqr']:
             print(f"[audit] NOTE: {name}: {stats['length_outliers_3iqr']} length outliers beyond the 3xIQR fence "
@@ -579,21 +632,25 @@ def main():
                   f"[{train_fence['lower']}, {train_fence['upper']}] derived from the training lengths alone")
     # Every split is audited, test included: the final numbers come from test,
     # so corruption there must fail the audit just like corruption in train.
-    non_finite = [name for name in ('train', 'validation', 'test')
+    non_finite = [name for name in active_splits
                   if not splits[name]['finite_lengths']]
     if non_finite:
         problems.append(f"non-finite document-length statistics (NaN/Inf in the data) in: {', '.join(non_finite)}")
-    if (splits['validation']['duplicate_overlap_with_train'] or 0) > 0 or (splits['test']['duplicate_overlap_with_train'] or 0) > 0:
+    if any((splits[name]['duplicate_overlap_with_train'] or 0) > 0
+           for name in ('validation', 'test') if name in splits):
         problems.append('duplicate documents (exact or canonical text) appear in both train and a held-out split (duplicate leakage)')
-    if (splits['test']['duplicate_overlap_with_validation'] or 0) > 0:
+    if ('test' in splits
+            and (splits['test']['duplicate_overlap_with_validation'] or 0) > 0):
         problems.append('duplicate documents (exact or canonical text) appear in both validation and test (the selection split and the sealed final split are not disjoint)')
     if args.group_key:
         straddling = []
         for name in ('validation', 'test'):
+            if name not in splits:
+                continue
             n_groups = splits[name].get('group_overlap_with_train_groups') or 0
             if n_groups:
                 straddling.append(f"{name} shares {n_groups} group(s) with train")
-        n_groups = splits['test'].get('group_overlap_with_validation_groups') or 0
+        n_groups = (splits.get('test') or {}).get('group_overlap_with_validation_groups') or 0
         if n_groups:
             straddling.append(f"test shares {n_groups} group(s) with validation")
         if straddling:
@@ -609,23 +666,41 @@ def main():
                 f"{info['n_docs_limit']} documents of its split, so a run consuming it "
                 f"still accepts cross-split duplicates/groups beyond that prefix "
                 f"(re-run with --n-docs 0 for a full ledger)")
+    sampled_short = []
+    for name, stats in splits.items():
+        report_count = (reports.get(name) or {}).get('count')
+        if (isinstance(report_count, int) and not isinstance(report_count, bool)
+                and stats.get('documents_sampled', 0) < report_count):
+            sampled_short.append(
+                f"{name}: sampled {stats.get('documents_sampled')} of {report_count}")
+    if sampled_short:
+        problems.append(
+            'the document stream ended before the nominal split size, so the audit '
+            'covered only a prefix and cannot claim exhaustive coverage (' +
+            '; '.join(sampled_short) + ')')
     empty_effective = [name for name in ('validation', 'test')
-                       if splits[name].get('documents_kept')
-                       and not splits[name].get('effective_documents_kept')]
+                       if (name in splits
+                           and ((splits[name].get('documents_kept')
+                                 and not splits[name].get('effective_documents_kept'))
+                                or not sum(effective_tokens[name].values())))]
     if empty_effective:
         problems.append(
             'the cross-split ledgers drop every kept document of: '
             + ', '.join(empty_effective)
             + ' (the effective held-out split is empty; the run would evaluate on nothing)')
-    out_of_range = [name for name in ('train', 'validation', 'test')
-                    if splits[name]['token_ids_out_of_range']]
+    out_of_range = [name for name in active_splits
+                    if splits[name]['token_ids_out_of_range']
+                    or splits[name].get('token_ids_out_of_range_effective')]
     if out_of_range:
         problems.append(f"token ids outside the tokenizer vocabulary range in: {', '.join(out_of_range)}")
-    if args.max_tvd is not None and shift['train_vs_validation_tvd'] > args.max_tvd:
+    if (args.max_tvd is not None and shift['train_vs_validation_tvd'] is not None
+            and shift['train_vs_validation_tvd'] > args.max_tvd):
         problems.append(f"train-vs-validation distribution shift TVD={shift['train_vs_validation_tvd']:.4f} > max-tvd={args.max_tvd}")
-    if args.max_test_tvd is not None and shift['train_vs_test_tvd'] > args.max_test_tvd:
+    if (args.max_test_tvd is not None and shift['train_vs_test_tvd'] is not None
+            and shift['train_vs_test_tvd'] > args.max_test_tvd):
         problems.append(f"train-vs-test distribution shift TVD={shift['train_vs_test_tvd']:.4f} > max-test-tvd={args.max_test_tvd}")
-    if args.max_val_test_tvd is not None and shift['validation_vs_test_tvd'] > args.max_val_test_tvd:
+    if (args.max_val_test_tvd is not None and shift['validation_vs_test_tvd'] is not None
+            and shift['validation_vs_test_tvd'] > args.max_val_test_tvd):
         problems.append(f"validation-vs-test distribution shift TVD={shift['validation_vs_test_tvd']:.4f} > max-val-test-tvd={args.max_val_test_tvd}")
     manifest = {
         'run_metadata': out['run_metadata'],
