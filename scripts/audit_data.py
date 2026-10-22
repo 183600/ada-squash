@@ -758,6 +758,27 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
     return result
 
 
+def _strict_int_option(value, name: str, minimum: int) -> int:
+    """An integer-valued measurement, rejecting bools and fractional values.
+
+    ``int(2.5)`` silently becomes 2; for a sequence length, batch count or
+    evaluation cadence that changes the geometry being audited while the
+    report still looks like it described the requested protocol. A bool is
+    not a count either.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got bool {value!r}")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    if converted != value:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if converted < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {converted}")
+    return converted
+
+
 def packed_window_count(tokens, seq_len: int) -> int | None:
     """Number of fixed-length LM windows a split with `tokens` tokens can emit.
 
@@ -770,16 +791,13 @@ def packed_window_count(tokens, seq_len: int) -> int | None:
     """
     if tokens is None:
         return None
+    if isinstance(tokens, bool):
+        raise ValueError(f"token count must be numeric or None, got {tokens!r}")
     try:
         tokens = int(math.floor(float(tokens)))
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f"token count must be numeric or None, got {tokens!r}") from None
-    try:
-        seq_len = int(seq_len)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f"seq_len must be an integer, got {seq_len!r}") from None
-    if seq_len < 1:
-        raise ValueError(f"seq_len must be >= 1, got {seq_len}")
+    seq_len = _strict_int_option(seq_len, "seq_len", 1)
     if tokens < 1:
         return 0
     return (tokens - 1) // seq_len
@@ -796,16 +814,8 @@ def eval_batch_capacity(budget: dict | None, seq_len: int, batch_size: int) -> d
     next to the capacity, because a capacity extrapolated from a sampled
     prefix is an estimate, not an exact count.
     """
-    try:
-        seq_len = int(seq_len)
-        batch_size = int(batch_size)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(
-            f"seq_len/batch_size must be integers, got {seq_len!r}/{batch_size!r}") from None
-    if seq_len < 1:
-        raise ValueError(f"seq_len must be >= 1, got {seq_len}")
-    if batch_size < 1:
-        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    seq_len = _strict_int_option(seq_len, "seq_len", 1)
+    batch_size = _strict_int_option(batch_size, "batch_size", 1)
     budget = budget or {}
     tokens = budget.get('estimated_effective_tokens')
     if tokens is not None:
@@ -854,20 +864,10 @@ def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
     """
     if split not in ('validation', 'test'):
         raise ValueError(f"split must be validation/test, got {split!r}")
-    try:
-        requested_batches = int(requested_batches)
-        val_every = int(val_every)
-        max_steps = int(max_steps)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(
-            "requested_batches/val_every/max_steps must be integers, got "
-            f"{requested_batches!r}/{val_every!r}/{max_steps!r}") from None
-    if requested_batches < 1:
-        raise ValueError(f"requested_batches must be >= 1, got {requested_batches}")
-    if val_every < 0:
-        raise ValueError(f"val_every must be >= 0, got {val_every}")
-    if max_steps < 0:
-        raise ValueError(f"max_steps must be >= 0, got {max_steps}")
+    requested_batches = _strict_int_option(
+        requested_batches, "requested_batches", 1)
+    val_every = _strict_int_option(val_every, "val_every", 0)
+    max_steps = _strict_int_option(max_steps, "max_steps", 0)
     capacity = capacity or {}
     unique = capacity.get('unique_batches')
     if unique is not None:
