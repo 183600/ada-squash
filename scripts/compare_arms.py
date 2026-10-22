@@ -69,6 +69,39 @@ def _seed_values(agg: dict, metric: str) -> dict[int, float]:
     return out
 
 
+def _seed_record_problems(agg: dict) -> list[str]:
+    """Structural problems in an aggregate's per-seed records.
+
+    Two records for one seed are one underlying run, not two replications;
+    collapsing them in `_seed_values` could otherwise lift a two-seed arm over
+    the three-seed certification threshold. A malformed seed id is unknown,
+    never a seed to skip silently.
+    """
+    per_seed = agg.get('per_seed') if isinstance(agg, dict) else None
+    if not isinstance(per_seed, list):
+        return []
+    seen = set()
+    duplicates = set()
+    malformed = []
+    for record in per_seed:
+        if not isinstance(record, dict):
+            malformed.append(repr(record))
+            continue
+        seed = record.get('seed')
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            malformed.append(repr(seed))
+            continue
+        if seed in seen:
+            duplicates.add(seed)
+        seen.add(seed)
+    problems = []
+    if duplicates:
+        problems.append(f'duplicate per-seed id(s) {sorted(duplicates)}')
+    if malformed:
+        problems.append(f'malformed per-seed id(s) {malformed}')
+    return problems
+
+
 def _safe_exp(value):
     """exp(loss) for PPL reporting; a finite but huge loss stays visible."""
     try:
@@ -176,6 +209,8 @@ def _arm_issues(name: str, agg: dict, metric: str) -> list[str]:
         issues.append(f"arm {name!r} has missing seeds {agg['missing_seeds']}")
     if agg.get('invalid_seeds'):
         issues.append(f"arm {name!r} has invalid seeds {agg['invalid_seeds']}")
+    for problem in _seed_record_problems(agg):
+        issues.append(f'arm {name!r} has {problem}')
     if agg.get('data_versions_consistent') is False:
         issues.append(f'arm {name!r} mixes resolved data versions across seeds')
     if agg.get('shapes_consistent') is False:
