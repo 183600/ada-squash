@@ -240,6 +240,11 @@ def _probe_markov(rng, batch_size, seq_len, device, n_states=64):
     x, _ = markov_batch(rng, -100, batch_size, seq_len, device, n_states=n_states)
     return x
 
+def _next_token_targets(x: torch.Tensor, ignore_index: int) -> torch.Tensor:
+    y = torch.full_like(x, ignore_index)
+    y[:, :-1] = x[:, 1:]
+    return y
+
 def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None, exclude_test_hash_file=None, group_key=None, exclude_group_file=None, exclude_test_group_file=None, dataset_revision=None, tokenizer_revision=None, seed=42, num_workers=2):
     # Scoring a checkpoint on the documents it trained on understates the
     # quantization damage; the probe must come from a held-out split. The
@@ -271,10 +276,10 @@ def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, 
     def _next():
         nonlocal it
         try:
-            return next(it)[0]
+            return next(it)
         except StopIteration:
             it = iter(loader)
-            return next(it)[0]
+            return next(it)
     # Keep the split report on the callable so the manifest can pin the data
     # version (boundary, resolved dataset/tokenizer commits, cleaning policy)
     # of the exact probe that produced the reported PPL.
@@ -578,11 +583,13 @@ def main():
     set_all_seeds(seeds[0])
 
     def make_probe(rng, cfg, dataset_probe):
+        if args.probe == 'dataset':
+            return dataset_probe()
         if args.probe == 'random':
-            return _probe_random(rng, cfg.vocab_size, args.batch_size, args.seq_len, device)
-        if args.probe == 'markov':
-            return _probe_markov(rng, args.batch_size, args.seq_len, device, n_states=args.n_states)
-        return dataset_probe()
+            x = _probe_random(rng, cfg.vocab_size, args.batch_size, args.seq_len, device)
+        else:
+            x = _probe_markov(rng, args.batch_size, args.seq_len, device, n_states=args.n_states)
+        return x, _next_token_targets(x, cfg.ignore_index)
     explicit_cli = _explicit_cli_names(sys.argv[1:], p)
     ckpt_groups = [[path for path in str(entry).split(',') if path] for entry in args.ckpts]
     if any(not group for group in ckpt_groups):
@@ -626,25 +633,18 @@ def main():
                 model.load_state_dict(fp_state)
                 model.eval()
                 rng = torch.Generator(device=device).manual_seed(seed)
-                batches = []
                 if dataset_probe_batches is not None:
                     start = seed_index * args.n_batches
                     batches = list(dataset_probe_batches[start:start + args.n_batches])
                 else:
-                    for _ in range(args.n_batches):
-                        x = make_probe(rng, model.cfg, dataset_probe)
-                        batches.append(x)
-                # The targets are a pure function of the probe; build them once
-                # and reuse them for the fp32 and the W8A8 pass.
-                pairs = []
-                for x in batches:
-                    # `x` is not always (batch_size, seq_len): the dataset
-                    # probe's loader keeps the final short batch, so derive
-                    # the target shape from the probe itself.
-                    y = torch.full_like(x, model.cfg.ignore_index)
-                    y[:, :-1] = x[:, 1:]
-                    pairs.append((x, y))
-                coverage = probe_token_coverage(batches)
+                    batches = [make_probe(rng, model.cfg, dataset_probe)
+                               for _ in range(args.n_batches)]
+                # The dataset probe's loader already supplies the packed
+                # window's real target (including the last valid position);
+                # synthesizing it here would silently drop that token from
+                # every batch. Keep the pair for both the fp32 and W8A8 pass.
+                pairs = batches
+                coverage = probe_token_coverage([x for x, _ in pairs])
                 if coverage > args.max_probe_coverage:
                     raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
                 ce_fp = torch.zeros((), dtype=torch.float64, device=device)
