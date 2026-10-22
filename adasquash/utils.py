@@ -280,10 +280,29 @@ class LossSpikeCounter:
         if not isinstance(state, dict):
             return False
         ema = state.get('ema')
-        if not (isinstance(ema, (int, float)) and math.isfinite(ema)):
+        if not (isinstance(ema, (int, float)) and not isinstance(ema, bool)
+                and math.isfinite(ema)):
+            return False
+        # Validate the whole state before mutating either field: a malformed
+        # count used to raise after `ema` had already been replaced, leaving
+        # the counter half-loaded. A negative count is not a possible state
+        # and must not be accepted as one.
+        raw_n = state.get('n_spikes', 0)
+        if raw_n is None:
+            n_spikes = 0
+        elif isinstance(raw_n, bool):
+            return False
+        elif isinstance(raw_n, int):
+            n_spikes = raw_n
+        elif (isinstance(raw_n, float) and math.isfinite(raw_n)
+                and raw_n.is_integer()):
+            n_spikes = int(raw_n)
+        else:
+            return False
+        if n_spikes < 0:
             return False
         self.ema = float(ema)
-        self.n_spikes = int(state.get('n_spikes') or 0)
+        self.n_spikes = n_spikes
         return True
 
 @torch.no_grad()
