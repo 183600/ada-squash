@@ -241,8 +241,12 @@ def markov_batch(rng: torch.Generator, ignore_index: int, batch_size: int, seq_l
         torch.cumsum(jumps, dim=1, out=x[:, 1:])
         del jumps
         x[:, 1:].add_(start).remainder_(n_states)
-    else:
+    elif seq_len == 1:
         x = start
+    else:
+        # seq_len == 0: return the empty (batch, 0) sequence, not the
+        # (batch, 1) start token, so x and y stay aligned.
+        x = torch.empty((batch_size, 0), dtype=start.dtype, device=device)
     y = torch.full((batch_size, seq_len), ignore_index, dtype=torch.long, device=device)
     y[:, :-1] = x[:, 1:]
     if outlier_id is not None:
