@@ -101,10 +101,19 @@ class AdaSquashLM:
         self.tokenizer = tokenizer
         self.batch_size = int(batch_size)
         self.max_gen_toks = int(max_gen_toks)
-        self.device = next(model.parameters()).device
+        # Keep the device in the standard lm-eval `_device` slot as well: a
+        # harness LM exposes `device` as a read-only property, and assigning
+        # the attribute directly would raise once this class is mixed with
+        # lm_eval.api.model.LM. The property below also serves the plain
+        # wrapper used without lm-eval installed.
+        self._device = next(model.parameters()).device
         cfg = getattr(model, 'cfg', None)
         self.max_length = int(getattr(cfg, 'max_seq_len', 2048))
         self.apply_chat_template = False
+
+    @property
+    def device(self):
+        return self._device
 
     def tok_encode(self, string: str, add_special_tokens: bool=False,
                    left_truncate_len: int | None=None) -> list:
@@ -123,8 +132,14 @@ class AdaSquashLM:
         whole = self.tok_encode(context + continuation)
         ctx = self.tok_encode(context)
         if not ctx:
+            # An empty context is represented by the EOS/BOS prefix, exactly
+            # as lm-eval's TemplateLM does. The continuation must remain the
+            # *whole* tokenization: slicing `whole[1:]` would silently drop
+            # its first token and score a different (shorter) string.
             ctx = [self.tokenizer.eos_token_id]
-        cont = whole[len(ctx):]
+            cont = whole
+        else:
+            cont = whole[len(ctx):]
         return (ctx, cont)
 
     def _forward_logprobs(self, ids: list) -> torch.Tensor:
@@ -164,7 +179,13 @@ class AdaSquashLM:
                 continue
             ids = [self.tokenizer.eos_token_id] + ids
             total = 0.0
-            for start in range(0, len(ids), self.max_length):
+            # Non-overlapping windows skip the first token of every window
+            # after the first (it is never a prediction target). Stride by
+            # max_length - 1 instead: each later window overlaps the previous
+            # one by one token, so its first token was already scored and the
+            # remaining `window[1:]` covers every new token exactly once.
+            stride = max(1, self.max_length - 1)
+            for start in range(0, len(ids), stride):
                 window = ids[start:start + self.max_length]
                 if len(window) < 2:
                     continue
@@ -204,7 +225,8 @@ class AdaSquashLM:
             out.append(text)
         return out
 
-def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16, tokenizer: str | None=None):
+def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16,
+                        tokenizer=None, tokenizer_revision: str | None=None):
     """Run lm-evaluation-harness tasks against the raw GPT module.
 
     Uses ``AdaSquashLM`` (loglikelihood + rolling + greedy generation), so no
@@ -218,8 +240,20 @@ def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16, tokenizer: 
         raise RuntimeError('lm-eval not installed. `pip install lm-eval`.') from e
     if tokenizer is None or isinstance(tokenizer, str):
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer or 'gpt2')
-    lm_obj = AdaSquashLM(model, tokenizer, batch_size=batch_size)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer or 'gpt2', revision=tokenizer_revision)
+    # lm-eval 0.4.x requires a real lm_eval.api.model.LM instance and raises
+    # TypeError for a duck-typed wrapper. Mix the fixed primitives in at call
+    # time so this module still imports (and the needle path still runs) when
+    # the optional lm-eval dependency is absent.
+    from lm_eval.api.model import LM
+
+    class _HarnessLM(AdaSquashLM, LM):
+        def __init__(self, *args, **kwargs):
+            LM.__init__(self)
+            AdaSquashLM.__init__(self, *args, **kwargs)
+
+    lm_obj = _HarnessLM(model, tokenizer, batch_size=batch_size)
     report = simple_evaluate(model=lm_obj, tasks=list(tasks), batch_size=batch_size,
                              bootstrap_iters=0)
     results = {}
@@ -470,7 +504,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True)
-    p.add_argument('--tasks', nargs='+', default=[], help='lm-eval tasks to request (none by default: the in-script harness is a NotImplementedError placeholder, so requesting tasks without the documented HF-export + `lm_eval --model hf` recipe is a hard error, never an empty "successful" result)')
+    p.add_argument('--tasks', nargs='+', default=[], help='lm-eval tasks to request (none by default). The in-script AdaSquashLM wrapper runs them directly against the raw GPT; if lm-eval is missing or the task run fails, the result is recorded as failed rather than as an empty successful evaluation.')
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--needle-test', action='store_true', help='also run needle-in-haystack')
     p.add_argument('--needle-context-len', type=int, default=None, help="needle context length (default: the checkpoint's trained seq_len, or its max_seq_len minus the positions the secret's decode needs when the checkpoint records no seq_len - so a model trained short is not silently evaluated at an extrapolated length; asking for more than max_seq_len raises)")
@@ -496,39 +530,47 @@ def main():
     set_all_seeds(args.seed)
     model, model_args = load_ckpt(args.ckpt, device=device)
     print(f"[eval] loaded {args.ckpt} | norm={model_args['norm']} | n_layers={model.cfg.n_layers}")
-    results = {'ckpt': args.ckpt, 'norm': model_args['norm'], 'tasks': {}}
+    # Resolve the tokenizer identity once, before either evaluation path. The
+    # benchmark branch used to fall back to the bare 'gpt2' default while the
+    # needle branch honoured the checkpoint/CLI tokenizer, so a non-gpt2 model
+    # was silently scored with the wrong vocabulary.
+    if args.tokenizer is not None:
+        # An explicit tokenizer is the user's choice, not a hint: the
+        # checkpoint may have been trained with a different vocabulary and
+        # silently overriding the flag evaluates a different model.
+        tok_name = args.tokenizer
+        recorded_revision = (
+            (model_args.get('tokenizer_revision_resolved')
+             or model_args.get('tokenizer_revision'))
+            if model_args.get('tokenizer') == args.tokenizer else None)
+    else:
+        tok_name, recorded_revision = _checkpoint_tokenizer(model_args, 'gpt2')
+    tok_revision = (args.tokenizer_revision if args.tokenizer_revision is not None
+                    else recorded_revision)
+    results = {'ckpt': args.ckpt, 'norm': model_args['norm'], 'tasks': {},
+               'tokenizer': tok_name, 'tokenizer_revision': tok_revision}
     if args.tasks:
         try:
-            res = evaluate_lm_harness(model, args.tasks, args.batch_size)
+            res = evaluate_lm_harness(model, args.tasks, args.batch_size,
+                                      tokenizer=tok_name,
+                                      tokenizer_revision=tok_revision)
             results['tasks'].update(res)
             results['tasks_ran'] = True
-        except (NotImplementedError, RuntimeError) as e:
+        except Exception as e:
             # A requested benchmark that did not run must not be written out as
             # an empty-but-successful result: that is how "evaluated on MMLU"
-            # gets claimed with zero scores behind it.
-            print(f'[eval] lm-eval path not available: {e}', file=sys.stderr)
+            # gets claimed with zero scores behind it. Catch every failure
+            # (including the TypeError an incompatible lm-eval version raises)
+            # so the results/manifest still record the failed task request.
+            print(f'[eval] lm-eval path failed ({type(e).__name__}): {e}',
+                  file=sys.stderr)
             results['tasks_ran'] = False
-            results['tasks_error'] = str(e)
+            results['tasks_error'] = f'{type(e).__name__}: {e}'
     else:
         results['tasks_ran'] = None
     if args.needle_test:
         from transformers import AutoTokenizer
-        if args.tokenizer is not None:
-            # An explicit tokenizer is the user's choice, not a hint: the
-            # checkpoint may have been trained with a different vocabulary and
-            # silently overriding the flag evaluates a different model.
-            tok_name = args.tokenizer
-            recorded_revision = (
-                (model_args.get('tokenizer_revision_resolved')
-                 or model_args.get('tokenizer_revision'))
-                if model_args.get('tokenizer') == args.tokenizer else None)
-        else:
-            tok_name, recorded_revision = _checkpoint_tokenizer(model_args, 'gpt2')
-        tok_revision = (args.tokenizer_revision if args.tokenizer_revision is not None
-                        else recorded_revision)
         tok = AutoTokenizer.from_pretrained(tok_name, revision=tok_revision)
-        results['tokenizer'] = tok_name
-        results['tokenizer_revision'] = tok_revision
         # Pin the concrete commit the tokenizer resolved to, not only the
         # mutable request: exact-match needle accuracy depends on it.
         results['tokenizer_revision_resolved'] = (
