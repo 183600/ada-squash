@@ -202,16 +202,23 @@ def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
     if isinstance(expected_ledgers, dict):
         data = manifest.get('data')
         data = data if isinstance(data, dict) else {}
-        for key, wanted in expected_ledgers.items():
-            if key not in data:
-                mismatches[f'data.{key}'] = [wanted, '<missing>']
-                continue
-            actual = data.get(key)
-            if isinstance(actual, dict):
-                actual = {name: actual.get(name)
-                          for name in ('path', 'exists', 'sha256', 'bytes')}
-            if actual != wanted:
-                mismatches[f'data.{key}'] = [wanted, actual]
+        # A legacy/minimal manifest that records no ledger fields at all stays
+        # compatible when the expected protocol also has no ledger path. Once
+        # either side claims a ledger identity, every role must be comparable.
+        has_expected_ledger = any(value is not None
+                                  for value in expected_ledgers.values())
+        has_recorded_ledger = any(key in data for key in expected_ledgers)
+        if has_expected_ledger or has_recorded_ledger:
+            for key, wanted in expected_ledgers.items():
+                if key not in data:
+                    mismatches[f'data.{key}'] = [wanted, '<missing>']
+                    continue
+                actual = data.get(key)
+                if isinstance(actual, dict):
+                    actual = {name: actual.get(name)
+                              for name in ('path', 'exists', 'sha256', 'bytes')}
+                if actual != wanted:
+                    mismatches[f'data.{key}'] = [wanted, actual]
     for key, wanted in expected['shape'].items():
         actual = results.get(key, missing)
         if actual is missing:
