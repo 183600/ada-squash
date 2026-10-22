@@ -24,7 +24,14 @@ This module supplies the reusable, pure-Python pieces:
     Python version and can be frozen in the pre-registration.
 ``schedule_balance_report``
     Per-arm position/block coverage, so an arm that only ever ran in one
-    time block is visible before the results are interpreted.
+    time block is visible before the results are interpreted. An RCBD is
+    also checked for the stronger arm x block crossing contract: every arm
+    must appear exactly once in every block, not merely the same number of
+    times overall.
+``schedule_fingerprint_status``
+    Recomputes the schedule hash from its recorded seed/order, so an
+    allocation edited after the pre-registration was frozen is detected
+    before the run instead of being silently analysed as the planned design.
 ``order_drift_report``
     Within-arm rank correlation between execution position and outcome, with
     a within-arm permutation test.  Centering by arm is what distinguishes
@@ -38,7 +45,14 @@ This module supplies the reusable, pure-Python pieces:
     A pre-flight checklist: replication, stated hypotheses, a pre-specified
     smallest effect, adequate planned power, a complete randomized schedule,
     a locked exclusion policy and the presence of an identity/negative
-    control pair.
+    control pair. The power check uses the family-adjusted alpha for the
+    planned primary claims and the expected complete pairs after attrition,
+    not the nominal per-test alpha and seed count.
+``prospective_power_plan``
+    Family-level (Bonferroni) and attrition-inflated sample-size planning:
+    how many *planned* seed pairs are needed before a run so that, after the
+    study-wide multiplicity correction and the expected run-level attrition,
+    the pre-specified smallest effect still has the target power.
 ``simulate_paired_design``
     A Monte-Carlo calibration of the actual paired-test code: empirical
     type-I error under a synthetic null and empirical power under a known
@@ -67,12 +81,14 @@ import numbers
 import random
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
-from .metrics import MIN_SEEDS_FOR_SIGNIFICANCE, paired_design_summary, paired_t_one_sided, tost_paired
+from .metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, paired_design_summary,
+                      paired_required_n, paired_t_one_sided, tost_paired)
 
 __all__ = [
     'block_randomized_schedule',
     'randomized_complete_block_schedule',
     'schedule_balance_report',
+    'schedule_fingerprint_status',
     'order_drift_report',
     'default_exclusion_policy',
     'normalize_exclusion_policy',
@@ -80,6 +96,7 @@ __all__ = [
     'classify_run_exclusions',
     'run_exclusion_audit',
     'design_readiness_audit',
+    'prospective_power_plan',
     'simulate_paired_design',
 ]
 
@@ -269,6 +286,76 @@ def randomized_complete_block_schedule(units: Iterable[str], replicates: Iterabl
     }
 
 
+def schedule_fingerprint_status(schedule: dict) -> dict:
+    """Recompute a schedule's SHA-256 from its recorded fields.
+
+    A schedule is only a pre-registration artefact if the order written to
+    disk is the order the fingerprint was computed from. This helper rebuilds
+    the canonical payload for either shipped schema and compares it with the
+    stored ``fingerprint``; an edited order, seed or block size without a
+    corresponding fingerprint update is visible before training starts.
+
+    ``verified`` is ``True``/``False`` for a recognized schema and ``None``
+    when the record is not a schedule this module can verify (for example a
+    legacy or caller-defined dict). A mismatch is a hard failure in
+    :func:`design_readiness_audit`; an unverifiable record is a warning.
+    """
+    if not isinstance(schedule, dict):
+        raise ValueError('schedule must be a mapping')
+    schema = schedule.get('schema')
+    expected = schedule.get('fingerprint')
+    if not isinstance(expected, str) or not expected:
+        return {
+            'schema': schema,
+            'fingerprint': expected,
+            'recomputed': None,
+            'verified': None,
+            'reason': 'schedule has no stored fingerprint to verify',
+        }
+    if schema == 'adasquash.run_schedule.v1':
+        payload = {
+            'seed': schedule.get('seed'),
+            'block_size': schedule.get('block_size'),
+            'order': schedule.get('order'),
+        }
+    elif schema == 'adasquash.rcbd_schedule.v1':
+        payload = {
+            'seed': schedule.get('seed'),
+            'units': schedule.get('units'),
+            'replicates': schedule.get('replicates'),
+            'order': schedule.get('order'),
+        }
+    else:
+        return {
+            'schema': schema,
+            'fingerprint': expected,
+            'recomputed': None,
+            'verified': None,
+            'reason': f'unrecognized schedule schema {schema!r}',
+        }
+    try:
+        recomputed = hashlib.sha256(
+            json.dumps(payload, sort_keys=True,
+                       separators=(',', ':')).encode('utf-8')).hexdigest()
+    except (TypeError, ValueError):
+        return {
+            'schema': schema,
+            'fingerprint': expected,
+            'recomputed': None,
+            'verified': None,
+            'reason': 'schedule fields are not JSON-serializable',
+        }
+    verified = recomputed == expected
+    return {
+        'schema': schema,
+        'fingerprint': expected,
+        'recomputed': recomputed,
+        'verified': verified,
+        'reason': ('fingerprint matches the recorded schedule' if verified else
+                   'fingerprint does not match the recorded schedule fields'),
+    }
+
+
 def _arm_resolver(arm_of):
     if arm_of is None:
         return lambda unit: unit
@@ -337,6 +424,16 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         structural.append('run ids are missing or not non-empty strings')
     if len(set(units)) != len(units):
         structural.append('duplicate run ids in the realized order')
+    raw_order = schedule.get('order')
+    if (positions_valid and isinstance(raw_order, list)
+            and len(raw_order) == len(entries)):
+        by_position = sorted(entries, key=lambda entry: entry['position'])
+        realized_order = [entry.get('run_id', entry.get('unit'))
+                          for entry in by_position]
+        if realized_order != raw_order:
+            structural.append(
+                'entries do not follow the recorded order; the frozen schedule '
+                'and the run records describe different allocations')
 
     per_arm: dict[str, dict] = {}
     blocks_valid = True
@@ -384,6 +481,57 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     if schedule.get('n_blocks') == 1 and n > 8:
         structural.append('a single block was used for a large grid; '
                           'blocking cannot spread a monotone drift')
+    # A complete randomized block design is a stronger contract than "every
+    # arm appears in several blocks": within *each* block every arm must
+    # appear exactly once. The check only applies when the schedule looks
+    # like an RCBD (each arm has one run per block), so a generic blocked
+    # order with unequal arm counts is not misclassified.
+    block_arm_counts: dict[int, dict[str, int]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        block = entry.get('block')
+        if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+            continue
+        arm = str(resolve(entry.get('run_id', entry.get('unit'))))
+        counts = block_arm_counts.setdefault(block, {})
+        counts[arm] = counts.get(arm, 0) + 1
+    declared_blocks = schedule.get('n_blocks')
+    is_rcbd = schedule.get('schema') == 'adasquash.rcbd_schedule.v1'
+    looks_complete = is_rcbd or (
+        isinstance(declared_blocks, int) and not isinstance(declared_blocks, bool)
+        and declared_blocks > 0 and bool(per_arm)
+        and sorted(block_arm_counts) == list(range(declared_blocks))
+        and all(bucket['count'] == declared_blocks
+                and bucket['n_blocks'] == declared_blocks
+                for bucket in per_arm.values()))
+    complete_block_design = None
+    if looks_complete:
+        block_index_valid = (isinstance(declared_blocks, int)
+                             and not isinstance(declared_blocks, bool)
+                             and declared_blocks > 0)
+        coverage_ok = (
+            block_index_valid
+            and sorted(block_arm_counts) == list(range(declared_blocks))
+            and all(bucket['count'] == declared_blocks
+                    and bucket['n_blocks'] == declared_blocks
+                    for bucket in per_arm.values()))
+        if not coverage_ok:
+            complete_block_design = False
+            structural.append(
+                'the declared randomized complete block design does not cover '
+                'every arm in every block exactly once (missing/extra block or '
+                'arm x block cell)')
+        else:
+            complete_block_design = True
+            for block, counts in sorted(block_arm_counts.items()):
+                if (set(counts) != set(per_arm)
+                        or any(value != 1 for value in counts.values())):
+                    complete_block_design = False
+                    structural.append(
+                        f'block {block} does not contain every arm exactly once '
+                        f'({counts}); the schedule is not a randomized complete '
+                        f'block design')
     return {
         'schema': 'adasquash.schedule_balance.v1',
         'schedule_fingerprint': schedule.get('fingerprint'),
@@ -392,6 +540,9 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         'block_sizes': schedule.get('block_sizes'),
         'overall_mean_position': overall_mean,
         'per_arm': per_arm,
+        'block_arm_counts': {str(block): counts
+                             for block, counts in sorted(block_arm_counts.items())},
+        'complete_block_design': complete_block_design,
         'arms_with_extreme_mean_position': sorted(extreme_counts),
         'balanced': not structural,
         'warnings': structural,
@@ -967,6 +1118,125 @@ def run_exclusion_audit(runs: Sequence[Mapping],
     }
 
 
+def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
+                           *, alpha: float = 0.05, power: float = 0.8,
+                           n_tests: int = 1, expected_attrition: float = 0.0,
+                           max_pairs: int = 100000) -> dict:
+    """Prospective sample-size plan with multiplicity and attrition.
+
+    ``paired_required_n`` answers "how many pairs detect ``margin`` at
+    ``alpha``". A confirmatory study asks two harder questions before launch:
+
+    * **Multiplicity.** The study makes ``n_tests`` pre-registered claims, not
+      one. Planning every comparison at the unadjusted ``alpha`` makes the
+      planned power for the family optimistic: the test that eventually
+      survives Holm must clear a smaller threshold. This helper plans at the
+      Bonferroni family level ``alpha / n_tests``. Bonferroni is deliberately
+      conservative and the analysis itself may use the more powerful Holm
+      step-down; a design that is adequate under the conservative planning
+      threshold is also adequate under Holm, whereas the reverse is not.
+    * **Attrition.** Runs can be lost for pre-specified protocol reasons
+      (missing artifact, non-finite loss, provenance mismatch). A *complete
+      pair* requires both arms of the same seed, so if each planned run is
+      lost independently with probability ``expected_attrition`` the expected
+      number of analyzable pairs is ``floor(n_pairs * (1 - a)^2)``. Planning
+      for the nominal seed count alone therefore overstates the final n.
+
+    ``margin`` is the smallest effect of scientific interest fixed in advance,
+    never the observed effect. The return value keeps the unadjusted and
+    family-adjusted required n side by side, the planned n after attrition
+    inflation, and the MDE at the expected analyzable n, so a null result
+    cannot be attributed to a design that never had resolution.
+    """
+    sd = _finite_float(paired_sd)
+    if sd is None or sd < 0.0:
+        raise ValueError(f'paired_sd must be a finite number >= 0, got {paired_sd!r}')
+    if isinstance(n_pairs, bool) or not isinstance(n_pairs, int) or n_pairs < 2:
+        raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
+    margin_value = _finite_float(margin)
+    if margin_value is None or margin_value <= 0.0:
+        raise ValueError(f'margin must be a finite number > 0, got {margin!r}')
+    alpha_value = _finite_float(alpha)
+    if alpha_value is None or not 0.0 < alpha_value < 1.0:
+        raise ValueError(f'alpha must be strictly between 0 and 1, got {alpha!r}')
+    power_value = _finite_float(power)
+    if power_value is None or not 0.0 < power_value < 1.0:
+        raise ValueError(f'power must be strictly between 0 and 1, got {power!r}')
+    if isinstance(n_tests, bool) or not isinstance(n_tests, int) or n_tests < 1:
+        raise ValueError(f'n_tests must be a positive integer, got {n_tests!r}')
+    attrition = _finite_float(expected_attrition)
+    if attrition is None or not 0.0 <= attrition < 1.0:
+        raise ValueError(
+            f'expected_attrition must be a probability in [0, 1), got '
+            f'{expected_attrition!r}')
+    if isinstance(max_pairs, bool) or not isinstance(max_pairs, int) or max_pairs < 2:
+        raise ValueError(f'max_pairs must be an integer >= 2, got {max_pairs!r}')
+
+    family_alpha = alpha_value / n_tests
+    required_unadjusted = paired_required_n(
+        sd, margin_value, alpha=alpha_value, power=power_value, max_n=max_pairs)
+    required_adjusted = paired_required_n(
+        sd, margin_value, alpha=family_alpha, power=power_value, max_n=max_pairs)
+    pair_survival = (1.0 - attrition) ** 2
+    expected_pairs = int(math.floor(n_pairs * pair_survival + 1e-12))
+    required_planned = (None if required_adjusted is None
+                        else int(math.ceil(required_adjusted / pair_survival)))
+    planned_unadjusted = paired_design_summary(
+        sd, n_pairs, margin=margin_value, alpha=alpha_value, power=power_value)
+    planned_summary = paired_design_summary(
+        sd, n_pairs, margin=margin_value, alpha=family_alpha, power=power_value)
+    effective_summary = (paired_design_summary(
+        sd, expected_pairs, margin=margin_value, alpha=family_alpha,
+        power=power_value) if expected_pairs >= 2 else None)
+    adequate_unadjusted = (None if required_unadjusted is None
+                           else bool(n_pairs >= required_unadjusted))
+    adequate_adjusted = (None if required_adjusted is None
+                         else bool(n_pairs >= required_adjusted))
+    adequate_after_attrition = (
+        None if required_adjusted is None else
+        bool(expected_pairs >= 2 and expected_pairs >= required_adjusted))
+    if required_adjusted is None:
+        note = ('the pre-specified margin is not detectable within max_pairs at '
+                'the family-level alpha even before attrition; increase the '
+                'budget or reconsider the margin')
+    elif adequate_after_attrition:
+        note = ('the planned seed count still covers the family-adjusted '
+                'requirement after the expected attrition')
+    else:
+        note = ('underpowered after multiplicity and attrition: plan '
+                f'{required_planned} seed pair(s), not {n_pairs}')
+    return {
+        'schema': 'adasquash.prospective_power.v1',
+        'paired_sd': sd,
+        'n_pairs': n_pairs,
+        'margin': margin_value,
+        'alpha': alpha_value,
+        'power_target': power_value,
+        'n_tests': n_tests,
+        'multiplicity_method': 'bonferroni',
+        'family_alpha': family_alpha,
+        'expected_attrition': attrition,
+        'complete_pair_survival': pair_survival,
+        'expected_analyzable_pairs': expected_pairs,
+        'required_pairs_unadjusted': required_unadjusted,
+        'required_pairs_family_adjusted': required_adjusted,
+        'required_planned_pairs': required_planned,
+        'shortfall_pairs': (None if required_planned is None
+                            else max(0, required_planned - n_pairs)),
+        'minimum_detectable_delta_unadjusted': planned_unadjusted[
+            'minimum_detectable_delta_95_power80'],
+        'minimum_detectable_delta_family_adjusted': planned_summary[
+            'minimum_detectable_delta_95_power80'],
+        'minimum_detectable_delta_after_attrition': (
+            effective_summary['minimum_detectable_delta_95_power80']
+            if effective_summary else None),
+        'adequately_powered_unadjusted': adequate_unadjusted,
+        'adequately_powered_family_adjusted': adequate_adjusted,
+        'adequately_powered_after_attrition': adequate_after_attrition,
+        'note': note,
+    }
+
+
 def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                            hypotheses: Mapping[str, str],
                            schedule: Optional[dict] = None,
@@ -979,7 +1249,9 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                            alpha: float = 0.05,
                            min_seeds: int = MIN_SEEDS_FOR_SIGNIFICANCE,
                            identity_controls: Sequence[Sequence[str]] = (),
-                           exclusion_policy: Optional[Mapping] = None) -> dict:
+                           exclusion_policy: Optional[Mapping] = None,
+                           n_confirmatory_tests: int = 1,
+                           expected_attrition: float = 0.0) -> dict:
     """Pre-flight design checklist, written before any run starts.
 
     Failures are structural and should stop a confirmatory launch; warnings are
@@ -987,9 +1259,16 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     absence of a pre-specified smallest effect is a warning, not a failure: an
     exploratory matrix may legitimately run without one, but it cannot make an
     equivalence claim later.
+
+    ``n_confirmatory_tests`` and ``expected_attrition`` make the power check
+    prospective rather than optimistic: the required n is computed at the
+    Bonferroni family level and inflated for the expected loss of complete
+    pairs (see :func:`prospective_power_plan`). The default of one test and no
+    attrition reproduces the single-comparison calculation.
     """
     names = list(rows.keys()) if isinstance(rows, Mapping) else list(rows)
     checks: list[dict] = []
+    planned_power = None
 
     def add(check_id: str, status: str, detail: str) -> None:
         checks.append({'id': check_id, 'status': status, 'detail': detail})
@@ -1060,27 +1339,80 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                 f'{n_pairs} distinct seed(s): at least 2 paired observations are '
                 f'needed to estimate power for margin={target:g}')
         else:
-            design = paired_design_summary(sd, n_pairs, margin=target,
-                                           alpha=float(alpha), power=float(target_power))
-            if design.get('adequately_powered_for_margin') is True:
-                add('power', 'pass',
-                    f'{n_pairs} pairs at paired SD={sd:g} reach the '
-                    f'{target:g} target (required '
-                    f'{design.get("required_pairs_for_margin")})')
-            elif design.get('adequately_powered_for_margin') is False:
-                add('power', 'fail',
-                    f'{n_pairs} pairs at paired SD={sd:g} are underpowered for '
-                    f'margin={target:g}; need {design.get("required_pairs_for_margin")}')
+            try:
+                plan = prospective_power_plan(
+                    sd, n_pairs, target, alpha=float(alpha),
+                    power=float(target_power),
+                    n_tests=n_confirmatory_tests,
+                    expected_attrition=expected_attrition)
+            except ValueError as exc:
+                add('power', 'fail', f'invalid power-planning input: {exc}')
             else:
-                add('power', 'warn',
-                    f'margin={target:g} is not reachable within the search cap at '
-                    f'paired SD={sd:g}')
+                planned_power = plan
+                family_note = (
+                    f'{plan["n_tests"]} test(s) at family alpha '
+                    f'{plan["family_alpha"]:.4g}' if plan['n_tests'] > 1 else
+                    'one test at alpha')
+                if plan['adequately_powered_after_attrition'] is True:
+                    add('power', 'pass',
+                        f'{n_pairs} pairs at paired SD={sd:g} reach the '
+                        f'{target:g} target ({family_note}); '
+                        f'{plan["required_planned_pairs"]} planned pairs needed '
+                        f'after {plan["expected_attrition"]:.0%} attrition')
+                elif plan['adequately_powered_after_attrition'] is False:
+                    add('power', 'fail',
+                        f'{n_pairs} pairs at paired SD={sd:g} are underpowered for '
+                        f'margin={target:g} ({family_note}): '
+                        f'{plan["required_pairs_family_adjusted"]} analyzable pairs '
+                        f'are required, so plan '
+                        f'{plan["required_planned_pairs"]} pairs after '
+                        f'{plan["expected_attrition"]:.0%} attrition')
+                else:
+                    add('power', 'warn',
+                        f'margin={target:g} is not reachable within the search cap '
+                        f'at paired SD={sd:g} and family alpha '
+                        f'{plan["family_alpha"]:.4g}')
+
+    attrition_value = _finite_float(expected_attrition)
+    if attrition_value is None or not 0.0 <= attrition_value < 1.0:
+        add('attrition', 'fail',
+            f'invalid expected attrition {expected_attrition!r}: must be a '
+            f'probability in [0, 1)')
+    else:
+        expected_pairs = int(math.floor(
+            n_pairs * (1.0 - attrition_value) ** 2 + 1e-12))
+        if expected_pairs < min_seeds:
+            add('attrition', 'fail',
+                f'{expected_pairs} complete pair(s) are expected to survive '
+                f'{attrition_value:.0%} run attrition, below the replication '
+                f'minimum of {min_seeds}; plan more seeds or lower the '
+                f'attrition assumption')
+        else:
+            add('attrition', 'pass',
+                f'{expected_pairs} of {n_pairs} planned pair(s) expected to '
+                f'survive {attrition_value:.0%} run attrition')
 
     if schedule is None:
         add('schedule', 'warn',
             'no randomized run schedule: execution order may be confounded with '
             'the arm and with time drift')
     else:
+        try:
+            integrity = schedule_fingerprint_status(schedule)
+        except ValueError as exc:
+            add('schedule_integrity', 'fail',
+                f'malformed run schedule: {exc}')
+        else:
+            if integrity['verified'] is True:
+                add('schedule_integrity', 'pass',
+                    'schedule fingerprint matches the recorded order')
+            elif integrity['verified'] is False:
+                add('schedule_integrity', 'fail',
+                    'schedule fingerprint does not match the recorded order; '
+                    'the pre-registered allocation was edited after freezing')
+            else:
+                add('schedule_integrity', 'warn',
+                    f'schedule cannot be verified: {integrity["reason"]}')
         try:
             balance = schedule_balance_report(schedule, arm_of=schedule_arm_of)
         except ValueError as exc:
@@ -1148,6 +1480,9 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         'n_fail': n_fail,
         'n_warn': n_warn,
         'checks': checks,
+        'planned_power': planned_power,
+        'n_confirmatory_tests': n_confirmatory_tests,
+        'expected_attrition': expected_attrition,
         'exclusion_policy': canonical_policy,
         'exclusion_policy_fingerprint': policy_fingerprint,
         'note': ('failures block a confirmatory launch; warnings are recorded so a '

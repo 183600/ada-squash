@@ -51,8 +51,11 @@ Comparison protocol (what the runner guarantees, and checks)
 * **Randomized complete-block execution order.** Every row runs once in each
   time block, with an independent per-row seed permutation and a keyed-SHA-256
   within-block order; the schedule (and its fingerprint) is frozen in
-  `analysis_plan.json` before training. A block-level drift then hits every row
-  once and cancels from the paired arm contrast. `run_order_audit.json` tests
+  `analysis_plan.json` before training. The pre-flight audit recomputes the
+  fingerprint and verifies that every row appears exactly once in every block,
+  so an edited or non-crossed allocation is not analysed as the planned
+  design. A block-level drift then hits every row once and cancels from the
+  paired arm contrast. `run_order_audit.json` tests
   whether the realized position still predicts the held-out loss after
   centering within arm, and reports when cached runs predate the schedule
   instead of inventing an order for them. `--no-randomize-order` is the
@@ -60,10 +63,15 @@ Comparison protocol (what the runner guarantees, and checks)
 * **Pre-flight design readiness.** `design_readiness.json` checks replication,
   stated hypotheses, a pre-specified smallest effect, planned power (from
   `--assumed-paired-sd`), schedule completeness/balance and the presence of
-  the identity `dytcd_full` / `dytcd_ls1e5` control pair. `--require-design-ready`
-  turns a structural failure into a pre-training error. When a margin and an
-  assumed SD are supplied, the same file calibrates the actual paired-test code
-  on synthetic data (`simulate_paired_design`) instead of trusting its formula.
+  the identity `dytcd_full` / `dytcd_ls1e5` control pair. Power is planned
+  over the pre-registered *primary* tier at the Bonferroni family alpha, not
+  once per test at 0.05, and the seed count is sized for the expected
+  complete pairs after `--expected-attrition` (a pair needs both arms, so
+  run-level attrition `a` leaves `n*(1-a)^2` pairs). The attrition assumption
+  is frozen in `analysis_plan.json`. `--require-design-ready` turns a
+  structural failure into a pre-training error. When a margin and an assumed
+  SD are supplied, the same file calibrates the actual paired-test code on
+  synthetic data (`simulate_paired_design`) instead of trusting its formula.
 * **Pre-specified attrition policy.** `exclusion_policy.json` fixes which runs
   may leave the primary contrast (missing run, protocol/provenance mismatch,
   non-finite loss) and which are retained with a sensitivity flag (a diverged
@@ -3773,7 +3781,8 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         alpha: float=0.05, margin: float=0.0,
                         equivalence_margin: float=0.0,
                         run_schedule: dict | None=None,
-                        exclusion_policy: dict | None=None) -> dict:
+                        exclusion_policy: dict | None=None,
+                        expected_attrition: float=0.0) -> dict:
     """Freeze the confirmatory contrast registry *before* any training starts.
 
     A comparison experiment is only confirmatory if the set of tests is fixed
@@ -3793,7 +3802,10 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     run; the realized reference is recorded in `baseline_comparison.json`.
     The exclusion policy is normalized and hashed into the same fingerprint:
     a rerun that quietly changes which runs may be dropped is a changed
-    experiment, not a re-analysis.
+    experiment, not a re-analysis. The expected run-attrition assumption used
+    to size the design is frozen in the same payload: it is the denominator
+    the planned power was computed against, so changing it after seeing how
+    many runs were lost would be a post-hoc design change.
     """
     baseline_set = set(baseline_names or [])
     contrasts: list = []
@@ -3963,6 +3975,11 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     # be dropped changes the analysed sample, so it belongs in the same
     # fingerprint as the contrasts and the randomized schedule.
     exclusion_policy = normalize_exclusion_policy(exclusion_policy)
+    if (not _finite_metric(expected_attrition)
+            or not 0.0 <= float(expected_attrition) < 1.0):
+        raise ValueError(
+            f'expected_attrition must be a finite probability in [0, 1), '
+            f'got {expected_attrition!r}')
     seeds = list(seeds or [])
     if not all(_is_seed_id(seed) for seed in seeds):
         raise ValueError(
@@ -3978,6 +3995,7 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         'margin': float(margin),
         'equivalence_margin': float(equivalence_margin),
         'baseline_pool': sorted(baseline_set),
+        'expected_attrition': float(expected_attrition),
         'exclusion_policy': exclusion_policy,
         'exclusion_policy_fingerprint': exclusion_policy_fingerprint(exclusion_policy),
         # The contrast *ids* alone do not identify the experiment: two
@@ -4376,6 +4394,7 @@ def main():
     p.add_argument('--schedule-seed', type=int, default=0, help='seed of the randomized complete-block execution schedule; the schedule is frozen in analysis_plan.json before training, so changing it changes the pre-registration fingerprint')
     p.add_argument('--no-randomize-order', dest='randomize_order', action='store_false', help='keep the matrix row order instead of a randomized complete-block schedule (the order is then recorded as not randomized; order drift cannot be separated from the arm)')
     p.add_argument('--assumed-paired-sd', type=float, default=None, help='pre-run assumption for the paired across-seed SD (e.g. from a pilot); with --baseline-margin this makes the design-readiness audit check planned power before launching runs')
+    p.add_argument('--expected-attrition', type=float, default=0.0, help='pre-run expected fraction of planned runs lost to pre-specified protocol failures; a complete pair needs both arms, so the readiness audit plans for n*(1-attrition)^2 analyzable pairs and freezes this assumption in analysis_plan.json')
     p.add_argument('--require-design-ready', action='store_true', help='fail before training when the design-readiness audit has a structural failure (missing replication/hypothesis, incomplete schedule, absent control pair, or underpowered for the stated margin)')
     p.add_argument('--require-plan-lock', action='store_true', help='fail when this invocation would replace an existing analysis_plan.json with a different fingerprint (changed seeds/alpha/margins/hypotheses); without it the drift is recorded and warned about, but the run proceeds')
     p.add_argument('--require-exclusion-audit', action='store_true', help='fail after training when the pre-specified attrition audit finds a duplicate run/seed, an unaccounted exclusion, or an arm left below 3 analyzable seeds; the audit is always written to exclusion_audit.json')
@@ -4401,6 +4420,8 @@ def main():
                 f'(0 disables equivalence testing)')
     if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
         p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
+    if not math.isfinite(args.expected_attrition) or not 0.0 <= args.expected_attrition < 1.0:
+        p.error(f'--expected-attrition {args.expected_attrition} must be finite and in [0, 1)')
     for flag, value in (('--max-steps', args.max_steps),
                         ('--batch-size', args.batch_size),
                         ('--seq-len', args.seq_len),
@@ -4475,7 +4496,8 @@ def main():
         ablations, hypotheses, matrix_report, args.baselines, args.model, seeds,
         alpha=args.alpha, margin=args.baseline_margin,
         equivalence_margin=args.equivalence_margin, run_schedule=run_schedule,
-        exclusion_policy=exclusion_policy)
+        exclusion_policy=exclusion_policy,
+        expected_attrition=args.expected_attrition)
     matrix_report['analysis_plan'] = analysis_plan
     print(f"[plan] {analysis_plan['n_contrasts']} pre-registered confirmatory contrast(s) "
           f"(fingerprint {analysis_plan['fingerprint'][:12]}); every test outside this "
@@ -4522,13 +4544,22 @@ def main():
     expected_schedule_units = (
         [f'{name}::rep={seed}' for name in canonical_rows for seed in seeds]
         if run_schedule is not None else None)
+    # Prospective power is planned over the *primary* confirmatory tier, not
+    # every secondary sweep: the hierarchical gatekeeping test only pays the
+    # family-wise price on the contrasts that carry the main claim. A focused
+    # run with no primary contrast is planned as a single test.
+    n_confirmatory_tests = max(
+        1, sum(1 for entry in analysis_plan['contrasts']
+               if entry.get('tier') == 1))
     design_readiness = design_readiness_audit(
         seeds, ablations, hypotheses, schedule=run_schedule,
         expected_units=expected_schedule_units,
         schedule_arm_of=schedule_arm_of, margin=args.baseline_margin,
         equivalence_margin=args.equivalence_margin,
         assumed_paired_sd=args.assumed_paired_sd, alpha=args.alpha,
-        identity_controls=control_pairs, exclusion_policy=exclusion_policy)
+        identity_controls=control_pairs, exclusion_policy=exclusion_policy,
+        n_confirmatory_tests=n_confirmatory_tests,
+        expected_attrition=args.expected_attrition)
     if run_schedule is not None:
         design_readiness['schedule_balance'] = schedule_balance_report(
             run_schedule, arm_of=schedule_arm_of)
@@ -4539,10 +4570,18 @@ def main():
         # loss). This is a preparation check, not a result. A one-seed
         # --allow-uncertified run has no paired test to calibrate, and the
         # replication/power checks already record that failure.
-        design_readiness['simulated_power_check'] = simulate_paired_design(
-            n_pairs=len(seeds), effect=-float(args.baseline_margin),
-            paired_sd=float(args.assumed_paired_sd), reps=1000,
-            alpha=args.alpha, seed=args.schedule_seed)
+        expected_pairs = int(math.floor(
+            len(seeds) * (1.0 - args.expected_attrition) ** 2 + 1e-12))
+        if expected_pairs >= 2:
+            design_readiness['simulated_power_check'] = simulate_paired_design(
+                n_pairs=expected_pairs, effect=-float(args.baseline_margin),
+                paired_sd=float(args.assumed_paired_sd), reps=1000,
+                alpha=args.alpha / n_confirmatory_tests,
+                seed=args.schedule_seed)
+            design_readiness['simulated_power_check']['n_confirmatory_tests'] = (
+                n_confirmatory_tests)
+            design_readiness['simulated_power_check']['expected_attrition'] = (
+                args.expected_attrition)
     with open(base / 'design_readiness.json', 'w') as f:
         json.dump(design_readiness, f, indent=2)
     for check in design_readiness['checks']:
