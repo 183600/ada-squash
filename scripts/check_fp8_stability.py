@@ -61,6 +61,12 @@ _FP8_SCRATCH: dict = {}
 def _fp8_scratch(shape, device):
     key = (tuple(shape), str(device))
     got = _FP8_SCRATCH.get(key)
+    # A scratch set allocated under torch.inference_mode() is an inference
+    # tensor; reusing it as an `out=` target outside that mode raises. It is
+    # only scratch data, so rebuild a normal set for the grad-enabled caller.
+    if (got is not None and not torch.is_inference_mode_enabled()
+            and any(t.is_inference() for t in got)):
+        got = None
     if got is None:
         got = (torch.empty(shape, dtype=torch.float32, device=device),
                torch.empty(shape, dtype=torch.int32, device=device),
