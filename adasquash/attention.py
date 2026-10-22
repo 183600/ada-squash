@@ -157,6 +157,8 @@ class CausalSelfAttention(nn.Module):
     def _logit_scratch(self, B: int, H: int, R: int, T: int, dtype: torch.dtype, device) -> torch.Tensor:
         key = (B, H, R, T, dtype, device)
         buf = _LOGIT_SCRATCH_CACHE.get(key)
+        if buf is not None and buf.is_inference() and (not torch.is_inference_mode_enabled()):
+            buf = None
         if buf is None:
             # Flat scratch for the whole sweep; each row block views a
             # contiguous prefix of the shape it needs.

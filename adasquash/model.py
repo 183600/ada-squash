@@ -82,6 +82,8 @@ def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tens
     """
     key = (rows, vocab, dtype, device)
     buf = _CE_SCRATCH_CACHE.get(key)
+    if buf is not None and buf.is_inference() and (not torch.is_inference_mode_enabled()):
+        buf = None
     if buf is None:
         buf = torch.empty(rows, vocab, dtype=dtype, device=device)
         if len(_CE_SCRATCH_CACHE) >= _CE_SCRATCH_MAX_ENTRIES:
