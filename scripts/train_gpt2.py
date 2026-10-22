@@ -1486,25 +1486,58 @@ def main():
                 'source': 'checkpoint_tracker',
             })
         if best_path.exists():
+            # Read only the scalar/provenance fields from the existing best
+            # artifact; its weights are never copied into the resumed model.
+            prior_loss = prior_step = None
+            prior_provenance = None
+            try:
+                prior = _load_checkpoint_cpu(best_path)
+            except Exception:
+                prior = None
+            if isinstance(prior, dict):
+                raw_loss = prior.get('val_loss')
+                if (isinstance(raw_loss, (int, float)) and not isinstance(raw_loss, bool)
+                        and math.isfinite(float(raw_loss))):
+                    prior_loss = float(raw_loss)
+                    raw_step = prior.get('step')
+                    prior_step = (int(raw_step) if isinstance(raw_step, int)
+                                  and not isinstance(raw_step, bool) else 0)
+                prior_provenance = prior.get('provenance')
+            del prior
             if resumed_best:
-                # The resumed checkpoint *is* the best checkpoint in this
-                # output directory; its recorded val_loss is the tracker's
-                # seed without a second read.
-                if resume_ckpt.get('val_loss') is not None:
-                    best_candidates.append({'val_loss': float(resume_ckpt['val_loss']),
+                # The resumed checkpoint is the best artifact the user chose
+                # to continue. If it is from another run, this output dir's
+                # best file must be replaced or the final test would restore
+                # the wrong model. Same-run artifacts keep the lower loss.
+                resume_loss = resume_ckpt.get('val_loss')
+                resume_loss = (float(resume_loss)
+                               if isinstance(resume_loss, (int, float))
+                               and not isinstance(resume_loss, bool)
+                               and math.isfinite(float(resume_loss)) else None)
+                same_run = (prior_provenance is not None
+                            and prior_provenance == resume_ckpt.get('provenance'))
+                replace = (prior_loss is None or not same_run
+                           or (resume_loss is not None
+                               and resume_loss <= prior_loss))
+                if replace and resume_loss is not None:
+                    _atomic_torch_save(resume_ckpt, best_path)
+                    prior_loss, prior_step = resume_loss, int(resume_ckpt.get('step', 0))
+                    print(f'[resume] replaced {best_path} with the resumed best '
+                          f'checkpoint (val_loss={resume_loss:.4f})')
+                if resume_loss is not None:
+                    best_candidates.append({'val_loss': resume_loss,
                                             'step': int(resume_ckpt.get('step', 0))})
-                else:
-                    prior = _load_checkpoint_cpu(best_path)
-                    best_candidates.append({'val_loss': float(prior['val_loss']),
-                                            'step': int(prior.get('step', 0))})
-                    del prior
-            else:
+                if prior_loss is not None:
+                    best_candidates.append({'val_loss': prior_loss,
+                                            'step': int(prior_step or 0)})
+            elif prior_loss is not None:
                 # A separate best file is the verified selection artifact;
                 # only its recorded scalar may seed the tracker.
-                prior = _load_checkpoint_cpu(best_path)
-                best_candidates.append({'val_loss': float(prior['val_loss']),
-                                        'step': int(prior.get('step', 0))})
-                del prior
+                best_candidates.append({'val_loss': prior_loss,
+                                        'step': int(prior_step or 0)})
+            else:
+                print(f'[resume][warn] {best_path} has no finite recorded '
+                      'val_loss; it cannot seed checkpoint selection')
         elif resumed_best and resume_ckpt.get('val_loss') is not None:
             # Resume from a best checkpoint into a fresh output directory:
             # keep that selection artifact there, otherwise the final test
