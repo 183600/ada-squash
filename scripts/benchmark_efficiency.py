@@ -386,6 +386,29 @@ def main():
     p.add_argument('--output', default='runs/efficiency/efficiency.json')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this benchmark tests (e.g. "DyT-CD reaches a lower loss per point of training cost than RMSNorm at the same lr"); recorded in the report and manifest so the tradeoff verdict is auditable against a claim')
     args = p.parse_args()
+    for flag, value in (('--seq-len', args.seq_len),
+                        ('--batch-size', args.batch_size),
+                        ('--iters', args.iters),
+                        ('--rounds', args.rounds)):
+        if value < 1:
+            p.error(f'{flag} {value} must be >= 1')
+    if args.warmup < 0:
+        p.error(f'--warmup {args.warmup} must be >= 0')
+    if not args.norms:
+        p.error('--norms must not be empty')
+    duplicate_norms = sorted({norm for norm in args.norms
+                              if args.norms.count(norm) > 1})
+    if duplicate_norms:
+        p.error(f'--norms contains duplicates: {duplicate_norms}; a repeated norm is '
+                'measured twice and breaks the interleaved round accounting')
+    if not math.isfinite(args.min_loss_gain) or args.min_loss_gain < 0.0:
+        p.error(f'--min-loss-gain {args.min_loss_gain} must be finite and >= 0')
+    if not math.isfinite(args.max_cost_ratio) or args.max_cost_ratio <= 0.0:
+        p.error(f'--max-cost-ratio {args.max_cost_ratio} must be finite and > 0')
+    if (args.max_component_ratio is not None
+            and (not math.isfinite(args.max_component_ratio)
+                 or args.max_component_ratio <= 0.0)):
+        p.error(f'--max-component-ratio {args.max_component_ratio} must be finite and > 0')
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     set_all_seeds(args.seed)
     print(f'[bench] model={args.model} device={device} batch={args.batch_size} seq={args.seq_len} '
@@ -394,9 +417,7 @@ def main():
         print(f'[hypothesis] {args.hypothesis}')
     else:
         print('[hypothesis] none stated: pass --hypothesis "..." so this tradeoff verdict is auditable as a test of a claim, not a sweep')
-    rounds = max(1, int(args.rounds))
-    if rounds != args.rounds:
-        print(f'[bench][warn] --rounds={args.rounds} clamped to {rounds}')
+    rounds = int(args.rounds)
     measurement_order = []
     raw_rows = []
     for r_i in range(rounds):
