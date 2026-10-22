@@ -235,6 +235,13 @@ def split_document_boundaries(num_documents: int, val_frac: float, test_frac: fl
     val_frac, test_frac = float(val_frac), float(test_frac)
     if not (0.0 <= val_frac < 1.0 and 0.0 <= test_frac < 1.0):
         raise ValueError(f"val_frac/test_frac must be in [0, 1), got {val_frac}/{test_frac}")
+    if val_frac + test_frac >= 1.0:
+        # Validate the requested fractions before rounding. Banker's rounding
+        # can otherwise round both halves down and leave a (small) train
+        # range even though the requested split assigns 100% to held-out data.
+        raise ValueError(
+            f"val_frac={val_frac} + test_frac={test_frac} leaves no training "
+            "documents; the split fractions must sum to less than 1")
     val_n = int(round(num_documents * val_frac))
     test_n = int(round(num_documents * test_frac))
     if val_frac > 0.0:
