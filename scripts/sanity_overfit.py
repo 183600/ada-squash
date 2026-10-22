@@ -449,10 +449,17 @@ def run_one(norm: str, args, device: str) -> dict:
     # Strawman guards: an accuracy the majority-class predictor already reaches
     # (imbalance) or a loss no better than guessing uniformly over the vocab
     # means the run learned nothing, whatever the threshold says.
-    checks["loss_below_uniform_baseline"] = bool(final_loss < math.log(vocab))
+    # A vocabulary of one has a uniform-guess loss of exactly zero; the usual
+    # strict `< log(vocab)` would reject a perfect zero-loss model.
+    checks["loss_below_uniform_baseline"] = bool(
+        final_loss <= 0.0 if vocab <= 1 else final_loss < math.log(vocab))
     checks["accuracy_above_threshold"] = bool(final_acc >= thresholds["acc"])
+    majority = final_metrics["majority_class_accuracy"]
+    # When every valid target is the same class, the majority predictor is
+    # already perfect and no model can beat it by a positive margin.
     checks["accuracy_beats_majority_baseline"] = bool(
-        final_acc > final_metrics["majority_class_accuracy"] + args.baseline_margin
+        True if majority >= 1.0
+        else final_acc > majority + args.baseline_margin
     )
     passed = all(checks.values())
     return {

@@ -817,10 +817,19 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                     # A missing key is unknown, not the expected value: a
                     # manifest that cannot say which model/norm/seed it ran
                     # cannot certify this aggregate.
+                    def _matches(key, wanted):
+                        actual = recorded.get(key)
+                        if key == 'seed':
+                            # `True == 1` and `1.0 == 1` must not let a
+                            # malformed manifest stand in for seed 1.
+                            return (_is_seed_id(actual)
+                                    and int(actual) == int(wanted))
+                        return actual == wanted
+
                     mismatches = {
                         key: [wanted, recorded.get(key)]
                         for key, wanted in expected.items()
-                        if recorded.get(key) != wanted
+                        if not _matches(key, wanted)
                     }
                     if mismatches:
                         reject_reason = ('recorded model/norm/seed differs from this aggregate: '

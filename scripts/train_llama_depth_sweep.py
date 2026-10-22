@@ -194,6 +194,18 @@ def _is_commit_revision(value) -> bool:
     return all(c in '0123456789abcdefABCDEF' for c in value)
 
 
+def _same_protocol_value(actual, wanted) -> bool:
+    """Type-aware comparison for ids/shape/bool recipe fields."""
+    if isinstance(wanted, bool) or isinstance(actual, bool):
+        return actual is wanted
+    if isinstance(wanted, int):
+        return (isinstance(actual, int) and not isinstance(actual, bool)
+                and actual == wanted)
+    if wanted is None:
+        return actual is None
+    return actual == wanted
+
+
 def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
     """Fields where a child manifest disagrees with this sweep invocation."""
     recorded = manifest.get('hyperparameters')
@@ -220,7 +232,7 @@ def manifest_protocol_mismatches(manifest: dict, expected: dict) -> dict:
             # commit recorded. Either is a real protocol mismatch.
             if _is_commit_revision(actual) and not _is_commit_revision(wanted):
                 continue
-        if actual != wanted:
+        if not _same_protocol_value(actual, wanted):
             mismatches[key] = [wanted, actual]
     expected_ledgers = expected.get('data_ledgers')
     if isinstance(expected_ledgers, dict):
