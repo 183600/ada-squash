@@ -711,6 +711,20 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                                          f'{reference_recipe.get("seed")}: '
                                          + json.dumps(recipe_mismatches, sort_keys=True))
                 if reject_reason is None:
+                    # A missing step is unknown, not evidence that every seed
+                    # stopped at the same fixed step. Without both numbers the
+                    # aggregate cannot certify the fixed-step comparison it is
+                    # about to pool.
+                    for step_key in ('final_step', 'final_val_step'):
+                        step_value = results.get(step_key)
+                        if (not isinstance(step_value, int)
+                                or isinstance(step_value, bool) or step_value <= 0):
+                            reject_reason = (
+                                f'run_manifest.json results.{step_key} is '
+                                f'{step_value!r}, not a positive integer step; '
+                                'the fixed-step comparison cannot be certified')
+                            break
+                if reject_reason is None:
                     context = {'final_step': results.get('final_step'),
                                'final_val_step': results.get('final_val_step')}
                     if reference_context is not None:
