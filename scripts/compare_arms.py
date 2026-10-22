@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT))
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                mean_std_stderr, paired_t_one_sided,
                                student_t_ppf)
+from adasquash.repro import training_recipe_mismatches
 
 _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
 
@@ -116,7 +117,8 @@ def _arm_issues(name: str, agg: dict, metric: str) -> list[str]:
 
 def compare_arms(arms: dict[str, dict], reference: str | None=None,
                  metric: str='final_val_loss', alpha: float=0.05,
-                 margin: float=0.0) -> dict:
+                 margin: float=0.0, manifests: dict[str, dict] | None=None,
+                 require_recipe: bool=True) -> dict:
     """Paired, Holm-adjusted comparison of arm aggregates.
 
     `arms` maps a display name to an aggregate.json object. The reference is
@@ -150,6 +152,11 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'curve_classification_counts': (agg.get('curve_classification_counts')
                                             if isinstance(agg, dict) else None),
         }
+    manifests = manifests or {}
+    for name in list(prepared):
+        manifest = manifests.get(name) if isinstance(manifests, dict) else None
+        hyper = manifest.get('hyperparameters') if isinstance(manifest, dict) else None
+        prepared[name]['recipe_recorded'] = isinstance(hyper, dict)
     if reference is not None:
         if reference not in prepared:
             raise ValueError(f'reference {reference!r} is not one of {sorted(prepared)}')
@@ -214,6 +221,22 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             pair_problems.append(
                 f"model selector differs: {signatures[name]['model']} vs "
                 f"{signatures[reference]['model']}")
+        cand_hyper = ((manifests.get(name) or {}).get('hyperparameters')
+                      if isinstance(manifests.get(name), dict) else None)
+        ref_hyper = ((manifests.get(reference) or {}).get('hyperparameters')
+                     if isinstance(manifests.get(reference), dict) else None)
+        recipe_mismatches = None
+        if isinstance(cand_hyper, dict) and isinstance(ref_hyper, dict):
+            recipe_mismatches = training_recipe_mismatches(ref_hyper, cand_hyper)
+            if recipe_mismatches:
+                pair_problems.append(
+                    'training recipe differs: '
+                    + json.dumps(recipe_mismatches, sort_keys=True))
+        elif require_recipe:
+            pair_problems.append(
+                'training recipe (optimizer/schedule/token budget) was not recorded '
+                'for one or both arms; pass --allow-missing-recipe only for an '
+                'exploratory comparison')
         pair_protocol_ok = not pair_problems
         common = sorted(set(cand['values']) & set(ref['values']))
         entry = {
@@ -257,6 +280,9 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'per_seed_delta': None,
             'minimum_detectable_delta_95_power80': None,
             'protocol_problems': pair_problems,
+            'recipe_checked': (isinstance(cand_hyper, dict)
+                               and isinstance(ref_hyper, dict)),
+            'recipe_mismatches': recipe_mismatches,
             'certifiable': False,
             'certified': False,
             'certification_basis': None,
@@ -358,9 +384,13 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'final_step': sorted(map(str, step_values)),
             'data_version': sorted(map(str, data_values)),
             'model': sorted(map(str, model_values)),
+            'require_recipe': bool(require_recipe),
+            'recipe_recorded': {name: prepared[name]['recipe_recorded']
+                                for name in prepared},
             'reading': ('only the normalization may differ across Phase-1 arms; shape, '
-                        'fixed final step and resolved data version must be identical, '
-                        'and each arm needs >= 3 clean seeds'),
+                        'fixed final step, resolved data version and the recorded '
+                        'optimizer/schedule/token recipe must be identical, and each '
+                        'arm needs >= 3 clean seeds'),
         },
         'multiple_comparison': (
             f'Holm-Bonferroni over the {len(family)} candidate arm(s) tested '
@@ -427,6 +457,10 @@ def main(argv=None) -> None:
                    help='one-sided significance level (Holm-adjusted over candidates)')
     p.add_argument('--margin', type=float, default=0.0,
                    help='minimum loss improvement required to count as better')
+    p.add_argument('--allow-missing-recipe', action='store_true',
+                   help='do not fail closed when a sibling run_manifest.json (the record of '
+                        'optimizer/schedule/token budget) is missing; the comparison is then '
+                        'reported as recipe-unchecked and cannot certify a norm effect')
     p.add_argument('--output', default=None,
                    help='write the full comparison JSON here (default: <first aggregate dir>/arm_comparison.json)')
     args = p.parse_args(argv)
@@ -441,6 +475,7 @@ def main(argv=None) -> None:
     if len(set(names)) != len(names):
         p.error(f'duplicate arm names: {names}; pass --names to disambiguate')
     arms = {}
+    manifests = {}
     for name, path in zip(names, paths):
         try:
             data = json.loads(path.read_text())
@@ -449,8 +484,20 @@ def main(argv=None) -> None:
         if not isinstance(data, dict) or not isinstance(data.get('per_seed'), list):
             p.error(f'{path} is not a train_gpt2.py seed aggregate (missing per_seed)')
         arms[name] = data
+        manifest_path = path.parent / 'run_manifest.json'
+        try:
+            manifests[name] = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            manifests[name] = None
+        if manifests[name] is None and not args.allow_missing_recipe:
+            print(f'[arms][warn] {name}: no readable {manifest_path}; the optimizer/'
+                  'schedule/token recipe cannot be verified. Pass --allow-missing-recipe '
+                  'to compare anyway (the result will not be certifiable).',
+                  file=sys.stderr)
     comparison = compare_arms(arms, reference=args.reference, metric=args.metric,
-                              alpha=args.alpha, margin=args.margin)
+                              alpha=args.alpha, margin=args.margin,
+                              manifests=manifests,
+                              require_recipe=not args.allow_missing_recipe)
     print_comparison(comparison)
     output = Path(args.output) if args.output else paths[0].parent / 'arm_comparison.json'
     output.parent.mkdir(parents=True, exist_ok=True)
