@@ -288,6 +288,10 @@ def efficiency_verdict(
     the same for cost: a measurement taken on a different architecture cannot
     certify the candidate's cost.
     """
+    if not _is_boolean_value(cost_is_proxy):
+        raise ValueError(
+            f"cost_is_proxy must be a boolean, got {cost_is_proxy!r}")
+    cost_is_proxy = bool(cost_is_proxy)
     min_gain_value = _nonnegative_real(min_loss_gain, "min_loss_gain")
     max_cost_value = _nonnegative_real(max_cost_ratio, "max_cost_ratio")
     max_component_value = (max_cost_value if max_component_ratio is None
