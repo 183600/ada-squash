@@ -587,6 +587,14 @@ def main():
         p.error(f'--max-probe-coverage {args.max_probe_coverage} must be finite and in (0, 1]')
     if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
         p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
+    for name, value in (('--val-frac', args.val_frac), ('--test-frac', args.test_frac)):
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            p.error(f'{name} {value} must be finite and in [0, 1)')
+    if args.val_frac + args.test_frac >= 1.0:
+        p.error(f'--val-frac {args.val_frac} + --test-frac {args.test_frac} leaves no '
+                'training stream; the split fractions must sum to less than 1')
+    if args.num_documents is not None and args.num_documents < 1:
+        p.error(f'--num-documents {args.num_documents} must be >= 1')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(seeds[0])
 
