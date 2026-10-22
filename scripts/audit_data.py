@@ -898,9 +898,21 @@ def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
     tokens = capacity.get('estimated_effective_tokens')
     tokens_per_batch = capacity.get('tokens_per_batch')
     if tokens is not None:
-        tokens = float(tokens)
+        if _is_boolean_scalar(tokens):
+            raise ValueError(
+                f"estimated_effective_tokens must be numeric or None, got {tokens!r}")
+        try:
+            tokens = float(tokens)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"estimated_effective_tokens must be numeric or None, got {tokens!r}") from None
+        if not math.isfinite(tokens) or tokens < 0.0:
+            raise ValueError(
+                "estimated_effective_tokens must be finite and >= 0, "
+                f"got {tokens!r}")
     if tokens_per_batch is not None:
-        tokens_per_batch = int(tokens_per_batch)
+        tokens_per_batch = _strict_int_option(
+            tokens_per_batch, "tokens_per_batch", 1)
     distinct = None if unique is None else min(requested_batches, unique)
     planned_tokens = (None if tokens_per_batch is None
                       else requested_batches * tokens_per_batch)
