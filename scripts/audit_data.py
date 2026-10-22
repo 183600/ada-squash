@@ -262,9 +262,29 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
     threshold is not proof of independence - it is a reason to inspect the
     corpus, not a certificate.
     """
-    if not (0.0 < float(threshold) <= 1.0):
+    if not isinstance(records_by_split, dict):
+        raise ValueError(
+            f"records_by_split must be a mapping, got {type(records_by_split).__name__}")
+    # A bool is not a probability: `float(True)` would silently become the
+    # permissive 100% threshold and `float(False)` a valid zero margin.
+    if _is_boolean_scalar(threshold):
+        raise ValueError(
+            f"near-duplicate threshold must be in (0, 1], got {threshold!r}")
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"near-duplicate threshold must be in (0, 1], got {threshold!r}") from None
+    if not (math.isfinite(threshold) and 0.0 < threshold <= 1.0):
         raise ValueError(f"near-duplicate threshold must be in (0, 1], got {threshold}")
-    margin = float(margin)
+    if _is_boolean_scalar(margin):
+        raise ValueError(
+            f"near-duplicate margin must be in [0, 1), got {margin!r}")
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"near-duplicate margin must be in [0, 1), got {margin!r}") from None
     if not (math.isfinite(margin) and 0.0 <= margin < 1.0):
         raise ValueError(f"near-duplicate margin must be in [0, 1), got {margin}")
     screening = max(0.0, float(threshold) - margin)
