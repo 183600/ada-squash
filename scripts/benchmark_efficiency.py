@@ -72,6 +72,14 @@ def _sync(device: str) -> None:
         torch.cuda.synchronize(device)
 
 
+def _is_boolean_scalar(value) -> bool:
+    """Python and NumPy booleans (``np.bool_`` is not a Python bool)."""
+    if isinstance(value, bool):
+        return True
+    cls = type(value)
+    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
 def _count_option(value, name: str, minimum: int) -> int:
     """Validate an iteration/round count instead of silently clamping it.
 
@@ -79,7 +87,7 @@ def _count_option(value, name: str, minimum: int) -> int:
     timing and a fractional count into a different protocol than the report
     names. A benchmark cannot certify a protocol it did not run.
     """
-    if isinstance(value, bool):
+    if _is_boolean_scalar(value):
         raise ValueError(f"{name} must be an integer, got bool {value!r}")
     try:
         converted = int(value)
