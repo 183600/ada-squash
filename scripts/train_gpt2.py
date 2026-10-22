@@ -1350,6 +1350,12 @@ def main():
         if resolved_tokenizer and resolved_tokenizer != args.tokenizer_revision:
             print(f'[data] tokenizer revision pinned: {args.tokenizer_revision!r} -> {resolved_tokenizer}')
             args.tokenizer_revision = resolved_tokenizer
+        # The requested revision can be a branch/tag (or None); these fields
+        # preserve the concrete commit separately so evaluation tooling can
+        # distinguish "both requests were None" from "both runs pinned the
+        # same snapshot" instead of certifying an unverifiable comparison.
+        args.dataset_revision_resolved = resolved_revision
+        args.tokenizer_revision_resolved = resolved_tokenizer
         print(f'[data] train split: {report}')
     val_loader = None
     val_state: dict = {'iter': None, 'batches_consumed': 0, 'resume_skip': 0}

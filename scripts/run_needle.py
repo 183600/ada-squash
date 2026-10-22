@@ -40,6 +40,10 @@ MIN_SHARED_PLACEMENT_SEEDS = 3
 OPTIONAL_PROTOCOL_KEYS = (
     '_depth_override', '_dim_override', '_heads_override',
 )
+# Concrete Hub commits recorded next to the mutable requested revision. They
+# are compared only when at least one checkpoint records them, so older
+# checkpoints still fall back to the requested-revision comparison above.
+RESOLVED_PROTOCOL_KEYS = ('dataset_revision_resolved', 'tokenizer_revision_resolved')
 TRAINING_PROTOCOL_KEYS = (
     'model', *OPTIONAL_PROTOCOL_KEYS,
     'dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tokenizer_revision',
@@ -78,6 +82,17 @@ def comparison_protocol_guard(candidate_args: dict, reference_args: dict) -> dic
         candidate_value = candidate_args.get(key, missing)
         reference_value = reference_args.get(key, missing)
         if candidate_value != reference_value:
+            mismatches[key] = {'candidate': candidate_value,
+                               'reference': reference_value}
+    for key in RESOLVED_PROTOCOL_KEYS:
+        if key not in candidate_args and key not in reference_args:
+            continue
+        candidate_value = candidate_args.get(key, missing)
+        reference_value = reference_args.get(key, missing)
+        if candidate_value != reference_value:
+            # A concrete commit on one side and none (or a different commit)
+            # on the other means the data/tokenizer identity is not proven
+            # equal, even when both requested revisions were None.
             mismatches[key] = {'candidate': candidate_value,
                                'reference': reference_value}
     candidate_step = candidate_args.get('_checkpoint_step')
