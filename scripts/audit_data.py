@@ -778,8 +778,12 @@ def _chronology_problems(reports: dict) -> list:
         report = active[0]
         if isinstance(report, dict):
             start, count = report.get('start'), report.get('count')
-            if (isinstance(start, int) and not isinstance(start, bool)
-                    and start == 0 and count is None):
+            # Older disabled-split reports may omit the implicit train start
+            # entirely; accept that legacy shape but not a false/negative one.
+            if (count is None
+                    and (start is None
+                         or (isinstance(start, int) and not isinstance(start, bool)
+                             and start == 0))):
                 return []
         return [f"cannot verify chronological split tiling: invalid start/count "
                 f"in the active split report {report!r}"]
