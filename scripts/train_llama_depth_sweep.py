@@ -630,11 +630,16 @@ def _cell_seed_metric(cell: dict, metric: str) -> dict:
     """{seed: metric value} of an aggregate cell; seeds without the metric dropped."""
     out = {}
     for item in cell.get('per_seed') or []:
-        if not isinstance(item, dict) or item.get('seed') is None:
+        if not isinstance(item, dict):
+            continue
+        seed = item.get('seed')
+        # A boolean/fractional/string seed is not an independent replication
+        # id; int(True)/int("42") would silently pair a different run.
+        if isinstance(seed, bool) or not isinstance(seed, int):
             continue
         value = item.get(metric)
         if _finite(value):
-            out[int(item['seed'])] = float(value)
+            out[int(seed)] = float(value)
     return out
 
 def _cell_step_context(cell: dict):

@@ -470,6 +470,25 @@ def _finite_metric(value) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(float(value)))
 
+def _seed_id(value):
+    """A seed key as an int, or None for a boolean/fractional/foreign key.
+
+    JSON turns an integer mapping key into its string form, so ``"42"`` is the
+    same seed as ``42``; ``"42.0"``, ``"042"`` and booleans are not.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            converted = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if str(converted) == value:
+            return converted
+    return None
+
 def _seed_metric_values(agg: dict, key: str) -> list:
     return [float(r[key]) for r in agg.get('per_seed', [])
             if _finite_metric(r.get(key))]
@@ -478,9 +497,10 @@ def _train_seed_metric_values(agg: dict, key: str) -> dict:
     """Per-training-seed mean of `key` (averaged over that seed's checkpoints)."""
     out = {}
     for train_seed, metrics in (agg.get('per_train_seed') or {}).items():
+        seed = _seed_id(train_seed)
         value = metrics.get(key) if isinstance(metrics, dict) else None
-        if _finite_metric(value):
-            out[int(train_seed)] = float(value)
+        if seed is not None and _finite_metric(value):
+            out[seed] = float(value)
     return out
 
 def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list, list]:
@@ -491,9 +511,14 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
     records are paired samples - the same reason the ablation runner pairs its
     rows by seed. A seed with a non-finite metric on either side is not a
     usable pair and is excluded rather than poisoning the paired t statistic.
+    A malformed seed field is unknown and is skipped, never coerced.
     """
-    a_by_seed = {r.get('seed'): r.get(key) for r in agg_a.get('per_seed', [])}
-    b_by_seed = {r.get('seed'): r.get(key) for r in agg_b.get('per_seed', [])}
+    a_by_seed = {_seed_id(r.get('seed')): r.get(key)
+                 for r in agg_a.get('per_seed', [])
+                 if _seed_id(r.get('seed')) is not None}
+    b_by_seed = {_seed_id(r.get('seed')): r.get(key)
+                 for r in agg_b.get('per_seed', [])
+                 if _seed_id(r.get('seed')) is not None}
     shared = sorted(s for s in set(a_by_seed) & set(b_by_seed)
                     if _finite_metric(a_by_seed[s])
                     and _finite_metric(b_by_seed[s]))
