@@ -1495,15 +1495,33 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     # Alias rows (identical effective config, `reused_from`) are the *same*
     # run under a second name: they are reported, but a run must not be
     # counted twice as independent evidence nor inflate the Holm family size.
-    by_identity: dict[str, str] = {
-        _run_identity(row, parent_of): row['name'] for row in baselines}
+    baseline_identity: dict[str, str] = {}
+    for row in baselines:
+        baseline_identity.setdefault(_run_identity(row, parent_of), row['name'])
+    rows_by_identity: dict[str, list] = {}
     for entry in out['rows']:
         identity = entry.get('run_identity') or entry['name']
-        canonical = by_identity.get(identity)
+        rows_by_identity.setdefault(identity, []).append(entry)
+    for identity, aliases in rows_by_identity.items():
+        canonical = baseline_identity.get(identity)
         if canonical is None:
-            by_identity[identity] = entry['name']
-        else:
-            entry['excluded_from_family'] = f'duplicate run of {canonical} (reused summary, not independent evidence)'
+            # Pick the canonical alias by evidence quality, not by summary
+            # order: an ineligible one-seed alias must not shadow a later
+            # replicated row that shares the same run identity.
+            canonical = min(
+                aliases,
+                key=lambda entry: (
+                    0 if entry['replicated_across_seeds'] else 1,
+                    0 if entry['test'] is not None else 1,
+                    -len(entry.get('paired_seeds') or []),
+                    entry['name'],
+                ),
+            )['name']
+        for entry in aliases:
+            if entry['name'] != canonical:
+                entry['excluded_from_family'] = (
+                    f'duplicate run of {canonical} (reused summary, not '
+                    'independent evidence)')
     # Every seed-replicated row above tests the same reference, so its raw
     # p-values form a family and the per-row alpha must be corrected
     # (Holm-Bonferroni step-down) before a row is reported as a significant
@@ -2203,17 +2221,29 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
     # alias pair would otherwise appear as two independent mechanism tests,
     # and a run could even be contrasted with itself via aliases. Each
     # underlying contrast enters the Holm family exactly once.
-    seen_contrasts: dict[tuple, str] = {}
+    contrasts_by_key: dict[tuple, list] = {}
     for entry in rows:
         if entry.get('skipped') or entry.get('run_identity_full') is None:
             continue
         key = (entry['run_identity_full'], entry['run_identity_reference'])
-        canonical = seen_contrasts.get(key)
-        if canonical is None:
-            seen_contrasts[key] = entry['mechanism']
-        else:
-            entry['excluded_from_family'] = (f"duplicate of mechanism '{canonical}' "
-                                             f"(same underlying runs, not independent evidence)")
+        contrasts_by_key.setdefault(key, []).append(entry)
+    for aliases in contrasts_by_key.values():
+        # Same rule as the baseline aliases: pick the usable/testable alias,
+        # not whichever one happened to be written first.
+        canonical = min(
+            aliases,
+            key=lambda entry: (
+                0 if entry['replicated_across_seeds'] else 1,
+                0 if entry['test'] is not None else 1,
+                -len(entry.get('paired_seeds') or []),
+                entry['mechanism'],
+            ),
+        )
+        for entry in aliases:
+            if entry is not canonical:
+                entry['excluded_from_family'] = (
+                    f"duplicate of mechanism '{canonical['mechanism']}' "
+                    "(same underlying runs, not independent evidence)")
     family = [entry for entry in rows
               if entry['replicated_across_seeds'] and entry['excluded_from_family'] is None]
     adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
@@ -2826,6 +2856,16 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         'margin': float(margin),
         'equivalence_margin': float(equivalence_margin),
         'baseline_pool': sorted(baseline_set),
+        # The contrast *ids* alone do not identify the experiment: two
+        # matrices can reuse the same row names and hypotheses while changing
+        # a model knob (e.g. alpha_init), or can map a factorial design to
+        # different cells. Hash those definitions too, or a post-hoc model
+        # change would not move the pre-registration fingerprint.
+        'row_configs': {name: rows.get(name) for name in sorted(rows)},
+        'matrix_cells': {
+            key: matrix_report.get(key)
+            for key in ('leave_one_out', 'factorial', 'qk_axis')
+        },
         'contrasts': contrasts,
     }
     fingerprint = hashlib.sha256(
