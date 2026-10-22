@@ -1015,19 +1015,32 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
             common = sorted(set(candidate_by_seed) & set(reference_by_seed))
             cand_values = [candidate_by_seed[seed] for seed in common]
             ref_values = [reference_by_seed[seed] for seed in common]
-            mismatches = {
-                key: {'reference': protocols.get(reference, {}).get(key),
-                      'candidate': protocols.get(norm, {}).get(key)}
-                for key in _MOE_PROTOCOL_KEYS
-                if protocols.get(reference, {}).get(key) != protocols.get(norm, {}).get(key)}
+            ref_protocol = protocols.get(reference)
+            cand_protocol = protocols.get(norm)
+            if not isinstance(ref_protocol, dict) or not isinstance(cand_protocol, dict):
+                # A missing protocol is unknown, not equal: without both
+                # recorded recipes the pair cannot be certified as a clean
+                # same-scale norm contrast.
+                mismatches = {'protocol': {
+                    'reference': ref_protocol if isinstance(ref_protocol, dict) else None,
+                    'candidate': cand_protocol if isinstance(cand_protocol, dict) else None,
+                }}
+            else:
+                mismatches = {
+                    key: {'reference': ref_protocol.get(key),
+                          'candidate': cand_protocol.get(key)}
+                    for key in _MOE_PROTOCOL_KEYS
+                    if ref_protocol.get(key) != cand_protocol.get(key)}
             shape_only_mismatch = bool(mismatches) and set(mismatches) <= _MOE_SHAPE_KEYS
-            a_shape = {key: protocols.get(norm, {}).get(key) for key in _MOE_SHAPE_KEYS}
-            b_shape = {key: protocols.get(reference, {}).get(key) for key in _MOE_SHAPE_KEYS}
+            a_shape = {key: (cand_protocol or {}).get(key) for key in _MOE_SHAPE_KEYS}
+            b_shape = {key: (ref_protocol or {}).get(key) for key in _MOE_SHAPE_KEYS}
             # Scale identity is decided by the shape fields alone. A pair can
             # differ in both shape and a non-shape recipe field; that must not
             # be labelled same-scale merely because the mismatch set is not
-            # shape-only.
-            same_scale = a_shape == b_shape
+            # shape-only. Missing protocols are not evidence of a shared scale.
+            same_scale = (isinstance(ref_protocol, dict)
+                          and isinstance(cand_protocol, dict)
+                          and a_shape == b_shape)
             entry = {
                 'name': f'{norm} vs {reference}',
                 'norm': norm,
