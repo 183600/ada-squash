@@ -179,6 +179,46 @@ def _arm_issues(name: str, agg: dict, metric: str) -> list[str]:
     return issues
 
 
+def _manifest_replication_problem(agg: dict, manifest: dict | None) -> str | None:
+    """Why a sibling replication manifest cannot certify this aggregate.
+
+    A recipe block alone does not tie the loaded `aggregate.json` to the run
+    that produced it: the manifest can be failed/unfinished, describe a
+    different seed set, or belong to a stale aggregate at the same path.
+    Certification must fail closed in all of those cases.
+    """
+    if not isinstance(manifest, dict):
+        return 'run_manifest.json is missing or unreadable'
+    status = manifest.get('status')
+    if status != 'finished':
+        return (f"run_manifest.json status is {status!r}, not 'finished'; the "
+                'replication did not complete cleanly')
+    recorded_seeds = manifest.get('seeds')
+    aggregate_seeds = agg.get('seeds') if isinstance(agg, dict) else None
+    if not isinstance(recorded_seeds, list) or not isinstance(aggregate_seeds, list):
+        return 'run_manifest.json does not record the replicated seed set'
+    try:
+        manifest_seed_set = sorted(int(seed) for seed in recorded_seeds
+                                   if not isinstance(seed, bool))
+        aggregate_seed_set = sorted(int(seed) for seed in aggregate_seeds
+                                    if not isinstance(seed, bool))
+    except (TypeError, ValueError, OverflowError):
+        return 'run_manifest.json has a malformed seed list'
+    if (len(manifest_seed_set) != len(recorded_seeds)
+            or len(aggregate_seed_set) != len(aggregate_seeds)):
+        return 'run_manifest.json has a malformed seed list'
+    if manifest_seed_set != aggregate_seed_set:
+        return (f'run_manifest.json seeds {manifest_seed_set} differ from the '
+                f'aggregate seeds {aggregate_seed_set}')
+    recorded_aggregate = manifest.get('aggregate')
+    if not isinstance(recorded_aggregate, dict):
+        return 'run_manifest.json does not record the aggregate it produced'
+    if recorded_aggregate != agg:
+        return ('run_manifest.json aggregate differs from the loaded aggregate.json; '
+                'the files are stale or belong to different runs')
+    return None
+
+
 def compare_arms(arms: dict[str, dict], reference: str | None=None,
                  metric: str='final_val_loss', alpha: float=0.05,
                  margin: float=0.0, manifests: dict[str, dict] | None=None,
@@ -221,10 +261,12 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                                             if isinstance(agg, dict) else None),
         }
     manifests = manifests or {}
+    manifest_problems: dict[str, str | None] = {}
     for name in list(prepared):
         manifest = manifests.get(name) if isinstance(manifests, dict) else None
         hyper = manifest.get('hyperparameters') if isinstance(manifest, dict) else None
         prepared[name]['recipe_recorded'] = isinstance(hyper, dict)
+        manifest_problems[name] = _manifest_replication_problem(arms[name], manifest)
     if reference is not None:
         if reference not in prepared:
             raise ValueError(f'reference {reference!r} is not one of {sorted(prepared)}')
@@ -306,6 +348,10 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                 'training recipe (optimizer/schedule/token budget) was not recorded '
                 'for one or both arms; the comparison is descriptive only'
                 + ('' if require_recipe else ' (--allow-missing-recipe)'))
+        for role in (name, reference):
+            problem = manifest_problems.get(role)
+            if problem:
+                pair_problems.append(f'run manifest for {role!r}: {problem}')
         pair_protocol_ok = not pair_problems
         common = sorted(set(cand['values']) & set(ref['values']))
         entry = {
