@@ -356,6 +356,21 @@ def main():
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests (e.g. "DyT-CD retains needle accuracy at 4k tokens"); recorded in the manifest so a pass/fail is auditable as a test rather than a fishing trip')
     p.add_argument('--max-failure-examples', type=int, default=3, help='bad-case samples to print per context length (all failures are kept in the JSON)')
     args = p.parse_args()
+    if args.trials < 1:
+        p.error(f'--trials {args.trials} must be >= 1: a trial count of zero measures nothing')
+    if args.decode_batch < 1:
+        p.error(f'--decode-batch {args.decode_batch} must be >= 1')
+    requested_ctx_lens = list(args.ctx_lens)
+    if not requested_ctx_lens:
+        p.error('--ctx-lens must not be empty: a sweep with no context length measures nothing')
+    for ctx_len in requested_ctx_lens:
+        if ctx_len < 1:
+            p.error(f'--ctx-lens entries must be >= 1, got {ctx_len}')
+    args.ctx_lens = list(dict.fromkeys(int(ctx_len) for ctx_len in requested_ctx_lens))
+    if len(args.ctx_lens) != len(requested_ctx_lens):
+        print(f'[needle][warn] duplicate context lengths removed: {requested_ctx_lens} -> '
+              f'{args.ctx_lens} (a repeated length is the same hypothesis, not an '
+              'independent test in the Holm family)', file=sys.stderr)
     if args.compare_to and not args.hypothesis:
         p.error('--compare-to requires --hypothesis "..." so the claim, direction and context '
                 'family are registered before the paired comparison is run, not selected after '
@@ -463,7 +478,8 @@ def main():
         'secret': args.secret,
         'trials': args.trials,
         'placement_seeds': list(seeds),
-        'ctx_lens_requested': list(args.ctx_lens),
+        'ctx_lens_requested': requested_ctx_lens,
+        'ctx_lens_evaluated': list(args.ctx_lens),
         'runs': results,
         'skipped': skipped,
         'ci_note': ('ci95_low/high are the cross-seed t interval when >= 2 placement seeds are run '
