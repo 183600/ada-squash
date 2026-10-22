@@ -96,6 +96,22 @@ def _validate_unit(unit) -> str:
     return unit
 
 
+def _finite_float(value) -> Optional[float]:
+    """``float(value)`` when it is a finite non-boolean real, else None.
+
+    An enormous Python integer is a real number but raises ``OverflowError``
+    on conversion to float. Pre-flight reports must classify such a value as
+    invalid instead of crashing.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def block_randomized_schedule(units: Iterable[str], block_size: Optional[int] = None,
                               seed: int = 0) -> dict:
     """Deterministically randomize run ids inside consecutive time blocks.
@@ -426,8 +442,8 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
     """
     if isinstance(permutations, bool) or not isinstance(permutations, int) or permutations < 1:
         raise ValueError(f'permutations must be a positive integer, got {permutations!r}')
-    if not (isinstance(alpha, (int, float)) and not isinstance(alpha, bool)
-            and math.isfinite(float(alpha)) and 0.0 < float(alpha) < 1.0):
+    alpha_value = _finite_float(alpha)
+    if alpha_value is None or not 0.0 < alpha_value < 1.0:
         raise ValueError(f'alpha must be strictly between 0 and 1, got {alpha!r}')
     seed = _validate_seed(seed)
     if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes)):
@@ -449,16 +465,18 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
                 or not isinstance(value, (int, float)) or isinstance(value, bool)):
             excluded['malformed'] += 1
             continue
-        if not (math.isfinite(float(position)) and math.isfinite(float(value))):
+        position_value = _finite_float(position)
+        value_value = _finite_float(value)
+        if position_value is None or value_value is None:
             excluded['non_finite'] += 1
             continue
-        key = (arm, float(position))
+        key = (arm, position_value)
         if key in seen:
             excluded['duplicate_position'] += 1
             continue
         seen.add(key)
         valid.append({'unit': record.get('unit'), 'arm': arm,
-                      'position': float(position), 'value': float(value)})
+                      'position': position_value, 'value': value_value})
 
     groups: dict[str, list[dict]] = {}
     for record in valid:
@@ -979,11 +997,12 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     else:
         add('hypotheses', 'pass', f'all {len(names)} rows state a hypothesis')
 
-    try:
-        margin = float(margin or 0.0)
-        equivalence_margin = float(equivalence_margin or 0.0)
-    except (TypeError, ValueError):
+    margin_value = _finite_float(margin or 0.0)
+    equivalence_value = _finite_float(equivalence_margin or 0.0)
+    if margin_value is None or equivalence_value is None:
         margin = equivalence_margin = float('nan')
+    else:
+        margin, equivalence_margin = margin_value, equivalence_value
     if not math.isfinite(margin) or margin < 0.0:
         add('effect_size', 'fail', f'invalid superiority margin {margin!r}')
     elif not math.isfinite(equivalence_margin) or equivalence_margin < 0.0:
@@ -997,11 +1016,11 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         add('effect_size', 'pass',
             f'superiority margin={margin}, equivalence margin={equivalence_margin}')
 
-    if not (isinstance(alpha, (int, float)) and not isinstance(alpha, bool)
-            and math.isfinite(float(alpha)) and 0.0 < float(alpha) < 1.0):
+    alpha_value = _finite_float(alpha)
+    target_power_value = _finite_float(target_power)
+    if alpha_value is None or not 0.0 < alpha_value < 1.0:
         add('power', 'fail', f'invalid alpha {alpha!r}')
-    elif not (isinstance(target_power, (int, float)) and not isinstance(target_power, bool)
-              and math.isfinite(float(target_power)) and 0.0 < float(target_power) < 1.0):
+    elif target_power_value is None or not 0.0 < target_power_value < 1.0:
         add('power', 'fail', f'invalid target power {target_power!r}')
     elif assumed_paired_sd is None:
         add('power', 'warn',
@@ -1009,12 +1028,9 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             'cannot be checked before the run (the comparison report still '
             'reports the observed MDE afterwards)')
     else:
-        try:
-            sd = float(assumed_paired_sd)
-        except (TypeError, ValueError):
-            sd = float('nan')
+        sd = _finite_float(assumed_paired_sd)
         target = margin if margin > 0.0 else equivalence_margin
-        if not math.isfinite(sd) or sd < 0.0:
+        if sd is None or sd < 0.0:
             add('power', 'fail', f'invalid assumed paired SD {assumed_paired_sd!r}')
         elif target <= 0.0:
             add('power', 'warn',
@@ -1148,19 +1164,19 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
         raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
     if isinstance(reps, bool) or not isinstance(reps, int) or reps < 100:
         raise ValueError(f'reps must be an integer >= 100, got {reps!r}')
-    for name, value in (('effect', effect), ('paired_sd', paired_sd)):
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))):
-            raise ValueError(f'{name} must be a finite number, got {value!r}')
-    if float(paired_sd) < 0.0:
+    effect_value = _finite_float(effect)
+    paired_sd_value = _finite_float(paired_sd)
+    if effect_value is None:
+        raise ValueError(f'effect must be a finite number, got {effect!r}')
+    if paired_sd_value is None:
+        raise ValueError(f'paired_sd must be a finite number, got {paired_sd!r}')
+    if paired_sd_value < 0.0:
         raise ValueError(f'paired_sd must be >= 0, got {paired_sd!r}')
-    if not (isinstance(alpha, (int, float)) and not isinstance(alpha, bool)
-            and math.isfinite(float(alpha)) and 0.0 < float(alpha) < 1.0):
+    alpha_value = _finite_float(alpha)
+    if alpha_value is None or not 0.0 < alpha_value < 1.0:
         raise ValueError(f'alpha must be strictly between 0 and 1, got {alpha!r}')
-    if (isinstance(equivalence_margin, bool)
-            or not isinstance(equivalence_margin, (int, float))
-            or not math.isfinite(float(equivalence_margin))
-            or float(equivalence_margin) < 0.0):
+    equivalence_value = _finite_float(equivalence_margin)
+    if equivalence_value is None or equivalence_value < 0.0:
         raise ValueError(f'equivalence_margin must be a finite number >= 0, '
                          f'got {equivalence_margin!r}')
     seed = _validate_seed(seed)
