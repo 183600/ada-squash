@@ -63,6 +63,14 @@ DEFAULT_CURVE_THRESHOLDS = {
 }
 
 
+def _is_boolean_scalar(value) -> bool:
+    """Python and NumPy booleans (``np.bool_`` is not a Python bool)."""
+    if isinstance(value, bool):
+        return True
+    cls = type(value)
+    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
 def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]:
     """(last - first) / max(|first|, eps) over the trailing `window` points.
 
@@ -185,7 +193,7 @@ def diagnose_train_val_curve(
         def _validated_stderr(value):
             if value is None:
                 return None
-            if isinstance(value, bool):
+            if _is_boolean_scalar(value):
                 raise ValueError(
                     f"val_stderr must be a finite non-negative number or None, "
                     f"got bool {value!r}")
