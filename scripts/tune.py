@@ -655,9 +655,15 @@ def lr_sensitivity(tuned: dict) -> dict:
                             'lr_effect_exceeds_seed_noise': None, 'selected': None}
             continue
         means = [float(cell['mean']) for cell in cells.values()]
+        # A zero std is not a measured seed-noise level: mean_std_stderr also
+        # returns 0.0 for a one-seed cell, so admitting it would label every
+        # non-zero lr spread as "larger than seed noise" when no noise was
+        # measured at all. Only a positive finite std qualifies.
         stds = [float(cell['std']) for cell in cells.values()
                 if isinstance(cell.get('std'), (int, float))
-                and math.isfinite(float(cell['std']))]
+                and not isinstance(cell.get('std'), bool)
+                and math.isfinite(float(cell['std']))
+                and float(cell['std']) > 0.0]
         spread = max(means) - min(means)
         noise = max(stds) if stds else None
         best = min(cells.items(), key=lambda item: item[1]['mean'])
