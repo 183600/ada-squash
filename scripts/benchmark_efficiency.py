@@ -216,6 +216,14 @@ def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
             raise ValueError(
                 f'norm {norm!r} has {len(norm_rows)} measured round(s), expected {rounds}; '
                 'refusing to average an incomplete interleaved benchmark')
+        # Counting rows is not enough: two samples of round 1 and none of round
+        # 2 would still pass a length check while leaving the interleaving (and
+        # therefore the drift cancellation) unverified.
+        measured_rounds = {r.get('round') for r in norm_rows}
+        if measured_rounds != set(range(rounds)):
+            raise ValueError(
+                f'norm {norm!r} measured round(s) {sorted(measured_rounds)} but expected '
+                f'0..{rounds - 1}; refusing to average a mis-numbered round set')
         base = dict(norm_rows[0])
         for key in _LATENCY_MEAN_KEYS:
             base[key] = sum(r[key] for r in norm_rows) / len(norm_rows)
