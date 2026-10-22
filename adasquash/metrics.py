@@ -1016,10 +1016,20 @@ def paired_trend_test(
                 f"trend values for seed {label!r} need {len(dose_values)} "
                 f"entries, got {len(values)}")
         pairs = []
-        for x, y in zip(dose_values, values):
+        dropped = []
+        for position, (x, y) in enumerate(zip(dose_values, values)):
             if (isinstance(y, (int, float)) and not isinstance(y, bool)
                     and math.isfinite(float(y))):
                 pairs.append((x, float(y)))
+            else:
+                dropped.append(position)
+        if dropped:
+            # The slope is still fitted on the remaining finite doses, but a
+            # silently shortened grid changes what the slope means; report it
+            # instead of letting the seed look complete.
+            out["excluded_seeds"][str(label)] = (
+                "dropped non-finite delta(s) at dose position(s) "
+                f"{dropped}; slope fitted on the remaining doses")
         if len({x for x, _ in pairs}) < 2:
             out["excluded_seeds"][str(label)] = (
                 "fewer than two distinct doses with finite deltas")
