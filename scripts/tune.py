@@ -108,6 +108,11 @@ def _cell_key(lr: float, weight_decay: float, multi_wd: bool) -> str:
     return f'{lr_key}_wd{_lr_key(weight_decay)}'
 
 
+def _is_seed_id(value) -> bool:
+    """A seed id is an int; 42.9/True must not be paired with seed 42/1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | None=None,
                          weight_decay: float | None=None) -> bool:
     """Whether a cached trial ran under the *same protocol* as this invocation.
@@ -146,7 +151,12 @@ def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | N
         if recorded is None:
             seeds = summary.get('seeds')
             recorded = seeds[0] if isinstance(seeds, list) and seeds else None
-        if recorded is None or int(recorded) != int(seed):
+        # A malformed cached seed is unknown, not another spelling of `seed`:
+        # `int(True)`/`int(42.9)` used to reuse a trial that was never seeded
+        # 1/42, silently mixing a different run into the lr grid.
+        if not _is_seed_id(recorded) or not _is_seed_id(seed):
+            return False
+        if recorded != seed:
             return False
     return True
 
