@@ -735,6 +735,9 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     reference_recipe = None
     reference_context = None
     reference_ledgers = None
+    ledger_identity_complete = True
+    ledger_missing_seeds = []
+    ledger_present_seeds = []
     for seed in seeds:
         run_dir = seed_run_dir(base_dir, seed)
         record = {
@@ -783,8 +786,14 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                     reject_reason = ('run_manifest.json has no results block; a finished '
                                      'run must record its results')
                 if reject_reason is None and reference_recipe is not None:
+                    # Compare every run-identity field that at least one side
+                    # records. Keys absent from both are unknown (older
+                    # manifests); a key present on only one side is a mismatch.
+                    within_keys = tuple(
+                        key for key in _WITHIN_ARM_PROTOCOL_KEYS
+                        if key in reference_recipe or key in recorded)
                     recipe_mismatches = training_recipe_mismatches(
-                        reference_recipe, recorded, keys=_WITHIN_ARM_PROTOCOL_KEYS)
+                        reference_recipe, recorded, keys=within_keys)
                     if recipe_mismatches:
                         reject_reason = ('recorded training recipe differs from seed '
                                          f'{reference_recipe.get("seed")}: '
@@ -792,18 +801,22 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                 if reject_reason is None:
                     ledgers = _manifest_ledger_fingerprints(manifest)
                     if ledgers is None:
-                        reject_reason = ('run_manifest.json has no complete ledger '
-                                         'identity; the held-out document set cannot be '
-                                         'compared with the other seed runs')
-                    elif reference_ledgers is None:
-                        reference_ledgers = ledgers
-                    elif ledgers != reference_ledgers:
-                        reject_reason = ('recorded cross-split ledger content differs from '
-                                         'the other seed runs; a different exclusion set '
-                                         'means the pooled losses are not one protocol: '
-                                         + json.dumps({'this': ledgers,
-                                                       'reference': reference_ledgers},
-                                                      sort_keys=True))
+                        # Older/minimal manifests may predate ledger fingerprinting.
+                        # Leave them unknown when *no* seed records one, but a mix of
+                        # known and unknown identities cannot be pooled; that is
+                        # settled after the loop.
+                        ledger_missing_seeds.append(int(seed))
+                    else:
+                        ledger_present_seeds.append(int(seed))
+                        if reference_ledgers is None:
+                            reference_ledgers = ledgers
+                        elif ledgers != reference_ledgers:
+                            reject_reason = ('recorded cross-split ledger content differs from '
+                                             'the other seed runs; a different exclusion set '
+                                             'means the pooled losses are not one protocol: '
+                                             + json.dumps({'this': ledgers,
+                                                           'reference': reference_ledgers},
+                                                          sort_keys=True))
                 if reject_reason is None:
                     # A missing step is unknown, not evidence that every seed
                     # stopped at the same fixed step. Without both numbers the
@@ -892,6 +905,18 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                 if r['seed'] not in invalid_seed_set and _finite(r.get(key))]
         return vals, (mean_std_stderr(vals) if vals else None)
 
+    if ledger_missing_seeds and ledger_present_seeds:
+        # Some seeds recorded ledger content and others did not: the held-out
+        # exclusion set cannot be proven identical across the arm.
+        ledger_identity_complete = False
+        for missing_seed in ledger_missing_seeds:
+            rejections.append({
+                'seed': int(missing_seed),
+                'path': str(seed_run_dir(base_dir, missing_seed) / 'run_manifest.json'),
+                'reason': ('run_manifest.json has no complete ledger identity while '
+                           'other seed runs record one; the held-out document set '
+                           'cannot be compared'),
+            })
     # A pooled loss is only one arm's number if every seed trained on the
     # same upstream snapshot. A missing resolved revision is unknown, not a
     # match (the Hub may have been unreachable and left a branch name).
@@ -937,6 +962,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     missing = [r['seed'] for r in per_seed if not _finite(r['final_val_loss'])]
     invalid = [r['seed'] for r in per_seed if r['seed'] in invalid_seed_set]
     pool_ok = (not missing and not invalid
+               and ledger_identity_complete
                and data_versions_complete and data_versions_consistent
                and shapes_complete and shapes_consistent)
     return {
@@ -950,6 +976,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'data_versions_by_seed': data_versions_by_seed,
         'data_ledgers_by_seed': {int(r['seed']): r.get('data_ledgers')
                                  for r in per_seed},
+        'data_ledgers_complete': ledger_identity_complete,
         'unknown_data_version_seeds': unknown_data_version_seeds,
         'data_versions_complete': data_versions_complete,
         'data_versions_consistent': data_versions_consistent,
