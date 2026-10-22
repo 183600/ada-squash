@@ -1126,7 +1126,10 @@ def _row_protocol_values(row: dict, fallback_model=None):
     schedule = controls.get('schedule') or {}
     data = controls.get('data') or {}
     return {
-        'model': row.get('model', fallback_model),
+        # Do not fill a missing model from the current invocation: an old row
+        # that never said which model it trained cannot be proven comparable,
+        # and `None` is what makes the signature mismatch/fail closed.
+        'model': row.get('model'),
         'optimizer_name': optimizer.get('name'),
         'optimizer_betas': optimizer.get('betas'),
         'optimizer_lr': optimizer.get('lr'),
@@ -1224,6 +1227,10 @@ def merge_summaries(previous: list, fresh: list) -> list:
         merged[name] = row
     return [merged[name] for name in order if name in merged]
 
+def _is_seed_id(value) -> bool:
+    """A seed id is an int; 42.9/True must not be paired with seed 42/1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
 def _seed_means(row) -> dict:
     """{seed: val_loss} for every row shape.
 
@@ -1235,10 +1242,16 @@ def _seed_means(row) -> dict:
     out = {}
     if isinstance(per, list):
         for item in per:
-            if not isinstance(item, dict) or item.get('seed') is None:
-                continue
+            if not isinstance(item, dict):
+                return {}
+            seed = item.get('seed')
+            if not _is_seed_id(seed):
+                # Unknown/malformed seed identity makes the whole row
+                # unpairable: dropping just this entry would silently pair a
+                # different number of runs than the row reports.
+                return {}
             if _finite_metric(item.get('val_loss')):
-                out[int(item['seed'])] = float(item['val_loss'])
+                out[int(seed)] = float(item['val_loss'])
         return out
     seeds = row.get('seeds') if isinstance(row.get('seeds'), list) else []
     seeds = [s for s in seeds if s is not None] or ([row['seed']] if row.get('seed') is not None else [])
@@ -1246,10 +1259,9 @@ def _seed_means(row) -> dict:
     # that seed's mean. A multi-seed row without per_seed losses has no
     # per-seed observations: copying the pooled mean to every seed would
     # invent zero variance and can turn it into a "significant" paired win.
-    unique_seeds = []
-    for s in seeds:
-        if int(s) not in unique_seeds:
-            unique_seeds.append(int(s))
+    if not all(_is_seed_id(s) for s in seeds):
+        return {}
+    unique_seeds = list(dict.fromkeys(int(s) for s in seeds))
     if len(unique_seeds) == 1 and _finite_metric(row.get('val_loss')):
         out[unique_seeds[0]] = float(row['val_loss'])
     return out
@@ -2379,6 +2391,12 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                     'delta_paired_mean': test['mean_delta'],
                     'n': test['n'],
                 })
+                # The paired test is the certifying statistic: its effect is
+                # the shared-seed mean. Keep the all-seed difference only as
+                # descriptive context; otherwise `effect_helps` and the
+                # cross-host direction can contradict a certified paired win
+                # when the arms' seed sets differ.
+                entry['effect_helps'] = bool(test['mean_delta'] < -margin)
             entry.update(_paired_effect_summary(cand, ref, common, test, alpha=alpha,
                                                margin=margin))
             entry.update(_robustness_for_deltas(
@@ -2407,8 +2425,8 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
     replicated_qk = [entry for entry in rows
                      if entry['contrast'] == 'qk_vs_off'
                      and entry['replicated_across_seeds']
-                     and entry.get('delta_candidate_minus_reference') is not None]
-    deltas = [entry['delta_candidate_minus_reference'] for entry in replicated_qk]
+                     and entry.get('delta_paired_mean') is not None]
+    deltas = [entry['delta_paired_mean'] for entry in replicated_qk]
     signs = {('negative' if delta < 0 else 'positive' if delta > 0 else 'zero')
              for delta in deltas}
     # An all-zero set is a null result, not a replicated direction: no host
@@ -2419,8 +2437,9 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                              if entry['effect_helps_significantly'])
     cross_host = {
         'hosts_with_replicated_test': sorted(entry['host'] for entry in replicated_qk),
-        'host_deltas': {entry['host']: entry['delta_candidate_minus_reference']
+        'host_deltas': {entry['host']: entry['delta_paired_mean']
                         for entry in replicated_qk},
+        'host_delta_basis': 'shared-seed paired mean (same statistic as the test)',
         'direction_signs': sorted(signs),
         'direction_consistent_across_hosts': direction_consistent,
         'hosts_certified_individually': certified_hosts,
@@ -3054,7 +3073,8 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             hypothesis=entry.get('hypothesis'),
             replicated=entry.get('replicated_across_seeds'),
             test_basis=entry.get('test_basis'),
-            effect=entry.get('delta_candidate_minus_reference'))
+            effect=entry.get('delta_paired_mean',
+                             entry.get('delta_candidate_minus_reference')))
 
     registered: list = []
     unregistered: list = []
