@@ -502,7 +502,12 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
 def _protocol_record(ckpt_args: dict, model) -> dict:
     """Training recipe and shape recorded by one checkpoint."""
     return {
-        'hyperparameters': {key: ckpt_args.get(key) for key in TRAINING_RECIPE_KEYS},
+        # Keep absent keys absent: `training_recipe_mismatches` treats a
+        # missing key as unknown, but materializing it as None made two
+        # unrecorded recipes compare equal.
+        'hyperparameters': {key: ckpt_args[key]
+                            for key in TRAINING_RECIPE_KEYS
+                            if key in ckpt_args},
         # The requested dataset/tokenizer revision may be None/branch while
         # the loader actually resolved a concrete commit. Each checkpoint's
         # probe is built from its own resolved revision, so the protocol guard
