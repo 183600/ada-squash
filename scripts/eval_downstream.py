@@ -312,6 +312,11 @@ def main():
     p.add_argument('--output', default=None)
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests; recorded in the manifest so a pass/fail is auditable as a test of a claim rather than a fishing trip')
     args = p.parse_args()
+    if not args.tasks and not args.needle_test:
+        # An evaluation with neither benchmarks nor the needle test measures
+        # nothing; writing a finished manifest for it would let an empty run
+        # be cited as an evaluation.
+        p.error('nothing to evaluate: pass --tasks and/or --needle-test')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     set_all_seeds(args.seed)
     model, model_args = load_ckpt(args.ckpt, device=device)
