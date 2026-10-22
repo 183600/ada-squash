@@ -328,9 +328,18 @@ def _chronology_problems(reports: dict) -> list:
     """
     names = [name for name in ('train', 'validation', 'test') if name in reports]
     active = [reports[name] for name in names]
-    if not active or not all(
+    if not active:
+        return []
+    if not all(
             isinstance(r, dict) and isinstance(r.get('start'), int)
             and isinstance(r.get('count'), int) for r in active):
+        # Train-only with count=None is the legitimate "held-out splits
+        # disabled" shape. With more than one active split, missing
+        # start/count means the tiling cannot be verified at all; reporting
+        # that as clean would fail open.
+        if len(active) > 1:
+            return ["cannot verify chronological split tiling: one or more active "
+                    "split reports lack an integer start/count"]
         return []
     ranges = [(name, r['start'], r['start'] + r['count'])
               for name, r in zip(names, active)]
@@ -339,6 +348,14 @@ def _chronology_problems(reports: dict) -> list:
     for (_, _, prev_end), (name, start, _) in zip(ranges, ranges[1:]):
         if start != prev_end:
             return [f"split ranges are not contiguous chronological slices: {ranges}"]
+    known_totals = sorted({r.get('num_documents') for r in active
+                           if isinstance(r.get('num_documents'), int)
+                           and not isinstance(r.get('num_documents'), bool)})
+    if len(known_totals) > 1:
+        # Reports from different runs/streams can tile by accident while
+        # describing different corpora; their counts are not comparable.
+        return [f"split reports were computed against different document totals: "
+                f"{known_totals}"]
     total = active[0].get('num_documents')
     last_name, _, last_end = ranges[-1]
     if isinstance(total, int) and last_end != total:
