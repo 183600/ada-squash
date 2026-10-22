@@ -359,10 +359,12 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     a lr selected on `--seeds` and then tested on those same runs is the
     winner's curse.
     """
+    requested_baselines = list(dict.fromkeys(baseline_arms or []))
     usable = {arm: r for arm, r in tuned.items() if r.get('best') is not None}
-    baselines = {arm: r for arm, r in usable.items() if arm in set(baseline_arms)}
+    baselines = {arm: r for arm, r in usable.items() if arm in set(requested_baselines)}
     if not baselines:
         return None
+    missing_baselines = sorted(set(requested_baselines) - set(baselines))
     # The confirm split is only a valid basis when *every* compared arm has
     # complete confirm statistics; a mixed basis would compare some arms on
     # fresh seeds and others on the seeds their lr was selected on. A
@@ -377,6 +379,14 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     confirm_ignored_missing_seeds = {
         a: (usable[a].get('confirm') or {}).get('missing_seeds') for a in confirm_ignored}
     use_confirm = len(confirm_ready) == len(usable) and bool(usable)
+    confirm_ns = {a: int((usable[a].get('confirm') or {}).get('stats', {}).get('n') or 0)
+                  for a in confirm_ready}
+    # A single fresh seed produces a paired test with df = 0 and none with df
+    # >= 2; treating it as a certified comparison would broadcast that a
+    # one-run check had established generality. Keep the fresh-seed means as
+    # descriptive evidence, but only a >= 3-seed confirm split can certify.
+    confirm_seeds_sufficient = bool(confirm_ready) and all(
+        n >= MIN_SEEDS_FOR_SIGNIFICANCE for n in confirm_ns.values())
     split = 'confirm_seeds' if use_confirm else 'selection_seeds'
     # Prefer a baseline that actually reached the confirm split only when the
     # whole comparison is on the confirm split. If confirm statistics are
@@ -392,7 +402,8 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
     # Only a comparison on held-back seeds can certify: without --confirm-seeds
     # the same runs selected the lr and then "proved" it, which is the
     # winner's curse regardless of how small the p-value looks.
-    certified = bool(certify and use_confirm)
+    certified = bool(certify and use_confirm and confirm_seeds_sufficient
+                     and not missing_baselines)
     ref_mean, ref_std, ref_n = _split_basis(ref, use_confirm)
     out = {
         'reference_arm': ref_arm,
@@ -420,19 +431,30 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
             'selection_val_loss': baselines[point_best_arm]['best']['mean'],
         },
         'certify_requested': bool(certify),
+        'requested_baseline_arms': requested_baselines,
+        'missing_baseline_arms': missing_baselines,
         'confirm_ignored_arms': confirm_ignored,
         'confirm_ignored_missing_seeds': confirm_ignored_missing_seeds,
+        'confirm_seed_counts': confirm_ns,
         'certified': certified,
         'certification': (
             'confirm_seeds: significance tested on seeds held back from lr selection'
             if certified else
-            ("none: --confirm-seeds was provided but unusable for "
-             f"{confirm_ignored or 'the compared arms'} (incomplete or missing confirm "
-             "statistics), so the comparison fell back to selection seeds and the p-values "
-             "are descriptive only (winner's curse)"
-             if certify else
-             "none: no held-back --confirm-seeds, so the p-values are descriptive "
-             "only and no arm is certified as significantly better (winner's curse)")),
+            (f"none: requested baseline arm(s) {missing_baselines} were not tuned, so the "
+             "comparison could not be made against every requested reference and no arm is "
+             "certified" if missing_baselines else
+             ("none: --confirm-seeds was provided but unusable for "
+              f"{confirm_ignored or 'the compared arms'} (incomplete or missing confirm "
+              "statistics), so the comparison fell back to selection seeds and the p-values "
+              "are descriptive only (winner's curse)"
+              if certify and not use_confirm else
+              ("none: fewer than "
+               f"{MIN_SEEDS_FOR_SIGNIFICANCE} held-back --confirm-seeds per arm "
+               f"({confirm_ns}), so the p-values are descriptive only and no arm is "
+               "certified as significantly better"
+               if certify else
+               "none: no held-back --confirm-seeds, so the p-values are descriptive "
+               "only and no arm is certified as significantly better (winner's curse)")))),
         'margin': margin,
         'alpha': alpha,
         'rows': [],
@@ -687,6 +709,12 @@ def main():
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check')
     p.add_argument('--force', action='store_true', help='rerun trials even if a summary already exists')
     args = p.parse_args()
+    for flag, value in (('--batch-size', args.batch_size),
+                        ('--seq-len', args.seq_len),
+                        ('--log-every', args.log_every),
+                        ('--stats-every', args.stats_every)):
+        if value < 1:
+            p.error(f'{flag} {value} must be >= 1')
     if not args.lrs:
         p.error('--lrs must not be empty')
     if any(not math.isfinite(lr) or lr <= 0.0 for lr in args.lrs):
