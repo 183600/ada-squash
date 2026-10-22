@@ -263,7 +263,9 @@ def infer_num_documents(ds) -> int | None:
     except AttributeError:
         split_info = splits["train"] if "train" in splits else None
     n = getattr(split_info, "num_examples", None) if split_info is not None else None
-    return n if isinstance(n, int) and n > 0 else None
+    # bool is an int subclass; True must not become a one-document stream and
+    # silently place the held-out boundary at the wrong place.
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
 
 
 _REVISION_CACHE: dict = {}
