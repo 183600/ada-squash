@@ -546,8 +546,21 @@ def main():
     p.add_argument('--output', default='runs/fp8_check/results.json')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this check tests (e.g. "DyT-CD limits fp8 activation blowup versus RMSNorm at matched init"); recorded in the run manifest so the result can be audited against the claim it was meant to support')
     args = p.parse_args()
+    if not args.norms:
+        p.error('--norms must not be empty')
+    if len(set(args.norms)) != len(args.norms):
+        p.error(f'--norms contains duplicates: {args.norms}; a repeated norm is the same '
+                'row and would add duplicate tests to the Holm family')
     if args.ckpt and len(args.ckpt) != len(args.norms):
         p.error(f'--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}')
+    for flag, value in (('--batch-size', args.batch_size), ('--seq-len', args.seq_len)):
+        if value < 1:
+            p.error(f'{flag} {value} must be >= 1')
+    if args.n_states < 2:
+        p.error(f'--n-states {args.n_states} must be >= 2: a one-state probe has a '
+                'deterministic successor and measures no next-token structure')
+    if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
+        p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds)
     if not raw_seeds:
         p.error('--seeds must not be empty')
@@ -570,6 +583,14 @@ def main():
         ckpt_groups = [[path for path in str(entry).split(',') if path] for entry in args.ckpt]
         if any(not group for group in ckpt_groups):
             p.error('--ckpt entries must not be empty')
+        for group in ckpt_groups:
+            if len(set(group)) != len(group):
+                p.error(f'--ckpt arm {group} repeats a checkpoint; a repeated path is the '
+                        'same trained run and would be weighted twice instead of adding evidence')
+        normalized_groups = [tuple(sorted(group)) for group in ckpt_groups]
+        if len(set(normalized_groups)) != len(normalized_groups):
+            p.error('--ckpt contains the same checkpoint set for two norms; the same weights '
+                    'cannot support a cross-norm difference')
     results = []
     for i, norm in enumerate(args.norms):
         if not args.ckpt:
