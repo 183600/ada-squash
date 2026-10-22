@@ -140,6 +140,18 @@ def _int_option(name: str, value, minimum: int, *, allow_none: bool = False):
     return converted
 
 
+def _bool_option(name: str, value) -> bool:
+    """A boolean option, without truthiness coercion.
+
+    ``bool(None)``/``bool("false")`` silently turn an absent or string-valued
+    flag into the opposite of what the caller wrote (an empty YAML key would
+    disable deduplication). Only an actual bool is a boolean measurement here.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"data option {name} must be a bool, got {value!r}")
+    return value
+
+
 def _fraction_option(name: str, value) -> float:
     if isinstance(value, bool):
         raise ValueError(f"data option {name} must be a fraction, got {value!r}")
@@ -179,7 +191,7 @@ def validate_data_options(options: dict | None = None) -> dict:
             "leave no training documents; the split fractions must sum to less than 1")
     opts["num_documents"] = _int_option(
         "num_documents", opts.get("num_documents"), 1, allow_none=True)
-    opts["dedup"] = bool(opts.get("dedup"))
+    opts["dedup"] = _bool_option("dedup", opts.get("dedup"))
     opts["dedup_max"] = _int_option("dedup_max", opts.get("dedup_max"), 1)
     opts["min_doc_chars"] = _int_option("min_doc_chars", opts.get("min_doc_chars"), 0)
     opts["max_doc_chars"] = _int_option("max_doc_chars", opts.get("max_doc_chars"), 0)
@@ -191,7 +203,8 @@ def validate_data_options(options: dict | None = None) -> dict:
     opts["seed"] = _int_option("seed", opts.get("seed"), -(2 ** 63))
     opts["num_workers"] = _int_option("num_workers", opts.get("num_workers"), 0)
     opts["prefetch_factor"] = _int_option("prefetch_factor", opts.get("prefetch_factor"), 1)
-    opts["persistent_workers"] = bool(opts.get("persistent_workers"))
+    opts["persistent_workers"] = _bool_option(
+        "persistent_workers", opts.get("persistent_workers"))
     for name in ("dataset_revision", "tokenizer_revision"):
         value = opts.get(name)
         if value is not None and not isinstance(value, str):
@@ -257,8 +270,15 @@ _REVISION_CACHE: dict = {}
 
 
 def _is_pinned_revision(revision) -> bool:
+    """Whether `revision` is a full 40-hex Hub commit, not a short/ambiguous id.
+
+    A 7-40 character hex string is also a valid branch/tag spelling and an
+    ambiguous abbreviated SHA. Treating it as a concrete commit would skip the
+    Hub resolution, certify a mutable name as the data version, and key the
+    held-out cache on it.
+    """
     text = str(revision or "")
-    return 7 <= len(text) <= 40 and all(c in "0123456789abcdefABCDEF" for c in text)
+    return len(text) == 40 and all(c in "0123456789abcdefABCDEF" for c in text)
 
 
 def _resolve_hub_revision(kind: str, name: str, revision) -> str | None:
@@ -371,17 +391,23 @@ def select_stream_split(ds, split: str, options: dict | None = None):
         opts.update(options)
     if split not in ("train", "validation", "test"):
         raise ValueError(f"unknown split '{split}'")
-    val_frac, test_frac = float(opts["val_frac"]), float(opts["test_frac"])
-    num_documents = opts.get("num_documents")
-    num_documents = int(num_documents) if num_documents is not None else infer_num_documents(ds)
+    val_frac = _fraction_option("val_frac", opts["val_frac"])
+    test_frac = _fraction_option("test_frac", opts["test_frac"])
+    if val_frac + test_frac >= 1.0:
+        raise ValueError(
+            f"val_frac={val_frac} + test_frac={test_frac} leaves no training "
+            "documents; the split fractions must sum to less than 1")
+    raw_documents = opts.get("num_documents")
+    num_documents = (_int_option("num_documents", raw_documents, 1)
+                     if raw_documents is not None else infer_num_documents(ds))
     report = {
         "split": split,
         "num_documents": num_documents,
         "val_frac": val_frac,
         "test_frac": test_frac,
-        "dedup": bool(opts["dedup"]),
-        "min_doc_chars": int(opts["min_doc_chars"]),
-        "max_doc_chars": int(opts["max_doc_chars"]),
+        "dedup": _bool_option("dedup", opts["dedup"]),
+        "min_doc_chars": _int_option("min_doc_chars", opts["min_doc_chars"], 0),
+        "max_doc_chars": _int_option("max_doc_chars", opts["max_doc_chars"], 0),
         "dataset_revision": opts.get("dataset_revision"),
         "tokenizer_revision": opts.get("tokenizer_revision"),
     }
@@ -1007,7 +1033,9 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     if cache_path.exists():
         fingerprint = _read_cache_fingerprint(meta_path)
         cached_documents = None if fingerprint is None else fingerprint.get("documents")
-        if (fingerprint is not None and _cache_matches(cache_path, fingerprint)
+        if (fingerprint is not None
+                and fingerprint.get("cache_key") == key
+                and _cache_matches(cache_path, fingerprint)
                 and isinstance(cached_documents, int)
                 and not isinstance(cached_documents, bool)
                 and cached_documents == int(count)):
@@ -1071,6 +1099,11 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     fingerprint = {
         "path": str(cache_path),
         "version": 3,
+        # The full identity that produced the payload. Size+sha alone only
+        # prove that the sidecar describes *this file*, not that the file is
+        # the split/dataset/revision the current key asked for: a foreign but
+        # self-consistent cache copied under this path would otherwise pass.
+        "cache_key": key,
         "dataset": dataset_name,
         "split": split,
         "dataset_revision_resolved": resolved_revision,
