@@ -106,6 +106,14 @@ _CHILD_PROTOCOL_KEYS = (
 def expected_child_protocol(args, depth: int, norm: str, seed: int) -> dict:
     """The controlled recipe and shape a child manifest must record."""
     hyperparameters = {key: getattr(args, key) for key in _CHILD_PROTOCOL_KEYS}
+    # `launch_one` omits these flags when the sweep value is None so the child
+    # can use its own defaults. The expected protocol must record the value the
+    # child will actually write, not the omitted None, or every child is
+    # rejected as a recipe mismatch.
+    if hyperparameters.get('dataset_config') is None:
+        hyperparameters['dataset_config'] = 'sample-10BT'
+    if hyperparameters.get('tokenizer') is None:
+        hyperparameters['tokenizer'] = 'gpt2'
     hyperparameters.update({'norm': norm, 'seed': int(seed)})
     base_dim, base_heads = base_shape_for_model(args.model)
     if args.no_dim_scaling:
@@ -923,7 +931,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
     return proc
 
 def main():
-    from scripts.train_gpt2 import apply_config_to_parser
+    from scripts.train_gpt2 import _explicit_arg_names, apply_config_to_parser
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=None)
     known, _ = pre.parse_known_args()
@@ -1020,7 +1028,11 @@ def main():
         p.error(f'--max-parallel {args.max_parallel} must be >= 1')
     if args.threads_per_run < 0:
         p.error(f'--threads-per-run {args.threads_per_run} must be >= 0')
-    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [42])
+    seed_names = _explicit_arg_names(sys.argv[1:], p, known.config)
+    if args.seed is not None and ('seed' in seed_names or 'seeds' not in seed_names):
+        raw_seeds = [args.seed]
+    else:
+        raw_seeds = list(args.seeds or [42])
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
         print(f'[sweep][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '

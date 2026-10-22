@@ -1164,9 +1164,16 @@ def main():
     # otherwise resuming a seed-42 checkpoint with a config (`seed: 7`) keeps
     # seed 7, reseeds the data stream and fast-forwards `data_position` along
     # a different stream than the one the checkpoint recorded.
-    seed_explicit = bool(
-        _explicit_arg_names(sys.argv[1:], p, known.config) & {'seed', 'seeds'})
-    raw_seeds = [args.seed] if args.seed is not None else list(args.seeds or [DEFAULT_SEED])
+    seed_names = _explicit_arg_names(sys.argv[1:], p, known.config)
+    seed_explicit = bool(seed_names & {'seed', 'seeds'})
+    # CLI precedence: `--seeds` typed on the command line must not be replaced
+    # by a `seed:` value that only came from --config. The deprecated --seed
+    # shorthand still wins when it is the explicit one (or when --seeds was
+    # not typed at all), matching its documented precedence.
+    if args.seed is not None and ('seed' in seed_names or 'seeds' not in seed_names):
+        raw_seeds = [args.seed]
+    else:
+        raw_seeds = list(args.seeds or [DEFAULT_SEED])
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
         print(f'[seeds][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
