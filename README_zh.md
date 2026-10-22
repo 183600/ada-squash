@@ -190,6 +190,15 @@ python scripts/ablation.py --config configs/ablation-matrix.yaml
 - softsign 族：p ∈ {1, 2, 4, 可学习, →∞（=硬 tanh）}
 - DyT alpha 初始化：0.3 / 0.5 / 1.0
 
+训练前运行器会写 `analysis_plan.json`：确认性对比集合由已校验的矩阵导出，
+每个对比有稳定 id 和明确的科学假设，整个注册表带哈希指纹。四份对比报告之后
+再写 `study_level_tests.json`，对预注册对比做分层 Holm 门控（第一层：主提案
+及其机制；第二层：其余单轴、对照与 QK 对比，只有第一层至少一项成立才检验）。
+不在计划中的检验只作为探索性结果报告。每个对比还附带留一 seed 的 jackknife
+（去掉任一 seed 后效应符号是否仍在），以及 `--equivalence-margin <delta>` 开启
+的 TOST 等价性检验——"两个设置相同"因此是一个有检验的结论，而不是" superiority
+检验不显著"。析因交互项按双侧报告，避免把拮抗交互误读成"协同不显著"。
+
 ## 方法速查
 
 ### 原版 DyT（基线）

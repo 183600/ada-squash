@@ -211,6 +211,23 @@ every sampled step of the run. Ablations include:
 - Softsign family: p ∈ {1, 2, 4, learnable, →∞ (=hard tanh)}
 - DyT alpha init: 0.3 / 0.5 / 1.0
 
+Before training, the runner writes `analysis_plan.json`: the set of
+confirmatory contrasts is derived from the validated matrix, every contrast
+gets a stable id and its stated hypothesis, and the whole registry is hashed.
+After the four comparison reports it writes `study_level_tests.json`, which
+applies hierarchical Holm gatekeeping across the pre-registered contrasts
+(primary: the main proposal and its mechanisms; secondary: the remaining
+single-axis, control and QK contrasts, tested only if a primary contrast
+survives). Tests outside the plan are reported as exploratory. A rerun that
+changes the plan fingerprint is recorded as post-hoc (`plan_changed`); pass
+`--require-plan-lock` to reject such a rerun outright. Each contrast
+also reports a leave-one-seed-out jackknife (does the sign survive dropping
+any one seed?) and, with `--equivalence-margin <delta>`, a TOST equivalence
+test, so "these two arms are the same" is a claim with a test rather than a
+non-significant superiority result. Factorial interactions are reported
+two-sided, so an antagonistic interaction is not mistaken for a failed
+synergy claim.
+
 ## Method reference
 
 ### Original DyT (baseline)

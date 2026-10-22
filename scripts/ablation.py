@@ -38,6 +38,22 @@ Comparison protocol (what the runner guarantees, and checks)
   a power-based minimum detectable delta. The reference baseline is the best
   *replicated* baseline (with the point-estimate best recorded alongside), so
   a lucky single-seed row cannot make certification impossible.
+* **Pre-registered analysis plan.** `build_analysis_plan` freezes every
+  confirmatory contrast (baseline, leave-one-out, factorial, QK) with a stable
+  id, its stated hypothesis, test direction and a SHA-256 fingerprint before
+  training starts, and writes `analysis_plan.json`. `study_level_tests.json`
+  then applies hierarchical Holm gatekeeping: the primary tier (main
+  proposal vs best baseline, its leave-one-out mechanisms, the main softsign
+  factorial) is corrected first; the secondary tier is tested only if a
+  primary contrast survives. A realized test absent from the plan is reported
+  as exploratory, and a pre-registered test that was not run is reported as
+  unresolved rather than silently dropped.
+* **Equivalence and seed robustness.** `--equivalence-margin` enables TOST on
+  every paired contrast, so "the two arms are the same" is a tested claim
+  rather than a non-significant superiority result; each contrast also carries
+  a leave-one-seed-out jackknife showing whether its sign survives dropping
+  any single seed. Factorial interactions are reported two-sided (synergy or
+  antagonism) alongside the one-sided synergy test.
 * **Task-grounded calibration.** A transformer-vs-transformer ranking only
   says which model is least bad; the tuned count model and the exact Bayes
   limits from `scripts/baseline_simple.py` say whether any row learned the
@@ -59,6 +75,7 @@ Comparison protocol (what the runner guarantees, and checks)
 """
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -73,8 +90,10 @@ from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpi
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
-from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
-                               paired_t_one_sided, student_t_ppf, welch_t_one_sided)
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
+                               leave_one_out_jackknife, mean_std_stderr,
+                               paired_t_one_sided, student_t_ppf, tost_paired,
+                               two_sided_p_from_t, welch_t_one_sided)
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import (_explicit_arg_names, apply_config_to_parser,
@@ -153,6 +172,85 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
     return out
 
 
+def _per_seed_deltas(row: dict, reference: dict, common_seeds) -> dict:
+    """{seed: row - reference} for the shared seeds, or {} when not pairable.
+
+    This is the single representation every robustness helper consumes, so
+    the sign-flip-free jackknife, the equivalence test and the direction
+    counts all agree on what "the effect for seed s" means.
+    """
+    row_seeds = _seed_means(row)
+    ref_seeds = _seed_means(reference)
+    out = {}
+    for seed in common_seeds or []:
+        if seed in row_seeds and seed in ref_seeds:
+            out[int(seed)] = float(row_seeds[seed] - ref_seeds[seed])
+    return out
+
+
+def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
+                           equivalence_margin: float = 0.0) -> dict:
+    """Attach seed-jackknife stability and a TOST equivalence check.
+
+    Two questions a significance test alone cannot answer are asked for every
+    paired contrast:
+
+    * **Is the sign carried by one seed?** `leave_one_out_jackknife` drops
+      each seed in turn and reports whether the direction survives. At three
+      seeds this is the difference between "the norm helps" and "one lucky
+      run helped".
+    * **Is the two arms' difference small enough to call them equivalent?**
+      Only a pre-registered `--equivalence-margin` enables TOST; a
+      non-significant superiority test is explicitly *not* relabelled as
+      equivalence. The margin is stored in the artifact with the p-value.
+
+    `deltas` maps seed -> paired difference (candidate - reference). Both
+    blocks are descriptive for the certification decision; the pre-specified
+    paired t-test remains the only certifying test.
+    """
+    values = [float(deltas[seed]) for seed in deltas]
+    labels = [str(seed) for seed in deltas]
+    jackknife = leave_one_out_jackknife(values, labels=labels)
+    if jackknife is not None:
+        jackknife["unit"] = "seed"
+    equivalence = {
+        "enabled": False,
+        "test": "tost_paired",
+        "margin": None,
+        "equivalent": None,
+        "p_tost": None,
+        "note": ("pass --equivalence-margin <val_loss> to test whether the two "
+                 "arms are equivalent; a non-significant difference is not "
+                 "equivalence"),
+    }
+    if equivalence_margin and equivalence_margin > 0.0 and len(values) >= 2:
+        tost = tost_paired(values, [0.0] * len(values),
+                           margin=equivalence_margin, alpha=alpha)
+        tost["enabled"] = True
+        equivalence = tost
+    return {"seed_jackknife": jackknife, "equivalence": equivalence}
+
+
+def _robustness_note(entry: dict) -> str:
+    """Compact human-readable suffix for the robustness/equivalence blocks."""
+    parts = []
+    jackknife = entry.get('seed_jackknife')
+    if isinstance(jackknife, dict) and jackknife.get('meaningful'):
+        if jackknife.get('sign_stable') is False:
+            parts.append(f" [SEED-SENSITIVE: dropping "
+                         f"{jackknife.get('influential_labels')} flips the sign]")
+        elif jackknife.get('sign_stable') is True:
+            parts.append(' [seed-robust sign]')
+    equivalence = entry.get('equivalence')
+    if isinstance(equivalence, dict) and equivalence.get('enabled'):
+        margin = equivalence.get('margin')
+        if equivalence.get('equivalent'):
+            parts.append(f' [EQUIVALENT within {margin:g}]')
+        else:
+            parts.append(f' [NOT equivalent within {margin:g}]')
+    return ''.join(parts)
+
+
 ABLATIONS = {'ln_baseline': dict(norm_name='ln'), 'rmsnorm_baseline': dict(norm_name='rmsnorm'), 'dyt_no_perchannel': dict(norm_name='dyt'), 'dytc_perchannel_tanh_k0': dict(norm_name='dytcd_tanh', k_init=0.0, learnable_k=False), 'dytd_tanh_k0': dict(norm_name='dytd_tanh', k_init=0.0, learnable_k=False), 'dytcd_full': dict(norm_name='dytcd'), 'dytcd_no_perchannel': dict(norm_name='dytcd', learnable_delta=False), 'dytcd_k0_no_depth_schedule': dict(norm_name='dytcd', k_init=0.0, learnable_k=False), 'dytcd_no_perchannel_no_depth': dict(norm_name='dytcd', learnable_delta=False, k_init=0.0, learnable_k=False), 'dytd_k0_no_depth_schedule': dict(norm_name='dytd', k_init=0.0, learnable_k=False), 'dytd_full': dict(norm_name='dytd'), 'dytd_tanh_full': dict(norm_name='dytd_tanh'), 'dytcd_no_ls': dict(norm_name='dytcd', use_layerscale=False), 'dytcd_no_softsign': dict(norm_name='dytcd_tanh'), 'dytcd_fixed_p': dict(norm_name='dytcd', p_init=2.0, learnable_p=False), 'dytcd_ls1e5': dict(norm_name='dytcd', layerscale_init=1e-05), 'dytcd_ls1e3': dict(norm_name='dytcd', layerscale_init=0.001), 'dytc_p1_softsign': dict(norm_name='dytc', p_init=1.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p2_softsign': dict(norm_name='dytc', p_init=2.0, learnable_p=False, alpha_jitter=0.0), 'dytc_p4_softsign': dict(norm_name='dytc', p_init=4.0, learnable_p=False, alpha_jitter=0.0), 'dytc_plearnable': dict(norm_name='dytc', p_init=2.0, learnable_p=True, alpha_jitter=0.0), 'dytc_hardtanh_eq': dict(norm_name='dytc', p_init=64.0, learnable_p=False, alpha_jitter=0.0), 'dyt_alpha_0.3': dict(norm_name='dyt', alpha_init=0.3), 'dyt_alpha_0.5': dict(norm_name='dyt', alpha_init=0.5), 'dyt_alpha_1.0': dict(norm_name='dyt', alpha_init=1.0), 'rmsnorm_qk': dict(norm_name='rmsnorm', qk_norm='dytqk'), 'rmsnorm_qknorm': dict(norm_name='rmsnorm', qk_norm='qknorm'), 'ln_qk': dict(norm_name='ln', qk_norm='dytqk'), 'ln_qknorm': dict(norm_name='ln', qk_norm='qknorm'), 'dytcd_qk': dict(norm_name='dytcd', qk_norm='dytqk'), 'dytcd_qknorm': dict(norm_name='dytcd', qk_norm='qknorm')}
 # Every row must state *why* it is run (the scientific hypothesis it tests),
 # not just what it configures. `load_ablations_from_config` enforces this for
@@ -212,6 +310,13 @@ _FORBIDDEN_ROW_KEYS = frozenset({
 # over >= 3 seeds and reported as mean +/- std across seeds (see
 # `aggregate_seed_summaries` and `baseline_comparison`).
 DEFAULT_SEEDS = (42, 43, 44)
+
+# The main proposal's row and its 2x2 factorial design. These define the
+# primary tier of the study-level gatekeeping correction; a custom matrix with
+# different row names must update them (the gate then falls back to
+# "not applicable" rather than silently treating an arbitrary row as primary).
+PRIMARY_MAIN_ROW = 'dytcd_full'
+PRIMARY_FACTORIAL_DESIGN = 'per_channel_x_depth_softsign'
 
 # Leave-one-out (LOO) coverage of the main proposal DyT-CD. Each entry names
 # one claimed mechanism and the matrix row that removes exactly it. The claim
@@ -1219,7 +1324,8 @@ def _run_identity(row: dict, parent_of: dict) -> str:
         name = parent
     return row.get('name')
 
-def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alpha: float=0.05) -> dict | None:
+def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alpha: float=0.05,
+                        equivalence_margin: float=0.0) -> dict | None:
     """Every row's held-out val_loss against the best reference baseline.
 
     The reference is the best (lowest val_loss) *replicated* row among
@@ -1292,6 +1398,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         'baseline_rows': {r['name']: r['val_loss'] for r in baselines},
         'margin': margin,
         'alpha': alpha,
+        'equivalence_margin': equivalence_margin,
         'protocol': ('seeds are the unit of replication: mean +/- std across >= 3 seeds; '
                      'only the paired test on >= 3 shared per-seed means certifies significance; '
                      'two or one shared seed(s) are descriptive only, and alias rows '
@@ -1338,6 +1445,8 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'per_seed_delta': None,
             'paired_delta_std': None,
             'minimum_detectable_delta_95_power80': None,
+            'seed_jackknife': None,
+            'equivalence': None,
             # Per-seed held-out losses let the calibrated count-model
             # comparison test the same seeds (the count model is fitted on
             # seed s and scored on the seed s+1 stream, exactly like the row).
@@ -1374,6 +1483,9 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['n'] = test['n']
         entry.update(_paired_effect_summary(row, reference, common, test, alpha=alpha))
+        entry.update(_robustness_for_deltas(
+            _per_seed_deltas(row, reference, common),
+            alpha=alpha, equivalence_margin=equivalence_margin))
         if entry['test'] is not None and not entry['replicated_across_seeds']:
             entry['significance_basis'] = (
                 f'descriptive only: {len(common)} shared seed(s), fewer than the required '
@@ -1497,7 +1609,8 @@ def print_baseline_comparison(comparison: dict | None) -> None:
               f"p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{basis}{direction}{mde_str} "
               f"beats={entry['beats_reference']} "
-              f"significant={entry['beats_reference_significantly']}{note}{regime_note}{power_warn}")
+              f"significant={entry['beats_reference_significantly']}{note}{regime_note}{power_warn}"
+              f"{_robustness_note(entry)}")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[compare] NOTE: tests with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are "
               f"described but never certified: {comparison['rows_tested_descriptively_only']}")
@@ -1961,7 +2074,9 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
               f"{sum(1 for entry in annotated if entry.get('beats_tuned_simple_significantly'))})")
     return block
 
-def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: float=0.0, alpha: float=0.05) -> dict | None:
+def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: float=0.0,
+                             alpha: float=0.05,
+                             equivalence_margin: float=0.0) -> dict | None:
     """Full vs each Full-minus-X row: does removing mechanism X hurt?
 
     `check_leave_one_out` proves the *structure* of the leave-one-out matrix -
@@ -2028,6 +2143,8 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 'per_seed_delta': None,
                 'paired_delta_std': None,
                 'minimum_detectable_delta_95_power80': None,
+                'seed_jackknife': None,
+                'equivalence': None,
             }
             if full is None:
                 entry['skipped'] = f"full row '{full_name}' has no usable val_loss"
@@ -2071,6 +2188,9 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
                 entry['n'] = test['n']
             entry.update(_paired_effect_summary(full, ref, common, test, alpha=alpha))
+            entry.update(_robustness_for_deltas(
+                _per_seed_deltas(full, ref, common),
+                alpha=alpha, equivalence_margin=equivalence_margin))
             if entry['test'] is not None and not entry['replicated_across_seeds']:
                 entry['significance_basis'] = (
                     f'descriptive only: {len(common)} shared seed(s), fewer than the required '
@@ -2114,6 +2234,7 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                      'when rows are aliases'),
         'margin': margin,
         'alpha': alpha,
+        'equivalence_margin': equivalence_margin,
         'multiple_comparison': (f'Holm-Bonferroni over the '
                                 f'{sum(e["p_one_sided"] is not None for e in family)} seed-replicated '
                                 f'mechanism(s); `mechanism_helps_significantly` uses the adjusted '
@@ -2124,7 +2245,8 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
     }
 
 def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.0,
-                       alpha: float=0.05) -> dict | None:
+                       alpha: float=0.05,
+                       equivalence_margin: float=0.0) -> dict | None:
     """Attribute the independent QK-compression axis on every host norm.
 
     The matrix contains a clean QK-off/on pair and a QK-Norm comparator on
@@ -2165,6 +2287,8 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                 'n_seeds_against': None, 'per_seed_delta': None,
                 'paired_delta_std': None,
                 'minimum_detectable_delta_95_power80': None,
+                'seed_jackknife': None,
+                'equivalence': None,
             }
             if cand is None or ref is None:
                 missing = [name for name, row in ((cand_name, cand), (ref_name, ref))
@@ -2186,6 +2310,9 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                     'n': test['n'],
                 })
             entry.update(_paired_effect_summary(cand, ref, common, test, alpha=alpha))
+            entry.update(_robustness_for_deltas(
+                _per_seed_deltas(cand, ref, common),
+                alpha=alpha, equivalence_margin=equivalence_margin))
             if entry['test'] is not None and not entry['replicated_across_seeds']:
                 entry['significance_basis'] = (
                     f'descriptive only: {len(common)} shared seed(s), fewer than the required '
@@ -2234,6 +2361,7 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                      'Holm-adjusted across all QK pairs'),
         'margin': margin,
         'alpha': alpha,
+        'equivalence_margin': equivalence_margin,
         'cross_host_replication': cross_host,
         'rows': rows,
         'rows_tested_descriptively_only': [
@@ -2258,7 +2386,8 @@ def print_qk_axis_comparison(comparison: dict | None) -> None:
         print(f"[qk] {entry['host']:>8s} {entry['contrast']:>14s}: "
               f"delta={entry['delta_candidate_minus_reference']:+.4f}{ci_str} "
               f"p={p_str} p(holm)={p_holm_str} helps={entry['effect_helps']} "
-              f"significant={entry['effect_helps_significantly']}{note}")
+              f"significant={entry['effect_helps_significantly']}{note}"
+              f"{_robustness_note(entry)}")
     cross = comparison.get('cross_host_replication') or {}
     print(f"[qk] cross-host: {cross.get('host_deltas')} signs={cross.get('direction_signs')} "
           f"consistent={cross.get('direction_consistent_across_hosts')} "
@@ -2321,7 +2450,8 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
               f"{ppl_str}{ratio_str} p(one-sided)={p_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{entry.get('test_basis') or '-'}{direction}{mde_str} "
               f"removing_hurts={entry['mechanism_helps']} "
-              f"significant={entry['mechanism_helps_significantly']}{note}{regime_note}{power_warn}")
+              f"significant={entry['mechanism_helps_significantly']}{note}{regime_note}{power_warn}"
+              f"{_robustness_note(entry)}")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[loo] NOTE: tests with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are described "
               f"but never certified: {comparison['rows_tested_descriptively_only']}")
@@ -2330,7 +2460,8 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
               f"{comparison['rows_with_fewer_than_3_seeds']}")
 
 def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=0.0,
-                         alpha: float=0.05) -> dict | None:
+                         alpha: float=0.05,
+                         equivalence_margin: float=0.0) -> dict | None:
     """Paired main effects and interaction for each declared 2x2 factorial.
 
     The interaction is the difference of the factor's effect in the two arms
@@ -2411,6 +2542,15 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
         for effect_name, effect in effects.items():
             values = list(effect['per_seed_values'].values())
             test = paired_t_one_sided(values, [0.0] * len(values), margin=margin, alpha=alpha)
+            # A two-sided test of "the effect is non-zero" is the right
+            # question for an interaction: antagonism (positive interaction)
+            # is as reportable as synergy, and the one-sided synergy test
+            # alone would silently ignore it. The one-sided test stays the
+            # certification for "helps", so the existing claim is unchanged.
+            two_sided_test = paired_t_one_sided(
+                values, [0.0] * len(values), margin=0.0, alpha=alpha)
+            p_two_sided = two_sided_p_from_t(
+                two_sided_test['t'], two_sided_test['df'])
             replicated = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
             entry = dict(base_entry, effect=effect_name, kind=effect['kind'],
                          formula=effect['formula'], shared_seeds=common,
@@ -2428,15 +2568,31 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                          replicated_across_seeds=replicated,
                          p_one_sided=test['p_one_sided'],
                          p_one_sided_holm=None,
+                         p_two_sided=p_two_sided,
+                         p_two_sided_holm=None,
+                         interaction_differs_significantly=None,
+                         interaction_direction=None,
                          t=test['t'],
                          df=test['df'],
                          delta_ci_95=[test['ci_low'], test['ci_high']],
                          n=test['n'])
+            if effect['kind'] == 'interaction':
+                delta = effect['delta_seed_mean']
+                if delta < -margin:
+                    entry['interaction_direction'] = 'synergy'
+                elif delta > margin:
+                    entry['interaction_direction'] = 'antagonism'
+                else:
+                    entry['interaction_direction'] = 'additive_or_within_margin'
             effect_row = {'per_seed': [{'seed': int(seed), 'val_loss': value}
                                        for seed, value in effect['per_seed_values'].items()]}
             zero_row = {'per_seed': [{'seed': int(seed), 'val_loss': 0.0}
                                      for seed in effect['per_seed_values']]}
             entry.update(_paired_effect_summary(effect_row, zero_row, common, test, alpha=alpha))
+            entry.update(_robustness_for_deltas(
+                {str(seed): float(value)
+                 for seed, value in effect['per_seed_values'].items()},
+                alpha=alpha, equivalence_margin=equivalence_margin))
             paired_std = entry.get('paired_delta_std')
             if (isinstance(paired_std, (int, float)) and paired_std > 0.0
                     and entry.get('delta_seed_mean') is not None):
@@ -2459,6 +2615,18 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
         entry['p_one_sided_holm'] = p_holm
         entry['effect_helps_significantly'] = bool(
             entry['effect_helps'] and p_holm is not None and p_holm < alpha)
+    # Interactions answer a two-sided question ("is the combination more or
+    # less than the sum of its parts?"), so they get their own Holm family
+    # over the two-sided p-values. A significant positive interaction is an
+    # antagonism finding, not a failed synergy claim.
+    interaction_family = [entry for entry in family
+                          if entry.get('kind') == 'interaction']
+    interaction_adjusted = holm_adjust(
+        [entry.get('p_two_sided') for entry in interaction_family])
+    for entry, p_holm in zip(interaction_family, interaction_adjusted):
+        entry['p_two_sided_holm'] = p_holm
+        entry['interaction_differs_significantly'] = bool(
+            p_holm is not None and p_holm < alpha)
     tested_descriptively = [entry['effect'] for entry in rows
                             if entry.get('p_one_sided') is not None
                             and not entry.get('replicated_across_seeds')]
@@ -2469,9 +2637,14 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                      'main effects and interactions form one Holm family'),
         'margin': margin,
         'alpha': alpha,
+        'equivalence_margin': equivalence_margin,
         'multiple_comparison': (f'Holm-Bonferroni over {len(family)} seed-replicated '
                                 'factorial term(s); `effect_helps_significantly` uses the '
-                                'adjusted p-value'),
+                                'adjusted one-sided p-value'),
+        'interaction_multiple_comparison': (
+            f'Holm-Bonferroni over {len(interaction_family)} seed-replicated interaction '
+            'term(s) using the two-sided p-value; `interaction_differs_significantly` '
+            'covers synergy and antagonism'),
         'designs': spec,
         'rows': rows,
         'rows_tested_descriptively_only': tested_descriptively,
@@ -2501,16 +2674,460 @@ def print_factorial_comparison(comparison: dict | None) -> None:
             if abs(entry['delta_seed_mean']) < mde:
                 power_warn += ' [UNDERPOWERED: |delta| < mde80]'
         note = '' if entry['replicated_across_seeds'] else ' [descriptive only, not certified]'
+        interaction = ''
+        if entry.get('kind') == 'interaction':
+            p2 = entry.get('p_two_sided')
+            p2_holm = entry.get('p_two_sided_holm')
+            interaction = (f" interaction={entry.get('interaction_direction')} "
+                           f"p(two-sided)={'n/a' if p2 is None else f'{p2:.3g}'} "
+                           f"p2(holm)={'n/a' if p2_holm is None else f'{p2_holm:.3g}'} "
+                           f"differs={entry.get('interaction_differs_significantly')}")
         print(f"[factorial] {entry['design']} {entry['kind']} {entry['effect']}: "
               f"delta={entry['delta_seed_mean']:+.4f} {ci_str}"
               f"seeds_favoring={entry['n_seeds_favoring']}/{entry['n_seeds']} "
               f"p(one-sided)={p_str} p(holm)={p_holm_str} {mde_str}{ratio_str}"
               f"helps={entry['effect_helps']} "
-              f"significant={entry['effect_helps_significantly']}{note}{power_warn}")
+              f"significant={entry['effect_helps_significantly']}{note}{power_warn}"
+              f"{interaction}{_robustness_note(entry)}")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[factorial] NOTE: terms with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared "
               f"seeds are described but never certified: "
               f"{comparison['rows_tested_descriptively_only']}")
+
+def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
+                        baseline_names, model_name: str, seeds,
+                        alpha: float=0.05, margin: float=0.0,
+                        equivalence_margin: float=0.0) -> dict:
+    """Freeze the confirmatory contrast registry *before* any training starts.
+
+    A comparison experiment is only confirmatory if the set of tests is fixed
+    in advance. Discovering an extra row after seeing the results and then
+    correcting only the surviving family is a well-known way to manufacture a
+    "significant" ablation. This function derives every mechanism / baseline /
+    factorial / QK contrast from the already-validated matrix (so it cannot
+    name a contrast the matrix does not isolate), records the stated
+    hypothesis and test direction, and hashes the whole registry. The hash is
+    written next to the results; `study_level_correction` only admits tests
+    whose id appears here, and everything else is reported as unregistered
+    (exploratory) even when its p-value is small.
+
+    The baseline reference is a *rule* ("best replicated baseline"), not a
+    single row name, because which baseline is strongest is a result of the
+    run; the realized reference is recorded in `baseline_comparison.json`.
+    """
+    baseline_set = set(baseline_names or [])
+    contrasts: list = []
+
+    def _add(entry: dict) -> None:
+        contrasts.append(entry)
+
+    for name in sorted(rows):
+        if name in baseline_set:
+            continue
+        if not str(hypotheses.get(name) or '').strip():
+            # `validate_matrix` already rejects this, but the plan must not
+            # silently drop a row if it is ever called directly.
+            continue
+        _add({
+            'id': f'baseline:{name}',
+            'family': 'baseline',
+            'kind': 'superiority',
+            'candidate': name,
+            'reference': 'best_replicated_baseline',
+            'metric': 'val_loss',
+            'sided': 'one_sided',
+            'hypothesis': hypotheses.get(name),
+        })
+    for full_name, mechanisms in sorted(
+            (matrix_report.get('leave_one_out') or {}).items()):
+        for mechanism, reference in sorted((mechanisms or {}).items()):
+            _add({
+                'id': f'loo:{full_name}:{mechanism}',
+                'family': 'leave_one_out',
+                'kind': 'mechanism_removal',
+                'candidate': full_name,
+                'reference': reference,
+                'metric': 'val_loss',
+                'sided': 'one_sided',
+                'hypothesis': (f'removing {mechanism} from {full_name} raises '
+                               f'held-out val_loss'),
+            })
+    for design, info in sorted((matrix_report.get('factorial') or {}).items()):
+        factor_names = list((info or {}).get('factors') or {})
+        for factor in factor_names:
+            _add({
+                'id': f'factorial:{design}:{factor}',
+                'family': 'factorial',
+                'kind': 'main_effect',
+                'design': design,
+                'factor': factor,
+                'metric': 'val_loss',
+                'sided': 'one_sided',
+                'hypothesis': f'{factor} lowers held-out val_loss in {design}',
+            })
+        if len(factor_names) == 2:
+            first, second = factor_names
+            _add({
+                'id': f'factorial:{design}:{first}_x_{second}',
+                'family': 'factorial',
+                'kind': 'interaction',
+                'design': design,
+                'factor': f'{first}_x_{second}',
+                'metric': 'val_loss',
+                'sided': 'two_sided',
+                'hypothesis': (f'{first} and {second} interact (synergy or '
+                               f'antagonism) in {design}'),
+            })
+    for host, info in sorted((matrix_report.get('qk_axis') or {}).items()):
+        info = info or {}
+        _add({
+            'id': f'qk:{host}:qk_vs_off',
+            'family': 'qk_axis',
+            'kind': 'superiority',
+            'candidate': info.get('on'),
+            'reference': info.get('off'),
+            'metric': 'val_loss',
+            'sided': 'one_sided',
+            'hypothesis': f'tanh QK compression lowers held-out val_loss on {host}',
+        })
+        _add({
+            'id': f'qk:{host}:qknorm_vs_qk',
+            'family': 'qk_axis',
+            'kind': 'comparator',
+            'candidate': info.get('comparator'),
+            'reference': info.get('on'),
+            'metric': 'val_loss',
+            'sided': 'one_sided',
+            'hypothesis': (f'per-head QK-Norm beats the tanh QK compression on '
+                           f'{host}'),
+        })
+    # Hierarchical gatekeeping: the main proposal's own superiority and
+    # mechanism contrasts are the primary family. Only if at least one of
+    # them survives its Holm correction may the secondary contrasts (single
+    # axis variants, control factorials, QK axis, hyper-parameter sweeps) be
+    # tested at full alpha. Gatekeeping keeps the study-wide false-positive
+    # rate at alpha without making every exploratory sweep compete with the
+    # primary claim for the same alpha budget.
+    for entry in contrasts:
+        primary = (
+            (entry['family'] == 'baseline'
+             and entry.get('candidate') == PRIMARY_MAIN_ROW)
+            or (entry['family'] == 'leave_one_out'
+                and entry.get('candidate') == PRIMARY_MAIN_ROW)
+            or (entry['family'] == 'factorial'
+                and entry.get('design') == PRIMARY_FACTORIAL_DESIGN)
+        )
+        entry['tier'] = 1 if primary else 2
+        entry['tier_role'] = 'primary' if primary else 'secondary'
+    payload = {
+        'model': model_name,
+        'seeds': [int(seed) for seed in seeds],
+        'alpha': float(alpha),
+        'margin': float(margin),
+        'equivalence_margin': float(equivalence_margin),
+        'baseline_pool': sorted(baseline_set),
+        'contrasts': contrasts,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+    return {
+        'schema': 'adasquash.analysis_plan.v1',
+        'fingerprint': fingerprint,
+        'n_contrasts': len(contrasts),
+        'contrast_ids': [entry['id'] for entry in contrasts],
+        **payload,
+        'protocol': (
+            'confirmatory contrasts are fixed before training and identified by '
+            '`id`; the study-level Holm correction admits only these ids, so a '
+            'realized test absent from this plan is exploratory and cannot be '
+            'counted as a confirmed claim'),
+    }
+
+
+def _finite_p(value):
+    if (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value))):
+        return float(value)
+    return None
+
+
+def study_level_correction(comparisons: dict, plan: dict | None,
+                           alpha: float=0.05) -> dict | None:
+    """Study-level gatekeeping over the pre-registered confirmatory contrasts.
+
+    The per-family reports each correct within their own family (baseline
+    rows, leave-one-out mechanisms, factorial terms, QK pairs). That is the
+    right correction for a claim scoped to one family, but the study as a
+    whole makes all of those claims at once - and they reuse the same seeds,
+    so the tests are correlated. This function pools the pre-registered
+    confirmatory p-values into a primary tier (the main proposal's superiority,
+    its mechanisms and its factorial) and a secondary tier. The primary tier is
+    Holm-corrected first; the secondary tier is corrected and tested only if at
+    least one primary contrast survives. Gatekeeping controls the study-wide
+    false-positive rate while keeping exploratory single-axis / control / QK
+    contrasts from competing with the primary claim for the same alpha budget.
+    The family-local adjusted p stays next to the study-level one, and every
+    demoted contrast (or secondary contrast not tested because the gate closed)
+    is listed explicitly rather than silently dropped.
+
+    Interactions enter with their two-sided p-value (either synergy or
+    antagonism is a finding); main effects and superiority contrasts enter
+    with the one-sided p-value that matches their directional claim. Tests
+    that touch fewer than `MIN_SEEDS_FOR_SIGNIFICANCE` seeds, duplicate runs
+    (aliases) and ids absent from the plan are excluded from the family and
+    reported with the reason. A focused run with no primary contrast gets
+    `primary_gate_status = not_applicable_no_primary_tests` (the secondary
+    tier is still tested) rather than a misleading "gate closed". Returns
+    `None` without a plan.
+    """
+    if not isinstance(plan, dict):
+        return None
+    planned = {entry['id']: entry for entry in plan.get('contrasts', [])
+               if isinstance(entry, dict) and entry.get('id')}
+    records: list = []
+
+    def _record(cid, family, p, family_p, claim_direction, family_significant,
+                *, hypothesis=None, replicated=False, test_basis=None,
+                effect=None, excluded_reason=None):
+        records.append({
+            'id': cid,
+            'family': family,
+            'p_one_sided_or_two_sided': _finite_p(p),
+            'p_family_holm': _finite_p(family_p),
+            'claim_direction_observed': bool(claim_direction),
+            'family_local_significant': bool(family_significant),
+            'replicated_across_seeds': bool(replicated),
+            'test_basis': test_basis,
+            'effect': effect,
+            'hypothesis': hypothesis,
+            'excluded_from_study_family': excluded_reason,
+            'p_study_holm': None,
+            'confirmed_at_study_level': False,
+            'downgraded_by_study_level': False,
+        })
+
+    baseline = comparisons.get('baseline') or {}
+    for entry in baseline.get('rows', []) or []:
+        name = entry.get('name')
+        if not name:
+            continue
+        _record(
+            f'baseline:{name}', 'baseline', entry.get('p_one_sided'),
+            entry.get('p_one_sided_holm'), entry.get('beats_reference'),
+            entry.get('beats_reference_significantly'),
+            hypothesis=entry.get('hypothesis'),
+            replicated=entry.get('replicated_across_seeds'),
+            test_basis=entry.get('test_basis'),
+            effect=entry.get('delta_vs_reference'),
+            excluded_reason=entry.get('excluded_from_family'))
+    loo = comparisons.get('leave_one_out') or {}
+    for entry in loo.get('rows', []) or []:
+        if entry.get('skipped') or not entry.get('full'):
+            continue
+        _record(
+            f"loo:{entry['full']}:{entry['mechanism']}", 'leave_one_out',
+            entry.get('p_one_sided'), entry.get('p_one_sided_holm'),
+            entry.get('mechanism_helps'),
+            entry.get('mechanism_helps_significantly'),
+            replicated=entry.get('replicated_across_seeds'),
+            test_basis=entry.get('test_basis'),
+            effect=entry.get('delta_full_minus_reference'),
+            excluded_reason=entry.get('excluded_from_family'))
+    factorial = comparisons.get('factorial') or {}
+    for entry in factorial.get('rows', []) or []:
+        if entry.get('skipped') or not entry.get('design'):
+            continue
+        is_interaction = entry.get('kind') == 'interaction'
+        _record(
+            f"factorial:{entry['design']}:{entry['effect']}", 'factorial',
+            entry.get('p_two_sided') if is_interaction else entry.get('p_one_sided'),
+            (entry.get('p_two_sided_holm') if is_interaction
+             else entry.get('p_one_sided_holm')),
+            (entry.get('interaction_direction') not in
+             (None, 'additive_or_within_margin'))
+            if is_interaction else entry.get('effect_helps'),
+            (entry.get('interaction_differs_significantly') if is_interaction
+             else entry.get('effect_helps_significantly')),
+            replicated=entry.get('replicated_across_seeds'),
+            test_basis=entry.get('test_basis'),
+            effect=entry.get('delta_seed_mean'))
+    qk = comparisons.get('qk_axis') or {}
+    for entry in qk.get('rows', []) or []:
+        if entry.get('skipped') or not entry.get('host'):
+            continue
+        _record(
+            f"qk:{entry['host']}:{entry['contrast']}", 'qk_axis',
+            entry.get('p_one_sided'), entry.get('p_one_sided_holm'),
+            entry.get('effect_helps'), entry.get('effect_helps_significantly'),
+            hypothesis=entry.get('hypothesis'),
+            replicated=entry.get('replicated_across_seeds'),
+            test_basis=entry.get('test_basis'),
+            effect=entry.get('delta_candidate_minus_reference'))
+
+    registered: list = []
+    unregistered: list = []
+    for record in records:
+        planned_entry = planned.get(record['id'])
+        if planned_entry is None:
+            record['excluded_from_study_family'] = (
+                'not present in the pre-registered analysis plan '
+                '(exploratory/unregistered)')
+            unregistered.append(record['id'])
+        else:
+            record['plan_kind'] = planned_entry.get('kind')
+            registered.append(record)
+    resolved_ids = {record['id'] for record in registered}
+    unresolved = sorted(set(planned) - resolved_ids)
+    eligible = [record for record in registered
+                if record.get('excluded_from_study_family') is None
+                and record.get('replicated_across_seeds')
+                and record.get('p_one_sided_or_two_sided') is not None]
+    eligible_ids = {record['id'] for record in eligible}
+    for record in registered:
+        if record['id'] not in eligible_ids:
+            if record.get('excluded_from_study_family') is None:
+                if not record.get('replicated_across_seeds'):
+                    record['excluded_from_study_family'] = (
+                        f'fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds; '
+                        'descriptive only')
+                elif record.get('p_one_sided_or_two_sided') is None:
+                    record['excluded_from_study_family'] = 'no testable p-value'
+    primary = [record for record in eligible
+               if (planned.get(record['id']) or {}).get('tier', 1) == 1]
+    secondary = [record for record in eligible
+                 if (planned.get(record['id']) or {}).get('tier', 1) == 2]
+    primary_adjusted = holm_adjust(
+        [record['p_one_sided_or_two_sided'] for record in primary])
+    for record, p_holm in zip(primary, primary_adjusted):
+        record['tier'] = 'primary'
+        record['p_study_holm'] = p_holm
+        record['confirmed_at_study_level'] = bool(
+            record['claim_direction_observed'] and p_holm is not None
+            and p_holm < alpha)
+    primary_gate_open = any(
+        record['confirmed_at_study_level'] for record in primary)
+    # A focused run (e.g. only the QK rows) has no primary tier at all. That
+    # is not a failed gate: the gate is only meaningful when the primary
+    # family was part of the study. Distinguish "not applicable" from
+    # "closed, so secondary claims are not licensed".
+    if not primary:
+        primary_gate_status = 'not_applicable_no_primary_tests'
+    elif primary_gate_open:
+        primary_gate_status = 'open'
+    else:
+        primary_gate_status = 'closed'
+    secondary_allowed = primary_gate_status in ('open',
+                                                'not_applicable_no_primary_tests')
+    if secondary_allowed:
+        secondary_adjusted = holm_adjust(
+            [record['p_one_sided_or_two_sided'] for record in secondary])
+    else:
+        secondary_adjusted = [None] * len(secondary)
+    for record, p_holm in zip(secondary, secondary_adjusted):
+        record['tier'] = 'secondary'
+        record['p_study_holm'] = p_holm
+        record['confirmed_at_study_level'] = bool(
+            secondary_allowed and record['claim_direction_observed']
+            and p_holm is not None and p_holm < alpha)
+        if not secondary_allowed:
+            record['gate_status'] = (
+                'secondary family not tested: no primary contrast survived '
+                'its gatekeeping correction, so the study has no confirmed '
+                'primary claim to license secondary claims')
+    for record in records:
+        if 'tier' not in record:
+            planned_entry = planned.get(record['id'])
+            if planned_entry is None:
+                record['tier'] = 'unregistered'
+            else:
+                record['tier'] = ('primary' if planned_entry.get('tier', 1) == 1
+                                  else 'secondary')
+        record['downgraded_by_study_level'] = bool(
+            record['family_local_significant']
+            and not record['confirmed_at_study_level'])
+    secondary_gate_closed = sorted(
+        record['id'] for record in secondary if not secondary_allowed)
+    local_significant = sorted(record['id'] for record in registered
+                               if record.get('family_local_significant'))
+    study_significant = sorted(record['id'] for record in primary + secondary
+                               if record.get('confirmed_at_study_level'))
+    downgraded = [
+        {'id': record['id'],
+         'family': record['family'],
+         'tier': record.get('tier'),
+         'p_family_holm': record['p_family_holm'],
+         'p_study_holm': record['p_study_holm']}
+        for record in primary + secondary if record['downgraded_by_study_level']
+    ]
+    records.sort(key=lambda record: record['id'])
+    return {
+        'schema': 'adasquash.study_level_tests.v1',
+        'analysis_plan_fingerprint': plan.get('fingerprint'),
+        'alpha': float(alpha),
+        'n_planned_contrasts': len(planned),
+        'n_registered_tests': len(registered),
+        'n_in_study_family': len(primary) + len(secondary),
+        'n_primary_tests': len(primary),
+        'n_secondary_tests': len(secondary),
+        'primary_gate_open': bool(primary_gate_open),
+        'primary_gate_status': primary_gate_status,
+        'n_confirmed_primary': sum(
+            record.get('confirmed_at_study_level') for record in primary),
+        'n_confirmed_secondary': sum(
+            record.get('confirmed_at_study_level') for record in secondary),
+        'n_confirmed_at_study_level': len(study_significant),
+        'family_local_significant': local_significant,
+        'study_level_significant': study_significant,
+        'downgraded_by_study_level': downgraded,
+        'secondary_not_tested_gate_closed': secondary_gate_closed,
+        'unregistered_contrasts': sorted(unregistered),
+        'unresolved_plan_contrasts': unresolved,
+        'protocol': (
+            'hierarchical Holm gatekeeping over the pre-registered confirmatory '
+            'contrasts. Tier 1 (primary) = the main proposal vs the best baseline, '
+            'its leave-one-out mechanisms, and the main softsign factorial. Only '
+            'if >= 1 primary contrast survives does the secondary tier (single-axis '
+            'variants, control factorials, QK axis, hyper-parameter sweeps) get '
+            'tested at alpha; both tiers are Holm-corrected within themselves. '
+            '`confirmed_at_study_level` additionally requires the claimed '
+            'direction. Interactions use the two-sided p-value, everything else '
+            'the one-sided p-value matching its directional hypothesis. '
+            'Family-local adjusted p-values are retained, so a demotion by the '
+            'study-level correction is visible rather than silent'),
+        'rows': records,
+    }
+
+
+def print_study_level_correction(comparison: dict | None) -> None:
+    if comparison is None:
+        print('[study] no analysis plan; study-level multiplicity correction skipped')
+        return
+    print(f"[study] {comparison['n_in_study_family']}/{comparison['n_planned_contrasts']} "
+          f"pre-registered contrast(s) tested "
+          f"(primary={comparison['n_primary_tests']}, "
+          f"secondary={comparison['n_secondary_tests']}); "
+          f"family-local significant={len(comparison['family_local_significant'])}, "
+          f"study-level confirmed={comparison['n_confirmed_at_study_level']} "
+          f"(primary gate {comparison.get('primary_gate_status', 'open').upper()}; "
+          f"plan {str(comparison.get('analysis_plan_fingerprint'))[:12]})")
+    for entry in comparison.get('downgraded_by_study_level') or []:
+        print(f"[study] DOWNGRADED {entry['id']}: family p_holm="
+              f"{entry['p_family_holm']} -> study p_holm={entry['p_study_holm']} "
+              f"(not confirmed once the whole study is corrected)")
+    if comparison.get('secondary_not_tested_gate_closed'):
+        print(f"[study] secondary contrasts not tested (primary gate closed): "
+              f"{comparison['secondary_not_tested_gate_closed']}")
+    if comparison.get('unregistered_contrasts'):
+        ids = comparison['unregistered_contrasts']
+        preview = f"{ids[:8]}{' ...' if len(ids) > 8 else ''}"
+        print(f"[study] unregistered/exploratory ({len(ids)}, not in the plan, "
+              f"not counted): {preview}")
+    if comparison.get('unresolved_plan_contrasts'):
+        ids = comparison['unresolved_plan_contrasts']
+        preview = f"{ids[:8]}{' ...' if len(ids) > 8 else ''}"
+        print(f"[study] pre-registered but not realized ({len(ids)}; full list in "
+              f"study_level_tests.json): {preview}")
+
 
 def main():
     pre = argparse.ArgumentParser(add_help=False)
@@ -2551,10 +3168,12 @@ def main():
     p.add_argument('--baseline-tuning', default=None, help='tuning_summary.json from scripts/tune.py; certifies whether the fixed matrix recipe is the baselines\' selected (lr, weight_decay) cell on the same seeds and records the result in baseline_comparison.json')
     p.add_argument('--require-baseline-tuning', action='store_true', help='fail before training unless --baseline-tuning certifies that every compared baseline selected this exact (lr, weight_decay) cell and tune.py confirmed it on held-back seeds; without this flag an uncertified comparison is written but marked as such')
     p.add_argument('--baseline-margin', type=float, default=0.0, help='minimum val_loss improvement over the best baseline to count as a win')
-    p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired t-test vs the best baseline (Holm-adjusted over rows)')
+    p.add_argument('--equivalence-margin', type=float, default=0.0, help='TOST equivalence margin in val_loss for "the two arms are the same" claims (e.g. explicit-vs-default init rows); 0 disables equivalence testing, and a non-significant difference is never relabelled as equivalence')
+    p.add_argument('--alpha', type=float, default=0.05, help='significance level of the one-sided paired t-test vs the best baseline (Holm-adjusted over rows, then across the whole pre-registered study)')
     p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check for every norm in the selected rows before training them (default: on; a row that cannot overfit one batch has a gradient/loss bug and must not be launched)')
     p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. an offline host)')
     p.add_argument('--check-matrix', action='store_true', help='validate controlled knobs, stated hypotheses and leave-one-out coverage of the matrix, then exit without training')
+    p.add_argument('--require-plan-lock', action='store_true', help='fail when this invocation would replace an existing analysis_plan.json with a different fingerprint (changed seeds/alpha/margins/hypotheses); without it the drift is recorded and warned about, but the run proceeds')
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
     p.add_argument('--allow-uncertified', action='store_true', help='allow running with <3 seeds (certification will be disabled); by default <3 seeds is an error')
@@ -2572,6 +3191,9 @@ def main():
         p.error(f'--weight-decay {args.weight_decay} must be finite and >= 0')
     if not math.isfinite(args.baseline_margin) or args.baseline_margin < 0.0:
         p.error(f'--baseline-margin {args.baseline_margin} must be finite and >= 0')
+    if not math.isfinite(args.equivalence_margin) or args.equivalence_margin < 0.0:
+        p.error(f'--equivalence-margin {args.equivalence_margin} must be finite and >= 0 '
+                f'(0 disables equivalence testing)')
     if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
         p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
     for flag, value in (('--max-steps', args.max_steps),
@@ -2608,6 +3230,14 @@ def main():
         sys.exit(1)
     print(f"[matrix] ok: {len(matrix_report['rows'])} rows, controlled optimizer/schedule/data, "
           f"every row has a hypothesis, leave-one-out coverage {matrix_report['leave_one_out']}")
+    analysis_plan = build_analysis_plan(
+        ablations, hypotheses, matrix_report, args.baselines, args.model, seeds,
+        alpha=args.alpha, margin=args.baseline_margin,
+        equivalence_margin=args.equivalence_margin)
+    matrix_report['analysis_plan'] = analysis_plan
+    print(f"[plan] {analysis_plan['n_contrasts']} pre-registered confirmatory contrast(s) "
+          f"(fingerprint {analysis_plan['fingerprint'][:12]}); every test outside this "
+          f"registry is reported as exploratory")
     if args.check_matrix:
         print(json.dumps(matrix_report, indent=2))
         return
@@ -2634,6 +3264,38 @@ def main():
                 f'tune the baselines with this recipe and held-back --confirm-seeds.')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    # Pre-registration drift: a rerun that changes the seeds, alpha, margins or
+    # hypotheses changes the plan fingerprint. Silently replacing the old plan
+    # would erase the fact that the confirmatory family moved after results
+    # were seen, so the change is recorded (and can be made fatal).
+    plan_path = base / 'analysis_plan.json'
+    previous_plan = None
+    if plan_path.exists():
+        try:
+            previous_plan = json.loads(plan_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            previous_plan = None
+    previous_fingerprint = (previous_plan or {}).get('fingerprint')
+    plan_changed = bool(previous_fingerprint
+                        and previous_fingerprint != analysis_plan['fingerprint'])
+    analysis_plan['plan_changed'] = plan_changed
+    analysis_plan['previous_fingerprint'] = previous_fingerprint
+    analysis_plan['plan_change_policy'] = (
+        'the fingerprint covers the confirmatory contrast registry, seeds, alpha '
+        'and margins; a changed fingerprint means the analysis plan moved after '
+        'it was first fixed')
+    if plan_changed:
+        message = (f'the analysis plan changed since the previous run in this '
+                   f'output directory ({str(previous_fingerprint)[:12]} -> '
+                   f'{analysis_plan["fingerprint"][:12]}); the change is recorded '
+                   f'as post-hoc unless this is a fresh pre-registration')
+        if args.require_plan_lock:
+            raise SystemExit(f'[plan] ERROR: {message}. Remove the old output '
+                             f'directory for a deliberate re-registration, or drop '
+                             f'--require-plan-lock to proceed with the drift recorded.')
+        print(f'[plan] WARNING: {message}')
+    with open(plan_path, 'w') as f:
+        json.dump(analysis_plan, f, indent=2)
     run_metadata = collect_run_metadata(seed=seeds[0], extra={'seeds': seeds})
     if args.sanity_check:
         from scripts.sanity_overfit import run_preflight
@@ -2740,7 +3402,9 @@ def main():
         print(f"[compare] WARNING: {len(stale_rows)} accumulated row(s) excluded from the comparisons "
               f"(trained under a different model/cfg/protocol than this invocation): "
               f"{[r['name'] for r in stale_rows]}; rerun them under this recipe to include them")
-    comparison = baseline_comparison(comparable, args.baselines, margin=args.baseline_margin, alpha=args.alpha)
+    comparison = baseline_comparison(comparable, args.baselines, margin=args.baseline_margin,
+                                     alpha=args.alpha,
+                                     equivalence_margin=args.equivalence_margin)
     simple_path = Path(args.simple_baselines) if args.simple_baselines else base / 'simple_baselines.json'
     floor_data = (load_simple_baselines(simple_path, args)
                   if args.simple_baselines_enabled else None)
@@ -2819,7 +3483,9 @@ def main():
     # The second half of the ablation contract: each claimed mechanism of the
     # main proposal must be shown to be load-bearing *on its own*, with a
     # paired Full-vs-Full-minus-X test over the same seeds.
-    loo_comparison = leave_one_out_comparison(comparable, margin=args.baseline_margin, alpha=args.alpha)
+    loo_comparison = leave_one_out_comparison(comparable, margin=args.baseline_margin,
+                                              alpha=args.alpha,
+                                              equivalence_margin=args.equivalence_margin)
     if loo_comparison is not None:
         loo_comparison['rows_excluded_protocol_mismatch'] = stale_rows
         with open(base / 'leave_one_out_comparison.json', 'w') as f:
@@ -2828,7 +3494,9 @@ def main():
     # The third half of the contract: Full combines two axes, so report the
     # 2x2 main effects and their interaction rather than inferring synergy
     # from Full's point estimate alone.
-    factorial = factorial_comparison(comparable, margin=args.baseline_margin, alpha=args.alpha)
+    factorial = factorial_comparison(comparable, margin=args.baseline_margin,
+                                     alpha=args.alpha,
+                                     equivalence_margin=args.equivalence_margin)
     if factorial is not None:
         factorial['rows_excluded_protocol_mismatch'] = stale_rows
         with open(base / 'factorial_comparison.json', 'w') as f:
@@ -2837,12 +3505,26 @@ def main():
     # The attention-logits axis (DyT-QK) is independent of the normalization
     # family, so it gets its own per-host attribution and cross-host
     # replication report instead of being folded into the baseline family.
-    qk_axis = qk_axis_comparison(comparable, margin=args.baseline_margin, alpha=args.alpha)
+    qk_axis = qk_axis_comparison(comparable, margin=args.baseline_margin,
+                                 alpha=args.alpha,
+                                 equivalence_margin=args.equivalence_margin)
     if qk_axis is not None:
         qk_axis['rows_excluded_protocol_mismatch'] = stale_rows
         with open(base / 'qk_axis_comparison.json', 'w') as f:
             json.dump(qk_axis, f, indent=2)
     print_qk_axis_comparison(qk_axis)
+    # Study-level multiplicity: the four reports above each correct within
+    # their own family, but the paper-level claim is made across all of them.
+    # Pool only the pre-registered confirmatory contrasts and report what the
+    # global Holm correction confirms (or demotes).
+    study = study_level_correction(
+        {'baseline': comparison, 'leave_one_out': loo_comparison,
+         'factorial': factorial, 'qk_axis': qk_axis},
+        analysis_plan, alpha=args.alpha)
+    if study is not None:
+        with open(base / 'study_level_tests.json', 'w') as f:
+            json.dump(study, f, indent=2)
+    print_study_level_correction(study)
     manifest = dict(run_metadata)
     manifest['git'] = git_revision()
     manifest['hyperparameters'] = vars(args)
@@ -2862,6 +3544,8 @@ def main():
     manifest['leave_one_out_comparison'] = loo_comparison
     manifest['factorial_comparison'] = factorial
     manifest['qk_axis_comparison'] = qk_axis
+    manifest['analysis_plan'] = analysis_plan
+    manifest['study_level_tests'] = study
     if sanity_report_path is not None:
         manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
     else:
@@ -2871,10 +3555,12 @@ def main():
     # and is recorded by size+mtime instead of a full re-hash.
     manifest = finish_metadata(manifest, artifacts={
         'all_summaries': artifact_record(base / 'all_summaries.json'),
+        'analysis_plan': artifact_record(base / 'analysis_plan.json'),
         'baseline_comparison': artifact_record(base / 'baseline_comparison.json'),
         'leave_one_out_comparison': artifact_record(base / 'leave_one_out_comparison.json'),
         'factorial_comparison': artifact_record(base / 'factorial_comparison.json'),
         'qk_axis_comparison': artifact_record(base / 'qk_axis_comparison.json'),
+        'study_level_tests': artifact_record(base / 'study_level_tests.json'),
         'sanity_report': file_fingerprint(sanity_report_path) if sanity_report_path else {'enabled': False},
     })
     save_run_manifest(base / 'run_manifest.json', manifest)

@@ -37,7 +37,13 @@ honest:
   `imbalance_report` flags exactly that regime for a target distribution;
 * a scan that tests many rows against one reference gets `holm_adjust`, so a
   row-by-row alpha is corrected for the family of tests actually performed
-  (Holm-Bonferroni), instead of reporting the best of many uncorrected draws.
+  (Holm-Bonferroni), instead of reporting the best of many uncorrected draws;
+* a claim that two arms are *the same* is an equivalence claim, not a
+  non-significant superiority test: `tost_paired` runs the two one-sided
+  tests and reports the matching interval. A small-seed effect is also
+  checked for being carried by a single observation with
+  `leave_one_out_jackknife`, and a factorial interaction is evaluated
+  two-sided (`two_sided_p_from_t`) because antagonism is a finding too.
 
 Everything is pure `math` (no scipy/sklearn), so the training scripts can run
 in a minimal environment.
@@ -52,6 +58,7 @@ __all__ = [
     "f1_from_counts",
     "holm_adjust",
     "imbalance_report",
+    "leave_one_out_jackknife",
     "macro_weighted_f1",
     "MIN_SEEDS_FOR_SIGNIFICANCE",
     "mcnemar_test",
@@ -63,6 +70,8 @@ __all__ = [
     "scale_replication_summary",
     "student_t_cdf",
     "student_t_ppf",
+    "tost_paired",
+    "two_sided_p_from_t",
     "welch_t_one_sided",
     "welch_z_one_sided",
     "wilson_interval",
@@ -432,6 +441,241 @@ def paired_t_one_sided(
         "n": n,
         "paired": True,
         "test": "paired_t",
+    }
+
+
+def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[float]:
+    """Two-sided p-value of a t statistic: ``2 * min(P(T<=t), P(T>=t))``.
+
+    The one-sided paired tests answer "is the candidate better"; a factorial
+    interaction (or an ablation null result) is a two-sided question, because
+    an effect in *either* direction is informative. This helper reuses the
+    same Student-t CDF as `paired_t_one_sided`, so the two reports never
+    disagree about the reference distribution. Infinite statistics (the
+    zero-variance limit) map to 0; unusable inputs return `None` rather than
+    a misleading 1.0.
+    """
+    if t is None or df is None:
+        return None
+    if not isinstance(t, (int, float)) or isinstance(t, bool):
+        return None
+    if not isinstance(df, (int, float)) or isinstance(df, bool):
+        return None
+    t, df = float(t), float(df)
+    if math.isnan(t) or math.isnan(df) or df <= 0.0:
+        return None
+    if math.isinf(t):
+        return 0.0
+    lower = student_t_cdf(t, df)
+    return min(1.0, 2.0 * min(lower, 1.0 - lower))
+
+
+def tost_paired(
+    a: Sequence[float], b: Sequence[float], margin: float, alpha: float = 0.05
+) -> dict:
+    """Two one-sided paired t-tests (TOST) for *equivalence* within `margin`.
+
+    A non-significant superiority test is **not** evidence that two arms are
+    the same: it only says the design failed to see a difference. Several
+    ablation hypotheses are equivalence claims ("explicit init 1e-5 must
+    coincide with the default", "the two LayerScale settings should match"),
+    so they need a test whose alternative is "the mean paired difference is
+    inside ``+/- margin``":
+
+    * H0: ``|mean(a-b)| >= margin`` (not equivalent);
+    * H1: ``|mean(a-b)| <  margin`` (equivalent).
+
+    This is the intersection-union TOST: reject H0 only when *both* the
+    lower-bound and upper-bound one-sided tests reject, so
+    ``p_tost = max(p_low, p_high)``. The reported interval is the matching
+    ``1 - 2*alpha`` confidence interval (``mean +/- t_{1-alpha,df} * se``); it
+    must lie inside ``[-margin, margin]`` for the equivalence claim. `margin`
+    is a *scientific* smallest effect of interest, not a knob to tune until
+    the result looks equivalent, so it is recorded next to the p-value in
+    every comparison artifact.
+
+    Returns a dict with ``equivalent=None`` (and a ``note``) when the test
+    cannot run: no positive margin, fewer than two paired observations, or a
+    non-finite input. The zero-variance case reduces to a deterministic
+    comparison of ``|mean|`` with `margin`.
+    """
+    out = {
+        "test": "tost_paired",
+        "margin": None,
+        "alpha": float(alpha),
+        "equivalent": None,
+        "p_tost": None,
+        "p_low": None,
+        "p_high": None,
+        "mean_delta": None,
+        "ci_low": None,
+        "ci_high": None,
+        "ci_level": None,
+        "n": 0,
+        "df": None,
+        "note": "equivalence not evaluated",
+    }
+    a = [float(v) for v in a]
+    b = [float(v) for v in b]
+    if len(a) != len(b):
+        raise ValueError(f"TOST needs equal lengths, got {len(a)} vs {len(b)}")
+    n = len(a)
+    out["n"] = n
+    if not (isinstance(margin, (int, float)) and not isinstance(margin, bool)
+            and math.isfinite(float(margin)) and float(margin) > 0.0):
+        out["note"] = ("equivalence margin must be a positive finite number; "
+                       "pass an explicit scientific margin to enable TOST")
+        return out
+    margin = float(margin)
+    out["margin"] = margin
+    if n < 2:
+        out["note"] = "TOST needs at least 2 paired observations"
+        return out
+    d = [x - y for x, y in zip(a, b)]
+    mean = sum(d) / n
+    if not math.isfinite(mean):
+        out["note"] = "a non-finite paired difference makes the test undefined"
+        return out
+    var = sum((v - mean) ** 2 for v in d) / (n - 1)
+    se = math.sqrt(var / n)
+    df = float(n - 1)
+    out.update({"mean_delta": mean, "df": df, "ci_level": 1.0 - 2.0 * alpha})
+    if se == 0.0:
+        equivalent = abs(mean) < margin
+        out.update({
+            "p_low": 0.0 if equivalent else 1.0,
+            "p_high": 0.0 if equivalent else 1.0,
+            "p_tost": 0.0 if equivalent else 1.0,
+            "equivalent": bool(equivalent),
+            "ci_low": mean,
+            "ci_high": mean,
+            "note": ("zero-variance paired differences: equivalence is decided "
+                     "by |mean_delta| < margin"),
+        })
+        return out
+    # p_low tests H0 `mean <= -margin` against H1 `mean > -margin`;
+    # p_high tests H0 `mean >= +margin` against H1 `mean < +margin`.
+    p_low = 1.0 - student_t_cdf((mean + margin) / se, df)
+    p_high = student_t_cdf((mean - margin) / se, df)
+    p_low = min(1.0, max(0.0, p_low))
+    p_high = min(1.0, max(0.0, p_high))
+    p_tost = max(p_low, p_high)
+    half = student_t_ppf(1.0 - alpha, df) * se
+    out.update({
+        "p_low": p_low,
+        "p_high": p_high,
+        "p_tost": p_tost,
+        "equivalent": bool(p_tost < alpha),
+        "ci_low": mean - half,
+        "ci_high": mean + half,
+        "note": ("equivalent" if p_tost < alpha else
+                 "not equivalent at this margin/alpha; this is not evidence of a difference"),
+    })
+    return out
+
+
+def leave_one_out_jackknife(
+    values: Sequence[float], labels: Optional[Sequence] = None
+) -> dict:
+    """How dependent is a sample mean on any single observation?
+
+    With three seeds, one lucky or broken run can carry a delta. Dropping
+    each observation in turn (the leave-one-out jackknife) shows whether the
+    *sign* of the effect is a property of the set or of one point: if removing
+    seed 42 reverses the direction, the claim is not seed-robust even when the
+    full-sample t-test is significant. This is a descriptive robustness check
+    - it never replaces the pre-specified significance test - and it is
+    reported per comparison so a reader can see which seed is influential.
+
+    ``labels`` name the observations (the caller passes seed ids); they must
+    match `values` in length. Returns `None` for an empty input, and
+    ``meaningful=False`` when fewer than three observations make the
+    sign-change test vacuous (dropping one leaves a single point).
+    """
+    vals = [float(v) for v in values]
+    n = len(vals)
+    if n == 0:
+        return None
+    if any(not math.isfinite(v) for v in vals):
+        return {
+            "n": n,
+            "unit": "observation",
+            "full_mean": None,
+            "sign": None,
+            "meaningful": False,
+            "per_drop": [],
+            "sign_stable": None,
+            "influential_labels": [],
+            "delta_range": None,
+            "max_abs_change": None,
+            "note": "non-finite observation(s); jackknife skipped",
+        }
+    names = list(range(n)) if labels is None else list(labels)
+    if len(names) != n:
+        raise ValueError(
+            f"jackknife labels need {n} entries, got {len(names)}")
+    full = sum(vals) / n
+
+    def _sign(x: float) -> str:
+        return "negative" if x < 0.0 else ("positive" if x > 0.0 else "zero")
+
+    full_sign = _sign(full)
+    if n < 2:
+        # Dropping the only observation leaves nothing to average: there is
+        # no jackknife sample, only the point estimate.
+        return {
+            "n": n,
+            "unit": "observation",
+            "full_mean": full,
+            "sign": full_sign,
+            "meaningful": False,
+            "per_drop": [],
+            "sign_stable": None,
+            "influential_labels": [],
+            "delta_range": None,
+            "max_abs_change": None,
+            "note": "a jackknife needs at least 2 observations",
+        }
+    per_drop = []
+    for i in range(n):
+        rest = vals[:i] + vals[i + 1:]
+        mean = sum(rest) / len(rest)
+        drop_sign = _sign(mean)
+        if full_sign == "zero":
+            # There is no direction to stabilise; a mean that is exactly zero
+            # is not made "unstable" by any single point, it simply has no
+            # sign claim. Report `sign_stable=None` instead of a misleading
+            # True/False.
+            keeps = True
+        elif full_sign == "negative":
+            keeps = mean < 0.0
+        else:
+            keeps = mean > 0.0
+        per_drop.append({
+            "dropped": names[i],
+            "mean_without": mean,
+            "sign": drop_sign,
+            "keeps_full_sign": bool(keeps),
+        })
+    drop_means = [item["mean_without"] for item in per_drop]
+    influential = [item["dropped"] for item in per_drop
+                   if not item["keeps_full_sign"]]
+    return {
+        "n": n,
+        "unit": "observation",
+        "full_mean": full,
+        "sign": full_sign,
+        "meaningful": n >= 3,
+        "per_drop": per_drop,
+        "sign_stable": (None if full_sign == "zero" else not influential),
+        "influential_labels": influential,
+        "delta_range": [min(drop_means), max(drop_means)],
+        "max_abs_change": max(abs(m - full) for m in drop_means),
+        "note": ("the full-sample mean is zero, so there is no direction to "
+                 "check for stability; the equivalence test is the relevant "
+                 "claim here" if full_sign == "zero" else
+                 "descriptive robustness check; dropping one observation is "
+                 "not an independent replication and never certifies a result"),
     }
 
 

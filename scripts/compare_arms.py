@@ -14,6 +14,10 @@ more aggregates, pairs them by training seed, and reports:
   minimum detectable delta at 80% power;
 * the ratio of the delta to the across-seed std (the scale check: a 0.01
   loss gap under a 0.05 seed std is not a result);
+* a leave-one-seed-out jackknife (does the sign survive dropping any one
+  seed?) and, with `--equivalence-margin <loss>`, a TOST equivalence test, so
+  "the two arms are the same" is a tested claim rather than a non-significant
+  superiority result;
 * both loss and perplexity (`exp(loss)`) deltas, because the papers quote
   PPL while the seed variance lives in loss;
 * a protocol audit across arms: identical model shape, fixed final step and
@@ -35,8 +39,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
-                               mean_std_stderr, paired_t_one_sided,
-                               student_t_ppf)
+                               leave_one_out_jackknife, mean_std_stderr,
+                               paired_t_one_sided, student_t_ppf, tost_paired)
 from adasquash.repro import training_recipe_mismatches
 
 _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
@@ -140,7 +144,8 @@ def _arm_issues(name: str, agg: dict, metric: str) -> list[str]:
 def compare_arms(arms: dict[str, dict], reference: str | None=None,
                  metric: str='final_val_loss', alpha: float=0.05,
                  margin: float=0.0, manifests: dict[str, dict] | None=None,
-                 require_recipe: bool=True) -> dict:
+                 require_recipe: bool=True,
+                 equivalence_margin: float=0.0) -> dict:
     """Paired, Holm-adjusted comparison of arm aggregates.
 
     `arms` maps a display name to an aggregate.json object. The reference is
@@ -155,6 +160,9 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         raise ValueError(f'metric must be one of {_LOSS_METRICS}')
     if not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
         raise ValueError('alpha must be finite and strictly between 0 and 1')
+    if not math.isfinite(equivalence_margin) or equivalence_margin < 0.0:
+        raise ValueError('equivalence_margin must be finite and >= 0 '
+                         '(0 disables TOST)')
 
     prepared = {}
     for name, agg in arms.items():
@@ -302,6 +310,13 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'n_seeds_against': None,
             'per_seed_delta': None,
             'minimum_detectable_delta_95_power80': None,
+            'seed_jackknife': None,
+            'equivalence': {
+                'enabled': False, 'test': 'tost_paired', 'margin': None,
+                'equivalent': None, 'p_tost': None,
+                'note': ('pass --equivalence-margin <loss> to test whether the '
+                         'arms are equivalent; a non-significant difference is '
+                         'not equivalence')},
             'protocol_problems': pair_problems,
             'recipe_checked': (isinstance(cand_hyper, dict)
                                and isinstance(ref_hyper, dict)),
@@ -373,6 +388,18 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             entry['certification_basis'] = (
                 f'{len(common)} shared seed(s); a paired test needs at least 2, '
                 f'and only >= {MIN_SEEDS_FOR_SIGNIFICANCE} can certify')
+        if common:
+            deltas = [cand['values'][seed] - ref['values'][seed]
+                      for seed in common]
+            entry['seed_jackknife'] = leave_one_out_jackknife(
+                deltas, labels=[str(seed) for seed in common])
+        if equivalence_margin > 0.0 and len(common) >= 2:
+            tost = tost_paired(
+                [cand['values'][seed] for seed in common],
+                [ref['values'][seed] for seed in common],
+                margin=equivalence_margin, alpha=alpha)
+            tost['enabled'] = True
+            entry['equivalence'] = tost
         rows.append(entry)
 
     # One reference means the candidate p-values are a family; adjust them
@@ -394,6 +421,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         'metric': metric,
         'alpha': alpha,
         'margin': margin,
+        'equivalence_margin': equivalence_margin,
         'reference': reference,
         'reference_mean': ref['mean'],
         'reference_std': ref['std'],
@@ -457,6 +485,16 @@ def print_comparison(comparison: dict) -> None:
         ppl_str = '' if ppl is None else f' dPPL={ppl:+.2f}%'
         noise = ' [WITHIN SEED NOISE]' if entry.get('within_seed_noise') else ''
         note = '' if entry.get('certifiable') else f" [{entry.get('certification_basis')}]"
+        jackknife = entry.get('seed_jackknife') or {}
+        if jackknife.get('meaningful') and jackknife.get('sign_stable') is False:
+            note += (f" [SEED-SENSITIVE: dropping "
+                     f"{jackknife.get('influential_labels')} flips the sign]")
+        equivalence = entry.get('equivalence') or {}
+        if equivalence.get('enabled'):
+            if equivalence.get('equivalent'):
+                note += f" [EQUIVALENT within {equivalence['margin']:g}]"
+            else:
+                note += f" [NOT equivalent within {equivalence['margin']:g}]"
         mean_str = ('n/a' if entry.get('mean') is None
                     else f"{entry['mean']:.4f}")
         delta_str = ('n/a' if delta is None else f"{delta:+.4f}")
@@ -487,6 +525,10 @@ def main(argv=None) -> None:
                    help='one-sided significance level (Holm-adjusted over candidates)')
     p.add_argument('--margin', type=float, default=0.0,
                    help='minimum loss improvement required to count as better')
+    p.add_argument('--equivalence-margin', type=float, default=0.0,
+                   help='TOST equivalence margin in loss for "the arms are the same" '
+                        'claims; 0 disables equivalence testing, and a non-significant '
+                        'difference is never relabelled as equivalence')
     p.add_argument('--allow-missing-recipe', action='store_true',
                    help='do not fail closed when a sibling run_manifest.json (the record of '
                         'optimizer/schedule/token budget) is missing; the comparison is then '
@@ -500,6 +542,8 @@ def main(argv=None) -> None:
         p.error('--alpha must be finite and strictly between 0 and 1')
     if not math.isfinite(args.margin) or args.margin < 0.0:
         p.error('--margin must be finite and >= 0')
+    if not math.isfinite(args.equivalence_margin) or args.equivalence_margin < 0.0:
+        p.error('--equivalence-margin must be finite and >= 0 (0 disables TOST)')
     paths = [Path(path) for path in args.aggregates]
     names = args.names or [_default_name(path) for path in paths]
     if len(set(names)) != len(names):
@@ -527,7 +571,8 @@ def main(argv=None) -> None:
     comparison = compare_arms(arms, reference=args.reference, metric=args.metric,
                               alpha=args.alpha, margin=args.margin,
                               manifests=manifests,
-                              require_recipe=not args.allow_missing_recipe)
+                              require_recipe=not args.allow_missing_recipe,
+                              equivalence_margin=args.equivalence_margin)
     print_comparison(comparison)
     output = Path(args.output) if args.output else paths[0].parent / 'arm_comparison.json'
     output.parent.mkdir(parents=True, exist_ok=True)

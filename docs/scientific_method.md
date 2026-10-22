@@ -32,7 +32,11 @@ may differ; a missing recipe is treated as unknown and cannot certify a win.
 
 `factorial_comparison.json` reports main effects and the interaction;
 `qk_axis_comparison.json` reports per-host QK effects and whether their sign
-replicates across hosts.
+replicates across hosts. Every factorial term also carries a **two-sided**
+interaction test alongside the one-sided synergy test: an antagonistic
+interaction (the combination is worse than the sum of its parts) is a
+finding, not a failed synergy claim, so it is reported and is eligible for
+the study-level correction as a two-sided hypothesis.
 
 ## 3. Replication and statistics
 
@@ -48,7 +52,56 @@ the family.
 `dPPL` is reported alongside the loss test. The ablation baseline comparison
 now carries the same fields.
 
-## 4. Learning-rate fairness
+Two robustness layers sit next to the significance test and never replace it:
+
+* **Leave-one-seed-out jackknife.** Every paired contrast reports what happens
+  to the sign of the effect when each seed is dropped in turn. A sign that
+  flips identifies the seed carrying the result (`SEED-SENSITIVE`), even if
+  the full-sample t-test is significant. With a zero full-sample mean there is
+  no direction to stabilise, so the block reports `sign_stable = null` rather
+  than a misleading boolean.
+* **Equivalence (TOST), not "not significant".** A non-significant superiority
+  test is not evidence that two arms are the same. Pass
+  `--equivalence-margin <val_loss>` to run two one-sided paired t-tests whose
+  alternative is "the mean difference is inside ±margin"; the report records
+  the margin, `p_tost`, the matching `1 - 2α` interval and `equivalent`. The
+  margin is a scientific smallest effect of interest fixed before the run, not
+  a knob to tune until the result looks equivalent.
+
+## 4. Pre-registered analysis plan and study-level multiplicity
+
+Each family (baseline, leave-one-out, factorial, QK) is corrected within
+itself, but the study makes all of those claims at once and reuses the same
+seeds. `scripts/ablation.py` therefore writes `analysis_plan.json` **before
+training**: every confirmatory contrast is derived from the validated matrix,
+carries a stable `id`, its stated hypothesis, the test direction and a
+SHA-256 fingerprint of the whole registry (rows, hypotheses, seeds, α, margins).
+Contrasts that the matrix does not isolate cannot appear in the plan.
+
+After the four reports are written, `study_level_tests.json`:
+
+* admits only ids present in the plan; a realized test absent from the plan is
+  reported as unregistered/exploratory and cannot become a confirmed claim;
+* applies **hierarchical Holm gatekeeping**: the primary tier (the main
+  proposal vs the best baseline, its leave-one-out mechanisms, and the main
+  softsign factorial) is corrected first; the secondary tier (single-axis
+  variants, control factorials, QK axis, hyper-parameter sweeps) is tested only
+  if at least one primary contrast survives. This controls the study-wide
+  false-positive rate without making every exploratory sweep compete with the
+  primary claim for the same alpha budget;
+* keeps the family-local adjusted p next to the study-level p, and lists every
+  contrast demoted by the correction (and, when the gate is closed, every
+  secondary contrast that was therefore not tested);
+* lists pre-registered contrasts that were not realized (missing rows/tests)
+  instead of silently dropping them.
+
+If a rerun in the same output directory changes the seeds, α, margins or
+hypotheses, the plan fingerprint changes. That drift is recorded as
+`plan_changed` and warned about; `--require-plan-lock` makes it a hard failure,
+so a result cannot silently replace the plan it was originally collected
+under. A deliberate re-registration needs a fresh output directory.
+
+## 5. Learning-rate fairness
 
 `scripts/tune.py` runs every arm over the same `(lr, weight_decay)` grid and
 adds `lr_sensitivity`: the per-arm spread across complete cells relative to
@@ -56,7 +109,7 @@ its seed std, and the cross-arm winner at each shared cell. If the winner
 changes with `lr`, a fixed-lr norm win is reported as an LR-bonus result, not
 a mechanism effect.
 
-## 5. Multi-scale replication
+## 6. Multi-scale replication
 
 FP8 random-init probing accepts `--models` (GPT-2 124M/350M, LLaMA-tiny 1B);
 W8A8 comparisons may include arm pairs from more than one checkpoint shape;
