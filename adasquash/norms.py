@@ -181,6 +181,12 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
     overwritten with the ``a * sigmoid(a)`` factor and consumed by the end of
     the call.
     """
+    if p.numel() != 1 or p_raw.numel() != 1:
+        raise ValueError(
+            "the generalized-softsign exponent must be a scalar (one element), "
+            f"got p.shape={tuple(p.shape)}")
+    p_scalar = p.reshape(())
+    p_raw_scalar = p_raw.reshape(())
     if gamma is not None:
         grad_phi.mul_(gamma)
     sig = a.sigmoid()
@@ -192,11 +198,15 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
         red = _dot_all(grad_phi, k)
     else:
         red = (grad_phi * k).sum(dtype=acc)
-    red = red.div_(p * p)
-    red.mul_(p_raw > _MIN_P)
+    # Out-of-place with a 0-dim p: an in-place division by a one-element p
+    # would try to write a [1] broadcast back into the 0-dim reduction. For a
+    # one-element tensor the scalar reduction is still the correct value; it
+    # is reshaped to p's shape only for autograd's returned gradient.
+    red = red / (p_scalar * p_scalar)
+    red = red * (p_raw_scalar > _MIN_P)
     if red.dtype != p.dtype:
         red = red.to(p.dtype)
-    return red
+    return red.reshape(p.shape)
 
 def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
     if name not in NORM_REGISTRY:
