@@ -90,6 +90,10 @@ def load_result(path) -> dict:
             f"[compare] {p} has no 'test_batch_losses': the record is incomplete, so a "
             "paired comparison is impossible. Re-run the sealed evaluation with the "
             "current scripts/train_gpt2.py (--final-test-eval).")
+    if any(isinstance(v, bool) for v in losses):
+        raise SystemExit(
+            f"[compare] {p} contains boolean per-batch test losses; a bool is a "
+            "malformed measurement, not a loss")
     try:
         losses = [float(v) for v in losses]
     except (TypeError, ValueError):
@@ -118,7 +122,8 @@ def load_result(path) -> dict:
             "per-batch losses; the sealed-test record is internally inconsistent")
     reported = data.get("test_loss")
     mean = sum(losses) / len(losses)
-    if not isinstance(reported, (int, float)) or not math.isfinite(reported):
+    if (isinstance(reported, bool) or not isinstance(reported, (int, float))
+            or not math.isfinite(reported)):
         raise SystemExit(f"[compare] {p} has no finite 'test_loss' to cross-check")
     if abs(mean - float(reported)) > 1e-9 * max(1.0, abs(float(reported))):
         raise SystemExit(
