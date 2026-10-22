@@ -79,13 +79,22 @@ def load_result(path) -> dict:
         data = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise SystemExit(f"[compare] {p} is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(
+            f"[compare] {p} is not a JSON object: the record is incomplete, so a "
+            "paired comparison is impossible. Re-run the sealed evaluation with the "
+            "current scripts/train_gpt2.py (--final-test-eval).")
     losses = data.get("test_batch_losses")
     if not isinstance(losses, list) or not losses:
         raise SystemExit(
             f"[compare] {p} has no 'test_batch_losses': the record is incomplete, so a "
             "paired comparison is impossible. Re-run the sealed evaluation with the "
             "current scripts/train_gpt2.py (--final-test-eval).")
-    losses = [float(v) for v in losses]
+    try:
+        losses = [float(v) for v in losses]
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"[compare] {p} contains non-numeric per-batch test losses; fix the run first")
     if not all(math.isfinite(v) for v in losses):
         raise SystemExit(f"[compare] {p} contains non-finite per-batch test losses; fix the run first")
     reported = data.get("test_loss")
