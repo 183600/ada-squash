@@ -24,7 +24,12 @@ Reads a bounded sample of the train / validation / test splits produced by
   `--near-dup-margin` below the threshold are listed as borderline rather
   than silently dropped.  The scan is bounded by `--near-dup-max-docs`, and a
   sampled/truncated scan reports itself as a lower bound rather than claiming
-  the splits are clean;
+  the splits are clean.  A zero-hit scan also carries a one-sided confidence
+  upper bound on the contamination rate (`--max-near-dup-rate` makes it a
+  pre-registered failure rule), and `--append-near-dup-to-ledgers` writes the
+  canonical digests of flagged held-out documents into the existing
+  `--write-train-hash-file` / `--write-val-hash-file` ledgers so the trainer
+  can drop them instead of only reporting them;
 * group hygiene (`--group-key`): documents sharing a grouping unit (same
   user / item / source page) must not straddle any split boundary. The audit
   counts held-out documents whose group occurs in an earlier split and fails
@@ -80,12 +85,14 @@ import sys
 from array import array
 from collections import Counter
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from adasquash.metrics import wilson_interval
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.data_pipeline import (DocumentCleaner, canonical_document_hash, document_hash,
                                    extract_group_value, group_hash, load_document_stream)
@@ -188,12 +195,20 @@ def minhash_signature(shingles) -> tuple:
 
 
 def near_duplicate_record(ids, shingle_size: int = 8,
-                          max_shingles: int = _NEAR_DUP_MAX_SHINGLES) -> dict:
+                          max_shingles: int = _NEAR_DUP_MAX_SHINGLES,
+                          canonical_digest=None) -> dict:
     """Compact near-duplicate sketch of one document's token stream.
 
     At most `max_shingles` bottom-hash shingles are used, so a very long
     document cannot make the audit quadratic in its length.  The full count is
     still reported alongside the number actually sketched.
+
+    `canonical_digest` is the document's canonical-text digest (the same
+    digest `DocumentCleaner` looks up in a cross-split ledger).  Recording it
+    next to the sketch is what lets a flagged held-out document be turned into
+    an exclusion ledger entry instead of remaining a purely diagnostic hit.
+    It is optional so the sketch stays usable on token streams that did not
+    come from a text document.
     """
     shingles = token_shingles(ids, shingle_size)
     total_shingles = len(shingles)
@@ -204,12 +219,26 @@ def near_duplicate_record(ids, shingle_size: int = 8,
         values = np.fromiter(shingles, dtype=np.uint64, count=total_shingles)
         values = np.partition(values, limit - 1)[:limit]
         shingles = set(int(v) for v in values)
-    return {
+    record = {
         "signature": minhash_signature(shingles),
         "n_tokens": len(ids),
         "n_shingles": total_shingles,
         "n_shingles_sketched": len(shingles),
     }
+    if canonical_digest is not None:
+        if isinstance(canonical_digest, str):
+            try:
+                canonical_digest = bytes.fromhex(canonical_digest)
+            except ValueError:
+                raise ValueError(
+                    "canonical_digest must be bytes or a hex string, got "
+                    f"{canonical_digest!r}") from None
+        if not isinstance(canonical_digest, (bytes, bytearray)) or not canonical_digest:
+            raise ValueError(
+                "canonical_digest must be non-empty bytes or a hex string, got "
+                f"{canonical_digest!r}")
+        record["canonical_digest"] = bytes(canonical_digest).hex()
+    return record
 
 
 def _band_key(signature, band: int):
@@ -244,10 +273,16 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
     exhaustive_by_split = exhaustive_by_split or {}
     truncated_by_split = truncated_by_split or {}
     pairs = {}
+    by_later_split = {}
     problems = []
     notes = []
     any_truncated = any(bool(truncated_by_split.get(name)) for name in ordered)
     any_sampled = any(not bool(exhaustive_by_split.get(name, True)) for name in ordered)
+    # A held-out document can be similar to documents in more than one earlier
+    # split.  For the contamination-rate bound the denominator is the whole
+    # later split, so the flagged set must be a union over earlier splits; a
+    # per-pair count would double-count the same contaminated document.
+    later_union: dict = {}
     for i, earlier in enumerate(ordered):
         earlier_records = records_by_split[earlier]
         if not earlier_records:
@@ -264,6 +299,8 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                 continue
             n_pairs = 0
             flagged_docs = set()
+            flagged_digests = set()
+            missing_digest_positions = set()
             candidate_pairs = 0
             examples = []
             borderline_pairs = 0
@@ -297,14 +334,25 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                         sim_pos = int(borderline[best_pos])
                         earlier_i = int(candidate_ids[sim_pos])
                         borderline_examples.append({
-                            "earlier_document_index": int(earlier_records[earlier_i]["doc_index"]),
-                            "later_document_index": int(later_record["doc_index"]),
+                            "earlier_document_index": int(
+                                earlier_records[earlier_i].get("doc_index", earlier_i)),
+                            "later_document_index": int(
+                                later_record.get("doc_index", later_i)),
                             "estimated_jaccard": round(float(sims[sim_pos]), 4),
                         })
                 if not hits.size:
                     continue
                 n_pairs += int(hits.size)
                 flagged_docs.add(later_i)
+                # The canonical digest is what `DocumentCleaner` checks
+                # against an exclusion ledger.  A flagged document without one
+                # can be reported but not remediated, so it is counted
+                # separately instead of silently omitted from the ledger.
+                digest = later_record.get("canonical_digest")
+                if isinstance(digest, str) and digest:
+                    flagged_digests.add(digest.lower())
+                else:
+                    missing_digest_positions.add(later_i)
                 if len(examples) < max_examples:
                     # Same indirection as the borderline example above.
                     best_pos = int(np.argmax(sims[hits]))
@@ -313,12 +361,27 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                     examples.append({
                         "earlier_split": earlier,
                         "later_split": later,
-                        "earlier_document_index": int(earlier_records[earlier_i]["doc_index"]),
-                        "later_document_index": int(later_record["doc_index"]),
+                        "earlier_document_index": int(
+                            earlier_records[earlier_i].get("doc_index", earlier_i)),
+                        "later_document_index": int(
+                            later_record.get("doc_index", later_i)),
                         "estimated_jaccard": round(float(sims[sim_pos]), 4),
                         "earlier_n_tokens": int(earlier_records[earlier_i]["n_tokens"]),
                         "later_n_tokens": int(later_record["n_tokens"]),
                     })
+            aggregate = later_union.setdefault(
+                later, {"positions": set(), "doc_indices": set(),
+                        "digests": set(), "missing_positions": set(),
+                        "missing_doc_indices": set()})
+            aggregate["positions"].update(flagged_docs)
+            aggregate["doc_indices"].update(
+                int(later_records[position].get("doc_index", position))
+                for position in flagged_docs)
+            aggregate["digests"].update(flagged_digests)
+            aggregate["missing_positions"].update(missing_digest_positions)
+            aggregate["missing_doc_indices"].update(
+                int(later_records[position].get("doc_index", position))
+                for position in missing_digest_positions)
             key = f"{earlier}->{later}"
             pairs[key] = {
                 "earlier_split": earlier,
@@ -328,6 +391,14 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                 "candidate_pairs": int(candidate_pairs),
                 "flagged_pairs": int(n_pairs),
                 "flagged_later_documents": len(flagged_docs),
+                "flagged_later_document_indices": sorted(
+                    int(later_records[position].get("doc_index", position))
+                    for position in flagged_docs),
+                "flagged_later_digests": sorted(flagged_digests),
+                "flagged_later_tokens": sum(
+                    int(later_records[position].get("n_tokens") or 0)
+                    for position in flagged_docs),
+                "flagged_later_missing_digest": len(missing_digest_positions),
                 "borderline_pairs": int(borderline_pairs),
                 "borderline_later_documents": len(borderline_docs),
                 "borderline_examples": borderline_examples,
@@ -339,6 +410,28 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                     f"document(s) have a token-shingle Jaccard estimate >= {threshold} "
                     f"with an earlier split ({n_pairs} matching pair(s)); exact/canonical "
                     "hash dedup cannot catch this overlap")
+    n_missing_digests = 0
+    for later in ordered[1:]:
+        aggregate = later_union.get(later) or {
+            "positions": set(), "doc_indices": set(), "digests": set(),
+            "missing_positions": set(), "missing_doc_indices": set()}
+        by_later_split[later] = {
+            "documents": len(records_by_split[later]),
+            "flagged_documents": len(aggregate["positions"]),
+            "flagged_document_indices": sorted(aggregate["doc_indices"]),
+            "flagged_digests": sorted(aggregate["digests"]),
+            "flagged_tokens": sum(
+                int(records_by_split[later][position].get("n_tokens") or 0)
+                for position in aggregate["positions"]),
+            "missing_digest_documents": len(aggregate["missing_positions"]),
+            "missing_digest_document_indices": sorted(aggregate["missing_doc_indices"]),
+        }
+        n_missing_digests += len(aggregate["missing_positions"])
+    if n_missing_digests:
+        notes.append(
+            f"{n_missing_digests} flagged held-out document(s) carry no canonical "
+            "digest, so they can be reported but not turned into exclusion-ledger "
+            "entries")
     n_borderline = sum(pair["borderline_pairs"] for pair in pairs.values())
     if n_borderline:
         notes.append(
@@ -366,11 +459,191 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
         "rows_per_band": _NEAR_DUP_ROWS,
         "shingle_size": int(shingle_size),
         "pairs": pairs,
+        "by_later_split": by_later_split,
         "problems": problems,
         "notes": notes,
         "exhaustive": not truncated,
         "lower_bound": bool(truncated),
     }
+
+
+def near_duplicate_scan_bound(report: dict, *, confidence: float = 0.95,
+                              max_rate=None) -> dict:
+    """Quantify what a near-duplicate scan *failed to find*.
+
+    A zero-hit scan is routinely read as "the splits are clean".  That is a
+    lower bound, not a measurement: with N held-out documents and zero hits,
+    the one-sided upper confidence bound on the contamination proportion is
+    still finite (about 0.0007 at N=4000, 95%).  This function attaches that
+    bound to each later split so the audit can state the largest
+    contamination rate its sample is compatible with, and - when
+    ``max_rate`` is pre-registered - refuse a scan that cannot rule out more
+    contamination than the tolerable amount.
+
+    The denominator is the number of *sketched* documents in the later split,
+    so a sampled/truncated scan is a bound on the scanned prefix only; the
+    report says so explicitly instead of extrapolating a prefix to the whole
+    split.  ``max_rate`` therefore checks the scanned data, and passing it
+    does not certify the unsampled remainder.
+    """
+    if not isinstance(report, dict):
+        raise ValueError(f"report must be a mapping, got {type(report).__name__}")
+    if _is_boolean_scalar(confidence):
+        raise ValueError(f"confidence must be a probability, got bool {confidence!r}")
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"confidence must be a probability, got {confidence!r}") from None
+    if not math.isfinite(confidence) or not 0.0 < confidence < 1.0:
+        raise ValueError(
+            f"confidence must be finite and in (0, 1), got {confidence!r}")
+    if max_rate is not None:
+        if _is_boolean_scalar(max_rate):
+            raise ValueError(f"max_rate must be a probability or None, got bool {max_rate!r}")
+        try:
+            max_rate = float(max_rate)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"max_rate must be a probability or None, got {max_rate!r}") from None
+        if not math.isfinite(max_rate) or not 0.0 <= max_rate <= 1.0:
+            raise ValueError(
+                f"max_rate must be finite and in [0, 1], got {max_rate!r}")
+    z = NormalDist().inv_cdf(confidence)
+    exhaustive = bool(report.get("exhaustive"))
+    scope = "audited_split" if exhaustive else "scanned_prefix"
+    by_later = report.get("by_later_split")
+    if not isinstance(by_later, dict):
+        by_later = {}
+    bounds = {}
+    problems = []
+    notes = []
+    for later, block in sorted(by_later.items()):
+        block = block if isinstance(block, dict) else {}
+        documents = block.get("documents")
+        flagged = block.get("flagged_documents")
+        if _is_boolean_scalar(documents) or not isinstance(documents, int) or documents < 0:
+            raise ValueError(
+                f"by_later_split[{later!r}].documents must be a non-negative "
+                f"integer, got {documents!r}")
+        if _is_boolean_scalar(flagged) or not isinstance(flagged, int) or flagged < 0:
+            raise ValueError(
+                f"by_later_split[{later!r}].flagged_documents must be a "
+                f"non-negative integer, got {flagged!r}")
+        if flagged > documents:
+            raise ValueError(
+                f"by_later_split[{later!r}] reports {flagged} flagged documents "
+                f"out of only {documents}; a subset cannot be larger than its set")
+        observed = None if documents == 0 else flagged / documents
+        upper = None if documents == 0 else wilson_interval(
+            flagged, documents, z=z)[1]
+        passes = None if max_rate is None or upper is None else upper <= max_rate
+        bounds[later] = {
+            "documents": documents,
+            "flagged_documents": flagged,
+            "observed_rate": observed,
+            "upper_bound": upper,
+            "confidence": confidence,
+            "scope": scope,
+            "passes_max_rate": passes,
+        }
+        if max_rate is not None:
+            if documents == 0:
+                problems.append(
+                    f"no {later} documents were sketched, so the near-duplicate "
+                    f"scan cannot certify a contamination rate <= {max_rate:g}")
+            elif upper > max_rate:
+                problems.append(
+                    f"the near-duplicate scan of {later} saw {flagged}/{documents} "
+                    f"document(s) at/above the threshold (observed {observed:.4%}); "
+                    f"the one-sided {confidence:.1%} upper bound is {upper:.4%}, "
+                    f"above the pre-registered max rate {max_rate:g}")
+    if not bounds:
+        notes.append(
+            "no later-split scan counts were available, so no contamination "
+            "bound could be computed; this is unknown, not clean")
+        if max_rate is not None:
+            problems.append(
+                "no later-split near-duplicate scan counts were available, so "
+                f"a contamination rate <= {max_rate:g} cannot be certified")
+    if not exhaustive and bounds:
+        notes.append(
+            "the bound applies to the scanned prefix only; the unsampled "
+            "remainder of each split has no finite upper bound from this scan")
+    if any(block["flagged_documents"] == 0 for block in bounds.values()):
+        notes.append(
+            "zero flagged documents does not prove absence: the reported "
+            "upper bound is the largest contamination rate compatible with "
+            "the scanned sample at the stated confidence")
+    return {
+        "enabled": bool(report.get("enabled", True)),
+        "confidence": confidence,
+        "method": "wilson_score_upper_bound",
+        "scope": scope,
+        "exhaustive": exhaustive,
+        "certifies_population": bool(exhaustive and bounds),
+        "max_rate": max_rate,
+        "by_later_split": bounds,
+        "problems": problems,
+        "notes": notes,
+    }
+
+
+def near_duplicate_ledger_additions(report: dict) -> dict:
+    """Canonical digests of flagged held-out documents, split by ledger role.
+
+    The existing cross-split ledgers are *earlier-side* lists applied to later
+    splits: the training ledger is applied to validation and test, and the
+    validation ledger to test only.  A flagged near-duplicate document belongs
+    in the ledger of the earlier side it duplicates, so a training-ledger
+    consumer drops it from both held-out splits and a validation-ledger
+    consumer drops it from the sealed test split.  Only the later (held-out)
+    document's digest is returned; training documents are never excluded.
+
+    Documents without a canonical digest are counted under
+    ``missing_digest_documents`` rather than silently omitted.
+    """
+    if not isinstance(report, dict):
+        raise ValueError(f"report must be a mapping, got {type(report).__name__}")
+    additions = {"train": set(), "validation": set()}
+    by_later = report.get("by_later_split")
+    missing = (sum(int(block.get("missing_digest_documents") or 0)
+                   for block in by_later.values() if isinstance(block, dict))
+               if isinstance(by_later, dict) else 0)
+    pairs = report.get("pairs")
+    if not isinstance(pairs, dict):
+        return {"hashes": additions, "missing_digest_documents": missing}
+    if not isinstance(by_later, dict):
+        missing = sum(int(pair.get("flagged_later_missing_digest") or 0)
+                      for pair in pairs.values() if isinstance(pair, dict))
+    for pair in pairs.values():
+        if not isinstance(pair, dict):
+            continue
+        earlier = pair.get("earlier_split")
+        later = pair.get("later_split")
+        if later == "validation" and earlier == "train":
+            role = "train"
+        elif later == "test" and earlier == "train":
+            role = "train"
+        elif later == "test" and earlier == "validation":
+            role = "validation"
+        else:
+            # The ledger convention only has earlier->later sides; an unknown
+            # orientation is not a reason to invent a ledger role.
+            continue
+        for digest in pair.get("flagged_later_digests") or []:
+            try:
+                raw = bytes.fromhex(str(digest))
+            except (TypeError, ValueError):
+                missing += 1
+                continue
+            if len(raw) != 16:
+                # `canonical_document_hash` is a 16-byte blake2b digest. A
+                # different length cannot match what DocumentCleaner looks up,
+                # so writing it would create a ledger entry that never fires.
+                missing += 1
+                continue
+            additions[role].add(raw)
+    return {"hashes": additions, "missing_digest_documents": missing}
 
 
 def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, known_hashes_exhaustive=True, known_hashes_extra_exhaustive=True, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, known_groups_exhaustive=True, known_groups_extra_exhaustive=True, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None, near_dup=False, near_dup_shingle=8, near_dup_max_docs=4000, near_dup_max_shingles=_NEAR_DUP_MAX_SHINGLES):
@@ -395,7 +668,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     near_dup_docs_seen = 0
     near_dup_truncated = False
 
-    def _record_near_dup(doc_index, ids) -> None:
+    def _record_near_dup(doc_index, ids, text) -> None:
         nonlocal near_dup_docs_seen, near_dup_truncated
         near_dup_docs_seen += 1
         if near_dup_docs_seen > int(near_dup_max_docs):
@@ -406,7 +679,9 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
             # shingle to compare; an all-max signature would make every such
             # document look identical to every other one.
             return
-        record = near_duplicate_record(ids, near_dup_shingle, near_dup_max_shingles)
+        record = near_duplicate_record(
+            ids, near_dup_shingle, near_dup_max_shingles,
+            canonical_digest=canonical_document_hash(text))
         record['doc_index'] = int(doc_index)
         near_records.append(record)
     # Token ids are counted per document with `np.bincount`; a per-document
@@ -480,12 +755,12 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
                     continue
                 _add_ids(ids, which)
                 if which == 'effective' and near_dup:
-                    _record_near_dup(doc_index, ids)
+                    _record_near_dup(doc_index, ids, text)
         else:
-            for (doc_index, _), ids in zip(batch, enc):
+            for (doc_index, text), ids in zip(batch, enc):
                 _add_ids(ids, which)
                 if which == 'effective' and near_dup:
-                    _record_near_dup(doc_index, ids)
+                    _record_near_dup(doc_index, ids, text)
         batch.clear()
 
     capped = False
@@ -1123,6 +1398,8 @@ def main():
     p.add_argument('--near-dup-shingle', type=int, default=8, help='token n-gram size used by the near-duplicate MinHash sketch (default 8)')
     p.add_argument('--near-dup-max-docs', type=int, default=4000, help='maximum documents sketched per split; the scan is then a prefix and reports itself as a lower bound (default 4000)')
     p.add_argument('--near-dup-max-shingles', type=int, default=_NEAR_DUP_MAX_SHINGLES, help='bottom-k token shingles used per document (default %(default)s); bounds the sketch cost on very long documents')
+    p.add_argument('--max-near-dup-rate', type=float, default=None, help='pre-registered tolerable fraction of held-out documents with a cross-split near-duplicate (e.g. 0.001); fail when the one-sided confidence upper bound on the scanned documents exceeds it (omit for report-only; requires --near-dup)')
+    p.add_argument('--append-near-dup-to-ledgers', action='store_true', help='append the canonical digests of flagged held-out near-duplicates to the --write-train-hash-file / --write-val-hash-file ledgers, so the training run drops them from validation/test instead of only reporting them (requires --near-dup and at least one ledger output)')
     p.add_argument('--min-eval-tokens', type=int, default=0, help='fail when the estimated effective tokens of validation or test fall below this floor (0 = report only); the estimate is exact when --n-docs 0, otherwise extrapolated from the sampled prefix')
     p.add_argument('--min-eval-docs', type=int, default=0, help='fail when the estimated effective document count of validation or test falls below this floor (0 = report only)')
     p.add_argument('--scheduled-train-tokens', type=int, default=0, help='planned unique training tokens (max_steps * batch_size * grad_accum * seq_len); when > 0, compare it with the estimated effective train-split budget so a silently recycled training stream is visible')
@@ -1179,6 +1456,20 @@ def main():
                                  ('--scheduled-train-tokens', args.scheduled_train_tokens, 0)):
         if value < minimum:
             raise SystemExit(f'{flag} {value} must be >= {minimum}')
+    if args.max_near_dup_rate is not None:
+        if not (math.isfinite(args.max_near_dup_rate)
+                and 0.0 <= args.max_near_dup_rate <= 1.0):
+            raise SystemExit(
+                f'--max-near-dup-rate {args.max_near_dup_rate} must be finite and in [0, 1]')
+        if not args.near_dup:
+            raise SystemExit('--max-near-dup-rate requires the near-duplicate scan (do not pass --no-near-dup)')
+    if args.append_near_dup_to_ledgers:
+        if not args.near_dup:
+            raise SystemExit('--append-near-dup-to-ledgers requires the near-duplicate scan (do not pass --no-near-dup)')
+        if not (args.write_train_hash_file or args.write_val_hash_file):
+            raise SystemExit(
+                '--append-near-dup-to-ledgers requires --write-train-hash-file '
+                'and/or --write-val-hash-file: there is no ledger to append to')
     if (args.write_train_group_file or args.write_val_group_file) and not args.group_key:
         raise SystemExit('--write-*-group-file requires --group-key')
     try:
@@ -1383,6 +1674,40 @@ def main():
             'lower_bound': False,
             'scan_by_split': near_meta,
         }
+    near_dup_bound = near_duplicate_scan_bound(
+        near_dup_report, max_rate=args.max_near_dup_rate)
+    near_dup_report['scan_bound'] = near_dup_bound
+    if args.append_near_dup_to_ledgers:
+        additions = near_duplicate_ledger_additions(near_dup_report)
+        coverage = ('audited_split' if near_dup_report.get('exhaustive')
+                    else 'scanned_prefix')
+        for role, path, base_hashes, info, label in (
+                ('train', args.write_train_hash_file, train_hashes,
+                 train_ledger_info, 'train-document'),
+                ('validation', args.write_val_hash_file, val_hashes,
+                 val_ledger_info, 'validation-document')):
+            if not path or info is None:
+                continue
+            base = set(base_hashes or ())
+            extra = set(additions['hashes'].get(role) or ())
+            added = extra - base
+            if added:
+                info = _write_hash_ledger(
+                    path, base | extra, args.n_docs, label,
+                    exhaustive=info.get('exhaustive'))
+            info['near_duplicate_hashes_added'] = len(added)
+            info['near_duplicate_coverage'] = coverage
+            info['near_duplicate_missing_digest_documents'] = int(
+                additions['missing_digest_documents'])
+            if role == 'train':
+                train_ledger_info = info
+            else:
+                val_ledger_info = info
+        if additions['missing_digest_documents']:
+            near_dup_report['notes'].append(
+                f"{additions['missing_digest_documents']} flagged held-out "
+                "document(s) had no usable canonical digest and were not added "
+                "to the exclusion ledger")
     out = {'options': vars(args), 'hypothesis': args.hypothesis, 'run_metadata': collect_run_metadata(),
            'split_reports': reports, 'split_chronology_problems': chronology,
            'cleaning_and_sanity': splits, 'distribution_shift': shift,
@@ -1485,6 +1810,23 @@ def main():
         else:
             print(f"[audit] near-dup scan: no cross-split pair at Jaccard >= "
                   f"{near_dup_report['threshold_jaccard']} in the sketched documents")
+        for later, bound in near_dup_report['scan_bound']['by_later_split'].items():
+            upper = bound['upper_bound']
+            observed = bound['observed_rate']
+            if upper is None:
+                print(f"[audit] near-dup bound {later}: no document was sketched, "
+                      "so no contamination rate can be bounded")
+                continue
+            print(f"[audit] near-dup bound {later}: {bound['flagged_documents']}/"
+                  f"{bound['documents']} flagged (observed {observed:.4%}), "
+                  f"one-sided {bound['confidence']:.1%} upper bound {upper:.4%} "
+                  f"on the {bound['scope'].replace('_', ' ')}")
+        for info_name, info in (('train', train_ledger_info),
+                                ('validation', val_ledger_info)):
+            if info and info.get('near_duplicate_hashes_added') is not None:
+                print(f"[audit] {info_name} ledger: +"
+                      f"{info['near_duplicate_hashes_added']} near-duplicate "
+                      f"exclusion(s) ({info.get('near_duplicate_coverage')})")
         for note in near_dup_report['notes']:
             print(f"[audit] NOTE: {note}")
     if args.hypothesis:
@@ -1650,6 +1992,7 @@ def main():
             f"a shortfall of {test_eval['shortfall_batches']}. Lower --test-batches or "
             "raise the test token budget so the advertised interval is the one reported")
     problems.extend(near_dup_report.get('problems') or [])
+    problems.extend((near_dup_report.get('scan_bound') or {}).get('problems') or [])
     # The report itself must carry the verdict. It was written before the
     # leakage/sanity checks ran, so a failed audit's data_audit.json used to
     # look like a clean report with no problems while only the separate

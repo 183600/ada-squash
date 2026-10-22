@@ -24,7 +24,8 @@ from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import mean_ci, mean_std_stderr
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.norms import NORM_REGISTRY
-from adasquash.repro import (TRAINING_RECIPE_KEYS, artifact_record, collect_run_metadata,
+from adasquash.repro import (TRAINING_RECIPE_KEYS, TrainStreamFingerprint,
+                             artifact_record, collect_run_metadata,
                              file_fingerprint, finish_metadata, save_run_manifest,
                              set_all_seeds, training_recipe_mismatches)
 from scripts.data_pipeline import build_dataloader, configure_data_options, _is_pinned_revision
@@ -755,6 +756,7 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             'n_nonfinite_gradients': None, 'n_nonfinite_val_losses': None,
             'curve_classification': None, 'curve_generalization_gap': None,
             'test_loss': None, 'data_version': None, 'data_ledgers': None,
+            'train_stream': None,
             'tokens_per_second': None, 'peak_device_memory_mb': None,
         }
         reject_reason = None
@@ -880,6 +882,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
             record['n_heads'] = results.get('n_heads')
             record['data_version'] = _manifest_data_version(manifest)
             record['data_ledgers'] = ledgers
+            stream = (manifest.get('data') or {}).get('train_stream')
+            record['train_stream'] = stream if isinstance(stream, dict) else None
             record['n_loss_spikes'] = results.get('n_loss_spikes')
             record['n_nonfinite_losses'] = results.get('n_nonfinite_losses')
             record['n_nonfinite_gradients'] = results.get('n_nonfinite_gradients')
@@ -983,6 +987,10 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
         'data_ledgers_by_seed': {int(r['seed']): r.get('data_ledgers')
                                  for r in per_seed},
         'data_ledgers_complete': ledger_identity_complete,
+        'train_stream_by_seed': {int(r['seed']): r.get('train_stream')
+                                 for r in per_seed},
+        'train_stream_complete': bool(per_seed) and all(
+            isinstance(r.get('train_stream'), dict) for r in per_seed),
         'unknown_data_version_seeds': unknown_data_version_seeds,
         'data_versions_complete': data_versions_complete,
         'data_versions_consistent': data_versions_consistent,
@@ -1782,6 +1790,7 @@ def main():
     manifest_path = Path(args.output_dir) / 'run_manifest.json'
     run_manifest: dict = {}
     run_finished = False
+    stream_fp = None
     step = 0
     try:
         run_manifest = collect_run_metadata(seed=args.seed)
@@ -1828,6 +1837,10 @@ def main():
             import wandb
             wandb.init(project=args.wandb_project, name=args.run_name or args.norm, config=vars(args))
         step = start_step
+        # Hash the batches the optimizer actually sees, not just the recipe
+        # that was supposed to produce them. Two arms are paired only if the
+        # same seed fed them the same windows in the same order.
+        stream_fp = TrainStreamFingerprint(start_step=start_step)
         t0 = time.time()
         tokens_processed = 0
         if device == 'cuda':
@@ -2035,6 +2048,10 @@ def main():
                 # skip exactly these.
                 batches_consumed += 1
                 x, y = batch
+                # Hash before the device transfer: this is the data the loader
+                # produced, not a device-specific copy of it. The target is
+                # included because a packed window's final label is not in x.
+                stream_fp.update(x, y)
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 tokens_processed += int(x.numel())
@@ -2299,6 +2316,8 @@ def main():
         # stderr is only interpretable if the pass saw as many distinct
         # batches as it advertises. `unique < requested` means the loader
         # cycled and the collected losses are not independent draws.
+        if stream_fp is not None:
+            run_manifest['data']['train_stream'] = stream_fp.record()
         run_manifest['data']['heldout_eval'] = {
             'validation_batches_requested': int(args.val_batches),
             'validation_batches_unique_last_pass': val_state.get('last_eval_unique_batches'),
@@ -2608,6 +2627,8 @@ def main():
             run_manifest['last_step'] = int(step)
             run_manifest['last_train_loss'] = last_train_loss
             run_manifest['last_val_loss'] = last_val_loss
+            if stream_fp is not None:
+                run_manifest.setdefault('data', {})['train_stream'] = stream_fp.record()
             # The curve is the artifact a reader needs for an interrupted run;
             # fingerprint whatever made it to disk.
             run_manifest.setdefault('artifacts', {})['train_jsonl'] = file_fingerprint(log_path)

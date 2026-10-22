@@ -42,7 +42,7 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_std_stderr,
                                paired_design_summary, paired_t_one_sided,
                                student_t_ppf, tost_paired)
-from adasquash.repro import training_recipe_mismatches
+from adasquash.repro import compare_train_streams, training_recipe_mismatches
 
 _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
 
@@ -220,6 +220,21 @@ def _final_step(agg: dict):
             and step > 0 else None)
 
 
+def _train_stream_for_seed(streams, seed):
+    """A per-seed stream record from an aggregate loaded from JSON.
+
+    `aggregate.json` is written by `json.dump`, so integer seed keys come back
+    as strings; a direct `mapping.get(42)` would silently treat a recorded
+    stream as missing. Accept either spelling.
+    """
+    if not isinstance(streams, dict):
+        return None
+    value = streams.get(seed)
+    if value is None:
+        value = streams.get(str(seed))
+    return value
+
+
 def _arm_issues(name: str, agg: dict, metric: str) -> list[str]:
     issues = []
     if not isinstance(agg, dict):
@@ -295,7 +310,8 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                  metric: str='final_val_loss', alpha: float=0.05,
                  margin: float=0.0, manifests: dict[str, dict] | None=None,
                  require_recipe: bool=True,
-                 equivalence_margin: float=0.0) -> dict:
+                 equivalence_margin: float=0.0,
+                 require_train_stream_identity: bool=False) -> dict:
     """Paired, Holm-adjusted comparison of arm aggregates.
 
     `arms` maps a display name to an aggregate.json object. The reference is
@@ -331,6 +347,10 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'issues': _arm_issues(name, agg, metric),
             'curve_classification_counts': (agg.get('curve_classification_counts')
                                             if isinstance(agg, dict) else None),
+            'train_stream_by_seed': (agg.get('train_stream_by_seed')
+                                     if isinstance(agg, dict)
+                                     and isinstance(agg.get('train_stream_by_seed'), dict)
+                                     else {}),
         }
     manifests = manifests or {}
     manifest_problems: dict[str, str | None] = {}
@@ -424,8 +444,31 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             problem = manifest_problems.get(role)
             if problem:
                 pair_problems.append(f'run manifest for {role!r}: {problem}')
-        pair_protocol_ok = not pair_problems
         common = sorted(set(cand['values']) & set(ref['values']))
+        # Pair the arms at the data level, not only at the config level: for
+        # every shared training seed, the input batches must be the same
+        # windows in the same order. A missing record is unknown, not equal.
+        stream_checks = {}
+        for seed in common:
+            check = compare_train_streams(
+                _train_stream_for_seed(ref['train_stream_by_seed'], seed),
+                _train_stream_for_seed(cand['train_stream_by_seed'], seed))
+            stream_checks[str(seed)] = check
+            if check.get('recorded') and not check.get('comparable'):
+                pair_problems.append(
+                    f'train stream for seed {seed} is not comparable: '
+                    + '; '.join(check.get('problems') or [check.get('reason')]))
+            elif check.get('comparable') and not check.get('identical'):
+                pair_problems.append(
+                    f'train stream differs for seed {seed} ('
+                    + ', '.join(check.get('problems') or ['unknown difference'])
+                    + ')')
+            elif (require_train_stream_identity
+                  and not (check.get('comparable') and check.get('identical'))):
+                pair_problems.append(
+                    f'train stream identity was not established for seed {seed}; '
+                    'the arms may have consumed different data batches')
+        pair_protocol_ok = not pair_problems
         entry = {
             'name': name,
             'norm': cand['norm'],
@@ -475,6 +518,11 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                          'arms are equivalent; a non-significant difference is '
                          'not equivalence')},
             'protocol_problems': pair_problems,
+            'train_stream_identity': {
+                'checked': bool(stream_checks),
+                'by_seed': stream_checks,
+                'required': bool(require_train_stream_identity),
+            },
             'recipe_checked': (isinstance(cand_hyper, dict)
                                and isinstance(ref_hyper, dict)),
             'recipe_mismatches': recipe_mismatches,
@@ -612,12 +660,14 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'data_version': sorted(map(str, data_values)),
             'model': sorted(map(str, model_values)),
             'require_recipe': bool(require_recipe),
+            'require_train_stream_identity': bool(require_train_stream_identity),
             'recipe_recorded': {name: prepared[name]['recipe_recorded']
                                 for name in prepared},
             'reading': ('only the normalization may differ across Phase-1 arms; shape, '
                         'fixed final step, resolved data version and the recorded '
-                        'optimizer/schedule/token recipe must be identical, and each '
-                        'arm needs >= 3 clean seeds'),
+                        'optimizer/schedule/token recipe must be identical, the shared '
+                        'seed must have consumed the same training stream, and each arm '
+                        'needs >= 3 clean seeds'),
         },
         'multiple_comparison': (
             f'Holm-Bonferroni over the {len(family)} candidate arm(s) tested '
@@ -705,6 +755,10 @@ def main(argv=None) -> None:
                    help='TOST equivalence margin in loss for "the arms are the same" '
                         'claims; 0 disables equivalence testing, and a non-significant '
                         'difference is never relabelled as equivalence')
+    p.add_argument('--require-train-stream-identity', action='store_true',
+                   help='fail closed when the per-seed training-stream fingerprint is '
+                        'missing or not comparable; the fingerprint proves the paired '
+                        'arms consumed the same token windows in the same order')
     p.add_argument('--allow-missing-recipe', action='store_true',
                    help='do not fail closed when a sibling run_manifest.json (the record of '
                         'optimizer/schedule/token budget) is missing; the comparison is then '
@@ -748,7 +802,8 @@ def main(argv=None) -> None:
                               alpha=args.alpha, margin=args.margin,
                               manifests=manifests,
                               require_recipe=not args.allow_missing_recipe,
-                              equivalence_margin=args.equivalence_margin)
+                              equivalence_margin=args.equivalence_margin,
+                              require_train_stream_identity=args.require_train_stream_identity)
     print_comparison(comparison)
     output = Path(args.output) if args.output else paths[0].parent / 'arm_comparison.json'
     output.parent.mkdir(parents=True, exist_ok=True)

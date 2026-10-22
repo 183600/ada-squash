@@ -26,12 +26,16 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from adasquash.repro import compare_train_streams
 from scripts.audit_data import (eval_batch_capacity, evaluation_reuse_status,
                                 packed_window_count, split_token_budget,
                                 minhash_signature, near_duplicate_leakage,
-                                near_duplicate_record, token_shingles,
+                                near_duplicate_ledger_additions,
+                                near_duplicate_record,
+                                near_duplicate_scan_bound, token_shingles,
                                 train_wrap_status)
-from scripts.data_pipeline import (configure_data_options, get_data_options,
+from scripts.data_pipeline import (canonical_document_hash,
+                                   configure_data_options, get_data_options,
                                    split_document_boundaries,
                                    validate_data_options)
 
@@ -397,3 +401,337 @@ def test_evaluate_heldout_reports_cycle_and_shortfall_without_changing_the_mean(
     assert state["last_eval_reused"] is False
     assert state["last_eval_unique_batches"] == 3
     assert state["last_eval_shortfall"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Near-duplicate uncertainty and remediation
+# ---------------------------------------------------------------------------
+def test_near_duplicate_record_carries_the_canonical_digest():
+    digest = canonical_document_hash("a document whose wording changes")
+    record = near_duplicate_record(list(range(40)), canonical_digest=digest)
+    assert record["canonical_digest"] == digest.hex()
+    # The digest is optional: a token stream that did not come from a text
+    # document still gets a usable sketch.
+    assert "canonical_digest" not in near_duplicate_record(list(range(40)))
+    with pytest.raises(ValueError):
+        near_duplicate_record([1, 2, 3], canonical_digest="not-hex")
+    with pytest.raises(ValueError):
+        near_duplicate_record([1, 2, 3], canonical_digest=b"")
+
+
+def _reworded_pair():
+    base = list(range(200))
+    reworded = base[:95] + [9000, 9001, 9002, 9003, 9004] + base[100:]
+    return base, reworded
+
+
+def test_near_duplicate_leakage_unions_flagged_documents_per_later_split():
+    base, reworded = _reworded_pair()
+    train = near_duplicate_record(base, canonical_digest=canonical_document_hash("train"))
+    train["doc_index"] = 0
+    validation = near_duplicate_record(
+        reworded, canonical_digest=canonical_document_hash("validation"))
+    validation["doc_index"] = 1
+    # The same test document is similar to both train and validation. It is
+    # one contaminated held-out document, not two, so the per-later-split
+    # denominator for the contamination bound must count it once.
+    test = near_duplicate_record(
+        reworded, canonical_digest=canonical_document_hash("test"))
+    test["doc_index"] = 2
+    report = near_duplicate_leakage(
+        {"train": [train], "validation": [validation], "test": [test]},
+        threshold=0.8)
+    later = report["by_later_split"]
+    assert later["validation"]["flagged_documents"] == 1
+    assert later["test"]["flagged_documents"] == 1
+    assert later["test"]["flagged_document_indices"] == [2]
+    assert later["test"]["flagged_digests"] == [canonical_document_hash("test").hex()]
+    # A pair still records its own hits; the union is an additional view.
+    assert report["pairs"]["train->test"]["flagged_later_documents"] == 1
+    assert report["pairs"]["validation->test"]["flagged_later_documents"] == 1
+
+
+def test_near_duplicate_scan_bound_quantifies_a_zero_hit_scan():
+    report = {
+        "enabled": True,
+        "exhaustive": True,
+        "by_later_split": {
+            "validation": {"documents": 4000, "flagged_documents": 0},
+        },
+        "pairs": {},
+    }
+    bound = near_duplicate_scan_bound(report)
+    row = bound["by_later_split"]["validation"]
+    assert row["observed_rate"] == 0.0
+    assert 0.0 < row["upper_bound"] < 0.001
+    assert row["scope"] == "audited_split"
+    assert bound["method"] == "wilson_score_upper_bound"
+    assert bound["certifies_population"] is True
+    # A clean sample of 4000 documents still cannot rule out a rate above
+    # 0.0005 (the Wilson upper bound is roughly 0.00068).
+    strict = near_duplicate_scan_bound(report, max_rate=0.0005)
+    assert strict["by_later_split"]["validation"]["passes_max_rate"] is False
+    assert strict["problems"]
+    # It can rule out the much larger rate that a 20-document sample could not.
+    loose = near_duplicate_scan_bound(report, max_rate=0.01)
+    assert loose["by_later_split"]["validation"]["passes_max_rate"] is True
+    assert loose["problems"] == []
+
+
+def test_near_duplicate_scan_bound_marks_a_sampled_prefix_as_narrower():
+    report = {
+        "enabled": True,
+        "exhaustive": False,
+        "by_later_split": {
+            "test": {"documents": 100, "flagged_documents": 1},
+        },
+        "pairs": {},
+    }
+    bound = near_duplicate_scan_bound(report, max_rate=0.5)
+    row = bound["by_later_split"]["test"]
+    assert row["scope"] == "scanned_prefix"
+    assert bound["certifies_population"] is False
+    assert row["observed_rate"] == pytest.approx(0.01)
+    assert row["upper_bound"] < 0.5
+    assert row["passes_max_rate"] is True
+    assert any("scanned prefix only" in note for note in bound["notes"])
+
+
+def test_near_duplicate_scan_bound_rejects_malformed_inputs():
+    good = {"enabled": True, "exhaustive": True,
+            "by_later_split": {"validation": {"documents": 10,
+                                              "flagged_documents": 1}}}
+    with pytest.raises(ValueError):
+        near_duplicate_scan_bound(good, confidence=0.0)
+    with pytest.raises(ValueError):
+        near_duplicate_scan_bound(good, confidence=True)
+    with pytest.raises(ValueError):
+        near_duplicate_scan_bound(good, max_rate=1.5)
+    with pytest.raises(ValueError):
+        near_duplicate_scan_bound({"by_later_split": {
+            "validation": {"documents": True, "flagged_documents": 0}}})
+    with pytest.raises(ValueError):
+        near_duplicate_scan_bound({"by_later_split": {
+            "validation": {"documents": 2, "flagged_documents": 3}}})
+    with pytest.raises(ValueError):
+        near_duplicate_scan_bound(None)
+    # A max-rate claim on a report with no scan counts is unknown, not clean.
+    empty = near_duplicate_scan_bound({"by_later_split": {}}, max_rate=0.1)
+    assert empty["problems"]
+
+
+def test_near_duplicate_ledger_additions_only_include_later_documents():
+    def digest(text):
+        return canonical_document_hash(text).hex()
+
+    report = {
+        "pairs": {
+            "train->validation": {
+                "earlier_split": "train", "later_split": "validation",
+                "flagged_later_digests": [digest("val-of-train")],
+                "flagged_later_missing_digest": 0,
+            },
+            "train->test": {
+                "earlier_split": "train", "later_split": "test",
+                "flagged_later_digests": [digest("test-of-train")],
+                "flagged_later_missing_digest": 0,
+            },
+            "validation->test": {
+                "earlier_split": "validation", "later_split": "test",
+                "flagged_later_digests": [digest("test-of-val")],
+                "flagged_later_missing_digest": 0,
+            },
+        },
+    }
+    additions = near_duplicate_ledger_additions(report)
+    assert additions["hashes"]["train"] == {
+        canonical_document_hash("val-of-train"),
+        canonical_document_hash("test-of-train"),
+    }
+    assert additions["hashes"]["validation"] == {
+        canonical_document_hash("test-of-val"),
+    }
+    # A training document is never an exclusion candidate.
+    assert canonical_document_hash("train-of-val") not in additions["hashes"]["train"]
+
+
+def test_near_duplicate_ledger_additions_report_missing_digests():
+    report = {
+        "by_later_split": {
+            "validation": {"documents": 10, "flagged_documents": 2,
+                           "missing_digest_documents": 2},
+        },
+        "pairs": {
+            "train->validation": {
+                "earlier_split": "train", "later_split": "validation",
+                "flagged_later_digests": [],
+                "flagged_later_missing_digest": 2,
+            },
+        },
+    }
+    additions = near_duplicate_ledger_additions(report)
+    assert additions["hashes"] == {"train": set(), "validation": set()}
+    assert additions["missing_digest_documents"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Paired data identity: the training stream an arm actually consumed
+# ---------------------------------------------------------------------------
+def _stream_record(*batches, start_step=0, prefix_batches=2):
+    from adasquash.repro import TrainStreamFingerprint
+
+    fingerprint = TrainStreamFingerprint(
+        start_step=start_step, prefix_batches=prefix_batches)
+    for batch in batches:
+        fingerprint.update(batch)
+    return fingerprint.record()
+
+
+def test_train_stream_fingerprint_is_order_and_shape_sensitive():
+    import torch
+
+    a = _stream_record(torch.tensor([[1, 2, 3], [4, 5, 6]]),
+                       torch.tensor([[7, 8, 9], [10, 11, 12]]))
+    b = _stream_record(torch.tensor([[1, 2, 3], [4, 5, 6]]),
+                       torch.tensor([[7, 8, 9], [10, 11, 12]]))
+    assert a == b
+    assert a["batches"] == 2 and a["tokens"] == 12
+    assert a["prefix_batches"] == 2
+
+    # Same token multiset, different order: the optimizer saw a different
+    # sequence, so the paired-design evidence must differ.
+    reordered = _stream_record(torch.tensor([[4, 5, 6], [1, 2, 3]]),
+                               torch.tensor([[7, 8, 9], [10, 11, 12]]))
+    assert reordered["prefix_fingerprint"] != a["prefix_fingerprint"]
+    assert reordered["stream_fingerprint"] != a["stream_fingerprint"]
+
+    # Same flattened tokens, different window shape: a different batch
+    # boundary is a different training stream too.
+    reshaped = _stream_record(torch.tensor([[1, 2, 3, 4, 5, 6]]),
+                              torch.tensor([[7, 8, 9], [10, 11, 12]]))
+    assert reshaped["prefix_fingerprint"] != a["prefix_fingerprint"]
+
+
+def test_train_stream_fingerprint_includes_the_target_tokens():
+    import torch
+    from adasquash.repro import TrainStreamFingerprint
+
+    x = torch.tensor([[1, 2], [3, 4]])
+    first = TrainStreamFingerprint()
+    first.update(x, torch.tensor([[2, 3], [4, 5]]))
+    second = TrainStreamFingerprint()
+    # The final label of a packed window is not part of its input; a stream
+    # that differs only in that label is still a different training stream.
+    second.update(x, torch.tensor([[2, 3], [4, 9]]))
+    assert first.record()["prefix_fingerprint"] != second.record()["prefix_fingerprint"]
+
+
+def test_train_stream_prefix_stays_comparable_when_one_run_stops_earlier():
+    import torch
+
+    first = torch.tensor([[1, 2], [3, 4]])
+    second = torch.tensor([[5, 6], [7, 8]])
+    third = torch.tensor([[9, 10], [11, 12]])
+    short = _stream_record(first, second)
+    long = _stream_record(first, second, third)
+    check = compare_train_streams(short, long)
+    assert check["comparable"] is True
+    assert check["identical"] is True
+    assert check["scope"] == "shared_prefix"
+    assert check["full_stream_compared"] is False
+
+    diverged = _stream_record(first, second, torch.tensor([[0, 0], [0, 0]]))
+    check = compare_train_streams(long, diverged)
+    assert check["comparable"] is True
+    assert check["identical"] is False
+    assert check["full_stream_compared"] is True
+    assert check["problems"]
+
+
+def test_compare_train_streams_treats_missing_records_as_unknown_not_equal():
+    import torch
+
+    record = _stream_record(torch.tensor([[1, 2], [3, 4]]))
+    missing = compare_train_streams(None, None)
+    assert missing["recorded"] is False
+    assert missing["comparable"] is False
+    assert missing["identical"] is None
+    one_side = compare_train_streams(record, None)
+    assert one_side["recorded"] is True
+    assert one_side["comparable"] is False
+    resumed = compare_train_streams(
+        _stream_record(torch.tensor([[1, 2]]), start_step=10),
+        _stream_record(torch.tensor([[1, 2]]), start_step=0))
+    assert resumed["comparable"] is False
+    assert any("different steps" in problem for problem in resumed["problems"])
+
+
+def test_train_stream_lookup_accepts_json_string_seed_keys():
+    from scripts.compare_arms import _train_stream_for_seed
+
+    record = {"prefix_fingerprint": "x", "batches": 1}
+    assert _train_stream_for_seed({42: record}, 42) is record
+    # `json.dump` turns integer aggregate keys into strings.
+    assert _train_stream_for_seed({"42": record}, 42) is record
+    assert _train_stream_for_seed({}, 42) is None
+    assert _train_stream_for_seed(None, 42) is None
+
+
+def test_compare_arms_reports_a_train_stream_mismatch_without_certifying():
+    from scripts.compare_arms import compare_arms
+
+    import torch
+
+    matching = _stream_record(torch.tensor([[1, 2], [3, 4]]))
+    different = _stream_record(torch.tensor([[9, 9], [9, 9]]))
+
+    def aggregate(values, stream):
+        return {
+            'model': 'gpt2-124m',
+            'per_seed': [{'seed': seed, 'final_val_loss': value,
+                          'final_val_step': 100}
+                         for seed, value in sorted(values.items())],
+            'shapes_by_seed': {str(seed): {'n_layers': 12, 'dim': 768,
+                                           'n_heads': 12}
+                               for seed in values},
+            'data_versions_by_seed': {str(seed): {'name': 'corpus',
+                                                  'revision': 'v1'}
+                                      for seed in values},
+            'train_stream_by_seed': {seed: stream for seed in values},
+        }
+
+    values = {42: 2.0, 43: 2.0, 44: 2.0}
+    clean = {
+        'reference': aggregate(values, matching),
+        'candidate': aggregate({42: 1.5, 43: 1.52, 44: 1.49}, matching),
+    }
+    out = compare_arms(clean, reference='reference', require_recipe=False)
+    row = out['rows'][0]
+    assert not any('train stream' in problem.lower()
+                   for problem in row['protocol_problems'])
+    assert row['train_stream_identity']['checked'] is True
+
+    dirty = {
+        'reference': aggregate(values, matching),
+        'candidate': aggregate({42: 1.5, 43: 1.52, 44: 1.49}, different),
+    }
+    out = compare_arms(dirty, reference='reference', require_recipe=False)
+    row = out['rows'][0]
+    assert any('train stream differs' in problem
+               for problem in row['protocol_problems'])
+    assert row['certifiable'] is False
+
+    # A legacy aggregate without a stream record is unknown, not equal. It is
+    # tolerated by default but fails closed when the comparison is required to
+    # prove data identity.
+    legacy = {
+        'reference': {**aggregate(values, matching),
+                      'train_stream_by_seed': {}},
+        'candidate': {**aggregate({42: 1.5, 43: 1.52, 44: 1.49}, matching),
+                      'train_stream_by_seed': {}},
+    }
+    out = compare_arms(legacy, reference='reference', require_recipe=False,
+                       require_train_stream_identity=True)
+    row = out['rows'][0]
+    assert any('identity was not established' in problem
+               for problem in row['protocol_problems'])

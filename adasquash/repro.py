@@ -124,6 +124,240 @@ def deterministic_algorithms_context(mode: str | None = None):
     return _ctx()
 
 
+
+# ---------------------------------------------------------------------------
+# Training-stream identity (paired-design evidence)
+# ---------------------------------------------------------------------------
+TRAIN_STREAM_FINGERPRINT_VERSION = 1
+TRAIN_STREAM_PREFIX_BATCHES = 64
+
+
+class TrainStreamFingerprint:
+    """Order-sensitive digest of the training batches a run actually consumed.
+
+    Two arms of a normalization comparison are paired only if the same seed
+    fed them the same token windows in the same order.  Recipe and data-version
+    checks cannot prove that: a worker-sharding change, a shuffle-buffer
+    change that did not make it into the recipe, or a different loader build
+    could all keep the recorded configuration identical while changing the
+    stream.  This class hashes every consumed input batch, so the manifest
+    carries an end-to-end fingerprint of the data the optimizer saw.
+
+    A fixed-size prefix digest is kept alongside the full digest.  The prefix
+    lets two arms that stopped at different steps still prove that their
+    streams agreed for the batches both consumed; the full digest proves
+    identity over the whole run when both runs consumed the same number of
+    batches.  `start_step` is recorded because a resumed run starts a new
+    digest at the resume point and is only comparable to another run that
+    resumed at the same step.
+    """
+
+    def __init__(self, start_step: int = 0,
+                 prefix_batches: int = TRAIN_STREAM_PREFIX_BATCHES):
+        if isinstance(start_step, bool) or not isinstance(start_step, int) or start_step < 0:
+            raise ValueError(f"start_step must be a non-negative integer, got {start_step!r}")
+        if (isinstance(prefix_batches, bool) or not isinstance(prefix_batches, int)
+                or prefix_batches < 1):
+            raise ValueError(
+                f"prefix_batches must be a positive integer, got {prefix_batches!r}")
+        self.start_step = int(start_step)
+        self.prefix_batches_target = int(prefix_batches)
+        self._full = hashlib.blake2b(digest_size=16)
+        self._prefix = hashlib.blake2b(digest_size=16)
+        self._batches = 0
+        self._prefix_batches = 0
+        self._tokens = 0
+        self._prefix_tokens = 0
+
+    def update(self, x, y=None) -> None:
+        """Hash one consumed (input, target) batch before device transfer.
+
+        The target is hashed too: a packed window's final label is not part of
+        its input, so two streams with identical inputs can still differ in
+        the token the model is trained to predict.  `y` is optional only so a
+        caller that has no separate labels can still fingerprint the inputs.
+        """
+        if not torch.is_tensor(x):
+            raise ValueError(
+                f"TrainStreamFingerprint.update expects a tensor, got {type(x).__name__}")
+        batch_hasher = hashlib.blake2b(digest_size=16)
+        for name, tensor in (("x", x), ("y", y)):
+            if tensor is None:
+                continue
+            if not torch.is_tensor(tensor):
+                raise ValueError(
+                    f"TrainStreamFingerprint.update expects tensor {name}, got "
+                    f"{type(tensor).__name__}")
+            batch_hasher.update(
+                (name + ":" + str(tuple(tensor.shape)) + "|"
+                 + str(tensor.dtype)).encode("ascii"))
+            batch_hasher.update(
+                tensor.detach().cpu().contiguous().numpy().tobytes())
+        batch_digest = batch_hasher.digest()
+        self._full.update(batch_digest)
+        if self._batches < self.prefix_batches_target:
+            self._prefix.update(batch_digest)
+            self._prefix_batches += 1
+            self._prefix_tokens += int(x.numel())
+        self._batches += 1
+        self._tokens += int(x.numel())
+
+    def record(self) -> dict:
+        return {
+            "version": TRAIN_STREAM_FINGERPRINT_VERSION,
+            "start_step": self.start_step,
+            "prefix_batches_target": self.prefix_batches_target,
+            "prefix_batches": self._prefix_batches,
+            "prefix_tokens": self._prefix_tokens,
+            "batches": self._batches,
+            "tokens": self._tokens,
+            "prefix_fingerprint": self._prefix.hexdigest(),
+            "stream_fingerprint": self._full.hexdigest(),
+        }
+
+
+def _stream_count(record: dict, name: str, minimum: int = 0):
+    value = record.get(name)
+    if value is None:
+        return None
+    if _is_boolean_scalar(value) or not isinstance(value, int) or value < minimum:
+        raise ValueError(
+            f"train stream record field {name!r} must be an integer >= {minimum}, "
+            f"got {value!r}")
+    return value
+
+
+def compare_train_streams(reference: dict, other: dict) -> dict:
+    """Do two runs' recorded training streams establish a paired design?
+
+    Missing records are *unknown*, not equal: an old manifest that never
+    recorded the stream cannot prove two arms saw the same batches.  The
+    caller decides whether unknown is fatal (`--require-train-stream-identity`)
+    or merely reported.  A recorded difference, or a different resume offset,
+    is always a pairing failure.
+    """
+    if not isinstance(reference, dict) or not isinstance(other, dict):
+        return {
+            "recorded": bool(reference or other),
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": [],
+            "reason": "training stream fingerprints were not recorded",
+        }
+    problems = []
+    version_a = reference.get("version")
+    version_b = other.get("version")
+    if version_a != version_b:
+        problems.append(
+            f"training stream fingerprint versions differ: {version_a!r} vs {version_b!r}")
+    for name in ("start_step", "prefix_batches_target", "prefix_batches", "batches"):
+        try:
+            a = _stream_count(reference, name)
+            b = _stream_count(other, name)
+        except ValueError as exc:
+            problems.append(str(exc))
+            continue
+        if name == "start_step" and a is not None and b is not None and a != b:
+            problems.append(
+                f"training stream starts at different steps: {a} vs {b}; a resumed "
+                "run is not the same data prefix as a fresh run")
+        if name == "prefix_batches_target" and a is not None and b is not None and a != b:
+            problems.append(
+                f"training stream prefix sizes differ: {a} vs {b}; the prefix "
+                "digests cover different numbers of batches")
+    if problems:
+        return {
+            "recorded": True,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": problems,
+            "reason": "training stream records are not comparable",
+        }
+    a_prefix = reference.get("prefix_fingerprint")
+    b_prefix = other.get("prefix_fingerprint")
+    a_full = reference.get("stream_fingerprint")
+    b_full = other.get("stream_fingerprint")
+    for label, value in (("prefix_fingerprint", a_prefix),
+                         ("prefix_fingerprint", b_prefix),
+                         ("stream_fingerprint", a_full),
+                         ("stream_fingerprint", b_full)):
+        if value is not None and not isinstance(value, str):
+            return {
+                "recorded": True,
+                "comparable": False,
+                "identical": None,
+                "scope": None,
+                "full_stream_compared": False,
+                "problems": [f"training stream {label} is not a string: {value!r}"],
+                "reason": "training stream record is malformed",
+            }
+    if a_prefix is None or b_prefix is None:
+        return {
+            "recorded": True,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": ["training stream prefix fingerprint is missing"],
+            "reason": "training stream record is incomplete",
+        }
+    prefix_a = _stream_count(reference, "prefix_batches") or 0
+    prefix_b = _stream_count(other, "prefix_batches") or 0
+    if prefix_a != prefix_b:
+        return {
+            "recorded": True,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": [
+                f"training stream prefix covers {prefix_a} batch(es) in one run "
+                f"and {prefix_b} in the other; the prefix digests are not "
+                "over the same number of batches"],
+            "reason": "training stream prefix lengths differ",
+        }
+    if prefix_a == 0:
+        return {
+            "recorded": True,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": ["neither run consumed a training batch to fingerprint"],
+            "reason": "training stream is empty",
+        }
+    identical = a_prefix == b_prefix
+    problems = [] if identical else [
+        "the first "
+        f"{prefix_a} training batch(es) differ between the two runs; they did "
+        "not consume the same token windows in the same order"]
+    batches_a = _stream_count(reference, "batches")
+    batches_b = _stream_count(other, "batches")
+    full_compared = False
+    scope = "shared_prefix"
+    if identical and batches_a == batches_b and a_full is not None and b_full is not None:
+        full_compared = True
+        scope = "full_run"
+        if a_full != b_full:
+            identical = False
+            problems.append(
+                f"the full training streams differ although the first "
+                f"{prefix_a} batch(es) match; the streams diverged later")
+    return {
+        "recorded": True,
+        "comparable": True,
+        "identical": identical,
+        "scope": scope,
+        "full_stream_compared": full_compared,
+        "problems": problems,
+        "reason": None,
+    }
+
+
 def _is_boolean_scalar(value) -> bool:
     """Python and NumPy booleans; both are not seeds/measurements.
 
@@ -714,6 +948,10 @@ __all__ = [
     "self_test",
     "training_recipe_mismatches",
     "TRAINING_RECIPE_KEYS",
+    "TrainStreamFingerprint",
+    "compare_train_streams",
+    "TRAIN_STREAM_FINGERPRINT_VERSION",
+    "TRAIN_STREAM_PREFIX_BATCHES",
     "set_all_seeds",
 ]
 
