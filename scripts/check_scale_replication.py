@@ -79,9 +79,10 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
         'scale': entry.get('a_scale') or entry.get('scale') or 'unknown',
         'metric': entry.get('metric') or metric or 'default',
         # The delta below is always candidate - reference (reversed pairs are
-        # sign-flipped), so the contrast label must use that same orientation.
-        'contrast': (f'{a} vs {b}' if orientation == 'candidate_vs_reference'
-                     else f'{b} vs {a}'),
+        # sign-flipped). Use the requested pair identity, not the artifact's
+        # display labels: checkpoint paths differ per scale, so label-based
+        # contrasts could never match across scales.
+        'contrast': f'{candidate} vs {reference}',
         'delta': delta,
         # A reversed pair tests the opposite one-sided hypothesis; keep it as a
         # descriptive sign observation but never inherit its certification.
@@ -120,10 +121,9 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
         out.append({
             'scale': row.get('scale') or data.get('scale') or 'unknown',
             'metric': row.get('metric') or metric or 'default',
-            # Same canonical orientation as the sign-flipped delta.
-            'contrast': (f"{row.get('norm')} vs {row.get('reference')}"
-                         if orientation == 'candidate_vs_reference'
-                         else f"{row.get('reference')} vs {row.get('norm')}"),
+            # Same canonical candidate/reference identity as the sign-flipped
+            # delta, so separate per-scale artifacts share one contrast id.
+            'contrast': f'{candidate} vs {reference}',
             'delta': delta,
             'certified': (bool(row.get('beats_reference_significantly'))
                           if orientation == 'candidate_vs_reference' else False),
