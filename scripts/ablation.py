@@ -265,6 +265,20 @@ LOO_SPEC = {
     },
 }
 
+# The attention-logits axis is independent of the normalization family: it
+# changes only the pre-dot-product Q/K compression and must be attributable
+# on each host it is stacked on, not inferred from one row. Each entry is a
+# clean triple: the same host norm with QK off, with the fixed tanh DyT-QK
+# compression on, and with the standard per-head QK-Norm comparator. The
+# checker below requires that both transitions change exactly `qk_norm`.
+QK_AXIS_SPEC = {
+    'ln': {'off': 'ln_baseline', 'on': 'ln_qk', 'comparator': 'ln_qknorm'},
+    'rmsnorm': {'off': 'rmsnorm_baseline', 'on': 'rmsnorm_qk',
+                'comparator': 'rmsnorm_qknorm'},
+    'dytcd': {'off': 'dytcd_full', 'on': 'dytcd_qk',
+              'comparator': 'dytcd_qknorm'},
+}
+
 # A complete 2x2 factorial for the two axes the main proposal combines. The
 # four cells all use tanh, the same LayerScale residual and the same scalar
 # initialization context, so the only moving parts are the per-channel factor
@@ -439,6 +453,54 @@ def check_factorial(rows: dict, model_name: str, spec: dict | None=None) -> dict
         raise ValueError('factorial coverage is incomplete: ' + '; '.join(problems))
     return report
 
+def check_qk_axis(rows: dict, model_name: str, spec: dict | None=None) -> dict:
+    """Verify the QK-compression axis is isolated on every host norm.
+
+    QK compression is a separate research axis from the normalization layer,
+    so its effect must be measured by switching *only* `qk_norm` on a host
+    whose weights/initialization are otherwise identical. This checks the
+    off/on pair and the QK-Norm comparator for each host, rejecting a triple
+    that also changes depth, initialization or the optimizer protocol.
+    """
+    spec = QK_AXIS_SPEC if spec is None else spec
+    problems: list[str] = []
+    report: dict = {}
+    for host, info in spec.items():
+        off_name, on_name = info['off'], info['on']
+        cmp_name = info['comparator']
+        missing = [name for name in (off_name, on_name, cmp_name) if name not in rows]
+        if missing:
+            problems.append(f"QK axis on '{host}' is missing row(s) {missing}")
+            continue
+        off_cfg = _effective_cfg(model_name, rows[off_name])
+        on_cfg = _effective_cfg(model_name, rows[on_name])
+        cmp_cfg = _effective_cfg(model_name, rows[cmp_name])
+        on_diff = {key for key in set(off_cfg) | set(on_cfg)
+                   if off_cfg.get(key) != on_cfg.get(key)}
+        cmp_diff = {key for key in set(on_cfg) | set(cmp_cfg)
+                    if on_cfg.get(key) != cmp_cfg.get(key)}
+        if on_diff != {'qk_norm'}:
+            problems.append(
+                f"QK axis on '{host}': {on_name} vs {off_name} differ in "
+                f"{sorted(on_diff)}, expected exactly ['qk_norm']")
+            continue
+        if cmp_diff != {'qk_norm'}:
+            problems.append(
+                f"QK comparator on '{host}': {cmp_name} vs {on_name} differ in "
+                f"{sorted(cmp_diff)}, expected exactly ['qk_norm']")
+            continue
+        if on_cfg.get('qk_norm') != 'dytqk':
+            problems.append(
+                f"QK axis on '{host}': {on_name} does not enable the fixed "
+                f"tanh compression (qk_norm={on_cfg.get('qk_norm')!r})")
+            continue
+        report[host] = {'off': off_name, 'on': on_name,
+                        'comparator': cmp_name,
+                        'isolated_field': 'qk_norm'}
+    if problems:
+        raise ValueError('QK-axis coverage is incomplete: ' + '; '.join(problems))
+    return report
+
 def validate_matrix(rows: dict, hypotheses: dict, model_name: str) -> dict:
     """Every static check the matrix must pass before any training starts."""
     missing = []
@@ -451,7 +513,8 @@ def validate_matrix(rows: dict, hypotheses: dict, model_name: str) -> dict:
             f"ablation rows without a stated scientific hypothesis: {sorted(missing)}")
     return {'rows': sorted(rows),
             'leave_one_out': check_leave_one_out(rows, model_name),
-            'factorial': check_factorial(rows, model_name)}
+            'factorial': check_factorial(rows, model_name),
+            'qk_axis': check_qk_axis(rows, model_name)}
 
 def install_outlier_channel(model, scale: float=25.0) -> int:
     with torch.no_grad():
@@ -1958,6 +2021,151 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
         'rows_with_fewer_than_3_seeds': thin,
     }
 
+def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.0,
+                       alpha: float=0.05) -> dict | None:
+    """Attribute the independent QK-compression axis on every host norm.
+
+    The matrix contains a clean QK-off/on pair and a QK-Norm comparator on
+    LN, RMSNorm and the full DyT-CD stack. This function tests each pair with
+    the same seed-paired one-sided test used everywhere else (`H1: on/off
+    lowers held-out loss`) and then reports whether the *direction* of the
+    QK effect replicates across hosts. A single host's point estimate is not
+    evidence that the attention-logits axis generalizes; a host whose seeds
+    do not share the required replication count stays descriptive.
+    """
+    spec = QK_AXIS_SPEC if spec is None else spec
+    usable = {r['name']: r for r in summaries
+              if isinstance(r, dict) and 'name' in r and _finite_metric(r.get('val_loss'))}
+    rows: list = []
+    for host, info in spec.items():
+        pair_specs = (
+            ('qk_vs_off', info['on'], info['off'],
+             'the fixed tanh QK compression lowers loss on this host'),
+            ('qknorm_vs_qk', info['comparator'], info['on'],
+             'the standard per-head QK-Norm comparator lowers loss relative to the fixed tanh QK compression'),
+        )
+        for contrast, cand_name, ref_name, hypothesis in pair_specs:
+            cand, ref = usable.get(cand_name), usable.get(ref_name)
+            entry = {
+                'host': host, 'contrast': contrast,
+                'candidate_row': cand_name, 'reference_row': ref_name,
+                'hypothesis': hypothesis,
+                'candidate_val_loss': None if cand is None else cand['val_loss'],
+                'reference_val_loss': None if ref is None else ref['val_loss'],
+                'delta_candidate_minus_reference': None,
+                'effect_helps': False,
+                'effect_helps_significantly': False,
+                'test': None, 'test_basis': None, 'paired_seeds': [],
+                'replicated_across_seeds': False, 'significance_basis': None,
+                'p_one_sided': None, 'p_one_sided_holm': None,
+                't': None, 'df': None, 'delta_ci_95': None,
+                'n_seeds_favoring': None, 'n_seeds_tied': None,
+                'n_seeds_against': None, 'per_seed_delta': None,
+                'paired_delta_std': None,
+                'minimum_detectable_delta_95_power80': None,
+            }
+            if cand is None or ref is None:
+                missing = [name for name, row in ((cand_name, cand), (ref_name, ref))
+                           if row is None]
+                entry['skipped'] = f"row(s) {missing} have no usable val_loss"
+                rows.append(entry)
+                continue
+            entry['delta_candidate_minus_reference'] = cand['val_loss'] - ref['val_loss']
+            entry['effect_helps'] = bool(entry['delta_candidate_minus_reference'] < -margin)
+            test, basis, common = _paired_row_test(cand, ref, margin=margin)
+            entry['test_basis'] = basis
+            entry['paired_seeds'] = common
+            entry['replicated_across_seeds'] = _basis_counted_in_family(basis, len(common))
+            if test is not None:
+                entry.update({
+                    'test': test['test'], 'p_one_sided': test['p_one_sided'],
+                    't': test['t'], 'df': test['df'],
+                    'delta_ci_95': [test['ci_low'], test['ci_high']],
+                    'n': test['n'],
+                })
+            entry.update(_paired_effect_summary(cand, ref, common, test, alpha=alpha))
+            if entry['test'] is not None and not entry['replicated_across_seeds']:
+                entry['significance_basis'] = (
+                    f'descriptive only: {len(common)} shared seed(s), fewer than the required '
+                    f'{MIN_SEEDS_FOR_SIGNIFICANCE}, so the QK effect cannot be certified; '
+                    'not counted in the Holm family')
+            rows.append(entry)
+    if not rows:
+        return None
+    family = [entry for entry in rows
+              if entry['replicated_across_seeds'] and not entry.get('skipped')]
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
+    for entry, p_holm in zip(family, adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['effect_helps_significantly'] = bool(
+            entry['effect_helps'] and p_holm is not None and p_holm < alpha)
+    # Cross-host replication of the QK-on vs QK-off direction. Only hosts
+    # with a seed-replicated test count as independent replications; a host
+    # tested on one run is reported but cannot make the axis "generalize".
+    replicated_qk = [entry for entry in rows
+                     if entry['contrast'] == 'qk_vs_off'
+                     and entry['replicated_across_seeds']
+                     and entry.get('delta_candidate_minus_reference') is not None]
+    deltas = [entry['delta_candidate_minus_reference'] for entry in replicated_qk]
+    signs = {('negative' if delta < 0 else 'positive' if delta > 0 else 'zero')
+             for delta in deltas}
+    certified_hosts = sorted(entry['host'] for entry in replicated_qk
+                             if entry['effect_helps_significantly'])
+    cross_host = {
+        'hosts_with_replicated_test': sorted(entry['host'] for entry in replicated_qk),
+        'host_deltas': {entry['host']: entry['delta_candidate_minus_reference']
+                        for entry in replicated_qk},
+        'direction_signs': sorted(signs),
+        'direction_consistent_across_hosts': len(signs) == 1 and bool(deltas),
+        'hosts_certified_individually': certified_hosts,
+        'certified_at_multiple_hosts': (len(certified_hosts) >= 2
+                                        and len(signs) == 1),
+        'reading': ('the attention-logits axis is independent of the norm family: a QK effect '
+                    'claimed as general must have the same direction on at least two hosts, and '
+                    'is only certified at multiple hosts when >= 2 hosts pass the Holm-adjusted '
+                    'paired test; a single host is a scope-limited result'),
+    }
+    return {
+        'protocol': ('QK compression is isolated by switching only `qk_norm` on each host; '
+                     'one-sided paired test H1 "on/comparator lowers held-out loss", '
+                     f'certified only with >= {MIN_SEEDS_FOR_SIGNIFICANCE} shared per-seed means, '
+                     'Holm-adjusted across all QK pairs'),
+        'margin': margin,
+        'alpha': alpha,
+        'cross_host_replication': cross_host,
+        'rows': rows,
+        'rows_tested_descriptively_only': [
+            f"{entry['host']}:{entry['contrast']}" for entry in rows
+            if entry.get('test') is not None and not entry['replicated_across_seeds']],
+    }
+
+def print_qk_axis_comparison(comparison: dict | None) -> None:
+    if comparison is None:
+        print('[qk] no QK-axis pair available; nothing to test')
+        return
+    for entry in comparison['rows']:
+        if entry.get('skipped'):
+            print(f"[qk] {entry['host']}/{entry['contrast']}: SKIPPED ({entry['skipped']})")
+            continue
+        p_str = 'n/a' if entry['p_one_sided'] is None else f"{entry['p_one_sided']:.3g}"
+        p_holm = entry.get('p_one_sided_holm')
+        p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
+        ci = entry.get('delta_ci_95')
+        ci_str = '' if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        note = '' if entry['replicated_across_seeds'] else ' [descriptive only, not certified]'
+        print(f"[qk] {entry['host']:>8s} {entry['contrast']:>14s}: "
+              f"delta={entry['delta_candidate_minus_reference']:+.4f}{ci_str} "
+              f"p={p_str} p(holm)={p_holm_str} helps={entry['effect_helps']} "
+              f"significant={entry['effect_helps_significantly']}{note}")
+    cross = comparison.get('cross_host_replication') or {}
+    print(f"[qk] cross-host: {cross.get('host_deltas')} signs={cross.get('direction_signs')} "
+          f"consistent={cross.get('direction_consistent_across_hosts')} "
+          f"certified_hosts={cross.get('hosts_certified_individually')} "
+          f"multi_host={cross.get('certified_at_multiple_hosts')}")
+    if not cross.get('certified_at_multiple_hosts'):
+        print('[qk] NOTE: the QK axis is not certified at multiple hosts; report any effect '
+              'with the host it was measured on (single-host scope), not as a general result')
+
 def print_leave_one_out_comparison(comparison: dict | None) -> None:
     if comparison is None:
         print('[loo] no leave-one-out contrast available; nothing to test')
@@ -2497,6 +2705,15 @@ def main():
         with open(base / 'factorial_comparison.json', 'w') as f:
             json.dump(factorial, f, indent=2)
     print_factorial_comparison(factorial)
+    # The attention-logits axis (DyT-QK) is independent of the normalization
+    # family, so it gets its own per-host attribution and cross-host
+    # replication report instead of being folded into the baseline family.
+    qk_axis = qk_axis_comparison(comparable, margin=args.baseline_margin, alpha=args.alpha)
+    if qk_axis is not None:
+        qk_axis['rows_excluded_protocol_mismatch'] = stale_rows
+        with open(base / 'qk_axis_comparison.json', 'w') as f:
+            json.dump(qk_axis, f, indent=2)
+    print_qk_axis_comparison(qk_axis)
     manifest = dict(run_metadata)
     manifest['git'] = git_revision()
     manifest['hyperparameters'] = vars(args)
@@ -2515,6 +2732,7 @@ def main():
     manifest['baseline_comparison'] = comparison
     manifest['leave_one_out_comparison'] = loo_comparison
     manifest['factorial_comparison'] = factorial
+    manifest['qk_axis_comparison'] = qk_axis
     if sanity_report_path is not None:
         manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
     else:
@@ -2527,6 +2745,7 @@ def main():
         'baseline_comparison': artifact_record(base / 'baseline_comparison.json'),
         'leave_one_out_comparison': artifact_record(base / 'leave_one_out_comparison.json'),
         'factorial_comparison': artifact_record(base / 'factorial_comparison.json'),
+        'qk_axis_comparison': artifact_record(base / 'qk_axis_comparison.json'),
         'sanity_report': file_fingerprint(sanity_report_path) if sanity_report_path else {'enabled': False},
     })
     save_run_manifest(base / 'run_manifest.json', manifest)
