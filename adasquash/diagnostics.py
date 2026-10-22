@@ -349,11 +349,35 @@ def diagnose_train_val_curve(
             "a win: compare the efficiency numbers before claiming the trade",
         ]
     elif train_trend == "falling" and val_trend == "falling":
-        classification = "healthy"
-        recommendations = [
-            "both curves are falling with the gap roughly stable; keep this "
-            "recipe as the comparison point for the next change",
-        ]
+        if gap_change is not None and gap_change > gap_widen:
+            if gap_change_within_noise:
+                classification = "noise_limited"
+                recommendations = [
+                    f"both curves are falling, but the train-validation gap widened "
+                    f"by {gap_change_abs:+.4f}, within {noise_z:g} standard errors "
+                    f"({val_noise_threshold:.4f}) of the held-out mean; the curve "
+                    "cannot yet distinguish a real gap growth from held-out noise",
+                    "keep training and read the next validation passes; increase "
+                    "--val-batches if the interval stays wider than the gap change "
+                    "you need to resolve",
+                ]
+            else:
+                classification = "overfitting"
+                recommendations = [
+                    "validation is still falling, but more slowly than train loss: "
+                    "the train-validation gap is widening beyond the held-out "
+                    "resolution, so the extra training capacity is starting to fit "
+                    "noise; watch --early-stop-patience and add data or regularization",
+                    "verify the split with scripts/audit_data.py before trusting the "
+                    "gap, and compare the efficiency numbers before claiming the "
+                    "deeper/wider model is the better trade",
+                ]
+        else:
+            classification = "healthy"
+            recommendations = [
+                "both curves are falling with the gap roughly stable; keep this "
+                "recipe as the comparison point for the next change",
+            ]
     elif train_trend == "falling" and val_trend == "flat" and gap_change is not None and gap_change > gap_widen:
         if gap_change_within_noise:
             # The gap widened by less than the held-out mean's resolution.
@@ -833,7 +857,8 @@ def classify_nan_stage(evidence: dict) -> dict:
             diagnosis = ("the fp32 forward raised before a finite loss could be measured "
                          f"({evidence['forward_error']})")
         elif evidence.get("fused_forward_error"):
-            diagnosis = ("the fp32 logits path raised "
+            diagnosis = ("the fp32 training path (fused cross-entropy, "
+                         "return_logits=False) raised "
                          f"({evidence['fused_forward_error']})")
         elif evidence.get("fp32_fused_loss_finite") is False:
             diagnosis = ("the fp32 training-path (fused cross-entropy) loss is "
@@ -1072,7 +1097,16 @@ def triage_nonfinite(
 
     # Stage 3: autocast forward (only meaningful where autocast is supported).
     evidence["autocast_forward_finite"] = None
-    if autocast_dtype is not None and device_type == "cuda" and torch.cuda.is_available():
+    if device_type == "cuda":
+        autocast_supported = torch.cuda.is_available()
+    else:
+        try:
+            autocast_supported = bool(torch.amp.is_autocast_available(device_type))
+        except Exception:
+            # Older torch versions lack the query; CPU autocast is the only
+            # non-CUDA backend we can rely on without it.
+            autocast_supported = device_type == "cpu"
+    if autocast_dtype is not None and autocast_supported:
         try:
             with torch.no_grad(), torch.amp.autocast(device_type=device_type, dtype=autocast_dtype):
                 loss_ac = _forward(loss_only=True)
