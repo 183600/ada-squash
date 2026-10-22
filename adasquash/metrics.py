@@ -1441,10 +1441,25 @@ def binary_auc_report(
             f"score matrix has row(s) with {bad_width} columns but {len(classes)} classes"
         )
     cols = list(zip(*rows)) if rows else []
+    # This function ranks each class column itself (it cannot delegate to
+    # `roc_auc`/`average_precision`, which score one column at a time), so it
+    # needs the same finite-score contract. A NaN/Inf has no rank position:
+    # Python's sort leaves it wherever it landed, making the reported AUC
+    # depend on the arbitrary order of the input rows.
+    try:
+        cols = [[float(v) for v in col] for col in cols]
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            "binary_auc_report scores must be finite numbers; a non-numeric "
+            "score has no rank") from None
+    if any(not math.isfinite(v) for col in cols for v in col):
+        raise ValueError(
+            "binary_auc_report scores must be finite numbers; a NaN/Inf score "
+            "has no rank")
     records = []
     skipped = []
     for k, cls in enumerate(classes):
-        col = [float(v) for v in cols[k]] if cols else []
+        col = cols[k] if cols else []
         labels = [g == cls for g in gold]
         n_pos = sum(labels)
         n_neg = len(labels) - n_pos
