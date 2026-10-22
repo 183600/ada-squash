@@ -1068,6 +1068,21 @@ def main():
     # Keep the CLI value identical to the analyzed radius (see `analyze`) so
     # the printed/`config`-recorded topk names the key that is in the summary.
     args.topk = max(1, min(int(args.topk), max(1, int(model.cfg.vocab_size) - 1)))
+    if args.corpus == 'dataset':
+        # When the analysis targets the checkpoint's own dataset/tokenizer
+        # and the CLI left the revision unpinned, inherit the concrete commit
+        # the checkpoint recorded. Loading the default branch instead could
+        # analyze a different upstream snapshot under the same run.
+        if (args.dataset == model_args.get('dataset')
+                and args.dataset_revision is None):
+            args.dataset_revision = (
+                model_args.get('dataset_revision_resolved')
+                or model_args.get('dataset_revision'))
+        if (args.tokenizer == model_args.get('tokenizer')
+                and args.tokenizer_revision is None):
+            args.tokenizer_revision = (
+                model_args.get('tokenizer_revision_resolved')
+                or model_args.get('tokenizer_revision'))
     print(f"[errors] loaded {args.ckpt} | norm={model_args['norm']} | corpus={args.corpus} | device={device}")
     protocol_mismatches = ({}
                            if args.corpus != 'dataset'
