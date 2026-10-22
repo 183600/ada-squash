@@ -118,6 +118,14 @@ DEFAULT_DATA_OPTIONS = {
 _active_data_options = dict(DEFAULT_DATA_OPTIONS)
 
 
+def _is_boolean_scalar(value) -> bool:
+    """Python and NumPy booleans (``np.bool_`` is not a Python bool)."""
+    if isinstance(value, bool):
+        return True
+    cls = type(value)
+    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
 def _int_option(name: str, value, minimum: int, *, allow_none: bool = False):
     """Validate an integer-valued data option without silently coercing it.
 
@@ -127,7 +135,7 @@ def _int_option(name: str, value, minimum: int, *, allow_none: bool = False):
     """
     if value is None and allow_none:
         return None
-    if isinstance(value, bool):
+    if _is_boolean_scalar(value):
         raise ValueError(f"data option {name} must be an integer, got bool {value!r}")
     try:
         converted = int(value)
@@ -153,7 +161,7 @@ def _bool_option(name: str, value) -> bool:
 
 
 def _fraction_option(name: str, value) -> float:
-    if isinstance(value, bool):
+    if _is_boolean_scalar(value):
         raise ValueError(f"data option {name} must be a fraction, got {value!r}")
     try:
         converted = float(value)

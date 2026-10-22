@@ -758,6 +758,14 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
     return result
 
 
+def _is_boolean_scalar(value) -> bool:
+    """Python and NumPy booleans (``np.bool_`` is not a Python bool)."""
+    if isinstance(value, bool):
+        return True
+    cls = type(value)
+    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
 def _strict_int_option(value, name: str, minimum: int) -> int:
     """An integer-valued measurement, rejecting bools and fractional values.
 
@@ -766,7 +774,7 @@ def _strict_int_option(value, name: str, minimum: int) -> int:
     report still looks like it described the requested protocol. A bool is
     not a count either.
     """
-    if isinstance(value, bool):
+    if _is_boolean_scalar(value):
         raise ValueError(f"{name} must be an integer, got bool {value!r}")
     try:
         converted = int(value)
@@ -791,7 +799,7 @@ def packed_window_count(tokens, seq_len: int) -> int | None:
     """
     if tokens is None:
         return None
-    if isinstance(tokens, bool):
+    if _is_boolean_scalar(tokens):
         raise ValueError(f"token count must be numeric or None, got {tokens!r}")
     try:
         tokens = int(math.floor(float(tokens)))
