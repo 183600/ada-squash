@@ -1344,8 +1344,12 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     else:
         add('hypotheses', 'pass', f'all {len(names)} rows state a hypothesis')
 
-    margin_value = _finite_float(margin or 0.0)
-    equivalence_value = _finite_float(equivalence_margin or 0.0)
+    # `margin or 0.0` silently turned malformed falsy values (False, "",
+    # []) into the legitimate "no margin specified" case. Only an actual
+    # None means unspecified; every other value goes through validation.
+    margin_value = 0.0 if margin is None else _finite_float(margin)
+    equivalence_value = (0.0 if equivalence_margin is None
+                         else _finite_float(equivalence_margin))
     if margin_value is None or equivalence_value is None:
         margin = equivalence_margin = float('nan')
     else:
