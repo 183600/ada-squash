@@ -65,7 +65,7 @@ def build_command(python: str, script: Path, scale: dict, passthrough: list[str]
 
 def summarise_scales(scales: list[dict], base: Path, candidate: str,
                      reference: str, metric: str | None = None,
-                     min_scales: int = 2) -> dict:
+                     min_scales: int = 2, alpha: float = 0.05) -> dict:
     entries = []
     for scale in scales:
         path = base / scale['name'] / 'norm_comparison.json'
@@ -85,7 +85,8 @@ def summarise_scales(scales: list[dict], base: Path, candidate: str,
             f'{reference!r}' + (f' on metric {metric!r}' if metric else '')
             + '; the per-scale comparisons do not contain that contrast')
     from adasquash.metrics import scale_replication_summary
-    summary = scale_replication_summary(observations, min_scales=min_scales)
+    summary = scale_replication_summary(observations, min_scales=min_scales,
+                                        alpha=alpha)
     return {
         'candidate': candidate,
         'reference': reference,
@@ -114,6 +115,8 @@ def main(argv=None) -> None:
                    help='metric to follow in every comparison (default: every metric)')
     p.add_argument('--min-scales', type=int, default=2,
                    help='distinct scales required before calling the effect replicated')
+    p.add_argument('--alpha', type=float, default=0.05,
+                   help='significance level for the pooled CI and heterogeneity test')
     p.add_argument('--output-dir', default='runs/moe-scale',
                    help='base directory; each scale writes <base>/<name>/')
     p.add_argument('--python', default=sys.executable)
@@ -124,6 +127,8 @@ def main(argv=None) -> None:
         passthrough = passthrough[1:]
     if args.min_scales < 2:
         p.error('--min-scales must be >= 2; one scale cannot replicate')
+    if not 0.0 < args.alpha < 1.0:
+        p.error('--alpha must be strictly between 0 and 1')
     bad = [token for token in passthrough
            if token.split('=', 1)[0] in _FORBIDDEN_PASSTHROUGH]
     if bad:
@@ -166,7 +171,8 @@ def main(argv=None) -> None:
             raise SystemExit(f"[moe-scale] scale {scale['name']} failed "
                              f"(exit {proc.returncode}); no cross-scale verdict is written")
     report = summarise_scales(scales, base, args.pair[0], args.pair[1],
-                              metric=args.metric, min_scales=args.min_scales)
+                              metric=args.metric, min_scales=args.min_scales,
+                              alpha=args.alpha)
     output = base / 'scale_replication.json'
     with open(output, 'w') as f:
         json.dump(report, f, indent=2)

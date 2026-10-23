@@ -665,7 +665,7 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
                               'ci_high': t.get('ci_high'),
                               'df': t.get('df'),
                               'ci_level': t.get('ci_level')})
-    scale_replication = scale_replication_summary(scale_obs)
+    scale_replication = scale_replication_summary(scale_obs, alpha=alpha)
     degradation = []
     for label, r in zip(labels, results):
         vals = _seed_metric_values(r, metric)

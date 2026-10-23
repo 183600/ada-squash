@@ -1291,6 +1291,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 't': None,
                 'df': None,
                 'delta_ci_95': None,
+                'ci_level': None,
                 'n_seeds_favoring': None,
                 'n_seeds_tied': None,
                 'n_seeds_against': None,
@@ -1310,6 +1311,10 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 entry['t'] = test['t']
                 entry['df'] = test['df']
                 entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
+                # The interval is a 1-alpha interval, not always 95%; record
+                # its level so the meta-analysis inverts it with the correct
+                # critical value instead of assuming 0.95.
+                entry['ci_level'] = test['ci_level']
                 deltas = [cand - ref for cand, ref in zip(cand_values, ref_values)]
                 stats = mean_std_stderr(deltas)
                 entry.update({
@@ -1391,7 +1396,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                               'ci_high': ci[1],
                               'df': entry.get('df'),
                               'ci_level': entry.get('ci_level')})
-    out['scale_replication'] = scale_replication_summary(scale_obs)
+    out['scale_replication'] = scale_replication_summary(scale_obs, alpha=alpha)
     out['certified_norms'] = sorted({entry['norm'] for entry in family
                                      if entry['beats_reference_significantly']})
     described = [entry['name'] for entry in out['rows']
