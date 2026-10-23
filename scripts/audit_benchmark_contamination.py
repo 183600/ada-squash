@@ -284,10 +284,13 @@ def _write_ledger(path: Path, hashes: set, *, exhaustive: bool, n_docs: int):
         "purpose": "training-side benchmark decontamination",
     }
     if not exhaustive:
+        coverage = (f"the first {n_docs} scanned training documents" if n_docs
+                    else "only the scanned training documents")
         print(
-            f"[decontam] WARNING: the exclusion ledger covers only the first "
-            f"{n_docs} scanned training documents; contamination outside that "
-            f"prefix is not removed. Re-run with --n-docs 0 for a full ledger.",
+            f"[decontam] WARNING: the exclusion ledger is incomplete: it covers "
+            f"{coverage}; contamination outside the scanned documents is not "
+            f"removed. Re-run with --n-docs 0 and a tokenizer that accepts every "
+            f"document for a full ledger.",
             file=sys.stderr)
     return info
 
@@ -365,6 +368,9 @@ def _scan_training(args, tokenizer, index):
     )
     report_scan["documents_read"] = documents_read
     report_scan["tokenization_errors"] = tokenization_errors
+    if tokenization_errors:
+        report_scan["exhaustive"] = False
+        report_scan["lower_bound"] = True
     report_scan["n_docs_limit"] = int(args.n_docs)
     report_scan["cleaning_stats"] = cleaner.report()
     return report_scan, split_report
@@ -520,6 +526,11 @@ def main(argv=None) -> int:
         problems.append(
             f"{scan['contaminated_documents']} training document(s) overlap a "
             "downstream benchmark; --fail-on-any-contamination was requested")
+    if scan.get("tokenization_errors"):
+        problems.append(
+            f"{scan['tokenization_errors']} cleaned training document(s) could "
+            "not be tokenized and were not scanned; the audit and any training "
+            "exclusion ledger are incomplete")
     if scan["documents_scanned"] == 0:
         problems.append(
             "no cleaned training document was scanned; check --n-docs, the split "
