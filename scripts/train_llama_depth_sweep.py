@@ -1576,6 +1576,13 @@ def main():
     multi = len(seeds) > 1
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
+    # Root-level artifacts from a previous invocation must not survive a
+    # launcher that dies before re-writing them: a stale comparison/order
+    # audit would then look like the current grid's result (the per-cell
+    # aggregates are already invalidated below for the same reason).
+    for stale_name in ('sweep_comparisons.json', 'run_order_audit.json',
+                       'run_schedule.json'):
+        (base / stale_name).unlink(missing_ok=True)
     # Every child written by this invocation carries this id in its launch
     # spec; aggregation refuses manifests from another sweep even when the
     # cell directory still exists from an earlier run.
