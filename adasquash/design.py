@@ -1246,11 +1246,11 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
         'shortfall_pairs': (None if required_planned is None
                             else max(0, required_planned - n_pairs)),
         'minimum_detectable_delta_unadjusted': planned_unadjusted[
-            'minimum_detectable_delta_95_power80'],
+            'minimum_detectable_delta'],
         'minimum_detectable_delta_family_adjusted': planned_summary[
-            'minimum_detectable_delta_95_power80'],
+            'minimum_detectable_delta'],
         'minimum_detectable_delta_after_attrition': (
-            effective_summary['minimum_detectable_delta_95_power80']
+            effective_summary['minimum_detectable_delta']
             if effective_summary else None),
         'adequately_powered_unadjusted': adequate_unadjusted,
         'adequately_powered_family_adjusted': adequate_adjusted,

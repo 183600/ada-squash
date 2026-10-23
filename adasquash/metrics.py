@@ -814,7 +814,12 @@ def paired_design_summary(std: float, n: int, margin: float = 0.0,
         "n": n,
         "alpha": float(alpha),
         "power_target": float(power),
-        "minimum_detectable_delta_95_power80": _paired_mde(std, n, alpha, power),
+        # The legacy key promises 95% confidence / 80% power, so it must not
+        # silently become the caller's alpha/power when those are overridden.
+        "minimum_detectable_delta_95_power80": _paired_mde(std, n, 0.05, 0.8),
+        "minimum_detectable_delta": _paired_mde(std, n, alpha, power),
+        "minimum_detectable_alpha": float(alpha),
+        "minimum_detectable_power": float(power),
         "margin": None,
         "required_pairs_for_margin": None,
         "adequately_powered_for_margin": None,
@@ -1152,12 +1157,15 @@ def paired_trend_test(
         "mean_slope_per_dose": None,
         "slope_std": None,
         "slope_ci_95": [None, None],
+        "slope_ci": [None, None],
         "ci_level": 1.0 - float(alpha),
         "t": None,
         "df": None,
         "p_one_sided": None,
         "minimum_detectable_slope_95_power80": None,
+        "minimum_detectable_slope": None,
         "slope_prediction_interval_95": [None, None],
+        "slope_prediction_interval": [None, None],
         "slope_same_direction_probability": None,
         "mean_r_squared": None,
         "n_seeds_with_negative_slope": None,
@@ -1251,11 +1259,17 @@ def paired_trend_test(
     out["slope_std"] = stats["std"]
     slope_replication = mean_prediction_interval(slopes, alpha=alpha)
     if slope_replication is not None:
-        out["slope_prediction_interval_95"] = [
+        out["slope_prediction_interval"] = [
             slope_replication["prediction_low"],
             slope_replication["prediction_high"]]
         out["slope_same_direction_probability"] = (
             slope_replication["same_direction_probability"])
+    slope_replication_95 = (slope_replication if float(alpha) == 0.05
+                            else mean_prediction_interval(slopes, alpha=0.05))
+    if slope_replication_95 is not None:
+        out["slope_prediction_interval_95"] = [
+            slope_replication_95["prediction_low"],
+            slope_replication_95["prediction_high"]]
     # Average over the fits themselves, not over the string-keyed output dict:
     # that keeps the mean correct even if two labels ever normalize together.
     out["mean_r_squared"] = (
@@ -1273,13 +1287,25 @@ def paired_trend_test(
         "t": test["t"],
         "df": test["df"],
         "p_one_sided": test["p_one_sided"],
-        "slope_ci_95": [test["ci_low"], test["ci_high"]],
+        "slope_ci": [test["ci_low"], test["ci_high"]],
         "ci_level": test["ci_level"],
     })
+    # The legacy `_95` keys are read by older reports; keep them at their
+    # named 95% / 80% defaults and expose the configured-alpha interval and
+    # MDE under the unsuffixed names.
+    if float(alpha) == 0.05:
+        out["slope_ci_95"] = [test["ci_low"], test["ci_high"]]
+    elif test.get("df"):
+        test_95 = paired_t_one_sided(slopes, [0.0] * n, alpha=0.05)
+        out["slope_ci_95"] = [test_95["ci_low"], test_95["ci_high"]]
     if stats is not None and stats["stderr"] is not None and test["df"]:
+        df = float(test["df"])
+        out["minimum_detectable_slope"] = (
+            (student_t_ppf(1.0 - float(alpha), df)
+             + student_t_ppf(0.8, df)) * stats["stderr"])
         out["minimum_detectable_slope_95_power80"] = (
-            (student_t_ppf(1.0 - float(alpha), float(test["df"]))
-             + student_t_ppf(0.8, float(test["df"]))) * stats["stderr"])
+            (student_t_ppf(0.95, df) + student_t_ppf(0.8, df))
+            * stats["stderr"])
     out["advantage_grows_with_dose"] = bool(
         out["certifiable"] and out["mean_slope_per_dose"] is not None
         and out["mean_slope_per_dose"] < 0.0
