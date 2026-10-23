@@ -942,8 +942,14 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                     # A missing step is unknown, not evidence that every seed
                     # stopped at the same fixed step. Without both numbers the
                     # aggregate cannot certify the fixed-step comparison it is
-                    # about to pool.
+                    # about to pool. `final_val_step` only exists when the run
+                    # validated: with `--val-every 0` there is no final held-out
+                    # pass, so its absence is not a malformed manifest (the
+                    # sweep aggregator applies the same guard).
                     for step_key in ('final_step', 'final_val_step'):
+                        if (step_key == 'final_val_step'
+                                and results.get('final_val_loss') is None):
+                            continue
                         step_value = results.get(step_key)
                         if (not isinstance(step_value, int)
                                 or isinstance(step_value, bool) or step_value <= 0):
@@ -952,7 +958,8 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                                 f'{step_value!r}, not a positive integer step; '
                                 'the fixed-step comparison cannot be certified')
                             break
-                if reject_reason is None:
+                if (reject_reason is None
+                        and results.get('final_val_loss') is not None):
                     # The comparable number is the held-out pass *at the
                     # fixed final step*. If validation stopped earlier
                     # (e.g. --max-steps 1200 with --val-every 500 ends at
