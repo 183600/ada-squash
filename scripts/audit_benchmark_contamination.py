@@ -362,13 +362,10 @@ def _scan_training(args, tokenizer, index):
         documents(),
         index,
         max_examples=args.max_examples,
-        # A bounded n_docs scan is exhaustive only when the stream ended
-        # before the cap; otherwise the result describes a prefix.
-        exhaustive=not capped,
     )
     report_scan["documents_read"] = documents_read
     report_scan["tokenization_errors"] = tokenization_errors
-    if tokenization_errors:
+    if capped or tokenization_errors:
         report_scan["exhaustive"] = False
         report_scan["lower_bound"] = True
     report_scan["n_docs_limit"] = int(args.n_docs)
