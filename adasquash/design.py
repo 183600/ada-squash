@@ -379,6 +379,18 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     if not isinstance(schedule, dict) or not isinstance(schedule.get('entries'), list):
         raise ValueError('schedule must be the dict returned by block_randomized_schedule')
     resolve = _arm_resolver(arm_of)
+    # An RCBD run id is `unit::rep=<replicate>`; its treatment/arm is the
+    # `unit` field, not the replicated run id. Without an explicit resolver,
+    # grouping by run id would give every arm one block and falsely reject a
+    # perfectly crossed design. `run_id` is still the identity used for the
+    # realized-order/duplicate checks below.
+    rcbd = schedule.get('schema') == 'adasquash.rcbd_schedule.v1'
+
+    def _arm_of(entry: dict):
+        if arm_of is None and rcbd:
+            return entry.get('unit', entry.get('run_id'))
+        return resolve(entry.get('run_id', entry.get('unit')))
+
     entries = schedule['entries']
     structural: list[str] = []
     if len(entries) != schedule.get('n_units'):
@@ -425,8 +437,17 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     if len(set(units)) != len(units):
         structural.append('duplicate run ids in the realized order')
     raw_order = schedule.get('order')
-    if (positions_valid and isinstance(raw_order, list)
-            and len(raw_order) == len(entries)):
+    if raw_order is not None and not isinstance(raw_order, list):
+        structural.append('recorded order is not a list of run ids')
+    elif isinstance(raw_order, list) and len(raw_order) != len(entries):
+        # A truncated/extended frozen order cannot be compared position by
+        # position. Silence here would certify a schedule whose recorded
+        # allocation and realized entries disagree in size.
+        structural.append(
+            f'recorded order has {len(raw_order)} run id(s) but there are '
+            f'{len(entries)} entries; the frozen schedule and the run records '
+            'describe different allocations')
+    elif positions_valid and isinstance(raw_order, list):
         by_position = sorted(entries, key=lambda entry: entry['position'])
         realized_order = [entry.get('run_id', entry.get('unit'))
                           for entry in by_position]
@@ -440,7 +461,7 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        arm = str(resolve(entry.get('run_id', entry.get('unit'))))
+        arm = str(_arm_of(entry))
         bucket = per_arm.setdefault(arm, {
             'count': 0, 'positions': [], 'blocks': set(), 'early': 0, 'late': 0,
         })
@@ -460,8 +481,9 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     overall_mean = (n - 1) / 2.0 if n else None
     extreme_counts: dict[str, int] = {}
     for arm, bucket in per_arm.items():
-        bucket['mean_position'] = (sum(bucket['positions']) / bucket['count']
-                                   if bucket['count'] else None)
+        bucket['mean_position'] = (
+            sum(bucket['positions']) / len(bucket['positions'])
+            if bucket['positions'] else None)
         bucket['position_span'] = (max(bucket['positions']) - min(bucket['positions'])
                                    if bucket['positions'] else None)
         bucket['blocks'] = sorted(bucket['blocks'])
@@ -474,7 +496,7 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
                 f"arm {arm!r} appears in only one time block "
                 f"({bucket['count']} run(s)); its position is confounded with "
                 f"any block-level drift")
-        if bucket['count'] >= 2 and n:
+        if bucket['count'] >= 2 and n and bucket['mean_position'] is not None:
             dev = abs(bucket['mean_position'] - overall_mean) / max(1.0, n - 1)
             if dev >= 1.0 / 3.0:
                 extreme_counts[arm] = bucket['count']
@@ -493,7 +515,7 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         block = entry.get('block')
         if isinstance(block, bool) or not isinstance(block, int) or block < 0:
             continue
-        arm = str(resolve(entry.get('run_id', entry.get('unit'))))
+        arm = str(_arm_of(entry))
         counts = block_arm_counts.setdefault(block, {})
         counts[arm] = counts.get(arm, 0) + 1
     declared_blocks = schedule.get('n_blocks')
@@ -1274,16 +1296,26 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         checks.append({'id': check_id, 'status': status, 'detail': detail})
 
     seeds = list(seeds or [])
+    min_seeds_valid = (isinstance(min_seeds, int) and not isinstance(min_seeds, bool)
+                       and min_seeds >= 1)
+    if not min_seeds_valid:
+        # A floor of 0 (or a bool) would switch off both the replication check
+        # and the attrition floor; the audit must not certify such a design.
+        add('replication', 'fail',
+            f'invalid min_seeds {min_seeds!r}: must be a positive integer; '
+            f'using {MIN_SEEDS_FOR_SIGNIFICANCE}')
+        min_seeds = MIN_SEEDS_FOR_SIGNIFICANCE
     # The power check must use the number of *distinct* observations the
     # paired test will actually have, not the raw list length (duplicate seeds
     # are the same run and the replication check above rejects them).
     n_pairs = len({seed for seed in seeds
                    if isinstance(seed, int) and not isinstance(seed, bool)})
-    if (len(seeds) < min_seeds or len(set(seeds)) != len(seeds)
+    if min_seeds_valid and (
+            len(seeds) < min_seeds or len(set(seeds)) != len(seeds)
             or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds)):
         add('replication', 'fail',
             f'{len(seeds)} seed(s) {seeds}: need >= {min_seeds} distinct integer seeds')
-    else:
+    elif min_seeds_valid:
         add('replication', 'pass', f'{len(seeds)} distinct seeds: {seeds}')
 
     missing = sorted(name for name in names if not str(hypotheses.get(name) or '').strip())
@@ -1313,10 +1345,17 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
 
     alpha_value = _finite_float(alpha)
     target_power_value = _finite_float(target_power)
+    n_tests_valid = (isinstance(n_confirmatory_tests, int)
+                     and not isinstance(n_confirmatory_tests, bool)
+                     and n_confirmatory_tests >= 1)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
         add('power', 'fail', f'invalid alpha {alpha!r}')
     elif target_power_value is None or not 0.0 < target_power_value < 1.0:
         add('power', 'fail', f'invalid target power {target_power!r}')
+    elif not n_tests_valid:
+        add('power', 'fail',
+            f'invalid n_confirmatory_tests {n_confirmatory_tests!r}: must be a '
+            'positive integer')
     elif assumed_paired_sd is None:
         add('power', 'warn',
             'no assumed paired SD supplied; planned power for the smallest effect '
