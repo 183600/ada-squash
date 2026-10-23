@@ -880,8 +880,13 @@ def main():
             per_seed.append(record)
         r = aggregate_w8a8_seed_rows(label, per_seed)
         # Scale-independent treatment identity for cross-scale replication;
-        # `label` may include the model name to keep within-run arms distinct.
-        r['arm'] = norm
+        # `label` may include the model name to keep within-run arms distinct,
+        # but the arm itself is the norm recorded by the checkpoint (the path
+        # differs at every scale and cannot identify the same treatment).
+        arm_name = (ckpt_args.get('norm') if isinstance(ckpt_args, dict) else None)
+        if not isinstance(arm_name, str) or not arm_name.strip():
+            arm_name = getattr(getattr(model, 'cfg', None), 'norm_name', None)
+        r['arm'] = str(arm_name).strip() if isinstance(arm_name, str) and arm_name.strip() else label
         train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
         r['train_seeds'] = train_seeds
         r['n_train_seeds'] = len(train_seeds)
