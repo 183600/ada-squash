@@ -591,6 +591,23 @@ def main():
             res = evaluate_lm_harness(model, args.tasks, args.batch_size,
                                       tokenizer=tok_name,
                                       tokenizer_revision=tok_revision)
+            if not isinstance(res, dict):
+                raise TypeError(
+                    f'lm-eval returned {type(res).__name__}, not a task mapping')
+            # `evaluate_lm_harness` filters non-numeric fields, so a requested
+            # task can be present yet carry no measured metric (or be absent
+            # entirely). Treat that as a failed request rather than setting
+            # tasks_ran=True on an empty result.
+            missing = [
+                task for task in args.tasks
+                if not isinstance(res.get(task), dict)
+                or not any(isinstance(value, (int, float))
+                           and not isinstance(value, bool)
+                           for value in res[task].values())
+            ]
+            if missing:
+                raise RuntimeError(
+                    f'lm-eval returned no numeric metric for task(s) {missing}')
             results['tasks'].update(res)
             results['tasks_ran'] = True
         except Exception as e:
