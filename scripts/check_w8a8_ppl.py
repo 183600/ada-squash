@@ -78,7 +78,11 @@ def _checkpoint_defaulted(args, parser, ckpt_args: dict, name: str,
     value = getattr(args, name)
     if explicit is not None and name in explicit:
         return value
-    if value == parser.get_default(name) and ckpt_args.get(name) is not None:
+    # Key presence, not truthiness, records the checkpoint's value: a
+    # legitimate `dataset_config=None` (datasets without a config) must stay
+    # None instead of being replaced by the CLI default and probing a
+    # different corpus configuration than the checkpoint was trained on.
+    if isinstance(ckpt_args, dict) and name in ckpt_args:
         return ckpt_args[name]
     return value
 
