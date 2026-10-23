@@ -107,6 +107,10 @@ def _pair_rows_from_fp8_w8a8(data, kind: str) -> list[dict]:
 
 def _observation_from_pair(entry: dict, candidate: str, reference: str,
                            metric: str | None) -> dict | None:
+    if not isinstance(entry, dict):
+        # A malformed/null row is not an observation; skip it instead of
+        # aborting the entire multi-scale report with an AttributeError.
+        return None
     a, b = entry.get('a'), entry.get('b')
     if metric is not None and entry.get('metric') != metric:
         return None
@@ -155,6 +159,8 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
         raise ValueError('moe comparison has no rows list')
     out = []
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         if metric is not None and row.get('metric') != metric:
             continue
         orientation = _pair_orientation(row.get('norm'), row.get('reference'),
@@ -181,7 +187,8 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
             'p_one_sided': (_reported_p(row.get('p_one_sided_holm'),
                                         row.get('p_one_sided'))
                             if orientation == 'candidate_vs_reference' else None),
-            'n_seeds': len(row.get('paired_seeds') or []),
+            'n_seeds': (len(row['paired_seeds'])
+                        if isinstance(row.get('paired_seeds'), list) else None),
             'orientation': orientation,
         })
     return out
