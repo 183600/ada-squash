@@ -778,6 +778,15 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             'tokenizer_revision_resolved': (
                 train_report.get('tokenizer_revision_resolved')
                 or val_report.get('tokenizer_revision_resolved')),
+            # The path alone cannot prove that two norm runs excluded the same
+            # held-out documents: a ledger can be regenerated at the same path
+            # between runs. Record content fingerprints so the cross-norm
+            # guard can compare the actual exclusion set, not its filename.
+            'ledger_fingerprints': {
+                key: (file_fingerprint(getattr(args, key))
+                      if getattr(args, key, None) else None)
+                for key in _MOE_LEDGER_KEYS
+            },
         }
         return result
     finally:
@@ -973,6 +982,9 @@ _MOE_PROTOCOL_KEYS = (
     'exclude_group_file', 'exclude_test_group_file', 'train_shuffle_buffer',
     'val_batches', 'sanity_check',
 )
+_MOE_LEDGER_KEYS = ('exclude_hash_file', 'exclude_test_hash_file',
+                    'exclude_train_hash_file', 'exclude_group_file',
+                    'exclude_test_group_file')
 _MOE_COMPARISON_METRICS = ('val_ce', 'final_expert_cv')
 # Shape fields: a mismatch here means a different model scale, not a recipe drift.
 _MOE_SHAPE_KEYS = frozenset({'n_experts', 'dim', 'n_layers', 'n_heads'})
@@ -1079,11 +1091,23 @@ def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
                 unknown.append((norm, seed))
                 continue
             has_real = True
+            ledgers = provenance.get('ledger_fingerprints')
+            if (not isinstance(ledgers, dict)
+                    or any(key not in ledgers for key in _MOE_LEDGER_KEYS)):
+                # A real-data provenance without the ledger content is as
+                # unauditable as a missing dataset revision: two runs can share
+                # every visible recipe field while excluding different
+                # documents from the same ledger path.
+                unknown.append((norm, seed))
+                continue
             versions = {
                 'dataset_revision_resolved': provenance.get('dataset_revision_resolved'),
                 'tokenizer_revision_resolved': provenance.get('tokenizer_revision_resolved'),
+                'ledger_fingerprints': {key: ledgers[key] for key in _MOE_LEDGER_KEYS},
             }
-            if not all(_is_pinned_revision(value) for value in versions.values()):
+            if not all(_is_pinned_revision(value)
+                       for key, value in versions.items()
+                       if key != 'ledger_fingerprints'):
                 unknown.append((norm, seed))
                 continue
             keys.add(json.dumps(versions, sort_keys=True))
