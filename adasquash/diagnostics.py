@@ -566,12 +566,15 @@ def tensor_finite_report(t: torch.Tensor) -> dict:
     if t.numel() == 0:
         return out
     if t.is_complex():
-        finite = torch.isfinite(t)
-        n_bad = int((~finite).sum().item())
-        out["finite"] = n_bad == 0
-        if n_bad:
-            out["n_nan"] = int(torch.isnan(t).sum().item())
-            out["n_inf"] = n_bad - out["n_nan"]
+        # A complex entry can have a NaN real part and an Inf imaginary part.
+        # Counting the bad entries as `n_bad - n_nan` classified that entry
+        # only as NaN and lost the Inf; count the two symbols independently.
+        n_nan = int(torch.isnan(t).sum().item())
+        n_inf = int(torch.isinf(t).sum().item())
+        out["finite"] = n_nan == 0 and n_inf == 0
+        if not out["finite"]:
+            out["n_nan"] = n_nan
+            out["n_inf"] = n_inf
         else:
             out["abs_max"] = float(t.detach().abs().max().item())
     elif t.is_floating_point():
