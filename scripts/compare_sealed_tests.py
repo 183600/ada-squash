@@ -115,10 +115,9 @@ def load_result(path) -> dict:
             f"[compare] {p} has no 'test_batch_losses': the record is incomplete, so a "
             "paired comparison is impossible. Re-run the sealed evaluation with the "
             "current scripts/train_gpt2.py (--final-test-eval).")
-    if any(isinstance(v, bool) for v in losses):
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in losses):
         raise SystemExit(
-            f"[compare] {p} contains boolean per-batch test losses; a bool is a "
-            "malformed measurement, not a loss")
+            f"[compare] {p} contains non-numeric per-batch test losses; fix the run first")
     try:
         losses = [float(v) for v in losses]
     except (TypeError, ValueError, OverflowError):
