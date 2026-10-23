@@ -4552,6 +4552,12 @@ def main():
                         ('--stats-every', args.stats_every)):
         if value < 1:
             p.error(f'{flag} {value} must be >= 1')
+    if args.seq_len < 2:
+        # The synthetic Markov corpus labels y[:, :-1] = x[:, 1:], so a
+        # one-token window leaves every target at ignore_index and no row can
+        # be trained or checked.
+        p.error(f'--seq-len {args.seq_len} must be >= 2 for next-token '
+                'supervision')
     # A `seed:` supplied by --config is a parser default, not an explicit CLI
     # override: an explicit `--seeds 42 43 44` must not be replaced by one
     # config-seeded value (same precedence rule as train_gpt2.py).

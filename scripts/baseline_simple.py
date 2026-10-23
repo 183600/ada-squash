@@ -799,6 +799,12 @@ def main():
                         ('--val-batches', args.val_batches)):
         if value < 1:
             p.error(f'{flag} {value} must be >= 1')
+    if args.seq_len < 2:
+        # A one-token sequence has no next-token target: the synthetic
+        # generator labels every position ignore_index, so no baseline/HMM
+        # statistic or supervised loss can be computed.
+        p.error(f'--seq-len {args.seq_len} must be >= 2 for next-token '
+                'supervision')
     if args.n_states < 1:
         p.error(f'--n-states {args.n_states} must be >= 1')
     if args.max_jump < 1:
