@@ -1005,6 +1005,32 @@ def _moe_ledger_fingerprints(args) -> dict:
                     for field in ('path', 'exists', 'sha256', 'bytes')}
     return out
 
+
+def _moe_ledger_payload_valid(value) -> bool:
+    """Whether one recorded ledger fingerprint proves its content identity.
+
+    No ledger is complete (None). An existing-file record must include a
+    non-empty content hash and byte count; `exists: False` is complete without
+    them. A partial dict cannot be compared as if its content were known.
+    """
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    path = value.get('path')
+    exists = value.get('exists')
+    if not isinstance(path, str) or not path:
+        return False
+    if exists is False:
+        return True
+    if exists is not True:
+        return False
+    sha = value.get('sha256')
+    nbytes = value.get('bytes')
+    return (isinstance(sha, str) and bool(sha)
+            and isinstance(nbytes, int) and not isinstance(nbytes, bool)
+            and nbytes >= 0)
+
 _MOE_COMPARISON_METRICS = ('val_ce', 'final_expert_cv')
 # Shape fields: a mismatch here means a different model scale, not a recipe drift.
 _MOE_SHAPE_KEYS = frozenset({'n_experts', 'dim', 'n_layers', 'n_heads'})
@@ -1113,11 +1139,14 @@ def _moe_data_version_guard(cells: dict) -> tuple[bool, str]:
             has_real = True
             ledgers = provenance.get('ledger_fingerprints')
             if (not isinstance(ledgers, dict)
-                    or any(key not in ledgers for key in _MOE_LEDGER_KEYS)):
+                    or any(key not in ledgers for key in _MOE_LEDGER_KEYS)
+                    or any(not _moe_ledger_payload_valid(ledgers[key])
+                           for key in _MOE_LEDGER_KEYS)):
                 # A real-data provenance without the ledger content is as
                 # unauditable as a missing dataset revision: two runs can share
                 # every visible recipe field while excluding different
-                # documents from the same ledger path.
+                # documents from the same ledger path. A partial payload
+                # (path/existence without a content hash) is not proof either.
                 unknown.append((norm, seed))
                 continue
             versions = {

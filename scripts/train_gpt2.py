@@ -815,8 +815,26 @@ def _manifest_ledger_fingerprints(manifest: dict):
         if value is None:
             out[name] = None
         elif isinstance(value, dict):
-            out[name] = {key: value.get(key)
-                         for key in ('path', 'exists', 'sha256', 'bytes')}
+            # A partial fingerprint cannot prove content identity. `exists:
+            # False` is complete without hashes (there is no file), but an
+            # existing file must carry a non-empty sha256 and a byte count.
+            path = value.get('path')
+            exists = value.get('exists')
+            if not isinstance(path, str) or not path:
+                return None
+            if exists is False:
+                out[name] = {'path': path, 'exists': False}
+            elif exists is True:
+                sha = value.get('sha256')
+                nbytes = value.get('bytes')
+                if (not isinstance(sha, str) or not sha
+                        or not isinstance(nbytes, int)
+                        or isinstance(nbytes, bool) or nbytes < 0):
+                    return None
+                out[name] = {'path': path, 'exists': True,
+                             'sha256': sha, 'bytes': nbytes}
+            else:
+                return None
         else:
             return None
     return out if present else None
@@ -1796,6 +1814,24 @@ def main():
                                   and not isinstance(raw_step, bool) else 0)
                 prior_provenance = prior.get('provenance')
             del prior
+            same_run = (prior_provenance is not None
+                        and prior_provenance == resume_ckpt.get('provenance'))
+            if not resumed_best and not same_run:
+                # The existing best artifact belongs to another run (or cannot
+                # prove it belongs to this one). Seeding selection from its
+                # loss and leaving the file in place would make the final test
+                # restore weights this run never selected, while the manifest
+                # reports that other run's best scalar. Remove it and let the
+                # resumed run write its own best after a validation improves.
+                print(f'[resume][warn] {best_path} does not belong to the '
+                      'checkpoint being resumed (provenance differs); '
+                      'discarding the stale best artifact', file=sys.stderr)
+                try:
+                    best_path.unlink()
+                except OSError as exc:
+                    print(f'[resume][warn] could not remove stale {best_path}: '
+                          f'{exc}', file=sys.stderr)
+                prior_loss = prior_step = None
             if resumed_best:
                 # The resumed checkpoint is the best artifact the user chose
                 # to continue. If it is from another run, this output dir's
@@ -1903,6 +1939,12 @@ def main():
             print(f'[resume] restored loss-spike counter from n_loss_spikes (n_spikes={loss_spike.n_spikes}, EMA warm restarted)')
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = Path(args.output_dir) / 'train.jsonl'
+    # A resume continues the same run and appends its rows. A fresh run reusing
+    # an old output directory must start a new log: appending would mix two
+    # runs' step numbers and make the manifest's train.jsonl fingerprint
+    # describe a file that contains another run's curve.
+    if not args.resume:
+        log_path.unlink(missing_ok=True)
     log_path.touch()
     # One line-buffered handle for the whole run: each written row stays
     # visible to tail -f / crash inspection.
