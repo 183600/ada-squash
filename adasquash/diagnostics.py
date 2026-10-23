@@ -199,6 +199,11 @@ def diagnose_train_val_curve(
         raise ValueError('curve thresholds must be a mapping')
     thresholds = {**DEFAULT_CURVE_THRESHOLDS, **(thresholds or {})}
     window = _threshold_int(thresholds.get("window"), "window", 1)
+    # A relative change needs two points. `relative_change` already enforces
+    # this, but the validation-noise gate used to use the raw `window`, so
+    # window=1 computed a trend from two points while leaving `val_change`
+    # and the noise threshold None and calling the same curve overfitting.
+    effective_window = max(2, window)
     min_imp = _threshold_float(
         thresholds.get("min_rel_improvement"), "min_rel_improvement", 0.0)
     worsen = _threshold_float(
@@ -282,6 +287,7 @@ def diagnose_train_val_curve(
             "n_train_points": len(raw_train),
             "n_val_points": len(raw_val),
             "window": window,
+            "effective_window": effective_window,
             "thresholds": dict(thresholds),
             "n_nonfinite_train_points": len(bad_train),
             "n_nonfinite_val_points": len(bad_val),
@@ -322,7 +328,7 @@ def diagnose_train_val_curve(
     train_trend = _trend(train_rel, min_imp, worsen)
     val_trend = _trend(val_rel, min_imp, worsen)
 
-    tail_len = min(window, len(val_losses))
+    tail_len = min(effective_window, len(val_losses))
     val_change = (val_losses[-1] - val_losses[-tail_len]) if tail_len >= 2 else None
     val_noise = None
     if (val_stderr_series is not None and tail_len >= 2
@@ -343,7 +349,7 @@ def diagnose_train_val_curve(
     # the validation-difference noise. Without this check a flat val curve
     # with a wide stderr can produce an "overfitting" verdict from a gap move
     # the held-out sample cannot resolve.
-    gap_tail_len = min(window, len(gap_points))
+    gap_tail_len = min(effective_window, len(gap_points))
     gap_change_abs = (gap_points[-1] - gap_points[-gap_tail_len]
                       if gap_tail_len >= 2 else None)
     # A gap that hovers around zero can flip sign and produce a huge *relative*
@@ -511,10 +517,10 @@ def diagnose_train_val_curve(
     )
     out["evidence"].update(
         {
-            "train_steps_tail": train_steps[-window:],
-            "val_steps_tail": val_steps[-window:],
-            "train_losses_tail": train_losses[-window:],
-            "val_losses_tail": val_losses[-window:],
+            "train_steps_tail": train_steps[-effective_window:],
+            "val_steps_tail": val_steps[-effective_window:],
+            "train_losses_tail": train_losses[-effective_window:],
+            "val_losses_tail": val_losses[-effective_window:],
             "log_vocab_size": log_vocab_size,
             "gap_alignment": gap_alignment,
             "gap_points": gap_points,
@@ -603,6 +609,12 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
     ignore_index = int(getattr(getattr(model, "cfg", None), "ignore_index", -100))
     x_report = tensor_finite_report(x)
     y_report = tensor_finite_report(y)
+    # GPT's forward and the cross-entropy both require one target per input
+    # position. A zero-length/mismatched pair is a data-pipeline shape error;
+    # letting it reach the model turns the resulting reshape exception into a
+    # misleading fp32-math diagnosis in `triage_nonfinite`.
+    shape_valid = (tuple(x.shape) == tuple(y.shape)
+                   and x.numel() > 0 and y.numel() > 0)
 
     def _integer_ids(t: torch.Tensor) -> bool:
         # Embedding and cross-entropy both index with these tensors; a float
@@ -650,10 +662,14 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
         "target_dtype_valid": bool(target_dtype_ok),
         "targets_valid": bool(targets_valid),
         "input_token_ids_valid": bool(tokens_valid),
+        "input_target_shapes": [list(x.shape), list(y.shape)],
+        "input_target_shape_matches": bool(shape_valid),
         "loss_mask_nonempty": mask_count > 0,
         "loss_mask_tokens": mask_count,
         "loss_denominator_positive": mask_count > 0,
-        "data_finite": bool(x_report["finite"] and y_report["finite"] and targets_valid and tokens_valid and mask_count > 0),
+        "data_finite": bool(x_report["finite"] and y_report["finite"]
+                            and targets_valid and tokens_valid and shape_valid
+                            and mask_count > 0),
     }
 
 
