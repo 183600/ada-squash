@@ -259,7 +259,8 @@ def mcnemar_test(n_fixed: int, n_broke: int) -> dict:
     out["p_one_sided"] = p_ge
     out["p_two_sided"] = min(1.0, 2.0 * min(p_ge, p_le))
     out["favors"] = "candidate" if n_fixed > n_broke else ("reference" if n_broke > n_fixed else "tied")
-    out["normal_z_continuity_corrected"] = (abs(n_fixed - n_broke) - 1.0) / math.sqrt(n)
+    out["normal_z_continuity_corrected"] = max(
+        0.0, (abs(n_fixed - n_broke) - 1.0) / math.sqrt(n))
     out["note"] = (
         "p_one_sided = P(Binomial(n_discordant, 0.5) >= n_fixed); the exact test "
         "is the small-discordant-count reference (the normal approximation is "
