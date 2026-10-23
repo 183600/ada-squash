@@ -506,6 +506,12 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
     0.2% drop under a 0.5% seed spread is never sold as a real degradation.
     """
     labels = [str(r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
+    # `ckpt`/label includes the per-scale path, so it cannot identify the same
+    # arm pair at another model scale. Keep a scale-independent arm id for the
+    # cross-scale replication buckets (falling back to the display label when
+    # a caller supplies no arm metadata).
+    arms = [str(r.get('arm') or r.get('norm') or labels[i])
+            for i, r in enumerate(results)]
     scales = [_result_scale(r, i) for i, r in enumerate(results)]
     tests = []
     for i in range(len(results)):
@@ -514,7 +520,8 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
             b_train = _train_seed_metric_values(results[j], metric)
             shared_train = sorted(set(a_train) & set(b_train))
             shared, av, bv = _shared_seed_samples(results[i], results[j], metric)
-            t = {'a': labels[i], 'b': labels[j], 'metric': metric,
+            t = {'a': labels[i], 'b': labels[j],
+                 'a_arm': arms[i], 'b_arm': arms[j], 'metric': metric,
                  'a_scale': scales[i], 'b_scale': scales[j],
                  'same_scale': scales[i] == scales[j],
                  'direction': f'negative mean_delta means A has lower {metric} (more W8A8-robust)',
@@ -578,7 +585,7 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
     for t in tests:
         if t.get('same_scale') and t.get('mean_delta') is not None:
             scale_obs.append({'scale': t.get('a_scale'), 'metric': t.get('metric'),
-                              'contrast': f"{t.get('a')} vs {t.get('b')}",
+                              'contrast': (f"{t.get('a_arm')} vs {t.get('b_arm')}"),
                               'delta': t.get('mean_delta'),
                               'certified': bool(t.get('significant')),
                               'p_one_sided': t.get('p_holm', t.get('p_one_sided')),
@@ -722,6 +729,10 @@ def main():
         if args.probe == 'random':
             x = _probe_random(rng, cfg.vocab_size, args.batch_size, args.seq_len, device)
         else:
+            if args.n_states > int(cfg.vocab_size):
+                raise SystemExit(
+                    f'[w8a8] --n-states {args.n_states} exceeds the model vocabulary '
+                    f'({int(cfg.vocab_size)}); the Markov probe would emit out-of-range ids')
             x = _probe_markov(rng, args.batch_size, args.seq_len, device, n_states=args.n_states)
         return x, _next_token_targets(x, cfg.ignore_index)
     explicit_cli = _explicit_cli_names(sys.argv[1:], p)
@@ -868,6 +879,9 @@ def main():
             record['n_checkpoints'] = len(per_ckpt)
             per_seed.append(record)
         r = aggregate_w8a8_seed_rows(label, per_seed)
+        # Scale-independent treatment identity for cross-scale replication;
+        # `label` may include the model name to keep within-run arms distinct.
+        r['arm'] = norm
         train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
         r['train_seeds'] = train_seeds
         r['n_train_seeds'] = len(train_seeds)

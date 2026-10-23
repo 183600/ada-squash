@@ -181,11 +181,15 @@ def data_protocol_mismatches(args, model_args: dict) -> dict:
     # requested) identity on both sides, and still flag a genuinely different
     # commit.
     for key in ('dataset_revision', 'tokenizer_revision'):
-        if key not in model_args:
+        resolved_key = key + '_resolved'
+        if key not in model_args and resolved_key not in model_args:
             out[key] = {'checkpoint': '<missing>', 'analysis': current[key]}
             continue
-        checkpoint_effective = (model_args.get(key + '_resolved')
-                                or model_args.get(key))
+        # Prefer the concrete resolved commit even when the checkpoint did
+        # not also record the requested branch/tag.
+        checkpoint_effective = (model_args.get(resolved_key)
+                                if resolved_key in model_args
+                                else model_args.get(key))
         if checkpoint_effective != current[key]:
             out[key] = {'checkpoint': checkpoint_effective,
                         'analysis': current[key]}

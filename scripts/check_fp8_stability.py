@@ -853,6 +853,10 @@ def main():
     def make_probe(rng, cfg):
         if args.probe == 'random':
             return torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
+        if args.n_states > int(cfg.vocab_size):
+            raise SystemExit(
+                f'[fp8] --n-states {args.n_states} exceeds the model vocabulary '
+                f'({int(cfg.vocab_size)}); markov_batch would emit out-of-range token ids')
         x, _ = markov_batch(rng, cfg.ignore_index, args.batch_size, args.seq_len, device, n_states=args.n_states)
         return x
     ckpt_groups = None
@@ -939,7 +943,11 @@ def main():
                               if c.get('protocol') is not None), None)
         arm_protocol_mismatches = []
         for c in per_ckpt:
-            if c.get('protocol') is None:
+            if c.get('protocol') is None or c.get('protocol') is base_protocol:
+                # Comparing the base checkpoint with itself is not a
+                # disagreement: a single arm with an old/incomplete protocol
+                # must not be marked inconsistent (the same reason the
+                # w8a8 path loops over the remaining checkpoints).
                 continue
             mismatches = _protocol_pair_mismatches(base_protocol, c.get('protocol'))
             if mismatches:

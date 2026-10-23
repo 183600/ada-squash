@@ -88,7 +88,12 @@ def _pair_orientation(a, b, candidate: str, reference: str):
         return 'candidate_vs_reference'
     if reversed_exact:
         return 'reversed'
-    if min(forward) == 0 or min(reversed_) == 0 or forward == reversed_:
+    # A basename match in one orientation necessarily leaves the other
+    # orientation with a zero (distinct basenames cannot match both ways), so
+    # requiring both orientations to be complete made the basename tier
+    # unreachable. Fail closed only when neither orientation is complete or
+    # both are equally good (e.g. both names are `ckpt_best.pt`).
+    if (min(forward) == 0 and min(reversed_) == 0) or forward == reversed_:
         return None
     return 'candidate_vs_reference' if forward > reversed_ else 'reversed'
 
