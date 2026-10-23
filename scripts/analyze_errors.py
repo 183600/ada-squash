@@ -186,10 +186,14 @@ def data_protocol_mismatches(args, model_args: dict) -> dict:
             out[key] = {'checkpoint': '<missing>', 'analysis': current[key]}
             continue
         # Prefer the concrete resolved commit even when the checkpoint did
-        # not also record the requested branch/tag.
-        checkpoint_effective = (model_args.get(resolved_key)
-                                if resolved_key in model_args
-                                else model_args.get(key))
+        # not also record the requested branch/tag. A resolved key that is
+        # present but None (the Hub-unreachable case) must not shadow a
+        # concrete requested revision: `main` inherits the same
+        # `resolved or requested` value, so preferring the None here would
+        # report the checkpoint's own revision as a mismatch.
+        checkpoint_effective = model_args.get(resolved_key)
+        if checkpoint_effective is None:
+            checkpoint_effective = model_args.get(key)
         if checkpoint_effective != current[key]:
             out[key] = {'checkpoint': checkpoint_effective,
                         'analysis': current[key]}
