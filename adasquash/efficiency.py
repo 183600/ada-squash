@@ -395,13 +395,14 @@ def efficiency_verdict(
         verdict["cost_ratio_stderr"] = cost_se
     if cost_n is not None:
         verdict["cost_ratio_n"] = cost_n
-    if cost_se is not None and enough_rounds and invalid_n is None:
-        if cost_n is None:
-            t_crit = 1.96
-            df = None
-        else:
-            df = cost_n - 1
-            t_crit = _t_critical_95(df)
+    # A standard error without a round count has no degrees of freedom, so a
+    # claimed 95% interval would fall back to the anti-conservative normal
+    # critical value. Report no interval and refuse to certify rather than
+    # contradicting the module's small-sample rationale.
+    if (cost_se is not None and cost_n is not None
+            and enough_rounds and invalid_n is None):
+        df = cost_n - 1
+        t_crit = _t_critical_95(df)
         half = t_crit * cost_se
         verdict["cost_ratio_ci_95"] = [max(0.0, cost - half), cost + half]
         verdict["cost_ratio_ci_95_df"] = df
@@ -409,9 +410,11 @@ def efficiency_verdict(
     # round count below 2 has no degrees of freedom: in either case the point
     # estimate cannot prove the cost stays within the cap, so certification
     # must fail closed. A supplied but invalid standard error is not the same
-    # as no uncertainty estimate: it cannot certify anything either.
+    # as no uncertainty estimate: it cannot certify anything either. The same
+    # fail-closed rule applies to a standard error with no round count.
     verdict["cost_uncertainty_certified"] = (
-        False if invalid_se is not None or invalid_n is not None
+        False if (invalid_se is not None or invalid_n is not None
+                  or (cost_se is not None and cost_n is None))
         else None if cost_n is None
         else (cost_se is not None and enough_rounds))
     component_limit = verdict["max_component_ratio"]
@@ -424,7 +427,12 @@ def efficiency_verdict(
             f"cost ratio round count {invalid_n} is not an integer measurement; "
             f"cannot certify the {cost_name} cost")
     elif verdict["cost_uncertainty_certified"] is False:
-        if cost_se is not None:
+        if cost_se is not None and cost_n is None:
+            failure = (
+                f"cost ratio has a standard error but no round count; at least "
+                f"2 paired rounds are needed to form a Student-t interval and "
+                f"certify the {cost_name} cost")
+        elif cost_se is not None:
             failure = (
                 f"cost ratio was measured in {cost_n} round(s); at least 2 "
                 f"paired rounds are needed to certify the {cost_name} cost")
