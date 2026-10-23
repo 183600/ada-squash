@@ -590,9 +590,11 @@ def main():
             raise SystemExit(1)
 
         def _cfg_is_proxy(cfg, norm, row_model=None):
-            if row_model is not None and str(row_model) != str(args.model):
-                # The row was trained on a different model family/scale; its
-                # cost cannot be represented by this benchmark's base model.
+            if row_model is None or str(row_model) != str(args.model):
+                # A missing model is unknown, not the benchmarked base model:
+                # a legacy/minimal cfg must not inherit this benchmark's cost.
+                # A different model family/scale likewise cannot be represented
+                # by this benchmark's base model.
                 return True
             if not isinstance(cfg, dict):
                 return True

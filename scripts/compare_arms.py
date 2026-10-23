@@ -172,6 +172,30 @@ def _data_version_signature(agg: dict):
     return next(iter(signatures))
 
 
+def _data_ledger_signature(agg: dict):
+    """Cross-split ledger identity recorded for every seed, or None if unknown.
+
+    The data *version* says which snapshot the loader requested; the ledger
+    content says which documents that snapshot actually held out after
+    deduplication/exclusion. Two arms can share a version and still validate
+    on different documents if a ledger file changed, so this must be part of
+    the cross-arm protocol identity.
+    """
+    ledgers = agg.get('data_ledgers_by_seed')
+    if not isinstance(ledgers, dict) or not ledgers:
+        return None
+    if not _provenance_covers_seeds(ledgers, agg):
+        return None
+    values = list(ledgers.values())
+    # A missing per-seed ledger record is unknown, not an empty ledger.
+    if any(not isinstance(value, dict) for value in values):
+        return None
+    signatures = {json.dumps(value, sort_keys=True) for value in values}
+    if len(signatures) != 1:
+        return 'MIXED'
+    return next(iter(signatures))
+
+
 _SHAPE_KEYS = ('n_layers', 'dim', 'n_heads')
 
 
@@ -381,11 +405,13 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
     signatures = {name: {'shape': _shape_signature(agg),
                          'final_step': _final_step(agg),
                          'data_version': _data_version_signature(agg),
+                         'data_ledger': _data_ledger_signature(agg),
                          'model': prepared[name]['model']}
                   for name, agg in arms.items()}
     shape_values = {sig['shape'] for sig in signatures.values()}
     step_values = {sig['final_step'] for sig in signatures.values()}
     data_values = {sig['data_version'] for sig in signatures.values()}
+    ledger_values = {sig['data_ledger'] for sig in signatures.values()}
     model_values = {sig['model'] for sig in signatures.values()}
     protocol_problems = []
     def _has_unknown(values) -> bool:
@@ -397,6 +423,10 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         protocol_problems.append(f'final step differs or is unknown: {sorted(map(str, step_values))}')
     if len(data_values) != 1 or _has_unknown(data_values):
         protocol_problems.append(f'data versions differ or are unknown: {sorted(map(str, data_values))}')
+    if len(ledger_values) != 1 or _has_unknown(ledger_values):
+        protocol_problems.append(
+            'cross-split ledger identities differ or are unknown: '
+            f'{sorted(map(str, ledger_values))}')
     if len(model_values) != 1 or _has_unknown(model_values):
         protocol_problems.append(f'model selectors differ or are unknown: {sorted(map(str, model_values))}')
     protocol_ok = not protocol_problems
@@ -412,6 +442,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         pair_problems = []
         for field, label in (('shape', 'model shape'), ('final_step', 'final step'),
                              ('data_version', 'data version'),
+                             ('data_ledger', 'cross-split ledger identity'),
                              ('model', 'model selector')):
             candidate_value = signatures[name][field]
             reference_value = signatures[reference][field]

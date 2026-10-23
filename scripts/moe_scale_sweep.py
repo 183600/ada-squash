@@ -75,6 +75,15 @@ def summarise_scales(scales: list[dict], base: Path, candidate: str,
         entries.append((scale['name'], path))
     observations, sources = build_observations(
         'moe', entries, candidate, reference, metric)
+    if not observations:
+        # The child comparison may have selected a different baseline, so an
+        # unmatched --pair would otherwise produce an empty report and exit 0
+        # ("not multi-scale") instead of saying the requested contrast was
+        # never run.
+        raise SystemExit(
+            f'[moe-scale] no observation found for pair {candidate!r} vs '
+            f'{reference!r}' + (f' on metric {metric!r}' if metric else '')
+            + '; the per-scale comparisons do not contain that contrast')
     from adasquash.metrics import scale_replication_summary
     summary = scale_replication_summary(observations, min_scales=min_scales)
     return {

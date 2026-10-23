@@ -236,12 +236,13 @@ def _evaluated_checkpoint_step(results: dict):
     return None
 
 def _shape_mismatches(ref_manifest: dict, other_manifest: dict,
-                      compare_evaluated_step: bool = True) -> dict:
+                      compare_evaluated_step: bool = True,
+                      compare_final_step: bool = True) -> dict:
     a = ref_manifest.get("results") or {}
     b = other_manifest.get("results") or {}
     missing = "<missing>"
     out = {}
-    for key in ("n_layers", "dim", "n_heads", "final_step"):
+    for key in ("n_layers", "dim", "n_heads"):
         ref_value = a.get(key, missing)
         other_value = b.get(key, missing)
         # Unknown is not equal. Two old manifests that both omit a shape field
@@ -253,6 +254,17 @@ def _shape_mismatches(ref_manifest: dict, other_manifest: dict,
                 or not _positive_shape_int(other_value)
                 or ref_value != other_value):
             out[f"results.{key}"] = [ref_value, other_value]
+    if compare_final_step:
+        # `final_step` is a per-seed outcome when early stopping is enabled,
+        # so cross-seed pairs are allowed to stop at different steps; only the
+        # same-seed pair must agree on the horizon it was compared at.
+        ref_value = a.get("final_step", missing)
+        other_value = b.get("final_step", missing)
+        if (ref_value is missing or other_value is missing
+                or not _positive_shape_int(ref_value)
+                or not _positive_shape_int(other_value)
+                or ref_value != other_value):
+            out["results.final_step"] = [ref_value, other_value]
     if compare_evaluated_step:
         ref_step = _evaluated_checkpoint_step(a)
         other_step = _evaluated_checkpoint_step(b)
@@ -489,9 +501,11 @@ def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
             # agree on it. Requiring every cross-seed pair to match would
             # reject a perfectly paired comparison just because seed 42
             # stopped at step 100 while seed 43 stopped at 110.
+            same_seed = run.get("seed") == ref_run.get("seed")
             mismatches.update(_shape_mismatches(
                 ref_manifest, manifest,
-                compare_evaluated_step=(run.get("seed") == ref_run.get("seed"))))
+                compare_evaluated_step=same_seed,
+                compare_final_step=same_seed))
             if mismatches:
                 recipe_problems.append(
                     f"{ref_run['path']} vs {run['path']}: "

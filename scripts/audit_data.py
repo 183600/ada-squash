@@ -160,7 +160,15 @@ def token_shingles(ids, shingle_size: int = 8) -> set:
     two audit runs compare the same shingles.
     """
     k = _strict_int_option(shingle_size, "shingle_size", 1)
-    tokens = [int(t) + 1 for t in ids]
+    # Exact integer ids only: `int(1.9)`/`int("1")` would silently sketch a
+    # different document than the counter pass, which rejects malformed ids.
+    raw_tokens = list(ids)
+    if any(not isinstance(token, numbers.Integral)
+           or isinstance(token, bool) for token in raw_tokens):
+        raise ValueError(
+            'token_shingles expects exact integer token ids; a float/string/bool '
+            'would be silently truncated')
+    tokens = [int(token) + 1 for token in raw_tokens]
     n = len(tokens)
     if n == 0:
         return set()
@@ -715,6 +723,11 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
 
     def _record_near_dup(doc_index, ids, text) -> None:
         nonlocal near_dup_docs_seen, near_dup_truncated
+        # Match `_add_ids`: malformed token ids are skipped rather than fed to
+        # the sketch, where `int()` would silently truncate them.
+        if any(not isinstance(value, numbers.Integral)
+               or isinstance(value, bool) for value in ids):
+            return
         near_dup_docs_seen += 1
         if near_dup_docs_seen > int(near_dup_max_docs):
             near_dup_truncated = True

@@ -550,6 +550,11 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                      if p['seed'] in invalid_seed_set]
     seeds_without_final = [p['seed'] for p in per_seed
                            if not _finite(p['final_val_loss'])]
+    # `best_val_loss` is a separate selection statistic; a seed with only the
+    # final loss would be silently dropped from the best-loss pool while the
+    # cell still claimed to be seed-complete.
+    seeds_without_best = [p['seed'] for p in per_seed
+                          if not _finite(p['best_val_loss'])]
     # A cell is one architecture. Seeds that report different shapes are not
     # independent replications of the same depth/norm cell and must not be
     # pooled into a certifiable mean. A seed with a missing/None shape field
@@ -578,11 +583,14 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         'missing_seeds': missing_seeds,
         'invalid_seeds': invalid_seeds,
         'seeds_without_final_val_loss': seeds_without_final,
+        'seeds_without_best_val_loss': seeds_without_best,
         'complete': (len(missing_seeds) == 0 and len(invalid_seeds) == 0
                      and not seeds_without_final
+                     and not seeds_without_best
                      and not rejected and data_versions_complete
                      and not data_version_mismatch
-                     and shape_consistent),        'manifest_rejections': rejected,
+                     and shape_consistent),
+        'manifest_rejections': rejected,
         'protocol_verified_by_launch_id': launch_id is not None,
         # A cell is only one data version: if the resolved upstream commits
         # differ across its seeds, the pooled delta mixes snapshots and cannot
