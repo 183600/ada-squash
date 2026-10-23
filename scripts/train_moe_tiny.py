@@ -782,11 +782,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             # held-out documents: a ledger can be regenerated at the same path
             # between runs. Record content fingerprints so the cross-norm
             # guard can compare the actual exclusion set, not its filename.
-            'ledger_fingerprints': {
-                key: (file_fingerprint(getattr(args, key))
-                      if getattr(args, key, None) else None)
-                for key in _MOE_LEDGER_KEYS
-            },
+            'ledger_fingerprints': _moe_ledger_fingerprints(args),
         }
         return result
     finally:
@@ -985,6 +981,25 @@ _MOE_PROTOCOL_KEYS = (
 _MOE_LEDGER_KEYS = ('exclude_hash_file', 'exclude_test_hash_file',
                     'exclude_train_hash_file', 'exclude_group_file',
                     'exclude_test_group_file')
+
+def _moe_ledger_fingerprints(args) -> dict:
+    """Content identity of every ledger role a MoE run consumed.
+
+    Keep only path/existence/content/size: mtime is not content, and a ledger
+    copied or checked out again with identical bytes must not look like a
+    different exclusion set.
+    """
+    out = {}
+    for key in _MOE_LEDGER_KEYS:
+        path = getattr(args, key, None)
+        if not path:
+            out[key] = None
+            continue
+        fingerprint = file_fingerprint(path)
+        out[key] = {field: fingerprint.get(field)
+                    for field in ('path', 'exists', 'sha256', 'bytes')}
+    return out
+
 _MOE_COMPARISON_METRICS = ('val_ce', 'final_expert_cv')
 # Shape fields: a mismatch here means a different model scale, not a recipe drift.
 _MOE_SHAPE_KEYS = frozenset({'n_experts', 'dim', 'n_layers', 'n_heads'})
