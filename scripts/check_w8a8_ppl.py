@@ -657,7 +657,14 @@ def compare_w8a8_checkpoints(results: list, metric: str='ppl_drop_pct', alpha: f
                               'p_one_sided': (p_holm if p_holm is not None
                                               else t.get('p_one_sided')),
                               'n_seeds': t.get('n_shared_train_seeds')
-                              or t.get('n_shared_seeds')})
+                              or t.get('n_shared_seeds'),
+                              # Forward the paired test's interval so the
+                              # multi-scale report can weight each scale by
+                              # its precision, not count signs.
+                              'ci_low': t.get('ci_low'),
+                              'ci_high': t.get('ci_high'),
+                              'df': t.get('df'),
+                              'ci_level': t.get('ci_level')})
     scale_replication = scale_replication_summary(scale_obs)
     degradation = []
     for label, r in zip(labels, results):

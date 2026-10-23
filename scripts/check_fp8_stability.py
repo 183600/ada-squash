@@ -831,7 +831,14 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                               'certified': t.get('significant') is True,
                               'p_one_sided': (p_holm if p_holm is not None
                                               else t.get('p_one_sided')),
-                              'n_seeds': t.get('n_shared_seeds')})
+                              'n_seeds': t.get('n_shared_seeds'),
+                              # Width of the same paired test, forwarded so
+                              # the multi-scale report can pool effects by
+                              # inverse variance instead of voting on signs.
+                              'ci_low': t.get('ci_low'),
+                              'ci_high': t.get('ci_high'),
+                              'df': t.get('df'),
+                              'ci_level': t.get('ci_level')})
     scale_replication = scale_replication_summary(scale_obs)
     ranking = {}
     for metric in metrics:

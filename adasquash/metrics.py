@@ -48,7 +48,15 @@ honest:
   trend, not inferred from a row of significant per-depth deltas:
   `paired_trend_test` fits one slope per seed on the paired deltas and tests
   the mean slope one-sided, so repeated depths within a seed are not
-  pseudo-replicated and a flat advantage is not mistaken for growth.
+  pseudo-replicated and a flat advantage is not mistaken for growth;
+* "the effect replicates across model scales" is not a sign vote. Each scale
+  estimates the same contrast with a different precision, and the scales can
+  disagree by more than their own standard errors. `meta_analysis` pools the
+  per-scale effects by inverse variance (fixed effect), adds a
+  DerSimonian-Laird random-effects estimate, and reports Cochran's Q, I^2 and
+  tau^2 together with a prediction interval for a *new* scale. A pooled
+  number under large heterogeneity is an average of unlike effects, not
+  evidence of one replicated mechanism.
 
 Everything is pure `math` (no scipy/sklearn), so the training scripts can run
 in a minimal environment.
@@ -61,6 +69,7 @@ from typing import Optional, Sequence
 __all__ = [
     "average_precision",
     "binary_auc_report",
+    "chi2_sf",
     "f1_from_counts",
     "holm_adjust",
     "imbalance_report",
@@ -71,6 +80,7 @@ __all__ = [
     "mean_ci",
     "mean_prediction_interval",
     "mean_std_stderr",
+    "meta_analysis",
     "max_p_combination",
     "paired_design_summary",
     "paired_required_n",
@@ -486,6 +496,68 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
     if x < (a + 1.0) / (a + b + 2.0):
         return bt * _betacf(a, b, x) / a
     return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def _gamma_p_series(a: float, x: float) -> float:
+    """Regularized lower incomplete gamma P(a, x) by its power series."""
+    ap = a
+    total = 1.0 / a
+    delta = total
+    for _ in range(10000):
+        ap += 1.0
+        delta *= x / ap
+        total += delta
+        if abs(delta) < abs(total) * 1e-15:
+            break
+    return total * math.exp(-x + a * math.log(x) - math.lgamma(a))
+
+
+def _gamma_q_cf(a: float, x: float) -> float:
+    """Regularized upper incomplete gamma Q(a, x) by Lentz's continued fraction."""
+    tiny = 1e-300
+    b = x + 1.0 - a
+    c = 1.0 / tiny
+    d = 1.0 / b
+    h = d
+    for i in range(1, 10000):
+        an = -i * (i - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-15:
+            break
+    return math.exp(-x + a * math.log(x) - math.lgamma(a)) * h
+
+
+def chi2_sf(x: float, df: float) -> float:
+    """Upper-tail probability P(X >= x) for a chi-square with `df` d.o.f.
+
+    The heterogeneity test in `meta_analysis` needs a chi-square tail, and the
+    repository deliberately has no scipy dependency. This is the standard
+    series / continued-fraction split for the regularized incomplete gamma:
+    use the series for P when ``x/2 < a + 1`` (it converges fast there) and
+    the continued fraction for Q otherwise, so neither tail loses precision.
+    """
+    if not math.isfinite(df) or df <= 0.0:
+        raise ValueError("chi2_sf needs df > 0")
+    if math.isnan(x):
+        raise ValueError("chi2_sf got a NaN statistic")
+    if x <= 0.0:
+        return 1.0
+    if math.isinf(x):
+        return 0.0
+    a = 0.5 * df
+    half = 0.5 * x
+    if half < a + 1.0:
+        return min(1.0, max(0.0, 1.0 - _gamma_p_series(a, half)))
+    return min(1.0, max(0.0, _gamma_q_cf(a, half)))
 
 
 def student_t_cdf(t: float, df: float) -> float:
@@ -1409,8 +1481,309 @@ def welch_t_one_sided(
     return empty
 
 
+_META_EFFECT_KEYS = ('effect', 'delta', 'estimate', 'mean_delta')
+_META_STDERR_KEYS = ('stderr', 'se', 'standard_error')
+
+
+def _meta_study(observation, index: int):
+    """One meta-analytic input record, or the reason it cannot be pooled.
+
+    The effect and its standard error are the only two numbers the pooling
+    needs. Accept the spellings the comparison artifacts already use
+    (`delta`/`mean_delta`, `stderr`/`se`) and, when only a confidence
+    interval is present, invert it with the interval's own level and degrees
+    of freedom instead of assuming a normal 95% interval.
+    """
+    if not isinstance(observation, dict):
+        return None, {'index': index, 'reason': 'not an object'}
+    label = observation.get('label')
+    if label is None:
+        label = observation.get('scale')
+    if label is None:
+        label = observation.get('name')
+    label = str(index if label is None else label)
+
+    effect = None
+    for key in _META_EFFECT_KEYS:
+        value = _as_real(observation.get(key))
+        if value is not None:
+            effect = value
+            break
+    if effect is None or not math.isfinite(effect):
+        return None, {'index': index, 'label': label,
+                      'reason': 'missing or non-finite effect'}
+
+    stderr = None
+    se_basis = 'reported'
+    for key in _META_STDERR_KEYS:
+        value = _as_real(observation.get(key))
+        if value is not None:
+            stderr = value
+            break
+    if stderr is None:
+        low = _as_real(observation.get('ci_low'))
+        high = _as_real(observation.get('ci_high'))
+        if (low is None or high is None or not math.isfinite(low)
+                or not math.isfinite(high) or high <= low):
+            return None, {'index': index, 'label': label,
+                          'reason': ('no finite stderr and no usable '
+                                     'ci_low/ci_high to derive one')}
+        level = _as_real(observation.get('ci_level'))
+        if level is None or not 0.0 < level < 1.0:
+            level = 0.95
+        df = _as_real(observation.get('df'))
+        if df is not None and (not math.isfinite(df) or df <= 0.0):
+            df = None
+        if df is None:
+            n = _as_real(observation.get('n_seeds'))
+            if n is None:
+                n = _as_real(observation.get('n'))
+            if n is not None and math.isfinite(n) and n >= 2.0:
+                df = n - 1.0
+        if df is not None and df > 0.0:
+            critical = student_t_ppf(1.0 - (1.0 - level) / 2.0, df)
+            se_basis = 'ci_t'
+        else:
+            # No df was recorded: use the normal limit only as a labelled
+            # fallback. A caller that knows the design should pass df so the
+            # derived stderr uses the same small-sample reference as the
+            # per-scale test.
+            critical = student_t_ppf(1.0 - (1.0 - level) / 2.0, 1e7)
+            se_basis = 'ci_normal_approx'
+        if not math.isfinite(critical) or critical <= 0.0:
+            return None, {'index': index, 'label': label,
+                          'reason': 'confidence level produced no finite '
+                                    'critical value'}
+        stderr = (high - low) / (2.0 * critical)
+    if stderr is None or not math.isfinite(stderr) or stderr <= 0.0:
+        return None, {'index': index, 'label': label,
+                      'reason': 'stderr must be finite and > 0 for '
+                                'inverse-variance pooling'}
+    return {
+        'label': label,
+        'effect': effect,
+        'stderr': stderr,
+        'se_basis': se_basis,
+        'ci_level': _as_real(observation.get('ci_level')),
+        'source_index': index,
+    }, None
+
+
+def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
+                  min_studies: int = 2) -> dict:
+    """Inverse-variance and random-effects meta-analysis of per-scale effects.
+
+    A multi-scale claim is not a vote on signs. Each model scale estimates the
+    same contrast with a different standard error, and two scales can agree in
+    sign while disagreeing by far more than their own noise. Pooling by
+    inverse variance answers "what is the common effect?"; the
+    DerSimonian-Laird random-effects estimate answers "what is the average
+    effect across the population of scales?"; and Cochran's Q / I^2 / tau^2
+    answer "is there one effect to pool at all?".
+
+    Required per observation: an effect under any of ``effect``, ``delta``,
+    ``estimate`` or ``mean_delta``, and a positive standard error under
+    ``stderr``, ``se`` or ``standard_error``. If the standard error is absent,
+    a finite ``ci_low``/``ci_high`` pair is inverted using ``ci_level``
+    (default 95%) and ``df`` (or ``n_seeds``/``n``); a missing df falls back
+    to the normal limit and is labelled ``ci_normal_approx``. An optional
+    ``label``/``scale``/``name`` identifies the study. Invalid records are
+    excluded with a reason rather than silently shrinking the pool.
+
+    Negative effects are the repository's convention for "candidate better".
+    ``p_one_sided`` is the lower-tail probability of the pooled statistic
+    (small when the pooled effect is negative), and ``p_two_sided`` doubles
+    the smaller tail. Because the number of scales is small, the pooled tests
+    and intervals use Student-t with ``k - 1`` degrees of freedom rather than
+    the normal limit.
+
+    The prediction interval (available with >= 3 studies) adds tau^2 to the
+    squared standard error and uses ``k - 2`` degrees of freedom: it says where
+    the effect at a *new* scale would plausibly land, not where the pooled mean
+    is. It is deliberately wider than the confidence interval.
+
+    This function never certifies a multi-scale claim by itself. A pooled
+    estimate with substantial heterogeneity is an average of unlike effects;
+    the caller must still show that the individual scales pass their own
+    tests and must report the heterogeneity rather than only the pooled
+    number.
+    """
+    alpha = _validate_alpha(alpha)
+    min_studies = _strict_int(min_studies, "min_studies", minimum=2)
+    studies = []
+    excluded = []
+    for index, observation in enumerate(observations or []):
+        record, problem = _meta_study(observation, index)
+        if problem is not None:
+            excluded.append(problem)
+        else:
+            studies.append(record)
+
+    k = len(studies)
+    out = {
+        'test': 'meta_analysis',
+        'method': 'DerSimonian-Laird random effects; inverse-variance fixed effect',
+        'effect_direction': ('negative effect favours the candidate; '
+                             'positive favours the reference'),
+        'alpha': alpha,
+        'ci_level': 1.0 - alpha,
+        'n_studies': k,
+        'min_studies_for_pooling': min_studies,
+        'meaningful': bool(k >= min_studies),
+        'studies': studies,
+        'excluded': excluded,
+        'fixed_effect': None,
+        'random_effects': None,
+        'heterogeneity': None,
+        'prediction_interval': {
+            'level': 1.0 - alpha, 'low': None, 'high': None,
+            'meaningful': False, 'df': None,
+            'note': 'a prediction interval for a new scale needs >= 3 studies',
+        },
+        'n_negative': sum(1 for study in studies if study['effect'] < 0.0),
+        'n_positive': sum(1 for study in studies if study['effect'] > 0.0),
+        'n_zero': sum(1 for study in studies if study['effect'] == 0.0),
+        'direction_consistent': None,
+        'pooled_effect': None,
+        'pooled_effect_source': None,
+        'note': None,
+    }
+    if k == 0:
+        out['note'] = ('no study has a finite effect and a positive stderr; '
+                       'nothing can be pooled')
+        return out
+
+    total_weight = sum(1.0 / study['stderr'] ** 2 for study in studies)
+    weighted_sum = sum(study['effect'] / study['stderr'] ** 2
+                       for study in studies)
+    fixed_pooled = weighted_sum / total_weight
+    fixed_stderr = math.sqrt(1.0 / total_weight)
+    for study in studies:
+        study['fixed_weight'] = 1.0 / study['stderr'] ** 2
+        study['fixed_weight_share'] = study['fixed_weight'] / total_weight
+
+    out['direction_consistent'] = bool(
+        out['n_zero'] == 0 and (out['n_negative'] == k or out['n_positive'] == k))
+
+    fixed = {
+        'pooled_effect': fixed_pooled,
+        'stderr': fixed_stderr,
+        'ci_low': None, 'ci_high': None,
+        't': None, 'df': None,
+        'p_one_sided': None, 'p_two_sided': None,
+    }
+    if k >= 2:
+        df = float(k - 1)
+        critical = student_t_ppf(1.0 - alpha / 2.0, df)
+        fixed.update({
+            'ci_low': fixed_pooled - critical * fixed_stderr,
+            'ci_high': fixed_pooled + critical * fixed_stderr,
+            't': fixed_pooled / fixed_stderr,
+            'df': df,
+        })
+        fixed['p_one_sided'] = student_t_cdf(fixed['t'], df)
+        fixed['p_two_sided'] = two_sided_p_from_t(fixed['t'], df)
+    out['fixed_effect'] = fixed
+
+    heterogeneity = {
+        'q': None, 'df': None, 'p': None,
+        'i_squared': None, 'tau_squared': None, 'tau': None,
+    }
+    tau_squared = 0.0
+    random_pooled = fixed_pooled
+    random_stderr = fixed_stderr
+    if k >= 2:
+        df_q = float(k - 1)
+        q = sum(study['fixed_weight'] * (study['effect'] - fixed_pooled) ** 2
+                for study in studies)
+        i_squared = (max(0.0, (q - df_q) / q) * 100.0) if q > 0.0 else 0.0
+        weight_sq_sum = sum(study['fixed_weight'] ** 2 for study in studies)
+        tau_denominator = total_weight - weight_sq_sum / total_weight
+        if tau_denominator > 0.0:
+            tau_squared = max(0.0, (q - df_q) / tau_denominator)
+        heterogeneity.update({
+            'q': q,
+            'df': df_q,
+            'p': chi2_sf(q, df_q),
+            'i_squared': i_squared,
+            'tau_squared': tau_squared,
+            'tau': math.sqrt(tau_squared),
+        })
+        random_weight = sum(1.0 / (study['stderr'] ** 2 + tau_squared)
+                            for study in studies)
+        random_sum = sum(study['effect'] / (study['stderr'] ** 2 + tau_squared)
+                         for study in studies)
+        random_pooled = random_sum / random_weight
+        random_stderr = math.sqrt(1.0 / random_weight)
+        for study in studies:
+            weight = 1.0 / (study['stderr'] ** 2 + tau_squared)
+            study['random_weight'] = weight
+            study['random_weight_share'] = weight / random_weight
+    out['heterogeneity'] = heterogeneity
+
+    random_effects = {
+        'pooled_effect': random_pooled,
+        'stderr': random_stderr,
+        'ci_low': None, 'ci_high': None,
+        't': None, 'df': None,
+        'p_one_sided': None, 'p_two_sided': None,
+        'tau_squared': tau_squared,
+    }
+    if k >= 2:
+        df = float(k - 1)
+        critical = student_t_ppf(1.0 - alpha / 2.0, df)
+        random_effects.update({
+            'ci_low': random_pooled - critical * random_stderr,
+            'ci_high': random_pooled + critical * random_stderr,
+            't': random_pooled / random_stderr,
+            'df': df,
+        })
+        random_effects['p_one_sided'] = student_t_cdf(
+            random_effects['t'], df)
+        random_effects['p_two_sided'] = two_sided_p_from_t(
+            random_effects['t'], df)
+    out['random_effects'] = random_effects
+    out['pooled_effect'] = random_pooled
+    out['pooled_effect_source'] = 'random_effects'
+
+    if k >= 3:
+        df_pi = float(k - 2)
+        critical = student_t_ppf(1.0 - alpha / 2.0, df_pi)
+        scale = math.sqrt(tau_squared + random_stderr ** 2)
+        out['prediction_interval'] = {
+            'level': 1.0 - alpha,
+            'low': random_pooled - critical * scale,
+            'high': random_pooled + critical * scale,
+            'meaningful': True,
+            'df': df_pi,
+            'note': ('where the effect at a new scale would plausibly fall; '
+                     'wider than the confidence interval for the pooled mean'),
+        }
+
+    i_squared = heterogeneity['i_squared']
+    q_p = heterogeneity['p']
+    if k < min_studies:
+        out['note'] = (
+            f'{k} usable study/studies, fewer than the {min_studies} needed '
+            'to pool: the estimate is descriptive')
+    elif (i_squared is not None and i_squared >= 50.0) or (
+            q_p is not None and q_p < alpha):
+        out['note'] = (
+            'substantial between-scale heterogeneity '
+            f"(I^2={i_squared:.1f}%, Q p={q_p:.3g}): the pooled number is an "
+            'average of unlike effects, so report the per-scale results and '
+            'this heterogeneity rather than a single replicated effect')
+    else:
+        out['note'] = (
+            'no substantial between-scale heterogeneity detected at this '
+            'alpha; the pooled estimate is descriptive and does not replace '
+            'each scale passing its own pre-specified test')
+    return out
+
+
 def scale_replication_summary(observations: Sequence[dict],
-                               min_scales: int = 2) -> dict:
+                               min_scales: int = 2,
+                               alpha: float = 0.05) -> dict:
     """Summarise whether an effect replicates across model scales.
 
     A single-scale result is one observation about one architecture; it is
@@ -1420,12 +1793,25 @@ def scale_replication_summary(observations: Sequence[dict],
     certified. It reports the direction per scale and only calls an effect
     replicated when at least `min_scales` distinct scales agree in sign.
 
+    A sign vote is necessary but not sufficient: the scales can agree while
+    differing by much more than their own noise. Each per-metric block also
+    carries ``meta_analysis`` (see `meta_analysis`), which pools the effects
+    by inverse variance, adds a random-effects estimate, and reports Cochran's
+    Q / I^2 / tau^2 plus a prediction interval for a new scale. That block is
+    only populated when the callers supply a standard error or a usable
+    confidence interval; a sign-only record still contributes to the vote but
+    is listed in the meta-analysis's ``excluded`` list rather than being
+    assigned an invented precision.
+
     Required keys per observation: `scale` (str), `delta` (finite number)
-    and `certified` (bool). Optional: `metric` (str) and `p`/`p_one_sided`.
-    Records with a non-finite delta are excluded from the sign vote but kept
-    in `excluded` so a failed scale is visible rather than silently dropped.
+    and `certified` (bool). Optional: `metric` (str), `contrast`, `stderr`
+    (or `se`), `ci_low`/`ci_high` (+ `df` or `n_seeds`, `ci_level`), and
+    `p`/`p_one_sided`. Records with a non-finite delta are excluded from the
+    sign vote but kept in `excluded` so a failed scale is visible rather than
+    silently dropped.
     """
     min_scales = _strict_int(min_scales, "min_scales", minimum=2)
+    alpha = _validate_alpha(alpha)
     by_metric: dict[str, dict[tuple[str, str, str], dict]] = {}
     duplicates: list[dict] = []
     excluded: list[dict] = []
@@ -1473,6 +1859,14 @@ def scale_replication_summary(observations: Sequence[dict],
             'certified': obs.get('certified') is True,
             'n_seeds': obs.get('n_seeds'),
             'p': obs.get('p_one_sided', obs.get('p')),
+            # Precision for the meta-analytic block. These are optional: a
+            # sign-only observation is still a valid vote, but meta_analysis
+            # will report it as excluded instead of inventing a stderr.
+            'stderr': obs.get('stderr', obs.get('se')),
+            'ci_low': obs.get('ci_low'),
+            'ci_high': obs.get('ci_high'),
+            'df': obs.get('df'),
+            'ci_level': obs.get('ci_level'),
         }
         bucket = by_metric.setdefault(bucket_id, {})
         if key in bucket:
@@ -1508,6 +1902,7 @@ def scale_replication_summary(observations: Sequence[dict],
         # reference anywhere, so the sign vote has no winner to replicate.
         direction_consistent = (len(set(signs)) == 1
                                 and signs[0] in ('negative', 'positive'))
+        pooled = meta_analysis(records, alpha=alpha, min_studies=min_scales)
         per_metric[metric] = {
             'metric': records[0]['metric'] if records else metric,
             'contrast': records[0]['contrast'] if records else None,
@@ -1524,6 +1919,7 @@ def scale_replication_summary(observations: Sequence[dict],
                                           and len(records) >= min_scales
                                           and len(certified) >= min_scales
                                           and len(certified_signs) == 1),
+            'meta_analysis': pooled,
         }
 
     scales = sorted({record['scale'] for bucket in by_metric.values()
@@ -1534,6 +1930,9 @@ def scale_replication_summary(observations: Sequence[dict],
                                 if block['replicated_direction'])
     multi_certified = sorted(metric for metric, block in per_metric.items()
                              if block['multi_scale_certified'])
+    pooled_metrics = sorted(
+        metric for metric, block in per_metric.items()
+        if block.get('meta_analysis') and block['meta_analysis']['meaningful'])
     return {
         'n_scales': len(scales),
         'scales': scales,
@@ -1545,13 +1944,18 @@ def scale_replication_summary(observations: Sequence[dict],
                                  and next(iter(overall_signs)) in ('negative', 'positive')),
         'replicated_metrics': replicated_metrics,
         'multi_scale_certified_metrics': multi_certified,
+        'meta_analysed_metrics': pooled_metrics,
         'per_metric': per_metric,
         'duplicate_observations': duplicates,
         'excluded': excluded,
         'reading': (f'an effect is replicated only when >= {min_scales} distinct model '
                     'scales agree in sign; it is certified across scales only when >= '
                     f'{min_scales} scales individually pass their own test. One scale is '
-                    'a scope-limited result, not a mechanism claim.'),
+                    'a scope-limited result, not a mechanism claim. The per-metric '
+                    '`meta_analysis` block pools the effects by inverse variance and '
+                    'reports between-scale heterogeneity (Q, I^2, tau^2); a pooled '
+                    'number under substantial heterogeneity is an average of unlike '
+                    'effects, not one replicated mechanism.'),
     }
 
 def f1_from_counts(

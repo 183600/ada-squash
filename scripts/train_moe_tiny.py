@@ -1375,13 +1375,22 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
             # p-value that is explicitly None must not hide the raw p-value
             # that the producer did record.
             p_holm = entry.get('p_one_sided_holm')
+            ci = entry.get('delta_ci_95')
+            if not (isinstance(ci, (list, tuple)) and len(ci) == 2):
+                ci = (None, None)
             scale_obs.append({'scale': entry.get('scale'), 'metric': entry.get('metric'),
                               'contrast': entry.get('name'),
                               'delta': entry.get('delta_vs_reference'),
                               'certified': entry.get('beats_reference_significantly') is True,
                               'p_one_sided': (p_holm if p_holm is not None
                                               else entry.get('p_one_sided')),
-                              'n_seeds': len(entry.get('paired_seeds') or [])})
+                              'n_seeds': len(entry.get('paired_seeds') or []),
+                              # The same paired interval feeds the inverse-
+                              # variance pool in the multi-scale report.
+                              'ci_low': ci[0],
+                              'ci_high': ci[1],
+                              'df': entry.get('df'),
+                              'ci_level': entry.get('ci_level')})
     out['scale_replication'] = scale_replication_summary(scale_obs)
     out['certified_norms'] = sorted({entry['norm'] for entry in family
                                      if entry['beats_reference_significantly']})

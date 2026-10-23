@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import (
     average_precision,
+    chi2_sf,
     f1_from_counts,
     holm_adjust,
     macro_weighted_f1,
@@ -27,6 +28,7 @@ from adasquash.metrics import (
     mean_prediction_interval,
     mean_std_stderr,
     max_p_combination,
+    meta_analysis,
     ndcg_at_k,
     paired_t_one_sided,
     paired_trend_test,
@@ -267,11 +269,69 @@ def student_t_cdf_for_check(t, df):
     raise ValueError('this independent check only covers df=2')
 
 
+def check_meta_analysis():
+    # Known chi-square critical values at alpha = 0.05 (df = 1, 2) from the
+    # closed-form chi-square CDFs, not from the helper under test.
+    close(chi2_sf(3.841458820694124, 1.0), 0.05, tol=1e-12,
+          label='chi2 df=1 5% point')
+    close(chi2_sf(5.991464547107979, 2.0), 0.05, tol=1e-12,
+          label='chi2 df=2 5% point')
+
+    # Recompute every step of the DerSimonian-Laird pooling from its
+    # definition: inverse-variance weights, Q, tau^2, then random weights.
+    ys = [-1.0, 0.0, 1.0]
+    ses = [0.2, 0.2, 0.2]
+    out = meta_analysis([
+        {'label': str(i), 'effect': y, 'stderr': se}
+        for i, (y, se) in enumerate(zip(ys, ses))
+    ])
+    w = [1.0 / se ** 2 for se in ses]
+    sum_w = sum(w)
+    pooled = sum(wi * y for wi, y in zip(w, ys)) / sum_w
+    q = sum(wi * (y - pooled) ** 2 for wi, y in zip(w, ys))
+    df = len(ys) - 1.0
+    i_squared = 100.0 * max(0.0, (q - df) / q)
+    tau2 = max(0.0, (q - df) / (sum_w - sum(wi ** 2 for wi in w) / sum_w))
+    wr = [1.0 / (se ** 2 + tau2) for se in ses]
+    random_pooled = sum(wi * y for wi, y in zip(wr, ys)) / sum(wr)
+
+    close(out['fixed_effect']['pooled_effect'], pooled,
+          label='meta fixed pooled')
+    close(out['fixed_effect']['stderr'], 1.0 / math.sqrt(sum_w),
+          label='meta fixed stderr')
+    close(out['heterogeneity']['q'], q, label='meta Cochran Q')
+    close(out['heterogeneity']['i_squared'], i_squared,
+          label='meta I squared')
+    close(out['heterogeneity']['tau_squared'], tau2,
+          label='meta tau squared')
+    close(out['random_effects']['pooled_effect'], random_pooled,
+          label='meta random pooled')
+    close(out['random_effects']['stderr'], 1.0 / math.sqrt(sum(wr)),
+          label='meta random stderr')
+    close(out['random_effects']['ci_low'],
+          random_pooled - student_t_ppf(0.975, df) / math.sqrt(sum(wr)),
+          label='meta random ci low')
+    equal(out['n_studies'], 3, label='meta study count')
+
+    # A CI-only study must recover the stderr it was built from, using the
+    # t critical value for that CI's own df rather than 1.96.
+    se = 0.35
+    half = student_t_ppf(0.975, 4.0) * se
+    ci_only = meta_analysis([{
+        'label': 'ci', 'effect': -0.5,
+        'ci_low': -0.5 - half, 'ci_high': -0.5 + half,
+        'df': 4.0, 'ci_level': 0.95,
+    }])
+    close(ci_only['studies'][0]['stderr'], se,
+          label='meta stderr from ci')
+
+
 def main():
     check_ranking()
     check_ranking_at_k()
     check_f1()
     check_statistics()
+    check_meta_analysis()
     print(f'[metrics-selfcheck] ok: {CHECKS} independent numerical checks passed')
 
 

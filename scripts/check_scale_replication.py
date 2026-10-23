@@ -9,6 +9,14 @@ artifact per scale and asks the same question for each metric: does the
 candidate beat the reference at every scale, is the sign consistent, and is
 the effect certified at >= 2 independent scales?
 
+A sign vote is not enough when the scales estimate the effect with different
+precision. Each per-metric block also carries an inverse-variance /
+DerSimonian-Laird random-effects meta-analysis (Cochran's Q, I^2, tau^2 and a
+prediction interval for a new scale). The pooled estimate is descriptive: it
+does not replace the requirement that each scale pass its own pre-specified
+test, and substantial heterogeneity means the pooled number is an average of
+unlike effects rather than one replicated mechanism.
+
 Inputs are the JSON files the experiment scripts already write:
 
 * ``--kind fp8``  -> ``comparison.json`` from check_fp8_stability.py
@@ -16,7 +24,10 @@ Inputs are the JSON files the experiment scripts already write:
 * ``--kind moe``  -> ``norm_comparison.json`` from train_moe_tiny.py
 * ``--kind generic`` -> a JSON list of observation records (or an object with
   an ``observations`` list): each record needs ``scale``, ``delta`` and
-  ``certified``, plus optional ``metric``/``p_one_sided``.
+  ``certified``, plus optional ``metric``/``p_one_sided`` and a precision for
+  the meta-analysis (``stderr``, or ``ci_low``/``ci_high`` with ``df`` or
+  ``n_seeds``). A record without a precision still counts in the sign vote but
+  is listed as excluded from the pooled estimate.
 
 The pair to follow is given with ``--pair A B`` (A is the candidate/treated
 arm, B the reference). For FP8/W8A8 the comparison's ``a``/``b`` labels must
@@ -127,6 +138,13 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
     delta = entry.get('mean_delta')
     if orientation == 'reversed' and _finite(delta):
         delta = -float(delta)
+    ci_low = entry.get('ci_low')
+    ci_high = entry.get('ci_high')
+    if orientation == 'reversed' and _finite(ci_low) and _finite(ci_high):
+        # The interval belongs to the same mean difference as the delta, so a
+        # reversed pair must mirror it around zero as well: a lower bound of
+        # -0.3 for B-A is an upper bound of +0.3 for A-B.
+        ci_low, ci_high = -float(ci_high), -float(ci_low)
     return {
         'scale': entry.get('a_scale') or entry.get('scale') or 'unknown',
         'metric': entry.get('metric') or metric or 'default',
@@ -148,6 +166,13 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
         'n_seeds': (entry.get('n_shared_train_seeds')
                     if entry.get('n_shared_train_seeds') not in (None, 0)
                     else entry.get('n_shared_seeds', entry.get('n_seeds'))),
+        # Precision for the inverse-variance meta-analysis. Keep the CI even
+        # for a reversed pair (mirrored above) so its width still contributes.
+        'stderr': entry.get('stderr', entry.get('se')),
+        'ci_low': ci_low,
+        'ci_high': ci_high,
+        'df': entry.get('df'),
+        'ci_level': entry.get('ci_level'),
         'orientation': orientation,
     }
 
@@ -175,6 +200,13 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
         delta = row.get('delta_vs_reference')
         if orientation == 'reversed' and _finite(delta):
             delta = -float(delta)
+        ci = row.get('delta_ci_95')
+        if isinstance(ci, (list, tuple)) and len(ci) == 2:
+            ci_low, ci_high = ci
+        else:
+            ci_low, ci_high = None, None
+        if orientation == 'reversed' and _finite(ci_low) and _finite(ci_high):
+            ci_low, ci_high = -float(ci_high), -float(ci_low)
         out.append({
             'scale': row.get('scale') or data.get('scale') or 'unknown',
             'metric': row.get('metric') or metric or 'default',
@@ -189,6 +221,11 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
                             if orientation == 'candidate_vs_reference' else None),
             'n_seeds': (len(row['paired_seeds'])
                         if isinstance(row.get('paired_seeds'), list) else None),
+            'stderr': row.get('stderr', row.get('se')),
+            'ci_low': ci_low,
+            'ci_high': ci_high,
+            'df': row.get('df'),
+            'ci_level': row.get('ci_level'),
             'orientation': orientation,
         })
     return out
@@ -275,11 +312,15 @@ def main(argv=None) -> None:
                    help='metric to follow (default: every metric present)')
     p.add_argument('--min-scales', type=int, default=2,
                    help='distinct scales required before an effect is called replicated')
+    p.add_argument('--alpha', type=float, default=0.05,
+                   help='significance level for the pooled CI and heterogeneity test')
     p.add_argument('--output', default=None,
                    help='write the full JSON report here')
     args = p.parse_args(argv)
     if args.min_scales < 2:
         p.error('--min-scales must be >= 2; one scale cannot replicate')
+    if not 0.0 < args.alpha < 1.0:
+        p.error('--alpha must be strictly between 0 and 1')
     if not args.scale:
         p.error('at least one --scale LABEL=PATH is required')
     if args.kind != 'generic' and args.pair is None:
@@ -295,7 +336,9 @@ def main(argv=None) -> None:
     candidate, reference = (args.pair or ('candidate', 'reference'))
     observations, sources = build_observations(args.kind, scales, candidate,
                                                reference, args.metric)
-    summary = scale_replication_summary(observations, min_scales=args.min_scales)
+    summary = scale_replication_summary(observations, min_scales=args.min_scales,
+                                        alpha=args.alpha)
+    ci_label = f'{100.0 * (1.0 - args.alpha):g}%'
     report = {
         'kind': args.kind,
         'pair': {'candidate': candidate, 'reference': reference},
@@ -311,6 +354,25 @@ def main(argv=None) -> None:
               f"replicated={block['replicated_direction']} "
               f"certified_scales={block['certified_scales']} "
               f"multi_scale_certified={block['multi_scale_certified']}")
+        pooled = block.get('meta_analysis') or {}
+        random_effects = pooled.get('random_effects') or {}
+        heterogeneity = pooled.get('heterogeneity') or {}
+        if pooled.get('n_studies', 0) >= 2 and random_effects.get('ci_low') is not None:
+            prediction = pooled.get('prediction_interval') or {}
+            pi = ('n/a' if prediction.get('low') is None else
+                  f"[{prediction['low']:+.4f}, {prediction['high']:+.4f}]")
+            print(f"[scale]     meta: pooled={random_effects['pooled_effect']:+.4f} "
+                  f"CI{ci_label}=[{random_effects['ci_low']:+.4f}, "
+                  f"{random_effects['ci_high']:+.4f}] "
+                  f"k={pooled['n_studies']} "
+                  f"I^2={heterogeneity.get('i_squared'):.1f}% "
+                  f"Q_p={heterogeneity.get('p'):.3g} "
+                  f"tau={heterogeneity.get('tau'):.4g} "
+                  f"prediction={pi}")
+            if pooled.get('excluded'):
+                print(f"[scale]     meta excluded (no usable precision): "
+                      f"{[item.get('label') for item in pooled['excluded']]}",
+                      file=sys.stderr)
     if summary['single_scale_only']:
         print(f"[scale] NOT a multi-scale result: only {summary['n_scales']} scale(s); "
               f"at least {args.min_scales} are required. Do not extrapolate the "
@@ -325,6 +387,29 @@ def main(argv=None) -> None:
     else:
         print('[scale] direction does not replicate across the supplied scales; '
               'the single-scale claim must not be generalized')
+    # The sign vote and the pooled estimate answer different questions. Say so
+    # when they disagree instead of letting the optimistic one stand alone.
+    heterogeneous = []
+    unresolved = []
+    for metric in summary['meta_analysed_metrics']:
+        pooled = summary['per_metric'][metric].get('meta_analysis') or {}
+        random_effects = pooled.get('random_effects') or {}
+        heterogeneity = pooled.get('heterogeneity') or {}
+        if (heterogeneity.get('i_squared') is not None
+                and (heterogeneity['i_squared'] >= 50.0
+                     or (heterogeneity.get('p') is not None
+                         and heterogeneity['p'] < args.alpha))):
+            heterogeneous.append(metric)
+        if (random_effects.get('ci_low') is not None
+                and random_effects['ci_low'] <= 0.0 <= random_effects['ci_high']):
+            unresolved.append(metric)
+    if heterogeneous:
+        print(f"[scale] WARNING: substantial between-scale heterogeneity for "
+              f"{heterogeneous}; the pooled estimate is an average of unlike "
+              'effects, so do not report it as one replicated mechanism.')
+    if unresolved:
+        print(f"[scale] WARNING: the pooled {ci_label} interval includes zero for "
+              f"{unresolved}; the direction vote is not a resolved pooled effect.")
     if summary['excluded']:
         print(f"[scale] excluded observations: {summary['excluded']}", file=sys.stderr)
     if args.output:
