@@ -576,7 +576,8 @@ TRAINING_RECIPE_KEYS = (
     "early_stop_patience", "nonfinite_policy", "num_workers",
     "val_frac", "test_frac", "num_documents", "val_every", "val_batches",
     "min_doc_chars", "max_doc_chars", "dedup", "train_shuffle_buffer",
-    "exclude_hash_file", "exclude_test_hash_file", "group_key",
+    "exclude_hash_file", "exclude_test_hash_file", "exclude_train_hash_file",
+    "group_key",
     "exclude_group_file", "exclude_test_group_file",
 )
 

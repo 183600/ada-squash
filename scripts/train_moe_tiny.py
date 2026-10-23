@@ -331,6 +331,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         'split_reports': data_reports,
         'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if getattr(args, 'exclude_hash_file', None) else None,
         'exclude_test_hash_file': file_fingerprint(args.exclude_test_hash_file) if getattr(args, 'exclude_test_hash_file', None) else None,
+        'exclude_train_hash_file': file_fingerprint(args.exclude_train_hash_file) if getattr(args, 'exclude_train_hash_file', None) else None,
         'group_key': getattr(args, 'group_key', None),
         'exclude_group_file': file_fingerprint(args.exclude_group_file) if getattr(args, 'exclude_group_file', None) else None,
         'exclude_test_group_file': file_fingerprint(args.exclude_test_group_file) if getattr(args, 'exclude_test_group_file', None) else None,
@@ -967,7 +968,8 @@ _MOE_PROTOCOL_KEYS = (
     'tokenizer_revision', 'n_experts', 'dim', 'n_layers', 'n_heads',
     'seq_len', 'batch_size', 'max_steps', 'lr', 'val_frac', 'test_frac',
     'num_documents', 'min_doc_chars', 'max_doc_chars', 'dedup',
-    'exclude_hash_file', 'exclude_test_hash_file', 'group_key',
+    'exclude_hash_file', 'exclude_test_hash_file', 'exclude_train_hash_file',
+    'group_key',
     'exclude_group_file', 'exclude_test_group_file', 'train_shuffle_buffer',
     'val_batches', 'sanity_check',
 )
@@ -1430,6 +1432,7 @@ def main():
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable duplicate document removal (exact and canonical text)')
     p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); validation documents duplicated in train are dropped, never training documents')
     p.add_argument('--exclude-test-hash-file', default=None, help='validation-document hash ledger (scripts/audit_data.py --write-val-hash-file); applied to the sealed test split only, so test documents duplicated in validation are dropped (ignored by the train/validation loaders)')
+    p.add_argument('--exclude-train-hash-file', default=None, help='training-side benchmark-decontamination ledger (scripts/audit_benchmark_contamination.py --write-train-exclusion-file); drops the listed documents from the TRAINING split only')
     p.add_argument('--group-key', default=None, help='grouping-unit field (top-level name or dotted path) for group-holdout ledgers (see train_gpt2.py --group-key)')
     p.add_argument('--exclude-group-file', default=None, help='training-group hash ledger (scripts/audit_data.py --write-train-group-file --group-key K); validation drops every document whose group occurs in train')
     p.add_argument('--exclude-test-group-file', default=None, help='validation-group hash ledger (scripts/audit_data.py --write-val-group-file --group-key K); the sealed test split drops every document whose group occurs in validation')

@@ -129,10 +129,12 @@ _CHILD_PROTOCOL_KEYS = (
     'compile', 'compile_mode', 'val_frac', 'test_frac', 'num_documents',
     'val_every', 'val_batches', 'min_doc_chars', 'max_doc_chars', 'dedup',
     'train_shuffle_buffer', 'exclude_hash_file', 'exclude_test_hash_file',
+    'exclude_train_hash_file',
     'group_key', 'exclude_group_file', 'exclude_test_group_file',
 )
 
 _LEDGER_PROTOCOL_KEYS = ('exclude_hash_file', 'exclude_test_hash_file',
+                         'exclude_train_hash_file',
                          'exclude_group_file', 'exclude_test_group_file')
 
 
@@ -1374,6 +1376,8 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
         cmd += ['--exclude-hash-file', str(args.exclude_hash_file)]
     if args.exclude_test_hash_file:
         cmd += ['--exclude-test-hash-file', str(args.exclude_test_hash_file)]
+    if args.exclude_train_hash_file:
+        cmd += ['--exclude-train-hash-file', str(args.exclude_train_hash_file)]
     if args.group_key:
         cmd += ['--group-key', str(args.group_key)]
     if args.exclude_group_file:
@@ -1474,6 +1478,7 @@ def main():
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable exact-duplicate document removal')
     p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger shared by every depth/norm row (build it once with scripts/audit_data.py --write-train-hash-file)')
     p.add_argument('--exclude-test-hash-file', default=None, help='validation-document hash ledger shared by every depth/norm row (build it once with scripts/audit_data.py --write-val-hash-file); keeps the sealed test disjoint from the validation used for checkpoint selection')
+    p.add_argument('--exclude-train-hash-file', default=None, help='training-side benchmark-decontamination ledger shared by every depth/norm row (build it once with scripts/audit_benchmark_contamination.py --write-train-exclusion-file); drops the listed documents from the TRAINING split only')
     p.add_argument('--group-key', default=None, help='grouping-unit field shared by every row (see train_gpt2.py --group-key)')
     p.add_argument('--exclude-group-file', default=None, help='training-group hash ledger shared by every row (scripts/audit_data.py --write-train-group-file --group-key K); no group straddles train<->held-out')
     p.add_argument('--exclude-test-group-file', default=None, help='validation-group hash ledger shared by every row (scripts/audit_data.py --write-val-group-file --group-key K); no group straddles validation<->test')

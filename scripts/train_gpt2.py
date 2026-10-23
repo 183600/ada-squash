@@ -319,7 +319,8 @@ def restore_monitor_args(args, ckpt_args: dict, explicit: frozenset=frozenset())
 _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tokenizer_revision',
               'val_frac', 'test_frac', 'num_documents',
               'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file',
-              'exclude_test_hash_file', 'group_key', 'exclude_group_file',
+              'exclude_test_hash_file', 'exclude_train_hash_file',
+              'group_key', 'exclude_group_file',
               'exclude_test_group_file', 'train_shuffle_buffer',
               # These define the stream geometry: the resumed run must read the
               # same document windows with the same batch/sequence shape, or
@@ -327,6 +328,7 @@ _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tok
               'seq_len', 'batch_size', 'num_workers')
 
 _LEDGER_ARGS = ('exclude_hash_file', 'exclude_test_hash_file',
+                'exclude_train_hash_file',
                 'exclude_group_file', 'exclude_test_group_file')
 
 def _ledger_identity(path):
@@ -386,6 +388,7 @@ def open_data_split(split: str, args, seq_len: int | None = None):
         max_doc_chars=args.max_doc_chars,
         exclude_hash_file=getattr(args, 'exclude_hash_file', None),
         exclude_test_hash_file=getattr(args, 'exclude_test_hash_file', None),
+        exclude_train_hash_file=getattr(args, 'exclude_train_hash_file', None),
         group_key=getattr(args, 'group_key', None),
         exclude_group_file=getattr(args, 'exclude_group_file', None),
         exclude_test_group_file=getattr(args, 'exclude_test_group_file', None),
@@ -1327,6 +1330,7 @@ def main():
     p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable duplicate document removal (exact and canonical text)')
     p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); held-out documents whose exact or canonical text also occurs in train are dropped from validation/test, never from train')
     p.add_argument('--exclude-test-hash-file', default=None, help='validation-document hash ledger (scripts/audit_data.py --write-val-hash-file); the sealed test split drops documents whose exact or canonical text also occurs in validation, so the selection split and the final split are disjoint (ignored for train/validation)')
+    p.add_argument('--exclude-train-hash-file', default=None, help='training-side exclusion ledger (scripts/audit_benchmark_contamination.py --write-train-exclusion-file); documents whose exact or canonical text is listed are dropped from the TRAINING split, so benchmark-contaminated text is never fitted. Ignored for validation/test, whose slices must not change')
     p.add_argument('--group-key', default=None, help='optional grouping-unit field (top-level name or dotted path such as "meta.url"); with a group ledger a held-out document whose group was seen on an earlier side is dropped whole, so a user/item/page cannot straddle a split boundary')
     p.add_argument('--exclude-group-file', default=None, help='training-group hash ledger (scripts/audit_data.py --write-train-group-file --group-key K); validation/test drop every document whose group occurs in train, never train itself')
     p.add_argument('--exclude-test-group-file', default=None, help='validation-group hash ledger (scripts/audit_data.py --write-val-group-file --group-key K); the sealed test split drops every document whose group occurs in validation, so no group straddles the selection/final boundary (ignored for train/validation)')
@@ -1905,6 +1909,7 @@ def main():
             'split_reports': data_reports,
             'exclude_hash_file': run_ledgers['exclude_hash_file'],
             'exclude_test_hash_file': run_ledgers['exclude_test_hash_file'],
+            'exclude_train_hash_file': run_ledgers['exclude_train_hash_file'],
             'group_key': args.group_key,
             'exclude_group_file': run_ledgers['exclude_group_file'],
             'exclude_test_group_file': run_ledgers['exclude_test_group_file'],

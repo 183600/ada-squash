@@ -48,6 +48,14 @@ Principles enforced here
    group lies wholly on the training side; a validation-group ledger
    (`--exclude-test-group-file`) is likewise applied to the test split only,
    so no group straddles the selection/final boundary either.
+8. **Benchmark-contaminated documents do not enter training.**  A clean
+   internal split cannot make a downstream score honest if the training
+   corpus itself contains the benchmark's questions or solutions.  An
+   optional training-side ledger (`exclude_train_hash_file`, written by
+   `scripts/audit_benchmark_contamination.py --write-train-exclusion-file`)
+   drops those documents from the train split only; held-out slices are not
+   changed by it, because the goal is to keep the model from fitting
+   benchmark text, not to redefine the evaluation sample.
 
 `build_dataloader` deliberately keeps its historical 5-argument call
 signature (the split / cleaning knobs travel through
@@ -103,6 +111,13 @@ DEFAULT_DATA_OPTIONS = {
     # split additionally drops exact duplicates of validation documents, so
     # the selection split and the sealed final split stay disjoint.
     "exclude_test_hash_file": None,
+    # Optional ledger of documents that must not enter the *training* split
+    # (for example benchmark-contaminated documents found by
+    # scripts/audit_benchmark_contamination.py).  Unlike the cross-split
+    # ledgers above, this one is applied to train itself: a benchmark
+    # question or solution in the training corpus inflates the downstream
+    # score no matter how clean the corpus's own split is.
+    "exclude_train_hash_file": None,
     # Optional grouping key (a top-level example field name or a dotted path
     # such as "meta.url").  Rows sharing a group value are one grouping unit;
     # with a group-hash ledger the held-out splits drop every document whose
@@ -234,6 +249,7 @@ def validate_data_options(options: dict | None = None) -> dict:
         raise ValueError(f"data option group_key must be a non-empty string or None, got {group_key!r}")
     opts["group_key"] = group_key.strip() if isinstance(group_key, str) else None
     for name in ("exclude_hash_file", "exclude_test_hash_file",
+                 "exclude_train_hash_file",
                  "exclude_group_file", "exclude_test_group_file"):
         value = opts.get(name)
         if value is not None and not isinstance(value, (str, os.PathLike)):
@@ -660,7 +676,8 @@ class DocumentCleaner:
                  min_doc_chars: int = 0, max_doc_chars: int = 0,
                  exclude_hashes: set | None = None,
                  group_key: str | None = None,
-                 exclude_group_hashes: set | None = None):
+                 exclude_group_hashes: set | None = None,
+                 exclude_train_hashes: set | None = None):
         self.dedup = bool(dedup)
         self.dedup_max = int(dedup_max)
         self.min_doc_chars = int(min_doc_chars)
@@ -668,6 +685,12 @@ class DocumentCleaner:
         # Held by reference: the ledger is shared with the caller, who must not
         # mutate it after handing it over.
         self.exclude_hashes = exclude_hashes if exclude_hashes is not None else set()
+        # Training-side exclusions are a separate role from the cross-split
+        # ledgers: they remove a document from the split that would otherwise
+        # train on it, while `exclude_hashes` removes a *held-out* copy of a
+        # document seen on an earlier side.
+        self.exclude_train_hashes = (
+            exclude_train_hashes if exclude_train_hashes is not None else set())
         self.group_key = group_key or None
         self.exclude_group_hashes = (exclude_group_hashes if exclude_group_hashes is not None
                                      else set())
@@ -726,16 +749,25 @@ class DocumentCleaner:
             # This document's grouping unit was already seen on an earlier
             # side of a split boundary; keeping it would leak the group.
             return None
-        if self.dedup or self.exclude_hashes:
+        if self.dedup or self.exclude_hashes or self.exclude_train_hashes:
             canonical = (precomputed_hash if precomputed_hash is not None
                          else canonical_document_hash(text))
+            exact = (document_hash(text)
+                     if (self.exclude_hashes or self.exclude_train_hashes) else None)
             if self.exclude_hashes:
-                exact = document_hash(text)
                 if exact in self.exclude_hashes or canonical in self.exclude_hashes:
                     # Exact or formatting-equivalent duplicate of an earlier
                     # split's document: keeping it would leak that document
                     # across the split boundary.
                     self.stats["dropped_cross_split_duplicate"] += 1
+                    return None
+            if self.exclude_train_hashes:
+                if exact in self.exclude_train_hashes or canonical in self.exclude_train_hashes:
+                    # This document is on the training side but must not be
+                    # trained on (e.g. it contains a downstream benchmark
+                    # question or solution).  Dropping it here is the
+                    # remediation step, not a split-boundary decision.
+                    self.stats["dropped_training_exclusion"] += 1
                     return None
             if self.dedup:
                 key = (int.from_bytes(canonical[:8], "little")
@@ -1393,6 +1425,11 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     # either.  Both are never applied to train (they are derived from earlier
     # splits; excluding them there would throw the split away).
     applied_train_ledger = opts.get("exclude_hash_file") if opts["split"] != "train" else None
+    # Training-side decontamination ledger: applied to train only.  Held-out
+    # splits must not consume it, because its purpose is to keep the model
+    # from fitting benchmark text, not to alter the evaluation slice.
+    applied_train_exclusion = (opts.get("exclude_train_hash_file")
+                               if opts["split"] == "train" else None)
     # The validation-document ledger has no source side when there is no
     # validation split; applying it to test would drop documents by hashes
     # that cannot correspond to this run's selection split.
@@ -1402,11 +1439,23 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     exclude_hashes: set = set()
     for path in exclude_files:
         exclude_hashes |= load_hash_file(path)
+    exclude_train_hashes: set = set()
+    if applied_train_exclusion:
+        exclude_train_hashes = load_hash_file(applied_train_exclusion)
     report["exclude_hash_file"] = str(applied_train_ledger) if applied_train_ledger else None
     report["exclude_test_hash_file"] = str(applied_test_ledger) if applied_test_ledger else None
+    report["exclude_train_hash_file"] = (
+        str(applied_train_exclusion) if applied_train_exclusion else None)
+    if opts.get("exclude_train_hash_file") and opts["split"] != "train":
+        # Record the deliberate no-op: a wrapper may pass every ledger to every
+        # split, but this one must not change a held-out slice.
+        report["exclude_train_hash_file_ignored"] = (
+            "training-side decontamination applies to the train split only")
     if exclude_files:
         report["exclude_hash_files"] = [str(p) for p in exclude_files]
         report["exclude_hashes"] = len(exclude_hashes)
+    if applied_train_exclusion:
+        report["exclude_train_hashes"] = len(exclude_train_hashes)
     cleaner = DocumentCleaner(
         dedup=opts["dedup"],
         dedup_max=opts["dedup_max"],
@@ -1415,6 +1464,7 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
         exclude_hashes=exclude_hashes,
         group_key=opts.get("group_key"),
         exclude_group_hashes=exclude_group_hashes,
+        exclude_train_hashes=exclude_train_hashes,
     )
     stream = PackedStream(
         stream_ds,
