@@ -364,6 +364,16 @@ def main(argv=None) -> None:
     candidate, reference = (args.pair or ('candidate', 'reference'))
     observations, sources = build_observations(args.kind, scales, candidate,
                                                reference, args.metric)
+    if not observations:
+        # An unmatched --pair/--metric (or an empty generic file) is an input
+        # error, not evidence that the effect failed to replicate. Exiting 0
+        # with "0 scales" would let a typo become a successful audit.
+        raise SystemExit(
+            f'[scale] no observation matches pair {candidate!r} vs '
+            f'{reference!r}'
+            + (f' on metric {args.metric!r}' if args.metric else '')
+            + ' in the supplied artifact(s); check --pair/--metric and the '
+            'comparison contents')
     summary = scale_replication_summary(observations, min_scales=args.min_scales,
                                         alpha=args.alpha)
     ci_label = f'{100.0 * (1.0 - args.alpha):g}%'
