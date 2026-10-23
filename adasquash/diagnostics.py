@@ -700,12 +700,13 @@ def first_nonfinite_module(model, run_forward, max_modules: int = 8) -> list[dic
                 if n_bad:
                     seen.add(id(module))
                     n_nan = int(torch.isnan(t).sum().item())
+                    n_inf = int(torch.isinf(t).sum().item())
                     found.append(
                         {
                             "module": names.get(id(module), module.__class__.__name__),
                             "class": module.__class__.__name__,
                             "n_nan": n_nan,
-                            "n_inf": n_bad - n_nan,
+                            "n_inf": n_inf,
                         }
                     )
                     break
