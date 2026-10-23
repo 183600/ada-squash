@@ -520,6 +520,24 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         counts[arm] = counts.get(arm, 0) + 1
     declared_blocks = schedule.get('n_blocks')
     is_rcbd = schedule.get('schema') == 'adasquash.rcbd_schedule.v1'
+    declared_missing = []
+    declared_extra = []
+    raw_units = schedule.get('units')
+    if is_rcbd and isinstance(raw_units, list) and raw_units:
+        # The frozen design declares every treatment; entries that retain only
+        # a subset are not a complete block design even when the retained
+        # subset is crossed. Compare the realized `unit` field, not the
+        # (possibly remapped) arm labels, so this check also works with an
+        # explicit `arm_of` mapping.
+        declared = {str(unit) for unit in raw_units}
+        realized = {str(entry.get('unit')) for entry in entries
+                    if isinstance(entry, dict) and entry.get('unit') is not None}
+        declared_missing = sorted(declared - realized)
+        declared_extra = sorted(realized - declared)
+        if declared_missing or declared_extra:
+            structural.append(
+                'the realized schedule does not cover the declared RCBD '
+                f'treatment(s): missing {declared_missing}, extra {declared_extra}')
     looks_complete = is_rcbd or (
         isinstance(declared_blocks, int) and not isinstance(declared_blocks, bool)
         and declared_blocks > 0 and bool(per_arm)
@@ -554,6 +572,8 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
                         f'block {block} does not contain every arm exactly once '
                         f'({counts}); the schedule is not a randomized complete '
                         f'block design')
+    if complete_block_design and (declared_missing or declared_extra):
+        complete_block_design = False
     return {
         'schema': 'adasquash.schedule_balance.v1',
         'schedule_fingerprint': schedule.get('fingerprint'),
