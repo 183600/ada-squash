@@ -322,6 +322,11 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     else:
         print('[hypothesis] none stated: pass --hypothesis "..." so this run is auditable as a test of a claim, not a sweep')
     data_reports: dict = {}
+    # Snapshot ledger content before the loader consumes it. Fingerprinting
+    # the paths again after training would describe a file that may have been
+    # replaced mid-run, not the exclusion set this run actually used (the
+    # train_gpt2 resume path has the same contract).
+    ledger_fingerprints = _moe_ledger_fingerprints(args)
     run_manifest['data'] = {
         'dataset': args.dataset,
         'dataset_config': args.dataset_config,
@@ -329,12 +334,12 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         'tokenizer': getattr(args, 'tokenizer', None),
         'tokenizer_revision': getattr(args, 'tokenizer_revision', None),
         'split_reports': data_reports,
-        'exclude_hash_file': file_fingerprint(args.exclude_hash_file) if getattr(args, 'exclude_hash_file', None) else None,
-        'exclude_test_hash_file': file_fingerprint(args.exclude_test_hash_file) if getattr(args, 'exclude_test_hash_file', None) else None,
-        'exclude_train_hash_file': file_fingerprint(args.exclude_train_hash_file) if getattr(args, 'exclude_train_hash_file', None) else None,
+        'exclude_hash_file': ledger_fingerprints['exclude_hash_file'],
+        'exclude_test_hash_file': ledger_fingerprints['exclude_test_hash_file'],
+        'exclude_train_hash_file': ledger_fingerprints['exclude_train_hash_file'],
         'group_key': getattr(args, 'group_key', None),
-        'exclude_group_file': file_fingerprint(args.exclude_group_file) if getattr(args, 'exclude_group_file', None) else None,
-        'exclude_test_group_file': file_fingerprint(args.exclude_test_group_file) if getattr(args, 'exclude_test_group_file', None) else None,
+        'exclude_group_file': ledger_fingerprints['exclude_group_file'],
+        'exclude_test_group_file': ledger_fingerprints['exclude_test_group_file'],
     }
     if sanity_report_path is not None:
         run_manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
@@ -780,9 +785,9 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                 or val_report.get('tokenizer_revision_resolved')),
             # The path alone cannot prove that two norm runs excluded the same
             # held-out documents: a ledger can be regenerated at the same path
-            # between runs. Record content fingerprints so the cross-norm
-            # guard can compare the actual exclusion set, not its filename.
-            'ledger_fingerprints': _moe_ledger_fingerprints(args),
+            # between runs. Use the pre-loader snapshot so the provenance
+            # describes the exclusion set this run actually consumed.
+            'ledger_fingerprints': ledger_fingerprints,
         }
         return result
     finally:
