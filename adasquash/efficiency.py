@@ -294,6 +294,11 @@ def efficiency_verdict(
     cost_is_proxy = bool(cost_is_proxy)
     if _is_boolean_value(statistically_significant):
         statistically_significant = bool(statistically_significant)
+    # Any other non-None value (1, "yes", a list) is not evidence that the
+    # significance gate passed. It must be reported as malformed, not silently
+    # treated like an absent test while the reason text still looks positive.
+    significance_invalid = (statistically_significant is not None
+                            and not isinstance(statistically_significant, bool))
     min_gain_value = _nonnegative_real(min_loss_gain, "min_loss_gain")
     max_cost_value = _nonnegative_real(max_cost_ratio, "max_cost_ratio")
     max_component_value = (max_cost_value if max_component_ratio is None
@@ -308,7 +313,8 @@ def efficiency_verdict(
         "max_component_ratio": max_component_value,
         "statistically_significant": statistically_significant,
         "significance_status": (
-            "certified" if statistically_significant is True
+            "invalid" if significance_invalid
+            else "certified" if statistically_significant is True
             else "not_significant" if statistically_significant is False
             else "no_evidence"),
         "cost_is_proxy": bool(cost_is_proxy),
@@ -512,6 +518,10 @@ def efficiency_verdict(
             "no significance evidence is available (no comparison row or no "
             "seed-replicated comparison was run); a point estimate cannot "
             "certify the gain"]
+    elif significance_invalid:
+        verdict["component_failures"] = list(verdict["component_failures"]) + [
+            f"significance flag {statistically_significant!r} is neither a "
+            "boolean nor None; it cannot certify the gain"]
     if cost_is_proxy:
         verdict["component_failures"] = list(verdict["component_failures"]) + [
             "cost is a proxy measured on a different architecture; it cannot "
