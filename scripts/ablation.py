@@ -4210,8 +4210,13 @@ def study_level_correction(comparisons: dict, plan: dict | None,
                         'descriptive only')
                 elif record.get('p_one_sided_or_two_sided') is None:
                     record['excluded_from_study_family'] = 'no testable p-value'
+    planned_primary_ids = {
+        contrast_id for contrast_id, entry in planned.items()
+        if (entry or {}).get('tier', 1) == 1}
+    resolved_primary = [record for record in registered
+                        if record['id'] in planned_primary_ids]
     primary = [record for record in eligible
-               if (planned.get(record['id']) or {}).get('tier', 1) == 1]
+               if record['id'] in planned_primary_ids]
     secondary = [record for record in eligible
                  if (planned.get(record['id']) or {}).get('tier', 1) == 2]
     primary_adjusted = holm_adjust(
@@ -4224,16 +4229,17 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             and p_holm < alpha)
     primary_gate_open = any(
         record['confirmed_at_study_level'] for record in primary)
-    # A focused run (e.g. only the QK rows) has no primary tier at all. That
-    # is not a failed gate: the gate is only meaningful when the primary
-    # family was part of the study. Distinguish "not applicable" from
-    # "closed, so secondary claims are not licensed".
-    if not primary:
+    # A focused run (e.g. only the QK rows) has no resolved primary contrast
+    # at all. That is not a failed gate: the gate is only meaningful when the
+    # primary family was part of the study. But a primary contrast that *was*
+    # planned and resolved yet became ineligible (e.g. under-replicated) is a
+    # closed gate, not an absent one: it must not license secondary claims.
+    if not planned_primary_ids or not resolved_primary:
         primary_gate_status = 'not_applicable_no_primary_tests'
-    elif primary_gate_open:
-        primary_gate_status = 'open'
-    else:
+    elif not primary or not primary_gate_open:
         primary_gate_status = 'closed'
+    else:
+        primary_gate_status = 'open'
     secondary_allowed = primary_gate_status in ('open',
                                                 'not_applicable_no_primary_tests')
     if secondary_allowed:
@@ -4439,6 +4445,12 @@ def main():
         raw_seeds = [args.seed]
     else:
         raw_seeds = list(args.seeds or DEFAULT_SEEDS)
+    # A `--config` value is a parser default and bypasses argparse's `type=int`
+    # conversion. Reject `42.9`/`true` instead of truncating them to a
+    # different seed than the configuration names.
+    malformed_seeds = [seed for seed in raw_seeds if not _is_seed_id(seed)]
+    if malformed_seeds:
+        p.error(f'seeds must be integer ids, got {malformed_seeds!r}')
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     # Keep `args.seeds` equal to the resolved set: protocol checks (e.g. the
     # simple-baseline calibration) must compare against the seeds actually
