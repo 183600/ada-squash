@@ -28,7 +28,8 @@ from adasquash.repro import (TRAINING_RECIPE_KEYS, TrainStreamFingerprint,
                              artifact_record, collect_run_metadata,
                              file_fingerprint, finish_metadata, save_run_manifest,
                              set_all_seeds, training_recipe_mismatches)
-from scripts.data_pipeline import build_dataloader, configure_data_options, _is_pinned_revision
+from scripts.data_pipeline import (build_dataloader, configure_data_options, _is_pinned_revision,
+                                   resolve_dataset_revision, resolve_tokenizer_revision)
 
 def load_yaml_config(path: str) -> dict:
     import yaml
@@ -37,6 +38,17 @@ def load_yaml_config(path: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"config '{path}' must be a mapping, got {type(data)}")
     return data
+
+def _config_bool(value):
+    """Parse a YAML boolean spelling, or return None when it is not one."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in (
+            'true', 'yes', 'on', '1', 'false', 'no', 'off', '0'):
+        return value.strip().lower() in ('true', 'yes', 'on', '1')
+    return None
 
 def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
     if not path:
@@ -53,18 +65,20 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
         if invert:
             # `use_layerscale: 0` / `bf16: "false"` must not remain a truthy
             # default that `not args.no_*` later reads as enabled.
-            if isinstance(value, bool):
-                bool_value = value
-            elif isinstance(value, (int, float)) and value in (0, 1):
-                bool_value = bool(value)
-            elif isinstance(value, str) and value.strip().lower() in (
-                    'true', 'yes', 'on', '1', 'false', 'no', 'off', '0'):
-                bool_value = value.strip().lower() in ('true', 'yes', 'on', '1')
-            else:
+            bool_value = _config_bool(value)
+            if bool_value is None:
                 raise ValueError(
                     f"config '{path}': {key}={value!r} is not a boolean; "
                     f"cannot map it to {dest}")
             value = not bool_value
+        elif dest in ('tie_embeddings', 'beta'):
+            # Positive-form boolean options have the same YAML aliases; a raw
+            # `"false"` string is truthy and would silently enable the option.
+            bool_value = _config_bool(value)
+            if bool_value is None:
+                raise ValueError(
+                    f"config '{path}': {key}={value!r} is not a boolean")
+            value = bool_value
         parser.set_defaults(**{dest: value})
     if unknown:
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
@@ -337,7 +351,23 @@ def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) ->
     for name in _DATA_ARGS:
         if name not in ckpt_args:
             continue
-        if getattr(args, name, None) != ckpt_args[name]:
+        current = getattr(args, name, None)
+        if (name in explicit and current != ckpt_args[name]
+                and name in ('dataset_revision', 'tokenizer_revision')):
+            # The checkpoint records the concrete commit, while the user may
+            # legitimately repeat the mutable branch/tag they originally
+            # requested. Resolve the request first; if it still names the
+            # checkpointed commit this is not a data change.
+            try:
+                resolved = (resolve_dataset_revision(args.dataset, current)
+                            if name == 'dataset_revision'
+                            else resolve_tokenizer_revision(args.tokenizer, current))
+            except Exception:
+                resolved = None
+            if resolved == ckpt_args[name]:
+                setattr(args, name, resolved)
+                current = resolved
+        if current != ckpt_args[name]:
             changed.append(name)
         if name in explicit:
             continue
@@ -423,7 +453,11 @@ def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
         cmd.append('--no-dedup')
     print(f'[errors] bad-case analysis on {ckpt_path.name} over the validation split '
           f'({args.error_analysis_batches} batches) -> {out_path}', flush=True)
-    rc = subprocess.run(cmd, cwd=str(ROOT)).returncode
+    # Inherit the caller's working directory: cmd contains paths the parent
+    # resolved relative to it (checkpoint/output/ledgers). Running the child
+    # from ROOT made a relative --output-dir point at a different place and
+    # the artifact fingerprint then reported a missing file.
+    rc = subprocess.run(cmd).returncode
     if rc != 0:
         print(f'[errors][warn] analyze_errors.py exited rc={rc}; no error_analysis '
               f'artifact was recorded', file=sys.stderr)
@@ -436,18 +470,25 @@ def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
         'command': cmd,
     }
 
-def _heldout_batch_fingerprint(x) -> bytes:
-    """Content digest of one held-out batch's input tokens.
+def _heldout_batch_fingerprint(x, y=None) -> bytes:
+    """Content digest of one held-out batch's tokens.
 
     The held-out loaders are deterministic and never shuffle, so a repeated
-    packed window produces exactly the same input tokens. Fingerprinting the
-    full batch therefore lets `evaluate_heldout` count *distinct* held-out
-    windows instead of trusting the requested batch count; hashing the
-    small input tensor is negligible next to a model forward pass.
+    packed window produces exactly the same tokens. The target is hashed too:
+    a window's final label is not part of its input, so two different held-out
+    windows can share `x` and differ only in that last target. Fingerprinting
+    the full batch therefore lets `evaluate_heldout` count *distinct* held-out
+    windows instead of trusting the requested batch count; hashing the small
+    host tensors is negligible next to a model forward pass.
     """
     hasher = hashlib.blake2b(digest_size=16)
-    hasher.update(str(tuple(x.shape)).encode('ascii'))
-    hasher.update(x.detach().cpu().contiguous().numpy().tobytes())
+    for name, tensor in (('x', x), ('y', y)):
+        if tensor is None:
+            continue
+        hasher.update(name.encode('ascii'))
+        hasher.update(str(tuple(tensor.shape)).encode('ascii'))
+        hasher.update(str(tensor.dtype).encode('ascii'))
+        hasher.update(tensor.detach().cpu().contiguous().numpy().tobytes())
     return hasher.digest()
 
 def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, collect: list | None = None, cycle: bool = True) -> float | None:
@@ -521,7 +562,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
             # Fingerprint on the loader's (host) tensor before the device
             # transfer: this avoids a per-batch device->host copy and keeps the
             # validation data budget independent of the compute device.
-            fingerprint = _heldout_batch_fingerprint(x)
+            fingerprint = _heldout_batch_fingerprint(x, y)
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             if fingerprint in seen_batches:
@@ -2085,6 +2126,17 @@ def main():
             return triage
 
         while step < args.max_steps:
+            if (resume_ckpt is not None and step == start_step
+                    and args.early_stop_patience > 0
+                    and val_checks_without_improvement >= args.early_stop_patience):
+                # The restored streak already satisfies patience. Waiting for
+                # `val_loader` to be created would train another whole
+                # validation interval, past the point where the uninterrupted
+                # run stopped.
+                print(f'[early-stop] restored streak {val_checks_without_improvement} '
+                      f'>= patience {args.early_stop_patience} at step {step}; '
+                      'stopping without another update')
+                break
             opt.zero_grad(set_to_none=True)
             attach_stats = (step + 1) % args.stats_every == 0
             if attach_stats:

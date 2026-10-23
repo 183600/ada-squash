@@ -108,7 +108,9 @@ def run_preflight(norms, seed: int, output_dir, model: str = "gpt", n_experts: i
     if repro_check:
         cmd.append("--repro-check")
     print(f"[sanity] pre-flight overfit check: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True, cwd=str(ROOT))
+    # Inherit the caller's cwd so a relative --output-dir/--config path means
+    # the same directory to the parent and the preflight child.
+    subprocess.run(cmd, check=True)
 
 
 def build_model(args, cfg: GPTConfig):
