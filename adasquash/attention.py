@@ -317,6 +317,21 @@ def _rope_halves(cos: torch.Tensor, sin: torch.Tensor, half: int):
         return (cos, cos, sin, sin)
     return (cos[..., :half], cos[..., half:], sin[..., :half], sin[..., half:])
 
+def _rope_table_like(table: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Align a cached table's singleton leading axes with ``x``.
+
+    The shared table cache stores ``(1, 1, T, D)`` so it broadcasts over the
+    usual ``(B, H, T, D)`` Q/K. ``apply_rope`` also accepts plain ``(T, D)``
+    and ``(B, T, D)`` tensors; against those, the extra singleton axes would
+    prepend dimensions and make the ``out=`` write fail (or resize it). Only
+    leading axes that are exactly one are squeezed, so the batched path is
+    unchanged.
+    """
+    if table.ndim > x.ndim and all(size == 1 for size in table.shape[:-2]):
+        return table.reshape(table.shape[-2:])
+    return table
+
+
 def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: torch.Tensor, hi_s: torch.Tensor, transpose: bool=False, out: Optional[torch.Tensor]=None):
     """(x_lo*lo_c - x_hi*lo_s, x_hi*hi_c + x_lo*hi_s) written into ``out``.
 
@@ -330,6 +345,10 @@ def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: to
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
     x_hi = x[..., half:]
+    lo_c = _rope_table_like(lo_c, x_lo)
+    hi_c = _rope_table_like(hi_c, x_lo)
+    lo_s = _rope_table_like(lo_s, x_lo)
+    hi_s = _rope_table_like(hi_s, x_lo)
     if out is None:
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     out_lo = out[..., :half]
@@ -352,6 +371,10 @@ def _rope_inplace_(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
     x_hi = x[..., half:]
+    lo_c = _rope_table_like(lo_c, x_lo)
+    hi_c = _rope_table_like(hi_c, x_lo)
+    lo_s = _rope_table_like(lo_s, x_lo)
+    hi_s = _rope_table_like(hi_s, x_lo)
     tmp = _rope_half_scratch(x_lo)
     tmp.copy_(x_lo)
     x_lo.mul_(lo_c)
