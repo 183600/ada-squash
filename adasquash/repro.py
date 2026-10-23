@@ -529,6 +529,12 @@ def git_revision() -> dict:
             # tracked-only answer rather than dropping the fields.
             branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
             dirty = bool(status)
+    # Detached HEAD: `git status` says `## HEAD (no branch)` and
+    # `rev-parse --abbrev-ref HEAD` returns the literal "HEAD". There is no
+    # checked-out branch, and "HEAD" is not a valid branch name, so record
+    # None instead of a misleading label.
+    if branch == "HEAD":
+        branch = None
     return {
         "commit": _run_git("rev-parse", "HEAD"),
         "branch": branch,
