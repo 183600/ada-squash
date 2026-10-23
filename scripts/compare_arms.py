@@ -765,7 +765,9 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                     same_protocol = signatures[member] == signatures[reference]
                     common_m = sorted(set(cand['values']) & set(other['values']))
                     record = {
-                        'comparable': bool(same_protocol and len(common_m) >= 2),
+                        'comparable': bool(
+                            same_protocol and
+                            len(common_m) >= MIN_SEEDS_FOR_SIGNIFICANCE),
                         'same_protocol': same_protocol,
                         'n_shared_seeds': len(common_m),
                     }
@@ -773,7 +775,9 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                         record['reason'] = (
                             'not protocol-comparable to the selected reference'
                             if not same_protocol else
-                            f'only {len(common_m)} shared seed(s); a paired test needs 2')
+                            f'only {len(common_m)} shared seed(s); a '
+                            f'certifying paired test needs '
+                            f'{MIN_SEEDS_FOR_SIGNIFICANCE}')
                         complete = False
                         pool_contrasts[member] = record
                         continue
