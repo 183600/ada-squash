@@ -1666,14 +1666,23 @@ def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
                        'nothing can be pooled')
         return out
 
-    total_weight = sum(1.0 / study['stderr'] ** 2 for study in studies)
-    weighted_sum = sum(study['effect'] / study['stderr'] ** 2
-                       for study in studies)
-    fixed_pooled = weighted_sum / total_weight
-    fixed_stderr = math.sqrt(1.0 / total_weight)
+    # Work with weights normalized by their maximum: each individual inverse-
+    # variance weight is finite (checked in `_meta_study`), but their sum can
+    # still overflow for very small stderr values. Scaling preserves the
+    # pooled estimate and yields a representable standard error via
+    # (1/sqrt(max_weight)) / sqrt(sum_scaled).
     for study in studies:
         study['fixed_weight'] = 1.0 / study['stderr'] ** 2
-        study['fixed_weight_share'] = study['fixed_weight'] / total_weight
+    max_fixed_weight = max(study['fixed_weight'] for study in studies)
+    fixed_scaled = [study['fixed_weight'] / max_fixed_weight for study in studies]
+    total_scaled = math.fsum(fixed_scaled)
+    fixed_pooled = math.fsum(
+        weight * study['effect'] for weight, study in zip(fixed_scaled, studies)
+    ) / total_scaled
+    fixed_stderr = ((1.0 / math.sqrt(max_fixed_weight))
+                    / math.sqrt(total_scaled))
+    for study, weight in zip(studies, fixed_scaled):
+        study['fixed_weight_share'] = weight / total_scaled
 
     out['direction_consistent'] = bool(
         out['n_zero'] == 0 and (out['n_negative'] == k or out['n_positive'] == k))
@@ -1707,13 +1716,22 @@ def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
     random_stderr = fixed_stderr
     if k >= 2:
         df_q = float(k - 1)
-        q = sum(study['fixed_weight'] * (study['effect'] - fixed_pooled) ** 2
-                for study in studies)
-        i_squared = (max(0.0, (q - df_q) / q) * 100.0) if q > 0.0 else 0.0
-        weight_sq_sum = sum(study['fixed_weight'] ** 2 for study in studies)
-        tau_denominator = total_weight - weight_sq_sum / total_weight
-        if tau_denominator > 0.0:
-            tau_squared = max(0.0, (q - df_q) / tau_denominator)
+        q_scaled = math.fsum(
+            weight * (study['effect'] - fixed_pooled) ** 2
+            for weight, study in zip(fixed_scaled, studies))
+        q = max_fixed_weight * q_scaled
+        if q > 0.0:
+            i_squared = (100.0 if math.isinf(q)
+                         else max(0.0, (q - df_q) / q) * 100.0)
+        else:
+            i_squared = 0.0
+        weight_sq_scaled = math.fsum(weight * weight for weight in fixed_scaled)
+        tau_denominator_scaled = (
+            total_scaled - weight_sq_scaled / total_scaled)
+        if tau_denominator_scaled > 0.0:
+            tau_squared = max(
+                0.0,
+                (q_scaled - df_q / max_fixed_weight) / tau_denominator_scaled)
         heterogeneity.update({
             'q': q,
             'df': df_q,
@@ -1722,16 +1740,28 @@ def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
             'tau_squared': tau_squared,
             'tau': math.sqrt(tau_squared),
         })
-        random_weight = sum(1.0 / (study['stderr'] ** 2 + tau_squared)
-                            for study in studies)
-        random_sum = sum(study['effect'] / (study['stderr'] ** 2 + tau_squared)
-                         for study in studies)
-        random_pooled = random_sum / random_weight
-        random_stderr = math.sqrt(1.0 / random_weight)
-        for study in studies:
-            weight = 1.0 / (study['stderr'] ** 2 + tau_squared)
-            study['random_weight'] = weight
-            study['random_weight_share'] = weight / random_weight
+        random_weights = [1.0 / (study['stderr'] ** 2 + tau_squared)
+                          for study in studies]
+        max_random_weight = max(random_weights) if random_weights else 0.0
+        if math.isfinite(max_random_weight) and max_random_weight > 0.0:
+            random_scaled = [weight / max_random_weight
+                             for weight in random_weights]
+            total_random_scaled = math.fsum(random_scaled)
+            random_pooled = math.fsum(
+                weight * study['effect']
+                for weight, study in zip(random_scaled, studies)
+            ) / total_random_scaled
+            random_stderr = ((1.0 / math.sqrt(max_random_weight))
+                             / math.sqrt(total_random_scaled))
+            for study, weight in zip(studies, random_scaled):
+                study['random_weight'] = weight * max_random_weight
+                study['random_weight_share'] = weight / total_random_scaled
+        else:
+            # An infinite tau^2 gives every study zero random weight (an
+            # unbounded between-scale variance): report the unweighted mean
+            # with an infinite standard error instead of dividing by zero.
+            random_pooled = math.fsum(study['effect'] for study in studies) / k
+            random_stderr = float('inf')
     out['heterogeneity'] = heterogeneity
 
     random_effects = {
