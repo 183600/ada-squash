@@ -389,6 +389,13 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     def _arm_of(entry: dict):
         if arm_of is None and rcbd:
             return entry.get('unit', entry.get('run_id'))
+        if rcbd and isinstance(arm_of, Mapping):
+            # An RCBD's treatment key is `unit`, not the replicated run id.
+            # Honour a mapping keyed by that natural identifier; fall back to
+            # the run id for callers that map the full run ids.
+            unit = entry.get('unit')
+            if unit in arm_of:
+                return arm_of[unit]
         return resolve(entry.get('run_id', entry.get('unit')))
 
     entries = schedule['entries']
