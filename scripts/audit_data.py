@@ -256,6 +256,29 @@ def _band_key(signature, band: int):
     return (band,) + tuple(signature[start:start + _NEAR_DUP_ROWS])
 
 
+def _has_shingle_sketch(record: dict) -> bool:
+    """Whether a near-duplicate record carries at least one shingle.
+
+    `minhash_signature(set())` is the all-ones sentinel. Two token-less
+    documents therefore share that signature and used to be reported as a
+    near-duplicate pair (estimated Jaccard 1.0), which is a false
+    contamination finding. An absent `n_shingles` field is checked against the
+    signature itself so hand-built records are handled too.
+    """
+    if not isinstance(record, dict):
+        return False
+    n = record.get('n_shingles')
+    if isinstance(n, int) and not isinstance(n, bool):
+        return n > 0
+    signature = record.get('signature')
+    if not signature:
+        return False
+    try:
+        return any(int(value) != _NEAR_DUP_MASK for value in signature)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                            margin: float = 0.05, shingle_size: int = 8,
                            max_examples: int = 20,
@@ -325,12 +348,18 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
         earlier_records = records_by_split[earlier]
         if not earlier_records:
             continue
-        earlier_sigs = np.asarray([r["signature"] for r in earlier_records],
-                                  dtype=np.uint64)
+        # Skip token-less documents: their all-ones sentinel signature is not
+        # evidence that two empty documents are copies of each other.
+        earlier_positions = [position for position, record in enumerate(earlier_records)
+                             if _has_shingle_sketch(record)]
+        earlier_sigs = np.asarray(
+            [earlier_records[position]["signature"] for position in earlier_positions],
+            dtype=np.uint64)
         index: dict = {}
-        for doc_i, signature in enumerate(earlier_records):
+        for signature_position, doc_i in enumerate(earlier_positions):
+            signature = earlier_records[doc_i]
             for band in range(_NEAR_DUP_BANDS):
-                index.setdefault(_band_key(signature["signature"], band), []).append(doc_i)
+                index.setdefault(_band_key(signature["signature"], band), []).append(signature_position)
         for later in ordered[i + 1:]:
             later_records = records_by_split[later]
             if not later_records:
@@ -345,6 +374,8 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
             borderline_docs = set()
             borderline_examples = []
             for later_i, later_record in enumerate(later_records):
+                if not _has_shingle_sketch(later_record):
+                    continue
                 candidates = set()
                 for band in range(_NEAR_DUP_BANDS):
                     candidates.update(index.get(
@@ -370,7 +401,7 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                         # than the pair that triggered it.
                         best_pos = int(np.argmax(sims[borderline]))
                         sim_pos = int(borderline[best_pos])
-                        earlier_i = int(candidate_ids[sim_pos])
+                        earlier_i = earlier_positions[int(candidate_ids[sim_pos])]
                         borderline_examples.append({
                             "earlier_document_index": int(
                                 earlier_records[earlier_i].get("doc_index", earlier_i)),
@@ -395,7 +426,7 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                     # Same indirection as the borderline example above.
                     best_pos = int(np.argmax(sims[hits]))
                     sim_pos = int(hits[best_pos])
-                    earlier_i = int(candidate_ids[sim_pos])
+                    earlier_i = earlier_positions[int(candidate_ids[sim_pos])]
                     examples.append({
                         "earlier_split": earlier,
                         "later_split": later,
