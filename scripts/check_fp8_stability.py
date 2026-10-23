@@ -1065,6 +1065,25 @@ def main():
             record['n_checkpoints'] = len(per_ckpt)
             per_seed.append(record)
         r = aggregate_fp8_seed_rows(norm, per_seed)
+        # The probe-seed row uses the mean over finite checkpoint values, so a
+        # mixed group can hide its diverged checkpoint from the arm census.
+        # Re-attach the count of non-finite checkpoint draws per metric.
+        arm_nonfinite = {}
+        for c in per_ckpt:
+            for rec in c.get('per_seed') or []:
+                for key in _FP8_SEED_METRIC_KEYS:
+                    value = rec.get(key)
+                    if (isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and not math.isfinite(float(value))):
+                        arm_nonfinite[key] = arm_nonfinite.get(key, 0) + 1
+        if arm_nonfinite:
+            counts = dict(r.get('nonfinite_metric_counts') or {})
+            for key, count in arm_nonfinite.items():
+                r[key + '_n_nonfinite'] = max(
+                    int(r.get(key + '_n_nonfinite') or 0), count)
+                counts[key] = max(int(counts.get(key) or 0), count)
+            r['nonfinite_metric_counts'] = counts
         train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
         r['train_seeds'] = train_seeds
         r['n_train_seeds'] = len(train_seeds)

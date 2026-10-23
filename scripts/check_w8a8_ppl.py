@@ -964,6 +964,26 @@ def main():
             record['n_checkpoints'] = len(per_ckpt)
             per_seed.append(record)
         r = aggregate_w8a8_seed_rows(label, per_seed)
+        # The arm-level record keeps only the mean of the finite checkpoint
+        # values, so a diverged checkpoint would disappear from the arm census.
+        # Re-attach how many checkpoint draws were non-finite for each metric;
+        # the per-checkpoint records already expose which run it was.
+        arm_nonfinite = {}
+        for c in per_ckpt:
+            for rec in c.get('per_seed') or []:
+                for key in _W8A8_SEED_METRIC_KEYS:
+                    value = rec.get(key)
+                    if (isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and not math.isfinite(float(value))):
+                        arm_nonfinite[key] = arm_nonfinite.get(key, 0) + 1
+        if arm_nonfinite:
+            counts = dict(r.get('nonfinite_metric_counts') or {})
+            for key, count in arm_nonfinite.items():
+                r[key + '_n_nonfinite'] = max(
+                    int(r.get(key + '_n_nonfinite') or 0), count)
+                counts[key] = max(int(counts.get(key) or 0), count)
+            r['nonfinite_metric_counts'] = counts
         # Scale-independent treatment identity for cross-scale replication;
         # `label` may include the model name to keep within-run arms distinct,
         # but the arm itself is the norm recorded by the checkpoint (the path
