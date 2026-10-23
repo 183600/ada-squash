@@ -142,7 +142,8 @@ from adasquash.design import (classify_run_exclusions,
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
-                               leave_one_out_jackknife, mean_std_stderr,
+                               leave_one_out_jackknife, mean_prediction_interval,
+                               mean_std_stderr, max_p_combination,
                                paired_design_summary, paired_t_one_sided,
                                student_t_ppf, tost_paired,
                                two_sided_p_from_t, welch_t_one_sided)
@@ -191,6 +192,8 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
         'paired_delta_std': None,
         'minimum_detectable_delta_95_power80': None,
         'design_power': None,
+        'delta_prediction_interval_95': None,
+        'delta_same_direction_probability': None,
     }
     common = list(common_seeds or [])
     if len(common) >= 2:
@@ -208,6 +211,13 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
                 'per_seed_delta': {str(seed): value for seed, value in deltas.items()},
                 'paired_delta_std': None if stats is None else stats['std'],
             })
+            replication = mean_prediction_interval(values, alpha=alpha)
+            if replication is not None:
+                out['delta_prediction_interval_95'] = [
+                    replication['prediction_low'],
+                    replication['prediction_high']]
+                out['delta_same_direction_probability'] = (
+                    replication['same_direction_probability'])
     if (test is not None and test.get('df') and len(common) >= 2):
         row_seeds = _seed_means(row)
         ref_seeds = _seed_means(reference)
@@ -1919,6 +1929,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     replicated_baselines = [r for r in baselines
                             if len(_seed_means(r)) >= MIN_SEEDS_FOR_SIGNIFICANCE]
     selection_pool = replicated_baselines or baselines
+    selection_pool_names = sorted(r['name'] for r in selection_pool)
     reference = min(selection_pool, key=lambda r: r['val_loss'])
     point_best = min(baselines, key=lambda r: r['val_loss'])
     ref_seeds = _seed_means(reference)
@@ -1945,6 +1956,13 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
                                              if r not in replicated_baselines),
             'reference_can_certify': len(ref_seeds) >= MIN_SEEDS_FOR_SIGNIFICANCE,
             'reference_is_point_estimate_best': reference['name'] == point_best['name'],
+            'data_dependent': True,
+            'pool': selection_pool_names,
+            'pool_size': len(selection_pool_names),
+            'adjustment': ('intersection-union max-p over the baseline pool: a '
+                           'candidate must beat every eligible baseline, not '
+                           'only the best-looking one'),
+            'p_family_basis': 'p_inferential (= selection-combined p)',
         },
         'point_estimate_best_baseline': {
             'name': point_best['name'],
@@ -2001,6 +2019,12 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'significance_basis': None,
             'excluded_from_family': None,
             'p_one_sided': None,
+            'p_one_sided_selection_adjusted': None,
+            'p_inferential': None,
+            'selection_adjustment_complete': True,
+            'pool_contrasts': {},
+            'beats_every_pool_member': None,
+            'delta_vs_pool_worst_case': None,
             'p_one_sided_holm': None,
             't': None,
             'df': None,
@@ -2061,6 +2085,78 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         entry.update(_robustness_for_deltas(
             _per_seed_deltas(row, reference, common),
             alpha=alpha, equivalence_margin=equivalence_margin))
+        # The reference baseline is itself the lowest-loss member of a pool
+        # chosen after seeing the matrix. The claim "this row beats the
+        # baselines" is therefore a claim against the best of that pool, and
+        # it needs the candidate to beat every eligible baseline. Combine the
+        # per-baseline one-sided p-values with the intersection-union max,
+        # which is valid under arbitrary dependence and does not reward
+        # picking the most favourable baseline.
+        pool_pvalues: list[float] = []
+        pool_deltas: list[float] = []
+        pool_contrasts: dict[str, dict] = {}
+        expected_comparators = 0
+        selection_complete = True
+        for baseline_row in selection_pool:
+            baseline_name = baseline_row['name']
+            if baseline_name == entry['name']:
+                continue
+            expected_comparators += 1
+            if baseline_name == reference['name'] and test is not None:
+                member_test = test
+                member_basis = basis
+                member_common = common
+            else:
+                member_test, member_basis, member_common = _paired_row_test(
+                    row, baseline_row, margin=margin, alpha=alpha)
+            record = {
+                'n_shared_seeds': len(member_common),
+                'test_basis': member_basis,
+                'comparable': (member_basis == 'seed_means'
+                               and len(member_common) >= MIN_SEEDS_FOR_SIGNIFICANCE),
+            }
+            if member_test is not None:
+                record['delta_paired_mean'] = member_test.get('mean_delta')
+                record['p_one_sided'] = member_test.get('p_one_sided')
+            if not record['comparable']:
+                selection_complete = False
+                record.setdefault(
+                    'reason',
+                    'fewer than the required shared seeds for a seed-level test')
+                pool_contrasts[baseline_name] = record
+                continue
+            pool_contrasts[baseline_name] = record
+            if member_test is None or not _finite_metric(member_test.get('p_one_sided')):
+                selection_complete = False
+            else:
+                pool_pvalues.append(member_test['p_one_sided'])
+            if member_test is None or member_test.get('mean_delta') is None:
+                selection_complete = False
+            else:
+                pool_deltas.append(member_test['mean_delta'])
+        entry['pool_contrasts'] = pool_contrasts
+        entry['selection_adjustment_complete'] = bool(
+            selection_complete and expected_comparators > 0
+            and len(pool_pvalues) == expected_comparators)
+        entry['p_one_sided_selection_adjusted'] = (
+            max_p_combination(pool_pvalues)
+            if entry['selection_adjustment_complete'] else None)
+        entry['p_inferential'] = (
+            entry['p_one_sided_selection_adjusted']
+            if entry['selection_adjustment_complete'] else None)
+        if pool_deltas:
+            entry['delta_vs_pool_worst_case'] = max(pool_deltas)
+        entry['beats_every_pool_member'] = bool(
+            entry['selection_adjustment_complete']
+            and len(pool_deltas) == expected_comparators
+            and all(value < -margin for value in pool_deltas))
+        if (entry['replicated_across_seeds']
+                and not entry['selection_adjustment_complete']
+                and entry['excluded_from_family'] is None):
+            entry['excluded_from_family'] = (
+                'reference-selection pool is incomplete: the candidate was '
+                'not tested against every eligible baseline, so the '
+                '"beats the baselines" claim is not certifiable')
         if entry['test'] is not None and not entry['replicated_across_seeds']:
             entry['significance_basis'] = (
                 f'descriptive only: {len(common)} shared seed(s), fewer than the required '
@@ -2104,8 +2200,10 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     # whose test could not run stay out of the family (and cannot be reported
     # significant).
     family = [entry for entry in out['rows']
-              if entry['replicated_across_seeds'] and entry['excluded_from_family'] is None]
-    adjusted = holm_adjust([entry['p_one_sided'] for entry in family])
+              if entry['replicated_across_seeds']
+              and entry['excluded_from_family'] is None
+              and entry.get('p_inferential') is not None]
+    adjusted = holm_adjust([entry['p_inferential'] for entry in family])
     for entry, p_holm in zip(family, adjusted):
         entry['p_one_sided_holm'] = p_holm
         # Match the effect estimate to the test that produced the p-value:
@@ -2114,6 +2212,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         paired_delta = entry.get('delta_paired_mean')
         entry['beats_reference_significantly'] = bool(
             paired_delta is not None and paired_delta < -margin
+            and entry.get('beats_every_pool_member') is True
             and p_holm is not None and p_holm < alpha
         )
     described_only = [entry['name'] for entry in out['rows']
@@ -2121,9 +2220,11 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     out['rows_tested_descriptively_only'] = described_only
     out['multiple_comparison'] = (
         f'Holm-Bonferroni over the {sum(p is not None for p in adjusted)} seed-replicated row(s) '
-        f'against the same reference; `beats_reference_significantly` uses the adjusted p-value. '
-        f'Single-run batch-level tests are descriptive only ('
-        f'{described_only}) and duplicates/aliases are counted once.'
+        f'against the best of the eligible baseline pool; each row first passes the '
+        f'intersection-union test against every pool member, so '
+        f'`beats_reference_significantly` requires beating all of them, not just '
+        f'the most favourable one. Single-run batch-level tests are descriptive '
+        f'only ({described_only}) and duplicates/aliases are counted once.'
     )
     thin = {r['name'] for r in [reference, *baselines] if _row_n_seeds(r) < 3}
     out['rows_with_fewer_than_3_seeds'] = sorted(thin | {e['name'] for e in out['rows'] if e['n_seeds'] < 3})
@@ -2142,8 +2243,13 @@ def print_baseline_comparison(comparison: dict | None) -> None:
     selection = comparison.get('reference_selection') or {}
     if selection:
         print(f"[compare] reference selection: {selection.get('rule')}; "
+              f"pool={selection.get('pool')}; "
               f"point-estimate best={comparison.get('point_estimate_best_baseline')}; "
               f"reference can certify={selection.get('reference_can_certify')}")
+        if selection.get('data_dependent') and selection.get('pool_size', 0) > 1:
+            print('[compare] NOTE: this reference was selected after seeing the '
+                  'losses; a candidate must beat every pool member '
+                  '(intersection-union max-p), not only the best-looking one')
     calibration_status = comparison.get('calibration_status')
     if calibration_status == 'missing':
         print('[compare] calibration: MISSING - rows are ranked only against each other; '
@@ -2165,13 +2271,19 @@ def print_baseline_comparison(comparison: dict | None) -> None:
     for entry in comparison['rows']:
         p = entry['p_one_sided']
         p_holm = entry.get('p_one_sided_holm')
+        p_inf = entry.get('p_inferential')
         p_str = 'n/a' if p is None else f'{p:.3g}'
+        p_inf_str = ('' if p_inf is None or p_inf == p
+                     else f' p(sel)={p_inf:.3g}')
         p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
         std = entry.get('val_loss_std')
         std_str = '' if std is None else f" +/- {std:.4f}"
         basis = entry.get('test_basis') or '-'
         ci = entry.get('delta_ci_95')
         ci_str = '' if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        pi = entry.get('delta_prediction_interval_95')
+        pi_str = ('' if pi is None or pi[0] is None
+                  else f" pi95=[{pi[0]:+.4f}, {pi[1]:+.4f}]")
         note = ''
         if entry.get('excluded_from_family'):
             note = f" [{entry['excluded_from_family']}]"
@@ -2203,8 +2315,8 @@ def print_baseline_comparison(comparison: dict | None) -> None:
                 regime_note = (f" [curve regimes {off_regime}: the delta was not measured "
                                f"in a healthy falling-falling regime - read the curve block]")
         print(f"[compare] {entry['name']:>32s} val_loss={entry['val_loss']:.4f}{std_str} "
-              f"delta={entry['delta_vs_reference']:+.4f}{ci_str}{ppl_str}{ratio_str} "
-              f"p(one-sided)={p_str} p(holm)={p_holm_str} "
+              f"delta={entry['delta_vs_reference']:+.4f}{ci_str}{pi_str}{ppl_str}{ratio_str} "
+              f"p(one-sided)={p_str}{p_inf_str} p(holm)={p_holm_str} "
               f"test={entry.get('test') or '-'}@{basis}{direction}{mde_str} "
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}{note}{regime_note}{power_warn}"
@@ -4100,7 +4212,10 @@ def study_level_correction(comparisons: dict, plan: dict | None,
         if not name:
             continue
         _record(
-            f'baseline:{name}', 'baseline', entry.get('p_one_sided'),
+            f'baseline:{name}', 'baseline',
+            (entry.get('p_inferential')
+             if entry.get('p_inferential') is not None
+             else entry.get('p_one_sided')),
             entry.get('p_one_sided_holm'), entry.get('beats_reference'),
             entry.get('beats_reference_significantly'),
             hypothesis=entry.get('hypothesis'),

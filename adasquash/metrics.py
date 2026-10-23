@@ -69,7 +69,9 @@ __all__ = [
     "MIN_SEEDS_FOR_SIGNIFICANCE",
     "mcnemar_test",
     "mean_ci",
+    "mean_prediction_interval",
     "mean_std_stderr",
+    "max_p_combination",
     "paired_design_summary",
     "paired_required_n",
     "paired_t_one_sided",
@@ -318,6 +320,115 @@ def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
         out["ci_low"] = stats["mean"] - half
         out["ci_high"] = stats["mean"] + half
     return out
+
+
+def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
+    """Where a *new* run's metric would plausibly fall, not where the mean is.
+
+    A confidence interval for the mean (`mean_ci`) narrows as the number of
+    seeds grows: it says where the population mean is, not where the next
+    replication will land. With three seeds a 95% CI can look reassuringly
+    tight while a fourth seed still reverses the sign. The prediction
+    interval uses the same Student-t reference with the extra between-run
+    variance:
+
+        mean +/- t_{1-alpha/2, n-1} * s * sqrt(1 + 1/n)
+
+    so it stays wide at small n and converges to the run-to-run spread rather
+    than to zero. This is the interval a replication claim should be read
+    against.
+
+    ``same_direction_probability`` is the model-based predictive probability
+    that a new observation has the same sign as the observed mean, i.e.
+    ``P(T_{n-1} <= |mean| / (s * sqrt(1 + 1/n)))``. It is a descriptive
+    predictive quantity, not a p-value and not a substitute for the
+    pre-specified superiority test; it assumes exchangeable, approximately
+    normal seed-level measurements.
+
+    Returns ``None`` when there is no finite observation. With ``n < 2`` the
+    interval is undefined (no degrees of freedom); with ``n == 2`` it is
+    defined but ``meaningful`` is False because one seed's spread cannot
+    support a replication claim. A zero-variance sample reduces to a
+    degenerate interval and a deterministic same-direction probability.
+    """
+    stats = mean_std_stderr(values)
+    if stats is None:
+        return None
+    alpha = _validate_alpha(alpha)
+    out = dict(stats)
+    out.update({
+        "prediction_interval_level": 1.0 - alpha,
+        "prediction_low": None,
+        "prediction_high": None,
+        "same_direction_probability": None,
+        "meaningful": bool(stats["n"] >= 3),
+        "note": ("a prediction interval describes the next run, not the mean; "
+                 "it is necessarily wider than the confidence interval"),
+    })
+    n = stats["n"]
+    if n < 2:
+        out["note"] = ("a prediction interval needs at least 2 observations; "
+                       "with one run there is no run-to-run spread to predict from")
+        return out
+    mean = stats["mean"]
+    std = stats["std"]
+    df = float(n - 1)
+    if std == 0.0:
+        out.update({
+            "prediction_low": mean,
+            "prediction_high": mean,
+            "same_direction_probability": 1.0 if mean != 0.0 else 0.5,
+            "note": ("zero observed variance: the interval is degenerate and the "
+                     "same-direction probability is deterministic, not evidence "
+                     "that a new run cannot differ"),
+        })
+        return out
+    scale = std * math.sqrt(1.0 + 1.0 / n)
+    half = student_t_ppf(1.0 - alpha / 2.0, df) * scale
+    out["prediction_low"] = mean - half
+    out["prediction_high"] = mean + half
+    out["same_direction_probability"] = student_t_cdf(abs(mean) / scale, df)
+    return out
+
+
+def max_p_combination(pvalues: Sequence[Optional[float]]) -> Optional[float]:
+    """Intersection-union p-value for "all of these one-sided tests reject".
+
+    When a reference is picked from a pool *after* seeing the losses, the
+    scientific claim is "the candidate beats the best member of that pool".
+    That is true only if the candidate beats **every** member, so the relevant
+    null is a union ("at least one pool member is at least as good") and the
+    combination is an intersection-union test (IUT):
+
+        p_combined = max(p_1, ..., p_m)
+
+    The IUT rejects at level alpha only when every individual test rejects,
+    and it needs no independence assumption and no Bonferroni factor. It is
+    conservative (max is stochastically larger than any single p), which is
+    the right direction for a confirmatory claim built on a data-selected
+    reference. Using the *minimum* p instead would answer a different
+    question - "the candidate beats at least one pool member" - and could
+    certify a candidate that loses to the selected reference.
+
+    ``None``, boolean and non-finite/out-of-range entries are ignored (the
+    same contract as `holm_adjust`); a caller that needs a *complete* family
+    must validate the pool before calling, otherwise dropping a missing test
+    silently weakens the "every member" claim. Returns ``None`` when no valid
+    p-value remains.
+    """
+    valid = []
+    for p in pvalues:
+        if p is None or _is_boolean_value(p):
+            continue
+        try:
+            value = float(p)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and 0.0 <= value <= 1.0:
+            valid.append(value)
+    if not valid:
+        return None
+    return max(valid)
 
 
 def _p_one_sided_from_z(z: float) -> float:
@@ -1046,6 +1157,8 @@ def paired_trend_test(
         "df": None,
         "p_one_sided": None,
         "minimum_detectable_slope_95_power80": None,
+        "slope_prediction_interval_95": [None, None],
+        "slope_same_direction_probability": None,
         "mean_r_squared": None,
         "n_seeds_with_negative_slope": None,
         "n_seeds_with_positive_slope": None,
@@ -1114,6 +1227,13 @@ def paired_trend_test(
     stats = mean_std_stderr(slopes)
     out["mean_slope_per_dose"] = stats["mean"]
     out["slope_std"] = stats["std"]
+    slope_replication = mean_prediction_interval(slopes, alpha=alpha)
+    if slope_replication is not None:
+        out["slope_prediction_interval_95"] = [
+            slope_replication["prediction_low"],
+            slope_replication["prediction_high"]]
+        out["slope_same_direction_probability"] = (
+            slope_replication["same_direction_probability"])
     out["mean_r_squared"] = (
         sum(out["per_seed_r_squared"].values()) / n
         if out.get("per_seed_r_squared") else None)

@@ -24,7 +24,9 @@ from adasquash.metrics import (
     macro_weighted_f1,
     mcnemar_test,
     mean_ci,
+    mean_prediction_interval,
     mean_std_stderr,
+    max_p_combination,
     ndcg_at_k,
     paired_t_one_sided,
     paired_trend_test,
@@ -232,6 +234,37 @@ def check_statistics():
           label='mean_ci low')
     close(ci['ci_high'], 2.0 + student_t_ppf(0.975, 2) / math.sqrt(3.0),
           label='mean_ci high')
+
+    # A prediction interval must be wider than the CI for the mean by the
+    # factor sqrt(1 + 1/n); the same t critical value is used.
+    pi = mean_prediction_interval([1.0, 2.0, 3.0])
+    half = student_t_ppf(0.975, 2) * 1.0 * math.sqrt(1.0 + 1.0 / 3.0)
+    close(pi['prediction_low'], 2.0 - half, label='prediction low')
+    close(pi['prediction_high'], 2.0 + half, label='prediction high')
+    equal(pi['meaningful'], True, label='prediction meaningful at n=3')
+    close(pi['same_direction_probability'],
+          student_t_cdf_for_check(2.0 / (1.0 * math.sqrt(1.0 + 1.0 / 3.0)), 2.0),
+          tol=1e-8, label='same-direction probability')
+
+    # The intersection-union combination is the max, not a corrected min.
+    close(max_p_combination([0.01, 0.04, None]), 0.04, label='max-p combine')
+    close(max_p_combination([0.4, 0.3, 0.2]), 0.4, label='max-p combine three')
+    close(max_p_combination([0.9, 0.8]), 0.9, label='max-p combine two')
+    equal(max_p_combination([]), None, label='max-p combine empty')
+    equal(max_p_combination([None, float('nan')]), None, label='max-p combine invalid')
+
+
+def student_t_cdf_for_check(t, df):
+    """Independent Student-t CDF for the predictive-probability check.
+
+    The metric module has its own CDF (used by the implementation); for df=2
+    this check uses the closed form of the t CDF, which is derived from the
+    density by direct integration rather than from the incomplete-beta code
+    path, so a sign error in the helper cannot make both sides agree.
+    """
+    if df == 2.0:
+        return 0.5 + t / (2.0 * math.sqrt(2.0) * math.sqrt(1.0 + t * t / 2.0))
+    raise ValueError('this independent check only covers df=2')
 
 
 def main():

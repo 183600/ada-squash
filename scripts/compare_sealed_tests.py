@@ -43,7 +43,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_ci, mean_std_stderr, paired_t_one_sided, student_t_ppf
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_ci,
+                               mean_prediction_interval, mean_std_stderr,
+                               paired_t_one_sided, student_t_ppf)
 from adasquash.repro import (collect_run_metadata, finish_metadata, save_run_manifest,
                              training_recipe_mismatches)
 
@@ -606,6 +608,8 @@ def main():
             "mean_delta": None,
             "delta_ci_low": None,
             "delta_ci_high": None,
+            "delta_prediction_interval_95": None,
+            "delta_same_direction_probability": None,
             "t": None,
             "df": None,
             "p_one_sided": None,
@@ -634,6 +638,13 @@ def main():
             row["stderr_all_candidate_seeds"] = cand_stats["stderr"]
             deltas = [x - y for x, y in zip(a, b)]
             delta_stats = mean_std_stderr(deltas)
+            replication = mean_prediction_interval(deltas, alpha=args.alpha)
+            if replication is not None:
+                row["delta_prediction_interval_95"] = [
+                    replication["prediction_low"],
+                    replication["prediction_high"]]
+                row["delta_same_direction_probability"] = (
+                    replication["same_direction_probability"])
             row["min_detectable_delta"] = _mde(
                 delta_stats["stderr"], test["df"], args.alpha, args.power,
                 margin=args.margin)

@@ -18,11 +18,21 @@ more aggregates, pairs them by training seed, and reports:
   seed?) and, with `--equivalence-margin <loss>`, a TOST equivalence test, so
   "the two arms are the same" is a tested claim rather than a non-significant
   superiority result;
+* a 95% *prediction* interval for the next seed's paired delta, alongside the
+  confidence interval for the mean: the CI says where the mean is, the PI says
+  how far a replication can still land;
 * both loss and perplexity (`exp(loss)`) deltas, because the papers quote
   PPL while the seed variance lives in loss;
 * a protocol audit across arms: identical model shape, fixed final step and
   resolved data version. If the arms differ on those, the comparison is
-  reported but never certified, no matter how small the p-value.
+  reported but never certified, no matter how small the p-value;
+* a reference-selection audit. The default reference is the best-looking arm,
+  and an explicit `--reference` is normally fixed in advance; when
+  `--reference-selection best-of-pool` (or `--reference-pool`) declares a
+  data-selected reference, the candidate must beat every pool member
+  (intersection-union max-p) before entering the Holm family. Reporting only
+  the comparison against the winner would make the claim conditional on the
+  selection.
 
 Only the paired test on >= 3 shared per-seed means is certifiable; two shared
 seeds are descriptive only (df = 1). p-values are Holm-adjusted over the
@@ -39,7 +49,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
-                               leave_one_out_jackknife, mean_std_stderr,
+                               leave_one_out_jackknife, mean_prediction_interval,
+                               mean_std_stderr, max_p_combination,
                                paired_design_summary, paired_t_one_sided,
                                student_t_ppf, tost_paired)
 from adasquash.repro import compare_train_streams, training_recipe_mismatches
@@ -335,7 +346,9 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                  margin: float=0.0, manifests: dict[str, dict] | None=None,
                  require_recipe: bool=True,
                  equivalence_margin: float=0.0,
-                 require_train_stream_identity: bool=False) -> dict:
+                 require_train_stream_identity: bool=False,
+                 reference_selection: str | None=None,
+                 reference_pool: list[str] | None=None) -> dict:
     """Paired, Holm-adjusted comparison of arm aggregates.
 
     `arms` maps a display name to an aggregate.json object. The reference is
@@ -343,6 +356,17 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
     is tested against it on the seeds both arms actually share. The result
     separates "delta < 0" (point estimate) from "certified" (>= 3 shared
     seeds, clean arms, identical protocol, and Holm-adjusted p < alpha).
+
+    Reference selection is itself a result-analysis decision. When the
+    reference was chosen *after* seeing the losses (`reference=None`, or
+    `reference_selection='best-of-pool'`), the reported p-value is for the
+    best-looking member of a pool, not for a pre-specified comparator.
+    `p_one_sided_selection_adjusted` applies an intersection-union max-p
+    over that pool (`max_p_combination`), and the certification family uses that
+    adjusted value; `p_one_sided` remains the raw test against the selected
+    reference so both quantities are auditable. An explicit `reference` is
+    treated as pre-specified unless `reference_selection='best-of-pool'` (or
+    `reference_pool`) says otherwise.
     """
     if not isinstance(arms, dict) or len(arms) < 2:
         raise ValueError('compare_arms needs at least two named aggregates')
@@ -353,6 +377,19 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
     if not math.isfinite(equivalence_margin) or equivalence_margin < 0.0:
         raise ValueError('equivalence_margin must be finite and >= 0 '
                          '(0 disables TOST)')
+    if reference_selection not in (None, 'prespecified', 'best-of-pool'):
+        raise ValueError(
+            "reference_selection must be None, 'prespecified' or 'best-of-pool', "
+            f'got {reference_selection!r}')
+    if reference_pool is not None:
+        if (not isinstance(reference_pool, (list, tuple))
+                or not reference_pool
+                or any(not isinstance(name, str) or not name for name in reference_pool)):
+            raise ValueError('reference_pool must be a non-empty list of arm names')
+        if reference_selection == 'prespecified':
+            raise ValueError(
+                'reference_pool declares a data-selected reference pool; it '
+                "cannot be combined with reference_selection='prespecified'")
 
     prepared = {}
     for name, agg in arms.items():
@@ -383,21 +420,43 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         hyper = manifest.get('hyperparameters') if isinstance(manifest, dict) else None
         prepared[name]['recipe_recorded'] = isinstance(hyper, dict)
         manifest_problems[name] = _manifest_replication_problem(arms[name], manifest)
+    reference_was_explicit = reference is not None
+    default_selection_pool: list[str] = []
     if reference is not None:
         if reference not in prepared:
             raise ValueError(f'reference {reference!r} is not one of {sorted(prepared)}')
+        if reference_selection == 'prespecified' and reference_pool is not None:
+            raise ValueError('a pre-specified reference cannot also declare a pool')
     else:
-        replicated = [row for row in prepared.values()
-                      if row['n_seeds'] >= MIN_SEEDS_FOR_SIGNIFICANCE
-                      and row['mean'] is not None]
-        pool = replicated or [row for row in prepared.values()
-                              if row['mean'] is not None]
+        if reference_selection == 'prespecified':
+            raise ValueError(
+                "reference_selection='prespecified' requires an explicit reference")
+        if reference_pool is not None:
+            missing = [name for name in reference_pool if name not in prepared]
+            if missing:
+                raise ValueError(
+                    f'reference_pool names unknown arm(s) {missing}; known: '
+                    f'{sorted(prepared)}')
+            pool = [prepared[name] for name in dict.fromkeys(reference_pool)
+                    if prepared[name]['mean'] is not None]
+        else:
+            replicated = [row for row in prepared.values()
+                          if row['n_seeds'] >= MIN_SEEDS_FOR_SIGNIFICANCE
+                          and row['mean'] is not None]
+            pool = replicated or [row for row in prepared.values()
+                                  if row['mean'] is not None]
         if not pool:
-            raise ValueError('no arm has a usable mean for the requested metric')
+            raise ValueError('no arm in the reference pool has a usable '
+                             f'{metric} mean')
         reference = min(pool, key=lambda row: row['mean'])['name']
+        default_selection_pool = sorted(row['name'] for row in pool)
     ref = prepared[reference]
     if ref['mean'] is None:
         raise ValueError(f'reference arm {reference!r} has no usable {metric}')
+    reference_data_dependent = bool(
+        not reference_was_explicit
+        or reference_selection == 'best-of-pool'
+        or reference_pool is not None)
 
     # Protocol identity across arms: only the normalization may differ. The
     # model shape, fixed final step and resolved data version are the
@@ -430,6 +489,41 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
     if len(model_values) != 1 or _has_unknown(model_values):
         protocol_problems.append(f'model selectors differ or are unknown: {sorted(map(str, model_values))}')
     protocol_ok = not protocol_problems
+
+    # The selection pool is the set of arms the reported reference was chosen
+    # from. For the default (best replicated arm) it is the same set the
+    # selection rule used, restricted to arms that share the reference's
+    # controlled protocol: an arm at another scale could not have supplied a
+    # like-for-like reference. When the caller names the pool explicitly we
+    # keep it verbatim, and a missing/incomparable member makes the
+    # selection-adjusted claim fail closed rather than silently shrink m.
+    selection_pool: list[str] = []
+    if reference_data_dependent:
+        if reference_pool is not None:
+            selection_pool = list(dict.fromkeys(reference_pool))
+            missing = [name for name in selection_pool if name not in prepared]
+            if missing:
+                raise ValueError(
+                    f'reference_pool names unknown arm(s) {missing}; known: '
+                    f'{sorted(prepared)}')
+            if reference not in selection_pool:
+                raise ValueError(
+                    f'reference {reference!r} is not in reference_pool '
+                    f'{selection_pool}; a data-selected reference must belong '
+                    'to the pool it was selected from')
+        elif default_selection_pool:
+            selection_pool = [
+                name for name in default_selection_pool
+                if signatures[name] == signatures[reference]]
+            if reference not in selection_pool:
+                selection_pool.append(reference)
+        else:
+            selection_pool = [
+                name for name in prepared
+                if name == reference
+                or (prepared[name]['n_seeds'] >= MIN_SEEDS_FOR_SIGNIFICANCE
+                    and prepared[name]['mean'] is not None
+                    and signatures[name] == signatures[reference])]
 
     rows = []
     for name, cand in prepared.items():
@@ -531,10 +625,19 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'test': None,
             'test_basis': None,
             'p_one_sided': None,
+            'p_one_sided_selection_adjusted': None,
+            'p_inferential': None,
+            'selection_adjustment_complete': (not reference_data_dependent),
+            'selection_pool_used': [],
+            'pool_contrasts': {},
+            'delta_vs_pool_worst_case': None,
+            'beats_every_pool_member': None,
             'p_one_sided_holm': None,
             't': None,
             'df': None,
             'delta_ci_95': None,
+            'delta_prediction_interval_95': None,
+            'delta_same_direction_probability': None,
             'n_seeds_favoring': None,
             'n_seeds_tied': None,
             'n_seeds_against': None,
@@ -586,6 +689,13 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             entry['n_seeds_against'] = sum(value > 0.0 for value in deltas)
             entry['per_seed_delta'] = {str(seed): value
                                        for seed, value in zip(common, deltas)}
+            replication = mean_prediction_interval(deltas, alpha=alpha)
+            if replication is not None:
+                entry['delta_prediction_interval_95'] = [
+                    replication['prediction_low'],
+                    replication['prediction_high']]
+                entry['delta_same_direction_probability'] = (
+                    replication['same_direction_probability'])
             if delta_stats['std'] and delta_stats['std'] > 0.0:
                 entry['delta_paired_over_delta_std'] = (
                     abs(delta_stats['mean']) / delta_stats['std'])
@@ -617,13 +727,114 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                 entry['design_power'] = paired_design_summary(
                     delta_stats['std'], len(common), margin=margin,
                     alpha=alpha, power=0.8)
+            if reference_data_dependent:
+                # The reported reference was selected from a pool. Test the
+                # candidate against every pool member that could actually
+                # have been the reference, and combine the p-values with the
+                # intersection-union max-p. Reporting only the comparison
+                # against the best-looking member would hide the selection.
+                used_pool: list[str] = []
+                pool_contrasts: dict[str, dict] = {}
+                pool_pvalues: list[float] = []
+                pool_deltas: list[float] = []
+                complete = True
+                for member in selection_pool:
+                    if member == name:
+                        pool_contrasts[member] = {
+                            'comparable': False,
+                            'reason': 'the candidate is this pool member',
+                        }
+                        continue
+                    if member == reference:
+                        used_pool.append(member)
+                        pool_contrasts[member] = {
+                            'comparable': True,
+                            'selected_reference': True,
+                            'n_shared_seeds': len(common),
+                            'delta_paired_mean': entry.get('delta_paired_mean'),
+                            'p_one_sided': entry.get('p_one_sided'),
+                        }
+                        if _finite(entry.get('p_one_sided')):
+                            pool_pvalues.append(entry['p_one_sided'])
+                        if entry.get('delta_paired_mean') is not None:
+                            pool_deltas.append(entry['delta_paired_mean'])
+                        else:
+                            complete = False
+                        continue
+                    other = prepared[member]
+                    same_protocol = signatures[member] == signatures[reference]
+                    common_m = sorted(set(cand['values']) & set(other['values']))
+                    record = {
+                        'comparable': bool(same_protocol and len(common_m) >= 2),
+                        'same_protocol': same_protocol,
+                        'n_shared_seeds': len(common_m),
+                    }
+                    if not record['comparable']:
+                        record['reason'] = (
+                            'not protocol-comparable to the selected reference'
+                            if not same_protocol else
+                            f'only {len(common_m)} shared seed(s); a paired test needs 2')
+                        complete = False
+                        pool_contrasts[member] = record
+                        continue
+                    member_values = [other['values'][seed] for seed in common_m]
+                    candidate_values = [cand['values'][seed] for seed in common_m]
+                    member_test = paired_t_one_sided(
+                        candidate_values, member_values, margin=margin, alpha=alpha)
+                    member_deltas = [a - b for a, b in
+                                     zip(candidate_values, member_values)]
+                    record.update({
+                        'delta_paired_mean': member_test['mean_delta'],
+                        'p_one_sided': member_test['p_one_sided'],
+                        'delta_ci_95': [member_test['ci_low'], member_test['ci_high']],
+                    })
+                    used_pool.append(member)
+                    pool_contrasts[member] = record
+                    if not _finite(member_test.get('p_one_sided')):
+                        complete = False
+                    else:
+                        pool_pvalues.append(member_test['p_one_sided'])
+                    if member_test['mean_delta'] is None:
+                        complete = False
+                    else:
+                        pool_deltas.append(member_test['mean_delta'])
+                entry['selection_pool_used'] = used_pool
+                entry['pool_contrasts'] = pool_contrasts
+                expected_comparators = len(
+                    [member for member in selection_pool if member != name])
+                entry['selection_adjustment_complete'] = bool(
+                    complete and len(pool_pvalues) == expected_comparators)
+                entry['p_one_sided_selection_adjusted'] = (
+                    max_p_combination(pool_pvalues)
+                    if entry['selection_adjustment_complete'] else None)
+                entry['p_inferential'] = (
+                    entry['p_one_sided_selection_adjusted']
+                    if entry['selection_adjustment_complete'] else None)
+                if pool_deltas:
+                    # Largest candidate-minus-baseline delta = smallest
+                    # advantage. A claim that survives only against the
+                    # most favourable pool member is visible here.
+                    entry['delta_vs_pool_worst_case'] = max(pool_deltas)
+                entry['beats_every_pool_member'] = bool(
+                    entry['selection_adjustment_complete']
+                    and len(pool_deltas) == expected_comparators
+                    and all(delta < -margin for delta in pool_deltas))
+            else:
+                entry['p_inferential'] = entry.get('p_one_sided')
             both_clean = (not cand['issues'] and not ref['issues']
                           and len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE)
-            entry['certifiable'] = bool(both_clean and pair_protocol_ok)
+            selection_ok = (not reference_data_dependent
+                            or entry['selection_adjustment_complete'])
+            entry['certifiable'] = bool(both_clean and pair_protocol_ok and selection_ok)
             if not pair_protocol_ok:
                 entry['certification_basis'] = (
                     'not certifiable: this pair differs on a controlled protocol field '
                     f'({"; ".join(pair_problems)})')
+            elif reference_data_dependent and not selection_ok:
+                entry['certification_basis'] = (
+                    'not certifiable: the data-selected reference pool could not be '
+                    'tested completely, so the reported comparison is conditional on '
+                    'the reference selection')
             elif len(common) < MIN_SEEDS_FOR_SIGNIFICANCE:
                 entry['certification_basis'] = (
                     f'descriptive only: {len(common)} shared seed(s), fewer than '
@@ -655,10 +866,12 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
     # before calling any arm a significant improvement.
     # Only a clean, >= 3-shared-seed pair is admissible to the Holm family:
     # a two-seed or cross-protocol p-value is descriptive and must not shrink
-    # the adjusted p of a certifiable contrast.
+    # the adjusted p of a certifiable contrast. When the reference was
+    # selected after seeing the losses, the family p-value is the
+    # selection-adjusted one, not the raw comparison against the winner.
     family = [entry for entry in rows
-              if entry.get('certifiable') and entry['p_one_sided'] is not None]
-    for entry, p_holm in zip(family, holm_adjust([e['p_one_sided'] for e in family])):
+              if entry.get('certifiable') and entry.get('p_inferential') is not None]
+    for entry, p_holm in zip(family, holm_adjust([e['p_inferential'] for e in family])):
         entry['p_one_sided_holm'] = p_holm
         # The test that produced `p_one_sided` is paired on the *shared* seeds,
         # so its effect estimate is `delta_paired_mean`. Comparing the adjusted
@@ -700,11 +913,33 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                         'seed must have consumed the same training stream, and each arm '
                         'needs >= 3 clean seeds'),
         },
+        'reference_selection': {
+            'data_dependent': reference_data_dependent,
+            'rule': ('explicitly named reference (treated as pre-specified)'
+                     if not reference_data_dependent else
+                     'lowest held-out mean among replicated arms'
+                     if not reference_was_explicit else
+                     'caller-declared selection from a reference pool'),
+            'pool': list(selection_pool),
+            'pool_size': len(selection_pool),
+            'adjustment': ('intersection-union max-p over the selection pool; '
+                           'the certification family uses p_inferential'
+                           if reference_data_dependent else
+                           'none: the reference is pre-specified'),
+            'p_family_basis': ('p_inferential (= selection-adjusted p)'
+                               if reference_data_dependent else
+                               'p_one_sided (= raw paired test)'),
+            'reading': ('a data-selected reference makes the reported comparison '
+                        'conditional on which arm looked best; the max-p '
+                        'intersection-union requires the candidate to beat '
+                        'every pool member, not just the winner'),
+        },
         'multiple_comparison': (
             f'Holm-Bonferroni over the {len(family)} candidate arm(s) tested '
             f'against {reference!r}; `certified` requires >= '
-            f'{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds, a clean protocol, and '
-            f'the adjusted p < {alpha}'),
+            f'{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds, a clean protocol, a '
+            f'complete reference-selection pool when the reference was '
+            f'data-selected, and the adjusted p < {alpha}'),
         'reading': ('delta < 0 means the candidate has lower loss than the reference. '
                     '`delta_over_seed_std` compares the gap with the larger of the '
                     'two across-seed stds; `within_seed_noise` is a warning, not a '
@@ -727,14 +962,25 @@ def print_comparison(comparison: dict) -> None:
         print('[arms] WARNING: cross-arm protocol mismatch; only pairs that share '
               'every controlled field can certify: '
               + '; '.join(protocol['problems']))
+    selection = comparison.get('reference_selection') or {}
+    if selection.get('data_dependent') and selection.get('pool_size', 0) > 1:
+        print(f"[arms] WARNING: reference {ref!r} was selected from "
+              f"{selection.get('pool')} after seeing the losses; the "
+              f"selection-adjusted p is reported alongside the raw one")
     for entry in comparison['rows']:
         delta = entry['delta_vs_reference']
         std = entry.get('std')
         p = entry.get('p_one_sided')
         p_holm = entry.get('p_one_sided_holm')
+        p_inf = entry.get('p_inferential')
         ci = entry.get('delta_ci_95')
         ci_str = '' if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
+        pi = entry.get('delta_prediction_interval_95')
+        pi_str = ('' if pi is None or pi[0] is None
+                  else f" pi95=[{pi[0]:+.4f}, {pi[1]:+.4f}]")
         p_str = 'n/a' if p is None else f'{p:.3g}'
+        p_inf_str = ('' if p_inf is None or p_inf == p
+                     else f' p(sel)={p_inf:.3g}')
         ph_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
         ratio = entry.get('delta_over_seed_std')
         ratio_str = '' if ratio is None else f' delta/seed_std={ratio:.2f}'
@@ -742,6 +988,9 @@ def print_comparison(comparison: dict) -> None:
         ppl_str = '' if ppl is None else f' dPPL={ppl:+.2f}%'
         noise = ' [WITHIN SEED NOISE]' if entry.get('within_seed_noise') else ''
         note = '' if entry.get('certifiable') else f" [{entry.get('certification_basis')}]"
+        if (selection.get('data_dependent') and selection.get('pool_size', 0) > 1
+                and entry.get('beats_every_pool_member') is False):
+            note += ' [does not beat every reference-pool member]'
         jackknife = entry.get('seed_jackknife') or {}
         if jackknife.get('meaningful') and jackknife.get('sign_stable') is False:
             note += (f" [SEED-SENSITIVE: dropping "
@@ -757,8 +1006,8 @@ def print_comparison(comparison: dict) -> None:
         delta_str = ('n/a' if delta is None else f"{delta:+.4f}")
         print(f"[arms] {entry['name']:>24s} mean={mean_str}"
               + ('' if std is None else f" +/- {std:.4f}")
-              + f" delta={delta_str}{ci_str}{ppl_str}{ratio_str}"
-              + f" p={p_str} p(holm)={ph_str} certified={entry['certified']}"
+              + f" delta={delta_str}{ci_str}{pi_str}{ppl_str}{ratio_str}"
+              + f" p={p_str}{p_inf_str} p(holm)={ph_str} certified={entry['certified']}"
               + f"{noise}{note}")
     print('[arms] ' + comparison['multiple_comparison'])
 
@@ -776,6 +1025,17 @@ def main(argv=None) -> None:
                    help='one display name per aggregate (default: the parent directory name)')
     p.add_argument('--reference', default=None,
                    help='arm name to compare against (default: best replicated arm)')
+    p.add_argument('--reference-selection', default=None,
+                   choices=('prespecified', 'best-of-pool'),
+                   help='declare whether the reference was fixed before seeing the '
+                        'results (prespecified) or chosen from a pool after seeing '
+                        'them (best-of-pool). The default reference is treated as '
+                        'data-selected; an explicit --reference is treated as '
+                        'pre-specified unless this flag says otherwise.')
+    p.add_argument('--reference-pool', nargs='+', default=None,
+                   help='arm names the reference was selected from; enables the '
+                        'intersection-union selection correction and requires '
+                        '--reference to be one of them')
     p.add_argument('--metric', default='final_val_loss', choices=_LOSS_METRICS,
                    help='held-out metric to compare (default: the fixed-step final validation loss)')
     p.add_argument('--alpha', type=float, default=0.05,
@@ -809,6 +1069,14 @@ def main(argv=None) -> None:
     names = args.names or [_default_name(path) for path in paths]
     if len(set(names)) != len(names):
         p.error(f'duplicate arm names: {names}; pass --names to disambiguate')
+    if args.reference_pool is not None:
+        unknown = sorted(set(args.reference_pool) - set(names))
+        if unknown:
+            p.error(f'--reference-pool names unknown arm(s) {unknown}; known: {names}')
+        if args.reference is not None and args.reference not in args.reference_pool:
+            p.error('--reference must be one of the --reference-pool members')
+    if args.reference_selection == 'prespecified' and args.reference is None:
+        p.error('--reference-selection prespecified requires --reference')
     arms = {}
     manifests = {}
     for name, path in zip(names, paths):
@@ -834,7 +1102,9 @@ def main(argv=None) -> None:
                               manifests=manifests,
                               require_recipe=not args.allow_missing_recipe,
                               equivalence_margin=args.equivalence_margin,
-                              require_train_stream_identity=args.require_train_stream_identity)
+                              require_train_stream_identity=args.require_train_stream_identity,
+                              reference_selection=args.reference_selection,
+                              reference_pool=args.reference_pool)
     print_comparison(comparison)
     output = Path(args.output) if args.output else paths[0].parent / 'arm_comparison.json'
     output.parent.mkdir(parents=True, exist_ok=True)
