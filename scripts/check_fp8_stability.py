@@ -524,6 +524,67 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
                     and _finite_metric(b_by_seed[s]))
     return shared, [float(a_by_seed[s]) for s in shared], [float(b_by_seed[s]) for s in shared]
 
+_TREATMENT_KEYS = (
+    'norm', 'qk_norm', 'qk_alpha_init', 'alpha_0', 'k_init', 'alpha_init',
+    'p_init', 'learnable_p', 'learnable_k', 'learnable_delta', 'beta',
+    'use_layerscale', 'layerscale_init', 'alpha_jitter',
+)
+
+
+def _treatment_record(ckpt_args, model) -> dict:
+    """The normalization treatment recorded by one checkpoint.
+
+    This is deliberately separate from `_protocol_record`: the treatment is
+    the one thing that *should* differ between comparison arms, but every
+    checkpoint inside one arm must share it. Checkpoint groups are accepted as
+    comma-separated lists, so without this check an ``ln`` checkpoint could be
+    averaged with two ``rmsnorm`` checkpoints and the mixed group certified as
+    a single norm.
+    """
+    args = ckpt_args if isinstance(ckpt_args, dict) else {}
+    cfg = getattr(model, 'cfg', None)
+
+    def recorded(name, cfg_name=None, default=None):
+        if name in args:
+            return args[name]
+        return getattr(cfg, cfg_name or name, default)
+
+    def negated(name, cfg_name, default):
+        # Training checkpoints store `--no-learnable-p` / `--no-layerscale`
+        # flags; the model config stores the positive attribute.
+        if name in args:
+            return not bool(args[name])
+        return getattr(cfg, cfg_name, default)
+
+    return {
+        'norm': recorded('norm', 'norm_name'),
+        'qk_norm': recorded('qk_norm'),
+        'qk_alpha_init': recorded('qk_alpha_init'),
+        'alpha_0': recorded('alpha_0'),
+        'k_init': recorded('k_init'),
+        'alpha_init': recorded('alpha_init'),
+        'p_init': recorded('p_init'),
+        'learnable_p': negated('no_learnable_p', 'learnable_p', True),
+        'learnable_k': negated('no_learnable_k', 'learnable_k', True),
+        'learnable_delta': negated('no_learnable_delta', 'learnable_delta', True),
+        'beta': recorded('beta', default=True),
+        'use_layerscale': negated('no_layerscale', 'use_layerscale', True),
+        'layerscale_init': recorded('layerscale_init'),
+        'alpha_jitter': recorded('alpha_jitter'),
+    }
+
+
+def _treatment_mismatches(records) -> dict:
+    """Per-key differing treatment values inside one checkpoint group."""
+    values = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key in _TREATMENT_KEYS:
+            values.setdefault(key, set()).add(repr(record.get(key)))
+    return {key: sorted(seen) for key, seen in values.items() if len(seen) > 1}
+
+
 def _protocol_record(ckpt_args: dict, model) -> dict:
     """Training recipe and shape recorded by one checkpoint."""
     return {
@@ -940,7 +1001,19 @@ def main():
             per_ckpt.append({'ckpt': ckpt_path, 'train_seed': train_seed,
                              'protocol': _protocol_record(ckpt_args, ckpt_model)
                              if ckpt_model is not None else None,
+                             'treatment': _treatment_record(ckpt_args, ckpt_model)
+                             if ckpt_model is not None else None,
                              'per_seed': per_seed_ckpt})
+        # A comma-separated group is one arm only when every checkpoint in it
+        # is the same treatment; otherwise its per-seed means mix norms before
+        # the cross-norm comparison ever starts.
+        treatment_mismatches = _treatment_mismatches(
+            c.get('treatment') for c in per_ckpt)
+        if treatment_mismatches:
+            p.error(
+                f'--ckpt group {label!r} mixes treatment values '
+                f'{json.dumps(treatment_mismatches, sort_keys=True)}; one '
+                'checkpoint group must contain a single normalization treatment')
         # A multi-checkpoint norm is one treatment only if its checkpoints
         # share the training recipe and model shape; keep any disagreement
         # visible instead of averaging it into the arm.
