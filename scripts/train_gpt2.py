@@ -460,16 +460,28 @@ def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
     # resolved relative to it (checkpoint/output/ledgers). Running the child
     # from ROOT made a relative --output-dir point at a different place and
     # the artifact fingerprint then reported a missing file.
+    # A failed child must not leave the previous run's JSON to be fingerprinted
+    # as this run's artifact. Remove it before the spawn and require a clean
+    # exit before accepting whatever the child wrote.
+    try:
+        out_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f'[errors][warn] could not remove stale {out_path}: {exc}',
+              file=sys.stderr)
     rc = subprocess.run(cmd).returncode
     if rc != 0:
         print(f'[errors][warn] analyze_errors.py exited rc={rc}; no error_analysis '
               f'artifact was recorded', file=sys.stderr)
+    artifact = (file_fingerprint(out_path)
+                if rc == 0 and out_path.exists() else None)
     return {
         'ran': rc == 0,
         'returncode': rc,
         'checkpoint': str(ckpt_path),
         'split': 'validation',
-        'artifact': file_fingerprint(out_path) if out_path.exists() else None,
+        'artifact': artifact,
         'command': cmd,
     }
 
