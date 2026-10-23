@@ -1239,8 +1239,13 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
         sd, margin_value, alpha=family_alpha, power=power_value, max_n=max_pairs)
     pair_survival = (1.0 - attrition) ** 2
     expected_pairs = int(math.floor(n_pairs * pair_survival + 1e-12))
-    required_planned = (None if required_adjusted is None
-                        else int(math.ceil(required_adjusted / pair_survival)))
+    required_planned = (
+        None if required_adjusted is None else
+        # The tiny subtraction matches the `+1e-12` tolerance used for
+        # `expected_pairs`: without it a mathematically exact 200 planned
+        # pairs can become 201 when `(1 - attrition) ** 2` rounds just below
+        # its decimal value (e.g. attrition=0.8).
+        int(math.ceil(required_adjusted / pair_survival - 1e-12)))
     planned_unadjusted = paired_design_summary(
         sd, n_pairs, margin=margin_value, alpha=alpha_value, power=power_value)
     planned_summary = paired_design_summary(
