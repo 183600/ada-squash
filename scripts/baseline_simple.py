@@ -450,8 +450,14 @@ def _is_seed_id(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _row_seed_losses(row: dict) -> dict:
-    """Per-seed validation losses of one ablation row, when recorded."""
+def _row_seed_losses(row: dict, duplicates: set | None = None) -> dict:
+    """Per-seed validation losses of one ablation row, when recorded.
+
+    A duplicate seed is one underlying run, not two independent observations.
+    Keep the first record but report the collision through `duplicates` (when
+    supplied) so the caller can exclude the row instead of letting the last
+    duplicate silently decide the paired test.
+    """
     out = {}
     per_seed = row.get('per_seed')
     if isinstance(per_seed, list):
@@ -462,10 +468,13 @@ def _row_seed_losses(row: dict) -> dict:
             # A boolean/fractional/string seed is not an independent
             # replication id; int(True)/int("42") would silently pair this
             # row with a different ablation run.
-            if not _is_seed_id(seed):
+            if not _is_seed_id(seed) or not _finite_number(item.get('val_loss')):
                 continue
-            if _finite_number(item.get('val_loss')):
-                out[seed] = float(item['val_loss'])
+            if seed in out:
+                if duplicates is not None:
+                    duplicates.add(seed)
+                continue
+            out[seed] = float(item['val_loss'])
         return out
     seed = row.get('seed')
     if _is_seed_id(seed) and _finite_number(row.get('val_loss')):
@@ -473,7 +482,8 @@ def _row_seed_losses(row: dict) -> dict:
     return out
 
 
-def _count_seed_ce(records: list, predictor: str) -> dict:
+def _count_seed_ce(records: list, predictor: str,
+                   duplicates: set | None = None) -> dict:
     """Per-seed CE of the tuned count model on the shared held-out stream."""
     out = {}
     for record in records or []:
@@ -483,8 +493,13 @@ def _count_seed_ce(records: list, predictor: str) -> dict:
         if not _is_seed_id(seed):
             continue
         value = (record.get('predictors') or {}).get(predictor)
-        if _finite_number(value):
-            out[seed] = float(value)
+        if not _finite_number(value):
+            continue
+        if seed in out:
+            if duplicates is not None:
+                duplicates.add(seed)
+            continue
+        out[seed] = float(value)
     return out
 
 
@@ -560,7 +575,10 @@ def _row_calibration_protocol(row: dict) -> dict | None:
         'vocab_size': _CALIBRATION_MODEL_VOCAB.get(row.get('model')),
         'batch_size': data.get('batch_size'),
         'seq_len': data.get('seq_len'),
-        'outlier_id': data.get('outlier_id'),
+        # An absent key is unknown, while an explicitly recorded `null` means
+        # the outlier channel was off. Both used to `.get()` to None, so an
+        # unverified row matched a no-outlier calibration run.
+        'outlier_id': (data['outlier_id'] if 'outlier_id' in data else '<missing>'),
         'val_seed_offset': data.get('val_seed_offset'),
         'val_batches': data.get('val_batches'),
     }
@@ -651,9 +669,12 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
                 entry['beats_tuned_simple_baseline'] = bool(val_loss < tuned_ce)
             if log_vocab is not None and ceiling is not None and log_vocab > ceiling:
                 entry['signal_captured_fraction'] = (log_vocab - val_loss) / (log_vocab - ceiling)
+        row_duplicates: set = set()
+        per_seed_val_loss = _row_seed_losses(row, row_duplicates)
         entry.update({
             'beats_tuned_simple_significantly': False,
-            'per_seed_val_loss': _row_seed_losses(row),
+            'per_seed_val_loss': per_seed_val_loss,
+            'duplicate_seed_ids': sorted(row_duplicates),
             'n_paired_seeds': 0,
             'p_one_sided_tuned_simple': None,
             'p_one_sided_tuned_simple_holm': None,
@@ -662,7 +683,9 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
             'minimum_detectable_delta_tuned_simple': None,
             'simple_baseline_test_basis': None,
         })
-        seed_ce = _count_seed_ce(records, tuned_predictor) if tuned_predictor else {}
+        seed_duplicates: set = set()
+        seed_ce = (_count_seed_ce(records, tuned_predictor, seed_duplicates)
+                   if tuned_predictor else {})
         common = sorted(set(entry['per_seed_val_loss']) & set(seed_ce))
         entry['n_paired_seeds'] = len(common)
         if len(common) >= 2:
@@ -687,6 +710,20 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
                 'cannot separate an arm effect from run-to-run noise')
         elif tuned_predictor:
             entry['simple_baseline_test_basis'] = 'no_shared_seeds'
+        duplicate_ids = row_duplicates | seed_duplicates
+        if duplicate_ids:
+            # Repeated seed ids are one run, not extra replication; the paired
+            # test above is not independent evidence and must not enter the
+            # Holm family (or set the significant flag).
+            entry['duplicate_seed_ids'] = sorted(duplicate_ids)
+            entry['replicated_across_seeds'] = False
+            entry['simple_baseline_test_basis'] = (
+                'duplicate seed record(s) '
+                f'{sorted(duplicate_ids)}: the same run cannot be counted twice')
+            if entry.get('excluded_from_family') is None:
+                entry['excluded_from_family'] = (
+                    'duplicate seed record(s) '
+                    f'{sorted(duplicate_ids)}: not independent evidence')
         out.append(entry)
     # Alias rows (`reused_from`) are the same underlying run under a second
     # name. Choose the canonical row by evidence quality, not by summary
