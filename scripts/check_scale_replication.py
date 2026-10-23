@@ -134,7 +134,11 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
         'delta': delta,
         # A reversed pair tests the opposite one-sided hypothesis; keep it as a
         # descriptive sign observation but never inherit its certification.
-        'certified': bool(entry.get('significant')) if orientation == 'candidate_vs_reference' else False,
+        # Only an explicit boolean True certifies a scale. `bool("False")`
+        # is True, so a malformed/legacy string must not inherit a
+        # certification the producer never asserted.
+        'certified': (entry.get('significant') is True
+                      if orientation == 'candidate_vs_reference' else False),
         'p_one_sided': (_reported_p(entry.get('p_holm'), entry.get('p_one_sided'))
                         if orientation == 'candidate_vs_reference' else None),
         'n_seeds': (entry.get('n_shared_train_seeds')
@@ -172,7 +176,7 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
             # delta, so separate per-scale artifacts share one contrast id.
             'contrast': f'{candidate} vs {reference}',
             'delta': delta,
-            'certified': (bool(row.get('beats_reference_significantly'))
+            'certified': ((row.get('beats_reference_significantly') is True)
                           if orientation == 'candidate_vs_reference' else False),
             'p_one_sided': (_reported_p(row.get('p_one_sided_holm'),
                                         row.get('p_one_sided'))
