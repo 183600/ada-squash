@@ -147,9 +147,27 @@ def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | N
     ):
         return False
     if seed is not None:
+        # The body of the cached summary must describe exactly this one run,
+        # not merely carry a matching top-level seed. A multi-seed aggregate
+        # reused as a single trial would put a pooled loss into one cell of the
+        # lr grid; a one-seed body naming another seed is just as wrong.
+        per_seed = summary.get('per_seed')
+        if per_seed is not None:
+            if not isinstance(per_seed, list) or len(per_seed) != 1:
+                return False
+            record = per_seed[0]
+            if not isinstance(record, dict) or not _is_seed_id(record.get('seed')):
+                return False
+            if int(record['seed']) != int(seed):
+                return False
+        seeds = summary.get('seeds')
+        if seeds is not None:
+            if not isinstance(seeds, list) or len(seeds) != 1:
+                return False
+            if not _is_seed_id(seeds[0]) or int(seeds[0]) != int(seed):
+                return False
         recorded = summary.get('seed')
         if recorded is None:
-            seeds = summary.get('seeds')
             recorded = seeds[0] if isinstance(seeds, list) and seeds else None
         # A malformed cached seed is unknown, not another spelling of `seed`:
         # `int(True)`/`int(42.9)` used to reuse a trial that was never seeded
