@@ -1422,6 +1422,13 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
         env['ADASQUASH_DIM_OVERRIDE'] = str(dim)
         env['ADASQUASH_HEADS_OVERRIDE'] = str(heads)
         shape = f' (dim={dim}, heads={heads})'
+    else:
+        # `_child_env` starts from the ambient environment. An inherited
+        # override from the caller's shell would silently give every child a
+        # different width/head count than `expected_child_protocol` checks,
+        # so a no-dim-scaling sweep must explicitly clear it.
+        env.pop('ADASQUASH_DIM_OVERRIDE', None)
+        env.pop('ADASQUASH_HEADS_OVERRIDE', None)
     print(f'[sweep] launching depth={depth} norm={norm} -> {output_dir}{shape}')
     # Invalidate the previous result *before* spawning. A child that dies
     # before train_gpt2.py writes its own manifest must leave no readable
