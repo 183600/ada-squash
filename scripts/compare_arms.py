@@ -284,7 +284,10 @@ def _arm_issues(name: str, agg: dict, metric: str) -> list[str]:
         issues.append(f"arm {name!r} has invalid seeds {agg['invalid_seeds']}")
     for problem in _seed_record_problems(agg):
         issues.append(f'arm {name!r} has {problem}')
-    if agg.get('complete') is False:
+    # Only an explicit True certifies completeness. An aggregate written by an
+    # older/malformed aggregator without the flag is unknown, not complete;
+    # `is False` let such an arm through and certify a partial run.
+    if agg.get('complete') is not True:
         issues.append(f"arm {name!r} was not marked complete by its aggregator")
     if agg.get('data_ledgers_complete') is False:
         issues.append(f'arm {name!r} mixes missing/known cross-split ledger identities')
