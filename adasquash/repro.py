@@ -249,7 +249,14 @@ def compare_train_streams(reference: dict, other: dict) -> dict:
     problems = []
     version_a = reference.get("version")
     version_b = other.get("version")
-    if version_a != version_b:
+    if version_a is None or version_b is None:
+        # An unversioned record cannot be interpreted: the field contract that
+        # makes two digests comparable is unknown. Treat it like a missing
+        # record, not as a version match.
+        problems.append(
+            "training stream fingerprint version is missing on at least one side; "
+            "the records are not comparable")
+    elif version_a != version_b:
         problems.append(
             f"training stream fingerprint versions differ: {version_a!r} vs {version_b!r}")
     for name in ("start_step", "prefix_batches_target", "prefix_batches", "batches"):
@@ -259,11 +266,19 @@ def compare_train_streams(reference: dict, other: dict) -> dict:
         except ValueError as exc:
             problems.append(str(exc))
             continue
-        if name == "start_step" and a is not None and b is not None and a != b:
+        if a is None or b is None:
+            # Missing fields are unknown, not equal. In particular a resumed
+            # run whose `start_step` was dropped must not look like a fresh
+            # full-run pair.
+            problems.append(
+                f"training stream record field {name!r} is missing on at least "
+                "one side; the records are not comparable")
+            continue
+        if name == "start_step" and a != b:
             problems.append(
                 f"training stream starts at different steps: {a} vs {b}; a resumed "
                 "run is not the same data prefix as a fresh run")
-        if name == "prefix_batches_target" and a is not None and b is not None and a != b:
+        if name == "prefix_batches_target" and a != b:
             problems.append(
                 f"training stream prefix sizes differ: {a} vs {b}; the prefix "
                 "digests cover different numbers of batches")
