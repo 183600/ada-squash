@@ -1559,6 +1559,19 @@ def _meta_study(observation, index: int):
         return None, {'index': index, 'label': label,
                       'reason': 'stderr must be finite and > 0 for '
                                 'inverse-variance pooling'}
+    variance = stderr * stderr
+    try:
+        weight = 1.0 / variance
+    except ZeroDivisionError:
+        weight = float('inf')
+    if variance == 0.0 or not math.isfinite(variance) or not math.isfinite(weight):
+        # Squaring an extreme (but individually finite) stderr can underflow
+        # to zero or overflow, and the inverse-variance weight can then be
+        # infinite. Such a study carries no representable precision; exclude
+        # it instead of letting the pool divide by zero or by infinity.
+        return None, {'index': index, 'label': label,
+                      'reason': 'stderr is too small or too large for a finite '
+                                'inverse-variance weight'}
     return {
         'label': label,
         'effect': effect,
