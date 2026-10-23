@@ -1121,6 +1121,17 @@ def run_exclusion_audit(runs: Sequence[Mapping],
                 f'arm {arm!r}: {bucket["n_seeds_analyzed"]} analyzable seed(s) '
                 f'after pre-specified exclusions, below the certification '
                 f'minimum of {min_seeds}')
+    if len(per_arm) >= 2:
+        # Per-arm seed counts are not enough: the paired contrast uses the
+        # seeds shared by every arm. Arms with disjoint seed sets can each look
+        # replicated while contributing zero analyzable pairs.
+        seed_sets = [set(bucket['seeds']) for bucket in per_arm.values()]
+        shared_seeds = set.intersection(*seed_sets) if seed_sets else set()
+        if not shared_seeds:
+            violations.append(
+                'no seed is shared by every analyzed arm; the planned paired '
+                'contrast has zero analyzable pairs (per-arm seed counts alone '
+                'do not establish a paired replication)')
     if duplicate_ids:
         violations.append(f'duplicate run id(s): {sorted(set(duplicate_ids))}')
     if duplicate_seeds:
