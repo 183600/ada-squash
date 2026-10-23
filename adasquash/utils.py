@@ -332,10 +332,6 @@ class LossSpikeCounter:
     def load_state_dict(self, state: Optional[dict]) -> bool:
         if not isinstance(state, dict):
             return False
-        ema = state.get('ema')
-        if not (isinstance(ema, (int, float)) and not isinstance(ema, bool)
-                and math.isfinite(ema)):
-            return False
         # Validate the whole state before mutating either field: a malformed
         # count used to raise after `ema` had already been replaced, leaving
         # the counter half-loaded. A negative count is not a possible state
@@ -353,6 +349,16 @@ class LossSpikeCounter:
         else:
             return False
         if n_spikes < 0:
+            return False
+        ema = state.get('ema')
+        if ema is None:
+            if n_spikes != 0:
+                return False
+            self.ema = None
+            self.n_spikes = 0
+            return True
+        if not (isinstance(ema, (int, float)) and not isinstance(ema, bool)
+                and math.isfinite(ema)):
             return False
         self.ema = float(ema)
         self.n_spikes = n_spikes
