@@ -50,6 +50,7 @@ import argparse
 import json
 import math
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -225,9 +226,15 @@ def _validate_token_row(row) -> list:
 
 
 def _tokenize_texts(texts, tokenizer) -> list:
-    """Tokenize a batch of strings, validating the row count and ids."""
+    """Tokenize a batch of strings, validating the row count and ids.
+
+    Real tokenizers return a ``transformers.BatchEncoding`` (a
+    ``UserDict``/``Mapping``), not a ``dict``; rejecting it made every
+    preset/file benchmark fail before the scan in the real environment even
+    though the fake tokenizer used by the tests returns a plain dict.
+    """
     encoded = tokenizer(list(texts), add_special_tokens=False)
-    rows = encoded.get("input_ids") if isinstance(encoded, dict) else None
+    rows = encoded.get("input_ids") if isinstance(encoded, Mapping) else None
     if not isinstance(rows, list) or len(rows) != len(texts):
         raise ValueError(
             f"tokenizer returned {None if rows is None else len(rows)} rows for "
