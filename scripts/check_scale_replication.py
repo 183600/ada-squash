@@ -75,6 +75,28 @@ def _reported_p(primary, fallback):
     return primary if _finite(primary) else fallback
 
 
+def _observation_seed_count(entry: dict):
+    """Replication count matching the basis the producer actually tested.
+
+    A `train_seed_means` row is replicated by trained runs; a probe-paired row
+    (one trained run per arm, several probe draws) is replicated by the probe
+    draws. Preferring the training-seed count for the latter made the meta
+    analysis fall back to a normal critical value even when the CI carried a
+    t quantile with df = probe_seeds - 1.
+    """
+    basis = entry.get('basis')
+    train_n = entry.get('n_shared_train_seeds')
+    probe_n = entry.get('n_shared_seeds')
+    if basis == 'train_seed_means' and train_n not in (None, 0):
+        return train_n
+    if basis is not None:
+        return _first_present(probe_n, entry.get('n_seeds'), train_n)
+    # Legacy rows without a basis keep the historical training-seed preference.
+    if train_n not in (None, 0):
+        return train_n
+    return _first_present(probe_n, entry.get('n_seeds'))
+
+
 def _match_quality(label, target: str) -> int:
     """2 = exact/arm label, 1 = same basename, 0 = no match."""
     label = str(label or '')
@@ -171,10 +193,7 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
                       if orientation == 'candidate_vs_reference' else False),
         'p_one_sided': (_reported_p(entry.get('p_holm'), entry.get('p_one_sided'))
                         if orientation == 'candidate_vs_reference' else None),
-        'n_seeds': (entry.get('n_shared_train_seeds')
-                    if entry.get('n_shared_train_seeds') not in (None, 0)
-                    else _first_present(entry.get('n_shared_seeds'),
-                                        entry.get('n_seeds'))),
+        'n_seeds': _observation_seed_count(entry),
         # Precision for the inverse-variance meta-analysis. Keep the CI even
         # for a reversed pair (mirrored above) so its width still contributes.
         'stderr': _first_present(entry.get('stderr'), entry.get('se')),
