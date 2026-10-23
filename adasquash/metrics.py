@@ -950,10 +950,11 @@ def tost_paired(
     non-finite input. The zero-variance case reduces to a deterministic
     comparison of ``|mean|`` with `margin`.
     """
+    alpha = _validate_alpha(alpha)
     out = {
         "test": "tost_paired",
         "margin": None,
-        "alpha": _validate_alpha(alpha),
+        "alpha": alpha,
         "equivalent": None,
         "p_tost": None,
         "p_low": None,
