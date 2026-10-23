@@ -760,11 +760,16 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
     scale_obs = []
     for t in tests:
         if t.get('same_scale') and t.get('mean_delta') is not None:
+            # A Holm p-value can be explicitly None for a row excluded from
+            # its family; `dict.get(key, fallback)` only falls back on a
+            # missing key, so choose the raw p explicitly.
+            p_holm = t.get('p_holm')
             scale_obs.append({'scale': t.get('a_scale'), 'metric': t.get('metric'),
                               'contrast': f"{t.get('a_norm')} vs {t.get('b_norm')}",
                               'delta': t.get('mean_delta'),
-                              'certified': bool(t.get('significant')),
-                              'p_one_sided': t.get('p_holm', t.get('p_one_sided')),
+                              'certified': t.get('significant') is True,
+                              'p_one_sided': (p_holm if p_holm is not None
+                                              else t.get('p_one_sided')),
                               'n_seeds': t.get('n_shared_seeds')})
     scale_replication = scale_replication_summary(scale_obs)
     ranking = {}

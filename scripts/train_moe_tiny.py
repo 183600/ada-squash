@@ -1327,12 +1327,16 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
         if (entry.get('same_scale') and entry.get('delta_vs_reference') is not None
                 and entry.get('test') is not None
                 and entry.get('excluded_from_family') is None):
+            # Only an explicit boolean True certifies a scale, and a Holm
+            # p-value that is explicitly None must not hide the raw p-value
+            # that the producer did record.
+            p_holm = entry.get('p_one_sided_holm')
             scale_obs.append({'scale': entry.get('scale'), 'metric': entry.get('metric'),
                               'contrast': entry.get('name'),
                               'delta': entry.get('delta_vs_reference'),
-                              'certified': bool(entry.get('beats_reference_significantly')),
-                              'p_one_sided': entry.get('p_one_sided_holm',
-                                                       entry.get('p_one_sided')),
+                              'certified': entry.get('beats_reference_significantly') is True,
+                              'p_one_sided': (p_holm if p_holm is not None
+                                              else entry.get('p_one_sided')),
                               'n_seeds': len(entry.get('paired_seeds') or [])})
     out['scale_replication'] = scale_replication_summary(scale_obs)
     out['certified_norms'] = sorted({entry['norm'] for entry in family
