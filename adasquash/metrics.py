@@ -1858,11 +1858,16 @@ def scale_replication_summary(observations: Sequence[dict],
             # a multi-scale certification.
             'certified': obs.get('certified') is True,
             'n_seeds': obs.get('n_seeds'),
-            'p': obs.get('p_one_sided', obs.get('p')),
+            # `dict.get(key, fallback)` only falls back when the key is
+            # absent. A producer that emits `p_one_sided: None` alongside a
+            # real `p` / `se` must not have that value silently discarded.
+            'p': (obs.get('p_one_sided')
+                  if obs.get('p_one_sided') is not None else obs.get('p')),
             # Precision for the meta-analytic block. These are optional: a
             # sign-only observation is still a valid vote, but meta_analysis
             # will report it as excluded instead of inventing a stderr.
-            'stderr': obs.get('stderr', obs.get('se')),
+            'stderr': (obs.get('stderr')
+                       if obs.get('stderr') is not None else obs.get('se')),
             'ci_low': obs.get('ci_low'),
             'ci_high': obs.get('ci_high'),
             'df': obs.get('df'),

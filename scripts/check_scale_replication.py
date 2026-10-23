@@ -57,6 +57,14 @@ def _finite(value) -> bool:
         return False
 
 
+def _first_present(*values):
+    """First value that is not None (a present-but-null key is not a value)."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _reported_p(primary, fallback):
     """The Holm p when it is a real value, else the unadjusted p.
 
@@ -165,10 +173,11 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
                         if orientation == 'candidate_vs_reference' else None),
         'n_seeds': (entry.get('n_shared_train_seeds')
                     if entry.get('n_shared_train_seeds') not in (None, 0)
-                    else entry.get('n_shared_seeds', entry.get('n_seeds'))),
+                    else _first_present(entry.get('n_shared_seeds'),
+                                        entry.get('n_seeds'))),
         # Precision for the inverse-variance meta-analysis. Keep the CI even
         # for a reversed pair (mirrored above) so its width still contributes.
-        'stderr': entry.get('stderr', entry.get('se')),
+        'stderr': _first_present(entry.get('stderr'), entry.get('se')),
         'ci_low': ci_low,
         'ci_high': ci_high,
         'df': entry.get('df'),
@@ -221,7 +230,7 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
                             if orientation == 'candidate_vs_reference' else None),
             'n_seeds': (len(row['paired_seeds'])
                         if isinstance(row.get('paired_seeds'), list) else None),
-            'stderr': row.get('stderr', row.get('se')),
+            'stderr': _first_present(row.get('stderr'), row.get('se')),
             'ci_low': ci_low,
             'ci_high': ci_high,
             'df': row.get('df'),
