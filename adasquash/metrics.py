@@ -698,7 +698,7 @@ def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[floa
     if t_value is None or df_value is None:
         return None
     t, df = t_value, df_value
-    if math.isnan(t) or math.isnan(df) or df <= 0.0:
+    if (math.isnan(t) or not math.isfinite(df) or df <= 0.0):
         return None
     if math.isinf(t):
         return 0.0
@@ -1173,8 +1173,21 @@ def paired_trend_test(
         return out
 
     labels = sorted((per_seed_values or {}), key=str)
+    # Different Python keys can stringify to the same seed id (JSON gives
+    # `"42"`, a direct caller may pass `42`). The per-seed output is keyed by
+    # the string form, so accepting both would silently overwrite one fitted
+    # slope and still report n_seeds=2. Reject the ambiguous record instead.
+    string_labels = [str(label) for label in labels]
+    duplicate_labels = sorted({label for label in string_labels
+                               if string_labels.count(label) > 1})
+    if duplicate_labels:
+        raise ValueError(
+            "trend values contain seed labels that collide after string "
+            f"normalization: {duplicate_labels}; each seed must appear once")
     slopes = []
     used = []
+    fitted_dose_counts = []
+    r_squared_values = []
     for label in labels:
         try:
             values = list(per_seed_values[label])
@@ -1211,10 +1224,19 @@ def paired_trend_test(
             continue
         slopes.append(fit[0])
         used.append(label)
+        fitted_dose_counts.append(len({x for x, _ in pairs}))
+        r_squared_values.append(fit[1])
         out["per_seed_slopes"][str(label)] = fit[0]
         out["per_seed_r_squared"][str(label)] = fit[1]
 
     n = len(slopes)
+    # A seed can drop a non-finite dose and still yield a slope, so the raw
+    # dose count can overstate the grid actually fitted. Report the smallest
+    # fitted grid across the seeds used: a two-point slope must never be
+    # presented as a three-dose trend.
+    if fitted_dose_counts:
+        n_doses = min(fitted_dose_counts)
+        out["n_doses"] = n_doses
     out["n_seeds"] = n
     out["seeds_used"] = used
     out["n_seeds_with_negative_slope"] = sum(1 for b in slopes if b < 0.0)
@@ -1234,9 +1256,11 @@ def paired_trend_test(
             slope_replication["prediction_high"]]
         out["slope_same_direction_probability"] = (
             slope_replication["same_direction_probability"])
+    # Average over the fits themselves, not over the string-keyed output dict:
+    # that keeps the mean correct even if two labels ever normalize together.
     out["mean_r_squared"] = (
-        sum(out["per_seed_r_squared"].values()) / n
-        if out.get("per_seed_r_squared") else None)
+        sum(r_squared_values) / len(r_squared_values)
+        if r_squared_values else None)
     out["seed_jackknife"] = leave_one_out_jackknife(
         slopes, labels=[str(label) for label in used])
     if n < 2:
