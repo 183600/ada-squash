@@ -229,8 +229,18 @@ def _evaluated_checkpoint_step(results: dict):
     training length, not the weights that produced the test loss.
     """
     best = results.get("best_val_step")
-    if isinstance(best, int) and not isinstance(best, bool) and best > 0:
+    best_is_int = isinstance(best, int) and not isinstance(best, bool)
+    if best_is_int and best > 0:
         return best
+    if best is not None and not (best_is_int and best == 0):
+        # A recorded but malformed step is unknown, not "no best checkpoint":
+        # falling through to final_step would claim the final weights were
+        # scored when the run actually restored a best checkpoint.
+        return None
+    if results.get("best_val_loss") is not None:
+        # The run recorded a best-validation loss but not the step those
+        # weights came from; final_step is not a substitute for that identity.
+        return None
     final = results.get("final_step")
     if isinstance(final, int) and not isinstance(final, bool) and final > 0:
         return final
