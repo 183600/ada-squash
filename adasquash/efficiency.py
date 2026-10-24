@@ -17,6 +17,7 @@ runners can attach the numbers to their summaries.
 import math
 import numbers
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import Optional
 
 from .metrics import student_t_ppf
@@ -448,7 +449,16 @@ def efficiency_verdict(
                 f"round(s); at least 2 paired rounds are needed to certify the "
                 f"{cost_name} cost")
         verdict["component_failures"].append(failure)
-    for name, raw_ratio in (cost_components or {}).items():
+    if cost_components is None:
+        component_items = ()
+    elif isinstance(cost_components, Mapping):
+        component_items = cost_components.items()
+    else:
+        component_items = ()
+        verdict["component_failures"].append(
+            f"cost components must be a mapping, got "
+            f"{type(cost_components).__name__}; cannot certify any component cost")
+    for name, raw_ratio in component_items:
         if _is_boolean_value(raw_ratio):
             verdict["component_costs"][str(name)] = {
                 "ratio": None,
