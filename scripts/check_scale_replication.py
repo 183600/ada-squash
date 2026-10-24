@@ -163,7 +163,7 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
     # into the sign vote would let two different architectures masquerade as
     # two replications. Same for a row the producing script excluded from its
     # own family.
-    if entry.get('same_scale') is False or entry.get('excluded_from_family') is not None:
+    if entry.get('same_scale') is False or entry.get('excluded_from_family'):
         return None
     delta = entry.get('mean_delta')
     if orientation == 'reversed' and _finite(delta):
@@ -220,10 +220,11 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
                                         candidate, reference)
         if orientation is None:
             continue
-        if row.get('same_scale') is False or row.get('excluded_from_family') is not None:
+        if row.get('same_scale') is False or row.get('excluded_from_family'):
             # Cross-scale or otherwise excluded rows are not independent
             # observations of the same-scale effect; including them would
-            # manufacture a replication.
+            # manufacture a replication. An explicit False/empty reason means
+            # the producer did not exclude the row, so it stays in the vote.
             continue
         delta = row.get('delta_vs_reference')
         if orientation == 'reversed' and _finite(delta):

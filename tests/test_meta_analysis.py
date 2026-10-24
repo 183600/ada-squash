@@ -36,7 +36,8 @@ if str(ROOT) not in sys.path:
 from adasquash.metrics import (chi2_sf, meta_analysis,
                                scale_replication_summary, student_t_cdf,
                                student_t_ppf)
-from scripts.check_scale_replication import _observation_from_pair
+from scripts.check_scale_replication import (_observation_from_pair,
+                                             _observations_from_moe)
 
 
 # ---------------------------------------------------------------------------
@@ -244,3 +245,38 @@ def test_reversed_pair_mirrors_the_confidence_interval_with_the_delta():
     assert observation['ci_low'] == pytest.approx(-0.3)
     assert observation['ci_high'] == pytest.approx(-0.1)
     assert observation['certified'] is False
+
+
+def test_explicit_false_or_empty_exclusion_reason_keeps_the_observation():
+    base = {
+        'a': 'candidate', 'b': 'reference', 'a_scale': 's1',
+        'metric': 'loss', 'mean_delta': -0.1, 'same_scale': True,
+        'significant': True,
+    }
+    for flag in (False, '', None):
+        entry = {**base, 'excluded_from_family': flag}
+        observation = _observation_from_pair(
+            entry, 'candidate', 'reference', 'loss')
+        assert observation is not None
+        assert observation['delta'] == pytest.approx(-0.1)
+
+    entry = {**base, 'excluded_from_family': 'protocol mismatch'}
+    assert _observation_from_pair(
+        entry, 'candidate', 'reference', 'loss') is None
+
+
+def test_moe_explicit_false_exclusion_reason_keeps_the_row():
+    def row(flag):
+        return {
+            'norm': 'candidate', 'reference': 'reference', 'scale': 's1',
+            'metric': 'loss', 'delta_vs_reference': -0.1,
+            'beats_reference_significantly': True, 'same_scale': True,
+            'excluded_from_family': flag,
+        }
+
+    observations = _observations_from_moe(
+        {'rows': [row(False), row('protocol mismatch'), row(None)]},
+        'candidate', 'reference', 'loss')
+    assert len(observations) == 2
+    assert all(item['delta'] == pytest.approx(-0.1)
+               for item in observations)
