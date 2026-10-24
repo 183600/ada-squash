@@ -1293,9 +1293,17 @@ def print_cross_depth_trends(comparison: dict) -> None:
                         f"flips the slope sign]")
         elif jack.get('sign_stable') is True:
             jack_str = ' [seed-robust slope sign]'
+        randomization = entry.get('slope_randomization_test') or {}
+        rand_p = randomization.get('p_one_sided')
+        rand_str = '' if rand_p is None else f' p(sign-flip)={rand_p:.4g}'
+        if randomization.get('can_reach_alpha') is False:
+            floor = randomization.get('minimum_attainable_p_one_sided')
+            if floor is not None:
+                rand_str += (f' [distribution-free p floor {floor:.3g} at '
+                             f"n={randomization.get('n')}]")
         print(f"[trend] {entry['norm']}: slope={slope:+.5f}/doubling{ci_str} "
               f"seeds={entry.get('n_seeds')}/{entry.get('n_balanced_seeds')} "
-              f"depths={depths} p_holm={p_str} "
+              f"depths={depths} p_holm={p_str}{rand_str} "
               f"grows_with_depth={entry.get('advantage_grows_with_depth')}"
               f"{jack_str}")
         if entry.get('excluded_depths'):

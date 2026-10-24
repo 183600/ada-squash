@@ -144,8 +144,8 @@ from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
-                               paired_design_summary, paired_t_one_sided,
-                               student_t_ppf, tost_paired,
+                               paired_design_summary, paired_randomization_test,
+                               paired_t_one_sided, student_t_ppf, tost_paired,
                                two_sided_p_from_t, welch_t_one_sided)
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
@@ -268,11 +268,12 @@ def _per_seed_deltas(row: dict, reference: dict, common_seeds) -> dict:
 
 
 def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
-                           equivalence_margin: float = 0.0) -> dict:
-    """Attach seed-jackknife stability and a TOST equivalence check.
+                           equivalence_margin: float = 0.0,
+                           margin: float = 0.0) -> dict:
+    """Attach seed-jackknife, equivalence and distribution-free checks.
 
-    Two questions a significance test alone cannot answer are asked for every
-    paired contrast:
+    Three questions a significance test alone cannot answer are asked for
+    every paired contrast:
 
     * **Is the sign carried by one seed?** `leave_one_out_jackknife` drops
       each seed in turn and reports whether the direction survives. At three
@@ -282,8 +283,14 @@ def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
       Only a pre-registered `--equivalence-margin` enables TOST; a
       non-significant superiority test is explicitly *not* relabelled as
       equivalence. The margin is stored in the artifact with the p-value.
+    * **Does the conclusion depend on the normal model?**
+      `paired_randomization_test` runs the exact sign-flip test on the same
+      deltas and records the smallest p-value attainable at this seed count.
+      A t-test that rejects at three seeds while the distribution-free floor
+      is 0.125 is reported as model-dependent rather than silently treated as
+      a nonparametric result.
 
-    `deltas` maps seed -> paired difference (candidate - reference). Both
+    `deltas` maps seed -> paired difference (candidate - reference). All
     blocks are descriptive for the certification decision; the pre-specified
     paired t-test remains the only certifying test.
     """
@@ -292,6 +299,8 @@ def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
     jackknife = leave_one_out_jackknife(values, labels=labels)
     if jackknife is not None:
         jackknife["unit"] = "seed"
+    randomization = paired_randomization_test(
+        values, margin=margin, alpha=alpha)
     equivalence = {
         "enabled": False,
         "test": "tost_paired",
@@ -307,7 +316,8 @@ def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
                            margin=equivalence_margin, alpha=alpha)
         tost["enabled"] = True
         equivalence = tost
-    return {"seed_jackknife": jackknife, "equivalence": equivalence}
+    return {"seed_jackknife": jackknife, "equivalence": equivalence,
+            "randomization_test": randomization}
 
 
 def _robustness_note(entry: dict) -> str:
@@ -327,6 +337,13 @@ def _robustness_note(entry: dict) -> str:
             parts.append(f' [EQUIVALENT within {margin:g}]')
         else:
             parts.append(f' [NOT equivalent within {margin:g}]')
+    randomization = entry.get('randomization_test')
+    if isinstance(randomization, dict) and randomization.get('can_reach_alpha') is False:
+        floor = randomization.get('minimum_attainable_p_one_sided')
+        if floor is not None:
+            parts.append(f' [distribution-free p floor {floor:.3g} at '
+                         f"n={randomization.get('n')}: sign-flip test cannot "
+                         'reject without the t model]')
     return ''.join(parts)
 
 
@@ -2084,7 +2101,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
                                            margin=margin))
         entry.update(_robustness_for_deltas(
             _per_seed_deltas(row, reference, common),
-            alpha=alpha, equivalence_margin=equivalence_margin))
+            alpha=alpha, equivalence_margin=equivalence_margin, margin=margin))
         # The reference baseline is itself the lowest-loss member of a pool
         # chosen after seeing the matrix. The claim "this row beats the
         # baselines" is therefore a claim against the best of that pool, and
@@ -2276,6 +2293,9 @@ def print_baseline_comparison(comparison: dict | None) -> None:
         p_inf_str = ('' if p_inf is None or p_inf == p
                      else f' p(sel)={p_inf:.3g}')
         p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
+        randomization = entry.get('randomization_test') or {}
+        rand_p = randomization.get('p_one_sided')
+        rand_str = '' if rand_p is None else f' p(sign-flip)={rand_p:.3g}'
         std = entry.get('val_loss_std')
         std_str = '' if std is None else f" +/- {std:.4f}"
         basis = entry.get('test_basis') or '-'
@@ -2316,8 +2336,8 @@ def print_baseline_comparison(comparison: dict | None) -> None:
                                f"in a healthy falling-falling regime - read the curve block]")
         print(f"[compare] {entry['name']:>32s} val_loss={entry['val_loss']:.4f}{std_str} "
               f"delta={entry['delta_vs_reference']:+.4f}{ci_str}{pi_str}{ppl_str}{ratio_str} "
-              f"p(one-sided)={p_str}{p_inf_str} p(holm)={p_holm_str} "
-              f"test={entry.get('test') or '-'}@{basis}{direction}{mde_str} "
+              f"p(one-sided)={p_str}{p_inf_str} p(holm)={p_holm_str}"
+              f"{rand_str} test={entry.get('test') or '-'}@{basis}{direction}{mde_str} "
               f"beats={entry['beats_reference']} "
               f"significant={entry['beats_reference_significantly']}{note}{regime_note}{power_warn}"
               f"{_robustness_note(entry)}")
@@ -2996,7 +3016,7 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                                                margin=margin))
             entry.update(_robustness_for_deltas(
                 _per_seed_deltas(full, ref, common),
-                alpha=alpha, equivalence_margin=equivalence_margin))
+                alpha=alpha, equivalence_margin=equivalence_margin, margin=margin))
             if entry['test'] is not None and not entry['replicated_across_seeds']:
                 entry['significance_basis'] = (
                     f'descriptive only: {len(common)} shared seed(s), fewer than the required '
@@ -3144,7 +3164,7 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
                                                margin=margin))
             entry.update(_robustness_for_deltas(
                 _per_seed_deltas(cand, ref, common),
-                alpha=alpha, equivalence_margin=equivalence_margin))
+                alpha=alpha, equivalence_margin=equivalence_margin, margin=margin))
             if entry['test'] is not None and not entry['replicated_across_seeds']:
                 entry['significance_basis'] = (
                     f'descriptive only: {len(common)} shared seed(s), fewer than the required '
@@ -3437,7 +3457,7 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
             entry.update(_robustness_for_deltas(
                 {str(seed): float(value)
                  for seed, value in effect['per_seed_values'].items()},
-                alpha=alpha, equivalence_margin=equivalence_margin))
+                alpha=alpha, equivalence_margin=equivalence_margin, margin=margin))
             paired_std = entry.get('paired_delta_std')
             if (isinstance(paired_std, (int, float)) and paired_std > 0.0
                     and entry.get('delta_seed_mean') is not None):
@@ -3720,7 +3740,7 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
                 effect_row, zero_row, common, test, alpha=alpha, margin=margin))
             entry.update(_robustness_for_deltas(
                 {str(seed): float(value) for seed, value in per_seed.items()},
-                alpha=alpha, equivalence_margin=equivalence_margin))
+                alpha=alpha, equivalence_margin=equivalence_margin, margin=margin))
             paired_std = entry.get('paired_delta_std')
             if (isinstance(paired_std, (int, float)) and paired_std > 0.0
                     and entry.get('delta_seed_mean') is not None):

@@ -51,8 +51,8 @@ sys.path.insert(0, str(ROOT))
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
-                               paired_design_summary, paired_t_one_sided,
-                               student_t_ppf, tost_paired)
+                               paired_design_summary, paired_randomization_test,
+                               paired_t_one_sided, student_t_ppf, tost_paired)
 from adasquash.repro import compare_train_streams, training_recipe_mismatches
 
 _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
@@ -656,6 +656,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'minimum_detectable_delta_95_power80': None,
             'design_power': None,
             'seed_jackknife': None,
+            'randomization_test': None,
             'equivalence': {
                 'enabled': False, 'test': 'tost_paired', 'margin': None,
                 'equivalent': None, 'p_tost': None,
@@ -868,6 +869,9 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                       for seed in common]
             entry['seed_jackknife'] = leave_one_out_jackknife(
                 deltas, labels=[str(seed) for seed in common])
+            if len(common) >= 2:
+                entry['randomization_test'] = paired_randomization_test(
+                    deltas, margin=margin, alpha=alpha)
         if equivalence_margin > 0.0 and len(common) >= 2:
             tost = tost_paired(
                 [cand['values'][seed] for seed in common],
@@ -1016,14 +1020,23 @@ def print_comparison(comparison: dict) -> None:
                 note += f" [EQUIVALENT within {equivalence['margin']:g}]"
             else:
                 note += f" [NOT equivalent within {equivalence['margin']:g}]"
+        randomization = entry.get('randomization_test') or {}
+        rand_p = randomization.get('p_one_sided')
+        rand_str = '' if rand_p is None else f' p(sign-flip)={rand_p:.3g}'
+        if randomization.get('can_reach_alpha') is False:
+            floor = randomization.get('minimum_attainable_p_one_sided')
+            if floor is not None:
+                note += (f" [distribution-free p floor {floor:.3g} at "
+                         f"n={randomization.get('n')}: sign-flip test cannot "
+                         "reject without the t model]")
         mean_str = ('n/a' if entry.get('mean') is None
                     else f"{entry['mean']:.4f}")
         delta_str = ('n/a' if delta is None else f"{delta:+.4f}")
         print(f"[arms] {entry['name']:>24s} mean={mean_str}"
               + ('' if std is None else f" +/- {std:.4f}")
               + f" delta={delta_str}{ci_str}{pi_str}{ppl_str}{ratio_str}"
-              + f" p={p_str}{p_inf_str} p(holm)={ph_str} certified={entry['certified']}"
-              + f"{noise}{note}")
+              + f" p={p_str}{p_inf_str} p(holm)={ph_str}{rand_str}"
+              + f" certified={entry['certified']}{noise}{note}")
     print('[arms] ' + comparison['multiple_comparison'])
 
 

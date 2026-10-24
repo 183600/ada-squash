@@ -43,7 +43,11 @@ honest:
   tests and reports the matching interval. A small-seed effect is also
   checked for being carried by a single observation with
   `leave_one_out_jackknife`, and a factorial interaction is evaluated
-  two-sided (`two_sided_p_from_t`) because antagonism is a finding too;
+  two-sided (`two_sided_p_from_t`) because antagonism is a finding too.
+  `paired_randomization_test` adds the exact sign-flip counterpart of the
+  t-test: it makes no normality assumption and reports the smallest p-value
+  attainable at the achieved seed count, so a 3-seed t-test's reliance on its
+  parametric model is visible instead of implicit;
 * a dose-response claim ("the advantage grows with depth") is tested as a
   trend, not inferred from a row of significant per-depth deltas:
   `paired_trend_test` fits one slope per seed on the paired deltas and tests
@@ -64,6 +68,7 @@ in a minimal environment.
 import functools
 import math
 import numbers
+import random
 from typing import Optional, Sequence
 
 __all__ = [
@@ -83,6 +88,7 @@ __all__ = [
     "meta_analysis",
     "max_p_combination",
     "paired_design_summary",
+    "paired_randomization_test",
     "paired_required_n",
     "paired_t_one_sided",
     "paired_trend_test",
@@ -102,6 +108,9 @@ __all__ = [
 
 _Z_95 = 1.959963984540054
 MIN_SEEDS_FOR_SIGNIFICANCE = 3
+# Above this many observations the 2**n sign-flip enumeration is no
+# longer a cheap exact computation; use the seeded Monte-Carlo branch.
+_RANDOMIZATION_EXACT_MAX = 20
 # Negatives-per-positive ratio above which the FPR denominator makes ROC-AUC
 # optimistic and PR-AUC (average precision) is the appropriate summary.
 _EXTREME_IMBALANCE = 1000.0
@@ -1135,6 +1144,182 @@ def leave_one_out_jackknife(
     }
 
 
+def paired_randomization_test(
+    deltas: Sequence[float],
+    margin: float = 0.0,
+    alpha: float = 0.05,
+    exact_max: int = 12,
+    permutations: int = 10000,
+    seed: int = 0,
+) -> dict:
+    """Exact sign-flip randomization test for a paired location effect.
+
+    The paired t-test is the repo's certifying test, but it assumes the
+    seed-level differences are approximately normal. With the 3-5 seeds the
+    experiments actually run, that assumption is doing real work: the t-test
+    can return ``p < 0.05`` from three consistent runs, while a
+    distribution-free test cannot. This function supplies the model-free
+    counterpart. It tests H0 "the paired differences are symmetric about
+    ``-margin``" against H1 "the mean difference is below ``-margin``" by
+    flipping the sign of each centered difference (``d_i + margin``) and
+    comparing the observed mean with the randomization distribution.
+
+    For ``n <= exact_max`` every one of the ``2**n`` sign patterns is
+    enumerated, so the p-value is exact and deterministic. ``exact_max`` is
+    capped at 20 so the enumeration cannot explode by accident. Larger
+    samples use a Monte-Carlo sign-flip distribution with a fixed seed; the
+    ``(extreme + 1) / (permutations + 1)`` estimator keeps the reported
+    p-value strictly positive and is reproducible across reruns.
+
+    The output is deliberately explicit about resolution. At ``n = 3`` the
+    smallest attainable one-sided p-value is ``1/8``, so
+    ``can_reach_alpha`` is False for the usual 0.05 threshold: a significant
+    t-test at that replication count rests on the parametric t model, not on
+    a distribution-free ordering of the signs. This check is therefore
+    descriptive robustness - it never replaces or overrides the
+    pre-specified paired t-test that certifies a comparison.
+
+    Non-finite or non-numeric deltas are excluded and listed in ``excluded``
+    rather than silently changing the sample. The direction convention is the
+    same as the rest of the repo: negative deltas favour the candidate.
+    """
+    alpha = _validate_alpha(alpha)
+    margin_value = _as_real(margin)
+    if margin_value is None or not math.isfinite(margin_value):
+        raise ValueError(f"margin must be a finite number, got {margin!r}")
+    exact_max = _strict_int(exact_max, "exact_max", minimum=0)
+    if exact_max > _RANDOMIZATION_EXACT_MAX:
+        raise ValueError(
+            f"exact_max must be <= {_RANDOMIZATION_EXACT_MAX} to bound the "
+            f"2**n enumeration, got {exact_max}")
+    permutations = _strict_int(permutations, "permutations", minimum=1)
+    seed = _strict_int(seed, "seed", minimum=0)
+
+    raw = list(deltas)
+    values = []
+    excluded = []
+    for index, value in enumerate(raw):
+        real = _as_real(value)
+        if real is None:
+            excluded.append({"index": index, "value": repr(value),
+                             "reason": "not a real number"})
+        elif not math.isfinite(real):
+            excluded.append({"index": index, "value": real,
+                             "reason": "non-finite delta"})
+        else:
+            values.append(real)
+    n = len(values)
+    out = {
+        "test": "paired_sign_flip_randomization",
+        "alternative": ("mean(delta) < -margin: deltas become more negative "
+                        "than the practical margin (negative favours the "
+                        "candidate)"),
+        "assumption": ("exchangeable paired differences, symmetric about "
+                       "-margin under the null; no normality assumption"),
+        "alpha": alpha,
+        "margin": margin_value,
+        "n": n,
+        "n_input": len(raw),
+        "n_excluded": len(excluded),
+        "excluded": excluded,
+        "n_negative": sum(1 for value in values if value < 0.0),
+        "n_positive": sum(1 for value in values if value > 0.0),
+        "n_zero": sum(1 for value in values if value == 0.0),
+        "mean_delta": None,
+        "observed_centered_mean": None,
+        "basis": "undefined",
+        "n_permutations_evaluated": None,
+        "minimum_attainable_p_one_sided": None,
+        "can_reach_alpha": None,
+        "p_one_sided": None,
+        "p_upper_one_sided": None,
+        "p_two_sided": None,
+        "monte_carlo_standard_error": None,
+        "seed": None,
+        "meaningful": bool(n >= MIN_SEEDS_FOR_SIGNIFICANCE),
+        "note": None,
+    }
+    if n == 0:
+        out["note"] = ("no finite paired delta: a randomization test needs "
+                       "at least one observation")
+        return out
+
+    mean = math.fsum(values) / n
+    centered = [value + margin_value for value in values]
+    observed = math.fsum(centered) / n
+    scale = max(1.0, math.fsum(abs(value) for value in centered))
+    tolerance = 1e-12 * scale
+    out["mean_delta"] = mean
+    out["observed_centered_mean"] = observed
+
+    if n <= exact_max:
+        sums = [0.0]
+        for value in centered:
+            sums = sums + [total + value for total in sums]
+        patterns = len(sums)
+        lower = sum(1 for total in sums if total / n <= observed + tolerance)
+        upper = sum(1 for total in sums if total / n >= observed - tolerance)
+        p_lower = lower / patterns
+        p_upper = upper / patterns
+        minimum = 1.0 / patterns
+        out.update({
+            "basis": "exact_enumeration",
+            "n_permutations_evaluated": patterns,
+            "minimum_attainable_p_one_sided": minimum,
+            "can_reach_alpha": bool(minimum < alpha),
+            "p_one_sided": p_lower,
+            "p_upper_one_sided": p_upper,
+            "p_two_sided": min(1.0, 2.0 * min(p_lower, p_upper)),
+        })
+    else:
+        rng = random.Random(seed)
+        lower = 0
+        upper = 0
+        for _ in range(permutations):
+            total = 0.0
+            for value in centered:
+                total += value if rng.random() < 0.5 else -value
+            permuted = total / n
+            if permuted <= observed + tolerance:
+                lower += 1
+            if permuted >= observed - tolerance:
+                upper += 1
+        p_lower = (lower + 1.0) / (permutations + 1.0)
+        p_upper = (upper + 1.0) / (permutations + 1.0)
+        minimum = 1.0 / (permutations + 1.0)
+        out.update({
+            "basis": "monte_carlo",
+            "n_permutations_evaluated": permutations,
+            "minimum_attainable_p_one_sided": minimum,
+            "can_reach_alpha": bool(minimum < alpha),
+            "p_one_sided": p_lower,
+            "p_upper_one_sided": p_upper,
+            "p_two_sided": min(1.0, 2.0 * min(p_lower, p_upper)),
+            "monte_carlo_standard_error": math.sqrt(
+                max(0.0, p_lower * (1.0 - p_lower)) / (permutations + 1.0)),
+            "seed": seed,
+        })
+
+    notes = []
+    if excluded:
+        notes.append(f"{len(excluded)} non-finite/non-numeric delta(s) excluded")
+    if n < MIN_SEEDS_FOR_SIGNIFICANCE:
+        notes.append(f"fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} paired "
+                     "observations: descriptive only")
+    if out["can_reach_alpha"] is False:
+        notes.append(
+            f"with n={n} the smallest attainable one-sided p is "
+            f"{out['minimum_attainable_p_one_sided']:.4g}, so no "
+            f"distribution-free test can reject at alpha={alpha:g}; a "
+            "smaller t-test p at this n relies on the parametric t model")
+    else:
+        notes.append(
+            "distribution-free robustness check; the pre-specified paired "
+            "t-test remains the certification test")
+    out["note"] = "; ".join(notes)
+    return out
+
+
 def _ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
     """Least-squares slope of ``ys`` on ``xs`` plus the fit's R-squared.
 
@@ -1247,6 +1432,7 @@ def paired_trend_test(
         "advantage_grows_with_dose": None,
         "certifiable": False,
         "seed_jackknife": None,
+        "slope_randomization_test": None,
         "note": None,
     }
     if n_doses < 2:
@@ -1351,6 +1537,8 @@ def paired_trend_test(
         if r_squared_values else None)
     out["seed_jackknife"] = leave_one_out_jackknife(
         slopes, labels=[str(label) for label in used])
+    out["slope_randomization_test"] = paired_randomization_test(
+        slopes, alpha=alpha)
     if n < 2:
         out["note"] = ("one usable seed: a slope is computable but its "
                        "sampling uncertainty is not; descriptive only")
