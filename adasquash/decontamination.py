@@ -192,6 +192,15 @@ def benchmark_fingerprint(records_by_benchmark: dict) -> dict:
     return out
 
 
+def _validate_hashable_tokens(sequence) -> None:
+    for token in sequence:
+        try:
+            hash(token)
+        except TypeError:
+            raise ValueError(
+                "token ids must be hashable (integers, not lists)") from None
+
+
 def token_ngrams(tokens, ngram_size: int = DEFAULT_NGRAM_SIZE) -> set:
     """All distinct contiguous token n-grams of one document.
 
@@ -208,6 +217,7 @@ def token_ngrams(tokens, ngram_size: int = DEFAULT_NGRAM_SIZE) -> set:
         sequence = list(tokens)
     except TypeError:
         raise ValueError(f"tokens must be an iterable sequence, got {type(tokens).__name__}") from None
+    _validate_hashable_tokens(sequence)
     if len(sequence) < n:
         return set()
     out = set()
@@ -317,6 +327,7 @@ def find_ngram_matches(tokens, index: NgramIndex) -> dict:
         sequence = list(tokens)
     except TypeError:
         raise ValueError(f"tokens must be an iterable sequence, got {type(tokens).__name__}") from None
+    _validate_hashable_tokens(sequence)
     n = index.ngram_size
     stats = {
         name: {"matched_ngrams": 0, "occurrences": 0, "first_position": None}
