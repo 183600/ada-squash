@@ -327,7 +327,11 @@ def find_ngram_matches(tokens, index: NgramIndex) -> dict:
     if len(sequence) >= n:
         for start in range(len(sequence) - n + 1):
             ngram = tuple(sequence[start:start + n])
-            owners = index.ngram_to_benchmarks.get(ngram)
+            try:
+                owners = index.ngram_to_benchmarks.get(ngram)
+            except TypeError:
+                raise ValueError(
+                    "token ids must be hashable (integers, not lists)") from None
             if not owners:
                 continue
             if first_position is None:
