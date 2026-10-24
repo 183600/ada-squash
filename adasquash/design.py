@@ -1354,8 +1354,10 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     n_pairs = len({seed for seed in seeds
                    if isinstance(seed, int) and not isinstance(seed, bool)})
     if min_seeds_valid and (
-            len(seeds) < min_seeds or len(set(seeds)) != len(seeds)
-            or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds)):
+            len(seeds) < min_seeds
+            or any(isinstance(seed, bool) or not isinstance(seed, int)
+                   for seed in seeds)
+            or len(set(seeds)) != len(seeds)):
         add('replication', 'fail',
             f'{len(seeds)} seed(s) {seeds}: need >= {min_seeds} distinct integer seeds')
     elif min_seeds_valid:
