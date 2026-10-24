@@ -958,8 +958,16 @@ def tost_paired(
     cannot run: no positive margin, fewer than two paired observations, or a
     non-finite input. The zero-variance case reduces to a deterministic
     comparison of ``|mean|`` with `margin`.
+
+    TOST needs ``alpha < 0.5``: its interval is the ``1 - 2*alpha`` one, so a
+    larger alpha would report a non-positive confidence level and a claimed
+    equivalence interval that does not exist.
     """
     alpha = _validate_alpha(alpha)
+    if alpha >= 0.5:
+        raise ValueError(
+            f"TOST needs alpha < 0.5 so the 1 - 2*alpha confidence interval "
+            f"is positive, got {alpha!r}")
     out = {
         "test": "tost_paired",
         "margin": None,
