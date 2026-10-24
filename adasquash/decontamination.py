@@ -172,7 +172,7 @@ def benchmark_fingerprint(records_by_benchmark: dict) -> dict:
         raise ValueError("records_by_benchmark must be a non-empty mapping")
     out = {}
     combined = hashlib.sha256()
-    for name in sorted(records_by_benchmark):
+    for name in sorted(records_by_benchmark, key=str):
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"benchmark name must be a non-empty string, got {name!r}")
         records = list(records_by_benchmark[name])
@@ -269,7 +269,7 @@ def build_ngram_index(benchmarks: dict, ngram_size: int = DEFAULT_NGRAM_SIZE) ->
     documents_by_benchmark = {}
     tokens_by_benchmark = {}
     documents_without_ngrams_by_benchmark = {}
-    for name in sorted(benchmarks):
+    for name in sorted(benchmarks, key=str):
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"benchmark name must be a non-empty string, got {name!r}")
         sequences = list(benchmarks[name])
