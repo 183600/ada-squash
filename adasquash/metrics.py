@@ -2044,7 +2044,7 @@ def scale_replication_summary(observations: Sequence[dict],
     """
     min_scales = _strict_int(min_scales, "min_scales", minimum=2)
     alpha = _validate_alpha(alpha)
-    by_metric: dict[str, dict[tuple[str, str, str], dict]] = {}
+    by_metric: dict[tuple[str, str], dict[tuple[str, str, str], dict]] = {}
     duplicates: list[dict] = []
     excluded: list[dict] = []
     for index, obs in enumerate(observations or []):
@@ -2060,7 +2060,6 @@ def scale_replication_summary(observations: Sequence[dict],
         # An explicit `contrast` keeps each pair as its own replication set;
         # callers without one retain the original (scale, metric) identity.
         contrast = str(obs.get('contrast') or '').strip()
-        bucket_id = f'{metric} [{contrast}]' if contrast else metric
         delta = obs.get('delta')
         if not scale:
             excluded.append({'index': index, 'reason': 'missing scale'})
@@ -2105,7 +2104,7 @@ def scale_replication_summary(observations: Sequence[dict],
             'df': obs.get('df'),
             'ci_level': obs.get('ci_level'),
         }
-        bucket = by_metric.setdefault(bucket_id, {})
+        bucket = by_metric.setdefault((metric, contrast), {})
         if key in bucket:
             # A duplicate is one underlying observation, not another scale.
             # Keep the first and expose both values instead of overwriting.
@@ -2117,8 +2116,17 @@ def scale_replication_summary(observations: Sequence[dict],
         bucket[key] = record
 
     per_metric: dict[str, dict] = {}
+    used_labels: set[str] = set()
     all_deltas: list[tuple[str, str, float]] = []
-    for metric, bucket in by_metric.items():
+    for (metric, contrast), bucket in by_metric.items():
+        label = f'{metric} [{contrast}]' if contrast else metric
+        if label in used_labels:
+            base = label
+            suffix = 2
+            while f'{base} #{suffix}' in used_labels:
+                suffix += 1
+            label = f'{base} #{suffix}'
+        used_labels.add(label)
         records = list(bucket.values())
         signs = []
         for record in records:
@@ -2128,7 +2136,7 @@ def scale_replication_summary(observations: Sequence[dict],
                 signs.append('positive')
             else:
                 signs.append('zero')
-            all_deltas.append((metric, record['scale'], record['delta']))
+            all_deltas.append((label, record['scale'], record['delta']))
         certified = [record for record in records if record['certified']]
         certified_signs = {
             ('negative' if record['delta'] < 0.0 else
@@ -2140,7 +2148,7 @@ def scale_replication_summary(observations: Sequence[dict],
         direction_consistent = (len(set(signs)) == 1
                                 and signs[0] in ('negative', 'positive'))
         pooled = meta_analysis(records, alpha=alpha, min_studies=min_scales)
-        per_metric[metric] = {
+        per_metric[label] = {
             'metric': records[0]['metric'] if records else metric,
             'contrast': records[0]['contrast'] if records else None,
             'scales': sorted(record['scale'] for record in records),
