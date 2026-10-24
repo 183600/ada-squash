@@ -571,7 +571,10 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
     raw_benchmarks = report.get("by_benchmark")
     if not isinstance(raw_benchmarks, dict):
         raw_benchmarks = {}
-    for name in sorted(raw_benchmarks):
+    for name in sorted(raw_benchmarks, key=str):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"by_benchmark names must be non-empty strings, got {name!r}")
         row = raw_benchmarks[name]
         if not isinstance(row, dict):
             raise ValueError(f"by_benchmark[{name!r}] must be a mapping")
