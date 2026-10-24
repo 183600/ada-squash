@@ -1695,20 +1695,29 @@ def _meta_study(observation, index: int):
     effect = None
     for key in _META_EFFECT_KEYS:
         value = _as_real(observation.get(key))
-        if value is not None:
+        if value is not None and math.isfinite(value):
             effect = value
             break
-    if effect is None or not math.isfinite(effect):
+    if effect is None:
         return None, {'index': index, 'label': label,
                       'reason': 'missing or non-finite effect'}
 
     stderr = None
+    invalid_stderr = None
     se_basis = 'reported'
     for key in _META_STDERR_KEYS:
         value = _as_real(observation.get(key))
-        if value is not None:
+        if value is None:
+            continue
+        if math.isfinite(value) and value > 0.0:
             stderr = value
             break
+        if invalid_stderr is None:
+            invalid_stderr = value
+    if stderr is None and invalid_stderr is not None:
+        # Preserve the malformed value so the final validation reports why the
+        # record is unusable instead of pretending no stderr was recorded.
+        stderr = invalid_stderr
     if stderr is None:
         low = _as_real(observation.get('ci_low'))
         high = _as_real(observation.get('ci_high'))
