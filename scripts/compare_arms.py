@@ -246,13 +246,21 @@ def _final_step(agg: dict):
     per_seed = agg.get('per_seed') if isinstance(agg, dict) else None
     if not isinstance(per_seed, list):
         return None
-    steps = {record.get('final_val_step') for record in per_seed
-             if isinstance(record, dict)}
-    if len(steps) != 1:
+    steps = []
+    for record in per_seed:
+        if not isinstance(record, dict):
+            continue
+        step = record.get('final_val_step')
+        # A bool/float/list spelling is not a step count. Comparison against
+        # the set form let `1` and `True` collapse into one value, so whether a
+        # malformed aggregate looked consistent depended on record order.
+        if not isinstance(step, int) or isinstance(step, bool):
+            return None
+        steps.append(step)
+    if not steps or len(set(steps)) != 1:
         return None
-    step = next(iter(steps))
-    return (step if isinstance(step, int) and not isinstance(step, bool)
-            and step > 0 else None)
+    step = steps[0]
+    return step if step > 0 else None
 
 
 def _train_stream_for_seed(streams, seed):
