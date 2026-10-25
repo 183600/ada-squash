@@ -1116,15 +1116,18 @@ def split_token_budget(stats: dict, report: dict) -> dict:
     """
     if not isinstance(stats, dict) or not isinstance(report, dict):
         raise ValueError('split_token_budget needs the stats and report mappings')
+    sampled_raw = stats.get('documents_sampled')
     sampled = _strict_int_option(
-        stats.get('documents_sampled') or 0, 'documents_sampled', 0)
+        0 if sampled_raw is None else sampled_raw, 'documents_sampled', 0)
     effective_documents = stats.get('effective_documents_kept')
     if effective_documents is None:
         effective_documents = stats.get('documents_kept', 0)
     effective_documents = _strict_int_option(
-        effective_documents or 0, 'effective_documents_kept', 0)
+        0 if effective_documents is None else effective_documents,
+        'effective_documents_kept', 0)
+    tokens_raw = stats.get('tokens_total_effective')
     tokens = _strict_int_option(
-        stats.get('tokens_total_effective') or 0, 'tokens_total_effective', 0)
+        0 if tokens_raw is None else tokens_raw, 'tokens_total_effective', 0)
     nominal = report.get('count')
     if nominal is not None:
         nominal = _strict_int_option(nominal, 'nominal_documents', 0)
@@ -1200,11 +1203,18 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
             raise ValueError(
                 "estimated_effective_tokens must be finite and >= 0, "
                 f"got {estimated!r}")
+    basis = None if budget is None else budget.get('basis')
+    if basis is not None and not isinstance(basis, str):
+        raise ValueError(
+            f"budget.basis must be a string or None, got {basis!r}")
+    exhaustive = (None if budget is None else
+                  _strict_bool_option(budget.get('exhaustive'),
+                                      "budget.exhaustive", allow_none=True))
     result = {
         'scheduled_tokens': scheduled or None,
         'estimated_effective_tokens': estimated,
-        'basis': None if budget is None else budget.get('basis'),
-        'exhaustive': None if budget is None else budget.get('exhaustive'),
+        'basis': basis,
+        'exhaustive': exhaustive,
         'wrap_expected': None,
         'coverage_ratio': None,
     }
