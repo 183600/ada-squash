@@ -59,8 +59,15 @@ _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
 
 
 def _finite(value) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)):
+        return False
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        # A JSON integer can exceed the finite float range; it is not a
+        # usable loss, but it must not crash the comparison.
+        return False
+    return math.isfinite(converted)
 
 
 def _seed_values(agg: dict, metric: str) -> dict[int, float]:
