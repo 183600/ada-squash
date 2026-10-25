@@ -70,6 +70,13 @@ def _finite(value) -> bool:
     return math.isfinite(converted)
 
 
+def _finite_number(value):
+    """The finite float value of a real scalar, or None for anything else."""
+    if not _finite(value):
+        return None
+    return float(value)
+
+
 def _seed_values(agg: dict, metric: str) -> dict[int, float]:
     """{seed: finite metric} from one aggregate's `per_seed` records."""
     out: dict[int, float] = {}
@@ -410,11 +417,18 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         raise ValueError('compare_arms needs at least two named aggregates')
     if metric not in _LOSS_METRICS:
         raise ValueError(f'metric must be one of {_LOSS_METRICS}')
-    if not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
+    alpha_value = _finite_number(alpha)
+    if alpha_value is None or not 0.0 < alpha_value < 1.0:
         raise ValueError('alpha must be finite and strictly between 0 and 1')
-    if not math.isfinite(equivalence_margin) or equivalence_margin < 0.0:
+    margin_value = _finite_number(margin)
+    if margin_value is None or margin_value < 0.0:
+        raise ValueError('margin must be finite and >= 0')
+    equivalence_value = _finite_number(equivalence_margin)
+    if equivalence_value is None or equivalence_value < 0.0:
         raise ValueError('equivalence_margin must be finite and >= 0 '
                          '(0 disables TOST)')
+    alpha, margin, equivalence_margin = (
+        alpha_value, margin_value, equivalence_value)
     if equivalence_margin > 0.0 and alpha >= 0.5:
         raise ValueError(
             'a positive equivalence_margin requires alpha < 0.5 so the TOST '
