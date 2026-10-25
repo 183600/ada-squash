@@ -294,6 +294,10 @@ def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
     blocks are descriptive for the certification decision; the pre-specified
     paired t-test remains the only certifying test.
     """
+    if equivalence_margin and equivalence_margin > 0.0 and alpha >= 0.5:
+        raise ValueError(
+            'a positive equivalence_margin requires alpha < 0.5 so the TOST '
+            f'confidence interval 1 - 2*alpha is positive, got alpha={alpha!r}')
     values = [float(deltas[seed]) for seed in deltas]
     labels = [str(seed) for seed in deltas]
     jackknife = leave_one_out_jackknife(values, labels=labels)
@@ -4561,6 +4565,9 @@ def main():
                 f'(0 disables equivalence testing)')
     if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
         p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
+    if args.equivalence_margin > 0.0 and args.alpha >= 0.5:
+        p.error('--equivalence-margin requires --alpha < 0.5 so the TOST '
+                'confidence interval 1 - 2*alpha is positive')
     if not math.isfinite(args.expected_attrition) or not 0.0 <= args.expected_attrition < 1.0:
         p.error(f'--expected-attrition {args.expected_attrition} must be finite and in [0, 1)')
     for flag, value in (('--max-steps', args.max_steps),

@@ -415,6 +415,10 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
     if not math.isfinite(equivalence_margin) or equivalence_margin < 0.0:
         raise ValueError('equivalence_margin must be finite and >= 0 '
                          '(0 disables TOST)')
+    if equivalence_margin > 0.0 and alpha >= 0.5:
+        raise ValueError(
+            'a positive equivalence_margin requires alpha < 0.5 so the TOST '
+            f'confidence interval 1 - 2*alpha is positive, got alpha={alpha!r}')
     if reference_selection not in (None, 'prespecified', 'best-of-pool'):
         raise ValueError(
             "reference_selection must be None, 'prespecified' or 'best-of-pool', "
@@ -1120,6 +1124,9 @@ def main(argv=None) -> None:
         p.error('--margin must be finite and >= 0')
     if not math.isfinite(args.equivalence_margin) or args.equivalence_margin < 0.0:
         p.error('--equivalence-margin must be finite and >= 0 (0 disables TOST)')
+    if args.equivalence_margin > 0.0 and args.alpha >= 0.5:
+        p.error('--equivalence-margin requires --alpha < 0.5 so the TOST '
+                'confidence interval 1 - 2*alpha is positive')
     paths = [Path(path) for path in args.aggregates]
     names = args.names or [_default_name(path) for path in paths]
     if len(set(names)) != len(names):
