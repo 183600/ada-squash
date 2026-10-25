@@ -678,10 +678,22 @@ class DocumentCleaner:
                  group_key: str | None = None,
                  exclude_group_hashes: set | None = None,
                  exclude_train_hashes: set | None = None):
-        self.dedup = bool(dedup)
-        self.dedup_max = int(dedup_max)
-        self.min_doc_chars = int(min_doc_chars)
-        self.max_doc_chars = int(max_doc_chars)
+        # Direct construction bypasses `validate_data_options`, but the
+        # cleaner's behaviour is the same safety-critical policy: a negative
+        # max length or a zero dedup cap silently drops every document or
+        # disables duplicate removal while the run still looks configured.
+        self.dedup = _bool_option("dedup", dedup)
+        self.dedup_max = _int_option("dedup_max", dedup_max, 1)
+        self.min_doc_chars = _int_option("min_doc_chars", min_doc_chars, 0)
+        self.max_doc_chars = _int_option("max_doc_chars", max_doc_chars, 0)
+        if self.max_doc_chars and self.min_doc_chars > self.max_doc_chars:
+            raise ValueError(
+                f"min_doc_chars={self.min_doc_chars} exceeds "
+                f"max_doc_chars={self.max_doc_chars}; no document could pass the cleaner")
+        if group_key is not None and (not isinstance(group_key, str)
+                                      or not group_key.strip()):
+            raise ValueError(
+                f"group_key must be a non-empty string or None, got {group_key!r}")
         # Held by reference: the ledger is shared with the caller, who must not
         # mutate it after handing it over.
         self.exclude_hashes = exclude_hashes if exclude_hashes is not None else set()
@@ -691,7 +703,7 @@ class DocumentCleaner:
         # document seen on an earlier side.
         self.exclude_train_hashes = (
             exclude_train_hashes if exclude_train_hashes is not None else set())
-        self.group_key = group_key or None
+        self.group_key = group_key.strip() if isinstance(group_key, str) else None
         self.exclude_group_hashes = (exclude_group_hashes if exclude_group_hashes is not None
                                      else set())
         # `seen` stores the leading 64 bits of each canonical digest as an
