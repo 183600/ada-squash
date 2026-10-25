@@ -177,7 +177,12 @@ def _data_version_signature(agg: dict):
     values = list(versions.values())
     if any(value is None for value in values):
         return None
-    signatures = {json.dumps(value, sort_keys=True) for value in values}
+    try:
+        signatures = {json.dumps(value, sort_keys=True) for value in values}
+    except (TypeError, ValueError):
+        # A non-JSON value (e.g. a set) is unknown provenance, not a reason to
+        # crash the comparison or let two malformed arms compare equal.
+        return None
     if len(signatures) != 1:
         return 'MIXED'
     return next(iter(signatures))
@@ -201,7 +206,11 @@ def _data_ledger_signature(agg: dict):
     # A missing per-seed ledger record is unknown, not an empty ledger.
     if any(not isinstance(value, dict) for value in values):
         return None
-    signatures = {json.dumps(value, sort_keys=True) for value in values}
+    try:
+        signatures = {json.dumps(value, sort_keys=True) for value in values}
+    except (TypeError, ValueError):
+        # Non-JSON ledger content is unknown, not a comparable identity.
+        return None
     if len(signatures) != 1:
         return 'MIXED'
     return next(iter(signatures))
@@ -240,6 +249,17 @@ def _shape_signature(agg: dict):
 
 def _signature_unknown(value) -> bool:
     return value is None or value == 'MIXED'
+
+
+def _model_selector(agg: dict):
+    """The aggregate's model selector, or None when it is malformed.
+
+    The selector is compared across arms and used as a set member. A list/dict
+    spelling is unhashable (crashing the comparison) and is not a known model
+    identity, so it must fail closed as unknown rather than certify.
+    """
+    model = agg.get('model') if isinstance(agg, dict) else None
+    return model if isinstance(model, str) and model else None
 
 
 def _final_step(agg: dict):
@@ -409,7 +429,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         prepared[name] = {
             'name': name,
             'norm': agg.get('norm') if isinstance(agg, dict) else None,
-            'model': agg.get('model') if isinstance(agg, dict) else None,
+            'model': _model_selector(agg),
             'values': vals,
             'mean': None if stats is None else stats['mean'],
             'std': None if stats is None or stats['n'] < 2 else stats['std'],
