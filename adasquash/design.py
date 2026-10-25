@@ -1646,6 +1646,10 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
     if equivalence_value is None or equivalence_value < 0.0:
         raise ValueError(f'equivalence_margin must be a finite number >= 0, '
                          f'got {equivalence_margin!r}')
+    if equivalence_value > 0.0 and alpha_value >= 0.5:
+        raise ValueError(f'a positive equivalence_margin requires alpha < 0.5 so '
+                         f'the TOST confidence interval 1 - 2*alpha is positive, '
+                         f'got alpha={alpha!r}')
     seed = _validate_seed(seed)
 
     rng = random.Random(seed)
