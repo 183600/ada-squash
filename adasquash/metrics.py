@@ -294,25 +294,35 @@ def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     Non-finite entries (NaN/Inf) are excluded from the statistics and counted
     in ``n_nonfinite``; a single corrupted batch must not turn the whole
     summary into `nan` (the caller can then see that the mean rests on fewer
-    points instead of silently quoting a poisoned number). If no finite value
+    points instead of silently quoting a poisoned number). Values with no
+    finite float image (including JSON integers too large for a double) are
+    excluded the same way instead of aborting the summary. If no finite value
     remains, `None` is returned so the caller cannot mistake "no measurement"
     for a result.
     """
-    raw = [float(v) for v in values
-           if v is not None and not _is_boolean_value(v)]
+    raw = []
+    n_unusable = 0
+    for value in values:
+        if value is None or _is_boolean_value(value):
+            continue
+        try:
+            raw.append(float(value))
+        except (TypeError, ValueError, OverflowError):
+            n_unusable += 1
     vals = [v for v in raw if math.isfinite(v)]
-    n_nonfinite = len(raw) - len(vals)
+    n_nonfinite = len(raw) - len(vals) + n_unusable
+    n_input = len(raw) + n_unusable
     n = len(vals)
     if n == 0:
         return None
     mean = sum(vals) / n
     if n < 2:
         return {"mean": mean, "std": 0.0, "stderr": 0.0, "n": n,
-                "n_input": len(raw), "n_nonfinite": n_nonfinite}
+                "n_input": n_input, "n_nonfinite": n_nonfinite}
     var = sum((v - mean) ** 2 for v in vals) / (n - 1)
     std = math.sqrt(var)
     return {"mean": mean, "std": std, "stderr": std / math.sqrt(n), "n": n,
-            "n_input": len(raw), "n_nonfinite": n_nonfinite}
+            "n_input": n_input, "n_nonfinite": n_nonfinite}
 
 
 def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
