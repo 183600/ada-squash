@@ -237,7 +237,9 @@ class NgramIndex:
     def __init__(self, ngram_size: int, ngrams_by_benchmark: dict,
                  documents_by_benchmark: dict, tokens_by_benchmark: dict,
                  documents_without_ngrams_by_benchmark: dict | None = None):
-        self.ngram_size = int(ngram_size)
+        # Public direct construction bypasses `build_ngram_index`; a fractional
+        # or zero geometry silently changes every comparison the index serves.
+        self.ngram_size = _positive_int(ngram_size, "ngram_size")
         self.ngrams_by_benchmark = {
             name: frozenset(ngrams) for name, ngrams in ngrams_by_benchmark.items()}
         self.documents_by_benchmark = dict(documents_by_benchmark)
