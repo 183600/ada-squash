@@ -1399,6 +1399,11 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                      and n_confirmatory_tests >= 1)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
         add('power', 'fail', f'invalid alpha {alpha!r}')
+    elif equivalence_margin > 0.0 and alpha_value >= 0.5:
+        add('power', 'fail',
+            f'alpha={alpha_value:g} cannot support the requested TOST '
+            'equivalence test: its confidence interval 1 - 2*alpha would be '
+            'non-positive, so alpha must be < 0.5')
     elif target_power_value is None or not 0.0 < target_power_value < 1.0:
         add('power', 'fail', f'invalid target power {target_power!r}')
     elif not n_tests_valid:
