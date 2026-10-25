@@ -65,6 +65,16 @@ def _first_present(*values):
     return None
 
 
+def _same_scale_confirmed(entry: dict) -> bool:
+    """Only an absent (legacy) or explicit True `same_scale` is usable.
+
+    A cross-scale row folded into the sign vote would let two architectures
+    masquerade as two replications. ``is False`` let a malformed string such
+    as ``"false"`` through, so any present non-True value fails closed.
+    """
+    return 'same_scale' not in entry or entry.get('same_scale') is True
+
+
 def _reported_p(primary, fallback):
     """The Holm p when it is a real value, else the unadjusted p.
 
