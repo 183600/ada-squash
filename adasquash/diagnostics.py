@@ -637,12 +637,16 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
     # data-pipeline dtype bug for the same reason.
     target_dtype_ok = y.dtype in (torch.int64, torch.uint8)
     targets_valid = target_integer_ids and target_dtype_ok
+    # Compare in int64: with Byte targets, Python scalars outside uint8
+    # (e.g. vocab_size=256 or ignore_index=-100) wrap on promotion, so the
+    # range test would reject valid ids or coerce the wrong ones.
+    target_ids = y.to(torch.int64) if y.dtype == torch.uint8 else y
     if y.numel() and target_integer_ids and target_dtype_ok:
         # A negative id is invalid whether or not the vocabulary upper bound
         # is known; ignore_index is the only negative value the loss accepts.
-        in_range = (y == ignore_index) | (y >= 0)
+        in_range = (target_ids == ignore_index) | (target_ids >= 0)
         if known_vocab:
-            in_range = in_range & (y < vocab_size)
+            in_range = in_range & (target_ids < vocab_size)
         targets_valid = bool(in_range.all().item())
     if x.numel() and input_integer_ids and input_dtype_ok:
         # Embedding ids are never allowed to be negative. When the vocabulary
@@ -654,7 +658,8 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
         tokens_valid = bool(in_range.all().item())
     else:
         tokens_valid = input_integer_ids and input_dtype_ok
-    mask_count = int((y != ignore_index).sum().item()) if target_integer_ids and y.numel() else 0
+    mask_count = (int((target_ids != ignore_index).sum().item())
+                  if target_integer_ids and y.numel() else 0)
     return {
         "input": x_report,
         "targets": y_report,
