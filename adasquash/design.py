@@ -1531,8 +1531,32 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                     f'{schedule.get("n_units")} run(s) in '
                     f'{schedule.get("n_blocks")} block(s)')
 
-    pairs = [tuple(pair) for pair in identity_controls if pair]
-    if not pairs:
+    pairs = []
+    malformed_controls = []
+    if identity_controls is None:
+        controls = ()
+    else:
+        try:
+            controls = list(identity_controls)
+        except TypeError:
+            controls = None
+            malformed_controls.append(identity_controls)
+    if controls is not None:
+        for pair in controls:
+            if not pair:
+                continue
+            # A string/dict/scalar is not a pair of row names. `tuple("ab")`
+            # silently becomes ('a', 'b') and could certify a control the
+            # caller never specified; an int used to crash the whole audit.
+            if not isinstance(pair, (list, tuple)):
+                malformed_controls.append(pair)
+                continue
+            pairs.append(tuple(pair))
+    if malformed_controls:
+        add('controls', 'fail',
+            f'control pair(s) must be two-element lists/tuples of row names: '
+            f'{malformed_controls!r}')
+    elif not pairs:
         add('controls', 'warn',
             'no identity/negative-control pair declared: the analysis has no '
             'known-null contrast to check its own calibration')
