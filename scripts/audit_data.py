@@ -333,6 +333,13 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
                if records_by_split.get(name)]
     exhaustive_by_split = exhaustive_by_split or {}
     truncated_by_split = truncated_by_split or {}
+    # A truthy string ("false") would silently mark the scan exhaustive and
+    # let a sampled prefix certify the population. Validate the coverage flags
+    # instead of coercing whatever the report happens to contain.
+    for label, mapping in (("exhaustive_by_split", exhaustive_by_split),
+                           ("truncated_by_split", truncated_by_split)):
+        for name, value in mapping.items():
+            _strict_bool_option(value, f"{label}[{name!r}]", allow_none=True)
     pairs = {}
     by_later_split = {}
     problems = []
@@ -578,7 +585,10 @@ def near_duplicate_scan_bound(report: dict, *, confidence: float = 0.95,
             raise ValueError(
                 f"max_rate must be finite and in [0, 1], got {max_rate!r}")
     z = NormalDist().inv_cdf(confidence)
-    exhaustive = bool(report.get("exhaustive"))
+    exhaustive = bool(_strict_bool_option(
+        report.get("exhaustive"), "report.exhaustive", allow_none=True))
+    enabled = bool(_strict_bool_option(
+        report.get("enabled", True), "report.enabled", allow_none=True))
     scope = "audited_split" if exhaustive else "scanned_prefix"
     by_later = report.get("by_later_split")
     if not isinstance(by_later, dict):
@@ -644,7 +654,7 @@ def near_duplicate_scan_bound(report: dict, *, confidence: float = 0.95,
             "upper bound is the largest contamination rate compatible with "
             "the scanned sample at the stated confidence")
     return {
-        "enabled": bool(report.get("enabled", True)),
+        "enabled": enabled,
         "confidence": confidence,
         "method": "wilson_score_upper_bound",
         "scope": scope,
@@ -652,7 +662,7 @@ def near_duplicate_scan_bound(report: dict, *, confidence: float = 0.95,
         # An empty split computes no upper bound, so it cannot certify a
         # population rate even though the scan was exhaustive.
         "certifies_population": bool(
-            bool(report.get("enabled", True)) and exhaustive and bounds
+            enabled and exhaustive and bounds
             and all(block["upper_bound"] is not None
                     for block in bounds.values())),
         "max_rate": max_rate,
@@ -1118,6 +1128,8 @@ def split_token_budget(stats: dict, report: dict) -> dict:
     nominal = report.get('count')
     if nominal is not None:
         nominal = _strict_int_option(nominal, 'nominal_documents', 0)
+    exhaustive = bool(_strict_bool_option(
+        stats.get('exhaustive', False), "stats.exhaustive", allow_none=True))
     result = {
         'nominal_documents': nominal,
         'documents_sampled': sampled,
@@ -1127,7 +1139,7 @@ def split_token_budget(stats: dict, report: dict) -> dict:
         'estimated_effective_tokens': None,
         'tokens_per_effective_document': None,
         'basis': 'no_usable_documents',
-        'exhaustive': bool(stats.get('exhaustive', False)),
+        'exhaustive': exhaustive,
     }
     if sampled <= 0 or effective_documents <= 0 or tokens <= 0:
         return result
@@ -1212,6 +1224,20 @@ def _is_boolean_scalar(value) -> bool:
         return True
     cls = type(value)
     return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
+
+def _strict_bool_option(value, name: str, *, allow_none: bool = False):
+    """A boolean flag, rejecting truthy/falsy stand-ins.
+
+    ``bool("false")`` is True: a malformed JSON/YAML spelling must not turn a
+    sampled scan into an exhaustive one (or vice versa). ``None`` is kept only
+    for callers whose field distinguishes "not recorded" from False.
+    """
+    if value is None and allow_none:
+        return None
+    if not _is_boolean_scalar(value):
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+    return bool(value)
 
 
 def _strict_int_option(value, name: str, minimum: int) -> int:
