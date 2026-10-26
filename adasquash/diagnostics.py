@@ -129,12 +129,14 @@ def _step_aligned_gap_points(train_losses, val_losses, train_steps, val_steps):
             or len(val_steps) != len(val_losses)):
         return None
     train_pairs = sorted(
-        (float(step), float(loss)) for step, loss in zip(train_steps, train_losses)
-        if loss is not None and math.isfinite(float(loss))
+        ((float(step), float(loss)) for step, loss in zip(train_steps, train_losses)
+         if loss is not None and math.isfinite(float(loss))),
+        key=lambda pair: pair[0],
     )
     val_pairs = sorted(
-        (float(step), float(loss)) for step, loss in zip(val_steps, val_losses)
-        if loss is not None and math.isfinite(float(loss))
+        ((float(step), float(loss)) for step, loss in zip(val_steps, val_losses)
+         if loss is not None and math.isfinite(float(loss))),
+        key=lambda pair: pair[0],
     )
     if not train_pairs or not val_pairs:
         return []
