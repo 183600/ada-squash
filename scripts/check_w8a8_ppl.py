@@ -214,6 +214,8 @@ def compute_ce_sum(model, batch, target, device='cuda'):
     """
     batch = batch.to(device)
     target = target.to(device)
+    if target.dtype == torch.uint8:
+        target = target.to(torch.int64)
     n = (target != model.cfg.ignore_index).sum()
     loss = model(batch, target, return_logits=False)[1]
     return (loss.detach().double() * n.double(), n)
@@ -251,7 +253,17 @@ def _probe_markov(rng, batch_size, seq_len, device, n_states=64):
     return x
 
 def _next_token_targets(x: torch.Tensor, ignore_index: int) -> torch.Tensor:
-    y = torch.full_like(x, ignore_index)
+    if x.dtype == torch.bool:
+        y = torch.full(x.shape, ignore_index, dtype=torch.int64, device=x.device)
+    else:
+        try:
+            info = torch.iinfo(x.dtype)
+        except TypeError:
+            y = torch.full_like(x, ignore_index)
+        else:
+            fits = info.min <= ignore_index <= info.max
+            y = (torch.full_like(x, ignore_index) if fits else
+                 torch.full(x.shape, ignore_index, dtype=torch.int64, device=x.device))
     y[:, :-1] = x[:, 1:]
     return y
 
