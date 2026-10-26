@@ -126,6 +126,9 @@ def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = 
     `backward=True` returns the training-step estimate: forward plus backward,
     with the multiplier used recorded as ``backward_factor``.
     """
+    if not _is_boolean_value(backward):
+        raise ValueError(f"backward must be a boolean, got {backward!r}")
+    backward = bool(backward)
     d = _positive_int(getattr(cfg, "dim", None), "cfg.dim")
     n_layers = _positive_int(getattr(cfg, "n_layers", None), "cfg.n_layers")
     vocab = _positive_int(getattr(cfg, "vocab_size", None), "cfg.vocab_size")
