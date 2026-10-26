@@ -194,6 +194,9 @@ def benchmark_fingerprint(records_by_benchmark: dict) -> dict:
 
 def _validate_hashable_tokens(sequence) -> None:
     for token in sequence:
+        if _is_bool(token):
+            raise ValueError(
+                f"token ids must be integers, not boolean {token!r}")
         try:
             hash(token)
         except TypeError:
