@@ -15,7 +15,9 @@ DerSimonian-Laird random-effects meta-analysis (Cochran's Q, I^2, tau^2 and a
 prediction interval for a new scale). The pooled estimate is descriptive: it
 does not replace the requirement that each scale pass its own pre-specified
 test, and substantial heterogeneity means the pooled number is an average of
-unlike effects rather than one replicated mechanism.
+unlike effects rather than one replicated mechanism. A leave-one-scale-out
+influence check reports when removing a single scale reverses the sign or
+changes the significance/heterogeneity verdict.
 
 Inputs are the JSON files the experiment scripts already write:
 
@@ -418,6 +420,13 @@ def main(argv=None) -> None:
                   f"Q_p={heterogeneity.get('p'):.3g} "
                   f"tau={heterogeneity.get('tau'):.4g} "
                   f"prediction={pi}")
+            influence = pooled.get('influence') or {}
+            if (influence.get('meaningful')
+                    and influence.get('influential_scales')):
+                print(f"[scale]     influence: dropping "
+                      f"{influence['influential_scales']} changes the sign, "
+                      "significance, or heterogeneity verdict; the pooled "
+                      "result depends on a single scale")
             if pooled.get('excluded'):
                 print(f"[scale]     meta excluded (no usable precision): "
                       f"{[item.get('label') for item in pooled['excluded']]}",

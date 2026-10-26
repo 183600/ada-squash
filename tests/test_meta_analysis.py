@@ -12,6 +12,9 @@ accompanies the vote:
   random-effects interval is wider than the fixed-effect one;
 * a prediction interval needs three studies and is wider than the confidence
   interval for the pooled mean;
+* leaving one scale out re-pools the rest, flags a scale that reverses the
+  sign or changes the significance/heterogeneity verdict, and stays quiet
+  when the pooled result is not single-scale dependent;
 * a precision supplied only as a confidence interval is inverted with that
   interval's own level and degrees of freedom, not assumed to be normal;
 * malformed records are excluded with a reason, never assigned an invented
@@ -145,6 +148,72 @@ def test_heterogeneity_widens_the_random_effects_interval_and_is_reported():
 
 
 # ---------------------------------------------------------------------------
+# Leave-one-scale-out influence
+# ---------------------------------------------------------------------------
+def test_leave_one_scale_out_flags_a_single_dominant_scale():
+    out = meta_analysis([
+        {'label': 'a', 'effect': -1.0, 'stderr': 0.1},
+        {'label': 'b', 'effect': -0.9, 'stderr': 0.1},
+        {'label': 'c', 'effect': 3.0, 'stderr': 0.1},
+    ])
+    influence = out['influence']
+
+    assert influence['meaningful'] is True
+    assert influence['n_scales'] == 3
+    assert len(influence['per_drop']) == 3
+    assert influence['influential_scales'] == ['c']
+    assert influence['n_influential'] == 1
+    # The outlier pulls the full pool positive; dropping it restores the
+    # negative direction of the other two scales and removes the heterogeneity.
+    assert out['pooled_effect'] > 0.0
+    dropped = next(row for row in influence['per_drop']
+                   if row['dropped'] == 'c')
+    assert dropped['pooled_effect'] < 0.0
+    assert dropped['keeps_full_sign'] is False
+    assert dropped['same_significance_verdict'] is False
+    assert dropped['same_heterogeneity_verdict'] is False
+    assert dropped['influential'] is True
+    assert influence['sign_stable'] is False
+    assert influence['significance_verdict_stable'] is False
+    assert influence['heterogeneity_verdict_stable'] is False
+    assert influence['max_abs_change'] == pytest.approx(1.3166666666666667)
+    assert influence['pooled_effect_range'][0] == pytest.approx(-0.95)
+    assert influence['pooled_effect_range'][1] == pytest.approx(1.05)
+    assert 'sensitive to a single scale' in influence['note']
+
+
+def test_leave_one_scale_out_is_quiet_for_a_stable_replication():
+    out = meta_analysis([
+        {'label': 'a', 'effect': -0.50, 'stderr': 0.05},
+        {'label': 'b', 'effect': -0.52, 'stderr': 0.06},
+        {'label': 'c', 'effect': -0.51, 'stderr': 0.04},
+    ])
+    influence = out['influence']
+
+    assert influence['meaningful'] is True
+    assert influence['influential_scales'] == []
+    assert influence['n_influential'] == 0
+    assert influence['sign_stable'] is True
+    assert influence['significance_verdict_stable'] is True
+    assert influence['heterogeneity_verdict_stable'] is True
+    assert all(not row['influential'] for row in influence['per_drop'])
+    assert 'descriptive sensitivity only' in influence['note']
+
+
+def test_leave_one_scale_out_needs_three_scales():
+    out = meta_analysis([
+        {'label': 'small', 'effect': -0.2, 'stderr': 0.1},
+        {'label': 'large', 'effect': -0.3, 'stderr': 0.1},
+    ])
+    influence = out['influence']
+
+    assert influence['meaningful'] is False
+    assert influence['per_drop'] == []
+    assert influence['influential_scales'] == []
+    assert '>= 3 usable scales' in influence['note']
+
+
+# ---------------------------------------------------------------------------
 # Precision recovered from a confidence interval
 # ---------------------------------------------------------------------------
 def test_ci_only_study_is_inverted_with_its_own_level_and_df():
@@ -190,6 +259,8 @@ def test_empty_input_returns_a_typed_empty_summary():
     assert out['meaningful'] is False
     assert out['pooled_effect'] is None
     assert out['fixed_effect'] is None
+    assert out['influence']['meaningful'] is False
+    assert out['influence']['per_drop'] == []
     assert 'nothing can be pooled' in out['note']
 
 

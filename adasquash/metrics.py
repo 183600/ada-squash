@@ -1798,118 +1798,64 @@ def _meta_study(observation, index: int):
     }, None
 
 
-def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
-                  min_studies: int = 2) -> dict:
-    """Inverse-variance and random-effects meta-analysis of per-scale effects.
+def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
+    """Pool validated effect/stderr records, fixed-effect and random-effects.
 
-    A multi-scale claim is not a vote on signs. Each model scale estimates the
-    same contrast with a different standard error, and two scales can agree in
-    sign while disagreeing by far more than their own noise. Pooling by
-    inverse variance answers "what is the common effect?"; the
-    DerSimonian-Laird random-effects estimate answers "what is the average
-    effect across the population of scales?"; and Cochran's Q / I^2 / tau^2
-    answer "is there one effect to pool at all?".
-
-    Required per observation: an effect under any of ``effect``, ``delta``,
-    ``estimate`` or ``mean_delta``, and a positive standard error under
-    ``stderr``, ``se`` or ``standard_error``. If the standard error is absent,
-    a finite ``ci_low``/``ci_high`` pair is inverted using ``ci_level``
-    (default 95%) and ``df`` (or ``n_seeds``/``n``); a missing df falls back
-    to the normal limit and is labelled ``ci_normal_approx``. An optional
-    ``label``/``scale``/``name`` identifies the study. Invalid records are
-    excluded with a reason rather than silently shrinking the pool.
-
-    Negative effects are the repository's convention for "candidate better".
-    ``p_one_sided`` is the lower-tail probability of the pooled statistic
-    (small when the pooled effect is negative), and ``p_two_sided`` doubles
-    the smaller tail. Because the number of scales is small, the pooled tests
-    and intervals use Student-t with ``k - 1`` degrees of freedom rather than
-    the normal limit.
-
-    The prediction interval (available with >= 3 studies) adds tau^2 to the
-    squared standard error and uses ``k - 2`` degrees of freedom: it says where
-    the effect at a *new* scale would plausibly land, not where the pooled mean
-    is. It is deliberately wider than the confidence interval.
-
-    This function never certifies a multi-scale claim by itself. A pooled
-    estimate with substantial heterogeneity is an average of unlike effects;
-    the caller must still show that the individual scales pass their own
-    tests and must report the heterogeneity rather than only the pooled
-    number.
+    Weights are normalized by their maximum so the sum of individually finite
+    inverse-variance weights cannot overflow; an infinite tau^2 is reported as
+    the unweighted mean with an infinite standard error rather than dividing
+    by zero. The caller keeps validation and the human-readable summary.
     """
-    alpha = _validate_alpha(alpha)
-    min_studies = _strict_int(min_studies, "min_studies", minimum=2)
-    studies = []
-    excluded = []
-    for index, observation in enumerate(observations or []):
-        record, problem = _meta_study(observation, index)
-        if problem is not None:
-            excluded.append(problem)
-        else:
-            studies.append(record)
-
     k = len(studies)
-    out = {
-        'test': 'meta_analysis',
-        'method': 'DerSimonian-Laird random effects; inverse-variance fixed effect',
-        'effect_direction': ('negative effect favours the candidate; '
-                             'positive favours the reference'),
-        'alpha': alpha,
-        'ci_level': 1.0 - alpha,
-        'n_studies': k,
-        'min_studies_for_pooling': min_studies,
-        'meaningful': bool(k >= min_studies),
-        'studies': studies,
-        'excluded': excluded,
-        'fixed_effect': None,
-        'random_effects': None,
-        'heterogeneity': None,
-        'prediction_interval': {
-            'level': 1.0 - alpha, 'low': None, 'high': None,
-            'meaningful': False, 'df': None,
-            'note': 'a prediction interval for a new scale needs >= 3 studies',
-        },
-        'n_negative': sum(1 for study in studies if study['effect'] < 0.0),
-        'n_positive': sum(1 for study in studies if study['effect'] > 0.0),
-        'n_zero': sum(1 for study in studies if study['effect'] == 0.0),
-        'direction_consistent': None,
+    fixed = {
         'pooled_effect': None,
-        'pooled_effect_source': None,
-        'note': None,
+        'stderr': None,
+        'ci_low': None, 'ci_high': None,
+        't': None, 'df': None,
+        'p_one_sided': None, 'p_two_sided': None,
+    }
+    heterogeneity = {
+        'q': None, 'df': None, 'p': None,
+        'i_squared': None, 'tau_squared': None, 'tau': None,
+    }
+    random_effects = {
+        'pooled_effect': None,
+        'stderr': None,
+        'ci_low': None, 'ci_high': None,
+        't': None, 'df': None,
+        'p_one_sided': None, 'p_two_sided': None,
+        'tau_squared': 0.0,
+    }
+    prediction = {
+        'level': 1.0 - alpha, 'low': None, 'high': None,
+        'meaningful': False, 'df': None,
+        'note': 'a prediction interval for a new scale needs >= 3 studies',
     }
     if k == 0:
-        out['note'] = ('no study has a finite effect and a positive stderr; '
-                       'nothing can be pooled')
-        return out
+        return {
+            'fixed_effect': fixed,
+            'heterogeneity': heterogeneity,
+            'random_effects': random_effects,
+            'prediction_interval': prediction,
+            'pooled_effect': None,
+            'pooled_effect_source': 'random_effects',
+        }
 
-    # Work with weights normalized by their maximum: each individual inverse-
-    # variance weight is finite (checked in `_meta_study`), but their sum can
-    # still overflow for very small stderr values. Scaling preserves the
-    # pooled estimate and yields a representable standard error via
-    # (1/sqrt(max_weight)) / sqrt(sum_scaled).
     for study in studies:
         study['fixed_weight'] = 1.0 / study['stderr'] ** 2
     max_fixed_weight = max(study['fixed_weight'] for study in studies)
-    fixed_scaled = [study['fixed_weight'] / max_fixed_weight for study in studies]
+    fixed_scaled = [study['fixed_weight'] / max_fixed_weight
+                    for study in studies]
     total_scaled = math.fsum(fixed_scaled)
     fixed_pooled = math.fsum(
-        weight * study['effect'] for weight, study in zip(fixed_scaled, studies)
+        weight * study['effect']
+        for weight, study in zip(fixed_scaled, studies)
     ) / total_scaled
     fixed_stderr = ((1.0 / math.sqrt(max_fixed_weight))
                     / math.sqrt(total_scaled))
     for study, weight in zip(studies, fixed_scaled):
         study['fixed_weight_share'] = weight / total_scaled
 
-    out['direction_consistent'] = bool(
-        out['n_zero'] == 0 and (out['n_negative'] == k or out['n_positive'] == k))
-
-    fixed = {
-        'pooled_effect': fixed_pooled,
-        'stderr': fixed_stderr,
-        'ci_low': None, 'ci_high': None,
-        't': None, 'df': None,
-        'p_one_sided': None, 'p_two_sided': None,
-    }
     if k >= 2:
         df = float(k - 1)
         critical = student_t_ppf(1.0 - alpha / 2.0, df)
@@ -1921,12 +1867,9 @@ def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
         })
         fixed['p_one_sided'] = student_t_cdf(fixed['t'], df)
         fixed['p_two_sided'] = two_sided_p_from_t(fixed['t'], df)
-    out['fixed_effect'] = fixed
+    fixed['pooled_effect'] = fixed_pooled
+    fixed['stderr'] = fixed_stderr
 
-    heterogeneity = {
-        'q': None, 'df': None, 'p': None,
-        'i_squared': None, 'tau_squared': None, 'tau': None,
-    }
     tau_squared = 0.0
     random_pooled = fixed_pooled
     random_stderr = fixed_stderr
@@ -1973,22 +1916,9 @@ def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
                 study['random_weight'] = weight * max_random_weight
                 study['random_weight_share'] = weight / total_random_scaled
         else:
-            # An infinite tau^2 gives every study zero random weight (an
-            # unbounded between-scale variance): report the unweighted mean
-            # with an infinite standard error instead of dividing by zero.
             random_pooled = math.fsum(study['effect'] for study in studies) / k
             random_stderr = float('inf')
-    out['heterogeneity'] = heterogeneity
 
-    random_effects = {
-        'pooled_effect': random_pooled,
-        'stderr': random_stderr,
-        'ci_low': None, 'ci_high': None,
-        't': None, 'df': None,
-        'p_one_sided': None, 'p_two_sided': None,
-        'tau_squared': tau_squared,
-    }
-    if k >= 2:
         df = float(k - 1)
         critical = student_t_ppf(1.0 - alpha / 2.0, df)
         random_effects.update({
@@ -2001,15 +1931,15 @@ def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
             random_effects['t'], df)
         random_effects['p_two_sided'] = two_sided_p_from_t(
             random_effects['t'], df)
-    out['random_effects'] = random_effects
-    out['pooled_effect'] = random_pooled
-    out['pooled_effect_source'] = 'random_effects'
+    random_effects['pooled_effect'] = random_pooled
+    random_effects['stderr'] = random_stderr
+    random_effects['tau_squared'] = tau_squared
 
     if k >= 3:
         df_pi = float(k - 2)
         critical = student_t_ppf(1.0 - alpha / 2.0, df_pi)
         scale = math.sqrt(tau_squared + random_stderr ** 2)
-        out['prediction_interval'] = {
+        prediction = {
             'level': 1.0 - alpha,
             'low': random_pooled - critical * scale,
             'high': random_pooled + critical * scale,
@@ -2019,8 +1949,251 @@ def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
                      'wider than the confidence interval for the pooled mean'),
         }
 
-    i_squared = heterogeneity['i_squared']
-    q_p = heterogeneity['p']
+    return {
+        'fixed_effect': fixed,
+        'heterogeneity': heterogeneity,
+        'random_effects': random_effects,
+        'prediction_interval': prediction,
+        'pooled_effect': random_pooled,
+        'pooled_effect_source': 'random_effects',
+    }
+
+
+def _meta_influence(studies: Sequence[dict], alpha: float, pooled: dict,
+                    min_studies: int) -> dict:
+    """Leave-one-scale-out re-pooling to expose single-scale dependence."""
+    k = len(studies)
+    block = {
+        'method': 'leave-one-scale-out re-pooling',
+        'meaningful': bool(k >= 3 and k >= min_studies),
+        'n_scales': k,
+        'full_pooled_effect': pooled['pooled_effect'],
+        'full_p_one_sided': pooled['random_effects']['p_one_sided'],
+        'full_i_squared': pooled['heterogeneity']['i_squared'],
+        'per_drop': [],
+        'pooled_effect_range': [None, None],
+        'max_abs_change': None,
+        'sign_stable': None,
+        'significance_verdict_stable': None,
+        'heterogeneity_verdict_stable': None,
+        'influential_scales': [],
+        'n_influential': 0,
+        'note': None,
+    }
+    if not block['meaningful']:
+        block['note'] = (
+            f'leave-one-scale-out influence needs >= 3 usable scales (and '
+            f'>={min_studies} for pooling); with {k} scale(s) the dropped '
+            'pool is too small to re-estimate')
+        return block
+
+    full_effect = block['full_pooled_effect']
+    full_p = block['full_p_one_sided']
+    full_i_squared = block['full_i_squared']
+    full_significant = bool(full_p is not None and full_p < alpha)
+    full_substantial = bool(
+        (full_i_squared is not None and full_i_squared >= 50.0)
+        or (pooled['heterogeneity']['p'] is not None
+            and pooled['heterogeneity']['p'] < alpha))
+
+    for index, study in enumerate(studies):
+        subset = [dict(item) for item in studies if item is not study]
+        subset_pooled = _pool_meta_studies(subset, alpha)
+        effect = subset_pooled['pooled_effect']
+        p_one_sided = subset_pooled['random_effects']['p_one_sided']
+        i_squared = subset_pooled['heterogeneity']['i_squared']
+        q_p = subset_pooled['heterogeneity']['p']
+        subset_substantial = bool(
+            (i_squared is not None and i_squared >= 50.0)
+            or (q_p is not None and q_p < alpha))
+        if full_effect is None or full_effect == 0.0:
+            keeps_sign = None
+        elif effect is None or effect == 0.0:
+            keeps_sign = False
+        else:
+            keeps_sign = bool((effect < 0.0) == (full_effect < 0.0))
+        subset_significant = bool(p_one_sided is not None and p_one_sided < alpha)
+        delta = (None if effect is None or full_effect is None
+                 else effect - full_effect)
+        row = {
+            'dropped': study['label'],
+            'pooled_effect': effect,
+            'stderr': subset_pooled['random_effects']['stderr'],
+            'p_one_sided': p_one_sided,
+            'i_squared': i_squared,
+            'tau_squared': subset_pooled['random_effects']['tau_squared'],
+            'delta_from_full': delta,
+            'keeps_full_sign': keeps_sign,
+            'same_significance_verdict': bool(
+                subset_significant == full_significant),
+            'same_heterogeneity_verdict': bool(
+                subset_substantial == full_substantial),
+        }
+        row['influential'] = bool(
+            keeps_sign is False
+            or not row['same_significance_verdict']
+            or not row['same_heterogeneity_verdict'])
+        block['per_drop'].append(row)
+
+    effects = [row['pooled_effect'] for row in block['per_drop']
+               if row['pooled_effect'] is not None]
+    if effects:
+        block['pooled_effect_range'] = [min(effects), max(effects)]
+    deltas = [abs(row['delta_from_full']) for row in block['per_drop']
+              if row['delta_from_full'] is not None]
+    if deltas:
+        block['max_abs_change'] = max(deltas)
+    signs = [row['keeps_full_sign'] for row in block['per_drop']]
+    if full_effect is None or full_effect == 0.0:
+        block['sign_stable'] = None
+    else:
+        block['sign_stable'] = all(value is True for value in signs)
+    block['significance_verdict_stable'] = all(
+        row['same_significance_verdict'] for row in block['per_drop'])
+    block['heterogeneity_verdict_stable'] = all(
+        row['same_heterogeneity_verdict'] for row in block['per_drop'])
+    block['influential_scales'] = [
+        row['dropped'] for row in block['per_drop'] if row['influential']]
+    block['n_influential'] = len(block['influential_scales'])
+
+    if block['influential_scales']:
+        block['note'] = (
+            'removing scale(s) '
+            + ', '.join(repr(label) for label in block['influential_scales'])
+            + ' changes the sign, the significance verdict, or the '
+            'heterogeneity classification: the pooled result is sensitive to '
+            'a single scale. This is a descriptive sensitivity check, not a '
+            'certification')
+    else:
+        block['note'] = (
+            'no single scale changes the sign, the significance verdict, or '
+            'the heterogeneity classification; descriptive sensitivity only, '
+            'not a certification')
+    return block
+
+
+def meta_analysis(observations: Sequence[dict], alpha: float = 0.05,
+                  min_studies: int = 2) -> dict:
+    """Inverse-variance and random-effects meta-analysis of per-scale effects.
+
+    A multi-scale claim is not a vote on signs. Each model scale estimates the
+    same contrast with a different standard error, and two scales can agree in
+    sign while disagreeing by far more than their own noise. Pooling by
+    inverse variance answers "what is the common effect?"; the
+    DerSimonian-Laird random-effects estimate answers "what is the average
+    effect across the population of scales?"; and Cochran's Q / I^2 / tau^2
+    answer "is there one effect to pool at all?".
+
+    Required per observation: an effect under any of ``effect``, ``delta``,
+    ``estimate`` or ``mean_delta``, and a positive standard error under
+    ``stderr``, ``se`` or ``standard_error``. If the standard error is absent,
+    a finite ``ci_low``/``ci_high`` pair is inverted using ``ci_level``
+    (default 95%) and ``df`` (or ``n_seeds``/``n``); a missing df falls back
+    to the normal limit and is labelled ``ci_normal_approx``. An optional
+    ``label``/``scale``/``name`` identifies the study. Invalid records are
+    excluded with a reason rather than silently shrinking the pool.
+
+    Negative effects are the repository's convention for "candidate better".
+    ``p_one_sided`` is the lower-tail probability of the pooled statistic
+    (small when the pooled effect is negative), and ``p_two_sided`` doubles
+    the smaller tail. Because the number of scales is small, the pooled tests
+    and intervals use Student-t with ``k - 1`` degrees of freedom rather than
+    the normal limit.
+
+    The prediction interval (available with >= 3 studies) adds tau^2 to the
+    squared standard error and uses ``k - 2`` degrees of freedom: it says where
+    the effect at a *new* scale would plausibly land, not where the pooled mean
+    is. It is deliberately wider than the confidence interval.
+
+    The ``influence`` block (available with >= 3 studies) re-pools after
+    dropping each scale in turn and reports whether the pooled sign, the
+    significance verdict, or the heterogeneity classification depends on one
+    scale. A multi-scale result that reverses when a single scale is removed
+    is not a replicated effect, so this sensitivity check is reported next to
+    the pooled estimate; it remains descriptive and never certifies a claim.
+
+    This function never certifies a multi-scale claim by itself. A pooled
+    estimate with substantial heterogeneity is an average of unlike effects;
+    the caller must still show that the individual scales pass their own
+    tests and must report the heterogeneity rather than only the pooled
+    number.
+    """
+    alpha = _validate_alpha(alpha)
+    min_studies = _strict_int(min_studies, "min_studies", minimum=2)
+    studies = []
+    excluded = []
+    for index, observation in enumerate(observations or []):
+        record, problem = _meta_study(observation, index)
+        if problem is not None:
+            excluded.append(problem)
+        else:
+            studies.append(record)
+
+    k = len(studies)
+    out = {
+        'test': 'meta_analysis',
+        'method': 'DerSimonian-Laird random effects; inverse-variance fixed effect',
+        'effect_direction': ('negative effect favours the candidate; '
+                             'positive favours the reference'),
+        'alpha': alpha,
+        'ci_level': 1.0 - alpha,
+        'n_studies': k,
+        'min_studies_for_pooling': min_studies,
+        'meaningful': bool(k >= min_studies),
+        'studies': studies,
+        'excluded': excluded,
+        'fixed_effect': None,
+        'random_effects': None,
+        'heterogeneity': None,
+        'prediction_interval': {
+            'level': 1.0 - alpha, 'low': None, 'high': None,
+            'meaningful': False, 'df': None,
+            'note': 'a prediction interval for a new scale needs >= 3 studies',
+        },
+        'influence': {
+            'method': 'leave-one-scale-out re-pooling',
+            'meaningful': False,
+            'n_scales': k,
+            'full_pooled_effect': None,
+            'full_p_one_sided': None,
+            'full_i_squared': None,
+            'per_drop': [],
+            'pooled_effect_range': [None, None],
+            'max_abs_change': None,
+            'sign_stable': None,
+            'significance_verdict_stable': None,
+            'heterogeneity_verdict_stable': None,
+            'influential_scales': [],
+            'n_influential': 0,
+            'note': 'leave-one-scale-out influence needs >= 3 usable scales',
+        },
+        'n_negative': sum(1 for study in studies if study['effect'] < 0.0),
+        'n_positive': sum(1 for study in studies if study['effect'] > 0.0),
+        'n_zero': sum(1 for study in studies if study['effect'] == 0.0),
+        'direction_consistent': None,
+        'pooled_effect': None,
+        'pooled_effect_source': None,
+        'note': None,
+    }
+    if k == 0:
+        out['note'] = ('no study has a finite effect and a positive stderr; '
+                       'nothing can be pooled')
+        return out
+
+    out['direction_consistent'] = bool(
+        out['n_zero'] == 0 and (out['n_negative'] == k or out['n_positive'] == k))
+
+    pooled = _pool_meta_studies(studies, alpha)
+    out['fixed_effect'] = pooled['fixed_effect']
+    out['heterogeneity'] = pooled['heterogeneity']
+    out['random_effects'] = pooled['random_effects']
+    out['prediction_interval'] = pooled['prediction_interval']
+    out['pooled_effect'] = pooled['pooled_effect']
+    out['pooled_effect_source'] = pooled['pooled_effect_source']
+    out['influence'] = _meta_influence(studies, alpha, pooled, min_studies)
+
+    i_squared = pooled['heterogeneity']['i_squared']
+    q_p = pooled['heterogeneity']['p']
     if k < min_studies:
         out['note'] = (
             f'{k} usable study/studies, fewer than the {min_studies} needed '
@@ -2060,7 +2233,9 @@ def scale_replication_summary(observations: Sequence[dict],
     only populated when the callers supply a standard error or a usable
     confidence interval; a sign-only record still contributes to the vote but
     is listed in the meta-analysis's ``excluded`` list rather than being
-    assigned an invented precision.
+    assigned an invented precision. The same block also carries the
+    leave-one-scale-out ``influence`` check, so a pooled result that depends
+    on a single scale is visible without a separate aggregation step.
 
     Required keys per observation: `scale` (str), `delta` (finite number)
     and `certified` (bool). Optional: `metric` (str), `contrast`, `stderr`
