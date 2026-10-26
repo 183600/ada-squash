@@ -191,8 +191,8 @@ class TrainStreamFingerprint:
             batch_hasher.update(
                 (name + ":" + str(tuple(tensor.shape)) + "|"
                  + str(tensor.dtype)).encode("ascii"))
-            batch_hasher.update(
-                tensor.detach().cpu().contiguous().numpy().tobytes())
+            payload = tensor.detach().cpu().contiguous().reshape(-1)
+            batch_hasher.update(payload.view(torch.uint8).numpy().tobytes())
         batch_digest = batch_hasher.digest()
         self._full.update(batch_digest)
         if self._batches < self.prefix_batches_target:
