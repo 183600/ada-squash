@@ -168,6 +168,18 @@ def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=Fa
         kwargs.update(beta=cfg.beta)
     return kwargs
 
+def _valid_target_mask(targets: torch.Tensor, ignore_index: int) -> torch.Tensor:
+    """Rows that contribute to the loss, without unsigned-integer wraparound.
+
+    Cross-entropy accepts Byte targets, but comparing a uint8 tensor with a
+    negative ignore index promotes through the unsigned dtype (`-100` becomes
+    ``156``), so a real token 156 would be silently dropped from the loss
+    denominator and its gradient. Compare an int64 image instead.
+    """
+    if targets.dtype == torch.uint8:
+        targets = targets.to(torch.int64)
+    return targets.ne(ignore_index)
+
 class _ChunkedCrossEntropy(torch.autograd.Function):
 
     @staticmethod
@@ -184,7 +196,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             torch.log_softmax(logits[start:end], dim=-1, out=log_probs)
             chunk_loss = F.nll_loss(log_probs, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk_loss if total is None else total.add_(chunk_loss)
-        count = targets.ne(ignore_index).sum()
+        count = _valid_target_mask(targets, ignore_index).sum()
         ctx.save_for_backward(logits, targets)
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
@@ -198,7 +210,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         grad_scale = (grad_out / ctx.count.clamp(min=1)).to(logits.dtype)
         chunk_rows = ctx.chunk_rows
         # The row mask and the scatter source depend only on the targets.
-        valid = targets.ne(ctx.ignore_index)
+        valid = _valid_target_mask(targets, ctx.ignore_index)
         # `scatter_add_` requires an int64 index. Cross-entropy accepts uint8
         # (Byte) targets as class ids, so cast the index copy, not the saved
         # target used by the mask.
@@ -284,7 +296,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                 torch.log_softmax(cast, -1, dtype=acc, out=buf)
             chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction='sum')
             total = chunk if total is None else total.add_(chunk)
-        count = targets.ne(ignore_index).sum()
+        count = _valid_target_mask(targets, ignore_index).sum()
         # Backward consumes the same cast weight the forward GEMMs use; the
         # original dtype is kept in `in_dtypes` for the returned gradient.
         ctx.save_for_backward(hidden, w, targets)
@@ -331,7 +343,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         probs = None
         cast_buf = None
         # Target-only row mask and scatter source.
-        valid = targets.ne(ctx.ignore_index)
+        valid = _valid_target_mask(targets, ctx.ignore_index)
         # `scatter_add_` requires an int64 index; Byte targets are valid class
         # ids for cross-entropy and must not fail only in this fused backward.
         gold = targets.to(torch.long).masked_fill(~valid, 0).unsqueeze(-1)
