@@ -1073,6 +1073,15 @@ def triage_nonfinite(
     after so the caller can safely continue (or abort) whichever policy it
     chose. `explosion_factor` is relative to `grad_clip` when that is given.
     """
+    explosion_factor = _threshold_float(
+        explosion_factor, "explosion_factor", 0.0)
+    if explosion_factor <= 0.0:
+        raise ValueError(
+            f"explosion_factor must be > 0, got {explosion_factor!r}")
+    if grad_clip is not None:
+        grad_clip = _threshold_float(grad_clip, "grad_clip", 0.0)
+        if grad_clip <= 0.0:
+            raise ValueError(f"grad_clip must be > 0, got {grad_clip!r}")
     was_training = model.training
     evidence: dict = {"lr": lr, "grad_clip": grad_clip, "autocast_dtype": None if autocast_dtype is None else str(autocast_dtype)}
     evidence.update(_batch_data_report(model, x, y))
