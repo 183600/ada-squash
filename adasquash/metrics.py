@@ -212,6 +212,11 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     """
     n_total = _strict_int(n_total, "n_total", minimum=1)
     n_success = _strict_int(n_success, "n_success", minimum=0)
+    z_value = _as_real(z)
+    if z_value is None or not math.isfinite(z_value) or z_value < 0.0:
+        raise ValueError(
+            f"z must be a finite non-negative number, got {z!r}")
+    z = z_value
     if n_success > n_total:
         # 150 successes out of 100 trials is impossible evidence, not a
         # proportion to clamp to 1. Clamping produced a valid-looking
