@@ -96,6 +96,21 @@ def _threshold_float(value, name: str, minimum: float = 0.0) -> float:
     return converted
 
 
+def _finite_float_or_none(value) -> Optional[float]:
+    """A finite float image, or None for absent/unrepresentable inputs.
+
+    JSON integers can exceed the finite float range; converting one must not
+    abort a curve report that is supposed to explain bad measurements.
+    """
+    if value is None:
+        return None
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return converted if math.isfinite(converted) else None
+
+
 def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]:
     """(last - first) / max(|first|, eps) over the trailing `window` points.
 
@@ -104,8 +119,12 @@ def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]
     excluded here as a last-resort guard; `diagnose_train_val_curve` reports
     them explicitly before this helper is reached.
     """
-    tail = [float(v) for v in values
-            if v is not None and math.isfinite(float(v))][-max(2, int(window)) :]
+    tail = []
+    for value in values:
+        converted = _finite_float_or_none(value)
+        if converted is not None:
+            tail.append(converted)
+    tail = tail[-max(2, int(window)):]
     if len(tail) < 2:
         return None
     first, last = tail[0], tail[-1]
@@ -221,8 +240,8 @@ def diagnose_train_val_curve(
 
     n_train_input = len(train_losses)
     n_val_input = len(val_losses)
-    raw_train = [float(v) for v in train_losses if v is not None]
-    raw_val = [float(v) for v in val_losses if v is not None]
+    raw_train = [v for v in train_losses if v is not None]
+    raw_val = [v for v in val_losses if v is not None]
     # `val_stderr` is parallel to the caller's (unfiltered) `val_losses`: a
     # `None`/NaN slot still occupies its position. Filter it with the same
     # finite mask as `val_losses` so the surviving stderr entries stay aligned
@@ -254,23 +273,23 @@ def diagnose_train_val_curve(
         val_stderr_series = [
             _validated_stderr(se)
             for v, se in zip(val_losses, val_stderr)
-            if v is not None and math.isfinite(float(v))
+            if _finite_float_or_none(v) is not None
         ]
     # Indices are into the caller's arrays (counting any None entries), so the
     # report points at the curve position the reader can look up.
     bad_train = [i for i, v in enumerate(train_losses)
-                 if v is not None and not math.isfinite(float(v))]
+                 if v is not None and _finite_float_or_none(v) is None]
     bad_val = [i for i, v in enumerate(val_losses)
-               if v is not None and not math.isfinite(float(v))]
+               if v is not None and _finite_float_or_none(v) is None]
     # Keep each surviving loss paired with its original step. Filtering only
     # the loss list (while passing the unfiltered step list) makes the arrays
     # unequal in length, and `_step_aligned_gap_points` silently falls back to
     # positional pairing - exactly the train/val cadence bug it exists to
     # prevent. None means "no point logged": drop the step with its loss.
     finite_train_idx = [i for i, v in enumerate(train_losses)
-                        if v is not None and math.isfinite(float(v))]
+                        if _finite_float_or_none(v) is not None]
     finite_val_idx = [i for i, v in enumerate(val_losses)
-                      if v is not None and math.isfinite(float(v))]
+                      if _finite_float_or_none(v) is not None]
     train_losses = [float(train_losses[i]) for i in finite_train_idx]
     val_losses = [float(val_losses[i]) for i in finite_val_idx]
     train_steps = ([] if train_steps is None or len(train_steps) != n_train_input
