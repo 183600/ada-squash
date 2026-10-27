@@ -237,6 +237,15 @@ def _trial_record(summary: dict, lr: float, seed: int, weight_decay: float | Non
     }
 
 
+def _finite_number(value) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _usable_loss(value) -> bool:
     """Whether a trial's val_loss may enter the lr-grid selection.
 
@@ -244,12 +253,7 @@ def _usable_loss(value) -> bool:
     would then poison the seed mean (NaN) or win the `min` (Inf), so selection
     must happen on finite losses only.
     """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return False
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return False
+    return _finite_number(value)
 
 
 def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> dict:
@@ -703,11 +707,8 @@ def lr_sensitivity(tuned: dict) -> dict:
             if not cell.get('complete_coverage'):
                 continue
             lr, wd, mean = cell.get('lr'), cell.get('weight_decay'), cell.get('mean')
-            if not (isinstance(lr, (int, float)) and isinstance(wd, (int, float))
-                    and isinstance(mean, (int, float))):
-                continue
-            if not (math.isfinite(float(lr)) and math.isfinite(float(wd))
-                    and math.isfinite(float(mean))):
+            if not (_finite_number(lr) and _finite_number(wd)
+                    and _finite_number(mean)):
                 continue
             cells[(float(lr), float(wd))] = cell
         arm_cells[arm] = cells
@@ -721,9 +722,7 @@ def lr_sensitivity(tuned: dict) -> dict:
         # non-zero lr spread as "larger than seed noise" when no noise was
         # measured at all. Only a positive finite std qualifies.
         stds = [float(cell['std']) for cell in cells.values()
-                if isinstance(cell.get('std'), (int, float))
-                and not isinstance(cell.get('std'), bool)
-                and math.isfinite(float(cell['std']))
+                if _finite_number(cell.get('std'))
                 and float(cell['std']) > 0.0]
         spread = max(means) - min(means)
         noise = max(stds) if stds else None

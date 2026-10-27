@@ -1079,7 +1079,7 @@ def main():
                     value = rec.get(key)
                     if (isinstance(value, (int, float))
                             and not isinstance(value, bool)
-                            and not math.isfinite(float(value))):
+                            and not _finite_metric(value)):
                         arm_nonfinite[key] = arm_nonfinite.get(key, 0) + 1
         if arm_nonfinite:
             counts = dict(r.get('nonfinite_metric_counts') or {})

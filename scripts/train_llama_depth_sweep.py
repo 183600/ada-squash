@@ -1865,9 +1865,7 @@ def main():
                 seed = item.get('seed')
                 value = item.get('final_val_loss')
                 if (isinstance(seed, bool) or not isinstance(seed, int)
-                        or isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not math.isfinite(float(value))):
+                        or not _finite(value)):
                     continue
                 entry = order_by_job.get((f'd{depth}-{norm}', seed))
                 if entry is None:

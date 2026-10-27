@@ -350,14 +350,21 @@ def _summary_rows(summaries_path: str) -> list:
     return []
 
 
+def _finite_number(value) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def load_losses(summaries_path: str) -> dict:
     rows = _summary_rows(summaries_path)
     out = {}
     for row in rows:
         if (isinstance(row, dict) and row.get('name') is not None
-                and isinstance(row.get('val_loss'), (int, float))
-                and not isinstance(row.get('val_loss'), bool)
-                and math.isfinite(float(row['val_loss']))):
+                and _finite_number(row.get('val_loss'))):
             out[row['name']] = float(row['val_loss'])
     return out
 

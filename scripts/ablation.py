@@ -1489,9 +1489,7 @@ def run_order_audit(summaries: list, schedule: dict | None=None) -> dict:
             if not isinstance(order, dict):
                 continue
             position = order.get('position')
-            if (isinstance(position, bool)
-                    or not isinstance(position, (int, float))
-                    or not math.isfinite(float(position))):
+            if not _finite_metric(position):
                 continue
             observations.append({
                 'unit': order.get('run_id') or f"{row.get('name')}::seed={item.get('seed')}",
@@ -4181,10 +4179,7 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
 
 
 def _finite_p(value):
-    if (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value))):
-        return float(value)
-    return None
+    return float(value) if _finite_metric(value) else None
 
 
 def study_level_correction(comparisons: dict, plan: dict | None,

@@ -1752,23 +1752,17 @@ def main():
                   'validation stream restarts at batch 0, so this run evaluates '
                   'different held-out slices than an uninterrupted run')
         saved_last_val = resume_ckpt.get('last_val_loss')
-        if (isinstance(saved_last_val, (int, float))
-                and not isinstance(saved_last_val, bool)
-                and math.isfinite(float(saved_last_val))):
+        if _is_finite_number(saved_last_val):
             last_val_loss = float(saved_last_val)
             last_val_step = (None if resume_ckpt.get('last_val_step') is None
                              else int(resume_ckpt['last_val_step']))
             saved_stderr = resume_ckpt.get('last_val_stderr')
             last_val_stderr = (float(saved_stderr)
-                               if isinstance(saved_stderr, (int, float))
-                               and not isinstance(saved_stderr, bool)
-                               and math.isfinite(float(saved_stderr)) else None)
+                               if _is_finite_number(saved_stderr) else None)
             saved_batches = resume_ckpt.get('last_val_batches')
             if isinstance(saved_batches, list):
                 last_val_batches = [float(v) for v in saved_batches
-                                    if isinstance(v, (int, float))
-                                    and not isinstance(v, bool)
-                                    and math.isfinite(float(v))]
+                                    if _is_finite_number(v)]
         # The best-validation tracker is run state like the step counter and
         # the loss-spike baseline: restarting it at `inf` would let the first
         # post-resume validation unconditionally overwrite a possibly better
@@ -1785,9 +1779,7 @@ def main():
         # real best with a worse checkpoint).
         saved_best_loss = resume_ckpt.get('best_val_loss')
         saved_best_step = resume_ckpt.get('best_val_step')
-        if (isinstance(saved_best_loss, (int, float))
-                and not isinstance(saved_best_loss, bool)
-                and math.isfinite(float(saved_best_loss))):
+        if _is_finite_number(saved_best_loss):
             best_candidates.append({
                 'val_loss': float(saved_best_loss),
                 'step': (int(saved_best_step)
@@ -1806,8 +1798,7 @@ def main():
                 prior = None
             if isinstance(prior, dict):
                 raw_loss = prior.get('val_loss')
-                if (isinstance(raw_loss, (int, float)) and not isinstance(raw_loss, bool)
-                        and math.isfinite(float(raw_loss))):
+                if _is_finite_number(raw_loss):
                     prior_loss = float(raw_loss)
                     raw_step = prior.get('step')
                     prior_step = (int(raw_step) if isinstance(raw_step, int)
@@ -1839,9 +1830,7 @@ def main():
                 # the wrong model. Same-run artifacts keep the lower loss.
                 resume_loss = resume_ckpt.get('val_loss')
                 resume_loss = (float(resume_loss)
-                               if isinstance(resume_loss, (int, float))
-                               and not isinstance(resume_loss, bool)
-                               and math.isfinite(float(resume_loss)) else None)
+                               if _is_finite_number(resume_loss) else None)
                 same_run = (prior_provenance is not None
                             and prior_provenance == resume_ckpt.get('provenance'))
                 replace = (prior_loss is None or not same_run
@@ -1873,9 +1862,7 @@ def main():
             # reported the historical best. A non-finite/boolean loss is not a
             # measurement and must not seed selection or be copied as "best".
             resume_loss = resume_ckpt.get('val_loss')
-            if (isinstance(resume_loss, (int, float))
-                    and not isinstance(resume_loss, bool)
-                    and math.isfinite(float(resume_loss))):
+            if _is_finite_number(resume_loss):
                 best_path.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_torch_save(resume_ckpt, best_path)
                 best_candidates.append({'val_loss': float(resume_loss),
@@ -2029,9 +2016,7 @@ def main():
             # accept internally consistent, finite points; a malformed or
             # pre-monitoring checkpoint must not poison the new curve.
             def _finite_point(value) -> bool:
-                return (isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and math.isfinite(float(value)))
+                return _is_finite_number(value)
 
             saved_train = resume_ckpt.get('curve_train')
             saved_val = resume_ckpt.get('curve_val')
@@ -2517,9 +2502,7 @@ def main():
             # weights are exactly the ones validated at this step. Keep that
             # known held-out number instead of reporting final_val_loss=None.
             resumed_val = resume_ckpt.get('val_loss')
-            if (isinstance(resumed_val, (int, float))
-                    and not isinstance(resumed_val, bool)
-                    and math.isfinite(float(resumed_val))):
+            if _is_finite_number(resumed_val):
                 last_val_loss = float(resumed_val)
                 last_val_step = step
         has_best_val = math.isfinite(best_val_loss)
