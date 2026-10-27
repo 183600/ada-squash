@@ -29,3 +29,8 @@ autodl_budget*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Coverage artifacts (never commit)
+.coverage
+.coverage.*
+htmlcov/
