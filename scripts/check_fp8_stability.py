@@ -126,7 +126,7 @@ def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
                                         3 if fmt == 'e4m3' else 2)
     return q
 
-# Reusable frexp/mask scratch keyed by (shape, device).
+# Reusable frexp scratch keyed by (shape, device).
 _FP8_SCRATCH: dict = {}
 
 def _fp8_scratch(shape, device):
@@ -141,7 +141,7 @@ def _fp8_scratch(shape, device):
     if got is None:
         got = (torch.empty(shape, dtype=torch.float32, device=device),
                torch.empty(shape, dtype=torch.int32, device=device),
-               torch.empty(shape, dtype=torch.bool, device=device))
+               torch.empty(shape, dtype=torch.int32, device=device))
         _FP8_SCRATCH[key] = got
     return got
 
@@ -150,27 +150,32 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
 
     `inplace=True` means the caller hands over ownership of an fp32 `x` (e.g. a
     fresh `F.linear` output) and gets the result written back into it.
+
+    Subnormals use the format's fixed quantum (``min_normal / 2**M``) rather
+    than the per-exponent normal quantum, so values between the smallest
+    subnormal and the smallest normal round onto that grid instead of being
+    flushed or emitted as off-grid values.
     """
     in_dtype = x.dtype
     if inplace and in_dtype == torch.float32:
         a = x
     else:
         a = x.float().clone()
-    levels = float(2 ** mantissa_bits)
     a.clamp_(-max_val, max_val)
-    # Flush only below the min *subnormal*; the three subnormal binades
-    # between the min normal and that grid point are representable and must
-    # survive (e.g. e4m3 2^-9..2^-6). The old threshold sat at the min normal
-    # and silently zeroed all of them.
-    min_exp = 2 - (1 << exp_bits - 1) - 2 * mantissa_bits
-    mant, exp, low = _fp8_scratch(a.shape, a.device)
+    # Normal numbers round to 2**(e - (M + 1)); subnormals round to the fixed
+    # 2**(min_normal_exp - M) quantum. `frexp` gives x = mant * 2**exp with
+    # mant in [0.5, 1), so the quantization exponent is the clamped
+    # `exp - (M + 1)` and the integer mantissa is `round(mant * 2**shift)`.
+    min_normal_exp = 1 - ((1 << (exp_bits - 1)) - 1)
+    min_sub_exp = min_normal_exp - mantissa_bits
+    mant, exp, qexp = _fp8_scratch(a.shape, a.device)
     torch.frexp(a, out=(mant, exp))
-    exp.sub_(1 + mantissa_bits)
-    mant.mul_(2.0 * levels)
+    torch.sub(exp, mantissa_bits + 1, out=qexp)
+    qexp.clamp_(min=min_sub_exp)
+    exp.sub_(qexp)
+    torch.ldexp(mant, exp, out=mant)
     mant.round_()
-    torch.lt(exp, min_exp, out=low)
-    mant.masked_fill_(low, 0.0)
-    torch.ldexp(mant, exp, out=a)
+    torch.ldexp(mant, qexp, out=a)
     return a.to(in_dtype)
 
 class FP8LinearSim:
