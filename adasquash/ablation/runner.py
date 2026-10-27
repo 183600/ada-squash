@@ -60,7 +60,11 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     rng = torch.Generator(device=device).manual_seed(seed)
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter()
-    outlier = install_residual_outlier(model, layer_idx=args.outlier_layer, channel=args.outlier_channel, scale=args.outlier_scale)
+    install_residual_outlier(model, layer_idx=args.outlier_layer, channel=args.outlier_channel, scale=args.outlier_scale)
+    # The synthetic corpus carries the protocol's outlier token id (the same
+    # id the residual-channel probe is paired with); it is independent of the
+    # forward hook and must be recorded in every training/validation batch.
+    outlier_id = _protocol_outlier_id(args.model)
     losses = []
     stats_windowed = False
     # In-training curve monitoring. The held-out stream for the curve is a
