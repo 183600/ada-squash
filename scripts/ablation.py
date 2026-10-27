@@ -160,8 +160,12 @@ def _finite_metric(value) -> bool:
     run; NaN then propagates through the seed mean (and the paired tests),
     silently poisoning the row's pooled val_loss.
     """
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _safe_exp(value):
@@ -2081,7 +2085,7 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
         row_std = _row_std(row)
         ref_std = _row_std(reference)
         seed_stds = [value for value in (row_std, ref_std)
-                     if isinstance(value, (int, float)) and math.isfinite(float(value))]
+                     if _finite_metric(value)]
         if seed_stds:
             denom = max(seed_stds)
             if denom > 0.0:
@@ -2999,7 +3003,7 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['ppl_delta_pct'] = (100.0 * (entry['ppl_full'] - entry['ppl_reference'])
                                           / entry['ppl_reference'])
             seed_stds = [value for value in (_row_std(full), _row_std(ref))
-                         if isinstance(value, (int, float)) and math.isfinite(float(value))]
+                         if _finite_metric(value)]
             if seed_stds:
                 denom = max(seed_stds)
                 if denom > 0.0:

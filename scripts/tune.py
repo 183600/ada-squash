@@ -244,8 +244,12 @@ def _usable_loss(value) -> bool:
     would then poison the seed mean (NaN) or win the `min` (Inf), so selection
     must happen on finite losses only.
     """
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def tune_arm(arm: str, args, base: Path, run_metadata: dict | None = None) -> dict:

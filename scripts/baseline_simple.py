@@ -441,8 +441,12 @@ def load_ablation_rows(path) -> list:
     return data if isinstance(data, list) else []
 
 def _finite_number(value) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _is_seed_id(value) -> bool:

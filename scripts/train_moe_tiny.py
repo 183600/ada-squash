@@ -825,8 +825,12 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
     hide behind the mean.
     """
     def _usable(value) -> bool:
-        return (isinstance(value, (int, float)) and not isinstance(value, bool)
-                and math.isfinite(value))
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     seed_values = list(seeds)
     requested_seed_ids = [_moe_seed_id(seed) for seed in seed_values]
@@ -1040,8 +1044,12 @@ def moe_protocol_signature(args) -> dict:
     return {key: getattr(args, key, None) for key in _MOE_PROTOCOL_KEYS}
 
 def _moe_finite(value) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _moe_seed_id(value):

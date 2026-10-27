@@ -381,7 +381,11 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
         raise ValueError(f"successes={k} cannot exceed trials={n}")
     if _is_bool(confidence) or not isinstance(confidence, (int, float)):
         raise ValueError(f"confidence must be a number in (0, 1), got {confidence!r}")
-    confidence = float(confidence)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"confidence must be finite and in (0, 1), got {confidence!r}") from None
     if not math.isfinite(confidence) or not 0.0 < confidence < 1.0:
         raise ValueError(f"confidence must be finite and in (0, 1), got {confidence!r}")
     if n == 0:
@@ -552,13 +556,21 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
             f"contaminated_documents={contaminated} cannot exceed scanned={scanned}")
     if _is_bool(confidence) or not isinstance(confidence, (int, float)):
         raise ValueError(f"confidence must be a number in (0, 1), got {confidence!r}")
-    confidence = float(confidence)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"confidence must be finite and in (0, 1), got {confidence!r}") from None
     if not math.isfinite(confidence) or not 0.0 < confidence < 1.0:
         raise ValueError(f"confidence must be finite and in (0, 1), got {confidence!r}")
     if max_rate is not None:
         if _is_bool(max_rate) or not isinstance(max_rate, (int, float)):
             raise ValueError(f"max_rate must be a number in [0, 1], got {max_rate!r}")
-        max_rate = float(max_rate)
+        try:
+            max_rate = float(max_rate)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"max_rate must be finite and in [0, 1], got {max_rate!r}") from None
         if not math.isfinite(max_rate) or not 0.0 <= max_rate <= 1.0:
             raise ValueError(f"max_rate must be finite and in [0, 1], got {max_rate!r}")
     exhaustive = report.get("exhaustive")

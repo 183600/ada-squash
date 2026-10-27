@@ -362,8 +362,12 @@ def _finite_metric(value) -> bool:
     too: a single NaN makes the t statistic NaN and aborts the whole
     comparison instead of testing the finite draws.
     """
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 def _seed_id(value):
     """A seed key as an int, or None for a boolean/fractional/foreign key.
