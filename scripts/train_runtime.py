@@ -470,17 +470,20 @@ def _manifest_data_version(manifest: dict):
         'tokenizer_revision_resolved': tokenizer_resolved,
     }
 
-def _manifest_ledger_fingerprints(manifest: dict):
-    """Content identity of the cross-split ledgers a seed's run manifest records.
+def _parse_manifest_ledger_fingerprints(manifest: dict):
+    """``(fingerprints, problem)`` for a seed manifest's ledger identities.
 
     A path alone cannot prove that two seeds excluded the same held-out
     documents: a ledger file can be regenerated at the same path between runs.
-    Missing/malformed records return ``None`` so they fail closed rather than
-    comparing two unknowns as equal.
+    ``fingerprints`` is ``None`` when the manifest has no ledger fields at all
+    (a legacy record), and ``problem`` names the first malformed record so the
+    caller can fail closed instead of treating it as an unknown legacy value.
     """
     data = manifest.get('data') if isinstance(manifest, dict) else None
     if not isinstance(data, dict):
-        return None
+        if isinstance(manifest, dict) and manifest.get('data') is not None:
+            return None, 'run_manifest.json data block is not a mapping'
+        return None, None
     out = {}
     present = False
     for name in _LEDGER_ARGS:
@@ -501,7 +504,7 @@ def _manifest_ledger_fingerprints(manifest: dict):
             path = value.get('path')
             exists = value.get('exists')
             if not isinstance(path, str) or not path:
-                return None
+                return None, f'data.{name} has no valid path'
             if exists is False:
                 out[name] = {'path': path, 'exists': False}
             elif exists is True:
@@ -510,14 +513,25 @@ def _manifest_ledger_fingerprints(manifest: dict):
                 if (not isinstance(sha, str) or not sha
                         or not isinstance(nbytes, int)
                         or isinstance(nbytes, bool) or nbytes < 0):
-                    return None
+                    return None, f'data.{name} has an incomplete file fingerprint'
                 out[name] = {'path': path, 'exists': True,
                              'sha256': sha, 'bytes': nbytes}
             else:
-                return None
+                return None, f'data.{name} has no boolean exists flag'
         else:
-            return None
-    return out if present else None
+            return None, f'data.{name} is not null or a fingerprint mapping'
+    return (out if present else None), None
+
+
+def _manifest_ledger_fingerprints(manifest: dict):
+    """Content identity of the cross-split ledgers a seed's run manifest records.
+
+    Missing/malformed records return ``None`` so they fail closed rather than
+    comparing two unknowns as equal; use `_parse_manifest_ledger_fingerprints`
+    when the caller must distinguish a legacy absence from malformed data.
+    """
+    ledgers, problem = _parse_manifest_ledger_fingerprints(manifest)
+    return None if problem is not None else ledgers
 
 def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
     """Pool per-seed runs into one Mean +/- Std record (Phase 1 statistics).
@@ -618,8 +632,14 @@ def aggregate_seed_runs(base_dir: Path, seeds, model: str, norm: str) -> dict:
                                          f'{reference_recipe.get("seed")}: '
                                          + json.dumps(recipe_mismatches, sort_keys=True))
                 if reject_reason is None:
-                    ledgers = _manifest_ledger_fingerprints(manifest)
-                    if ledgers is None:
+                    ledgers, ledger_problem = _parse_manifest_ledger_fingerprints(manifest)
+                    if ledger_problem is not None:
+                        # A malformed record is not a legacy absence: pooling it
+                        # would let unverifiable exclusions certify the arm.
+                        reject_reason = (
+                            'run_manifest.json has a malformed ledger identity: '
+                            + ledger_problem)
+                    elif ledgers is None:
                         # Older/minimal manifests may predate ledger fingerprinting.
                         # Leave them unknown when *no* seed records one, but a mix of
                         # known and unknown identities cannot be pooled; that is
