@@ -803,6 +803,9 @@ class _DyTSForward(torch.autograd.Function):
         if p_is_tensor:
             p_raw = p
             p = p.clamp(min=_MIN_P)
+        else:
+            # Frozen p is a Python float; apply the same D2 floor as tensor p.
+            p = max(float(p), _MIN_P)
         phi = _softsign_forward(x, p, alpha)
         if beta is not None:
             out = phi.mul_(gamma).add_(beta)
