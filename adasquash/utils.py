@@ -357,10 +357,15 @@ class LossSpikeCounter:
             self.ema = None
             self.n_spikes = 0
             return True
-        if not (isinstance(ema, (int, float)) and not isinstance(ema, bool)
-                and math.isfinite(ema)):
+        if not (isinstance(ema, (int, float)) and not isinstance(ema, bool)):
             return False
-        self.ema = float(ema)
+        try:
+            ema_value = float(ema)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(ema_value):
+            return False
+        self.ema = ema_value
         self.n_spikes = n_spikes
         return True
 
