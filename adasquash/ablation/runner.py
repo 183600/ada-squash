@@ -229,7 +229,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         'schedule': {'type': 'constant', 'lr': args.lr},
         'data': {'generator': 'markov_batch', 'batch_size': args.batch_size,
                  'seq_len': args.seq_len, 'outlier_id': outlier_id,
-                 'outlier_scale': 25.0,
+                 'outlier_scale': args.outlier_scale,
                  'val_seed_offset': 1, 'val_batches': n_val_batches},
         'curve_monitoring': {
             'every': curve_every, 'batches': curve_batches,
@@ -565,7 +565,7 @@ def _protocol_payload(args) -> dict:
         'batch_size': args.batch_size,
         'seq_len': args.seq_len,
         'outlier_id': _protocol_outlier_id(args.model),
-        'outlier_scale': 25.0,
+        'outlier_scale': args.outlier_scale,
         'val_seed_offset': 1,
         'val_batches': max(1, int(getattr(args, 'val_batches', 20))),
         'train_steps': args.max_steps,
