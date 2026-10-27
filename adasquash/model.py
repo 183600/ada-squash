@@ -242,6 +242,10 @@ def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index
         # explicit row instead of slicing a 0-dim target (IndexError).
         logits = logits.unsqueeze(0)
         targets = targets.reshape(-1)
+    if targets.numel() != logits.size(0):
+        raise ValueError(
+            f"targets must contain one label per logit row, got "
+            f"{targets.numel()} labels for {logits.size(0)} rows")
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(logits.size(-1))
     if logits.size(0) == 0:
@@ -423,6 +427,10 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
 
 def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, ignore_index: int=-100, chunk_rows: Optional[int]=None) -> torch.Tensor:
     n = targets.numel()
+    if hidden.numel() != n * hidden.size(-1):
+        raise ValueError(
+            f"hidden has {hidden.numel()} values but {n} targets with "
+            f"{hidden.size(-1)} features")
     if hidden.dim() != 2 or hidden.size(0) != n:
         hidden = hidden.reshape(n, -1)
     # `F.cross_entropy`/`nll_loss` expect a 1-D target whose length matches
