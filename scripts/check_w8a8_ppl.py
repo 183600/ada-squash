@@ -763,7 +763,7 @@ def main():
     p.add_argument('--tokenizer', default='gpt2', help='tokenizer for --probe dataset; a checkpoint that recorded the one it was trained with wins')
     p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) for --probe dataset; same precedence as --tokenizer')
     p.add_argument('--n-states', type=int, default=64, help="state count of the synthetic 'markov' probe")
-    p.add_argument('--max-probe-coverage', type=float, default=0.5, help='reject a probe whose tokens are more than this fraction distinct (uniform noise is ~1.0)')
+    p.add_argument('--max-probe-coverage', type=float, default=0.5, help='warn when more than this fraction of probe tokens are distinct; token coverage is descriptive only and does not prove a probe has or lacks next-token signal')
     p.add_argument('--batch-size', type=int, default=4)
     p.add_argument('--seq-len', type=int, default=512)
     p.add_argument('--n-batches', type=int, default=20)
@@ -910,7 +910,17 @@ def main():
                 pairs = batches
                 coverage = probe_token_coverage([x for x, _ in pairs])
                 if coverage > args.max_probe_coverage:
-                    raise ValueError(f"probe='{args.probe}' carries no next-token signal: {coverage:.0%} of its tokens are distinct, so nothing repeats and no model can beat chance. Use --probe markov|dataset (--max-probe-coverage overrides).")
+                    # Token diversity is not evidence about predictability: an
+                    # all-distinct deterministic sequence is perfectly
+                    # predictable, while a small repeating vocabulary can be
+                    # independent noise. Keep the statistic as a diagnostic
+                    # and let the absolute fp32 PPL/CE decide whether the
+                    # probe carries usable signal.
+                    print(f"[w8a8][warn] probe='{args.probe}' token coverage {coverage:.0%} "
+                          f"exceeds --max-probe-coverage {args.max_probe_coverage:.0%}; "
+                          'token diversity alone does not show the probe lacks next-token '
+                          'structure. Check the absolute fp32 PPL/CE before interpreting '
+                          'ppl_drop_pct.', file=sys.stderr)
                 ce_fp = torch.zeros((), dtype=torch.float64, device=device)
                 n_tok = torch.zeros((), dtype=torch.long, device=device)
                 for x, y in pairs:
@@ -939,7 +949,7 @@ def main():
                       f"(per-seed records kept); triage the overflow before quoting "
                       f"the PPL drop", file=sys.stderr)
             if r_ckpt.get('ppl_fp') is not None and r_ckpt['ppl_fp'] >= 0.5 * model.cfg.vocab_size:
-                print(f"[w8a8] WARNING: {ckpt_path} ppl_fp={r_ckpt['ppl_fp']:.1f} (mean over {r_ckpt['n_seeds']} seeds) is at the vocab_size={model.cfg.vocab_size} ceiling - the probe is fine (coverage={r_ckpt['probe_token_coverage']:.1%}) but this checkpoint appears untrained, so ppl_drop_pct is not meaningful yet", file=sys.stderr)
+                print(f"[w8a8] WARNING: {ckpt_path} ppl_fp={r_ckpt['ppl_fp']:.1f} (mean over {r_ckpt['n_seeds']} seeds) is at least half the vocabulary size={model.cfg.vocab_size}; that is consistent with an untrained/uniform probe, but PPL is not bounded by vocab_size, so verify the checkpoint and probe before interpreting ppl_drop_pct", file=sys.stderr)
             per_ckpt.append({'path': ckpt_path, 'train_seed': train_seed,
                              'protocol': _protocol_record(ckpt_args, model),
                              'treatment': _treatment_record(ckpt_args, model),
