@@ -83,14 +83,7 @@
 
 - **决策**：`Q' = tanh(alpha_q · Q)`，`K' = tanh(alpha_k · K)`，
   logits 随后乘 `1/sqrt(head_dim)`。`tanh` 把元素界在 [-1,1]，点积
-  上界 ±head_dim，缩放后 ±sqrt(head_dim)。
-- **上界澄清**：RMSNorm 有*相同*的天花板——归一化后向量 L2 范数恰为
-  sqrt(head_dim)，柯西不等式给 |q'ᵀk'| ≤ head_dim，缩放后同样是
-  ±sqrt(head_dim)。区别不在上界，而在有界向量的*形状*：tanh 非尺度
-  不变（未饱和幅值透传，仅大值封顶），RMSNorm 严格尺度不变（整
-  token 范数被精确移除）。与基线对照的是"逐元素饱和 vs 向量归一化"
-  这一机制差异；公平比较还需对齐有效 logit 尺度（tanh 向量范数
-  ≤ sqrt(head_dim)，通常更小）。
+  上界 ±head_dim，缩放后 ±sqrt(head_dim)——与激活幅值无关的天花板。
 - **禁止**：把 tanh 换成 softsign / clip / 其它压缩函数（那是
   另一个研究问题）；改共享标量对（`k_squash = q_squash`）的设计。
 - **理由**：与 RMSNorm 基线（重缩放不饱和）对照的正是"饱和截断"
@@ -99,8 +92,7 @@
 ### D5. 归一化注册表与超参分发
 
 - **决策**：`NORM_REGISTRY` 必须包含
-  `ln / rmsnorm / dyt / dyts / dytp / dytc / dytd / dytdi / dytcd / dytcdi`
-  十项（四格因子分解单元 + 深度重参数化与深度初始化对照）；超参
+  `ln / rmsnorm / dyt / dytc / dytd / dytcd` 六项；超参
   （`alpha_init / alpha_0 / k_init / p_init`）经 `build_norm_kwargs`
   统一分发，不接收该超参的基线（LN/RMSNorm）自动忽略。
 - **禁止**：改注册名（configs/ 与脚本依赖）；把分发逻辑内联到
