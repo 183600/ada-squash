@@ -5,7 +5,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .norms import build_norm, _reduce_products
+from .norms import (build_norm, NORM_REGISTRY, _reduce_products,
+                    _sum_leading_dims, DyTD, DyTDTanh, DyTCD, DyTCDTanh)
 from .attention import CausalSelfAttention, _make_linear, _skip_init
 
 @dataclass
@@ -31,6 +32,8 @@ class GPTConfig:
     layerscale_init: float = 1e-05
     alpha_0: float = 0.9
     k_init: float = 1.0
+    k_min: Optional[float] = 0.0
+    shared_depth_schedule: bool = False
     alpha_init: float = 0.5
     p_init: float = 2.0
     learnable_p: bool = True
@@ -146,23 +149,35 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     _CAST_WEIGHT_CACHE_BYTES += nbytes
     return got
 
+# All statistic-free squashing norms (share the ``beta`` affine switch).
+# The factorial cells: {scalar, per-channel} alpha x {tanh, softsign}, plus
+# the depth-conditioned family and its depth-*init* controls.
+_DYT_FAMILY = ('dyt', 'dyts', 'dytp', 'dytc', 'dytd', 'dytd_tanh', 'dytdi', 'dytcd', 'dytcd_tanh', 'dytcdi')
+# Norms whose alpha follows (alpha_0, k) at construction time.
+_DEPTH_REPARAM = ('dytd', 'dytd_tanh', 'dytcd', 'dytcd_tanh')
+# Depth-family norms that accept (layer_idx, num_layers, alpha_0, k_init).
+_DEPTH_FAMILY = _DEPTH_REPARAM + ('dytdi', 'dytcdi')
+# Norms parameterized by the generalized-softsign exponent p.
+_SOFTSIGN_P = ('dyts', 'dytc', 'dytcd', 'dytcdi')
+
 def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=False) -> dict:
     kwargs: dict = {}
-    is_dyt_family = cfg.norm_name in ('dyt', 'dytd', 'dytd_tanh', 'dytc', 'dytcd', 'dytcd_tanh')
-    if cfg.norm_name in ('dytd', 'dytd_tanh', 'dytcd', 'dytcd_tanh'):
+    is_dyt_family = cfg.norm_name in _DYT_FAMILY
+    if cfg.norm_name in _DEPTH_FAMILY:
         if is_final_norm:
-            depth_ratio = 1.0
             layer_idx = cfg.n_layers
-        else:
-            depth_ratio = float(layer_idx) / float(cfg.n_layers)
-        kwargs = dict(layer_idx=layer_idx, num_layers=cfg.n_layers, alpha_0=cfg.alpha_0, k_init=cfg.k_init, learnable_k=cfg.learnable_k)
+        kwargs = dict(layer_idx=layer_idx, num_layers=cfg.n_layers, alpha_0=cfg.alpha_0, k_init=cfg.k_init)
+        if cfg.norm_name in _DEPTH_REPARAM:
+            # Only the reparameterized variants own a (learnable) k; the
+            # depth-init controls consume (alpha_0, k_init) purely at init.
+            kwargs.update(learnable_k=cfg.learnable_k, k_min=cfg.k_min)
     if cfg.norm_name in ('dytcd', 'dytcd_tanh'):
         kwargs.update(learnable_delta=cfg.learnable_delta)
-    if cfg.norm_name == 'dytcd':
+    if cfg.norm_name in _SOFTSIGN_P:
         kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p)
-    if cfg.norm_name == 'dytc':
-        kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p, alpha_init=cfg.alpha_init, alpha_jitter=cfg.alpha_jitter)
-    if cfg.norm_name == 'dyt':
+    if cfg.norm_name in ('dytc', 'dytp'):
+        kwargs.update(alpha_init=cfg.alpha_init, alpha_jitter=cfg.alpha_jitter)
+    if cfg.norm_name in ('dyt', 'dyts'):
         kwargs.update(alpha_init=cfg.alpha_init)
     if is_dyt_family and hasattr(cfg, 'beta') and (cfg.beta is not None):
         kwargs.update(beta=cfg.beta)
@@ -626,6 +641,22 @@ class GPT(nn.Module):
             self.lm_head.weight = self.tok_emb.weight
         if init:
             self.apply(self._init_weights)
+        if cfg.shared_depth_schedule and cfg.norm_name in _DEPTH_REPARAM:
+            # Genuine cross-layer depth law: one (alpha_0, k) pair for the
+            # whole model instead of one per norm. Each layer still evaluates
+            # alpha_l = alpha_0 * exp(-k l / L) at its own depth, so the two
+            # scalars are *identifiable* (with per-layer pairs only the
+            # product alpha_0 * exp(-k l / L) is observable and the "law" is
+            # merely an initialization prior).
+            self.shared_alpha_0 = nn.Parameter(torch.tensor(float(cfg.alpha_0)))
+            if cfg.learnable_k:
+                self.shared_k = nn.Parameter(torch.tensor(float(cfg.k_init)))
+            else:
+                self.register_buffer('shared_k', torch.tensor(float(cfg.k_init)))
+            for m in self.modules():
+                if isinstance(m, (DyTD, DyTDTanh, DyTCD, DyTCDTanh)):
+                    m.alpha_0 = self.shared_alpha_0
+                    m.k = self.shared_k
         if cfg.rotary:
             head_dim = cfg.dim // cfg.n_heads
             freqs = 1.0 / 10000 ** (torch.arange(0, head_dim, 2).float() / head_dim)

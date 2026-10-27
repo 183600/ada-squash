@@ -1,6 +1,9 @@
 model: llama-1b
 depths: [12, 24, 48, 96]
-norms: [rmsnorm, dyt, dytcd]
+# dytdi = depth-init control: plain DyT initialized at the DyT-D schedule.
+# The depth claims need it - without dytd vs dytdi the "depth-conditioning"
+# axis cannot distinguish the reparameterization from a better init.
+norms: [rmsnorm, dyt, dytcd, dytdi]
 
 # Every (depth, norm) cell is replicated over these independent seeds and the
 # launcher reports Mean +/- Std across runs for both validation statistics:

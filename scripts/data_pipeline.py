@@ -1309,12 +1309,13 @@ def _cached_tokenizer(name: str, revision):
 
 
 def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int,
-                     batch_size: int, tokenizer: str = "gpt2"):
-    """Build the DataLoader for the split currently configured.
+                     batch_size: int, tokenizer: str = "gpt2",
+                     split: str = "train"):
+    """Build the DataLoader for `split` under the configured cleaning policy.
 
-    Kept at five arguments on purpose - the split / cleaning knobs are read
-    from `configure_data_options`; existing callers and test stubs keep
-    working unchanged. The explicit generator and `worker_init_fn` make the
+    `split` defaults to training, while the remainder of the split / cleaning
+    knobs still come from `configure_data_options`. The explicit generator and
+    `worker_init_fn` make the
     loader's base seed - and therefore every worker's RNG - a function of the
     configured seed alone, not of how much global RNG the caller happened to
     consume before building it. The optional `dataset_revision` /
@@ -1323,7 +1324,9 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     both the request and the resolved hash are copied into the split report
     (data-version tracking), the latter also keying the held-out cache.
     """
-    opts = validate_data_options(get_data_options())
+    scoped = dict(get_data_options())
+    scoped["split"] = split
+    opts = validate_data_options(scoped)
     seq_len = _int_option("seq_len", seq_len, 1)
     batch_size = _int_option("batch_size", batch_size, 1)
     if (opts.get("exclude_group_file") or opts.get("exclude_test_group_file")) and not opts.get("group_key"):

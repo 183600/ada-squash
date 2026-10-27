@@ -82,7 +82,7 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
         parser.set_defaults(**{dest: value})
     if unknown:
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
-_TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False)}
+_TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False), 'k_min': ('k_min', False), 'shared_depth_schedule': ('shared_depth_schedule', False)}
 
 def _optional_dest(parser, option: str):
     """`dest` of an option spelling, including argparse's unambiguous prefixes.
@@ -273,7 +273,7 @@ def build_lr_lambda(args):
     return lambda s: cosine_schedule(s + 1, args.max_steps, args.warmup, args.min_lr_ratio)
 _SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip', 'grad_accum')
 _MONITOR_ARGS = ('val_every', 'val_batches', 'early_stop_patience')
-_ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'no_learnable_delta', 'beta', 'alpha_0', 'k_init', 'alpha_init', 'p_init', 'alpha_jitter', 'gradient_checkpointing')
+_ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'no_learnable_delta', 'beta', 'alpha_0', 'k_init', 'k_min', 'shared_depth_schedule', 'alpha_init', 'p_init', 'alpha_jitter', 'gradient_checkpointing')
 _NUMERIC_ARGS = ('compile', 'compile_mode', 'no_bf16')
 _RESUME_RUN_ARGS = _ARCH_ARGS + _NUMERIC_ARGS
 # A within-arm aggregation must compare the whole run identity, not only the
@@ -376,7 +376,9 @@ def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) ->
         setattr(args, name, ckpt_args[name])
     return changed
 
-def open_data_split(split: str, args, seq_len: int | None = None):
+def open_data_split(split: str, args, seq_len: int | None = None,
+                    dataset_name: str | None = None,
+                    dataset_config: str | None = None):
     """Open one logical split through the shared leakage-safe pipeline."""
     configure_data_options(
         split=split,
@@ -398,7 +400,18 @@ def open_data_split(split: str, args, seq_len: int | None = None):
         num_workers=getattr(args, 'num_workers', 2),
         seed=args.seed,
     )
-    return build_dataloader(args.dataset, args.dataset_config, seq_len or args.seq_len, args.batch_size, tokenizer=args.tokenizer)
+    return build_dataloader(dataset_name or args.dataset,
+                            dataset_config if dataset_name is not None else args.dataset_config,
+                            seq_len or args.seq_len, args.batch_size,
+                            tokenizer=args.tokenizer, split=split)
+
+def open_validation_split(args):
+    """Open the held-out selection stream, optionally from a distinct corpus."""
+    if getattr(args, 'val_dataset', None):
+        return open_data_split(args.val_split, args, seq_len=args.val_seq_len,
+                               dataset_name=args.val_dataset,
+                               dataset_config=args.val_dataset_config)
+    return open_data_split('validation', args)
 
 def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
     """Run the bad-case analysis as a reproducible post-training step.
@@ -1326,6 +1339,9 @@ def main():
     p.add_argument('--alpha-0', type=float, default=0.9)
     p.add_argument('--alpha-init', type=float, default=0.5)
     p.add_argument('--k-init', type=float, default=1.0)
+    p.add_argument('--k-min', type=float, default=0.0, help='floor on the per-norm depth-decay rate k of dytd/dytcd (keeps the depth schedule non-increasing); use --no-k-min to restore the old unconstrained k')
+    p.add_argument('--no-k-min', dest='k_min', action='store_const', const=None)
+    p.add_argument('--shared-depth-schedule', action='store_true', help='share one (alpha_0, k) pair across every dytd/dytcd norm so the depth law is a genuine cross-layer schedule instead of a per-layer initialization prior')
     p.add_argument('--p-init', type=float, default=2.0)
     p.add_argument('--no-learnable-p', action='store_true')
     p.add_argument('--no-learnable-k', action='store_true')
@@ -1351,6 +1367,10 @@ def main():
     p.add_argument('--num-documents', type=int, default=None, help='total documents in the stream; required when the dataset reports no size')
     p.add_argument('--val-every', type=int, default=500, help='run a held-out validation pass every N optimizer steps (0 disables; 0 is not recommended)')
     p.add_argument('--val-batches', type=int, default=10, help='batches per held-out validation pass')
+    p.add_argument('--val-dataset', default=None, help='held-out validation corpus, e.g. Salesforce/wikitext; must be disjoint from the training stream (default: the validation slice of --dataset)')
+    p.add_argument('--val-dataset-config', default='wikitext-103-raw-v1')
+    p.add_argument('--val-split', default='test', help='logical split of --val-dataset used for selection')
+    p.add_argument('--val-seq-len', type=int, default=None, help='validation sequence length (default: the training seq-len)')
     p.add_argument('--early-stop-patience', type=int, default=0, help='stop after this many validation passes without improvement (0 = off)')
     p.add_argument('--fail-on-eval-reuse', action='store_true', help='abort on the first validation pass that has to cycle the held-out loader (fewer distinct batches than --val-batches); repeated batches would make the validation stderr look more precise than it is and turn checkpoint selection into a maximum over reused data')
     p.add_argument('--nonfinite-policy', choices=['abort', 'skip'], default='abort', help='what to do when a training loss is NaN/Inf: abort (default) runs the ordered data->math->precision->gradient triage and stops; skip runs the triage and discards only that step (5 consecutive non-finite steps still abort)')
@@ -1544,7 +1564,7 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dtype = torch.bfloat16 if args.bf16 and device == 'cuda' else torch.float32
     ctx = torch.amp.autocast(device_type='cuda', dtype=dtype) if dtype != torch.float32 else nullcontext()
-    model_cfg = dict(norm_name=args.norm, qk_norm=args.qk_norm, qk_alpha_init=args.qk_alpha_init, use_layerscale=not args.no_layerscale, alpha_0=args.alpha_0, k_init=args.k_init, alpha_init=args.alpha_init, p_init=args.p_init, learnable_p=not args.no_learnable_p, learnable_k=not args.no_learnable_k, learnable_delta=not args.no_learnable_delta, beta=args.beta, alpha_jitter=args.alpha_jitter, gradient_checkpointing=args.gradient_checkpointing)
+    model_cfg = dict(norm_name=args.norm, qk_norm=args.qk_norm, qk_alpha_init=args.qk_alpha_init, use_layerscale=not args.no_layerscale, alpha_0=args.alpha_0, k_init=args.k_init, k_min=args.k_min, shared_depth_schedule=args.shared_depth_schedule, alpha_init=args.alpha_init, p_init=args.p_init, learnable_p=not args.no_learnable_p, learnable_k=not args.no_learnable_k, learnable_delta=not args.no_learnable_delta, beta=args.beta, alpha_jitter=args.alpha_jitter, gradient_checkpointing=args.gradient_checkpointing)
     if args.layerscale_init is not None:
         model_cfg['layerscale_init'] = args.layerscale_init
     if args.tie_embeddings is not None:
@@ -2286,7 +2306,7 @@ def main():
             if (args.val_every > 0
                     and (step % args.val_every == 0 or step == args.max_steps)):
                 if val_loader is None:
-                    val_loader = open_data_split('validation', args)
+                    val_loader = open_validation_split(args)
                     rval = getattr(val_loader, 'split_report', None)
                     if rval:
                         data_reports['validation'] = rval

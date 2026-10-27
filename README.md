@@ -11,14 +11,19 @@ Dynamic Tanh (DyT, Zhu et al. 2025) along three orthogonal axes:
 
 | Variant | Axis | What it adds | Targets |
 |--------|------|---------------|---------|
-| **DyT-C**  | per-channel                | per-channel alpha + generalized softsign | outlier-heavy channels (LLaMA "super-active" dims) |
-| **DyT-D**  | depth-conditioned         | depth-decaying alpha + LayerScale residual | the "curse of depth" in Pre-LN Transformers |
+| **DyT-S**  | activation family         | scalar α + generalized softsign (the {scalar × softsign} factorial cell) | saturation profile vs tanh |
+| **DyT-P**  | per-channel (tanh)        | per-channel α under tanh (the {per-channel × tanh} cell) | isolates the per-channel axis from the family swap |
+| **DyT-C**  | per-channel + softsign    | per-channel α + generalized softsign | outlier-heavy channels (LLaMA "super-active" dims) |
+| **DyT-D**  | depth-conditioned         | depth-decaying α + LayerScale residual | the "curse of depth" in Pre-LN Transformers |
 | **DyT-CD** | both (the main proposal)  | DyT-C + DyT-D combined                     | ultra-deep, MoE, FP8 |
 | **DyT-QK** | attention logits (Variant C) | scalar squashing of Q/K before dot product | long-context logit explosion |
 
 The core hypothesis: statistic-free element-wise adaptive squashing can
 stand in for statistic-based normalization while adding **<0.1% additional
-parameters**.
+parameters**. For the QK variant the sharper, honest form of the question
+is: *element-wise saturation vs vector normalization — which handles
+outlier channels and attention expressivity better, at matched effective
+logit scale?* (Both bound the logit identically; see the DyT-QK section.)
 
 ## Repository layout
 
@@ -26,19 +31,19 @@ parameters**.
 ada-squash/
 ├── adasquash/        # importable package
 │   ├── __init__.py
-│   ├── norms.py        # LayerNorm, RMSNorm, DyT, DyT-C, DyT-D, DyT-CD, QKSquash
+│   ├── norms.py        # LayerNorm, RMSNorm, DyT(-S/-P/-C/-D/-CD/-DI), QKSquash
 │   ├── attention.py    # CausalSelfAttention with optional QK-squashing
 │   ├── model.py        # GPT-style decoder, RoPE optional, configurable depth
 │   └── utils.py        # ActivationStats, KurtosisMeter, LossSpikeCounter, ...
 ├── scripts/           # CLI entrypoints
-│   ├── train_gpt2.py             # Phase 1 driver (GPT-2 124M, FineWeb-Edu)
-│   ├── train_llama_depth_sweep.py# Phase 2 depth sweep (12/24/48/96)
-│   ├── eval_downstream.py       # MMLU / GSM8K / HumanEval / DROP / needle
-│   ├── ablation.py              # one-shot ablation matrix runner
+│   ├── train_gpt2.py             # Phase 1 driver (GPT-2 124M, FineWeb-Edu, held-out val)
+│   ├── train_llama_depth_sweep.py# Phase 2 depth sweep (12/24/48/96, incl. the dytdi control)
+│   ├── eval_downstream.py       # lm-eval harness (custom LM wrapper), needle
+│   ├── ablation.py              # single-variable ablation matrix runner, multi-seed
 │   ├── train_moe_tiny.py        # Phase 3a: tiny MoE expert-variance study
-│   ├── check_fp8_stability.py   # Phase 3b: simulated FP8 overflow / underflow
-│   ├── check_w8a8_ppl.py       # Phase 3c: post-training W8A8 PPL drop
-│   └── run_needle.py            # Phase 3d: needle-in-a-haystack sweep
+│   ├── check_fp8_stability.py   # Phase 3b: simulated FP8 overflow / underflow (scoped)
+│   ├── check_w8a8_ppl.py       # Phase 3c: post-training W8A8 PPL drop (held-out)
+│   └── run_needle.py            # Phase 3d: needle-in-a-haystack sweep (per-position)
 ├── tests/
 │   └── test_norms.py            # shape/dtype/gradient/schedule sanity
 ├── configs/                    # YAML configs (see configs/)
@@ -90,6 +95,19 @@ python scripts/train_gpt2.py --config configs/gpt2-124m-rmsnorm.yaml
 # Original DyT
 python scripts/train_gpt2.py --config configs/gpt2-124m-dyt.yaml
 
+# Factorial cells: scalar softsign / per-channel tanh
+python scripts/train_gpt2.py --config configs/gpt2-124m-dyts.yaml
+python scripts/train_gpt2.py --config configs/gpt2-124m-dytp.yaml
+
+# Depth controls: init-only variants and a truly shared (alpha_0, k)
+python scripts/train_gpt2.py --config configs/gpt2-124m-dytdi.yaml
+python scripts/train_gpt2.py --config configs/gpt2-124m-dytcdi.yaml
+python scripts/train_gpt2.py --config configs/gpt2-124m-dytd-shared.yaml
+
+# LayerScale controls under the baselines
+python scripts/train_gpt2.py --config configs/gpt2-124m-ln-ls.yaml
+python scripts/train_gpt2.py --config configs/gpt2-124m-rmsnorm-ls.yaml
+
 # DyT++ main proposal
 python scripts/train_gpt2.py --config configs/gpt2-124m-dytcd.yaml
 ```
@@ -105,8 +123,14 @@ python scripts/train_gpt2.py \
 ```
 
 Resume an interrupted run with `--resume <ckpt>.pt`; the model, optimizer,
-scheduler and step counter are all restored, so the LR schedule continues
-where it stopped instead of replaying warmup. The schedule-defining flags
+scheduler, step counter, **RNG states** (torch / CUDA / python, so dropout
+continues as if uninterrupted) and **data position** (number of stream
+batches already consumed) are all restored. By default the dataloader is
+fast-forwarded past the consumed batches — same streaming order, so the
+resumed run trains on *fresh* data instead of replaying the beginning of
+the corpus; pass `--resume-skip-data` to skip the fast-forward (faster, but
+the run replays training data — only acceptable when you do not compare
+PPL/val curves across the resume). The schedule-defining flags
 (`--max-steps`, `--warmup`, `--min-lr-ratio`, `--lr`, `--weight-decay`,
 `--beta1` / `--beta2`, `--grad-clip`) are read back from the checkpoint as
 well -
@@ -117,13 +141,19 @@ kept and reported, which is how a finished run is extended
 (`--resume <ckpt> --max-steps <larger>` continues the cosine tail instead
 of truncating it). The loss-spike counter and its EMA baseline are part of
 the checkpoint, so `n_loss_spikes` keeps counting across a resume rather
-than restarting.
+than restarting. Checkpoints written before RNG/data-position tracking
+say so loudly on resume instead of pretending to be exact continuations.
 
 Logged outputs in `<output-dir>/`:
-- `train.jsonl`     - per-step loss / lr
-- `tb/`             - TensorBoard scalars
-- `ckpt_NNNNNN.pt`  - resumable checkpoints
+- `train.jsonl`     - per-step loss / lr / held-out val_loss
+- `tb/`             - TensorBoard scalars (train/ and val/)
+- `ckpt_NNNNNN.pt`  - resumable checkpoints (incl. RNG + data position)
 - `stdout.log`      - raw stdout (for depth-sweep runs)
+
+Every shipped phase-1 config enables held-out validation
+(`val_every: 500` on wikitext-103-raw-v1 *test*, disjoint from the
+FineWeb-Edu training stream), so a run's val curve is never computed on
+training data.
 
 ### Phase 2: LLaMA-tiny 1.1B with depth sweep
 
@@ -177,52 +207,86 @@ python scripts/train_moe_tiny.py --norm dytcd --n-experts 8
 # Phase 3b: FP8 stability (CPU/GPU simulation, no real FP8 hardware needed)
 # Runs the real forward pass with both operands of every GEMM (SwiGLU MLP
 # included) on FP8-quantized values and reports the logit divergence,
-# per-norm overflow/underflow, the first block whose residual stream leaves
-# the FP8 range and the first block that goes non-finite.
+# per-norm overflow/underflow/subnormal/quantized-to-zero rates, the first
+# block whose residual stream leaves the FP8 range and the first block that
+# goes non-finite.
+# SCOPE: forward-only (no FP8 gradients or optimizer states), and with
+# --scaling none (default) it is a NO-RESCALING STRESS TEST: real FP8
+# recipes rescale each tensor by its amax, so run --scaling dynamic-tensor
+# as well and compare before reading any of this as a training-stability
+# prediction.
 # Add `--ckpt <one per --norms entry>` to probe trained weights instead of
 # a fresh random init.
-python scripts/check_fp8_stability.py --norms ln rmsnorm dyt dytc dytd dytcd
+python scripts/check_fp8_stability.py --norms ln rmsnorm dyt dyts dytp dytc dytd dytcd
 
 # Phase 3c: post-training W8A8 PPL drop (quantizes the SwiGLU MLPs too)
 # The probe corpus matters: on uniform random tokens both models sit at
 # ppl ~= vocab_size and the drop is noise, so the default probe is the
-# learnable synthetic corpus (--probe dataset uses real text instead).
+# learnable synthetic corpus. --probe dataset reads a HELD-OUT corpus
+# (default wikitext-103-raw-v1 test split, disjoint from the FineWeb-Edu
+# training stream) - pointing it at the training data would make ppl_fp a
+# partially-memorized number and the drop a comparison against a
+# contaminated baseline. The report carries ppl_fp (unquantized baseline),
+# ppl_w8a8, the absolute/pct drop, the eval-dataset identity and the token
+# count the numbers are computed over.
 python scripts/check_w8a8_ppl.py \
     --ckpts runs/gpt2-124m-ln/ckpt_final.pt \
             runs/gpt2-124m-rmsnorm/ckpt_final.pt \
             runs/gpt2-124m-dytcd/ckpt_final.pt
 
 # Phase 3d: long-context needle-in-a-haystack
+# Sweeps several needles (different secrets and phrasings) x context
+# lengths, and reports accuracy by needle POSITION tercile (early / middle /
+# late) - a model that only recalls shallow needles looks identical to one
+# that recalls everywhere in the scalar average.
 python scripts/run_needle.py --ckpt runs/gpt2-124m-dytcd/ckpt_final.pt \
     --ctx-lens 512 1024 2048 4096
 ```
 
 ### Ablations
 
-The ablation runner sweeps the variant matrix (1000 steps, GPT-2 124M) over a
-synthetic Markov-chain corpus. The chain is an actual *walk*
+The ablation runner sweeps a **single-variable** matrix (1000 steps, GPT-2
+124M) over a synthetic Markov-chain corpus. The chain is an actual *walk*
 (`s_{t+1} = (s_t + j_{t+1}) mod n_states`), so the target is a function of
 the current state and the loss has a learnable floor well below
 `log(vocab_size)` — uniformly random tokens have no next-token signal and
 pin every variant at `log(vocab_size)`, which would make the loss column
-unable to rank anything. A deliberately inflated embedding row supplies the
-activation-outlier channel the squashing layers are meant to control.
+unable to rank anything.
+
+The activation-outlier probe is a **persistent residual-stream channel
+amplification after the middle block** (a forward hook scaling one channel
+by 25×; see `install_residual_outlier`). The old probe inflated a token
+embedding row instead — but with tied embeddings that row is also a row of
+the output classifier, so it confounded "handle an input-side outlier
+channel" with "relearn to never predict a token", an output-side pathology
+no normalization layer has to fix. The hook touches no weights and is
+applied identically to every row, so it is a constant of the comparison.
 
 ```bash
+# single seed
 python scripts/ablation.py --config configs/ablation-matrix.yaml
+# three seeds per row -> per-row mean/std in <out>/<name>/summary.json
+python scripts/ablation.py --config configs/ablation-matrix.yaml --seeds 42 43 44
 ```
 
-It writes a `summary.json` per ablation and an `all_summaries.json`
+It writes a `summary.json` per ablation (per-seed under
+`<out>/<name>/seed<N>/` when `--seeds` is given) and an `all_summaries.json`
 aggregating them (merged with any previous run, so a partial re-run does
 not discard rows it skipped). Each summary carries the full loss curve,
-the loss-spike count, and the pre-norm activation statistics pooled over
-every sampled step of the run. Ablations include:
+the loss-spike count, the outlier-probe description and the pre-norm
+activation statistics pooled over every sampled step of the run. Every
+row of `configs/ablation-matrix.yaml` documents its reference row and the
+single axis it changes; the families:
 
-- Per-channel on/off
-- Depth-conditioning on/off
-- LayerScale init: 1e-5 / 1e-3 / off
-- Softsign family: p ∈ {1, 2, 4, learnable, →∞ (=hard tanh)}
-- DyT alpha init: 0.3 / 0.5 / 1.0
+- LayerScale ± under LN / RMSNorm / DyT-CD (the old plan's LN(no-LS) →
+  dytcd(LS-on) baseline bundled this axis with the norm swap)
+- Activation family × per-channel factorial: `dyt` / `dyts` / `dytp` /
+  `dytc` (each adjacent pair isolates exactly one axis), LS off
+- Depth axis at matched LS: `dyt_ls` → `dytd` (add reparameterization) →
+  `dytdi` (same init, no reparameterization) / `dytd_shared` (one `(α_0, k)`
+  for the whole model) / `dytd_k0` (schedule off)
+- Softsign exponent p: 1 / 2 / 4 / learnable
+- LayerScale init: 1e-5 / 1e-3 / off under DyT-CD
 
 Before training, the runner writes `analysis_plan.json`: the set of
 confirmatory contrasts is derived from the validated matrix, every contrast
@@ -272,9 +336,30 @@ y   = γ · tanh(α_l · x) + β
 x_out = x + λ_l · Block(y)        # LayerScale-style residual gate
 ```
 
-* α_l decays with depth: shallow layers squash strongly (bounding the
-  largest pre-norm activations), while deep layers relax toward a
-  near-linear, gradient-friendly response.
+**What the parameterization is (and is not).** With the default
+configuration each norm owns an independent `(α_0, k)` pair, and a single
+layer only ever *observes* the product `α_0 · exp(−k·l/L)` — one effective
+scalar. The depth-decaying shape is therefore a **depth-dependent
+initialization prior** for each layer's α, not an emergent cross-layer law:
+after training, the per-layer `α_l` values are free to drift away from any
+common curve, and the honest reading of a learned `k` is "the decay rate this
+layer's α started from". Two mechanisms make the claim testable instead of
+rhetorical:
+
+* `--k-min` (default `0.0`) floors the decay rate, so a layer's `α_l` cannot
+  *grow* with depth via `k < 0` — the schedule stays non-increasing wherever
+  the optimizer takes it (`--no-k-min` restores the old unconstrained `k`).
+* `--shared-depth-schedule` replaces the per-layer pairs with **one
+  `(α_0, k)` for the whole model** (2 scalars total). Now the pair is
+  *identifiable*: every layer evaluates `α_l = α_0·exp(−k·l/L)` at its own
+  depth against the same parameters, and the learned curve is a genuine
+  cross-layer law rather than an init.
+
+The `dytdi` / `dytcdi` rows of the ablation matrix are the matching controls:
+plain per-layer α *initialized* at the schedule value and then learned freely.
+`dytd` vs `dytdi` isolates "the reparameterization" from "the init prior";
+if `dytd` only wins through a better-conditioned start, `dytdi` matches it.
+
 * Combined with the LayerScale residual gate, this targets the "curse of
   depth" in Pre-LN Transformers (Liu et al. 2020).
 
@@ -293,9 +378,10 @@ y    = γ · φ + β
   but the two layers are **not** functionally identical: DyT-D squashes
   with `tanh`, while DyT-CD squashes with the generalized softsign and a
   learnable `p`. The transfer is therefore not a lossless "free upgrade",
-  and the `dytd → dytcd` row of the ablation matrix bundles the
-  per-channel axis with the activation-family change (see
-  `configs/ablation-matrix.yaml`).
+  and the `dytd → dytcd` jump crosses *two* axes (per-channel α and the
+  activation family) — the matrix decomposes it as
+  `dytd → dytcdi` (both axes, init only) and `dytcdi → dytcd`
+  (add the reparameterization), so each step is again single-variable.
 
 ### DyT-QK — Variant C: attention logit squashing
 
@@ -305,16 +391,40 @@ logits = (Q' · K') · scale
 ```
 
 * Replaces QK-Norm (which requires two RMSNorms of size `head_dim`) with
-  two scalars per layer.
-* Removes the activation magnitude from the logit entirely. `tanh` bounds
-  every element of `Q'` / `K'` to ±1, so the dot product over `head_dim`
-  terms is bounded by ±`head_dim` pre-scale, i.e. ±`sqrt(head_dim)` after the
-  `1/sqrt(head_dim)` scale — a hard ceiling independent of how large the
-  incoming activations are. That is what kills the logit-explosion failure
-  mode that breaks long-context training.
-* Sharper than QK-Norm for this purpose: RMSNorm rescales but does not
-  saturate, so a single dominant channel still drives the logit, whereas
-  `tanh` clips it.
+  two scalars per layer, and the op is element-wise (no collectives).
+
+* **Bounded logits — but so is QK-Norm.** `tanh` bounds every element of
+  `Q'`/`K'` to ±1, so the dot product over `head_dim` terms is bounded by
+  `±head_dim` pre-scale, i.e. `±sqrt(head_dim)` after the `1/sqrt(head_dim)`
+  scale. But RMSNorm has the *same* ceiling: an RMS-normalized vector has
+  L2 norm exactly `sqrt(head_dim)`, so by Cauchy-Schwarz
+  `|q'ᵀk'| ≤ ||q'||·||k'|| = head_dim` pre-scale — identical
+  `±sqrt(head_dim)` after scaling. The hard ceiling is therefore **not** a
+  differentiator between the two; what actually differs is the *shape* of
+  the bounded vectors:
+
+  | | tanh squash | QK-RMSNorm |
+  |---|---|---|
+  | scale invariance | no — sub-saturated magnitudes pass through (`tanh(z) ≈ z` for small `z`), only large values are capped | yes — a 10× larger token vector yields a *bit-identical* normalized vector |
+  | single dominant channel | the outlier saturates to ±1; the small channels keep their relative sizes | every channel is divided by the outlier-inflated RMS, so the small channels are crushed relative to it |
+  | what the logit can express | magnitude *and* direction of q·k (more expressive, more exposed) | direction only (per-token norm removed exactly) |
+
+* "Removes the activation magnitude from the logit" would be the claim for
+  QK-Norm, **not** for `tanh`: saturation caps large magnitudes, but a
+  medium activation passes through and still scales the logit. The honest
+  framing of Variant C is a *trade-off*: element-wise saturation (cheap,
+  compile-friendly, keeps some magnitude information) vs vector
+  normalization (exactly scale-invariant, costlier). Which one matters more
+  for long-context training is an open question this repo measures rather
+  than asserts.
+
+* **Fair comparison requires matched effective logit scale.** An
+  RMS-normalized vector has L2 norm `sqrt(head_dim)`; a tanh-squashed one
+  has L2 norm *at most* `sqrt(head_dim)` and typically much less (only
+  fully-saturated vectors reach it). At the same `α`, tanh logits are
+  systematically smaller — so any tanh-vs-QKNorm comparison must either
+  calibrate `α` or sweep a temperature on both sides before attributing
+  differences to the squashing shape itself.
 
 ## Metrics
 
@@ -323,23 +433,32 @@ All training scripts log:
 | Metric              | What it captures                                   |
 |---------------------|---------------------------------------------------|
 | `loss`              | training cross-entropy                            |
+| `val_loss`          | held-out cross-entropy (wikitext-103 test in the shipped configs) |
 | `n_loss_spikes`     | relative+absolute loss jumps over the run         |
 | `max_abs_pre_norm`  | max \|activation\| entering each normalization    |
 | `expert_cv`         | (MoE only) CoV of tokens-per-expert, per block    |
 | `logit_rel_divergence` | (FP8 sim) max abs logit error vs fp32         |
 | `overflow_rate_e4m3`| (FP8 sim) fraction of activations above ±448      |
-| `underflow_rate_e4m3` | (FP8 sim) fraction of activations below min-normal |
+| `underflow_rate_e4m3` | (FP8 sim) fraction of activations below min-normal (small-value share) |
+| `subnormal_rate_e4m3` | (FP8 sim) fraction in (0, min-normal) — representable only as subnormals |
+| `quantized_zero_rate_e4m3` | (FP8 sim) fraction of nonzero activations that quantize to exactly 0 |
+| `rel_quant_err_e4m3` | (FP8 sim) mean relative quantization error      |
 | `first_overflow_layer` | (FP8 sim) first block whose residual leaves ±448 |
 | `first_nonfinite_layer` | (FP8 sim) depth at which the residual breaks  |
+| `ppl_fp`            | (W8A8) unquantized baseline PPL on the held-out probe |
+| `ppl_w8a8`          | (W8A8) PPL after post-training quantization        |
 | `ppl_drop_pct`      | (W8A8) PPL increase after post-training quantization |
 
 A note on interpreting these: an experiment is only as good as its probe
-corpus. Three failure modes are checked rather than assumed —
+corpus. Four failure modes are checked rather than assumed —
 `check_w8a8_ppl.py` rejects a probe whose tokens are (near-)all distinct,
-since nothing repeats and no model can beat chance on it; `check_fp8_stability.py`
-only measures outlier channels on trained weights, so pass `--ckpt`; and
-the ablation / MoE corpora are genuine Markov walks rather than uniform
-draws.
+since nothing repeats and no model can beat chance on it, and defaults its
+`--probe dataset` path to a held-out corpus (wikitext-103 test) rather than
+the training stream; `check_fp8_stability.py` only measures outlier channels
+on trained weights, so pass `--ckpt`, and labels its own output as a
+forward-only, no-rescaling stress test; the ablation / MoE corpora are
+genuine Markov walks rather than uniform draws; and the needle sweep
+reports accuracy by insertion position, not just the scalar average.
 
 ## Citation
 

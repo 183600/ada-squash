@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import copy
 import json
 import sys
 from collections import Counter
@@ -183,8 +184,8 @@ def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
                 or ckpt_args.get('tokenizer_revision'))
     return name, revision
 
-def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
-    """One checkpoint's needle sweep over `args.ctx_lens` x placement seeds."""
+def _evaluate_one_needle(model, tok, args, device, seeds, trained_seq_len):
+    """One checkpoint's sweep for a single needle over `args.ctx_lens` x seeds."""
     results = []
     skipped = []
     overhead = needle_decode_overhead(tok, args.secret)
@@ -293,6 +294,24 @@ def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
         results.append(record)
     return results, skipped
 
+def evaluate_model(model, tok, args, device, seeds, trained_seq_len):
+    """One checkpoint's sweep over `--needles` x `args.ctx_lens` x placement seeds."""
+    needles = list(getattr(args, 'needles_resolved', None) or [args.secret])
+    results = []
+    skipped = []
+    for needle in needles:
+        one_args = copy.copy(args)
+        one_args.secret = needle
+        one_results, one_skipped = _evaluate_one_needle(
+            model, tok, one_args, device, seeds, trained_seq_len)
+        for record in one_results:
+            record['needle'] = needle
+        for record in one_skipped:
+            record['needle'] = needle
+        results.extend(one_results)
+        skipped.extend(one_skipped)
+    return results, skipped
+
 def _placement_seed_map(result: dict):
     """``{seed: record}`` with duplicate/malformed placement seeds rejected.
 
@@ -334,10 +353,10 @@ def compare_needle(results, reference_results, alpha=0.05, protocol=None):
     certified: placement-level pairing cannot remove a training-recipe
     confound.
     """
-    ref_by_ctx = {r['ctx_len']: r for r in reference_results}
+    ref_by_ctx = {(r['ctx_len'], r.get('needle')): r for r in reference_results}
     tests = []
     for cand in results:
-        ref = ref_by_ctx.get(cand['ctx_len'])
+        ref = ref_by_ctx.get((cand['ctx_len'], cand.get('needle')))
         if ref is None:
             tests.append({'ctx_len': cand['ctx_len'], 'testable': False,
                           'reason': 'context length was not evaluated for the reference'})
@@ -451,6 +470,10 @@ def compare_needle(results, reference_results, alpha=0.05, protocol=None):
                         'each placement draw equally'),
             'tests': tests}
 
+# Coverage beyond a single secret: different digits, different phrasings, so a
+# result is not "can the model copy one memorized sentence".
+DEFAULT_NEEDLES = ['The magic number is 98765.', 'The secret code is 4242.', 'The hidden word is pineapple.', 'The pass code is 77341.']
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', required=True)
@@ -461,13 +484,24 @@ def main():
     p.add_argument('--decode-batch', type=int, default=8, help='independent trials decoded per forward pass (the per-trial prefix is still recomputed every step)')
     p.add_argument('--tokenizer', default=None, help="tokenizer name; default: the checkpoint's recorded tokenizer, else gpt2. An explicit flag wins, exactly as in eval_downstream.py")
     p.add_argument('--tokenizer-revision', default=None, help="tokenizer revision; default: the checkpoint's resolved/recorded revision (an explicit flag wins)")
-    p.add_argument('--secret', default='The magic number is 98765.')
+    p.add_argument('--needles', nargs='+', default=DEFAULT_NEEDLES, help='one or more needle sentences; results are reported per needle and aggregated by position bucket')
+    p.add_argument('--secret', default=None, help='(legacy single-needle flag; overrides --needles)')
     p.add_argument('--output', default=None)
     p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; when given it overrides --seeds (one placement draw - the Wilson interval then says nothing about placement variability)')
     p.add_argument('--seeds', nargs='+', type=int, default=None, help='placement seeds; the whole evaluation is repeated once per seed and reported as cross-seed Mean +/- Std with a t interval over the seed means (default: 0 1 2, the minimum for a placement-level comparison)')
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests (e.g. "DyT-CD retains needle accuracy at 4k tokens"); recorded in the manifest so a pass/fail is auditable as a test rather than a fishing trip')
     p.add_argument('--max-failure-examples', type=int, default=3, help='bad-case samples to print per context length (all failures are kept in the JSON)')
     args = p.parse_args()
+    needles = [args.secret] if args.secret else list(args.needles or [])
+    if not needles:
+        p.error('--needles must not be empty: a sweep with no needle measures nothing')
+    raw_needles = needles
+    needles = list(dict.fromkeys(str(n) for n in needles))
+    if len(needles) != len(raw_needles):
+        print(f'[needle][warn] duplicate needles removed: {len(raw_needles)} -> {len(needles)}',
+              file=sys.stderr)
+    args.needles_resolved = needles
+    args.secret = needles[0] if len(needles) == 1 else None
     if args.trials < 1:
         p.error(f'--trials {args.trials} must be >= 1: a trial count of zero measures nothing')
     if args.decode_batch < 1:
@@ -611,6 +645,7 @@ def main():
         'tokenizer_revision': tok_revision,
         'tokenizer_revision_resolved': tok_revision_resolved,
         'secret': args.secret,
+        'needles': needles,
         'trials': args.trials,
         'placement_seeds': list(seeds),
         'ctx_lens_requested': requested_ctx_lens,

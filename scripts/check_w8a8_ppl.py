@@ -267,7 +267,7 @@ def _next_token_targets(x: torch.Tensor, ignore_index: int) -> torch.Tensor:
     y[:, :-1] = x[:, 1:]
     return y
 
-def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='validation', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None, exclude_test_hash_file=None, group_key=None, exclude_group_file=None, exclude_test_group_file=None, dataset_revision=None, tokenizer_revision=None, seed=42, num_workers=2):
+def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, split='test', val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True, min_doc_chars=0, max_doc_chars=0, exclude_hash_file=None, exclude_test_hash_file=None, group_key=None, exclude_group_file=None, exclude_test_group_file=None, dataset_revision=None, tokenizer_revision=None, seed=42, num_workers=2):
     # Scoring a checkpoint on the documents it trained on understates the
     # quantization damage; the probe must come from a held-out split. The
     # default is the chronological validation slice, and the cleaning policy
@@ -289,7 +289,7 @@ def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, 
                            dataset_revision=dataset_revision,
                            tokenizer_revision=tokenizer_revision,
                            seed=seed, num_workers=num_workers)
-    loader = build_dataloader(dataset, dataset_config, seq_len, batch_size, tokenizer=tokenizer)
+    loader = build_dataloader(dataset, dataset_config, seq_len, batch_size, tokenizer=tokenizer, split=split)
     report = getattr(loader, 'split_report', None)
     if split != 'train' and report:
         print(f'[w8a8] dataset probe split: {report}', file=sys.stderr)

@@ -284,3 +284,145 @@ ablations:
     hypothesis: >
       DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best
       must be reported so the family is not compared at a strawman init.
+
+  # --- Reference single-variable factorial / depth-control rows ---
+  - name: ln
+    hypothesis: >
+      LayerNorm without LayerScale: the simple statistical baseline with the residual gate off.
+    norm: ln
+    use_layerscale: false
+
+  - name: ln_ls
+    hypothesis: >
+      LayerNorm plus LayerScale: ln -> ln_ls isolates the residual gate under the same normalization.
+    norm: ln
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: rmsnorm
+    hypothesis: >
+      RMSNorm without LayerScale: the strongest simple no-mean baseline with the residual gate off.
+    norm: rmsnorm
+    use_layerscale: false
+
+  - name: rmsnorm_ls
+    hypothesis: >
+      RMSNorm plus LayerScale: rmsnorm -> rmsnorm_ls isolates the residual gate under the same normalization.
+    norm: rmsnorm
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  # ---- Activation family x per-channel factorial (LayerScale OFF) ----
+  # {scalar, per-channel} alpha x {tanh, softsign}: the four cells of the
+  # 2x2. All four share alpha_init=0.5, jitter=0, p=2 (fixed) so the only
+  # moving parts are the two axes.
+
+  - name: dyt
+    hypothesis: >
+      Scalar-alpha tanh DyT without LayerScale: the scalar-tanh reference cell of the activation x per-channel factorial.
+    norm: dyt
+    alpha_init: 0.5
+    use_layerscale: false
+
+  - name: dyts
+    hypothesis: >
+      Scalar-alpha generalized softsign without LayerScale: dyt -> dyts isolates the activation family at fixed scalar alpha.
+    norm: dyts
+    alpha_init: 0.5
+    p_init: 2.0
+    learnable_p: false
+    use_layerscale: false
+
+  - name: dytp
+    hypothesis: >
+      Per-channel-alpha tanh without LayerScale: dyt -> dytp isolates the per-channel axis under the tanh family.
+    norm: dytp
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    use_layerscale: false
+
+  - name: dytc
+    hypothesis: >
+      Per-channel-alpha generalized softsign without LayerScale: completes the scalar/per-channel x tanh/softsign 2x2 with single-variable contrasts.
+    norm: dytc
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: false
+    use_layerscale: false
+
+  # Softsign exponent sweep (single variable: p, under dytc, LS off)
+
+  - name: dyt_ls
+    hypothesis: >
+      Plain DyT plus LayerScale: the LS-matched scalar-tanh reference for the depth-conditioned rows.
+    norm: dyt
+    alpha_init: 0.5
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytd
+    hypothesis: >
+      Depth-conditioned tanh plus LayerScale: dyt_ls -> dytd adds the (alpha_0, k) depth reparameterization at matched LayerScale.
+    norm: dytd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytdi
+    hypothesis: >
+      Depth-initialized but freely learned per-layer alpha: dytd -> dytdi isolates the init prior from the depth-decay reparameterization.
+    norm: dytdi
+    alpha_0: 0.9
+    k_init: 1.0
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytd_shared
+    hypothesis: >
+      One shared (alpha_0, k) pair for every layer: dytd -> dytd_shared isolates a genuine identifiable cross-layer depth law.
+    norm: dytd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    shared_depth_schedule: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytc_ls
+    hypothesis: >
+      Per-channel softsign plus LayerScale: the LS-matched reference for the main DyT-CD proposal.
+    norm: dytc
+    alpha_init: 0.5
+    p_init: 2.0
+    learnable_p: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytcd
+    hypothesis: >
+      Per-channel softsign plus depth schedule and LayerScale: dytc_ls -> dytcd isolates the depth reparameterization.
+    norm: dytcd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    p_init: 2.0
+    learnable_p: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytcdi
+    hypothesis: >
+      Per-channel softsign with depth-initialized but freely learned alpha: dytcd -> dytcdi isolates the depth reparameterization from the init prior.
+    norm: dytcdi
+    alpha_0: 0.9
+    k_init: 1.0
+    p_init: 2.0
+    learnable_p: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5

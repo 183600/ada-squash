@@ -973,7 +973,7 @@ def aggregate_moe_seed_results(results: list, seeds) -> dict:
                           'values are excluded and listed in invalid_seeds.')
     return agg
 
-_NORM_CHOICES = ['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd']
+_NORM_CHOICES = ['ln', 'rmsnorm', 'dyt', 'dyts', 'dytp', 'dytc', 'dytd', 'dytd_tanh', 'dytdi', 'dytcd', 'dytcd_tanh', 'dytcdi']
 # Everything that changes the trained weights, the held-out sample or the
 # evaluation count. A cross-norm comparison must hold all of these fixed, or
 # the norm contrast is confounded with a recipe change.

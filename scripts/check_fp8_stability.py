@@ -17,6 +17,7 @@ from adasquash.model import (MLP, build_gpt_124m, build_gpt_350m,
 from adasquash.repro import (TRAINING_RECIPE_KEYS, collect_run_metadata, file_fingerprint,
                              finish_metadata, save_run_manifest, set_all_seeds,
                              training_recipe_mismatches)
+from adasquash.norms import LayerNorm, RMSNorm, _SquashedAffine
 from adasquash.utils import KurtosisMeter, markov_batch
 from scripts.data_pipeline import _is_pinned_revision
 FP8_E4M3_MAX = 448.0
@@ -61,6 +62,9 @@ _FP8_SEED_METRIC_KEYS = (
 def fp8_min_normal(exp_bits: int) -> float:
     return 2.0 ** (1 - (2 ** (exp_bits - 1) - 1))
 
+def fp8_min_subnormal(exp_bits: int, mantissa_bits: int) -> float:
+    return fp8_min_normal(exp_bits) / float(2 ** mantissa_bits)
+
 def to_fp8_e4m3(x: torch.Tensor, axis: int=-1, inplace: bool=False) -> torch.Tensor:
     return simulate_fp8(x, max_val=448.0, exp_bits=4, mantissa_bits=3, inplace=inplace)
 
@@ -71,9 +75,11 @@ def to_fp8_e5m2(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
 # which format/scaling was actually applied instead of assuming e4m3.
 to_fp8_e4m3.max_val = 448.0
 to_fp8_e4m3.min_normal = fp8_min_normal(4)
+to_fp8_e4m3.min_subnormal = fp8_min_subnormal(4, 3)
 to_fp8_e4m3.scaling = 'none'
 to_fp8_e5m2.max_val = 57344.0
 to_fp8_e5m2.min_normal = fp8_min_normal(5)
+to_fp8_e5m2.min_subnormal = fp8_min_subnormal(5, 2)
 to_fp8_e5m2.scaling = 'none'
 
 def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
@@ -116,6 +122,8 @@ def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
     q.scaling = scaling
     q.max_val = maxv
     q.min_normal = fp8_min_normal(4 if fmt == 'e4m3' else 5)
+    q.min_subnormal = fp8_min_subnormal(4 if fmt == 'e4m3' else 5,
+                                        3 if fmt == 'e4m3' else 2)
     return q
 
 # Reusable frexp/mask scratch keyed by (shape, device).
@@ -150,12 +158,11 @@ def simulate_fp8(x: torch.Tensor, max_val: float, exp_bits: int, mantissa_bits: 
         a = x.float().clone()
     levels = float(2 ** mantissa_bits)
     a.clamp_(-max_val, max_val)
-    # This simulation intentionally flushes everything below the min *normal*
-    # to zero: the repo's fixed test contract treats the subnormal range as
-    # underflow (see tests/test_norms.py). Keep the quantizer semantics stable;
-    # the subnormal share is reported separately by the metric hook where it
-    # can be read without redefining the format's zero threshold.
-    min_exp = 2 - (1 << exp_bits - 1) - mantissa_bits
+    # Flush only below the min *subnormal*; the three subnormal binades
+    # between the min normal and that grid point are representable and must
+    # survive (e.g. e4m3 2^-9..2^-6). The old threshold sat at the min normal
+    # and silently zeroed all of them.
+    min_exp = 2 - (1 << exp_bits - 1) - 2 * mantissa_bits
     mant, exp, low = _fp8_scratch(a.shape, a.device)
     torch.frexp(a, out=(mant, exp))
     exp.sub_(1 + mantissa_bits)
@@ -222,12 +229,15 @@ def fp8_forward(model: nn.Module, quant):
             p.module.forward = p.orig_forward
 
 def measure_fp8_divergence(model, x, norm_name: str, quant=None):
+
     handles = []
     quant_errors = []
     ranges = []
     quant = quant or to_fp8_e4m3
     quant_max = float(getattr(quant, 'max_val', FP8_E4M3_MAX))
     quant_min = float(getattr(quant, 'min_normal', fp8_min_normal(4)))
+    quant_min_subnormal = float(getattr(
+        quant, 'min_subnormal', fp8_min_subnormal(4, 3)))
     quant_dynamic = getattr(quant, 'scaling', None) == 'dynamic-tensor'
 
     def _zero_scalar(device) -> torch.Tensor:
@@ -267,13 +277,15 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
                 threshold_max = quant_max
             if numel:
                 overflow = torch.count_nonzero(scaled_abs > threshold_max).to(torch.float64) / numel
-                underflow = torch.count_nonzero(scaled_abs < quant_min).to(torch.float64) / numel
+                underflow = torch.count_nonzero(
+                    (scaled_abs > 0) & (scaled_abs < quant_min_subnormal)
+                ).to(torch.float64) / numel
                 # A subnormal is representable but below the min normal; a
                 # quantized zero is a value the format could not represent at
                 # all. Report them separately so "underflow" does not conflate
                 # representable subnormals with a true flush to zero.
                 subnormal = torch.count_nonzero(
-                    (scaled_abs > 0) & (scaled_abs < quant_min)
+                    (scaled_abs >= quant_min_subnormal) & (scaled_abs < quant_min)
                 ).to(torch.float64) / numel
             else:
                 overflow = underflow = subnormal = zero
@@ -317,7 +329,7 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
     with torch.no_grad():
         logits_fp32, _ = model(x)
     for name, m in model.named_modules():
-        if m.__class__.__name__ in {'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTDTanh', 'DyTCD', 'DyTCDTanh'}:
+        if isinstance(m, (LayerNorm, RMSNorm, _SquashedAffine)):
             handles.append(m.register_forward_hook(make_stat_hook()))
     block_handles = [blk.register_forward_hook(make_block_hook(i)) for i, blk in enumerate(model.blocks)]
     with fp8_forward(model, quant):

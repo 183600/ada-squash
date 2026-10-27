@@ -424,7 +424,7 @@ class _DyTCForward(torch.autograd.Function):
 @register_norm("dytd")
 class DyTD(_SquashedAffine):
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True):
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, k_min: Optional[float]=0.0):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_layers = max(1, num_layers)
@@ -434,15 +434,29 @@ class DyTD(_SquashedAffine):
             self.k = nn.Parameter(torch.tensor(float(k_init)))
         else:
             self.register_buffer('k', torch.tensor(float(k_init)))
+        # Depth-decay rate floor. ``None`` restores the old unconstrained
+        # behaviour (k may go negative and alpha_l then *grows* with depth);
+        # the default 0.0 keeps the schedule non-increasing in depth, so the
+        # "depth-conditioned" claim holds not only at init but for every
+        # point the optimizer visits.
+        self.k_min = k_min
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
+    def _k_effective(self):
+        k = self.k
+        if self.k_min is None:
+            return k
+        if isinstance(k, torch.Tensor):
+            return k.clamp(min=self.k_min)
+        return max(float(k), float(self.k_min))
+
     @property
     def alpha_l(self) -> torch.Tensor:
-        return self.alpha_0 * torch.exp(self.k.mul(-self._depth_ratio))
+        return self.alpha_0 * torch.exp(-self._k_effective() * self._depth_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _DyTDForward.apply(x, self.alpha_0, self.k, self.gamma, self.beta, self._depth_ratio)
+        return _DyTDForward.apply(x, self.alpha_0, self._k_effective(), self.gamma, self.beta, self._depth_ratio)
 
 class _DyTDForward(torch.autograd.Function):
 
@@ -497,7 +511,7 @@ class DyTDTanh(nn.Module):
     Frozen `k` is supported via `learnable_k=False` (registers a buffer).
     """
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True):
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, k_min: Optional[float]=0.0):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_layers = max(1, num_layers)
@@ -507,12 +521,21 @@ class DyTDTanh(nn.Module):
             self.k = nn.Parameter(torch.tensor(float(k_init)))
         else:
             self.register_buffer('k', torch.tensor(float(k_init)))
+        self.k_min = k_min
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
+    def _k_effective(self):
+        k = self.k
+        if self.k_min is None:
+            return k
+        if isinstance(k, torch.Tensor):
+            return k.clamp(min=self.k_min)
+        return max(float(k), float(self.k_min))
+
     @property
     def alpha_l(self) -> torch.Tensor:
-        return self.alpha_0 * torch.exp(self.k.mul(-self._depth_ratio))
+        return self.alpha_0 * torch.exp(-self._k_effective() * self._depth_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi = torch.tanh(self.alpha_l * x)
@@ -567,7 +590,7 @@ class _DyTForward(torch.autograd.Function):
 @register_norm("dytcd")
 class DyTCD(_SquashedAffine):
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, p_init: float=2.0, learnable_p: bool=True, beta: bool=True, learnable_delta: bool=True):
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, p_init: float=2.0, learnable_p: bool=True, beta: bool=True, learnable_delta: bool=True, k_min: Optional[float]=0.0):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_layers = max(1, num_layers)
@@ -577,6 +600,7 @@ class DyTCD(_SquashedAffine):
             self.k = nn.Parameter(torch.tensor(float(k_init)))
         else:
             self.register_buffer('k', torch.tensor(float(k_init)))
+        self.k_min = k_min
         if learnable_delta:
             self.delta = nn.Parameter(torch.zeros(dim))
         else:
@@ -594,13 +618,21 @@ class DyTCD(_SquashedAffine):
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
+    def _k_effective(self):
+        k = self.k
+        if self.k_min is None:
+            return k
+        if isinstance(k, torch.Tensor):
+            return k.clamp(min=self.k_min)
+        return max(float(k), float(self.k_min))
+
     @property
     def alpha_per_channel(self) -> torch.Tensor:
-        scale = self.alpha_0 * torch.exp(self.k.mul(-self._depth_ratio))
+        scale = self.alpha_0 * torch.exp(-self._k_effective() * self._depth_ratio)
         return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _DyTCDForward.apply(x, self.alpha_0, self.k, self.delta, self.p, self.gamma, self.beta, self._depth_ratio)
+        return _DyTCDForward.apply(x, self.alpha_0, self._k_effective(), self.delta, self.p, self.gamma, self.beta, self._depth_ratio)
 
 class _DyTCDForward(torch.autograd.Function):
 
@@ -705,7 +737,7 @@ class DyTCDTanh(nn.Module):
     control, not part of the research core), so its gradients are torch's own.
     """
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, learnable_delta: bool=True):
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, learnable_delta: bool=True, k_min: Optional[float]=0.0):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_layers = max(1, num_layers)
@@ -715,6 +747,7 @@ class DyTCDTanh(nn.Module):
             self.k = nn.Parameter(torch.tensor(float(k_init)))
         else:
             self.register_buffer('k', torch.tensor(float(k_init)))
+        self.k_min = k_min
         if learnable_delta:
             self.delta = nn.Parameter(torch.zeros(dim))
         else:
@@ -722,9 +755,17 @@ class DyTCDTanh(nn.Module):
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
+    def _k_effective(self):
+        k = self.k
+        if self.k_min is None:
+            return k
+        if isinstance(k, torch.Tensor):
+            return k.clamp(min=self.k_min)
+        return max(float(k), float(self.k_min))
+
     @property
     def alpha_per_channel(self) -> torch.Tensor:
-        scale = self.alpha_0 * torch.exp(self.k.mul(-self._depth_ratio))
+        scale = self.alpha_0 * torch.exp(-self._k_effective() * self._depth_ratio)
         return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -732,6 +773,175 @@ class DyTCDTanh(nn.Module):
         if self.beta is not None:
             return phi * self.gamma + self.beta
         return phi * self.gamma
+@register_norm("dyts")
+class DyTS(_SquashedAffine):
+    """Scalar-alpha generalized softsign: the missing cell of the
+    {scalar, per-channel} x {tanh, softsign} factorial.
+
+    Identical to DyTC except alpha is a single scalar, so ``dyt -> dyts``
+    isolates the activation family and ``dyts -> dytc`` isolates the
+    per-channel axis (single-variable contrasts the old matrix mixed).
+    """
+
+    def __init__(self, dim: int, alpha_init: float=0.5, p_init: float=2.0, learnable_p: bool=True, beta: bool=True):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.p = nn.Parameter(torch.tensor(float(p_init))) if learnable_p else float(p_init)
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _DyTSForward.apply(x, self.alpha, self.p, self.gamma, self.beta)
+
+class _DyTSForward(torch.autograd.Function):
+    """DyTS forward: same math as _DyTCForward but with a scalar alpha, so
+    the alpha gradient is a full reduction (_dot_all) instead of per-channel."""
+
+    @staticmethod
+    def forward(ctx, x, alpha, p, gamma, beta):
+        p_is_tensor = isinstance(p, torch.Tensor)
+        if p_is_tensor:
+            p_raw = p
+            p = p.clamp(min=_MIN_P)
+        phi = _softsign_forward(x, p, alpha)
+        if beta is not None:
+            out = phi.mul_(gamma).add_(beta)
+        else:
+            out = phi.mul_(gamma)
+        ctx.p_is_tensor = p_is_tensor
+        ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
+        saved = [x, alpha, gamma, beta]
+        if p_is_tensor:
+            saved.append(p_raw)
+        else:
+            ctx.p_value = float(p)
+        ctx.save_for_backward(*saved)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        saved = ctx.saved_tensors
+        x, alpha, gamma, beta = saved[:4]
+        p_is_tensor = ctx.p_is_tensor
+        p_raw = saved[4] if p_is_tensor else None
+        if p_is_tensor:
+            p = p_raw.clamp(min=_MIN_P)
+        else:
+            p = ctx.p_value
+        need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+        need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
+        need_gamma_grad = ctx.needs_input_grad[3]
+        need_phi = need_p_grad or need_gamma_grad
+        phi = None
+        a = None
+        if need_softsign or need_phi:
+            g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha)
+        p_val = p if p_is_tensor else float(p)
+        grad_p = grad_gamma = None
+        if need_phi:
+            grad_phi = phi.mul_(grad_out)
+            if need_gamma_grad:
+                grad_gamma = _sum_leading_dims(grad_phi)
+            if need_p_grad:
+                grad_p = _softsign_p_grad(grad_phi, a, p, p_raw, gamma)
+            del phi, a, grad_phi
+        grad_x = grad_alpha = None
+        if need_softsign:
+            grad_x_scaled = g.log2_().mul_(p_val + 1).exp2_()
+            grad_x_scaled.mul_(grad_out).mul_(gamma)
+            if ctx.needs_input_grad[1]:
+                grad_alpha = _dot_all(grad_x_scaled, x)
+            if ctx.needs_input_grad[0]:
+                grad_x = grad_x_scaled.mul_(alpha)
+        grad_beta = None
+        if beta is not None and ctx.needs_input_grad[4]:
+            grad_beta = _sum_leading_dims(grad_out)
+        return (grad_x, grad_alpha, grad_p, grad_gamma, grad_beta)
+
+@register_norm("dytp")
+class DyTP(_SquashedAffine):
+    """Per-channel-alpha tanh: the other missing cell of the
+    {scalar, per-channel} x {tanh, softsign} factorial.
+
+    Identical to DyT except alpha is a per-channel vector, so ``dyt -> dytp``
+    isolates the per-channel axis under the *tanh* family.
+    """
+
+    def __init__(self, dim: int, alpha_init: float=0.5, beta: bool=True, alpha_jitter: float=0.0):
+        super().__init__()
+        alpha = torch.full((dim,), float(alpha_init))
+        if alpha_jitter > 0:
+            alpha = alpha + alpha_jitter * torch.randn(dim) * alpha_init
+        self.alpha = nn.Parameter(alpha)
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _DyTPForward.apply(x, self.alpha, self.gamma, self.beta)
+
+class _DyTPForward(torch.autograd.Function):
+    """DyTP forward: same math as _DyTForward but with a per-channel alpha,
+    so the alpha gradient is a per-channel reduction (_reduce_products)."""
+
+    @staticmethod
+    def forward(ctx, x, alpha, gamma, beta):
+        phi = x.mul(alpha).tanh_()
+        if beta is not None:
+            out = phi.mul_(gamma).add_(beta)
+        else:
+            out = phi.mul_(gamma)
+        ctx.save_for_backward(x, alpha, gamma, beta)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, alpha, gamma, beta = ctx.saved_tensors
+        phi = x.mul(alpha).tanh_()
+        w = phi * grad_out
+        grad_gamma = None
+        if ctx.needs_input_grad[2]:
+            grad_gamma = _sum_leading_dims(w)
+        w.mul_(phi)
+        torch.sub(grad_out, w, out=w)
+        w.mul_(gamma)
+        grad_alpha = _reduce_products(w, x) if ctx.needs_input_grad[1] else None
+        del phi
+        grad_x = w.mul_(alpha) if ctx.needs_input_grad[0] else None
+        grad_beta = None
+        if beta is not None and ctx.needs_input_grad[3]:
+            grad_beta = _sum_leading_dims(grad_out)
+        return (grad_x, grad_alpha, grad_gamma, grad_beta)
+
+@register_norm("dytdi")
+class DyTDI(DyT):
+    """Depth-*init* control for DyT-D: a plain DyT whose scalar alpha is
+    *initialized* at the DyT-D schedule value alpha_0 * exp(-k l / L) and
+    then learned freely, with no (alpha_0, k) reparameterization.
+
+    Against ``dytd`` this isolates "depth prior at init + plain
+    parameterization" from "depth-decay reparameterization": if dytd wins
+    only via a better-conditioned init, dytdi matches it.
+    """
+
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, beta: bool=True):
+        ratio = float(layer_idx) / float(max(1, num_layers))
+        super().__init__(dim, alpha_init=float(alpha_0) * math.exp(-float(k_init) * ratio), beta=beta)
+
+@register_norm("dytcdi")
+class DyTCDI(DyTC):
+    """Depth-*init* control for DyT-CD: DyT-C (per-channel alpha, generalized
+    softsign, learnable p) whose per-channel alpha is *initialized* at the
+    DyT-CD schedule value alpha_0 * exp(-k l / L) (delta = 0) and then
+    learned freely.
+
+    Against ``dytcd`` this isolates the depth-decay reparameterization from
+    the depth prior at init, activation family and per-channel axis held
+    fixed.
+    """
+
+    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, p_init: float=2.0, learnable_p: bool=True, beta: bool=True):
+        ratio = float(layer_idx) / float(max(1, num_layers))
+        super().__init__(dim, alpha_init=float(alpha_0) * math.exp(-float(k_init) * ratio), p_init=p_init, learnable_p=learnable_p, beta=beta, alpha_jitter=0.0)
 
 class _QKSquashTanh(torch.autograd.Function):
     """tanh(alpha * Q) and tanh(alpha * K) as one autograd node.
@@ -782,4 +992,4 @@ class QKSquash(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
         return _QKSquashTanh.apply(q, k, self.alpha_q, self.alpha_k)
-__all__ = ['NORM_REGISTRY', 'register_norm', 'build_norm', 'generalized_softsign', 'LayerNorm', 'RMSNorm', 'DyT', 'DyTC', 'DyTD', 'DyTDTanh', 'DyTCD', 'DyTCDTanh', 'QKSquash']
+__all__ = ['NORM_REGISTRY', 'register_norm', 'build_norm', 'generalized_softsign', 'LayerNorm', 'RMSNorm', 'DyT', 'DyTS', 'DyTP', 'DyTC', 'DyTD', 'DyTDTanh', 'DyTDI', 'DyTCD', 'DyTCDTanh', 'DyTCDI', 'QKSquash']
