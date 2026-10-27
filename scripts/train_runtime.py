@@ -893,7 +893,10 @@ def launch_multi_seed(args, seeds) -> None:
     (base / 'aggregate.json').unlink(missing_ok=True)
     (base / 'run_manifest.json').unlink(missing_ok=True)
     child_argv = list(sys.argv[1:])
-    script = str(Path(__file__).resolve())
+    # This helper lives in train_runtime, but the trainable entry point is
+    # train_gpt2: relaunching `__file__` would run an import-only module that
+    # exits successfully without training or writing a seed manifest.
+    script = str(ROOT / 'scripts' / 'train_gpt2.py')
     failed_seeds: list = []
     for seed in seeds:
         out_dir = seed_run_dir(base, seed)
