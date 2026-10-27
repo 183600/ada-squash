@@ -722,7 +722,14 @@ class GPT(nn.Module):
             if return_logits:
                 logits = self.lm_head(x)
         else:
-            flat = (targets[:, -1:] if last_position_only else targets).reshape(-1)
+            if last_position_only:
+                # A 1-D `targets` carries one label per sequence, matching the
+                # single position kept in `x`; a 2-D (or higher) `targets` uses
+                # the last position of each row, as in the full-sequence case.
+                target_rows = targets.reshape(-1, 1) if targets.dim() <= 1 else targets[:, -1:]
+            else:
+                target_rows = targets
+            flat = target_rows.reshape(-1)
             if return_logits:
                 logits = self.lm_head(x)
                 loss = cross_entropy_mean(logits.view(-1, logits.size(-1)), flat, ignore_index=self.cfg.ignore_index)
