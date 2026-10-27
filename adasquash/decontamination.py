@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import numbers
 import unicodedata
 from statistics import NormalDist
 
@@ -192,16 +193,16 @@ def benchmark_fingerprint(records_by_benchmark: dict) -> dict:
     return out
 
 
-def _validate_hashable_tokens(sequence) -> None:
+def _validate_token_ids(sequence) -> None:
     for token in sequence:
-        if _is_bool(token):
+        if _is_bool(token) or not isinstance(token, numbers.Integral):
             raise ValueError(
-                f"token ids must be integers, not boolean {token!r}")
+                f"token ids must be integers, not {type(token).__name__} {token!r}")
         try:
             hash(token)
         except TypeError:
             raise ValueError(
-                "token ids must be hashable (integers, not lists)") from None
+                "token ids must be hashable integers") from None
 
 
 def token_ngrams(tokens, ngram_size: int = DEFAULT_NGRAM_SIZE) -> set:
@@ -220,7 +221,7 @@ def token_ngrams(tokens, ngram_size: int = DEFAULT_NGRAM_SIZE) -> set:
         sequence = list(tokens)
     except TypeError:
         raise ValueError(f"tokens must be an iterable sequence, got {type(tokens).__name__}") from None
-    _validate_hashable_tokens(sequence)
+    _validate_token_ids(sequence)
     if len(sequence) < n:
         return set()
     out = set()
@@ -332,7 +333,7 @@ def find_ngram_matches(tokens, index: NgramIndex) -> dict:
         sequence = list(tokens)
     except TypeError:
         raise ValueError(f"tokens must be an iterable sequence, got {type(tokens).__name__}") from None
-    _validate_hashable_tokens(sequence)
+    _validate_token_ids(sequence)
     n = index.ngram_size
     stats = {
         name: {"matched_ngrams": 0, "occurrences": 0, "first_position": None}
