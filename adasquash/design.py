@@ -145,6 +145,24 @@ def _complete_pairs_after_attrition(n_pairs: int, survival: float) -> int:
         return math.floor(product + Fraction(1, 10**12))
 
 
+def _pairs_needed_after_attrition(required_pairs: int,
+                                  survival: float) -> Optional[int]:
+    """Inflate a required pair count for expected complete-pair survival.
+
+    ``required_pairs / survival`` raises ``OverflowError`` when the required
+    count is a huge integer, even though the inflated count is a perfectly
+    ordinary integer. The exact rational fallback mirrors the tolerated
+    ceiling used by the ordinary path.
+    """
+    if not math.isfinite(survival) or survival <= 0.0:
+        return None
+    try:
+        return int(math.ceil(required_pairs / survival - 1e-12))
+    except (OverflowError, ValueError):
+        ratio = Fraction(required_pairs) / Fraction.from_float(survival)
+        return math.ceil(ratio - Fraction(1, 10**12))
+
+
 def block_randomized_schedule(units: Iterable[str], block_size: Optional[int] = None,
                               seed: int = 0) -> dict:
     """Deterministically randomize run ids inside consecutive time blocks.
@@ -1248,7 +1266,16 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
     if isinstance(max_pairs, bool) or not isinstance(max_pairs, int) or max_pairs < 2:
         raise ValueError(f'max_pairs must be an integer >= 2, got {max_pairs!r}')
 
-    family_alpha = alpha_value / n_tests
+    try:
+        family_alpha = alpha_value / n_tests
+    except OverflowError:
+        raise ValueError(
+            f'n_tests={n_tests!r} is too large: alpha / n_tests exceeds the '
+            f'float range') from None
+    if family_alpha == 0.0:
+        raise ValueError(
+            f'n_tests={n_tests!r} is too large: alpha / n_tests underflows to '
+            f'zero')
     required_unadjusted = paired_required_n(
         sd, margin_value, alpha=alpha_value, power=power_value, max_n=max_pairs)
     required_adjusted = paired_required_n(
@@ -1261,7 +1288,7 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
         # `expected_pairs`: without it a mathematically exact 200 planned
         # pairs can become 201 when `(1 - attrition) ** 2` rounds just below
         # its decimal value (e.g. attrition=0.8).
-        int(math.ceil(required_adjusted / pair_survival - 1e-12)))
+        _pairs_needed_after_attrition(required_adjusted, pair_survival))
     planned_unadjusted = paired_design_summary(
         sd, n_pairs, margin=margin_value, alpha=alpha_value, power=power_value)
     planned_summary = paired_design_summary(
@@ -1280,6 +1307,9 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
         note = ('the pre-specified margin is not detectable within max_pairs at '
                 'the family-level alpha even before attrition; increase the '
                 'budget or reconsider the margin')
+    elif required_planned is None:
+        note = ('the attrition assumption leaves no positive complete-pair '
+                'survival, so a finite planned pair count does not exist')
     elif adequate_after_attrition:
         note = ('the planned seed count still covers the family-adjusted '
                 'requirement after the expected attrition')

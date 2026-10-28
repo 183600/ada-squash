@@ -860,11 +860,19 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
         df = float(n - 1)
     except OverflowError:
         df = math.inf
+    upper_tail = 1.0 - alpha
     if not math.isfinite(df) or df > _T_NORMAL_APPROX_DF:
         normal = NormalDist()
-        critical = normal.inv_cdf(1.0 - alpha) + normal.inv_cdf(power)
+        # For an extremely small alpha, `1 - alpha` rounds to 1 and the
+        # inverse CDF rejects it. The upper quantile is minus the lower
+        # quantile by symmetry, which stays representable.
+        upper = (normal.inv_cdf(upper_tail) if upper_tail < 1.0
+                 else -normal.inv_cdf(alpha))
+        critical = upper + normal.inv_cdf(power)
     else:
-        critical = student_t_ppf(1.0 - alpha, df) + student_t_ppf(power, df)
+        upper = (student_t_ppf(upper_tail, df) if upper_tail < 1.0
+                 else -student_t_ppf(alpha, df))
+        critical = upper + student_t_ppf(power, df)
     try:
         inverse_sqrt_n = 1.0 / math.sqrt(n)
     except OverflowError:
