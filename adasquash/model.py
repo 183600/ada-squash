@@ -216,7 +216,9 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
         ctx.count = count
-        return total / count
+        # An all-masked batch has no defined mean, but returning NaN would
+        # poison a training step whose backward is already a zero gradient.
+        return total / count.clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -257,6 +259,8 @@ def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index
         # explicit row instead of slicing a 0-dim target (IndexError).
         logits = logits.unsqueeze(0)
         targets = targets.reshape(-1)
+    if targets.dim() != 1:
+        targets = targets.reshape(-1)
     if targets.numel() != logits.size(0):
         raise ValueError(
             f"targets must contain one label per logit row, got "
@@ -264,7 +268,9 @@ def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(logits.size(-1))
     if logits.size(0) == 0:
-        return F.cross_entropy(logits, targets, ignore_index=ignore_index)
+        # An empty block has no tokens to average, but a NaN loss would still
+        # poison an otherwise valid training step.
+        return logits.sum() * 0.0
     return _ChunkedCrossEntropy.apply(logits, targets, int(ignore_index), int(chunk_rows))
 
 def _loss_acc_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -324,7 +330,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         ctx.count = count
         ctx.compute_dtype = dt
         ctx.in_dtypes = (hidden.dtype, weight.dtype)
-        return total / count
+        return total / count.clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -466,7 +472,14 @@ def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets
             hidden = hidden.to(dt)
         if weight.dtype != dt:
             weight = weight.to(dt)
-        return F.cross_entropy(F.linear(hidden, weight), targets, ignore_index=ignore_index)
+        loss = F.cross_entropy(
+            F.linear(hidden, weight), targets, ignore_index=ignore_index)
+        # Keep the fast path consistent with the chunked node: an all-masked
+        # batch contributes a zero loss rather than NaN. `where` selects the
+        # zero without a host synchronization on the validity tensor.
+        return torch.where(
+            _valid_target_mask(targets, ignore_index).any(), loss,
+            loss.new_zeros(()))
     return _FusedLinearCrossEntropy.apply(hidden, weight, targets, int(ignore_index), int(chunk_rows))
 
 class _LayerScaleResidual(torch.autograd.Function):
