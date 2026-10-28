@@ -516,8 +516,14 @@ def chi2_sf(x: float, df: float) -> float:
     use the series for P when ``x/2 < a + 1`` (it converges fast there) and
     the continued fraction for Q otherwise, so neither tail loses precision.
     """
-    if not math.isfinite(df) or df <= 0.0:
+    x_value = _as_real(x)
+    if x_value is None:
+        raise ValueError("chi2_sf got a non-finite statistic")
+    x = x_value
+    df_value = _as_real(df)
+    if df_value is None or not math.isfinite(df_value) or df_value <= 0.0:
         raise ValueError("chi2_sf needs df > 0")
+    df = df_value
     if math.isnan(x):
         raise ValueError("chi2_sf got a NaN statistic")
     if x <= 0.0:
@@ -539,8 +545,14 @@ def student_t_cdf(t: float, df: float) -> float:
     n - 1 = 1-4). This is the reference distribution for the paired and Welch
     tests below; the normal CDF (z) is only the df -> infinity limit.
     """
-    if not math.isfinite(df) or df <= 0:
+    t_value = _as_real(t)
+    if t_value is None:
+        raise ValueError("student_t_cdf got a non-numeric statistic")
+    t = t_value
+    df_value = _as_real(df)
+    if df_value is None or not math.isfinite(df_value) or df_value <= 0:
         raise ValueError("student_t_cdf needs df > 0")
+    df = df_value
     if math.isnan(t):
         raise ValueError("student_t_cdf got a NaN statistic")
     if t == float("inf"):
@@ -558,10 +570,14 @@ def student_t_ppf(p: float, df: float) -> float:
     Used for confidence-interval critical values. The result is a pure
     function of `(p, df)`, so it is memoized.
     """
-    if not 0.0 < p < 1.0:
+    p_value = _as_real(p)
+    if p_value is None or not 0.0 < p_value < 1.0:
         raise ValueError("student_t_ppf needs 0 < p < 1")
-    if not math.isfinite(df) or df <= 0:
+    p = p_value
+    df_value = _as_real(df)
+    if df_value is None or not math.isfinite(df_value) or df_value <= 0:
         raise ValueError("student_t_ppf needs df > 0")
+    df = df_value
     if p == 0.5:
         # The median of every Student-t is exactly zero. Bisection can stop on
         # adjacent floats whose CDF rounds around 0.5 and return a tiny
