@@ -655,15 +655,44 @@ def _pearson(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
     n = len(x)
     if n < 2 or len(y) != n:
         return None
-    mx = sum(x) / n
-    my = sum(y) / n
-    dx = [value - mx for value in x]
-    dy = [value - my for value in y]
-    sx = math.sqrt(sum(value * value for value in dx))
-    sy = math.sqrt(sum(value * value for value in dy))
+    try:
+        mx = sum(x) / n
+        my = sum(y) / n
+        dx = [value - mx for value in x]
+        dy = [value - my for value in y]
+        sx = math.sqrt(sum(value * value for value in dx))
+        sy = math.sqrt(sum(value * value for value in dy))
+        if sx == 0.0 or sy == 0.0:
+            return None
+        rho = sum(a * b for a, b in zip(dx, dy)) / (sx * sy)
+        if math.isfinite(rho):
+            return rho
+    except OverflowError:
+        pass
+    # Finite values near the float limit can overflow the raw sums even when
+    # the correlation is ordinary. Scale both inputs by their largest
+    # magnitude; the coefficient is invariant to positive rescaling.
+    scale_x = max(abs(value) for value in x)
+    scale_y = max(abs(value) for value in y)
+    if scale_x == 0.0 or scale_y == 0.0:
+        return None
+    scaled_x = [value / scale_x for value in x]
+    scaled_y = [value / scale_y for value in y]
+    if not (all(math.isfinite(value) for value in scaled_x)
+            and all(math.isfinite(value) for value in scaled_y)):
+        return None
+    mx = math.fsum(scaled_x) / n
+    my = math.fsum(scaled_y) / n
+    dx = [value - mx for value in scaled_x]
+    dy = [value - my for value in scaled_y]
+    sx = math.sqrt(math.fsum(value * value for value in dx))
+    sy = math.sqrt(math.fsum(value * value for value in dy))
     if sx == 0.0 or sy == 0.0:
         return None
-    return sum(a * b for a, b in zip(dx, dy)) / (sx * sy)
+    rho = math.fsum(a * b for a, b in zip(dx, dy)) / (sx * sy)
+    if not math.isfinite(rho):
+        return None
+    return min(1.0, max(-1.0, rho))
 
 
 def _spearman(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
