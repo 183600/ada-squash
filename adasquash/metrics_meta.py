@@ -138,8 +138,10 @@ def paired_randomization_test(
         else:
             working = centered
             observed_work = observed
-            tolerance = 1e-12 * max(
-                1.0, math.fsum(abs(value) for value in working))
+            # Keep the tolerance relative: an absolute 1e-12 floor swamps
+            # centered deltas that are themselves below 1e-12 and collapses
+            # every sign pattern to the same comparison.
+            tolerance = 1e-12 * math.fsum(abs(value) for value in working)
     else:
         center_scale = max(max(abs(value) for value in values),
                            abs(margin_value))
