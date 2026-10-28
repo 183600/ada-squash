@@ -253,12 +253,31 @@ def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     n = len(vals)
     if n == 0:
         return None
-    mean = sum(vals) / n
-    if n < 2:
-        return {"mean": mean, "std": 0.0, "stderr": 0.0, "n": n,
-                "n_input": n_input, "n_nonfinite": n_nonfinite}
-    var = sum((v - mean) ** 2 for v in vals) / (n - 1)
-    std = math.sqrt(var)
+    try:
+        mean = sum(vals) / n
+        if n < 2:
+            return {"mean": mean, "std": 0.0, "stderr": 0.0, "n": n,
+                    "n_input": n_input, "n_nonfinite": n_nonfinite}
+        var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+        std = math.sqrt(var)
+        if not math.isfinite(mean) or not math.isfinite(std):
+            raise OverflowError
+    except OverflowError:
+        # A mean or variance of finite values can overflow the ordinary sums
+        # (e.g. two batches each with loss 1e308). Scale by the largest
+        # magnitude and map the result back; the mean and std of finite
+        # values are representable unless the true std exceeds the float
+        # range, in which case infinity is the correct report.
+        scale = max(abs(v) for v in vals)
+        if scale == 0.0:
+            mean, std = 0.0, 0.0
+        else:
+            scaled = [v / scale for v in vals]
+            mean_scaled = math.fsum(scaled) / n
+            var_scaled = math.fsum(
+                (v - mean_scaled) * (v - mean_scaled) for v in scaled) / (n - 1)
+            mean = mean_scaled * scale
+            std = math.sqrt(var_scaled) * scale
     return {"mean": mean, "std": std, "stderr": std / math.sqrt(n), "n": n,
             "n_input": n_input, "n_nonfinite": n_nonfinite}
 

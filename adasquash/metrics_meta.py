@@ -114,21 +114,35 @@ def paired_randomization_test(
                        "at least one observation")
         return out
 
-    mean = math.fsum(values) / n
+    mean = _finite_weighted_mean(values, [1.0] * n, float(n))
     centered = [value + margin_value for value in values]
-    observed = math.fsum(centered) / n
-    scale = max(1.0, math.fsum(abs(value) for value in centered))
-    tolerance = 1e-12 * scale
+    observed = _finite_weighted_mean(centered, [1.0] * n, float(n))
+    # Flip signs in scaled units when the centered values are large; the
+    # permutation distribution only cares about the sign of the deviations,
+    # and scaling preserves the comparisons. The tolerance is converted with
+    # the same scale so the ordinary-size path is unchanged.
+    max_centered = max(abs(value) for value in centered)
+    if max_centered > 1.0:
+        working = [value / max_centered for value in centered]
+        observed_work = observed / max_centered
+        tolerance = 1e-12 * math.fsum(abs(value) for value in working)
+    else:
+        working = centered
+        observed_work = observed
+        tolerance = 1e-12 * max(
+            1.0, math.fsum(abs(value) for value in working))
     out["mean_delta"] = mean
     out["observed_centered_mean"] = observed
 
     if n <= exact_max:
         sums = [0.0]
-        for value in centered:
+        for value in working:
             sums = sums + [total + value for total in sums]
         patterns = len(sums)
-        lower = sum(1 for total in sums if total / n <= observed + tolerance)
-        upper = sum(1 for total in sums if total / n >= observed - tolerance)
+        lower = sum(1 for total in sums
+                    if total / n <= observed_work + tolerance)
+        upper = sum(1 for total in sums
+                    if total / n >= observed_work - tolerance)
         p_lower = lower / patterns
         p_upper = upper / patterns
         minimum = 1.0 / patterns
@@ -147,12 +161,12 @@ def paired_randomization_test(
         upper = 0
         for _ in range(permutations):
             total = 0.0
-            for value in centered:
+            for value in working:
                 total += value if rng.random() < 0.5 else -value
             permuted = total / n
-            if permuted <= observed + tolerance:
+            if permuted <= observed_work + tolerance:
                 lower += 1
-            if permuted >= observed - tolerance:
+            if permuted >= observed_work - tolerance:
                 upper += 1
         p_lower = (lower + 1.0) / (permutations + 1.0)
         p_upper = (upper + 1.0) / (permutations + 1.0)
@@ -190,29 +204,66 @@ def paired_randomization_test(
     return out
 
 
+def _scaled_ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
+    """Overflow-safe least-squares fit used for extreme finite inputs."""
+    n = len(xs)
+    x_scale = max(abs(x) for x in xs)
+    if x_scale == 0.0:
+        return None
+    y_scale = max(abs(y) for y in ys)
+    scaled_x = [x / x_scale for x in xs]
+    scaled_y = [(y / y_scale if y_scale else 0.0) for y in ys]
+    mx = math.fsum(scaled_x) / n
+    my = math.fsum(scaled_y) / n
+    sxx = math.fsum((x - mx) * (x - mx) for x in scaled_x)
+    if sxx == 0.0:
+        return None
+    sxy = math.fsum((x - mx) * (y - my)
+                    for x, y in zip(scaled_x, scaled_y))
+    slope_scaled = sxy / sxx
+    slope = slope_scaled * y_scale / x_scale
+    ss_tot = math.fsum((y - my) * (y - my) for y in scaled_y)
+    residuals = [(y - my) - slope_scaled * (x - mx)
+                 for x, y in zip(scaled_x, scaled_y)]
+    ss_res = math.fsum(value * value for value in residuals)
+    if ss_tot == 0.0:
+        r2 = 1.0 if ss_res == 0.0 else 0.0
+    else:
+        r2 = min(1.0, max(0.0, 1.0 - ss_res / ss_tot))
+    return slope, r2
+
+
 def _ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
     """Least-squares slope of ``ys`` on ``xs`` plus the fit's R-squared.
 
     Returns ``None`` when every ``x`` is identical (the slope is undefined).
     R-squared is clamped to [0, 1] so a tiny negative value from floating
-    point cancellation is not reported as a nonsensical fit quality.
+    point cancellation is not reported as a nonsensical fit quality. The
+    ordinary sums are used for normal inputs; finite values near the float
+    limit fall back to a scaled fit instead of overflowing to a non-finite
+    slope.
     """
     n = len(xs)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx == 0.0:
-        return None
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    slope = sxy / sxx
-    intercept = my - slope * mx
-    ss_tot = sum((y - my) ** 2 for y in ys)
-    ss_res = sum((y - (intercept + slope * x)) ** 2
-                 for x, y in zip(xs, ys))
-    if ss_tot == 0.0:
-        r2 = 1.0 if ss_res == 0.0 else 0.0
-    else:
-        r2 = min(1.0, max(0.0, 1.0 - ss_res / ss_tot))
+    try:
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        if sxx == 0.0:
+            return None
+        sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        slope = sxy / sxx
+        intercept = my - slope * mx
+        ss_tot = sum((y - my) ** 2 for y in ys)
+        ss_res = sum((y - (intercept + slope * x)) ** 2
+                     for x, y in zip(xs, ys))
+        if ss_tot == 0.0:
+            r2 = 1.0 if ss_res == 0.0 else 0.0
+        else:
+            r2 = min(1.0, max(0.0, 1.0 - ss_res / ss_tot))
+    except (OverflowError, ZeroDivisionError):
+        return _scaled_ols_slope_and_r2(xs, ys)
+    if not math.isfinite(slope) or not math.isfinite(r2):
+        return _scaled_ols_slope_and_r2(xs, ys)
     return slope, r2
 
 
@@ -360,6 +411,9 @@ def paired_trend_test(
         if fit is None:
             out["excluded_seeds"][str(label)] = "undefined slope"
             continue
+        if not all(math.isfinite(value) for value in fit):
+            out["excluded_seeds"][str(label)] = "non-finite slope"
+            continue
         slopes.append(fit[0])
         used.append(label)
         fitted_dose_counts.append(len({x for x, _ in pairs}))
@@ -413,23 +467,36 @@ def paired_trend_test(
         out["note"] = ("one usable seed: a slope is computable but its "
                        "sampling uncertainty is not; descriptive only")
         return out
-    test = paired_t_one_sided(slopes, [0.0] * n, alpha=alpha)
+    # The t statistic is invariant to a positive rescaling of the slopes, so
+    # extreme finite slopes are tested in units of their maximum; otherwise
+    # their mean and variance sums overflow even though the slopes themselves
+    # are finite. CIs are mapped back to the original units.
+    test_scale = max(abs(value) for value in slopes)
+    if test_scale > 1.0:
+        test_slopes = [value / test_scale for value in slopes]
+    else:
+        test_scale = 1.0
+        test_slopes = slopes
+    test = paired_t_one_sided(test_slopes, [0.0] * n, alpha=alpha)
     out.update({
-        "mean_slope_per_dose": test["mean_delta"],
+        "mean_slope_per_dose": test["mean_delta"] * test_scale,
         "t": test["t"],
         "df": test["df"],
         "p_one_sided": test["p_one_sided"],
-        "slope_ci": [test["ci_low"], test["ci_high"]],
+        "slope_ci": [test["ci_low"] * test_scale,
+                     test["ci_high"] * test_scale],
         "ci_level": test["ci_level"],
     })
     # The legacy `_95` keys are read by older reports; keep them at their
     # named 95% / 80% defaults and expose the configured-alpha interval and
     # MDE under the unsuffixed names.
     if float(alpha) == 0.05:
-        out["slope_ci_95"] = [test["ci_low"], test["ci_high"]]
+        out["slope_ci_95"] = [test["ci_low"] * test_scale,
+                              test["ci_high"] * test_scale]
     elif test.get("df"):
-        test_95 = paired_t_one_sided(slopes, [0.0] * n, alpha=0.05)
-        out["slope_ci_95"] = [test_95["ci_low"], test_95["ci_high"]]
+        test_95 = paired_t_one_sided(test_slopes, [0.0] * n, alpha=0.05)
+        out["slope_ci_95"] = [test_95["ci_low"] * test_scale,
+                              test_95["ci_high"] * test_scale]
     if stats is not None and stats["stderr"] is not None and test["df"]:
         df = float(test["df"])
         out["minimum_detectable_slope"] = (
