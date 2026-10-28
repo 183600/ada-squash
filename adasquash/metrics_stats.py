@@ -16,6 +16,10 @@ _T_NORMAL_APPROX_DF = 1.0e7
 # Above this many observations the 2**n sign-flip enumeration is no
 # longer a cheap exact computation; use the seeded Monte-Carlo branch.
 _RANDOMIZATION_EXACT_MAX = 20
+# Above this many discordant pairs the incomplete-beta binomial tail loses
+# precision (and eventually overflows); the normal approximation with a
+# continuity correction is accurate to far better than the reporting precision.
+_MCNEMAR_NORMAL_MIN = 100000
 # Negatives-per-positive ratio above which the FPR denominator makes ROC-AUC
 # optimistic and PR-AUC (average precision) is the appropriate summary.
 _EXTREME_IMBALANCE = 1000.0
@@ -163,9 +167,13 @@ def mcnemar_test(n_fixed: int, n_broke: int) -> dict:
     binomial CDF at p = 1/2), not the normal approximation: paired bad-case
     analysis runs on a few hundred to a few thousand scanned errors, and at
     the small discordant counts that survive there the normal tail is
-    anti-conservative. `p_one_sided` is P(X >= n_fixed) and supports
-    "candidate better"; `p_two_sided` doubles the smaller tail (capped at 1).
-    `normal_z_continuity_corrected` is reported for reference only.
+    anti-conservative. Above ``_MCNEMAR_NORMAL_MIN`` discordant pairs the
+    incomplete beta loses precision and eventually overflows, so the
+    continuity-corrected normal tail is used instead (its error is far below
+    the reporting precision at that sample size). `p_one_sided` is
+    P(X >= n_fixed) and supports "candidate better"; `p_two_sided` doubles the
+    smaller tail (capped at 1). `normal_z_continuity_corrected` is reported
+    for reference only.
 
     Degenerate case `n_discordant = 0`: the models agree on every compared
     sample, so there is no evidence either way and both p-values are `None`
@@ -190,15 +198,26 @@ def mcnemar_test(n_fixed: int, n_broke: int) -> dict:
             "so the comparison carries no evidence either way"
         )
         return out
-    # P(X <= k) for X ~ Bin(n, 1/2) is I_{1/2}(n - k, k + 1); the one-sided
-    # p-value P(X >= n_fixed) is the mirror image I_{1/2}(n_fixed, n_broke + 1).
-    p_ge = _reg_incomplete_beta(n_fixed, n_broke + 1, 0.5) if n_fixed > 0 else 1.0
-    p_le = _reg_incomplete_beta(n_broke, n_fixed + 1, 0.5) if n_broke > 0 else 1.0
+    if n > _MCNEMAR_NORMAL_MIN:
+        # Continuity-corrected normal tails. P(X >= n_fixed) uses the lower
+        # boundary n_fixed - 1/2; P(X <= n_fixed) uses the upper boundary
+        # n_fixed + 1/2. Both are evaluated through int/sqrt ratios so huge
+        # Python-int counts never need conversion to float.
+        z_ge = _int_over_sqrt(n_fixed - n_broke - 1, n)
+        z_le = _int_over_sqrt(n_fixed - n_broke + 1, n)
+        p_ge = _p_one_sided_from_z(-z_ge)
+        p_le = _p_one_sided_from_z(z_le)
+    else:
+        # P(X <= k) for X ~ Bin(n, 1/2) is I_{1/2}(n - k, k + 1); the one-sided
+        # p-value P(X >= n_fixed) is the mirror image I_{1/2}(n_fixed, n_broke + 1).
+        p_ge = _reg_incomplete_beta(n_fixed, n_broke + 1, 0.5) if n_fixed > 0 else 1.0
+        p_le = _reg_incomplete_beta(n_broke, n_fixed + 1, 0.5) if n_broke > 0 else 1.0
     out["p_one_sided"] = p_ge
     out["p_two_sided"] = min(1.0, 2.0 * min(p_ge, p_le))
     out["favors"] = "candidate" if n_fixed > n_broke else ("reference" if n_broke > n_fixed else "tied")
-    out["normal_z_continuity_corrected"] = max(
-        0.0, (abs(n_fixed - n_broke) - 1.0) / math.sqrt(n))
+    difference = abs(n_fixed - n_broke)
+    out["normal_z_continuity_corrected"] = (
+        0.0 if difference <= 1 else _int_over_sqrt(difference - 1, n))
     out["note"] = (
         "p_one_sided = P(Binomial(n_discordant, 0.5) >= n_fixed); the exact test "
         "is the small-discordant-count reference (the normal approximation is "
@@ -383,6 +402,20 @@ def max_p_combination(pvalues: Sequence[Optional[float]]) -> Optional[float]:
 def _p_one_sided_from_z(z: float) -> float:
     """P(Z <= z) for a standard normal Z (the one-sided p-value of a z-score)."""
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+
+def _int_over_sqrt(value: int, n: int) -> float:
+    """``value / sqrt(n)`` for arbitrary Python ints, without float overflow.
+
+    ``math.sqrt(n)`` raises ``OverflowError`` when ``n`` exceeds the float
+    range, and ``float(value)`` can do the same for the numerator. Dividing
+    the two ints directly lets Python's long true-division scale the quotient;
+    only a genuinely unrepresentable result becomes an infinity.
+    """
+    try:
+        return value / math.isqrt(n)
+    except OverflowError:
+        return math.copysign(math.inf, value)
 
 
 def _betacf(a: float, b: float, x: float) -> float:
