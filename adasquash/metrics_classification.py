@@ -492,11 +492,11 @@ def ndcg_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]]
     k = _strict_int(k, "ndcg_at_k k", minimum=1)
     if not ranked:
         return None
-    if not any(rel for rel in relevant):
+    relevant_sets = [set(rel) for rel in relevant]
+    if not any(relevant_sets):
         return None
     ndcgs = []
-    for r, rel in zip(ranked, relevant):
-        rel_set = set(rel)
+    for r, rel_set in zip(ranked, relevant_sets):
         if not rel_set:
             ndcgs.append(0.0)
             continue
