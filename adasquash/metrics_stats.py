@@ -265,6 +265,34 @@ def _mean_and_std(values: Sequence[float]):
     return mean_scaled * scale, math.sqrt(variance_scaled) * scale
 
 
+def _paired_mean_std(a: Sequence[float], b: Sequence[float]):
+    """Mean and sample std of paired differences without subtract overflow.
+
+    Two finite observations near opposite float limits have a difference
+    larger than the float range: ``x - y`` becomes +/-inf and the ordinary
+    mean/std path then sees an infinite sample and returns NaN. Scaling both
+    inputs by their common maximum magnitude keeps every difference in
+    [-2, 2]; the true mean/std are mapped back afterwards, and the scaled
+    triple is returned so the t/z ratio and confidence interval can be
+    computed before that (possibly overflowing) mapping.
+    """
+    d = [x - y for x, y in zip(a, b)]
+    mean, std = _mean_and_std(d)
+    if math.isfinite(mean) and math.isfinite(std):
+        return mean, std, None
+    if not (all(math.isfinite(value) for value in a)
+            and all(math.isfinite(value) for value in b)):
+        return mean, std, None
+    scale = max(max(abs(value) for value in a),
+                max(abs(value) for value in b))
+    if scale == 0.0:
+        return 0.0, 0.0, None
+    scaled = [x / scale - y / scale for x, y in zip(a, b)]
+    mean_scaled, std_scaled = _mean_and_std(scaled)
+    return (mean_scaled * scale, std_scaled * scale,
+            (mean_scaled, std_scaled, scale))
+
+
 def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     """Sample mean, sample std (ddof=1) and standard error of the mean.
 
@@ -700,15 +728,19 @@ def paired_z_one_sided(
     n = len(a)
     if n == 0:
         return {"mean_delta": None, "z": None, "p_one_sided": None, "n": 0, "paired": True}
-    d = [x - y for x, y in zip(a, b)]
-    mean, std = _mean_and_std(d)
+    mean, std, scaled = _paired_mean_std(a, b)
     if n < 2:
         return {"mean_delta": mean, "z": None, "p_one_sided": None, "n": n, "paired": True}
-    se = std / math.sqrt(n)
-    if se == 0.0:
-        z = float("-inf") if mean + margin < 0.0 else (float("inf") if mean + margin > 0.0 else 0.0)
+    if scaled is not None:
+        mean_test, se = scaled[0], scaled[1] / math.sqrt(n)
+        margin_test = margin / scaled[2]
     else:
-        z = (mean + margin) / se
+        mean_test, se, margin_test = mean, std / math.sqrt(n), margin
+    if se == 0.0:
+        z = float("-inf") if mean_test + margin_test < 0.0 else (
+            float("inf") if mean_test + margin_test > 0.0 else 0.0)
+    else:
+        z = (mean_test + margin_test) / se
     return {
         "mean_delta": mean,
         "z": z,
@@ -746,25 +778,31 @@ def paired_t_one_sided(
     }
     if n == 0:
         return empty
-    d = [x - y for x, y in zip(a, b)]
-    mean, std = _mean_and_std(d)
+    mean, std, scaled = _paired_mean_std(a, b)
     if n < 2:
         empty["mean_delta"] = mean
         return empty
-    se = std / math.sqrt(n)
     df = float(n - 1)
-    if se == 0.0:
-        t = float("-inf") if mean + margin < 0.0 else (float("inf") if mean + margin > 0.0 else 0.0)
+    if scaled is not None:
+        mean_test, se, ci_scale = scaled[0], scaled[1] / math.sqrt(n), scaled[2]
+        margin_test = margin / ci_scale
     else:
-        t = (mean + margin) / se
+        mean_test, se, ci_scale, margin_test = mean, std / math.sqrt(n), 1.0, margin
+    if se == 0.0:
+        t = float("-inf") if mean_test + margin_test < 0.0 else (
+            float("inf") if mean_test + margin_test > 0.0 else 0.0)
+    else:
+        t = (mean_test + margin_test) / se
     half = student_t_ppf(1.0 - alpha / 2.0, df) * se
+    ci_low = (mean_test - half) * ci_scale
+    ci_high = (mean_test + half) * ci_scale
     return {
         "mean_delta": mean,
         "t": t,
         "df": df,
         "p_one_sided": student_t_cdf(t, df),
-        "ci_low": mean - half,
-        "ci_high": mean + half,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
         "ci_level": 1.0 - alpha,
         "n": n,
         "paired": True,
@@ -1028,42 +1066,51 @@ def tost_paired(
     if n < 2:
         out["note"] = "TOST needs at least 2 paired observations"
         return out
-    d = [x - y for x, y in zip(a, b)]
-    mean, std = _mean_and_std(d)
-    if not math.isfinite(mean):
+    mean, std, scaled = _paired_mean_std(a, b)
+    if scaled is None and not math.isfinite(mean):
         out["note"] = "a non-finite paired difference makes the test undefined"
         return out
-    se = std / math.sqrt(n)
     df = float(n - 1)
+    if scaled is not None:
+        mean_test, se, ci_scale = scaled[0], scaled[1] / math.sqrt(n), scaled[2]
+        margin_test = margin / ci_scale
+    else:
+        mean_test, se, ci_scale, margin_test = mean, std / math.sqrt(n), 1.0, margin
     out.update({"mean_delta": mean, "df": df, "ci_level": 1.0 - 2.0 * alpha})
     if se == 0.0:
-        equivalent = abs(mean) < margin
+        equivalent = abs(mean_test) < margin_test
+        ci_low = ci_high = mean_test * ci_scale
         out.update({
             "p_low": 0.0 if equivalent else 1.0,
             "p_high": 0.0 if equivalent else 1.0,
             "p_tost": 0.0 if equivalent else 1.0,
             "equivalent": bool(equivalent),
-            "ci_low": mean,
-            "ci_high": mean,
+            "ci_low": ci_low,
+            "ci_high": ci_high,
             "note": ("zero-variance paired differences: equivalence is decided "
                      "by |mean_delta| < margin"),
         })
         return out
+    # In the scaled branch the excess over +/-margin is compared before the
+    # (possibly overflowing) mapping back, so a huge finite difference stays
+    # a definite non-equivalence instead of becoming NaN.
     # p_low tests H0 `mean <= -margin` against H1 `mean > -margin`;
     # p_high tests H0 `mean >= +margin` against H1 `mean < +margin`.
-    p_low = 1.0 - student_t_cdf((mean + margin) / se, df)
-    p_high = student_t_cdf((mean - margin) / se, df)
+    p_low = 1.0 - student_t_cdf((mean_test + margin_test) / se, df)
+    p_high = student_t_cdf((mean_test - margin_test) / se, df)
     p_low = min(1.0, max(0.0, p_low))
     p_high = min(1.0, max(0.0, p_high))
     p_tost = max(p_low, p_high)
     half = student_t_ppf(1.0 - alpha, df) * se
+    ci_low = (mean_test - half) * ci_scale
+    ci_high = (mean_test + half) * ci_scale
     out.update({
         "p_low": p_low,
         "p_high": p_high,
         "p_tost": p_tost,
         "equivalent": bool(p_tost < alpha),
-        "ci_low": mean - half,
-        "ci_high": mean + half,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
         "note": ("equivalent" if p_tost < alpha else
                  "not equivalent at this margin/alpha; this is not evidence of a difference"),
     })
