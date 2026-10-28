@@ -8,8 +8,9 @@ from typing import Optional, Sequence
 
 from .metrics_stats import (MIN_SEEDS_FOR_SIGNIFICANCE,
                          _RANDOMIZATION_EXACT_MAX, _as_real,
-                         _is_boolean_value, _p_one_sided_from_z, _strict_int,
-                         _validate_alpha, chi2_sf, leave_one_out_jackknife,
+                         _is_boolean_value, _mean_and_std,
+                         _p_one_sided_from_z, _strict_int, _validate_alpha,
+                         chi2_sf, leave_one_out_jackknife,
                          mean_prediction_interval, mean_std_stderr,
                          paired_t_one_sided, student_t_cdf, student_t_ppf,
                          two_sided_p_from_t)
@@ -539,10 +540,9 @@ def welch_z_one_sided(
     if len(a) < 2 or len(b) < 2:
         return {"mean_delta": None, "z": None, "p_one_sided": None,
                 "n": [len(a), len(b)], "paired": False}
-    ma, mb = sum(a) / len(a), sum(b) / len(b)
-    va = sum((v - ma) ** 2 for v in a) / (len(a) - 1)
-    vb = sum((v - mb) ** 2 for v in b) / (len(b) - 1)
-    se = math.sqrt(va / len(a) + vb / len(b))
+    ma, sa = _mean_and_std(a)
+    mb, sb = _mean_and_std(b)
+    se = math.hypot(sa / math.sqrt(len(a)), sb / math.sqrt(len(b)))
     delta = ma - mb
     if se == 0.0:
         z = float("-inf") if delta + margin < 0.0 else (float("inf") if delta + margin > 0.0 else 0.0)
@@ -580,17 +580,21 @@ def welch_t_one_sided(
     }
     if na < 2 or nb < 2:
         return empty
-    ma, mb = sum(a) / na, sum(b) / nb
-    va = sum((v - ma) ** 2 for v in a) / (na - 1)
-    vb = sum((v - mb) ** 2 for v in b) / (nb - 1)
+    ma, sa = _mean_and_std(a)
+    mb, sb = _mean_and_std(b)
     delta = ma - mb
-    se = math.sqrt(va / na + vb / nb)
+    se = math.hypot(sa / math.sqrt(na), sb / math.sqrt(nb))
     df = float(max(1, na + nb - 2))
-    if se > 0.0:
-        spread_a, spread_b = va / na, vb / nb
-        denom = spread_a ** 2 / (na - 1) + spread_b ** 2 / (nb - 1)
+    std_scale = max(sa, sb)
+    if se > 0.0 and math.isfinite(std_scale):
+        # Welch-Satterthwaite is scale invariant; normalize the arm standard
+        # deviations so squared variances near the float limit do not
+        # overflow before they cancel in the ratio.
+        var_a = (sa / std_scale) ** 2 / na
+        var_b = (sb / std_scale) ** 2 / nb
+        denom = (var_a ** 2 / (na - 1) + var_b ** 2 / (nb - 1))
         if denom > 0.0:
-            df = max(1.0, (spread_a + spread_b) ** 2 / denom)
+            df = max(1.0, (var_a + var_b) ** 2 / denom)
     if se == 0.0:
         t = float("-inf") if delta + margin < 0.0 else (float("inf") if delta + margin > 0.0 else 0.0)
     else:

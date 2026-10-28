@@ -226,6 +226,45 @@ def mcnemar_test(n_fixed: int, n_broke: int) -> dict:
     return out
 
 
+def _mean_and_std(values: Sequence[float]):
+    """Mean and sample standard deviation without overflow of the sums.
+
+    Finite observations near the float limit can overflow a sum, a squared
+    deviation, or the sample variance even when both the mean and the standard
+    deviation are representable. The ordinary path is kept unchanged; if it
+    overflows or produces a non-finite result, the values are scaled by their
+    maximum magnitude and mapped back.
+    """
+    n = len(values)
+    if n == 0:
+        return None, None
+    mean = std = float("nan")
+    try:
+        mean = sum(values) / n
+        if n < 2:
+            return mean, 0.0
+        variance = sum((value - mean) * (value - mean)
+                       for value in values) / (n - 1)
+        std = math.sqrt(variance)
+        if math.isfinite(mean) and math.isfinite(std):
+            return mean, std
+    except OverflowError:
+        pass
+    if not all(math.isfinite(value) for value in values):
+        return mean, std
+    scale = max(abs(value) for value in values)
+    if scale == 0.0:
+        return 0.0, 0.0
+    scaled = [value / scale for value in values]
+    mean_scaled = math.fsum(scaled) / n
+    if n < 2:
+        return mean_scaled * scale, 0.0
+    variance_scaled = math.fsum(
+        (value - mean_scaled) * (value - mean_scaled)
+        for value in scaled) / (n - 1)
+    return mean_scaled * scale, math.sqrt(variance_scaled) * scale
+
+
 def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     """Sample mean, sample std (ddof=1) and standard error of the mean.
 
@@ -253,31 +292,7 @@ def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     n = len(vals)
     if n == 0:
         return None
-    try:
-        mean = sum(vals) / n
-        if n < 2:
-            return {"mean": mean, "std": 0.0, "stderr": 0.0, "n": n,
-                    "n_input": n_input, "n_nonfinite": n_nonfinite}
-        var = sum((v - mean) ** 2 for v in vals) / (n - 1)
-        std = math.sqrt(var)
-        if not math.isfinite(mean) or not math.isfinite(std):
-            raise OverflowError
-    except OverflowError:
-        # A mean or variance of finite values can overflow the ordinary sums
-        # (e.g. two batches each with loss 1e308). Scale by the largest
-        # magnitude and map the result back; the mean and std of finite
-        # values are representable unless the true std exceeds the float
-        # range, in which case infinity is the correct report.
-        scale = max(abs(v) for v in vals)
-        if scale == 0.0:
-            mean, std = 0.0, 0.0
-        else:
-            scaled = [v / scale for v in vals]
-            mean_scaled = math.fsum(scaled) / n
-            var_scaled = math.fsum(
-                (v - mean_scaled) * (v - mean_scaled) for v in scaled) / (n - 1)
-            mean = mean_scaled * scale
-            std = math.sqrt(var_scaled) * scale
+    mean, std = _mean_and_std(vals)
     return {"mean": mean, "std": std, "stderr": std / math.sqrt(n), "n": n,
             "n_input": n_input, "n_nonfinite": n_nonfinite}
 
@@ -686,11 +701,10 @@ def paired_z_one_sided(
     if n == 0:
         return {"mean_delta": None, "z": None, "p_one_sided": None, "n": 0, "paired": True}
     d = [x - y for x, y in zip(a, b)]
-    mean = sum(d) / n
+    mean, std = _mean_and_std(d)
     if n < 2:
         return {"mean_delta": mean, "z": None, "p_one_sided": None, "n": n, "paired": True}
-    var = sum((v - mean) ** 2 for v in d) / (n - 1)
-    se = math.sqrt(var / n)
+    se = std / math.sqrt(n)
     if se == 0.0:
         z = float("-inf") if mean + margin < 0.0 else (float("inf") if mean + margin > 0.0 else 0.0)
     else:
@@ -733,12 +747,11 @@ def paired_t_one_sided(
     if n == 0:
         return empty
     d = [x - y for x, y in zip(a, b)]
-    mean = sum(d) / n
+    mean, std = _mean_and_std(d)
     if n < 2:
         empty["mean_delta"] = mean
         return empty
-    var = sum((v - mean) ** 2 for v in d) / (n - 1)
-    se = math.sqrt(var / n)
+    se = std / math.sqrt(n)
     df = float(n - 1)
     if se == 0.0:
         t = float("-inf") if mean + margin < 0.0 else (float("inf") if mean + margin > 0.0 else 0.0)
@@ -1016,12 +1029,11 @@ def tost_paired(
         out["note"] = "TOST needs at least 2 paired observations"
         return out
     d = [x - y for x, y in zip(a, b)]
-    mean = sum(d) / n
+    mean, std = _mean_and_std(d)
     if not math.isfinite(mean):
         out["note"] = "a non-finite paired difference makes the test undefined"
         return out
-    var = sum((v - mean) ** 2 for v in d) / (n - 1)
-    se = math.sqrt(var / n)
+    se = std / math.sqrt(n)
     df = float(n - 1)
     out.update({"mean_delta": mean, "df": df, "ci_level": 1.0 - 2.0 * alpha})
     if se == 0.0:
@@ -1102,7 +1114,7 @@ def leave_one_out_jackknife(
             "max_abs_change": None,
             "note": "non-finite observation(s); jackknife skipped",
         }
-    full = sum(vals) / n
+    full, _ = _mean_and_std(vals)
 
     def _sign(x: float) -> str:
         return "negative" if x < 0.0 else ("positive" if x > 0.0 else "zero")
@@ -1127,7 +1139,7 @@ def leave_one_out_jackknife(
     per_drop = []
     for i in range(n):
         rest = vals[:i] + vals[i + 1:]
-        mean = sum(rest) / len(rest)
+        mean, _ = _mean_and_std(rest)
         drop_sign = _sign(mean)
         if full_sign == "zero":
             # There is no direction to stabilise; a mean that is exactly zero
