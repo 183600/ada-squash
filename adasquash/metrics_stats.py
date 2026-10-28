@@ -53,6 +53,18 @@ def _as_real(value) -> Optional[float]:
         return None
 
 
+def _real_values(values, name: str = "values") -> list[float]:
+    """Float observations, with an unrepresentable integer reported cleanly."""
+    out = []
+    for value in values:
+        try:
+            out.append(float(value))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"{name} must contain real numbers, got {value!r}") from None
+    return out
+
+
 def _strict_int(value, name: str, minimum: Optional[int] = None) -> int:
     """An integer-valued count/id, rejecting bools and fractional values.
 
@@ -727,8 +739,8 @@ def paired_z_one_sided(
     in this repo actually run, the normal tail is anti-conservative - use
     `paired_t_one_sided`, which also reports a confidence interval.
     """
-    a = [float(v) for v in a]
-    b = [float(v) for v in b]
+    a = _real_values(a, "a")
+    b = _real_values(b, "b")
     if len(a) != len(b):
         raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
     n = len(a)
@@ -771,8 +783,8 @@ def paired_t_one_sided(
     (`stderr == 0`) is the usual degenerate limit of the t statistic: the
     sign of `mean_delta + margin` decides p = 0 or 1.
     """
-    a = [float(v) for v in a]
-    b = [float(v) for v in b]
+    a = _real_values(a, "a")
+    b = _real_values(b, "b")
     alpha = _validate_alpha(alpha)
     if len(a) != len(b):
         raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
@@ -1064,8 +1076,8 @@ def tost_paired(
         "df": None,
         "note": "equivalence not evaluated",
     }
-    a = [float(v) for v in a]
-    b = [float(v) for v in b]
+    a = _real_values(a, "a")
+    b = _real_values(b, "b")
     if len(a) != len(b):
         raise ValueError(f"TOST needs equal lengths, got {len(a)} vs {len(b)}")
     n = len(a)
@@ -1149,7 +1161,7 @@ def leave_one_out_jackknife(
     ``meaningful=False`` when fewer than three observations make the
     sign-change test vacuous (dropping one leaves a single point).
     """
-    vals = [float(v) for v in values]
+    vals = _real_values(values)
     n = len(vals)
     # Validate the labels even on the early-return paths: a caller that
     # supplies the wrong number of names has a programming error, and silently

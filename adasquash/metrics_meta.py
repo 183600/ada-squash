@@ -8,7 +8,7 @@ from typing import Optional, Sequence
 
 from .metrics_stats import (MIN_SEEDS_FOR_SIGNIFICANCE,
                          _RANDOMIZATION_EXACT_MAX, _as_real,
-                         _is_boolean_value, _mean_and_std,
+                         _is_boolean_value, _mean_and_std, _real_values,
                          _p_one_sided_from_z, _strict_int, _validate_alpha,
                          chi2_sf, leave_one_out_jackknife,
                          mean_prediction_interval, mean_std_stderr,
@@ -555,8 +555,8 @@ def welch_z_one_sided(
     and preferred whenever the batch counts match. Like its paired sibling
     this is the large-n limit; `welch_t_one_sided` is the small-sample test.
     """
-    a = [float(v) for v in a]
-    b = [float(v) for v in b]
+    a = _real_values(a, "a")
+    b = _real_values(b, "b")
     if len(a) < 2 or len(b) < 2:
         return {"mean_delta": None, "z": None, "p_one_sided": None,
                 "n": [len(a), len(b)], "paired": False}
@@ -589,8 +589,8 @@ def welch_t_one_sided(
     the same two-sided `1 - alpha` interval for the difference as the paired
     test. `n` is `[na, nb]`, `paired` is False.
     """
-    a = [float(v) for v in a]
-    b = [float(v) for v in b]
+    a = _real_values(a, "a")
+    b = _real_values(b, "b")
     alpha = _validate_alpha(alpha)
     na, nb = len(a), len(b)
     empty = {
