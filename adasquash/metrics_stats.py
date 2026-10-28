@@ -4,10 +4,15 @@ import functools
 import math
 import numbers
 import random
+from statistics import NormalDist
 from typing import Optional, Sequence
 
 _Z_95 = 1.959963984540054
 MIN_SEEDS_FOR_SIGNIFICANCE = 3
+# Above this many degrees of freedom the t distribution is indistinguishable
+# from the normal limit at double precision, while the incomplete-beta CDF
+# loses accuracy (and eventually overflows) for very large df.
+_T_NORMAL_APPROX_DF = 1.0e7
 # Above this many observations the 2**n sign-flip enumeration is no
 # longer a cheap exact computation; use the seeded Monte-Carlo branch.
 _RANDOMIZATION_EXACT_MAX = 20
@@ -718,10 +723,28 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     ``(t_{1-alpha, n-1} + t_{power, n-1}) * std / sqrt(n)``. This is the
     standard two-point t approximation used by the comparison scripts; keeping
     one implementation means a power plan and a reported MDE never disagree.
+
+    An ``n`` beyond the float range is a legitimate (if absurd) power-plan
+    input, not a reason to crash. Above ``_T_NORMAL_APPROX_DF`` degrees of
+    freedom the t quantiles are computed from the normal limit, which is
+    accurate to better than double precision there; ``1 / sqrt(n)`` is
+    evaluated through its logarithm when converting ``n`` to float would
+    overflow.
     """
-    df = float(n - 1)
-    return ((student_t_ppf(1.0 - alpha, df) + student_t_ppf(power, df))
-            * std / math.sqrt(n))
+    try:
+        df = float(n - 1)
+    except OverflowError:
+        df = math.inf
+    if not math.isfinite(df) or df > _T_NORMAL_APPROX_DF:
+        normal = NormalDist()
+        critical = normal.inv_cdf(1.0 - alpha) + normal.inv_cdf(power)
+    else:
+        critical = student_t_ppf(1.0 - alpha, df) + student_t_ppf(power, df)
+    try:
+        inverse_sqrt_n = 1.0 / math.sqrt(n)
+    except OverflowError:
+        inverse_sqrt_n = math.exp(-0.5 * math.log(n))
+    return critical * std * inverse_sqrt_n
 
 
 def _validate_design_inputs(std, alpha: float, power: float) -> tuple[float, float, float]:

@@ -79,6 +79,7 @@ import json
 import math
 import numbers
 import random
+from fractions import Fraction
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from .metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, paired_design_summary,
@@ -127,6 +128,21 @@ def _finite_float(value) -> Optional[float]:
     except (TypeError, ValueError, OverflowError):
         return None
     return out if math.isfinite(out) else None
+
+
+def _complete_pairs_after_attrition(n_pairs: int, survival: float) -> int:
+    """Expected analyzable complete pairs, including for huge ``n_pairs``.
+
+    ``n_pairs * survival`` raises ``OverflowError`` when ``n_pairs`` is larger
+    than the float range even though the correct count is a perfectly ordinary
+    integer. Reproduce the same tolerated flooring with an exact rational
+    fallback rather than crashing the pre-registration plan.
+    """
+    try:
+        return int(math.floor(n_pairs * survival + 1e-12))
+    except OverflowError:
+        product = Fraction(n_pairs) * Fraction.from_float(survival)
+        return math.floor(product + Fraction(1, 10**12))
 
 
 def block_randomized_schedule(units: Iterable[str], block_size: Optional[int] = None,
@@ -1238,7 +1254,7 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
     required_adjusted = paired_required_n(
         sd, margin_value, alpha=family_alpha, power=power_value, max_n=max_pairs)
     pair_survival = (1.0 - attrition) ** 2
-    expected_pairs = int(math.floor(n_pairs * pair_survival + 1e-12))
+    expected_pairs = _complete_pairs_after_attrition(n_pairs, pair_survival)
     required_planned = (
         None if required_adjusted is None else
         # The tiny subtraction matches the `+1e-12` tolerance used for
