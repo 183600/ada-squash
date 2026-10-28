@@ -117,19 +117,37 @@ def paired_randomization_test(
 
     mean = _finite_weighted_mean(values, [1.0] * n, float(n))
     centered = [value + margin_value for value in values]
-    observed = _finite_weighted_mean(centered, [1.0] * n, float(n))
-    # Flip signs in scaled units when the centered values are large; the
-    # permutation distribution only cares about the sign of the deviations,
-    # and scaling preserves the comparisons. The tolerance is converted with
-    # the same scale so the ordinary-size path is unchanged.
-    max_centered = max(abs(value) for value in centered)
-    if max_centered > 1.0:
-        working = [value / max_centered for value in centered]
-        observed_work = observed / max_centered
-        tolerance = 1e-12 * math.fsum(abs(value) for value in working)
+    # `d_i + margin` can overflow to infinity for finite inputs near the
+    # float limit. A non-finite centered sample used to poison every
+    # comparison in the sign-flip sweep, collapsing both one-sided p-values
+    # to 0.0 - a maximally significant verdict produced by arithmetic
+    # overflow. Center in units of a common positive scale in that case; the
+    # sign-flip test is invariant to rescaling the centered deltas, so the
+    # counting order is unchanged.
+    if all(math.isfinite(value) for value in centered):
+        observed = _finite_weighted_mean(centered, [1.0] * n, float(n))
+        # Flip signs in scaled units when the centered values are large; the
+        # permutation distribution only cares about the sign of the deviations,
+        # and scaling preserves the comparisons. The tolerance is converted with
+        # the same scale so the ordinary-size path is unchanged.
+        max_centered = max(abs(value) for value in centered)
+        if max_centered > 1.0:
+            working = [value / max_centered for value in centered]
+            observed_work = observed / max_centered
+            tolerance = 1e-12 * math.fsum(abs(value) for value in working)
+        else:
+            working = centered
+            observed_work = observed
+            tolerance = 1e-12 * max(
+                1.0, math.fsum(abs(value) for value in working))
     else:
-        working = centered
-        observed_work = observed
+        center_scale = max(max(abs(value) for value in values),
+                           abs(margin_value))
+        # At least one term is nonzero, otherwise the sum could not overflow.
+        working = [value / center_scale + margin_value / center_scale
+                   for value in values]
+        observed = mean + margin_value
+        observed_work = math.fsum(working) / n
         tolerance = 1e-12 * max(
             1.0, math.fsum(abs(value) for value in working))
     out["mean_delta"] = mean
