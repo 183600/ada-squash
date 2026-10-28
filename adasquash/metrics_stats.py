@@ -124,13 +124,22 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
         raise ValueError(
             f"wilson_interval needs 0 <= n_success <= n_total, got "
             f"{n_success} successes out of {n_total} trials")
-    p = n_success / n_total
     z2 = z * z
-    denom = 1.0 + z2 / n_total
-    centre = (p + z2 / (2.0 * n_total)) / denom
-    half = (z / denom) * math.sqrt(
-        p * (1.0 - p) / n_total + z2 / (4.0 * n_total * n_total)
-    )
+    try:
+        p = n_success / n_total
+        denom = 1.0 + z2 / n_total
+        centre = (p + z2 / (2.0 * n_total)) / denom
+        half = (z / denom) * math.sqrt(
+            p * (1.0 - p) / n_total + z2 / (4.0 * n_total * n_total)
+        )
+    except OverflowError:
+        inv_n = 1 / n_total
+        p = n_success / n_total
+        denom = 1.0 + z2 * inv_n
+        centre = (p + z2 * inv_n / 2.0) / denom
+        half = (z / denom) * math.sqrt(
+            p * (1.0 - p) * inv_n + z2 * inv_n * inv_n / 4.0
+        )
     return max(0.0, centre - half), min(1.0, centre + half)
 
 

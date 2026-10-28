@@ -9,6 +9,16 @@ from typing import Optional, Sequence
 from .metrics_stats import (_EXTREME_IMBALANCE,
                                _binary_labels, _strict_int)
 
+def _weighted_mean(values: Sequence[float], weights: Sequence[int],
+                  total: int) -> float:
+    if not total:
+        return 0.0
+    try:
+        return sum(v * w for v, w in zip(values, weights)) / total
+    except OverflowError:
+        return math.fsum(v * (w / total) for v, w in zip(values, weights))
+
+
 def f1_from_counts(
     gold_counts: Sequence[int],
     pred_counts: Sequence[int],
@@ -63,11 +73,18 @@ def f1_from_counts(
     f1_by_class = {}
     for i in present:
         denom = 2 * tp[i] + fp[i] + fn[i]
-        f1_by_class[i] = (2.0 * tp[i] / denom) if denom else 0.0
+        if not denom:
+            f1_by_class[i] = 0.0
+            continue
+        try:
+            f1_by_class[i] = 2.0 * tp[i] / denom
+        except OverflowError:
+            f1_by_class[i] = (2 * tp[i]) / denom
     macro = sum(f1_by_class.values()) / len(f1_by_class) if f1_by_class else 0.0
-    weighted = (
-        sum(f1_by_class[i] * (tp[i] + fn[i]) for i in present) / support
-        if support else 0.0
+    weighted = _weighted_mean(
+        [f1_by_class[i] for i in present],
+        [tp[i] + fn[i] for i in present],
+        support,
     )
     micro = (sum(tp) / support) if support else 0.0
     # Per-class precision/recall, then macro/weighted/micro aggregates, so a
@@ -85,13 +102,15 @@ def f1_from_counts(
                        if precision_by_class else 0.0)
     macro_recall = (sum(recall_by_class.values()) / len(recall_by_class)
                     if recall_by_class else 0.0)
-    weighted_precision = (
-        sum(precision_by_class[i] * (tp[i] + fn[i]) for i in present) / support
-        if support else 0.0
+    weighted_precision = _weighted_mean(
+        [precision_by_class[i] for i in present],
+        [tp[i] + fn[i] for i in present],
+        support,
     )
-    weighted_recall = (
-        sum(recall_by_class[i] * (tp[i] + fn[i]) for i in present) / support
-        if support else 0.0
+    weighted_recall = _weighted_mean(
+        [recall_by_class[i] for i in present],
+        [tp[i] + fn[i] for i in present],
+        support,
     )
     micro_precision = (sum(tp) / (sum(tp) + sum(fp))) if (sum(tp) + sum(fp)) else 0.0
     micro_recall = (sum(tp) / (sum(tp) + sum(fn))) if (sum(tp) + sum(fn)) else 0.0
@@ -163,7 +182,10 @@ def imbalance_report(counts: Sequence[int]) -> dict:
         }
     majority = max(positives)
     minority = min(positives)
-    ratio = majority / minority
+    try:
+        ratio = majority / minority
+    except OverflowError:
+        ratio = math.inf
     extreme = ratio >= _EXTREME_IMBALANCE
     return {
         "n_classes_with_support": len(positives),
