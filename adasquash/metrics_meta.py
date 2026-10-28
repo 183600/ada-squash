@@ -650,11 +650,31 @@ def _meta_study(observation, index: int):
     }, None
 
 
+def _finite_weighted_mean(values: Sequence[float],
+                          weights: Sequence[float], total: float) -> float:
+    """Weighted mean of finite values without overflowing the weighted sum.
+
+    ``math.fsum(weight * value ...)`` can overflow even when the weighted mean
+    is representable (for example, two studies both estimate an effect of
+    ``1e308``). Scaling the values by their maximum keeps the sum bounded;
+    the mean of values in ``[-scale, scale]`` is itself in that interval.
+    """
+    scale = max(abs(value) for value in values)
+    if scale == 0.0:
+        return 0.0
+    scaled = math.fsum(
+        weight * (value / scale)
+        for value, weight in zip(values, weights)) / total
+    scaled = max(-1.0, min(1.0, scaled))
+    return scaled * scale
+
+
 def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
     """Pool validated effect/stderr records, fixed-effect and random-effects.
 
     Weights are normalized by their maximum so the sum of individually finite
-    inverse-variance weights cannot overflow; an infinite tau^2 is reported as
+    inverse-variance weights cannot overflow; the weighted effects are scaled
+    by their maximum for the same reason. An infinite tau^2 is reported as
     the unweighted mean with an infinite standard error rather than dividing
     by zero. The caller keeps validation and the human-readable summary.
     """
@@ -699,10 +719,8 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
     fixed_scaled = [study['fixed_weight'] / max_fixed_weight
                     for study in studies]
     total_scaled = math.fsum(fixed_scaled)
-    fixed_pooled = math.fsum(
-        weight * study['effect']
-        for weight, study in zip(fixed_scaled, studies)
-    ) / total_scaled
+    fixed_pooled = _finite_weighted_mean(
+        [study['effect'] for study in studies], fixed_scaled, total_scaled)
     fixed_stderr = ((1.0 / math.sqrt(max_fixed_weight))
                     / math.sqrt(total_scaled))
     for study, weight in zip(studies, fixed_scaled):
@@ -727,10 +745,26 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
     random_stderr = fixed_stderr
     if k >= 2:
         df_q = float(k - 1)
-        q_scaled = math.fsum(
-            weight * (study['effect'] - fixed_pooled) ** 2
-            for weight, study in zip(fixed_scaled, studies))
-        q = max_fixed_weight * q_scaled
+        try:
+            q_scaled = math.fsum(
+                weight * (study['effect'] - fixed_pooled) ** 2
+                for weight, study in zip(fixed_scaled, studies))
+            q = max_fixed_weight * q_scaled
+        except OverflowError:
+            # Squaring a finite but extreme effect difference can overflow.
+            # Compute Q in units of the largest effect, then convert back; a
+            # truly unrepresentable Q is still reported as infinity.
+            effect_scale = max(abs(study['effect']) for study in studies)
+            if effect_scale == 0.0:
+                q_scaled = 0.0
+                q = 0.0
+            else:
+                q_scaled = math.fsum(
+                    weight * ((study['effect'] - fixed_pooled) / effect_scale) ** 2
+                    for weight, study in zip(fixed_scaled, studies))
+                q = (max_fixed_weight * q_scaled
+                     * effect_scale * effect_scale)
+                q_scaled = q / max_fixed_weight
         if q > 0.0:
             i_squared = (100.0 if math.isinf(q)
                          else max(0.0, (q - df_q) / q) * 100.0)
@@ -758,17 +792,18 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
             random_scaled = [weight / max_random_weight
                              for weight in random_weights]
             total_random_scaled = math.fsum(random_scaled)
-            random_pooled = math.fsum(
-                weight * study['effect']
-                for weight, study in zip(random_scaled, studies)
-            ) / total_random_scaled
+            random_pooled = _finite_weighted_mean(
+                [study['effect'] for study in studies],
+                random_scaled, total_random_scaled)
             random_stderr = ((1.0 / math.sqrt(max_random_weight))
                              / math.sqrt(total_random_scaled))
             for study, weight in zip(studies, random_scaled):
                 study['random_weight'] = weight * max_random_weight
                 study['random_weight_share'] = weight / total_random_scaled
         else:
-            random_pooled = math.fsum(study['effect'] for study in studies) / k
+            random_pooled = _finite_weighted_mean(
+                [study['effect'] for study in studies],
+                [1.0] * k, float(k))
             random_stderr = float('inf')
 
         df = float(k - 1)
