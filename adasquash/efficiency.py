@@ -18,6 +18,7 @@ import math
 import numbers
 from collections import defaultdict
 from collections.abc import Mapping
+from fractions import Fraction
 from typing import Optional
 
 from .metrics import student_t_ppf
@@ -105,7 +106,12 @@ def mlp_hidden_size(dim: int, mlp_ratio: float) -> int:
     """Hidden width of the SwiGLU MLP, exactly as `model.MLP` computes it."""
     dim = _positive_int(dim, "dim")
     mlp_ratio = _positive_real(mlp_ratio, "mlp_ratio")
-    hidden = int(int(dim * mlp_ratio) * 2 / 3)
+    try:
+        base = int(dim * mlp_ratio)
+        hidden = int(base * 2 / 3)
+    except OverflowError:
+        base = math.floor(Fraction(dim) * Fraction.from_float(mlp_ratio))
+        hidden = (2 * base) // 3
     return hidden + 7 & ~7
 
 
@@ -155,12 +161,29 @@ def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = 
         raise ValueError(f"{len_name} must be an integer, got {raw_len!r}")
     if T < 0:
         raise ValueError(f"{len_name} must be >= 0, got {T}")
-    attn = float(n_layers * 8 * d * d)          # 4 d x d matmuls/token/layer
-    attn_scores = float(4 * n_layers * d * T)   # QK^T + AV, 4 d T^2 per layer / T
-    mlp = float(n_layers * 6 * d * h)           # 3 d x h matmuls/token/layer
-    lm_head = float(2 * d * vocab)
-    forward = attn + attn_scores + mlp + lm_head
-    training = 3.0 * forward
+    attn_count = n_layers * 8 * d * d          # 4 d x d matmuls/token/layer
+    score_count = 4 * n_layers * d * T          # QK^T + AV, 4 d T^2 per layer / T
+    mlp_count = n_layers * 6 * d * h            # 3 d x h matmuls/token/layer
+    head_count = 2 * d * vocab
+    try:
+        attn = float(attn_count)
+        attn_scores = float(score_count)
+        mlp = float(mlp_count)
+        lm_head = float(head_count)
+        forward = attn + attn_scores + mlp + lm_head
+        training = 3.0 * forward
+        if not all(math.isfinite(value) for value in
+                   (attn, attn_scores, mlp, lm_head, forward, training)):
+            raise OverflowError
+    except OverflowError:
+        # Huge but valid geometry has an exact integer FLOP count even when
+        # the float image exceeds the representable range.
+        attn = attn_count
+        attn_scores = score_count
+        mlp = mlp_count
+        lm_head = head_count
+        forward = attn + attn_scores + mlp + lm_head
+        training = 3 * forward
     # `backward` selects the reported estimate; both component estimates stay
     # available so callers can compare a forward-only run with a training run.
     per_token = training if backward else forward
