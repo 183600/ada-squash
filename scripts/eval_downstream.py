@@ -322,8 +322,17 @@ def needle_target_ids(tokenizer, needle: str=DEFAULT_NEEDLE) -> list:
 def needle_decode_overhead(tokenizer, needle: str=DEFAULT_NEEDLE) -> int:
     return max(0, len(needle_target_ids(tokenizer, needle)) - 1)
 
-def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0, return_counts: bool=False, decode_batch: int=8, return_details: bool=False):
+def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0, return_counts: bool=False, decode_batch: int=8, return_details: bool=False, random_haystack: bool=False, haystack_vocab_size: int | None=None, needle_present: bool=True):
     """Exact-match accuracy of the secret over `n_trials` independent placements.
+
+    `random_haystack=True` replaces the repeated `haystack_prompt` filler with
+    uniformly random token ids drawn from `haystack_vocab_size` (default: the
+    model's `cfg.vocab_size`), so success cannot come from a filler phrase the
+    model memorized. `needle_present=False` omits the needle from the context
+    while still scoring the secret: the resulting accuracy is the model's
+    hallucination rate on the no-needle control, not a retrieval rate. Each
+    per-trial detail record carries `needle_present` so control trials cannot
+    be mistaken for real ones.
 
     Cost: every trial generates `len(target_ids)` steps and each step runs one
     full forward over the whole prefix, so the flops are
@@ -371,6 +380,17 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     prompt_ids = tok(haystack_prompt, add_special_tokens=False)['input_ids']
     question_ids = tok(DEFAULT_QUESTION, add_special_tokens=False)['input_ids']
     target_ids = needle_target_ids(tok, needle)
+    inserted = list(needle_ids) if needle_present else []
+    haystack_vocab = None
+    if random_haystack:
+        raw_vocab = (haystack_vocab_size if haystack_vocab_size is not None
+                     else getattr(getattr(model, 'cfg', None), 'vocab_size', 0))
+        try:
+            haystack_vocab = int(raw_vocab)
+        except (TypeError, ValueError):
+            haystack_vocab = 0
+        if haystack_vocab <= 0:
+            raise ValueError('random_haystack needs a positive haystack_vocab_size or a model cfg.vocab_size')
     model_limit = getattr(getattr(model, 'cfg', None), 'max_seq_len', None)
     if model_limit is not None and context_len > model_limit:
         raise ValueError(f"context_len={context_len} exceeds the model's max_seq_len={model_limit}; raise max_seq_len (and retrain) or lower the context length - there is no valid result at this length")
@@ -379,22 +399,27 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         raise ValueError(f"context_len={context_len} + {overhead} scoring positions for the {len(target_ids)}-token secret exceeds the model's max_seq_len={model_limit}; scoring the last token would index past the positional table - lower the context length by at least {context_len + overhead - model_limit}")
     if not target_ids:
         raise ValueError(f'could not derive a secret to score from needle={needle!r}')
-    if len(prompt_ids) == 0:
+    if not random_haystack and len(prompt_ids) == 0:
         raise ValueError('haystack_prompt tokenizes to zero tokens')
     # Every trial uses the same fix-up RNG order as the sequential version, so
     # batching (which only groups independent trials) changes no placement.
     contexts: list = []
     for _ in range(n_trials):
-        body_len = context_len - len(needle_ids) - len(question_ids)
-        if body_len < len(prompt_ids):
-            raise ValueError(f'context_len={context_len} is too short to hold the needle ({len(needle_ids)} tok) + question ({len(question_ids)} tok) + one haystack repeat ({len(prompt_ids)} tok)')
-        n_repeats, remainder = divmod(body_len, len(prompt_ids))
-        # Fill the final partial repeat too: flooring alone left the context
-        # up to one prompt shorter than the requested length, so trials were
-        # silently scored at different (and smaller) than reported contexts.
-        body = prompt_ids * n_repeats + prompt_ids[:remainder]
+        body_len = context_len - len(inserted) - len(question_ids)
+        if random_haystack:
+            if body_len < 0:
+                raise ValueError(f'context_len={context_len} is too short to hold the question ({len(question_ids)} tok) and a random haystack')
+            body = [rng.randrange(haystack_vocab) for _ in range(body_len)]
+        else:
+            if body_len < len(prompt_ids):
+                raise ValueError(f'context_len={context_len} is too short to hold the needle ({len(inserted)} tok) + question ({len(question_ids)} tok) + one haystack repeat ({len(prompt_ids)} tok)')
+            n_repeats, remainder = divmod(body_len, len(prompt_ids))
+            # Fill the final partial repeat too: flooring alone left the context
+            # up to one prompt shorter than the requested length, so trials were
+            # silently scored at different (and smaller) than reported contexts.
+            body = prompt_ids * n_repeats + prompt_ids[:remainder]
         pos = rng.randint(0, len(body))
-        full = body[:pos] + needle_ids + body[pos:] + question_ids
+        full = body[:pos] + inserted + body[pos:] + question_ids
         contexts.append((pos, full))
     n_run = len(contexts)
     if n_run == 0:
@@ -516,6 +541,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                     'bucket': ('early' if pos_frac < 1 / 3
                                else 'middle' if pos_frac < 2 / 3 else 'late'),
                     'correct': bool(not failed[i]),
+                    'needle_present': bool(needle_present),
                     'generated': generated_text,
                 })
     if n_run == 0:
