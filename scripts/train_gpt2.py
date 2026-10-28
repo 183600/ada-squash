@@ -537,6 +537,7 @@ def main():
         if saved_position is None:
             print('[resume] checkpoint predates data-position tracking: the stream restarts from the beginning and REPLAYS training data - finish the run with this caveat, or restart from a newer checkpoint')
         elif args.resume_skip_data:
+            batches_consumed = int(saved_position)
             print(f'[resume] --resume-skip-data: NOT skipping the {saved_position} batches the checkpoint already consumed - the resumed run replays training data (accepted)')
         else:
             print(f'[resume] fast-forwarding the dataloader past {saved_position} already-consumed batches (same streaming order, so the resumed run sees fresh data)...')
