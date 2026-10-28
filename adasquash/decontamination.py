@@ -391,10 +391,18 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     if n == 0:
         return None
     z = NormalDist().inv_cdf(confidence)
-    p = k / n
-    denominator = 1.0 + z * z / n
-    centre = (p + z * z / (2.0 * n)) / denominator
-    margin = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denominator
+    try:
+        p = k / n
+        denominator = 1.0 + z * z / n
+        centre = (p + z * z / (2.0 * n)) / denominator
+        margin = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denominator
+    except OverflowError:
+        inv_n = 1 / n
+        p = k / n
+        denominator = 1.0 + z * z * inv_n
+        centre = (p + z * z * inv_n / 2.0) / denominator
+        margin = z * math.sqrt(
+            p * (1.0 - p) * inv_n + z * z * inv_n * inv_n / 4.0) / denominator
     return min(1.0, centre + margin)
 
 
