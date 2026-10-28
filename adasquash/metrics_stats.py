@@ -621,6 +621,10 @@ def student_t_cdf(t: float, df: float) -> float:
         return 1.0
     if t == float("-inf"):
         return 0.0
+    if df > _T_NORMAL_APPROX_DF:
+        # The incomplete-beta CDF loses accuracy for very large df and can
+        # overflow in `df + t * t`; the normal limit is accurate there.
+        return NormalDist().cdf(t)
     tail = 0.5 * _reg_incomplete_beta(0.5 * df, 0.5, df / (df + t * t))
     return 1.0 - tail if t > 0.0 else tail
 
@@ -645,6 +649,8 @@ def student_t_ppf(p: float, df: float) -> float:
         # adjacent floats whose CDF rounds around 0.5 and return a tiny
         # nonzero value, which would make a 50% interval asymmetric.
         return 0.0
+    if df > _T_NORMAL_APPROX_DF:
+        return NormalDist().inv_cdf(p)
     lo, hi = -1.0, 1.0
     while student_t_cdf(lo, df) > p:
         lo *= 2.0
