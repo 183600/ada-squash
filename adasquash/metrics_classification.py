@@ -187,6 +187,30 @@ def imbalance_report(counts: Sequence[int]) -> dict:
     }
 
 
+def _score_values(scores, metric: str) -> list[float]:
+    """Convert scores to finite floats, rejecting unrepresentable values.
+
+    Python integers larger than a float raise ``OverflowError`` on conversion.
+    Such a score cannot be ranked, so it is a malformed measurement just like
+    NaN/Inf; the caller must see a ``ValueError`` instead of an overflow from
+    inside the metric.
+    """
+    out: list[float] = []
+    for score in scores:
+        try:
+            value = float(score)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"{metric} scores must be finite numbers; a non-numeric "
+                f"score has no rank") from None
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{metric} scores must be finite numbers; a NaN/Inf score "
+                f"has no rank")
+        out.append(value)
+    return out
+
+
 def _tie_groups_ascending(scores: list, labels: list):
     """``(order, groups)`` of one ascending sort, ties collected into groups.
 
@@ -247,15 +271,10 @@ def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
     even when every operating point usable in practice has low precision;
     use `average_precision` (PR-AUC) there.
     """
-    scores = [float(s) for s in scores]
+    scores = _score_values(scores, "roc_auc")
     labels = _binary_labels(labels)
     if len(scores) != len(labels):
         raise ValueError(f"score/label length mismatch: {len(scores)} vs {len(labels)}")
-    if any(not math.isfinite(s) for s in scores):
-        # A NaN score has no rank: Python's sort leaves it wherever it landed,
-        # so the same positive/negative pair can produce different AUCs merely
-        # by reversing the input list. Refuse the malformed measurement.
-        raise ValueError("roc_auc scores must be finite numbers; a NaN/Inf score has no rank")
     n = len(scores)
     n_pos = sum(labels)
     n_neg = n - n_pos
@@ -277,14 +296,10 @@ def average_precision(scores: Sequence[float], labels: Sequence[int]) -> Optiona
     (matching `sklearn.average_precision_score`): random order inside a tie
     earns no precision credit.
     """
-    scores = [float(s) for s in scores]
+    scores = _score_values(scores, "average_precision")
     labels = _binary_labels(labels)
     if len(scores) != len(labels):
         raise ValueError(f"score/label length mismatch: {len(scores)} vs {len(labels)}")
-    if any(not math.isfinite(s) for s in scores):
-        # Same order-dependence as roc_auc: NaN has no threshold position.
-        raise ValueError("average_precision scores must be finite numbers; "
-                         "a NaN/Inf score has no rank")
     n_pos = sum(labels)
     if n_pos == 0:
         return None
