@@ -357,6 +357,10 @@ def binary_auc_report(
     optimistic and PR-AUC is the metric to read.
     """
     classes = [_strict_int(c, "class id") for c in classes]
+    if len(set(classes)) != len(classes):
+        raise ValueError(
+            "classes must be unique: a repeated id would score one target "
+            "class against several score columns and double-count it in the averages")
     gold = [_strict_int(g, "gold class id") for g in gold]
     rows = list(scores)
     if len(rows) != len(gold):
