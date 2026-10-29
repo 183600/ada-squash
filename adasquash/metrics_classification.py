@@ -219,6 +219,11 @@ def _score_values(scores, metric: str) -> list[float]:
     """
     out: list[float] = []
     for score in scores:
+        if (isinstance(score, bool)
+                or isinstance(score, (str, bytes, bytearray))):
+            raise ValueError(
+                f"{metric} scores must be finite numbers; a boolean/string "
+                f"score has no rank")
         try:
             value = float(score)
         except (TypeError, ValueError, OverflowError):
@@ -369,11 +374,11 @@ def binary_auc_report(
     # Python's sort leaves it wherever it landed, making the reported AUC
     # depend on the arbitrary order of the input rows.
     try:
-        cols = [[float(v) for v in col] for col in cols]
-    except (TypeError, ValueError, OverflowError):
+        cols = [_score_values(col, "binary_auc_report") for col in cols]
+    except ValueError:
         raise ValueError(
-            "binary_auc_report scores must be finite numbers; a non-numeric "
-            "score has no rank") from None
+            "binary_auc_report scores must be finite numbers; a boolean/string "
+            "or non-numeric score has no rank") from None
     if any(not math.isfinite(v) for col in cols for v in col):
         raise ValueError(
             "binary_auc_report scores must be finite numbers; a NaN/Inf score "
