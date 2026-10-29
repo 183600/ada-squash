@@ -373,6 +373,12 @@ def efficiency_verdict(
             "loss improvement/cost ratio is a boolean, not a measurement; "
             "nothing to certify")
         return verdict
+    if (not isinstance(loss_improvement, numbers.Number)
+            or not isinstance(cost_ratio, numbers.Number)):
+        verdict["reason"] = (
+            "loss improvement/cost ratio cannot be read as a finite measurement; "
+            "nothing to certify")
+        return verdict
     try:
         gain = float(loss_improvement)
         cost = float(cost_ratio)
@@ -400,6 +406,9 @@ def efficiency_verdict(
         if _is_boolean_value(cost_ratio_stderr):
             invalid_se = repr(cost_ratio_stderr)
             candidate_se = None
+        elif not isinstance(cost_ratio_stderr, numbers.Number):
+            invalid_se = repr(cost_ratio_stderr)
+            candidate_se = None
         else:
             try:
                 candidate_se = float(cost_ratio_stderr)
@@ -419,6 +428,8 @@ def efficiency_verdict(
         # int(2.5) would silently turn a fractional round count into 2 and
         # let it certify a t-interval.
         if _is_boolean_value(cost_ratio_n):
+            invalid_n = repr(cost_ratio_n)
+        elif not isinstance(cost_ratio_n, numbers.Number):
             invalid_n = repr(cost_ratio_n)
         elif isinstance(cost_ratio_n, numbers.Integral):
             # A huge Python integer is a finite integral count even though it
@@ -513,6 +524,14 @@ def efficiency_verdict(
             }
             verdict["component_failures"].append(
                 f"{name} is unmeasured; cannot certify it stays within {component_limit:.3f}x")
+            continue
+        if not isinstance(raw_ratio, numbers.Number):
+            verdict["component_costs"][str(name)] = {
+                "ratio": None,
+                "acceptable": False,
+            }
+            verdict["component_failures"].append(
+                f"{name} ratio {raw_ratio!r} is not a finite non-negative measurement")
             continue
         try:
             ratio = float(raw_ratio)
