@@ -26,6 +26,7 @@ plain dicts/lists and are unit-testable without a model.
 import bisect
 import math
 from collections.abc import Mapping
+from fractions import Fraction
 from typing import Optional, Sequence
 
 import torch
@@ -102,7 +103,8 @@ def _finite_float_or_none(value) -> Optional[float]:
     JSON integers can exceed the finite float range; converting one must not
     abort a curve report that is supposed to explain bad measurements.
     """
-    if value is None:
+    if (value is None or _is_boolean_scalar(value)
+            or isinstance(value, (str, bytes, bytearray))):
         return None
     try:
         converted = float(value)
@@ -128,7 +130,17 @@ def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]
     if len(tail) < 2:
         return None
     first, last = tail[0], tail[-1]
-    return (last - first) / max(abs(first), 1e-8)
+    denominator = max(abs(first), 1e-8)
+    change = (last - first) / denominator
+    if math.isfinite(change):
+        return change
+    # Two finite values near opposite float limits have a difference larger
+    # than the float range. The relative change itself is still a small
+    # ordinary number; compute it exactly instead of reporting ±inf.
+    try:
+        return float((Fraction(last) - Fraction(first)) / Fraction(denominator))
+    except OverflowError:
+        return math.inf if last > first else -math.inf
 
 
 def _step_aligned_gap_points(train_losses, val_losses, train_steps, val_steps):
