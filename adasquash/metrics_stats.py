@@ -154,21 +154,22 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
             f"wilson_interval needs 0 <= n_success <= n_total, got "
             f"{n_success} successes out of {n_total} trials")
     z2 = z * z
-    try:
-        p = n_success / n_total
-        denom = 1.0 + z2 / n_total
-        centre = (p + z2 / (2.0 * n_total)) / denom
-        half = (z / denom) * math.sqrt(
-            p * (1.0 - p) / n_total + z2 / (4.0 * n_total * n_total)
-        )
-    except OverflowError:
-        inv_n = 1 / n_total
-        p = n_success / n_total
-        denom = 1.0 + z2 * inv_n
-        centre = (p + z2 * inv_n / 2.0) / denom
-        half = (z / denom) * math.sqrt(
-            p * (1.0 - p) * inv_n + z2 * inv_n * inv_n / 4.0
-        )
+    # Work in units of 1/n. `2.0 * n_total` / `4.0 * n_total * n_total`
+    # overflow to inf for huge counts without raising, which zeroed the
+    # z^2/(2n) and variance-of-mean terms and collapsed the interval to a
+    # point. `1 / n_total` stays exact-or-subnormal instead of converting
+    # the count itself to a float.
+    inv_n = 1 / n_total
+    p = n_success / n_total
+    denom = 1.0 + z2 * inv_n
+    centre = (p + z2 * inv_n / 2.0) / denom
+    # Split the root into its two components before squaring: `p*(1-p)/n`
+    # and `(z/(2n))^2` can each underflow as a single product, while the
+    # square roots and the hypot keep the small terms.
+    root = math.hypot(
+        math.sqrt(p * (1.0 - p)) * math.sqrt(inv_n),
+        z * inv_n / 2.0)
+    half = (z / denom) * root
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
