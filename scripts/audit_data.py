@@ -539,23 +539,46 @@ def split_token_budget(stats: dict, report: dict) -> dict:
         raise ValueError(
             f"documents_sampled={sampled} exceeds the nominal split size "
             f"{nominal}; a sampled prefix cannot be longer than its split")
-    mean_tokens = tokens / effective_documents
+    def _exact_ratio(numerator, denominator):
+        """Ratio, keeping an integral result exact and never overflowing."""
+        if denominator == 0:
+            return None
+        if isinstance(numerator, int) and isinstance(denominator, int):
+            quotient, remainder = divmod(numerator, denominator)
+            if remainder == 0:
+                return quotient
+        try:
+            return numerator / denominator
+        except OverflowError:
+            try:
+                return float(Fraction(numerator) / Fraction(denominator))
+            except OverflowError:
+                return math.inf if numerator > 0 else -math.inf
+
+    mean_tokens = _exact_ratio(tokens, effective_documents)
     result['tokens_per_effective_document'] = mean_tokens
     if result['exhaustive']:
         # `exhaustive` means the collector reached the end of the split
         # stream. The observed count is then exact even when the upstream
         # stream is shorter than its reported nominal length; extrapolating
         # to `nominal` would invent documents the stream never contained.
-        estimated_documents = float(effective_documents)
+        estimated_documents = effective_documents
+        estimated_tokens = tokens
         result['basis'] = 'observed'
     elif nominal is not None:
-        estimated_documents = nominal * (effective_documents / sampled)
+        # tokens/effective * (nominal*effective/sampled) = tokens*nominal/sampled;
+        # computing the counted token total directly keeps a huge corpus exact
+        # instead of passing the ratio through a float.
+        estimated_documents = _exact_ratio(
+            nominal * effective_documents, sampled)
+        estimated_tokens = _exact_ratio(tokens * nominal, sampled)
         result['basis'] = 'extrapolated_from_sampled_prefix'
     else:
-        estimated_documents = float(effective_documents)
+        estimated_documents = effective_documents
+        estimated_tokens = tokens
         result['basis'] = 'sampled_only'
     result['estimated_effective_documents'] = estimated_documents
-    result['estimated_effective_tokens'] = mean_tokens * estimated_documents
+    result['estimated_effective_tokens'] = estimated_tokens
     return result
 
 
