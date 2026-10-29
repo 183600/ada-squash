@@ -489,15 +489,22 @@ def _p_one_sided_from_z(z: float) -> float:
 def _int_over_sqrt(value: int, n: int) -> float:
     """``value / sqrt(n)`` for arbitrary Python ints, without float overflow.
 
-    ``math.sqrt(n)`` raises ``OverflowError`` when ``n`` exceeds the float
-    range, and ``float(value)`` can do the same for the numerator. Dividing
-    the two ints directly lets Python's long true-division scale the quotient;
-    only a genuinely unrepresentable result becomes an infinity.
+    The direct float path is exact to the usual rounding. Only when either
+    operand exceeds the float range do we evaluate the quotient through
+    logarithms; using ``isqrt(n)`` as a substitute denominator would inflate
+    the z-score noticeably just above the large-sample threshold.
     """
     try:
-        return value / math.isqrt(n)
+        return value / math.sqrt(n)
     except OverflowError:
-        return math.copysign(math.inf, value)
+        pass
+    if value == 0:
+        return 0.0
+    try:
+        magnitude = math.exp(math.log(abs(value)) - 0.5 * math.log(n))
+    except OverflowError:
+        magnitude = math.inf
+    return -magnitude if value < 0 else magnitude
 
 
 def _betacf(a: float, b: float, x: float) -> float:
