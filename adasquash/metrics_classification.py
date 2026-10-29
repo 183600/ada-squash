@@ -7,7 +7,7 @@ import random
 from typing import Optional, Sequence
 
 from .metrics_stats import (_EXTREME_IMBALANCE,
-                               _binary_labels, _strict_int)
+                               _binary_labels, _is_boolean_value, _strict_int)
 
 def _weighted_mean(values: Sequence[float], weights: Sequence[int],
                   total: int) -> float:
@@ -219,7 +219,7 @@ def _score_values(scores, metric: str) -> list[float]:
     """
     out: list[float] = []
     for score in scores:
-        if (isinstance(score, bool)
+        if (_is_boolean_value(score)
                 or isinstance(score, (str, bytes, bytearray))):
             raise ValueError(
                 f"{metric} scores must be finite numbers; a boolean/string "
