@@ -453,11 +453,16 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
                      "that a new run cannot differ"),
         })
         return out
-    scale = std * math.sqrt(1.0 + 1.0 / n)
+    spread_factor = math.sqrt(1.0 + 1.0 / n)
+    scale = std * spread_factor
     half = student_t_ppf(1.0 - alpha / 2.0, df) * scale
     out["prediction_low"] = mean - half
     out["prediction_high"] = mean + half
-    out["same_direction_probability"] = student_t_cdf(abs(mean) / scale, df)
+    # Divide by `std` before the spread factor so a representable std near
+    # the float limit does not overflow the denominator to infinity and turn
+    # the probability into a spurious 0.5.
+    out["same_direction_probability"] = student_t_cdf(
+        abs(mean) / std / spread_factor, df)
     return out
 
 
