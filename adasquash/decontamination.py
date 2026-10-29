@@ -176,6 +176,9 @@ def benchmark_fingerprint(records_by_benchmark: dict) -> dict:
     for name in sorted(records_by_benchmark, key=str):
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"benchmark name must be a non-empty string, got {name!r}")
+        if name == "combined_sha256":
+            raise ValueError(
+                "benchmark name 'combined_sha256' is reserved for the combined digest")
         records = list(records_by_benchmark[name])
         texts = sorted({normalize_match_text(benchmark_text(record))
                         for record in records})
