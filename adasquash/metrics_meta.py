@@ -902,13 +902,14 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
         random_effects.update({
             'ci_low': random_pooled - critical * random_stderr,
             'ci_high': random_pooled + critical * random_stderr,
-            't': random_pooled / random_stderr,
             'df': df,
         })
-        random_effects['p_one_sided'] = student_t_cdf(
-            random_effects['t'], df)
-        random_effects['p_two_sided'] = two_sided_p_from_t(
-            random_effects['t'], df)
+        if math.isfinite(random_stderr):
+            random_effects['t'] = random_pooled / random_stderr
+            random_effects['p_one_sided'] = student_t_cdf(
+                random_effects['t'], df)
+            random_effects['p_two_sided'] = two_sided_p_from_t(
+                random_effects['t'], df)
     random_effects['pooled_effect'] = random_pooled
     random_effects['stderr'] = random_stderr
     random_effects['tau_squared'] = tau_squared
