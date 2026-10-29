@@ -400,8 +400,16 @@ def split_document_boundaries(num_documents: int, val_frac: float, test_frac: fl
         raise ValueError(
             f"val_frac={val_frac} + test_frac={test_frac} leaves no training "
             "documents; the split fractions must sum to less than 1")
-    val_n = int(round(num_documents * val_frac))
-    test_n = int(round(num_documents * test_frac))
+    try:
+        val_n = int(round(num_documents * val_frac))
+        test_n = int(round(num_documents * test_frac))
+    except OverflowError:
+        # A huge (but valid) document count has no finite float product with a
+        # fractional split. Scale the exact binary fraction instead so the
+        # boundaries still sum to num_documents.
+        from fractions import Fraction
+        val_n = int(round(num_documents * Fraction(val_frac)))
+        test_n = int(round(num_documents * Fraction(test_frac)))
     if val_frac > 0.0:
         val_n = max(1, val_n)
     if test_frac > 0.0:
