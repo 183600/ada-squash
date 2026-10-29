@@ -9,10 +9,10 @@ from typing import Optional, Sequence
 
 _Z_95 = 1.959963984540054
 MIN_SEEDS_FOR_SIGNIFICANCE = 3
-# Above this many degrees of freedom the t distribution is indistinguishable
-# from the normal limit at double precision, while the incomplete-beta CDF
-# loses accuracy (and eventually overflows) for very large df.
-_T_NORMAL_APPROX_DF = 1.0e7
+# Above this many degrees of freedom the first-order normal expansion below
+# is more accurate than the incomplete-beta CDF, which loses precision (and
+# eventually overflows) for very large df.
+_T_NORMAL_APPROX_DF = 1.0e6
 # Above this many observations the 2**n sign-flip enumeration is no
 # longer a cheap exact computation; use the seeded Monte-Carlo branch.
 _RANDOMIZATION_EXACT_MAX = 20
@@ -706,10 +706,16 @@ def student_t_cdf(t: float, df: float) -> float:
         return 1.0
     if t == float("-inf"):
         return 0.0
-    if df > _T_NORMAL_APPROX_DF:
+    if df >= _T_NORMAL_APPROX_DF:
         # The incomplete-beta CDF loses accuracy for very large df and can
-        # overflow in `df + t * t`; the normal limit is accurate there.
-        return NormalDist().cdf(t)
+        # overflow in `df + t * t`. The O(1/df) normal expansion keeps the
+        # leading t-correction instead of dropping to the pure normal limit.
+        normal = NormalDist().cdf(t)
+        if abs(t) < 1.0e100:
+            correction = (math.exp(-0.5 * t * t) / _SQRT_2PI
+                          * (t * t * t + t) / (4.0 * df))
+            return min(1.0, max(0.0, normal - correction))
+        return normal
     tail = 0.5 * _reg_incomplete_beta(0.5 * df, 0.5, df / (df + t * t))
     return 1.0 - tail if t > 0.0 else tail
 
@@ -734,8 +740,12 @@ def student_t_ppf(p: float, df: float) -> float:
         # adjacent floats whose CDF rounds around 0.5 and return a tiny
         # nonzero value, which would make a 50% interval asymmetric.
         return 0.0
-    if df > _T_NORMAL_APPROX_DF:
-        return NormalDist().inv_cdf(p)
+    if df >= _T_NORMAL_APPROX_DF:
+        z = NormalDist().inv_cdf(p)
+        if abs(z) < 1.0e100:
+            # Cornish-Fisher inverse of the same O(1/df) CDF correction.
+            z += (z * z * z + z) / (4.0 * df)
+        return z
     lo, hi = -1.0, 1.0
     while student_t_cdf(lo, df) > p:
         lo *= 2.0
@@ -935,9 +945,8 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     one implementation means a power plan and a reported MDE never disagree.
 
     An ``n`` beyond the float range is a legitimate (if absurd) power-plan
-    input, not a reason to crash. Above ``_T_NORMAL_APPROX_DF`` degrees of
-    freedom the t quantiles are computed from the normal limit, which is
-    accurate to better than double precision there; ``1 / sqrt(n)`` is
+    input, not a reason to crash. Large finite degrees of freedom use the
+    normal expansion maintained by ``student_t_ppf``; ``1 / sqrt(n)`` is
     evaluated through its logarithm when converting ``n`` to float would
     overflow.
     """
@@ -946,7 +955,7 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     except OverflowError:
         df = math.inf
     upper_tail = 1.0 - alpha
-    if not math.isfinite(df) or df > _T_NORMAL_APPROX_DF:
+    if not math.isfinite(df):
         normal = NormalDist()
         # For an extremely small alpha, `1 - alpha` rounds to 1 and the
         # inverse CDF rejects it. The upper quantile is minus the lower
