@@ -581,6 +581,62 @@ def _gamma_q_cf(a: float, x: float) -> float:
     return math.exp(-x + a * math.log(x) - math.lgamma(a)) * h
 
 
+_CHI2_SADDLEPOINT_MIN_DF = 1.0e6
+_SQRT_2 = math.sqrt(2.0)
+_SQRT_2PI = math.sqrt(2.0 * math.pi)
+
+
+def _chi2_sf_large_df(x: float, df: float) -> float:
+    """Chi-square upper tail for a very large ``df`` by a saddlepoint.
+
+    The incomplete-gamma continued fraction loses precision once both the
+    shape and the argument are huge, and ``lgamma`` eventually overflows.
+    Lugannani-Rice around the gamma saddlepoint stays accurate (absolute
+    error near the mean is O(df^-3/2)) and only needs representable logs.
+    """
+    a = 0.5 * df
+    half = 0.5 * x
+    # Standardized distance from the mean, d/a. Values this close to -1 mean
+    # x is negligible compared with df, so the upper tail is 1.
+    s = half / a - 1.0
+    if s <= -1.0:
+        return 1.0
+    if s == 0.0:
+        return min(1.0, 0.5 - 1.0 / (_SQRT_2PI * 3.0 * math.sqrt(a)))
+    if abs(s) < 0.1:
+        # s - log1p(s) as a series, avoiding cancellation near the mean.
+        series = 0.0
+        power = s * s
+        k = 2
+        while True:
+            step = power / k
+            series = series + step if k % 2 == 0 else series - step
+            power *= s
+            k += 1
+            if abs(step) <= abs(series) * 1e-17 or k > 200:
+                break
+        w_squared = 2.0 * a * series
+    else:
+        w_squared = 2.0 * (half - a - a * math.log1p(s))
+    if w_squared < 0.0:
+        w_squared = 0.0
+    if math.isinf(w_squared):
+        return 0.0 if s > 0.0 else 1.0
+    w = math.copysign(math.sqrt(w_squared), s)
+    phi = math.exp(-0.5 * w_squared) / _SQRT_2PI
+    if abs(w) < 1e-3:
+        correction = 1.0 / (3.0 * math.sqrt(a))
+    else:
+        u = s * math.sqrt(a)
+        correction = 1.0 / w - 1.0 / u
+    if s > 0.0:
+        tail = 0.5 * math.erfc(w / _SQRT_2) - phi * correction
+    else:
+        cdf = 0.5 * math.erfc(-w / _SQRT_2) + phi * correction
+        tail = 1.0 - cdf
+    return min(1.0, max(0.0, tail))
+
+
 def chi2_sf(x: float, df: float) -> float:
     """Upper-tail probability P(X >= x) for a chi-square with `df` d.o.f.
 
@@ -604,6 +660,8 @@ def chi2_sf(x: float, df: float) -> float:
         return 1.0
     if math.isinf(x):
         return 0.0
+    if df > _CHI2_SADDLEPOINT_MIN_DF:
+        return _chi2_sf_large_df(x, df)
     a = 0.5 * df
     half = 0.5 * x
     if half < a + 1.0:
