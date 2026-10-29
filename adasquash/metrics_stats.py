@@ -889,7 +889,23 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
         inverse_sqrt_n = 1.0 / math.sqrt(n)
     except OverflowError:
         inverse_sqrt_n = math.exp(-0.5 * math.log(n))
-    return critical * std * inverse_sqrt_n
+    result = critical * std * inverse_sqrt_n
+    if math.isfinite(result) and result != 0.0:
+        return result
+    if std == 0.0 or critical == 0.0 or inverse_sqrt_n == 0.0:
+        return result
+    # A huge standard deviation multiplied by the t quantile can overflow
+    # before the division by sqrt(n), while the true MDE is representable.
+    # Re-associate the factors, then fall back to logarithms for the extreme
+    # underflow case where both direct orders round to zero.
+    regrouped = critical * (std * inverse_sqrt_n)
+    if math.isfinite(regrouped) and regrouped != 0.0:
+        return regrouped
+    try:
+        return math.exp(math.log(critical) + math.log(std)
+                        + math.log(inverse_sqrt_n))
+    except OverflowError:
+        return float("inf")
 
 
 def _validate_design_inputs(std, alpha: float, power: float) -> tuple[float, float, float]:
