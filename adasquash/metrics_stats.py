@@ -736,7 +736,16 @@ def student_t_cdf(t: float, df: float) -> float:
                           * (t * t * t + t) / (4.0 * df))
             return min(1.0, max(0.0, normal - correction))
         return normal
-    tail = 0.5 * _reg_incomplete_beta(0.5 * df, 0.5, df / (df + t * t))
+    x = df / (df + t * t)
+    if x > 0.5:
+        # `df / (df + t * t)` rounds to 1 for tiny `t`, which makes the
+        # incomplete beta exactly 1 and collapses the CDF to 0.5. Use the
+        # complementary argument `t^2 / (df + t^2)` instead: it keeps the
+        # O(t) shift around the median representable.
+        y = (t * t) / (df + t * t)
+        tail = 0.5 * _reg_incomplete_beta(0.5, 0.5 * df, y)
+        return 0.5 + tail if t > 0.0 else 0.5 - tail
+    tail = 0.5 * _reg_incomplete_beta(0.5 * df, 0.5, x)
     return 1.0 - tail if t > 0.0 else tail
 
 
