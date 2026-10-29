@@ -10,7 +10,7 @@ from .metrics_stats import (MIN_SEEDS_FOR_SIGNIFICANCE,
                          _RANDOMIZATION_EXACT_MAX, _as_real,
                          _is_boolean_value, _mean_and_std, _real_values,
                          _p_one_sided_from_z, _strict_int, _validate_alpha,
-                         chi2_sf, leave_one_out_jackknife,
+                         _validate_margin, chi2_sf, leave_one_out_jackknife,
                          mean_prediction_interval, mean_std_stderr,
                          paired_t_one_sided, student_t_cdf, student_t_ppf,
                          two_sided_p_from_t)
@@ -557,6 +557,7 @@ def welch_z_one_sided(
     """
     a = _real_values(a, "a")
     b = _real_values(b, "b")
+    margin = _validate_margin(margin)
     if len(a) < 2 or len(b) < 2:
         return {"mean_delta": None, "z": None, "p_one_sided": None,
                 "n": [len(a), len(b)], "paired": False}
@@ -592,6 +593,7 @@ def welch_t_one_sided(
     a = _real_values(a, "a")
     b = _real_values(b, "b")
     alpha = _validate_alpha(alpha)
+    margin = _validate_margin(margin)
     na, nb = len(a), len(b)
     empty = {
         "mean_delta": None, "t": None, "df": None, "p_one_sided": None,

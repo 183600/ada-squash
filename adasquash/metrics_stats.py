@@ -114,6 +114,20 @@ def _validate_alpha(alpha, name: str = "alpha") -> float:
     return value
 
 
+def _validate_margin(margin, name: str = "margin") -> float:
+    """A practical margin must be a finite real number.
+
+    ``margin=True`` would otherwise be used as a 1.0 margin and a NaN margin
+    would make the t/z statistic and its p-value NaN while the rest of the
+    report still looks measured. Strings and other non-numbers are rejected
+    instead of being coerced by ``float()``.
+    """
+    value = _as_real(margin)
+    if value is None or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {margin!r}")
+    return value
+
+
 def _binary_labels(labels, name: str = "labels") -> list[int]:
     """0/1 labels without truthiness coercion.
 
@@ -830,6 +844,7 @@ def paired_z_one_sided(
     """
     a = _real_values(a, "a")
     b = _real_values(b, "b")
+    margin = _validate_margin(margin)
     if len(a) != len(b):
         raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
     n = len(a)
@@ -875,6 +890,7 @@ def paired_t_one_sided(
     a = _real_values(a, "a")
     b = _real_values(b, "b")
     alpha = _validate_alpha(alpha)
+    margin = _validate_margin(margin)
     if len(a) != len(b):
         raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
     n = len(a)
