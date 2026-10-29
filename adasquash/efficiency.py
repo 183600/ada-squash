@@ -99,7 +99,14 @@ def _t_critical_95(df: int) -> float:
         return float("inf")
     if df <= len(_T95):
         return _T95[df - 1]
-    return student_t_ppf(0.975, float(df))
+    try:
+        df_float = float(df)
+    except OverflowError:
+        # Beyond the float range the t distribution is indistinguishable from
+        # the normal limit; using an enormous representable df keeps the same
+        # critical value instead of rejecting the exact integer round count.
+        df_float = 1.0e300
+    return student_t_ppf(0.975, df_float)
 
 
 def mlp_hidden_size(dim: int, mlp_ratio: float) -> int:
@@ -413,6 +420,11 @@ def efficiency_verdict(
         # let it certify a t-interval.
         if _is_boolean_value(cost_ratio_n):
             invalid_n = repr(cost_ratio_n)
+        elif isinstance(cost_ratio_n, numbers.Integral):
+            # A huge Python integer is a finite integral count even though it
+            # has no float image; converting through float would reject it as
+            # malformed. Keep the exact integer for `df`.
+            cost_n = int(cost_ratio_n)
         else:
             try:
                 candidate_n = float(cost_ratio_n)
