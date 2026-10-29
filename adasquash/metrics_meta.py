@@ -1247,7 +1247,11 @@ def scale_replication_summary(observations: Sequence[dict],
         if not scale:
             excluded.append({'index': index, 'reason': 'missing scale'})
             continue
-        if _is_boolean_value(delta) or delta is None:
+        if (_is_boolean_value(delta) or delta is None
+                or isinstance(delta, (str, bytes, bytearray))):
+            # A numeric string is not an observed effect: `float("-0.2")`
+            # would let a malformed artifact join the sign vote even though
+            # `meta_analysis` excludes the same record as non-numeric.
             excluded.append({'index': index, 'scale': scale, 'metric': metric,
                              'reason': f'non-finite delta {delta!r}'})
             continue
