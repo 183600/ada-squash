@@ -267,7 +267,12 @@ def _mean_and_std(values: Sequence[float]):
                        for value in values) / (n - 1)
         std = math.sqrt(variance)
         if math.isfinite(mean) and math.isfinite(std):
-            return mean, std
+            # A zero standard deviation is the correct answer for a constant
+            # sample, but tiny non-constant values can also square to zero and
+            # fake a constant sample. Fall through to the scaled path in that
+            # case so differences near the underflow limit keep their spread.
+            if std > 0.0 or all(value == values[0] for value in values):
+                return mean, std
     except OverflowError:
         pass
     if not all(math.isfinite(value) for value in values):
