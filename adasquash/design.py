@@ -1800,9 +1800,13 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
         variance_scaled = (
             sum((value - mean_scaled) ** 2 for value in means)
             / (len(means) - 1))
-        if math.isfinite(variance_scaled):
+        if math.isfinite(variance_scaled) and variance_scaled > 0.0:
             estimate_sd = math.sqrt(variance_scaled) * scale
         else:
+            # A zero variance can be a genuine constant sample or the
+            # underflow of tiny squared deviations. Recompute around the
+            # largest spread in normalized units; the constant case still
+            # falls through with spread == 0 and reports a zero SD.
             spread = max(abs(value - mean_scaled) for value in means)
             if spread == 0.0:
                 estimate_sd = 0.0
