@@ -277,6 +277,18 @@ def markov_batch(rng: torch.Generator, ignore_index: int, batch_size: int, seq_l
         x[spike] = outlier_id
     return (x, y)
 
+def _is_boolean_scalar(value) -> bool:
+    """Python and NumPy booleans.
+
+    ``isinstance(np.bool_(True), bool)`` is False; without this check a NumPy
+    boolean is silently coerced to 1.0 by ``float()`` and enters the loss EMA
+    as a real observation.
+    """
+    if isinstance(value, bool):
+        return True
+    cls = type(value)
+    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+
 class LossSpikeCounter:
 
     def __init__(self, ema_beta: float=0.99, rel_threshold: float=0.2, abs_threshold: float=0.05):
@@ -295,7 +307,7 @@ class LossSpikeCounter:
         # spike detection. Keep it visible in the history but leave the
         # baseline untouched so the next finite loss is still judged against
         # the last finite one.
-        if isinstance(loss_value, bool):
+        if _is_boolean_scalar(loss_value):
             self.history.append((loss_value, self.ema, False))
             return False
         try:
