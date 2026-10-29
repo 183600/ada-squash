@@ -282,6 +282,23 @@ def compare_train_streams(reference: dict, other: dict) -> dict:
             problems.append(
                 f"training stream prefix sizes differ: {a} vs {b}; the prefix "
                 "digests cover different numbers of batches")
+    if not problems:
+        # A prefix cannot cover more batches than the run consumed or than the
+        # fingerprint was configured to keep. Such a record is malformed, and
+        # treating it as a comparable shared prefix would overstate the scope
+        # of the digest comparison.
+        for label, record in (("reference", reference), ("other", other)):
+            prefix = _stream_count(record, "prefix_batches")
+            target = _stream_count(record, "prefix_batches_target")
+            batches = _stream_count(record, "batches")
+            if prefix > target:
+                problems.append(
+                    f"training stream {label} prefix_batches={prefix} exceeds "
+                    f"prefix_batches_target={target}; the record is malformed")
+            if prefix > batches:
+                problems.append(
+                    f"training stream {label} prefix_batches={prefix} exceeds "
+                    f"the {batches} batch(es) consumed; the record is malformed")
     if problems:
         return {
             "recorded": True,
