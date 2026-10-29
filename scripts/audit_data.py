@@ -85,6 +85,7 @@ import numbers
 import sys
 from array import array
 from collections import Counter
+from fractions import Fraction
 from pathlib import Path
 from statistics import NormalDist
 
@@ -558,6 +559,39 @@ def split_token_budget(stats: dict, report: dict) -> dict:
     return result
 
 
+def _numeric_token_count(value, name: str):
+    """Validate a token measurement without forcing an exact int through float.
+
+    A JSON token count can be an arbitrary-precision integer; converting it to
+    float loses the low bits above 2**53 and can overflow entirely. Integral
+    inputs stay exact, while fractional estimates keep their float image.
+    """
+    if _is_boolean_scalar(value):
+        raise ValueError(f"{name} must be numeric or None, got {value!r}")
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be numeric or None, got {value!r}") from None
+    if not math.isfinite(converted):
+        raise ValueError(f"{name} must be numeric or None, got {value!r}")
+    return converted
+
+
+def _safe_ratio(numerator, denominator):
+    """Divide measurements without overflowing on a huge exact denominator."""
+    if denominator == 0:
+        return None
+    try:
+        return numerator / denominator
+    except OverflowError:
+        try:
+            return float(Fraction(numerator) / Fraction(denominator))
+        except OverflowError:
+            return math.inf if numerator > 0 else -math.inf
+
+
 def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
     """Compare the planned training-token budget with the effective train split.
 
@@ -574,15 +608,9 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
             f"budget must be a mapping or None, got {type(budget).__name__}")
     estimated = None if budget is None else budget.get('estimated_effective_tokens')
     if estimated is not None:
-        if _is_boolean_scalar(estimated):
-            raise ValueError(
-                f"estimated_effective_tokens must be numeric or None, got {estimated!r}")
-        try:
-            estimated = float(estimated)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(
-                f"estimated_effective_tokens must be numeric or None, got {estimated!r}") from None
-        if not math.isfinite(estimated) or estimated < 0.0:
+        estimated = _numeric_token_count(
+            estimated, "estimated_effective_tokens")
+        if estimated < 0.0:
             raise ValueError(
                 "estimated_effective_tokens must be finite and >= 0, "
                 f"got {estimated!r}")
@@ -606,7 +634,7 @@ def train_wrap_status(budget: dict | None, scheduled_tokens: int) -> dict:
     # so leave the wrap verdict unknown instead of aborting a legitimate run.
     if (scheduled > 0 and estimated is not None
             and result['basis'] != 'sampled_only'):
-        result['coverage_ratio'] = estimated / scheduled
+        result['coverage_ratio'] = _safe_ratio(estimated, scheduled)
         result['wrap_expected'] = estimated < scheduled
     return result
 
@@ -623,12 +651,9 @@ def packed_window_count(tokens, seq_len: int) -> int | None:
     """
     if tokens is None:
         return None
-    if _is_boolean_scalar(tokens):
-        raise ValueError(f"token count must be numeric or None, got {tokens!r}")
-    try:
-        tokens = int(math.floor(float(tokens)))
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f"token count must be numeric or None, got {tokens!r}") from None
+    tokens = _numeric_token_count(tokens, "token count")
+    if not isinstance(tokens, int):
+        tokens = math.floor(tokens)
     seq_len = _strict_int_option(seq_len, "seq_len", 1)
     if tokens < 1:
         return 0
@@ -657,15 +682,8 @@ def eval_batch_capacity(budget: dict | None, seq_len: int, batch_size: int) -> d
         # A bool is not a token measurement: float(True) would turn it into a
         # one-token budget and report a capacity for a value the audit never
         # measured (the same rule the sibling budget helpers enforce).
-        if _is_boolean_scalar(tokens):
-            raise ValueError(
-                f"estimated_effective_tokens must be numeric or None, got {tokens!r}")
-        try:
-            tokens = float(tokens)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(
-                f"estimated_effective_tokens must be numeric or None, got {tokens!r}") from None
-        if not math.isfinite(tokens) or tokens < 0:
+        tokens = _numeric_token_count(tokens, "estimated_effective_tokens")
+        if tokens < 0:
             raise ValueError(
                 f"estimated_effective_tokens must be finite and >= 0, got {tokens!r}")
     windows = packed_window_count(tokens, seq_len)
@@ -720,15 +738,8 @@ def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
     tokens = capacity.get('estimated_effective_tokens')
     tokens_per_batch = capacity.get('tokens_per_batch')
     if tokens is not None:
-        if _is_boolean_scalar(tokens):
-            raise ValueError(
-                f"estimated_effective_tokens must be numeric or None, got {tokens!r}")
-        try:
-            tokens = float(tokens)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(
-                f"estimated_effective_tokens must be numeric or None, got {tokens!r}") from None
-        if not math.isfinite(tokens) or tokens < 0.0:
+        tokens = _numeric_token_count(tokens, "estimated_effective_tokens")
+        if tokens < 0.0:
             raise ValueError(
                 "estimated_effective_tokens must be finite and >= 0, "
                 f"got {tokens!r}")
@@ -739,7 +750,8 @@ def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
     planned_tokens = (None if tokens_per_batch is None
                       else requested_batches * tokens_per_batch)
     token_coverage = (
-        None if tokens is None or not planned_tokens else tokens / planned_tokens)
+        None if tokens is None or not planned_tokens
+        else _safe_ratio(tokens, planned_tokens))
     if split == 'validation':
         reuses = None if unique is None else requested_batches > unique
         cycled = requested_batches - unique if reuses else 0
@@ -762,7 +774,8 @@ def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
         passes = max_steps // val_every
     selection_draws = None if passes is None else passes * requested_batches
     selection_reuse_factor = (
-        None if selection_draws is None or not unique else selection_draws / unique)
+        None if selection_draws is None or not unique
+        else _safe_ratio(selection_draws, unique))
     return {
         'split': split,
         'requested_batches': requested_batches,
