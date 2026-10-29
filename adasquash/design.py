@@ -1733,7 +1733,15 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
     seed = _validate_seed(seed)
 
     rng = random.Random(seed)
-    draw = _normal_sampler(rng, float(effect), float(paired_sd))
+    # Above this scale the direct draws and their squares can overflow even
+    # when the reported mean and standard error are representable. The paired
+    # tests are invariant to a positive common scale, so draw in normalized
+    # units and map only the descriptive estimates back afterwards.
+    simulation_scale = max(abs(effect_value), paired_sd_value)
+    scaled_run = simulation_scale > 1e150
+    scale = simulation_scale if scaled_run else 1.0
+    draw = _normal_sampler(rng, effect_value / scale, paired_sd_value / scale)
+    test_margin = equivalence_value / scale
     detection = 0
     equivalence = 0
     undefined = 0
@@ -1741,20 +1749,39 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
     for _ in range(reps):
         deltas = [draw() for _ in range(n_pairs)]
         means.append(sum(deltas) / n_pairs)
-        test = paired_t_one_sided(deltas, [0.0] * n_pairs, margin=0.0, alpha=float(alpha))
+        test = paired_t_one_sided(deltas, [0.0] * n_pairs, margin=0.0,
+                                  alpha=alpha_value)
         p_value = test.get('p_one_sided')
         if p_value is None or not math.isfinite(float(p_value)):
             undefined += 1
-        elif float(p_value) < float(alpha):
+        elif float(p_value) < alpha_value:
             detection += 1
-        if float(equivalence_margin) > 0.0:
+        if equivalence_value > 0.0:
             equiv = tost_paired(deltas, [0.0] * n_pairs,
-                                margin=float(equivalence_margin), alpha=float(alpha))
+                                margin=test_margin, alpha=alpha_value)
             if equiv.get('equivalent') is True:
                 equivalence += 1
-    mean_estimate = sum(means) / len(means)
-    variance = (sum((value - mean_estimate) ** 2 for value in means) / (len(means) - 1)
-                if len(means) > 1 else 0.0)
+    mean_scaled = sum(means) / len(means)
+    mean_estimate = mean_scaled * scale
+    if len(means) > 1:
+        variance_scaled = (
+            sum((value - mean_scaled) ** 2 for value in means)
+            / (len(means) - 1))
+        if math.isfinite(variance_scaled):
+            estimate_sd = math.sqrt(variance_scaled) * scale
+        else:
+            spread = max(abs(value - mean_scaled) for value in means)
+            if spread == 0.0:
+                estimate_sd = 0.0
+            else:
+                variance_scaled = (
+                    sum(((value - mean_scaled) / spread) ** 2 for value in means)
+                    / (len(means) - 1))
+                estimate_sd = math.sqrt(variance_scaled) * spread * scale
+    else:
+        estimate_sd = 0.0
+    mean_bias = ((mean_scaled - effect_value / scale) * scale
+                 if scaled_run else mean_estimate - effect_value)
     detection_rate = detection / reps
     return {
         'schema': 'adasquash.design_simulation.v1',
@@ -1773,8 +1800,8 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
         'wrong_direction_rate': (sum(1 for value in means if value > 0.0) / reps
                                  if float(effect) <= 0.0 else None),
         'mean_estimate': mean_estimate,
-        'mean_bias': mean_estimate - float(effect),
-        'estimate_sd': math.sqrt(variance),
+        'mean_bias': mean_bias,
+        'estimate_sd': estimate_sd,
         'monte_carlo_se_detection_rate': math.sqrt(
             max(0.0, detection_rate * (1.0 - detection_rate)) / reps),
         'undefined_p_rate': undefined / reps,
