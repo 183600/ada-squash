@@ -1067,21 +1067,33 @@ def test_fp8_quantizer_respects_format_range():
 def test_build_llama_tiny_accepts_tie_override():
     """`tie_word_embeddings` can be overridden through **over.
 
-    A full ~1B fp32 build needs ~4 GB of RAM just for the weights, so the
-    test is skipped on small-memory runners (the tie/untie wiring it checks
-    is config-level and cannot silently differ with the parameter count).
+    The tie/untie wiring asserted here is config-level reference identity
+    (`lm_head.weight is tok_emb.weight`), which does not depend on storage,
+    so both models are built on `torch.device("meta")` — the same zero-
+    allocation pattern as `adasquash/ablation/matrix.py` and the meta path
+    of `_skip_init` (see also the meta GPT build in this file, above).
+
+    A REAL build is the whole point of the guard: untied ~1.07B + tied
+    ~1.00B params are alive at once, i.e. ~7.7 GB of fp32 weights (before
+    any activations). The old "<6 GB skip" gate let 6-9 GB runners through
+    exactly when that peak OOM-kills the entire machine (SIGKILL / exit
+    137), turning `ci_gate.py`'s `pytest tests/ -x -q` into a runner
+    reboot instead of a test failure. On meta the same assertions hold
+    with ~0 RAM, so the test now runs on every runner, no memory gate.
+    `init=False` matches how `scripts/train_gpt2.py` / `eval_downstream.py`
+    build the 1B model (values would be discarded immediately anyway).
     """
-    try:
-        import os
-        _ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError, AttributeError):
-        _ram = 1 << 40  # unknown -> assume a big machine
-    if _ram < 6 * 1024**3:
-        pytest.skip("full 1B build needs >6 GB RAM")
-    m = build_llama_tiny_1b(norm_name="dytcd", tie_word_embeddings=True)
-    assert m.lm_head.weight is m.tok_emb.weight
-    m2 = build_llama_tiny_1b(norm_name="dytcd")
-    assert m2.lm_head.weight is not m2.tok_emb.weight
+    with torch.device("meta"):
+        m = build_llama_tiny_1b(norm_name="dytcd", init=False,
+                                 tie_word_embeddings=True)
+        # Guard the zero-allocation contract: if `_skip_init` ever falls
+        # back to materializing weights, this fails LOUDLY here instead of
+        # silently OOM-killing the runner again.
+        assert m.tok_emb.weight.device.type == "meta"
+        assert m.lm_head.weight is m.tok_emb.weight
+        m2 = build_llama_tiny_1b(norm_name="dytcd", init=False)
+        assert m2.tok_emb.weight.device.type == "meta"
+        assert m2.lm_head.weight is not m2.tok_emb.weight
 
 
 # ---------------------------------------------------------------------------
