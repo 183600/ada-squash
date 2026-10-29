@@ -54,9 +54,17 @@ def _as_real(value) -> Optional[float]:
 
 
 def _real_values(values, name: str = "values") -> list[float]:
-    """Float observations, with an unrepresentable integer reported cleanly."""
+    """Float observations, with an unrepresentable integer reported cleanly.
+
+    Booleans and strings are not observations: ``float(True)`` and
+    ``float("0.1")`` would silently turn a malformed sample into a number.
+    Numeric scalars (including NumPy/Decimal/Fraction values) are accepted.
+    """
     out = []
     for value in values:
+        if _is_boolean_value(value) or isinstance(value, (str, bytes, bytearray)):
+            raise ValueError(
+                f"{name} must contain real numbers, got {value!r}")
         try:
             out.append(float(value))
         except (TypeError, ValueError, OverflowError):
