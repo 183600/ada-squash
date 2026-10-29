@@ -783,10 +783,40 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
                         'distinct positions are needed to test order drift')
         return base
 
-    for arm, records in usable.items():
-        mean = sum(record['value'] for record in records) / len(records)
-        for record in records:
-            record['residual'] = record['value'] - mean
+    residual_scale = None
+    ordinary_ok = True
+    try:
+        for arm, records in usable.items():
+            mean = sum(record['value'] for record in records) / len(records)
+            if not math.isfinite(mean):
+                ordinary_ok = False
+                break
+            for record in records:
+                record['residual'] = record['value'] - mean
+                if not math.isfinite(record['residual']):
+                    ordinary_ok = False
+                    break
+            if not ordinary_ok:
+                break
+    except OverflowError:
+        ordinary_ok = False
+    if not ordinary_ok:
+        # Finite values near the float limit overflow the per-arm sum, making
+        # every residual ±inf even though the rank correlation is well
+        # defined. Center in units of the largest observed magnitude; a
+        # common positive scale preserves every rank, so the ordinary path
+        # above (and its exact tie behaviour) remains unchanged.
+        residual_scale = max(abs(record['value']) for record in flat)
+        if residual_scale == 0.0:
+            for record in flat:
+                record['residual'] = 0.0
+        else:
+            for arm, records in usable.items():
+                scaled = [record['value'] / residual_scale for record in records]
+                mean_scaled = math.fsum(scaled) / len(scaled)
+                for record in records:
+                    record['residual'] = (
+                        record['value'] / residual_scale - mean_scaled)
     x = [record['position'] for record in flat]
     y = [record['residual'] for record in flat]
     rho = _spearman(x, y)
@@ -826,7 +856,10 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
             'count': len(records),
             'mean_position': sum(positions) / len(positions),
             'position_span': max(positions) - min(positions),
-            'mean_residual': sum(record['residual'] for record in records) / len(records),
+            'mean_residual': (
+                math.fsum(record['residual'] for record in records)
+                / len(records)
+                * (1.0 if residual_scale is None else residual_scale)),
         })
     base.update({
         'status': 'tested',
