@@ -179,9 +179,14 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     centre = (p + z2 * inv_n / 2.0) / denom
     # Split the root into its two components before squaring: `p*(1-p)/n`
     # and `(z/(2n))^2` can each underflow as a single product, while the
-    # square roots and the hypot keep the small terms.
+    # square roots and the hypot keep the small terms. Beyond the float
+    # range `1 / n_total` itself underflows to zero even though
+    # `sqrt(1 / n_total)` is still representable, so take the square root
+    # through the logarithm instead of through the underflowed reciprocal.
+    sqrt_inv_n = (math.sqrt(inv_n) if inv_n > 0.0
+                  else math.exp(-0.5 * math.log(n_total)))
     root = math.hypot(
-        math.sqrt(p * (1.0 - p)) * math.sqrt(inv_n),
+        math.sqrt(p * (1.0 - p)) * sqrt_inv_n,
         z * inv_n / 2.0)
     half = (z / denom) * root
     return max(0.0, centre - half), min(1.0, centre + half)

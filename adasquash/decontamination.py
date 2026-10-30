@@ -406,8 +406,13 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     # Split the root into its two components before squaring: `p*(1-p)/n`
     # and `(z/(2n))^2` can each underflow when evaluated as a single
     # product, while the square roots and the hypot keep the small terms.
+    # Beyond the float range `1 / n` itself underflows to zero even though
+    # `sqrt(1 / n)` is still representable, so take the square root through
+    # the logarithm instead of through the underflowed reciprocal.
+    sqrt_inv_n = (math.sqrt(inv_n) if inv_n > 0.0
+                  else math.exp(-0.5 * math.log(n)))
     root = math.hypot(
-        math.sqrt(p * (1.0 - p)) * math.sqrt(inv_n),
+        math.sqrt(p * (1.0 - p)) * sqrt_inv_n,
         z * inv_n / 2.0)
     margin = z * root / denominator
     return min(1.0, centre + margin)
