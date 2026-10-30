@@ -380,10 +380,10 @@ def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
     of freedom and `ci_low`/`ci_high` are `None` (the mean is still returned);
     the caller should not quote an interval it never measured.
     """
+    alpha = _validate_alpha(alpha)
     stats = mean_std_stderr(values)
     if stats is None:
         return None
-    alpha = _validate_alpha(alpha)
     out = dict(stats)
     out["ci_level"] = 1.0 - float(alpha)
     out["ci_low"] = None
@@ -424,10 +424,10 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
     support a replication claim. A zero-variance sample reduces to a
     degenerate interval and a deterministic same-direction probability.
     """
+    alpha = _validate_alpha(alpha)
     stats = mean_std_stderr(values)
     if stats is None:
         return None
-    alpha = _validate_alpha(alpha)
     out = dict(stats)
     out.update({
         "prediction_interval_level": 1.0 - alpha,
