@@ -558,7 +558,8 @@ def _welch_arm_statistics(a: Sequence[float], b: Sequence[float]):
     ma, sa = _mean_and_std(a)
     mb, sb = _mean_and_std(b)
     if (math.isfinite(ma) and math.isfinite(sa)
-            and math.isfinite(mb) and math.isfinite(sb)):
+            and math.isfinite(mb) and math.isfinite(sb)
+            and math.isfinite(ma - mb)):
         return ma, sa, mb, sb, 1.0
     if not (all(math.isfinite(value) for value in a)
             and all(math.isfinite(value) for value in b)):
