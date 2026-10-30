@@ -920,14 +920,23 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
         df_pi = float(k - 2)
         critical = student_t_ppf(1.0 - alpha / 2.0, df_pi)
         scale = math.sqrt(tau_squared + random_stderr ** 2)
+        low = random_pooled - critical * scale
+        high = random_pooled + critical * scale
+        # An infinite between-scale variance makes the predictive spread
+        # infinite; reporting `meaningful=True` with an unbounded interval
+        # would imply the next scale can be predicted when it cannot.
+        meaningful = math.isfinite(low) and math.isfinite(high)
         prediction = {
             'level': 1.0 - alpha,
-            'low': random_pooled - critical * scale,
-            'high': random_pooled + critical * scale,
-            'meaningful': True,
+            'low': low,
+            'high': high,
+            'meaningful': meaningful,
             'df': df_pi,
-            'note': ('where the effect at a new scale would plausibly fall; '
-                     'wider than the confidence interval for the pooled mean'),
+            'note': (('where the effect at a new scale would plausibly fall; '
+                      'wider than the confidence interval for the pooled mean')
+                     if meaningful else
+                     ('the between-scale variance is not finite, so a '
+                      'prediction interval for a new scale cannot be bounded')),
         }
 
     return {
