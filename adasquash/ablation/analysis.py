@@ -240,6 +240,22 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         raise ValueError(
             f'expected_attrition must be a finite probability in [0, 1), '
             f'got {expected_attrition!r}')
+    if not _finite_metric(alpha) or not 0.0 < float(alpha) < 1.0:
+        raise ValueError(
+            f'analysis-plan alpha must be a finite number strictly between '
+            f'0 and 1, got {alpha!r}')
+    if not _finite_metric(margin) or float(margin) < 0.0:
+        raise ValueError(
+            f'analysis-plan margin must be a finite number >= 0, '
+            f'got {margin!r}')
+    if not _finite_metric(equivalence_margin) or float(equivalence_margin) < 0.0:
+        raise ValueError(
+            f'analysis-plan equivalence_margin must be a finite number >= 0, '
+            f'got {equivalence_margin!r}')
+    if float(equivalence_margin) > 0.0 and float(alpha) >= 0.5:
+        raise ValueError(
+            'analysis-plan equivalence_margin > 0 requires alpha < 0.5 so '
+            f'the TOST interval 1 - 2*alpha is positive, got alpha={alpha!r}')
     seeds = list(seeds or [])
     if not all(_is_seed_id(seed) for seed in seeds):
         raise ValueError(
