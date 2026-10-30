@@ -273,7 +273,15 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
                 # Keep the first offending batch/point so the caller can run
                 # the ordered data -> math -> precision -> gradients triage
                 # on the *held-out* input instead of only seeing a NaN mean.
-                state['nonfinite_batch'] = (x, y, float(term))
+                # This loop runs under inference_mode, so x/y are inference
+                # tensors: the triage's Stage 4 forward would then fail to
+                # save embedding indices for backward ("Inference tensors
+                # cannot be saved for backward"). Materialize normal tensors
+                # outside inference mode before storing them.
+                with torch.inference_mode(False):
+                    triage_x = x.clone()
+                    triage_y = y.clone()
+                state['nonfinite_batch'] = (triage_x, triage_y, float(term))
             if terms is not None:
                 terms.append(term)
             total = term.clone() if total is None else total.add_(term)

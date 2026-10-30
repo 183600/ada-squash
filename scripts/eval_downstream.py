@@ -35,6 +35,19 @@ def load_ckpt(path: str, device: str='cuda'):
     ckpt = _load_checkpoint_cpu(path)
     args = ckpt['args']
     model_cfg = dict(norm_name=args['norm'], qk_norm=args.get('qk_norm'), qk_alpha_init=args.get('qk_alpha_init', 1.0), use_layerscale=not args.get('no_layerscale', False), alpha_0=args.get('alpha_0', 0.9), k_init=args.get('k_init', 1.0), alpha_init=args.get('alpha_init', 0.5), p_init=args.get('p_init', 2.0), learnable_p=not args.get('no_learnable_p', False), learnable_k=not args.get('no_learnable_k', False), learnable_delta=not args.get('no_learnable_delta', False), beta=args.get('beta', True))
+    # Protocol fields that change the *function* the checkpoint implements
+    # must be restored, not defaulted: `k_min=None` (--no-k-min) permits a
+    # learned negative k, while the default clamps k at 0, and a shared depth
+    # schedule adds shared_alpha_0/shared_k to the state_dict. Rebuilding with
+    # the defaults silently evaluates a different model or rejects the
+    # checkpoint's own keys. An absent old checkpoint key keeps the historic
+    # default; an explicit None is preserved.
+    model_cfg['k_min'] = args.get('k_min', 0.0)
+    model_cfg['shared_depth_schedule'] = args.get('shared_depth_schedule', False)
+    # alpha_jitter only perturbs initial parameters, and init=False makes it
+    # inert here; gradient_checkpointing only changes the training backward
+    # path. Neither changes the loaded function, so they are intentionally
+    # not part of the evaluation reconstruction.
     if args.get('layerscale_init') is not None:
         model_cfg['layerscale_init'] = args['layerscale_init']
     if args.get('tie_embeddings') is not None:
