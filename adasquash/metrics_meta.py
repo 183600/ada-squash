@@ -623,12 +623,32 @@ def welch_t_one_sided(
     b = _real_values(b, "b")
     alpha = _validate_alpha(alpha)
     margin = _validate_margin(margin)
+    n_input = [len(a), len(b)]
+    excluded = []
+    for arm_name, values in (("a", a), ("b", b)):
+        for index, value in enumerate(values):
+            if not math.isfinite(value):
+                excluded.append({
+                    "arm": arm_name,
+                    "index": index,
+                    "value": value,
+                    "reason": "non-finite observation",
+                })
+    if excluded:
+        a = [value for value in a if math.isfinite(value)]
+        b = [value for value in b if math.isfinite(value)]
     na, nb = len(a), len(b)
     empty = {
         "mean_delta": None, "t": None, "df": None, "p_one_sided": None,
         "ci_low": None, "ci_high": None, "ci_level": 1.0 - alpha,
-        "n": [na, nb], "paired": False, "test": "welch_t",
+        "n": [na, nb], "n_input": n_input, "n_excluded": len(excluded),
+        "excluded": excluded, "paired": False, "test": "welch_t",
     }
+    if excluded:
+        empty["note"] = (
+            f"{len(excluded)} of {sum(n_input)} observation(s) excluded "
+            "because the value was NaN or infinite; each arm is filtered "
+            "independently for this unpaired test")
     if na < 2 or nb < 2:
         return empty
     ma, sa, mb, sb, scale = _welch_arm_statistics(a, b)

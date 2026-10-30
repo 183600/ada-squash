@@ -113,6 +113,33 @@ def _is_seed_id(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _cache_batch_losses_finite(summary: dict) -> bool:
+    """Whether a cached summary's held-out losses are all finite.
+
+    JSON round-trips ``NaN``/``Infinity``, so a cached trial saved from a
+    diverged or interrupted probe can look protocol-identical while its
+    ``val_losses`` would crash the later paired test. Such a cache is stale
+    evidence and must be retrained, not silently reused.
+    """
+    values = summary.get('val_losses')
+    if isinstance(values, list) and any(not _finite_number(v) for v in values):
+        return False
+    by_seed = summary.get('val_losses_by_seed')
+    if isinstance(by_seed, dict):
+        for seed_values in by_seed.values():
+            if (isinstance(seed_values, list)
+                    and any(not _finite_number(v) for v in seed_values)):
+                return False
+    return True
+
+
+def _finite_batch_values(values):
+    """Held-out batch losses without NaN/Inf, or None for a non-list."""
+    if not isinstance(values, list):
+        return None
+    return [value for value in values if _finite_number(value)]
+
+
 def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | None=None,
                          weight_decay: float | None=None) -> bool:
     """Whether a cached trial ran under the *same protocol* as this invocation.
@@ -133,6 +160,8 @@ def cached_trial_matches(summary: dict, arm: str, lr: float, args, seed: int | N
     data = controls.get('data') or {}
     cfg = summary.get('cfg')
     if not (isinstance(cfg, dict) and cfg == {'norm_name': arm}):
+        return False
+    if not _cache_batch_losses_finite(summary):
         return False
     expected_wd = float(getattr(args, 'weight_decay', 0.1)
                         if weight_decay is None else weight_decay)
@@ -590,8 +619,10 @@ def compare(tuned: dict, baseline_arms, margin: float, alpha: float, certify: bo
                                      r['best'].get('weight_decay')).get(seed)
             b_trial = _trial_by_seed(_split_trials(ref), ref['best']['lr'],
                                      ref['best'].get('weight_decay')).get(seed)
-            a_batches = a_trial.get('val_losses') if a_trial else None
-            b_batches = b_trial.get('val_losses') if b_trial else None
+            a_batches = (_finite_batch_values(a_trial.get('val_losses'))
+                         if a_trial else None)
+            b_batches = (_finite_batch_values(b_trial.get('val_losses'))
+                         if b_trial else None)
             test = None
             entry['test_basis'] = f'val_batches_single_seed{seed}'
             if (isinstance(a_batches, list) and isinstance(b_batches, list)

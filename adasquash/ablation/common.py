@@ -328,11 +328,29 @@ def _batches_of_seed(row, seed):
     Never returns `val_losses` when the row pooled batches from several
     seeds: those concatenated lists must not be treated as one run's pairing
     basis (batch k of seed 42 would otherwise be zipped with batch k of
-    seed 44).
+    seed 44). Non-finite batch losses are dropped before the test; they are
+    corrupted measurements, not observations, and leaving one in the list
+    made the paired/welch test raise deep inside the Student-t CDF. The
+    number dropped is recorded on the row under
+    ``val_losses_excluded_by_seed`` so the reduced pairing basis is visible.
     """
+    def _finite_batches(values):
+        finite = [value for value in values if _finite_metric(value)]
+        dropped = len(values) - len(finite)
+        if dropped and isinstance(row, dict):
+            ledger = row.setdefault('val_losses_excluded_by_seed', {})
+            if isinstance(ledger, dict):
+                key = str(seed)
+                ledger[key] = int(ledger.get(key, 0)) + dropped
+        return finite
+
     by_seed = row.get('val_losses_by_seed')
-    if isinstance(by_seed, dict) and isinstance(by_seed.get(str(seed)), list):
-        return by_seed[str(seed)]
+    if isinstance(by_seed, dict):
+        # Accept both JSON's string keys and in-memory integer seed keys.
+        for key in (str(seed), seed):
+            values = by_seed.get(key)
+            if isinstance(values, list):
+                return _finite_batches(values)
     # The legacy fallback below uses the row's pooled `val_losses`. That list
     # is one run's batches only when the row itself represents one run: a
     # `per_seed` record with several seeds (even if only one has a finite mean)
@@ -351,7 +369,7 @@ def _batches_of_seed(row, seed):
         return None
     means = _seed_means(row)
     if len(means) == 1 and seed in means and isinstance(row.get('val_losses'), list):
-        return row['val_losses']
+        return _finite_batches(row['val_losses'])
     return None
 
 def _row_n_seeds(row) -> int:

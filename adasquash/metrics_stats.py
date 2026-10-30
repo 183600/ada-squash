@@ -903,6 +903,38 @@ def benjamini_hochberg_adjust(
     return adjusted
 
 
+def _finite_paired_observations(a: Sequence[float], b: Sequence[float]):
+    """Drop pairs containing a non-finite observation, keeping an audit trail.
+
+    A NaN/Inf held-out batch or seed loss is a corrupted measurement, not an
+    ordinary large effect. The statistical core cannot represent it: the
+    difference is non-finite and ``student_t_cdf`` raises from deep inside the
+    test. Excluding the whole pair (rather than only the bad side) keeps the
+    pairing aligned, and the returned records make the reduced sample visible
+    to callers instead of silently changing ``n``.
+    """
+    pairs = []
+    excluded = []
+    for index, (left, right) in enumerate(zip(a, b)):
+        if math.isfinite(left) and math.isfinite(right):
+            pairs.append((left, right))
+        else:
+            excluded.append({
+                "index": index,
+                "a": left,
+                "b": right,
+                "reason": "non-finite paired observation",
+            })
+    return pairs, excluded
+
+
+def _excluded_note(excluded, total: int) -> Optional[str]:
+    if not excluded:
+        return None
+    return (f"{len(excluded)} of {total} paired observation(s) excluded "
+            "because a member was NaN or infinite")
+
+
 def paired_z_one_sided(
     a: Sequence[float], b: Sequence[float], margin: float = 0.0
 ) -> dict:
@@ -916,18 +948,42 @@ def paired_z_one_sided(
     This is the df -> infinity limit: with the 2-4 replicas the experiments
     in this repo actually run, the normal tail is anti-conservative - use
     `paired_t_one_sided`, which also reports a confidence interval.
+
+    Pairs with a non-finite observation are excluded before the mean is
+    formed and listed in ``excluded``; the remaining sample's ``n`` is
+    reported next to ``n_input``. A non-finite difference can therefore
+    never reach the normal tail.
     """
     a = _real_values(a, "a")
     b = _real_values(b, "b")
     margin = _validate_margin(margin)
     if len(a) != len(b):
         raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
+    n_input = len(a)
+    pairs, excluded = _finite_paired_observations(a, b)
+    a = [left for left, _ in pairs]
+    b = [right for _, right in pairs]
     n = len(a)
+    out = {
+        "mean_delta": None,
+        "z": None,
+        "p_one_sided": None,
+        "n": n,
+        "n_input": n_input,
+        "n_excluded": len(excluded),
+        "excluded": excluded,
+        "paired": True,
+        "test": "paired_z",
+    }
+    note = _excluded_note(excluded, n_input)
+    if note is not None:
+        out["note"] = note
     if n == 0:
-        return {"mean_delta": None, "z": None, "p_one_sided": None, "n": 0, "paired": True}
+        return out
     mean, std, scaled = _paired_mean_std(a, b)
     if n < 2:
-        return {"mean_delta": mean, "z": None, "p_one_sided": None, "n": n, "paired": True}
+        out["mean_delta"] = mean
+        return out
     if scaled is not None:
         mean_test, se = scaled[0], scaled[1] / math.sqrt(n)
         margin_test = margin / scaled[2]
@@ -938,13 +994,12 @@ def paired_z_one_sided(
             float("inf") if mean_test + margin_test > 0.0 else 0.0)
     else:
         z = (mean_test + margin_test) / se
-    return {
+    out.update({
         "mean_delta": mean,
         "z": z,
         "p_one_sided": _p_one_sided_from_z(z),
-        "n": n,
-        "paired": True,
-    }
+    })
+    return out
 
 
 def paired_t_one_sided(
@@ -968,12 +1023,20 @@ def paired_t_one_sided(
     margin = _validate_margin(margin)
     if len(a) != len(b):
         raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
+    n_input = len(a)
+    pairs, excluded = _finite_paired_observations(a, b)
+    a = [left for left, _ in pairs]
+    b = [right for _, right in pairs]
     n = len(a)
     empty = {
         "mean_delta": None, "t": None, "df": None, "p_one_sided": None,
         "ci_low": None, "ci_high": None, "ci_level": 1.0 - alpha,
-        "n": n, "paired": True, "test": "paired_t",
+        "n": n, "n_input": n_input, "n_excluded": len(excluded),
+        "excluded": excluded, "paired": True, "test": "paired_t",
     }
+    note = _excluded_note(excluded, n_input)
+    if note is not None:
+        empty["note"] = note
     if n == 0:
         return empty
     mean, std, scaled = _paired_mean_std(a, b)
@@ -994,7 +1057,7 @@ def paired_t_one_sided(
     half = student_t_ppf(1.0 - alpha / 2.0, df) * se
     ci_low = (mean_test - half) * ci_scale
     ci_high = (mean_test + half) * ci_scale
-    return {
+    out = {
         "mean_delta": mean,
         "t": t,
         "df": df,
@@ -1003,9 +1066,15 @@ def paired_t_one_sided(
         "ci_high": ci_high,
         "ci_level": 1.0 - alpha,
         "n": n,
+        "n_input": n_input,
+        "n_excluded": len(excluded),
+        "excluded": excluded,
         "paired": True,
         "test": "paired_t",
     }
+    if note is not None:
+        out["note"] = note
+    return out
 
 
 def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[float]:
