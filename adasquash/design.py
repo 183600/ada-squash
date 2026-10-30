@@ -1748,7 +1748,7 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             try:
                 eq_plan = tost_power_plan(
                     eq_sd, n_pairs, equivalence_margin,
-                    alpha=float(alpha), power=float(target_power),
+                    alpha=alpha_value, power=target_power_value,
                     n_tests=n_confirmatory_tests,
                     expected_attrition=expected_attrition)
             except ValueError as exc:
