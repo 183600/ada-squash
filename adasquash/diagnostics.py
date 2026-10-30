@@ -121,12 +121,22 @@ def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]
     excluded here as a last-resort guard; `diagnose_train_val_curve` reports
     them explicitly before this helper is reached.
     """
+    if (_is_boolean_scalar(window)
+            or isinstance(window, (str, bytes, bytearray))):
+        raise ValueError(f"window must be an integer >= 1, got {window!r}")
+    try:
+        window_value = int(window)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"window must be an integer >= 1, got {window!r}") from None
+    if window_value != window or window_value < 1:
+        raise ValueError(f"window must be an integer >= 1, got {window!r}")
     tail = []
     for value in values:
         converted = _finite_float_or_none(value)
         if converted is not None:
             tail.append(converted)
-    tail = tail[-max(2, int(window)):]
+    tail = tail[-max(2, window_value):]
     if len(tail) < 2:
         return None
     first, last = tail[0], tail[-1]
