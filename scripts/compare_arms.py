@@ -52,7 +52,8 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
                                paired_design_summary, paired_randomization_test,
-                               paired_t_one_sided, student_t_ppf, tost_paired)
+                               paired_t_one_sided, student_t_ppf,
+                               tost_design_summary, tost_paired)
 from adasquash.repro import compare_train_streams, training_recipe_mismatches
 
 _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
@@ -923,6 +924,12 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                 [ref['values'][seed] for seed in common],
                 margin=equivalence_margin, alpha=alpha)
             tost['enabled'] = True
+            paired_summary = mean_std_stderr(deltas)
+            if (paired_summary is not None
+                    and paired_summary.get('std') is not None):
+                tost['design'] = tost_design_summary(
+                    paired_summary['std'], int(tost['n']),
+                    equivalence_margin, alpha=alpha)
             entry['equivalence'] = tost
         rows.append(entry)
 

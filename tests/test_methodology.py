@@ -26,8 +26,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import (leave_one_out_jackknife, paired_trend_test,
-                               tost_paired, two_sided_p_from_t)
+from adasquash.metrics import (benjamini_hochberg_adjust,
+                               leave_one_out_jackknife, paired_trend_test,
+                               tost_design_summary, tost_paired, tost_power,
+                               tost_required_n, two_sided_p_from_t)
 from scripts.ablation import (baseline_comparison, build_analysis_plan,
                               factorial_comparison,
                               study_level_correction)
@@ -93,6 +95,36 @@ def test_tost_zero_variance_is_deterministic():
     shifted = tost_paired([1.1] * 3, [1.0] * 3, margin=0.01)
     assert shifted['equivalent'] is False
     assert shifted['p_tost'] == 1.0
+
+
+def test_tost_design_power_is_not_the_superiority_calculation():
+    # The TOST rejection region shrinks as the margin approaches the assumed
+    # difference; power must fall, not rise as it would for a superiority
+    # test of a larger effect.
+    far = tost_power(0.10, 12, margin=0.20)['approximate_power']
+    near = tost_power(0.10, 12, margin=0.11)['approximate_power']
+    assert far > near
+    required = tost_required_n(0.10, 0.10)
+    assert required is not None and required > 2
+    assert tost_power(0.10, required, 0.10)['approximate_power'] >= 0.8
+    assert (tost_power(0.10, required - 1, 0.10)['approximate_power']
+            < 0.8)
+    # A planning difference outside the margin is not an equivalence design.
+    assert tost_required_n(0.10, 0.10, true_delta=0.10) is None
+
+
+def test_tost_design_summary_reports_resolution_and_minimum_margin():
+    summary = tost_design_summary(0.05, 10, 0.10)
+    assert summary['margin'] == 0.10
+    assert summary['required_pairs_for_margin'] == (
+        tost_required_n(0.05, 0.10))
+    assert summary['adequately_powered_for_equivalence'] is True
+    assert 0.0 < summary['minimum_detectable_equivalence_margin'] < 0.10
+    underpowered = tost_design_summary(0.20, 3, 0.10)
+    assert underpowered['adequately_powered_for_equivalence'] is False
+    # The exact TOST verdict remains the certifying result; this block is
+    # explicitly labelled as a design approximation.
+    assert 'design' in summary['test']
 
 
 def test_two_sided_p_from_t_is_symmetric_and_bounded():
@@ -193,6 +225,8 @@ def test_leave_one_out_comparison_reports_robustness():
     # Removing the mechanism made the model clearly worse, so the two arms
     # are not equivalent within a 0.01 loss margin.
     assert entry['equivalence']['equivalent'] is False
+    assert entry['equivalence']['design']['test'] == 'tost_paired_design'
+    assert entry['equivalence']['design']['n'] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +383,36 @@ def test_unregistered_rows_cannot_become_confirmed_claims():
     assert 'pre-registered analysis plan' in row['excluded_from_study_family']
 
 
+def test_unregistered_contrasts_get_exploratory_bh_q_values():
+    plan = {'fingerprint': 'empty-plan', 'contrasts': []}
+    rows = [{
+        'name': f'row{i}', 'p_one_sided': p,
+        'beats_reference': True, 'beats_reference_significantly': True,
+        'replicated_across_seeds': True, 'excluded_from_family': None,
+        'delta_vs_reference': -0.1, 'test_basis': 'seed_means',
+        'hypothesis': 'h',
+    } for i, p in enumerate((0.01, 0.04, 0.03))]
+    study = study_level_correction({'baseline': {'rows': rows}}, plan)
+    expected = benjamini_hochberg_adjust([0.01, 0.04, 0.03])
+    assert [row['q_value_bh'] for row in study['rows']] == pytest.approx(
+        expected)
+    assert study['exploratory_fdr']['n_tested'] == 3
+    assert study['exploratory_fdr']['n_discoveries'] == 3
+    assert study['exploratory_fdr']['discoveries'] == [
+        'baseline:row0', 'baseline:row1', 'baseline:row2']
+    assert all(row['tier'] == 'unregistered' for row in study['rows'])
+
+
+def test_benjamini_hochberg_is_a_step_up_correction_with_invalid_slots_ignored():
+    assert benjamini_hochberg_adjust([0.01, 0.04, 0.03, None]) == pytest.approx(
+        [0.03, 0.04, 0.04, None])
+    assert benjamini_hochberg_adjust([0.01, 0.02, 0.03, 0.04, 0.05]) == (
+        pytest.approx([0.05] * 5))
+    # Invalid p-values keep their None slot and do not enter the family size.
+    assert benjamini_hochberg_adjust([0.01, 1.5, '0.01', True, -0.1]) == (
+        pytest.approx([0.01, None, None, None, None]))
+
+
 def test_unresolved_plan_contrasts_are_reported_not_silently_dropped():
     plan, comparison = _plan_and_comparison({42: 1.5, 43: 1.5, 44: 1.5}, 1.6)
     # The plan also contains the leave-one-out contrast, but no LOO report is
@@ -435,6 +499,8 @@ def test_compare_arms_reports_equivalence_and_jackknife():
     row = out['rows'][0]
     assert row['equivalence']['enabled'] is True
     assert row['equivalence']['equivalent'] is True
+    assert row['equivalence']['design']['test'] == 'tost_paired_design'
+    assert row['equivalence']['design']['required_pairs_for_margin'] >= 2
     # Small, sign-alternating differences: no stable direction to report.
     assert row['seed_jackknife']['sign'] == 'zero'
     assert row['seed_jackknife']['sign_stable'] is None

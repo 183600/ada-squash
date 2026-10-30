@@ -53,6 +53,10 @@ This module supplies the reusable, pure-Python pieces:
     how many *planned* seed pairs are needed before a run so that, after the
     study-wide multiplicity correction and the expected run-level attrition,
     the pre-specified smallest effect still has the target power.
+``tost_power_plan``
+    The equivalence counterpart. A superiority power formula evaluated at the
+    equivalence margin answers the wrong question, so TOST claims get their
+    own family-level and attrition-inflated sample-size plan.
 ``simulate_paired_design``
     A Monte-Carlo calibration of the actual paired-test code: empirical
     type-I error under a synthetic null and empirical power under a known
@@ -83,7 +87,8 @@ from fractions import Fraction
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from .metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, paired_design_summary,
-                      paired_required_n, paired_t_one_sided, tost_paired)
+                      paired_required_n, paired_t_one_sided,
+                      tost_design_summary, tost_paired, tost_required_n)
 
 __all__ = [
     'block_randomized_schedule',
@@ -98,6 +103,7 @@ __all__ = [
     'run_exclusion_audit',
     'design_readiness_audit',
     'prospective_power_plan',
+    'tost_power_plan',
     'simulate_paired_design',
 ]
 
@@ -1412,6 +1418,146 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
     }
 
 
+def tost_power_plan(paired_sd: float, n_pairs: int,
+                    equivalence_margin: float, *, alpha: float = 0.05,
+                    power: float = 0.8, n_tests: int = 1,
+                    expected_attrition: float = 0.0,
+                    max_pairs: int = 100000) -> dict:
+    """Prospective sample-size plan for a TOST equivalence claim.
+
+    This mirrors :func:`prospective_power_plan` but uses the equivalence
+    power calculation. Substituting the equivalence bound into the
+    superiority formula would answer "how often would a difference of this
+    size be declared *superior*", which is not the TOST question and
+    understates the pairs needed near the bound.
+
+    ``n_tests`` applies the same conservative Bonferroni family correction
+    to the TOST alpha, and ``expected_attrition`` inflates the planned pair
+    count by the probability that both arms of a seed survive. The margin is
+    the pre-specified equivalence bound; it must not be chosen from the
+    observed interval.
+    """
+    sd = _finite_float(paired_sd)
+    if sd is None or sd < 0.0:
+        raise ValueError(
+            f'paired_sd must be a finite number >= 0, got {paired_sd!r}')
+    if isinstance(n_pairs, bool) or not isinstance(n_pairs, int) or n_pairs < 2:
+        raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
+    margin_value = _finite_float(equivalence_margin)
+    if margin_value is None or margin_value <= 0.0:
+        raise ValueError(
+            f'equivalence_margin must be a finite number > 0, got '
+            f'{equivalence_margin!r}')
+    alpha_value = _finite_float(alpha)
+    if alpha_value is None or not 0.0 < alpha_value < 0.5:
+        raise ValueError(
+            f'alpha must be strictly between 0 and 0.5 for a TOST, got '
+            f'{alpha!r}')
+    power_value = _finite_float(power)
+    if power_value is None or not 0.0 < power_value < 1.0:
+        raise ValueError(
+            f'power must be strictly between 0 and 1, got {power!r}')
+    if isinstance(n_tests, bool) or not isinstance(n_tests, int) or n_tests < 1:
+        raise ValueError(
+            f'n_tests must be a positive integer, got {n_tests!r}')
+    attrition = _finite_float(expected_attrition)
+    if attrition is None or not 0.0 <= attrition < 1.0:
+        raise ValueError(
+            f'expected_attrition must be a probability in [0, 1), got '
+            f'{expected_attrition!r}')
+    if (isinstance(max_pairs, bool) or not isinstance(max_pairs, int)
+            or max_pairs < 2):
+        raise ValueError(
+            f'max_pairs must be an integer >= 2, got {max_pairs!r}')
+
+    try:
+        family_alpha = alpha_value / n_tests
+    except OverflowError:
+        raise ValueError(
+            f'n_tests={n_tests!r} is too large: alpha / n_tests exceeds the '
+            f'float range') from None
+    if family_alpha == 0.0:
+        raise ValueError(
+            f'n_tests={n_tests!r} is too large: alpha / n_tests underflows to '
+            f'zero')
+    required_unadjusted = tost_required_n(
+        sd, margin_value, alpha=alpha_value, power=power_value,
+        max_n=max_pairs)
+    required_adjusted = tost_required_n(
+        sd, margin_value, alpha=family_alpha, power=power_value,
+        max_n=max_pairs)
+    pair_survival = (1.0 - attrition) ** 2
+    expected_pairs = _complete_pairs_after_attrition(n_pairs, pair_survival)
+    required_planned = (
+        None if required_adjusted is None else
+        _pairs_needed_after_attrition(required_adjusted, pair_survival))
+    planned_unadjusted = tost_design_summary(
+        sd, n_pairs, margin_value, alpha=alpha_value, power=power_value)
+    planned_summary = tost_design_summary(
+        sd, n_pairs, margin_value, alpha=family_alpha, power=power_value)
+    effective_summary = (
+        tost_design_summary(
+            sd, expected_pairs, margin_value, alpha=family_alpha,
+            power=power_value) if expected_pairs >= 2 else None)
+    adequate_unadjusted = (
+        None if required_unadjusted is None
+        else bool(n_pairs >= required_unadjusted))
+    adequate_adjusted = (
+        None if required_adjusted is None
+        else bool(n_pairs >= required_adjusted))
+    adequate_after_attrition = (
+        None if required_adjusted is None else
+        bool(expected_pairs >= 2 and expected_pairs >= required_adjusted))
+    if required_adjusted is None:
+        note = ('the equivalence margin is not reachable within max_pairs at '
+                'the family-level alpha even before attrition; increase the '
+                'budget or reconsider the margin')
+    elif required_planned is None:
+        note = ('the attrition assumption leaves no positive complete-pair '
+                'survival, so a finite planned pair count does not exist')
+    elif adequate_after_attrition:
+        note = ('the planned seed count still covers the family-adjusted '
+                'TOST requirement after the expected attrition')
+    else:
+        note = ('underpowered for equivalence after multiplicity and '
+                f'attrition: plan {required_planned} seed pair(s), not '
+                f'{n_pairs}')
+    return {
+        'schema': 'adasquash.tost_power.v1',
+        'paired_sd': sd,
+        'n_pairs': n_pairs,
+        'equivalence_margin': margin_value,
+        'alpha': alpha_value,
+        'power_target': power_value,
+        'n_tests': n_tests,
+        'multiplicity_method': 'bonferroni',
+        'family_alpha': family_alpha,
+        'expected_attrition': attrition,
+        'complete_pair_survival': pair_survival,
+        'expected_analyzable_pairs': expected_pairs,
+        'required_pairs_unadjusted': required_unadjusted,
+        'required_pairs_family_adjusted': required_adjusted,
+        'required_planned_pairs': required_planned,
+        'shortfall_pairs': (None if required_planned is None
+                            else max(0, required_planned - n_pairs)),
+        'approximate_power_unadjusted': planned_unadjusted[
+            'approximate_power_at_n'],
+        'approximate_power_family_adjusted': planned_summary[
+            'approximate_power_at_n'],
+        'approximate_power_after_attrition': (
+            effective_summary['approximate_power_at_n']
+            if effective_summary else None),
+        'minimum_detectable_equivalence_margin_unadjusted':
+            planned_unadjusted['minimum_detectable_equivalence_margin'],
+        'minimum_detectable_equivalence_margin_family_adjusted':
+            planned_summary['minimum_detectable_equivalence_margin'],
+        'adequately_powered_unadjusted': adequate_unadjusted,
+        'adequately_powered_family_adjusted': adequate_adjusted,
+        'adequately_powered_after_attrition': adequate_after_attrition,
+        'note': note,
+    }
+
+
 def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                            hypotheses: Mapping[str, str],
                            schedule: Optional[dict] = None,
@@ -1439,11 +1585,15 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     prospective rather than optimistic: the required n is computed at the
     Bonferroni family level and inflated for the expected loss of complete
     pairs (see :func:`prospective_power_plan`). The default of one test and no
-    attrition reproduces the single-comparison calculation.
+    attrition reproduces the single-comparison calculation. When an
+    ``equivalence_margin`` is supplied the audit adds a separate
+    ``equivalence_power`` check based on :func:`tost_power_plan`; the
+    superiority formula is not reused for a TOST claim.
     """
     names = list(rows.keys()) if isinstance(rows, Mapping) else list(rows)
     checks: list[dict] = []
     planned_power = None
+    planned_equivalence_power = None
 
     def add(check_id: str, status: str, detail: str) -> None:
         checks.append({'id': check_id, 'status': status, 'detail': detail})
@@ -1527,13 +1677,14 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             'reports the observed MDE afterwards)')
     else:
         sd = _finite_float(assumed_paired_sd)
-        target = margin if margin > 0.0 else equivalence_margin
+        target = margin
         if sd is None or sd < 0.0:
             add('power', 'fail', f'invalid assumed paired SD {assumed_paired_sd!r}')
         elif target <= 0.0:
-            add('power', 'warn',
-                'a paired SD was supplied but no positive margin defines the effect '
-                'to power for')
+            if equivalence_margin <= 0.0:
+                add('power', 'warn',
+                    'a paired SD was supplied but no positive margin defines the '
+                    'effect to power for')
         elif n_pairs < 2:
             # A paired design needs at least two distinct observations before
             # its power can be estimated. Reporting a crash here would turn a
@@ -1575,6 +1726,56 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                         f'margin={target:g} is not reachable within the search cap '
                         f'at paired SD={sd:g} and family alpha '
                         f'{plan["family_alpha"]:.4g}')
+
+    if equivalence_margin > 0.0 and assumed_paired_sd is not None:
+        eq_sd = _finite_float(assumed_paired_sd)
+        if eq_sd is None or eq_sd < 0.0:
+            add('equivalence_power', 'fail',
+                f'invalid assumed paired SD {assumed_paired_sd!r}')
+        elif n_pairs < 2:
+            add('equivalence_power', 'fail',
+                f'{n_pairs} distinct seed(s): at least 2 paired observations '
+                f'are needed to plan a TOST at margin='
+                f'{equivalence_margin:g}')
+        else:
+            try:
+                eq_plan = tost_power_plan(
+                    eq_sd, n_pairs, equivalence_margin,
+                    alpha=float(alpha), power=float(target_power),
+                    n_tests=n_confirmatory_tests,
+                    expected_attrition=expected_attrition)
+            except ValueError as exc:
+                add('equivalence_power', 'fail',
+                    f'invalid equivalence power-planning input: {exc}')
+            else:
+                planned_equivalence_power = eq_plan
+                family_note = (
+                    f'{eq_plan["n_tests"]} test(s) at family alpha '
+                    f'{eq_plan["family_alpha"]:.4g}'
+                    if eq_plan['n_tests'] > 1 else 'one test at alpha')
+                if eq_plan['adequately_powered_after_attrition'] is True:
+                    add('equivalence_power', 'pass',
+                        f'{n_pairs} pairs at paired SD={eq_sd:g} reach the '
+                        f'{target_power:g} TOST target for margin='
+                        f'{equivalence_margin:g} ({family_note}); '
+                        f'{eq_plan["required_planned_pairs"]} planned pairs '
+                        f'needed after {eq_plan["expected_attrition"]:.0%} '
+                        f'attrition')
+                elif eq_plan['adequately_powered_after_attrition'] is False:
+                    add('equivalence_power', 'fail',
+                        f'{n_pairs} pairs at paired SD={eq_sd:g} are '
+                        f'underpowered for TOST equivalence at margin='
+                        f'{equivalence_margin:g} ({family_note}): '
+                        f'{eq_plan["required_pairs_family_adjusted"]} '
+                        f'analyzable pairs are required, so plan '
+                        f'{eq_plan["required_planned_pairs"]} pairs after '
+                        f'{eq_plan["expected_attrition"]:.0%} attrition')
+                else:
+                    add('equivalence_power', 'warn',
+                        f'equivalence margin={equivalence_margin:g} is not '
+                        f'reachable within the search cap at paired SD='
+                        f'{eq_sd:g} and family alpha '
+                        f'{eq_plan["family_alpha"]:.4g}')
 
     attrition_value = _finite_float(expected_attrition)
     if attrition_value is None or not 0.0 <= attrition_value < 1.0:
@@ -1708,6 +1909,7 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         'n_warn': n_warn,
         'checks': checks,
         'planned_power': planned_power,
+        'planned_equivalence_power': planned_equivalence_power,
         'n_confirmatory_tests': n_confirmatory_tests,
         'expected_attrition': expected_attrition,
         'exclusion_policy': canonical_policy,

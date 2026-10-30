@@ -21,7 +21,8 @@ from adasquash.design import (classify_run_exclusions,
                                schedule_balance_report, simulate_paired_design)
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
-from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE,
+                               benjamini_hochberg_adjust, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
                                paired_design_summary, paired_randomization_test,
@@ -312,7 +313,11 @@ def study_level_correction(comparisons: dict, plan: dict | None,
     contrasts from competing with the primary claim for the same alpha budget.
     The family-local adjusted p stays next to the study-level one, and every
     demoted contrast (or secondary contrast not tested because the gate closed)
-    is listed explicitly rather than silently dropped.
+    is listed explicitly rather than silently dropped. Unregistered contrasts
+    remain exploratory, but their p-values get Benjamini-Hochberg q-values so
+    the screening set can be read at a stated false-discovery rate instead of
+    an uncorrected alpha; those discoveries are explicitly labelled
+    hypothesis-generating rather than confirmed.
 
     Interactions enter with their two-sided p-value (either synergy or
     antagonism is a finding); main effects and superiority contrasts enter
@@ -346,6 +351,8 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             'hypothesis': hypothesis,
             'excluded_from_study_family': excluded_reason,
             'p_study_holm': None,
+            'q_value_bh': None,
+            'exploratory_fdr_significant': False,
             'confirmed_at_study_level': False,
             'downgraded_by_study_level': False,
         })
@@ -453,6 +460,32 @@ def study_level_correction(comparisons: dict, plan: dict | None,
         else:
             record['plan_kind'] = planned_entry.get('kind')
             registered.append(record)
+    unregistered_records = [record for record in records
+                            if record['id'] in set(unregistered)
+                            and record['p_one_sided_or_two_sided'] is not None]
+    unregistered_q = benjamini_hochberg_adjust(
+        [record['p_one_sided_or_two_sided']
+         for record in unregistered_records])
+    for record, q_value in zip(unregistered_records, unregistered_q):
+        record['q_value_bh'] = q_value
+        record['exploratory_fdr_significant'] = bool(
+            q_value is not None and q_value < alpha)
+    exploratory_fdr = {
+        'method': 'benjamini-hochberg-step-up',
+        'alpha': float(alpha),
+        'n_tested': len(unregistered_records),
+        'n_discoveries': sum(
+            record['exploratory_fdr_significant']
+            for record in unregistered_records),
+        'discoveries': sorted(
+            record['id'] for record in unregistered_records
+            if record['exploratory_fdr_significant']),
+        'note': ('q-values control the false-discovery rate among the '
+                 'exploratory/unregistered contrasts only; they are '
+                 'hypothesis-generating and do not become confirmatory claims. '
+                 'The BH guarantee assumes independence or positive regression '
+                 'dependence'),
+    }
     resolved_ids = {record['id'] for record in registered}
     unresolved = sorted(set(planned) - resolved_ids)
     eligible = [record for record in registered
@@ -564,6 +597,7 @@ def study_level_correction(comparisons: dict, plan: dict | None,
         'downgraded_by_study_level': downgraded,
         'secondary_not_tested_gate_closed': secondary_gate_closed,
         'unregistered_contrasts': sorted(unregistered),
+        'exploratory_fdr': exploratory_fdr,
         'unresolved_plan_contrasts': unresolved,
         'protocol': (
             'hierarchical Holm gatekeeping over the pre-registered confirmatory '
@@ -576,7 +610,10 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             'direction. Interactions use the two-sided p-value, everything else '
             'the one-sided p-value matching its directional hypothesis. '
             'Family-local adjusted p-values are retained, so a demotion by the '
-            'study-level correction is visible rather than silent'),
+            'study-level correction is visible rather than silent. '
+            'Exploratory/unregistered contrasts are never promoted: they receive '
+            'Benjamini-Hochberg q-values for a stated FDR and remain '
+            'hypothesis-generating'),
         'rows': records,
     }
 
@@ -605,6 +642,10 @@ def print_study_level_correction(comparison: dict | None) -> None:
         preview = f"{ids[:8]}{' ...' if len(ids) > 8 else ''}"
         print(f"[study] unregistered/exploratory ({len(ids)}, not in the plan, "
               f"not counted): {preview}")
+        fdr = comparison.get('exploratory_fdr') or {}
+        print(f"[study] exploratory BH-FDR: {fdr.get('n_discoveries', 0)}/"
+              f"{fdr.get('n_tested', 0)} q<{fdr.get('alpha', comparison['alpha'])} "
+              f"(hypothesis-generating only)")
     if comparison.get('unresolved_plan_contrasts'):
         ids = comparison['unresolved_plan_contrasts']
         preview = f"{ids[:8]}{' ...' if len(ids) > 8 else ''}"

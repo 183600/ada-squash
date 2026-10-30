@@ -818,22 +818,15 @@ def student_t_ppf(p: float, df: float) -> float:
     return 0.5 * (lo + hi)
 
 
-def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
-    """Holm-Bonferroni step-down adjustment of a family of p-values.
+def _valid_indexed_pvalues(pvalues: Sequence[Optional[float]]):
+    """Valid p-values paired with their original slots, sorted ascending.
 
-    A matrix run scans many rows against one reference, so an uncorrected
-    alpha = 0.05 makes a "significant" win almost guaranteed by chance (with
-    19 rows the family-wise error rate approaches 1 - 0.95^19 ~ 62%). Holm's
-    step-down is uniformly more powerful than plain Bonferroni and needs no
-    assumption beyond validity of the individual p-values: sort ascending and
-    multiply the k-th smallest by `m - k + 1`, then enforce monotonicity.
-    `None` entries (tests that could not run) stay `None` and are not counted
-    in `m`.
+    Accept any real numeric scalar (including NumPy integer/float scalars),
+    not only Python int/float: dropping an unrecognised scalar returns None
+    for that test and silently removes it from the correction family. Bools,
+    numeric strings, non-numeric values, non-finite values and values outside
+    [0, 1] stay out of the family and keep a ``None`` adjusted slot.
     """
-    # Accept any real numeric scalar (including NumPy integer/float scalars),
-    # not only Python int/float: dropping an unrecognised scalar returns None
-    # for that test and silently removes it from the correction family. Bools
-    # are still rejected, and non-numeric / non-finite values stay None.
     indexed = []
     for i, p in enumerate(pvalues):
         if (p is None or _is_boolean_value(p)
@@ -847,18 +840,65 @@ def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
         except (TypeError, ValueError, OverflowError):
             continue
         # A p-value outside [0, 1] is not a valid test result. Keeping it
-        # would either make a negative value maximally significant (after the
-        # running max) or silently cap one above 1 to a perfect result; both
-        # turn malformed evidence into a claim. Exclude it like a non-finite
-        # p-value, and leave its slot None.
+        # would either make a negative value maximally significant or
+        # silently cap one above 1 to a perfect result; both turn malformed
+        # evidence into a claim.
         if math.isfinite(value) and 0.0 <= value <= 1.0:
             indexed.append((value, i))
     indexed.sort()
+    return indexed
+
+
+def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
+    """Holm-Bonferroni step-down adjustment of a family of p-values.
+
+    A matrix run scans many rows against one reference, so an uncorrected
+    alpha = 0.05 makes a "significant" win almost guaranteed by chance (with
+    19 rows the family-wise error rate approaches 1 - 0.95^19 ~ 62%). Holm's
+    step-down is uniformly more powerful than plain Bonferroni and needs no
+    assumption beyond validity of the individual p-values: sort ascending and
+    multiply the k-th smallest by `m - k + 1`, then enforce monotonicity.
+    `None` entries (tests that could not run) stay `None` and are not counted
+    in `m`.
+    """
+    indexed = _valid_indexed_pvalues(pvalues)
     m = len(indexed)
     adjusted: list[Optional[float]] = [None] * len(pvalues)
     running = 0.0
     for rank, (p, i) in enumerate(indexed):
         running = max(running, min(1.0, (m - rank) * p))
+        adjusted[i] = running
+    return adjusted
+
+
+def benjamini_hochberg_adjust(
+    pvalues: Sequence[Optional[float]],
+) -> list[Optional[float]]:
+    """Benjamini-Hochberg step-up FDR-adjusted p-values (q-values).
+
+    Holm controls the family-wise error rate, which is the right guarantee
+    for the small pre-registered confirmatory family. An exploratory scan is
+    a different claim: many rows are screened, most will be followed up, and
+    requiring *no* false discovery among them is unnecessarily strict. The
+    Benjamini-Hochberg step-up reports q-values so the exploratory set can be
+    read at a stated false-discovery rate instead of at an uncorrected alpha.
+
+    Sort the ``m`` valid p-values ascending and set
+    ``q_(k) = min_{j >= k} min(1, p_(j) * m / j)``. The monotone minimum from
+    the largest p-value downward is what makes the result a valid step-up
+    adjustment rather than m independent Bonferroni factors. ``None`` entries
+    (tests that could not run) stay ``None`` and are not counted in ``m``.
+    The usual BH guarantee assumes independent tests or positive regression
+    dependence; the report labels exploratory discoveries as
+    hypothesis-generating, not confirmatory, for that reason.
+    """
+    indexed = _valid_indexed_pvalues(pvalues)
+    m = len(indexed)
+    adjusted: list[Optional[float]] = [None] * len(pvalues)
+    running = 1.0
+    for rank in range(m - 1, -1, -1):
+        p, i = indexed[rank]
+        running = min(running, min(1.0, p * m / (rank + 1)))
         adjusted[i] = running
     return adjusted
 
@@ -1299,6 +1339,199 @@ def tost_paired(
         "note": ("equivalent" if p_tost < alpha else
                  "not equivalent at this margin/alpha; this is not evidence of a difference"),
     })
+    return out
+
+
+def _tost_power_at_n(std: float, n: int, margin: float, alpha: float,
+                     true_delta: float = 0.0) -> float:
+    """Approximate power of a paired TOST at ``n`` pairs.
+
+    The TOST rejects only when both one-sided tests clear their
+    ``1 - alpha`` threshold. With a paired difference distributed as
+    ``N(true_delta, std**2)`` and the sample standard deviation treated as
+    fixed at its planning value, the rejection region is
+
+        -margin + c*se < mean < margin - c*se,   c = t_{1-alpha, n-1}
+
+    and the probability of that interval is the difference of two central-t
+    CDF values. This is the standard two-point approximation used by the
+    sample-size helper; it is deliberately a planning calculation, not a
+    post-hoc substitution for the exact TOST p-value.
+    """
+    df = float(n - 1)
+    se = std / math.sqrt(n)
+    if se == 0.0:
+        return 1.0 if abs(true_delta) < margin else 0.0
+    upper_tail = 1.0 - alpha
+    critical = (student_t_ppf(upper_tail, df) if upper_tail < 1.0
+                else -student_t_ppf(alpha, df))
+    upper = (margin - true_delta) / se - critical
+    lower = (-margin - true_delta) / se + critical
+    power = student_t_cdf(upper, df) - student_t_cdf(lower, df)
+    return min(1.0, max(0.0, power))
+
+
+def tost_power(std: float, n: int, margin: float, alpha: float = 0.05,
+               true_delta: float = 0.0) -> dict:
+    """Approximate power of a paired TOST at the achieved/planned ``n``.
+
+    Equivalence claims need their own design calculation: a superiority
+    power formula evaluated at the equivalence margin answers the wrong
+    question (it powers a test of "the difference exceeds the margin" rather
+    than "the confidence interval lies inside it"). ``true_delta`` is the
+    difference the planning assumes; the default zero is the usual
+    conservative planning value for an equivalence study.
+
+    ``tost_paired`` remains the certifying test. This helper only makes the
+    design's resolution visible before or after the run.
+    """
+    std_value, alpha_value, _ = _validate_design_inputs(std, alpha, 0.5)
+    n = _strict_int(n, "n", minimum=2)
+    margin_value = _validate_margin(margin)
+    true_value = _validate_margin(true_delta, "true_delta")
+    if margin_value <= 0.0:
+        raise ValueError(f"margin must be finite and > 0, got {margin!r}")
+    if alpha_value >= 0.5:
+        raise ValueError(
+            f"TOST needs alpha < 0.5 for a positive 1 - 2*alpha interval, "
+            f"got {alpha!r}")
+    power = _tost_power_at_n(std_value, n, margin_value, alpha_value,
+                             true_value)
+    return {
+        "test": "tost_paired_design",
+        "paired_sd": std_value,
+        "n": n,
+        "df": float(n - 1),
+        "margin": margin_value,
+        "alpha": alpha_value,
+        "true_delta_assumed": true_value,
+        "approximate_power": power,
+        "note": ("two-point t approximation with the planning SD held fixed; "
+                 "the exact TOST p-value remains the certifying test"),
+    }
+
+
+def tost_required_n(std: float, margin: float, alpha: float = 0.05,
+                    power: float = 0.8, true_delta: float = 0.0,
+                    max_n: int = 100000) -> Optional[int]:
+    """Prospective paired sample size for a TOST equivalence claim.
+
+    Returns the smallest ``n >= 2`` whose approximate TOST power (see
+    ``tost_power``) reaches ``power`` at the planning difference
+    ``true_delta`` (default zero). ``margin`` is the pre-specified
+    equivalence bound, never a value tuned after seeing the observed
+    difference. A planning difference at or beyond the margin is not an
+    equivalence design (the rejection probability tends to zero or to
+    ``alpha`` rather than to one), so ``None`` is returned instead of a huge
+    or misleading n. Zero paired variance needs only the minimum two pairs
+    when the assumed difference is genuinely inside the margin.
+    """
+    std_value, alpha_value, power_value = _validate_design_inputs(
+        std, alpha, power)
+    margin_value = _validate_margin(margin)
+    true_value = _validate_margin(true_delta, "true_delta")
+    max_n = _strict_int(max_n, "max_n", minimum=2)
+    if margin_value <= 0.0:
+        raise ValueError(f"margin must be finite and > 0, got {margin!r}")
+    if alpha_value >= 0.5:
+        raise ValueError(
+            f"TOST needs alpha < 0.5 for a positive 1 - 2*alpha interval, "
+            f"got {alpha!r}")
+    if abs(true_value) >= margin_value:
+        return None
+    if std_value == 0.0:
+        return 2
+    if _tost_power_at_n(std_value, max_n, margin_value, alpha_value,
+                        true_value) < power_value:
+        return None
+    lo, hi = 2, max_n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _tost_power_at_n(std_value, mid, margin_value, alpha_value,
+                            true_value) >= power_value:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def tost_design_summary(std: float, n: int, margin: float,
+                        alpha: float = 0.05, power: float = 0.8,
+                        true_delta: float = 0.0) -> dict:
+    """Prospective TOST design check for one achieved equivalence contrast.
+
+    A non-significant superiority test is not an equivalence result, and a
+    TOST result without its design resolution is equally incomplete. This
+    block reports the approximate power at the achieved ``n``, the pairs the
+    pre-specified margin would have required, and the smallest equivalence
+    margin the current design could certify at the target power. It never
+    changes the TOST verdict in ``tost_paired``.
+    """
+    std_value, alpha_value, power_value = _validate_design_inputs(
+        std, alpha, power)
+    n = _strict_int(n, "n", minimum=2)
+    true_value = _validate_margin(true_delta, "true_delta")
+    out = {
+        "test": "tost_paired_design",
+        "paired_sd": std_value,
+        "n": n,
+        "df": float(n - 1),
+        "alpha": alpha_value,
+        "power_target": power_value,
+        "true_delta_assumed": true_value,
+        "margin": None,
+        "required_pairs_for_margin": None,
+        "adequately_powered_for_equivalence": None,
+        "approximate_power_at_n": None,
+        "minimum_detectable_equivalence_margin": None,
+        "note": ("pass a positive pre-specified equivalence margin to compute "
+                 "the pairs needed for that bound"),
+    }
+    margin_value = _as_real(margin)
+    if margin_value is None or not math.isfinite(margin_value):
+        raise ValueError(f"margin must be a finite number > 0, got {margin!r}")
+    if margin_value <= 0.0:
+        return out
+    if alpha_value >= 0.5:
+        raise ValueError(
+            f"TOST needs alpha < 0.5 for a positive 1 - 2*alpha interval, "
+            f"got {alpha!r}")
+    out["margin"] = margin_value
+    out["approximate_power_at_n"] = _tost_power_at_n(
+        std_value, n, margin_value, alpha_value, true_value)
+    required = tost_required_n(
+        std_value, margin_value, alpha=alpha_value, power=power_value,
+        true_delta=true_value)
+    out["required_pairs_for_margin"] = required
+    out["adequately_powered_for_equivalence"] = (
+        None if required is None else bool(n >= required))
+    # Smallest margin whose TOST reaches the target power at this n under the
+    # conservative zero-difference planning assumption. When the assumed
+    # difference is nonzero this is a labelled approximation.
+    try:
+        upper_tail = 1.0 - alpha_value
+        alpha_critical = (student_t_ppf(upper_tail, float(n - 1))
+                          if upper_tail < 1.0
+                          else -student_t_ppf(alpha_value, float(n - 1)))
+        power_mid = (1.0 + power_value) / 2.0
+        power_critical = (student_t_ppf(power_mid, float(n - 1))
+                          if power_mid < 1.0
+                          else -student_t_ppf(1.0 - power_mid, float(n - 1)))
+        critical = alpha_critical + power_critical
+        detectable = critical * std_value / math.sqrt(n)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        detectable = None
+    out["minimum_detectable_equivalence_margin"] = detectable
+    if out["adequately_powered_for_equivalence"]:
+        out["note"] = ("the design reaches the pre-specified equivalence "
+                       "margin at the target power")
+    elif required is not None:
+        out["note"] = ("underpowered for the pre-specified equivalence "
+                       f"margin: {required} pairs needed, {n} available")
+    else:
+        out["note"] = ("the pre-specified equivalence margin is not reachable "
+                       "within the search cap (or the assumed difference is "
+                       "outside the margin)")
     return out
 
 

@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import (
     average_precision,
+    benjamini_hochberg_adjust,
     chi2_sf,
     f1_from_counts,
     holm_adjust,
@@ -34,7 +35,10 @@ from adasquash.metrics import (
     paired_trend_test,
     recall_at_k,
     roc_auc,
+    student_t_cdf,
     student_t_ppf,
+    tost_power,
+    tost_required_n,
     welch_t_one_sided,
     wilson_interval,
 )
@@ -200,6 +204,24 @@ def check_statistics():
     equal(holm_adjust([0.01, 0.04, 0.03, None]), [0.03, 0.06, 0.06, None],
           label='Holm adjustment')
     equal(holm_adjust([]), [], label='Holm empty')
+    equal(benjamini_hochberg_adjust([0.01, 0.04, 0.03, None]),
+          [0.03, 0.04, 0.04, None], label='BH q-values')
+    equal(benjamini_hochberg_adjust([0.01, 1.5, '0.01', True]),
+          [0.01, None, None, None], label='BH invalid p-values')
+
+    # TOST design power from its explicit two-tail rejection probability.
+    tost_se = 0.10 / math.sqrt(12)
+    tost_critical = student_t_ppf(0.95, 11)
+    tost_expected = (
+        student_t_cdf((0.10 - 0.0) / tost_se - tost_critical, 11)
+        - student_t_cdf((-0.10 - 0.0) / tost_se + tost_critical, 11))
+    close(tost_power(0.10, 12, 0.10)['approximate_power'], tost_expected,
+          label='TOST design power')
+    tost_n = tost_required_n(0.10, 0.10, power=0.8)
+    equal(tost_power(0.10, tost_n, 0.10)['approximate_power'] >= 0.8, True,
+          label='TOST required n reaches target')
+    equal(tost_power(0.10, tost_n - 1, 0.10)['approximate_power'] < 0.8, True,
+          label='TOST required n is minimal')
 
     paired = paired_t_one_sided([1.0, 2.0, 3.0], [0.0, 0.0, 0.0])
     close(paired['mean_delta'], 2.0, label='paired mean')

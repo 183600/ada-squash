@@ -25,7 +25,8 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
                                paired_design_summary, paired_randomization_test,
-                               paired_t_one_sided, student_t_ppf, tost_paired,
+                               paired_t_one_sided, student_t_ppf,
+                               tost_design_summary, tost_paired,
                                two_sided_p_from_t, welch_t_one_sided)
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
@@ -213,6 +214,11 @@ def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
         tost = tost_paired(values, [0.0] * len(values),
                            margin=equivalence_margin, alpha=alpha)
         tost["enabled"] = True
+        summary = mean_std_stderr(values)
+        if summary is not None and summary.get("std") is not None:
+            tost["design"] = tost_design_summary(
+                summary["std"], int(tost["n"]), equivalence_margin,
+                alpha=alpha)
         equivalence = tost
     return {"seed_jackknife": jackknife, "equivalence": equivalence,
             "randomization_test": randomization}

@@ -37,7 +37,10 @@ honest:
   `imbalance_report` flags exactly that regime for a target distribution;
 * a scan that tests many rows against one reference gets `holm_adjust`, so a
   row-by-row alpha is corrected for the family of tests actually performed
-  (Holm-Bonferroni), instead of reporting the best of many uncorrected draws;
+  (Holm-Bonferroni), instead of reporting the best of many uncorrected draws.
+  `benjamini_hochberg_adjust` supplies the complementary FDR-controlled
+  q-values for exploratory screens, where the goal is a stated false-discovery
+  rate rather than a family-wise guarantee;
 * a claim that two arms are *the same* is an equivalence claim, not a
   non-significant superiority test: `tost_paired` runs the two one-sided
   tests and reports the matching interval. A small-seed effect is also
@@ -73,6 +76,7 @@ from typing import Optional, Sequence
 
 __all__ = [
     "average_precision",
+    "benjamini_hochberg_adjust",
     "binary_auc_report",
     "chi2_sf",
     "f1_from_counts",
@@ -97,7 +101,10 @@ __all__ = [
     "scale_replication_summary",
     "student_t_cdf",
     "student_t_ppf",
+    "tost_design_summary",
     "tost_paired",
+    "tost_power",
+    "tost_required_n",
     "two_sided_p_from_t",
     "welch_t_one_sided",
     "welch_z_one_sided",
@@ -123,6 +130,7 @@ from .metrics_stats import (MIN_SEEDS_FOR_SIGNIFICANCE,
     _strict_int,
     _validate_alpha,
     _validate_design_inputs,
+    benjamini_hochberg_adjust,
     chi2_sf,
     holm_adjust,
     leave_one_out_jackknife,
@@ -137,7 +145,10 @@ from .metrics_stats import (MIN_SEEDS_FOR_SIGNIFICANCE,
     paired_z_one_sided,
     student_t_cdf,
     student_t_ppf,
+    tost_design_summary,
     tost_paired,
+    tost_power,
+    tost_required_n,
     two_sided_p_from_t,
     wilson_interval,
 )

@@ -28,7 +28,8 @@ from adasquash.design import (design_readiness_audit,
                               prospective_power_plan,
                               randomized_complete_block_schedule,
                               schedule_balance_report,
-                              schedule_fingerprint_status)
+                              schedule_fingerprint_status,
+                              tost_power_plan)
 from scripts.ablation import build_analysis_plan
 
 
@@ -124,6 +125,35 @@ def _audit(seeds, *, n_tests, attrition, sd=0.10, margin=0.05):
         assumed_paired_sd=sd, identity_controls=[('arm0', 'arm1')],
         schedule_arm_of=lambda unit: unit.rsplit('::rep=', 1)[0],
         n_confirmatory_tests=n_tests, expected_attrition=attrition)
+
+
+def test_tost_power_plan_uses_equivalence_power_and_attrition():
+    plan = tost_power_plan(0.10, 12, equivalence_margin=0.10, n_tests=4,
+                           expected_attrition=0.10)
+    assert plan['n_tests'] == 4
+    assert plan['family_alpha'] == pytest.approx(0.0125)
+    assert plan['required_pairs_family_adjusted'] > plan[
+        'required_pairs_unadjusted']
+    assert plan['required_planned_pairs'] >= plan[
+        'required_pairs_family_adjusted']
+    assert plan['expected_analyzable_pairs'] == 9
+    assert plan['schema'] == 'adasquash.tost_power.v1'
+
+
+def test_readiness_checks_equivalence_power_separately_from_superiority():
+    rows = {'arm0': {}, 'arm1': {}}
+    seeds = list(range(12))
+    schedule = _schedule(len(rows), len(seeds))
+    report = design_readiness_audit(
+        seeds, rows, {name: 'h' for name in rows}, schedule=schedule,
+        expected_units=schedule['order'], equivalence_margin=0.10,
+        assumed_paired_sd=0.10, identity_controls=[('arm0', 'arm1')],
+        schedule_arm_of=lambda unit: unit.rsplit('::rep=', 1)[0])
+    by_id = {check['id']: check for check in report['checks']}
+    assert 'power' not in by_id
+    assert by_id['equivalence_power']['status'] == 'pass'
+    assert report['planned_power'] is None
+    assert report['planned_equivalence_power']['n_tests'] == 1
 
 
 def test_readiness_plans_at_the_family_level_and_reports_the_assumptions():
