@@ -307,7 +307,12 @@ class LossSpikeCounter:
         # spike detection. Keep it visible in the history but leave the
         # baseline untouched so the next finite loss is still judged against
         # the last finite one.
-        if _is_boolean_scalar(loss_value):
+        if (_is_boolean_scalar(loss_value)
+                or isinstance(loss_value, (str, bytes, bytearray))):
+            # A numeric string is not a measured loss: `float("10.0")` would
+            # enter the EMA and could report a spike from a malformed log
+            # record. Keep it visible in the history without changing the
+            # baseline, like a non-finite loss.
             self.history.append((loss_value, self.ema, False))
             return False
         try:
