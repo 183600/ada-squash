@@ -1411,6 +1411,28 @@ def tost_paired(
     return out
 
 
+def _tost_df(n: int) -> float:
+    """Degrees of freedom for a count that may exceed the float range.
+
+    A huge Python-int pair count is a legitimate (if absurd) design input.
+    Beyond the float range the t distribution is indistinguishable from the
+    normal limit; use an enormous representable df so the existing normal
+    expansion stays in effect instead of crashing on ``float(n - 1)``.
+    """
+    try:
+        return float(n - 1)
+    except OverflowError:
+        return 1.0e300
+
+
+def _tost_inverse_sqrt_n(n: int) -> float:
+    """``1 / sqrt(n)`` for a count that may exceed the float range."""
+    try:
+        return 1.0 / math.sqrt(n)
+    except OverflowError:
+        return math.exp(-0.5 * math.log(n))
+
+
 def _tost_power_at_n(std: float, n: int, margin: float, alpha: float,
                      true_delta: float = 0.0) -> float:
     """Approximate power of a paired TOST at ``n`` pairs.
@@ -1427,8 +1449,11 @@ def _tost_power_at_n(std: float, n: int, margin: float, alpha: float,
     sample-size helper; it is deliberately a planning calculation, not a
     post-hoc substitution for the exact TOST p-value.
     """
-    df = float(n - 1)
-    se = std / math.sqrt(n)
+    df = _tost_df(n)
+    try:
+        se = std / math.sqrt(n)
+    except OverflowError:
+        se = std * _tost_inverse_sqrt_n(n)
     if se == 0.0:
         return 1.0 if abs(true_delta) < margin else 0.0
     upper_tail = 1.0 - alpha
@@ -1470,7 +1495,7 @@ def tost_power(std: float, n: int, margin: float, alpha: float = 0.05,
         "test": "tost_paired_design",
         "paired_sd": std_value,
         "n": n,
-        "df": float(n - 1),
+        "df": _tost_df(n),
         "margin": margin_value,
         "alpha": alpha_value,
         "true_delta_assumed": true_value,
@@ -1544,7 +1569,7 @@ def tost_design_summary(std: float, n: int, margin: float,
         "test": "tost_paired_design",
         "paired_sd": std_value,
         "n": n,
-        "df": float(n - 1),
+        "df": _tost_df(n),
         "alpha": alpha_value,
         "power_target": power_value,
         "true_delta_assumed": true_value,
@@ -1578,16 +1603,20 @@ def tost_design_summary(std: float, n: int, margin: float,
     # conservative zero-difference planning assumption. When the assumed
     # difference is nonzero this is a labelled approximation.
     try:
+        df = _tost_df(n)
         upper_tail = 1.0 - alpha_value
-        alpha_critical = (student_t_ppf(upper_tail, float(n - 1))
+        alpha_critical = (student_t_ppf(upper_tail, df)
                           if upper_tail < 1.0
-                          else -student_t_ppf(alpha_value, float(n - 1)))
+                          else -student_t_ppf(alpha_value, df))
         power_mid = (1.0 + power_value) / 2.0
-        power_critical = (student_t_ppf(power_mid, float(n - 1))
+        power_critical = (student_t_ppf(power_mid, df)
                           if power_mid < 1.0
-                          else -student_t_ppf(1.0 - power_mid, float(n - 1)))
+                          else -student_t_ppf(1.0 - power_mid, df))
         critical = alpha_critical + power_critical
-        detectable = critical * std_value / math.sqrt(n)
+        try:
+            detectable = critical * std_value / math.sqrt(n)
+        except OverflowError:
+            detectable = critical * std_value * _tost_inverse_sqrt_n(n)
     except (OverflowError, ValueError, ZeroDivisionError):
         detectable = None
     out["minimum_detectable_equivalence_margin"] = detectable
