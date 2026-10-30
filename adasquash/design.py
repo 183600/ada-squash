@@ -1598,7 +1598,10 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     def add(check_id: str, status: str, detail: str) -> None:
         checks.append({'id': check_id, 'status': status, 'detail': detail})
 
-    seeds = list(seeds or [])
+    # `seeds or []` asks a NumPy array for its truth value, which raises
+    # "truth value is ambiguous" before any check can run. A None default is
+    # the only case that means "no seeds".
+    seeds = [] if seeds is None else list(seeds)
     min_seeds_valid = (isinstance(min_seeds, int) and not isinstance(min_seeds, bool)
                        and min_seeds >= 1)
     if not min_seeds_valid:
@@ -1610,14 +1613,18 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         min_seeds = MIN_SEEDS_FOR_SIGNIFICANCE
     # The power check must use the number of *distinct* observations the
     # paired test will actually have, not the raw list length (duplicate seeds
-    # are the same run and the replication check above rejects them).
-    n_pairs = len({seed for seed in seeds
-                   if isinstance(seed, int) and not isinstance(seed, bool)})
+    # are the same run and the replication check above rejects them). NumPy
+    # integer scalars are exact seed identities too, matching `_validate_seed`;
+    # normalizing through `int` also makes int/np.int64 duplicates compare
+    # equal in the distinctness set.
+    integral_seeds = [seed for seed in seeds
+                      if isinstance(seed, numbers.Integral)
+                      and not isinstance(seed, bool)]
+    n_pairs = len({int(seed) for seed in integral_seeds})
     if min_seeds_valid and (
             len(seeds) < min_seeds
-            or any(isinstance(seed, bool) or not isinstance(seed, int)
-                   for seed in seeds)
-            or len(set(seeds)) != len(seeds)):
+            or len(integral_seeds) != len(seeds)
+            or n_pairs != len(seeds)):
         add('replication', 'fail',
             f'{len(seeds)} seed(s) {seeds}: need >= {min_seeds} distinct integer seeds')
     elif min_seeds_valid:
