@@ -46,7 +46,8 @@ sys.path.insert(0, str(ROOT))
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_ci,
                                mean_prediction_interval, mean_std_stderr,
                                paired_t_one_sided, student_t_ppf)
-from adasquash.repro import (collect_run_metadata, finish_metadata, save_run_manifest,
+from adasquash.repro import (collect_run_metadata, execution_identity_mismatches,
+                             finish_metadata, save_run_manifest,
                              training_recipe_mismatches)
 
 PAIRING_KEYS = (
@@ -501,10 +502,17 @@ def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
                 + "; ".join(association_problems[:3]))
     recipe_problems = []
     ledger_problems = []
+    identity_problems = []
     for run in cand_arm["runs"]:
         for ref_run in ref_arm["runs"]:
             ref_manifest = ref_run["manifest"]
             manifest = run["manifest"]
+            identity = execution_identity_mismatches(ref_manifest, manifest)
+            if identity["mismatches"] or identity["problems"]:
+                identity_problems.append(
+                    f"{ref_run['path']} vs {run['path']}: "
+                    + "; ".join(identity["problems"]
+                                or [identity.get("reason") or "unknown difference"]))
             mismatches = training_recipe_mismatches(
                 ref_manifest.get("hyperparameters"), manifest.get("hyperparameters"))
             # The evaluated checkpoint step is a per-seed choice (early
@@ -529,6 +537,10 @@ def _pairing_problem(ref_arm: dict, cand_arm: dict) -> str | None:
     if ledger_problems:
         return ("cross-split ledger contents differ, so the arms were not scored on the "
                 "same held-out documents: " + "; ".join(ledger_problems[:3]))
+    if identity_problems:
+        return ("execution identity (code commit and software/numeric stack) differs, "
+                "so the arms are not a controlled comparison: "
+                + "; ".join(identity_problems[:3]))
     if recipe_problems:
         return ("training recipe/model shape differs, so the arms are not a controlled "
                 "comparison: " + "; ".join(recipe_problems[:3]))

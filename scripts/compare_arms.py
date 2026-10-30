@@ -54,7 +54,9 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                paired_design_summary, paired_randomization_test,
                                paired_t_one_sided, student_t_ppf,
                                tost_design_summary, tost_paired)
-from adasquash.repro import compare_train_streams, training_recipe_mismatches
+from adasquash.repro import (compare_train_streams,
+                             execution_identity_mismatches,
+                             training_recipe_mismatches)
 
 _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
 
@@ -393,6 +395,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                  require_recipe: bool=True,
                  equivalence_margin: float=0.0,
                  require_train_stream_identity: bool=False,
+                 require_execution_identity: bool=False,
                  reference_selection: str | None=None,
                  reference_pool: list[str] | None=None) -> dict:
     """Paired, Holm-adjusted comparison of arm aggregates.
@@ -413,6 +416,15 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
     reference so both quantities are auditable. An explicit `reference` is
     treated as pre-specified unless `reference_selection='best-of-pool'` (or
     `reference_pool`) says otherwise.
+
+    A recorded mismatch in the code/environment identity (commit, Python,
+    torch, NumPy, CUDA/cuDNN, thread counts, TF32/cuDNN/deterministic flags,
+    hash-seed policy) is always an incomparability, even when every
+    hyperparameter matches. A manifest with a dirty working tree is also
+    incomparable because its commit does not pin the executed code. Missing
+    identity fields are reported as unknown; pass
+    `require_execution_identity=True` to make them fatal for a confirmatory
+    comparison.
     """
     if not isinstance(arms, dict) or len(arms) < 2:
         raise ValueError('compare_arms needs at least two named aggregates')
@@ -650,6 +662,24 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                 pair_problems.append(
                     f'train stream identity was not established for seed {seed}; '
                     'the arms may have consumed different data batches')
+        # Recipe equality is necessary but not sufficient: the same recipe
+        # executed by a different commit or numeric stack is not the same
+        # experiment. Recorded differences and dirty trees always block
+        # certification; absent identity fields are unknown, and only block
+        # when the caller opts into a confirmatory comparison.
+        execution_identity = execution_identity_mismatches(
+            manifests.get(reference), manifests.get(name))
+        if execution_identity['mismatches'] or execution_identity['problems']:
+            pair_problems.append(
+                'execution identity differs or is unverifiable: '
+                + '; '.join(execution_identity['problems']
+                            or [execution_identity.get('reason') or 'unknown difference']))
+        elif require_execution_identity and execution_identity['unknown']:
+            pair_problems.append(
+                'execution identity (code commit and software/numeric stack) '
+                'was not recorded for one or both arms; the comparison cannot '
+                'certify that they ran the same experiment: missing '
+                + ', '.join(execution_identity['unknown']))
         pair_protocol_ok = not pair_problems
         entry = {
             'name': name,
@@ -715,6 +745,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                 'by_seed': stream_checks,
                 'required': bool(require_train_stream_identity),
             },
+            'execution_identity': execution_identity,
             'recipe_checked': (isinstance(cand_hyper, dict)
                                and isinstance(ref_hyper, dict)),
             'recipe_mismatches': recipe_mismatches,
@@ -976,13 +1007,15 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'model': sorted(map(str, model_values)),
             'require_recipe': bool(require_recipe),
             'require_train_stream_identity': bool(require_train_stream_identity),
+            'require_execution_identity': bool(require_execution_identity),
             'recipe_recorded': {name: prepared[name]['recipe_recorded']
                                 for name in prepared},
             'reading': ('only the normalization may differ across Phase-1 arms; shape, '
                         'fixed final step, resolved data version and the recorded '
                         'optimizer/schedule/token recipe must be identical, the shared '
-                        'seed must have consumed the same training stream, and each arm '
-                        'needs >= 3 clean seeds'),
+                        'seed must have consumed the same training stream, the code/'
+                        'environment identity must match, and each arm needs >= 3 '
+                        'clean seeds'),
         },
         'reference_selection': {
             'data_dependent': reference_data_dependent,
@@ -1039,6 +1072,15 @@ def print_comparison(comparison: dict) -> None:
               f"{selection.get('pool')} after seeing the losses; the "
               f"selection-adjusted p is reported alongside the raw one")
     for entry in comparison['rows']:
+        identity = entry.get('execution_identity') or {}
+        if identity.get('problems') or (
+                protocol.get('require_execution_identity')
+                and identity.get('unknown')):
+            print(f"[arms] WARNING: {entry['name']}: execution identity cannot "
+                  "be verified; this contrast cannot certify a code/environment-"
+                  "controlled effect: "
+                  + '; '.join(identity.get('problems')
+                              or ['missing ' + ', '.join(identity.get('unknown') or [])]))
         delta = entry['delta_vs_reference']
         std = entry.get('std')
         p = entry.get('p_one_sided')
@@ -1130,6 +1172,11 @@ def main(argv=None) -> None:
                    help='fail closed when the per-seed training-stream fingerprint is '
                         'missing or not comparable; the fingerprint proves the paired '
                         'arms consumed the same token windows in the same order')
+    p.add_argument('--require-execution-identity', action='store_true',
+                   help='fail closed when the code/environment identity (commit, Python, '
+                        'torch, NumPy, CUDA/cuDNN, thread counts, TF32/determinism flags, '
+                        'hash-seed policy) is missing or not comparable; recorded '
+                        'differences and dirty working trees always block certification')
     p.add_argument('--allow-missing-recipe', action='store_true',
                    help='do not fail closed when a sibling run_manifest.json (the record of '
                         'optimizer/schedule/token budget) is missing; the comparison is then '
@@ -1186,6 +1233,7 @@ def main(argv=None) -> None:
                               require_recipe=not args.allow_missing_recipe,
                               equivalence_margin=args.equivalence_margin,
                               require_train_stream_identity=args.require_train_stream_identity,
+                              require_execution_identity=args.require_execution_identity,
                               reference_selection=args.reference_selection,
                               reference_pool=args.reference_pool)
     print_comparison(comparison)

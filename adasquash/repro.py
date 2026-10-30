@@ -21,6 +21,12 @@ diagnosed from the record instead of from memory. `environment_info` also
 records the rest of the *RNG/determinism configuration* the run actually
 used (cuDNN flags, TF32 flags, thread counts, hash seeds).
 
+`execution_identity_mismatches` is the cross-run counterpart: two arms are
+comparable only when their manifests agree on the source commit and the
+software/numeric stack that executed the recipe. A recorded difference or a
+dirty working tree is a hard incomparability; absent fields are unknown and
+must be made fatal explicitly by a confirmatory analysis.
+
 TensorFlow is not a dependency of this repository; the training stack is
 pure PyTorch, so no TF RNG is seeded here.
 
@@ -38,11 +44,13 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+RUN_MANIFEST_SCHEMA = "adasquash.run_manifest.v1"
 
 # `PYTHONHASHSEED` is only read by the interpreter at startup. Snapshotting
 # the environment here (import time, before `set_all_seeds` can overwrite it)
@@ -645,6 +653,192 @@ def training_recipe_mismatches(reference: dict, other: dict,
     return out
 
 
+# Fields that define the *execution identity* of a run, independently of its
+# hyperparameters: the source revision and the software/numeric stack that
+# turned the same recipe into a different sequence of floating-point
+# operations. They are dotted paths into a run manifest produced by
+# `collect_run_metadata` (or the equivalent script manifest).
+EXECUTION_IDENTITY_KEYS = (
+    "git.commit",
+    "environment.python",
+    "environment.platform",
+    "environment.torch",
+    "environment.numpy",
+    "environment.cuda_available",
+    "environment.cuda_version",
+    "environment.cudnn_version",
+    "environment.device_names",
+    "environment.transformers",
+    "environment.datasets",
+    "environment.tokenizers",
+    "environment.pyyaml",
+    "environment.rng_config.torch_num_threads",
+    "environment.rng_config.torch_num_interop_threads",
+    "environment.rng_config.cudnn_deterministic",
+    "environment.rng_config.cudnn_benchmark",
+    "environment.rng_config.tf32_matmul_allowed",
+    "environment.rng_config.tf32_cudnn_allowed",
+    "environment.rng_config.deterministic_algorithms",
+    "environment.rng_config.deterministic_algorithms_warn_only",
+    "environment.rng_config.cublas_workspace_config",
+    "environment.rng_config.hash_randomization",
+    "environment.rng_config.pythonhashseed_at_process_start",
+)
+# Fields where a recorded null/empty value means "not identified", not "both
+# runs agree on the identity". `cuda_version`/`cudnn_version` are deliberately
+# absent: they are legitimately None on a CPU-only run.
+_IDENTITY_NON_NULL = frozenset({
+    "git.commit",
+    "environment.python",
+    "environment.platform",
+    "environment.torch",
+    "environment.numpy",
+    "environment.cuda_available",
+    "environment.rng_config.torch_num_threads",
+    "environment.rng_config.torch_num_interop_threads",
+    "environment.rng_config.cudnn_deterministic",
+    "environment.rng_config.cudnn_benchmark",
+    "environment.rng_config.tf32_matmul_allowed",
+    "environment.rng_config.tf32_cudnn_allowed",
+    "environment.rng_config.deterministic_algorithms",
+    "environment.rng_config.deterministic_algorithms_warn_only",
+})
+_MISSING_IDENTITY = object()
+
+
+def _identity_lookup(record, path: str):
+    """Resolve a dotted path inside a nested mapping, or return a sentinel."""
+    node = record
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            return _MISSING_IDENTITY
+        node = node[part]
+    return node
+
+
+def _identity_canonical(value) -> str:
+    """Stable representation for equality across JSON round-trips.
+
+    Dict ordering must not matter, while ``1`` and ``True`` must not compare
+    equal just because Python's ``==`` says so. Non-JSON values are compared
+    by ``repr`` instead of raising; a malformed manifest is reported as a
+    difference rather than crashing the audit.
+    """
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=repr)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _identity_output(value):
+    """A JSON-friendly copy of a recorded identity value."""
+    if value is _MISSING_IDENTITY:
+        return None
+    try:
+        return json.loads(json.dumps(value, sort_keys=True, default=repr))
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def execution_identity_mismatches(reference, other,
+                                  keys=EXECUTION_IDENTITY_KEYS) -> dict:
+    """Compare the code/environment identity recorded by two run manifests.
+
+    A training-recipe check answers "did both runs use the same optimizer,
+    schedule and token budget?". It cannot answer "did both runs execute the
+    same code with the same numeric stack?". Two arms trained under different
+    commits, torch versions, CUDA kernels, thread counts or TF32/cuDNN
+    settings can share every hyperparameter and still produce a loss delta
+    that has nothing to do with the normalization layer. This helper makes
+    that distinction explicit.
+
+    Semantics (the same fail-closed rule used for recipes and data streams):
+
+    * a recorded difference is a hard incomparability;
+    * a missing field is *unknown*, not equal, and is listed separately;
+    * a manifest whose ``git.dirty`` is true does not pin the code at all, so
+      it is a problem even when the commit hash matches;
+    * ``comparable`` is true only when every requested field is present on
+      both sides, equal, and both trees are known to be clean.
+
+    ``problems`` holds recorded failures that are actionable without knowing
+    the caller's policy (differences, dirty trees, malformed values);
+    ``unknown`` holds absent fields. A caller that only reports (rather than
+    certifies) can ignore ``unknown``; a confirmatory comparison must pass
+    ``require_execution_identity`` so that unknown is also fatal.
+    """
+    if isinstance(keys, str) or not isinstance(keys, (list, tuple)):
+        raise ValueError("keys must be a sequence of dotted manifest paths")
+    checked_keys = tuple(str(key) for key in keys)
+    reference_mapping = isinstance(reference, Mapping)
+    other_mapping = isinstance(other, Mapping)
+    problems: list[str] = []
+    mismatches: dict[str, list] = {}
+    unknown: list[str] = []
+    for path in checked_keys:
+        a = _identity_lookup(reference, path) if reference_mapping else _MISSING_IDENTITY
+        b = _identity_lookup(other, path) if other_mapping else _MISSING_IDENTITY
+        if a is _MISSING_IDENTITY or b is _MISSING_IDENTITY:
+            unknown.append(path)
+            continue
+        if path in _IDENTITY_NON_NULL and (
+                a is None or b is None
+                or (isinstance(a, str) and not a.strip())
+                or (isinstance(b, str) and not b.strip())):
+            unknown.append(path)
+            continue
+        if _identity_canonical(a) != _identity_canonical(b):
+            mismatches[path] = [_identity_output(a), _identity_output(b)]
+            problems.append(
+                f"{path} differs: {_identity_output(a)!r} vs {_identity_output(b)!r}")
+    dirty = {}
+    for role, record, is_mapping in (
+            ("reference", reference, reference_mapping),
+            ("other", other, other_mapping)):
+        value = _identity_lookup(record, "git.dirty") if is_mapping else _MISSING_IDENTITY
+        if value is _MISSING_IDENTITY:
+            dirty[role] = None
+            if "git.dirty" not in unknown:
+                unknown.append("git.dirty")
+            continue
+        if not isinstance(value, bool):
+            dirty[role] = None
+            if "git.dirty" not in unknown:
+                unknown.append("git.dirty")
+            problems.append(
+                f"{role} git.dirty is not a boolean: {_identity_output(value)!r}; "
+                "the working-tree state cannot be verified")
+            continue
+        dirty[role] = value
+        if value:
+            problems.append(
+                f"{role} run was produced from a dirty working tree; the "
+                "recorded commit does not pin the executed code")
+    missing_side = []
+    if not reference_mapping:
+        missing_side.append("reference")
+    if not other_mapping:
+        missing_side.append("other")
+    if missing_side:
+        problems.append(
+            "run manifest is missing or unreadable for "
+            + " and ".join(missing_side))
+    comparable = bool(not problems and not unknown)
+    return {
+        "schema": "adasquash.execution_identity.v1",
+        "keys": list(checked_keys),
+        "recorded": bool(reference_mapping and other_mapping),
+        "comparable": comparable,
+        "identical": comparable,
+        "mismatches": mismatches,
+        "unknown": unknown,
+        "dirty_tree": dirty,
+        "problems": problems,
+        "reason": (None if comparable else
+                   "execution identity differs or is not fully recorded"),
+    }
+
+
 def artifact_record(path) -> dict:
     """Cheap pointer to a run artifact: path, existence, size and mtime.
 
@@ -700,6 +894,7 @@ def environment_info() -> dict:
         "tensorflow": _module_version("tensorflow"),
         "transformers": _module_version("transformers"),
         "datasets": _module_version("datasets"),
+        "tokenizers": _module_version("tokenizers"),
         "pyyaml": _module_version("yaml"),
         "cuda_available": torch.cuda.is_available(),
         "cuda_version": getattr(torch.version, "cuda", None),
@@ -727,10 +922,10 @@ def environment_info() -> dict:
             "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         },
     }
-    if torch.cuda.is_available():
-        info["device_names"] = [
-            torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
-        ]
+    info["device_names"] = (
+        [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+        if torch.cuda.is_available() else []
+    )
     return info
 
 
@@ -740,7 +935,11 @@ def collect_run_metadata(seed: int | None = None, extra: dict | None = None,
                         results: dict | None = None) -> dict:
     """Metadata block attached to every run manifest.
 
-    `hyperparameters`, `data_version`, `training_curves` and `results` are
+    The block carries `RUN_MANIFEST_SCHEMA`, the code revision, the full
+    environment identity (including the numeric flags compared by
+    `execution_identity_mismatches`), the seed and optional experiment
+    payloads. `hyperparameters`, `data_version`, `training_curves` and
+    `results` are
     optional convenience fields so a caller can record the full experiment
     (code version, hyperparameters, seed, data version, training curves and
     final results) in one call instead of mutating the dict by hand. They are
@@ -748,6 +947,7 @@ def collect_run_metadata(seed: int | None = None, extra: dict | None = None,
     and `extra` (if given) is applied last, so callers can still override.
     """
     metadata = {
+        "schema": RUN_MANIFEST_SCHEMA,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "seed": None if seed is None else _strict_seed(seed),
         "git": git_revision(),
@@ -933,6 +1133,61 @@ def _self_test_deterministic_algorithms_optin() -> bool:
     return ok
 
 
+def _self_test_execution_identity() -> bool:
+    """A mismatched/dirty/unknown identity must never verify as comparable."""
+    def manifest(**environment_overrides):
+        environment = {
+            'python': '3.12.0',
+            'platform': 'Linux-test',
+            'torch': '2.14.1',
+            'numpy': '2.5.4',
+            'transformers': '4.44.0',
+            'datasets': '2.20.0',
+            'tokenizers': '0.19.1',
+            'pyyaml': '6.0.1',
+            'cuda_available': False,
+            'cuda_version': None,
+            'cudnn_version': None,
+            'device_names': [],
+            'rng_config': {
+                'torch_num_threads': 4,
+                'torch_num_interop_threads': 1,
+                'cudnn_deterministic': True,
+                'cudnn_benchmark': False,
+                'tf32_matmul_allowed': False,
+                'tf32_cudnn_allowed': False,
+                'deterministic_algorithms': False,
+                'deterministic_algorithms_warn_only': False,
+                'cublas_workspace_config': ':4096:8',
+                'hash_randomization': True,
+                'pythonhashseed_at_process_start': None,
+            },
+        }
+        environment.update(environment_overrides)
+        return {'git': {'commit': 'abc123', 'dirty': False},
+                'environment': environment}
+
+    clean = manifest()
+    same = execution_identity_mismatches(clean, manifest())
+    different_commit = execution_identity_mismatches(
+        clean, {'git': {'commit': 'def456', 'dirty': False},
+                'environment': clean['environment']})
+    dirty = manifest()
+    dirty['git']['dirty'] = True
+    dirty_check = execution_identity_mismatches(clean, dirty)
+    unknown = execution_identity_mismatches(
+        clean, {'git': {'commit': 'abc123', 'dirty': False}})
+    return bool(
+        same['comparable'] and same['identical'] and not same['problems']
+        and different_commit['mismatches'].get('git.commit')
+        and not different_commit['comparable']
+        and not dirty_check['comparable']
+        and 'dirty' in ' '.join(dirty_check['problems'])
+        and not unknown['comparable']
+        and unknown['unknown']
+    )
+
+
 def self_test(verbose: bool = True) -> dict:
     """Run the in-process reproducibility regression checks.
 
@@ -940,7 +1195,8 @@ def self_test(verbose: bool = True) -> dict:
     a reused seed across Python/NumPy/torch, per-worker stream derivation,
     deterministic DataLoader ordering under an explicit generator +
     `seed_worker`, atomic manifest round-trip with the determinism fields,
-    the chronological/disjoint split boundaries, and the deterministic-
+    the chronological/disjoint split boundaries, the execution-identity
+    comparison used by the cross-arm certificate, and the deterministic-
     algorithms opt-in. Meant to be run from CI or by hand
     (`python3 -m adasquash.repro --self-test`).
     """
@@ -952,6 +1208,7 @@ def self_test(verbose: bool = True) -> dict:
         'dataloader_reproducible': _self_test_dataloader_reproducibility(),
         'manifest_atomic_roundtrip_with_determinism_fields': _self_test_manifest_roundtrip(),
         'split_boundaries_chronological_and_disjoint': _self_test_split_boundaries(),
+        'execution_identity_fails_closed': _self_test_execution_identity(),
         'deterministic_algorithms_optin': _self_test_deterministic_algorithms_optin(),
     }
     if verbose:
@@ -978,11 +1235,14 @@ def _main(argv=None) -> int:
 
 __all__ = [
     "REPO_ROOT",
+    "RUN_MANIFEST_SCHEMA",
     "apply_deterministic_algorithms",
     "artifact_record",
     "collect_run_metadata",
     "deterministic_algorithms_context",
     "environment_info",
+    "execution_identity_mismatches",
+    "EXECUTION_IDENTITY_KEYS",
     "file_fingerprint",
     "finish_metadata",
     "git_revision",
