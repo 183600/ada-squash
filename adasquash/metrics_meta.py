@@ -545,6 +545,33 @@ def paired_trend_test(
     return out
 
 
+def _welch_arm_statistics(a: Sequence[float], b: Sequence[float]):
+    """Arm means/std plus the scale needed to keep Welch ratios finite.
+
+    An arm's sample standard deviation can exceed the float range even when
+    its standard error and every observation are finite (for example,
+    ``[max_float, -max_float, -max_float]``). Scaling both arms by their
+    common maximum magnitude preserves the Welch ratio and its degrees of
+    freedom while keeping every intermediate finite. The returned scale maps
+    a tested difference back to the original units.
+    """
+    ma, sa = _mean_and_std(a)
+    mb, sb = _mean_and_std(b)
+    if (math.isfinite(ma) and math.isfinite(sa)
+            and math.isfinite(mb) and math.isfinite(sb)):
+        return ma, sa, mb, sb, 1.0
+    if not (all(math.isfinite(value) for value in a)
+            and all(math.isfinite(value) for value in b)):
+        return ma, sa, mb, sb, 1.0
+    scale = max(max(abs(value) for value in a),
+                max(abs(value) for value in b))
+    if scale == 0.0:
+        return 0.0, 0.0, 0.0, 0.0, 1.0
+    ma, sa = _mean_and_std([value / scale for value in a])
+    mb, sb = _mean_and_std([value / scale for value in b])
+    return ma, sa, mb, sb, scale
+
+
 def welch_z_one_sided(
     a: Sequence[float], b: Sequence[float], margin: float = 0.0
 ) -> dict:
@@ -561,16 +588,17 @@ def welch_z_one_sided(
     if len(a) < 2 or len(b) < 2:
         return {"mean_delta": None, "z": None, "p_one_sided": None,
                 "n": [len(a), len(b)], "paired": False}
-    ma, sa = _mean_and_std(a)
-    mb, sb = _mean_and_std(b)
+    ma, sa, mb, sb, scale = _welch_arm_statistics(a, b)
     se = math.hypot(sa / math.sqrt(len(a)), sb / math.sqrt(len(b)))
     delta = ma - mb
+    margin_test = margin / scale
     if se == 0.0:
-        z = float("-inf") if delta + margin < 0.0 else (float("inf") if delta + margin > 0.0 else 0.0)
+        z = float("-inf") if delta + margin_test < 0.0 else (
+            float("inf") if delta + margin_test > 0.0 else 0.0)
     else:
-        z = (delta + margin) / se
+        z = (delta + margin_test) / se
     return {
-        "mean_delta": delta,
+        "mean_delta": delta * scale,
         "z": z,
         "p_one_sided": _p_one_sided_from_z(z),
         "n": [len(a), len(b)],
@@ -602,8 +630,7 @@ def welch_t_one_sided(
     }
     if na < 2 or nb < 2:
         return empty
-    ma, sa = _mean_and_std(a)
-    mb, sb = _mean_and_std(b)
+    ma, sa, mb, sb, scale = _welch_arm_statistics(a, b)
     delta = ma - mb
     se = math.hypot(sa / math.sqrt(na), sb / math.sqrt(nb))
     df = float(max(1, na + nb - 2))
@@ -617,18 +644,20 @@ def welch_t_one_sided(
         denom = (var_a ** 2 / (na - 1) + var_b ** 2 / (nb - 1))
         if denom > 0.0:
             df = max(1.0, (var_a + var_b) ** 2 / denom)
+    margin_test = margin / scale
     if se == 0.0:
-        t = float("-inf") if delta + margin < 0.0 else (float("inf") if delta + margin > 0.0 else 0.0)
+        t = float("-inf") if delta + margin_test < 0.0 else (
+            float("inf") if delta + margin_test > 0.0 else 0.0)
     else:
-        t = (delta + margin) / se
+        t = (delta + margin_test) / se
     half = student_t_ppf(1.0 - alpha / 2.0, df) * se
     empty.update({
-        "mean_delta": delta,
+        "mean_delta": delta * scale,
         "t": t,
         "df": df,
         "p_one_sided": student_t_cdf(t, df),
-        "ci_low": delta - half,
-        "ci_high": delta + half,
+        "ci_low": (delta - half) * scale,
+        "ci_high": (delta + half) * scale,
     })
     return empty
 
