@@ -152,6 +152,146 @@ def test_ngram_index_can_attribute_a_document_to_multiple_benchmarks():
     assert match["benchmarks"] == ["a", "b"]
 
 
+def test_ngram_match_extent_distinguishes_a_copy_from_an_incidental_hit():
+    base = list(range(100))
+    index = build_ngram_index({"bench": [base]}, ngram_size=8)
+
+    copied = find_ngram_matches(base, index)
+    assert copied["longest_match_tokens"] == 100
+    assert copied["matched_token_coverage"] == pytest.approx(1.0)
+    assert copied["by_benchmark"]["bench"]["benchmark_ngram_coverage"] == pytest.approx(1.0)
+
+    excerpt = find_ngram_matches([999] + base[10:30] + [888], index)
+    assert excerpt["longest_match_tokens"] == 20
+    assert excerpt["matched_token_coverage"] == pytest.approx(20 / 22)
+    assert excerpt["by_benchmark"]["bench"]["benchmark_ngram_coverage"] == pytest.approx(
+        13 / 93)
+
+    # A single shared 8-gram in a 1000-token document is a much weaker signal
+    # than a copied 100-token document, even though both are "matched".
+    incidental = find_ngram_matches(list(range(500, 600)) + base[20:28]
+                                    + list(range(700, 1100)), index)
+    assert incidental["longest_match_tokens"] == 8
+    assert incidental["matched_token_coverage"] < 0.02
+
+
+def test_ngram_match_coverage_unions_overlapping_token_spans():
+    index = build_ngram_index({
+        "bench": [list(range(8)), list(range(2, 10))],
+    }, ngram_size=8)
+    match = find_ngram_matches(list(range(10)), index)
+    # The matching windows start at 0 and 2: their token spans overlap even
+    # though the window at start 1 does not match. Coverage must count the
+    # union (10 tokens), not the sum of the two 8-token spans.
+    assert match["longest_match_tokens"] == 8
+    assert match["matched_token_coverage"] == pytest.approx(1.0)
+    assert match["by_benchmark"]["bench"]["matched_token_coverage"] == pytest.approx(1.0)
+    assert match["by_benchmark"]["bench"]["occurrences"] == 2
+
+
+def test_scan_extent_rule_keeps_below_threshold_hits_visible():
+    base = list(range(100))
+    index = build_ngram_index({"bench": [base]}, ngram_size=8)
+    document = {"tokens": base[10:50], "text": "excerpt"}
+    strict = scan_token_documents(
+        [document], index, min_match_tokens=41,
+        min_match_fraction=0.0)
+    assert strict["contaminated_documents"] == 0
+    assert strict["below_threshold_documents"] == 1
+    assert strict["contaminated_hashes"] == []
+    assert strict["by_benchmark"]["bench"]["below_threshold_documents"] == 1
+    assert strict["by_benchmark"]["bench"]["max_longest_match_tokens"] == 40
+    assert strict["by_benchmark"]["bench"][
+        "max_benchmark_ngram_coverage"] == pytest.approx(33 / 93)
+    assert strict["examples"] == []
+
+    looser = scan_token_documents(
+        [document], index, min_match_tokens=40,
+        min_match_fraction=0.0)
+    assert looser["contaminated_documents"] == 1
+    assert looser["below_threshold_documents"] == 0
+    assert looser["examples"][0]["longest_match_tokens"] == 40
+    assert looser["examples"][0]["matched_token_coverage"] == pytest.approx(1.0)
+
+
+def test_scan_rejects_malformed_extent_rule():
+    index = build_ngram_index({"bench": [list(range(20))]}, ngram_size=8)
+    for kwargs in ({"min_match_tokens": -1},
+                   {"min_match_tokens": True},
+                   {"min_match_fraction": -0.1},
+                   {"min_match_fraction": 1.5},
+                   {"min_match_fraction": True}):
+        with pytest.raises(ValueError):
+            scan_token_documents([], index, **kwargs)
+
+
+def test_text_normalization_is_applied_to_corpus_and_benchmark_alike():
+    from types import SimpleNamespace
+
+    import scripts.audit_benchmark_contamination as audit
+    from scripts.data_pipeline import DocumentCleaner
+
+    class Tokenizer:
+        def __call__(self, texts, add_special_tokens=False):
+            single = isinstance(texts, str)
+            rows = [[ord(char) % 97 for char in text if not char.isspace()]
+                    for text in ([texts] if single else list(texts))]
+            return {"input_ids": rows[0] if single else rows}
+
+    # The benchmark text is upper-case while the training document is
+    # lower-case with different spacing.  Casefold+whitespace normalization
+    # must make them the same token stream.
+    benchmark_tokens = [[ord(char) % 97 for char in "abcdefgh"]]
+    index = build_ngram_index({"bench": benchmark_tokens}, ngram_size=4)
+    stream = [{"text": "xx   ABCDEFGH   yy"}]
+
+    def fake_iter(_args):
+        return iter(stream), {"split": "train"}, DocumentCleaner()
+
+    original = audit._iter_training_documents
+    audit._iter_training_documents = fake_iter
+    try:
+        args = SimpleNamespace(
+            n_docs=0, tokenize_batch_size=4, max_examples=10,
+            val_frac=0.005, test_frac=0.005, num_documents=None, dedup=True,
+            min_doc_chars=0, max_doc_chars=0, dataset="fake", dataset_config=None,
+            dataset_revision=None, tokenizer_revision=None,
+            text_normalization="nfkc_casefold", min_match_tokens=0,
+            min_match_fraction=0.0,
+        )
+        scan, _ = audit._scan_training(args, Tokenizer(), index)
+    finally:
+        audit._iter_training_documents = original
+    assert scan["documents_scanned"] == 1
+    assert scan["contaminated_documents"] == 1
+    assert scan["contaminated_hashes"] == [
+        canonical_document_hash("xx   ABCDEFGH   yy").hex()]
+    # The raw protocol would tokenize two different strings and miss it.
+    args.text_normalization = "raw"
+    audit._iter_training_documents = fake_iter
+    try:
+        raw_scan, _ = audit._scan_training(args, Tokenizer(), index)
+    finally:
+        audit._iter_training_documents = original
+    assert raw_scan["contaminated_documents"] == 0
+
+
+def test_contamination_protocol_digest_covers_normalization_and_extent_rule():
+    records = {"bench": [{"text": "a benchmark question"}]}
+    base = contamination_protocol(
+        ngram_size=13, benchmarks=records, tokenizer="gpt2")
+    raw = contamination_protocol(
+        ngram_size=13, benchmarks=records, tokenizer="gpt2",
+        normalization="raw")
+    strict = contamination_protocol(
+        ngram_size=13, benchmarks=records, tokenizer="gpt2",
+        min_match_tokens=26, min_match_fraction=0.5)
+    assert protocol_digest(base) != protocol_digest(raw)
+    assert protocol_digest(base) != protocol_digest(strict)
+    assert strict["extent_rule"] == {
+        "min_match_tokens": 26, "min_match_fraction": 0.5}
+
+
 def test_ngram_index_rejects_empty_or_malformed_benchmarks():
     with pytest.raises(ValueError):
         build_ngram_index({})
@@ -209,6 +349,32 @@ def test_scan_bound_quantifies_a_zero_hit_sample():
     # stricter claim is not certified.
     assert bound["passes_max_rate"] is True
     assert contamination_scan_bound(report, max_rate=0.001)["passes_max_rate"] is False
+
+
+def test_scan_bound_can_make_per_benchmark_bounds_simultaneous():
+    index = build_ngram_index({
+        "a": [list(range(50))],
+        "b": [list(range(200, 250))],
+    }, ngram_size=8)
+    report = scan_token_documents(
+        [{"tokens": list(range(1000 + i, 1100 + i))} for i in range(400)],
+        index)
+    marginal = contamination_scan_bound(report)
+    simultaneous = contamination_scan_bound(
+        report, familywise_benchmark_bounds=True)
+    assert marginal["multiplicity"]["method"] == "none"
+    assert simultaneous["multiplicity"]["method"] == "bonferroni"
+    assert simultaneous["multiplicity"]["benchmarks"] == 2
+    assert simultaneous["multiplicity"]["per_benchmark_confidence"] == pytest.approx(0.975)
+    for name in ("a", "b"):
+        assert (simultaneous["by_benchmark"][name]["upper_bound"]
+                == wilson_upper_bound(0, 400, 0.975))
+        assert (simultaneous["by_benchmark"][name]["upper_bound"]
+                > marginal["by_benchmark"][name]["upper_bound"])
+    # The any-benchmark bound stays at the requested confidence.
+    assert simultaneous["upper_bound"] == marginal["upper_bound"]
+    with pytest.raises(ValueError):
+        contamination_scan_bound(report, familywise_benchmark_bounds="yes")
 
 
 def test_scan_bound_marks_an_empty_scan_as_unknown_not_clean():

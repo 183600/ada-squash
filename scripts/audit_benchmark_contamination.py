@@ -13,11 +13,17 @@ Method
 1. Load one or more benchmark sets (local JSON/JSONL files or the built-in
    MMLU / GSM8K / HumanEval / DROP presets), pinning their revision where the
    source supports it.
-2. Tokenize the evaluated text with the *same* tokenizer (and revision) the
-   run uses, and build an exact token n-gram index (default 13-grams, the
-   usual LM-decontamination primitive).
+2. Apply the *same* text normalization (NFKC + casefold + whitespace
+   collapse by default) to the benchmark and the corpus, tokenize both with
+   the same tokenizer (and revision) the run uses, and build an exact token
+   n-gram index (default 13-grams, the usual LM-decontamination primitive).
 3. Stream the training split through the same split/cleaning policy as
-   training and scan each cleaned document against that index.
+   training and scan each cleaned document against that index.  Besides the
+   any-overlap verdict, report the longest matching token run and the
+   document/benchmark token coverage, so an incidental stock phrase is not
+   reported in the same units as a copied question or solution.  The optional
+   ``--min-match-tokens`` / ``--min-match-fraction`` extent rule turns that
+   distinction into a pre-registered gate.
 4. Report per-benchmark overlap rates with a one-sided Wilson upper bound,
    and optionally write the canonical digests of contaminated training
    documents to a ledger.  Pass that ledger to
@@ -67,6 +73,7 @@ from adasquash.decontamination import (
     contamination_ledger_hashes,
     contamination_protocol,
     contamination_scan_bound,
+    normalize_match_text,
     protocol_digest,
     scan_token_documents,
 )
@@ -86,6 +93,26 @@ _PRESETS = {
     "humaneval": {"dataset": "openai/openai_humaneval", "config": None, "split": "test"},
     "drop": {"dataset": "ucinlp/drop", "config": None, "split": "validation"},
 }
+
+# The corpus and every benchmark go through the *same* transformation before
+# tokenization.  Exact matching on differently formatted copies of the same
+# sentence is a false negative, so the default is the recorded protocol's
+# NFKC/casefold/whitespace normalization; `raw` remains available for auditing
+# a case- or formatting-sensitive benchmark.
+_TEXT_NORMALIZATIONS = {
+    "nfkc_casefold": "unicode_nfkc_casefold_whitespace",
+    "raw": "raw",
+}
+
+
+def _match_text(text: str, normalization: str = "nfkc_casefold") -> str:
+    if normalization not in _TEXT_NORMALIZATIONS:
+        raise ValueError(
+            f"unknown text normalization {normalization!r}; choose from "
+            f"{sorted(_TEXT_NORMALIZATIONS)}")
+    if normalization == "raw":
+        return text
+    return normalize_match_text(text)
 
 
 def _load_benchmark_file(path: Path) -> list:
@@ -308,19 +335,23 @@ def _scan_training(args, tokenizer, index):
     documents_read = 0
     tokenization_errors = 0
     capped = False
+    normalization = getattr(args, "text_normalization", "raw")
     pending_texts: list = []
+    pending_match_texts: list = []
     pending_indices: list = []
 
     def tokenize_pending():
         """Tokenize and yield one pending batch, aligned with its texts."""
-        nonlocal pending_texts, pending_indices, tokenization_errors
-        texts, indices = pending_texts, pending_indices
-        pending_texts, pending_indices = [], []
+        nonlocal pending_texts, pending_match_texts, pending_indices, tokenization_errors
+        texts = pending_texts
+        match_texts = pending_match_texts
+        indices = pending_indices
+        pending_texts, pending_match_texts, pending_indices = [], [], []
         try:
-            rows = _tokenize_texts(texts, tokenizer)
+            rows = _tokenize_texts(match_texts, tokenizer)
         except Exception:
             rows = []
-            for text in texts:
+            for text in match_texts:
                 try:
                     row = tokenizer(text, add_special_tokens=False)["input_ids"]
                     rows.append(_validate_token_row(row))
@@ -351,6 +382,7 @@ def _scan_training(args, tokenizer, index):
                 capped = True
                 break
             pending_texts.append(text)
+            pending_match_texts.append(_match_text(text, normalization))
             pending_indices.append(documents_scanned)
             documents_scanned += 1
             if len(pending_texts) >= args.tokenize_batch_size:
@@ -362,6 +394,8 @@ def _scan_training(args, tokenizer, index):
         documents(),
         index,
         max_examples=args.max_examples,
+        min_match_tokens=getattr(args, "min_match_tokens", 0),
+        min_match_fraction=getattr(args, "min_match_fraction", 0.0),
     )
     report_scan["documents_read"] = documents_read
     report_scan["tokenization_errors"] = tokenization_errors
@@ -369,6 +403,7 @@ def _scan_training(args, tokenizer, index):
         report_scan["exhaustive"] = False
         report_scan["lower_bound"] = True
     report_scan["n_docs_limit"] = int(args.n_docs)
+    report_scan["text_normalization"] = normalization
     report_scan["cleaning_stats"] = cleaner.report()
     return report_scan, split_report
 
@@ -377,13 +412,20 @@ def _validate_args(args) -> None:
     for flag, value in (("--n-docs", args.n_docs),
                         ("--tokenize-batch-size", args.tokenize_batch_size),
                         ("--max-examples", args.max_examples),
-                        ("--ngram-size", args.ngram_size)):
+                        ("--ngram-size", args.ngram_size),
+                        ("--min-match-tokens", args.min_match_tokens)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise SystemExit(f"{flag} must be a non-negative integer")
     if args.tokenize_batch_size < 1:
         raise SystemExit("--tokenize-batch-size must be >= 1")
     if args.ngram_size < 1:
         raise SystemExit("--ngram-size must be >= 1")
+    if (not math.isfinite(args.min_match_fraction)
+            or not 0.0 <= args.min_match_fraction <= 1.0):
+        raise SystemExit("--min-match-fraction must be finite and in [0, 1]")
+    if args.text_normalization not in _TEXT_NORMALIZATIONS:
+        raise SystemExit(
+            f"--text-normalization must be one of {sorted(_TEXT_NORMALIZATIONS)}")
     for flag, value in (("--val-frac", args.val_frac), ("--test-frac", args.test_frac)):
         if not math.isfinite(value) or not 0.0 <= value < 1.0:
             raise SystemExit(f"{flag} must be finite and in [0, 1)")
@@ -434,6 +476,19 @@ def main(argv=None) -> int:
     p.add_argument("--no-dedup", dest="dedup", action="store_false")
     p.add_argument("--ngram-size", type=int, default=DEFAULT_NGRAM_SIZE,
                    help=f"token n-gram size for exact overlap (default {DEFAULT_NGRAM_SIZE})")
+    p.add_argument("--text-normalization", default="nfkc_casefold",
+                   choices=sorted(_TEXT_NORMALIZATIONS),
+                   help="normalization applied identically to the corpus and the "
+                        "benchmarks before tokenization (default: NFKC + casefold "
+                        "+ whitespace collapse; 'raw' keeps the original text)")
+    p.add_argument("--min-match-tokens", type=int, default=0,
+                   help="pre-registered extent rule: only count a document as "
+                        "contaminated for a benchmark when its longest matching "
+                        "token run is at least this long (0 = any n-gram match)")
+    p.add_argument("--min-match-fraction", type=float, default=0.0,
+                   help="pre-registered extent rule: also require this fraction of "
+                        "the document's tokens to be covered by the match "
+                        "(default 0 = any n-gram match)")
     p.add_argument("--tokenize-batch-size", type=int, default=64)
     p.add_argument("--max-examples", type=int, default=100,
                    help="contaminated-document examples kept in the report "
@@ -451,6 +506,9 @@ def main(argv=None) -> int:
                         "--exclude-train-hash-file")
     p.add_argument("--confidence", type=float, default=0.95,
                    help="confidence level of the contamination upper bound")
+    p.add_argument("--familywise-benchmark-bounds", action="store_true",
+                   help="apply a Bonferroni adjustment to the per-benchmark "
+                        "bounds so they are simultaneous at --confidence")
     p.add_argument("--output", default="runs/benchmark_contamination.json")
     p.add_argument("--hypothesis", default=None,
                    help="the scientific claim this audit supports; recorded in "
@@ -472,13 +530,15 @@ def main(argv=None) -> int:
         args.tokenizer, revision=args.tokenizer_revision)
     tokenized = {}
     for name, records in records_by_benchmark.items():
-        texts = [benchmark_text(record) for record in records]
+        texts = [_match_text(benchmark_text(record), args.text_normalization)
+                 for record in records]
         tokenized[name] = _tokenize_texts(texts, tokenizer)
     index = build_ngram_index(tokenized, ngram_size=args.ngram_size)
     scan, split_report = _scan_training(args, tokenizer, index)
     bound = contamination_scan_bound(
         scan, confidence=args.confidence,
-        max_rate=args.max_contamination_rate)
+        max_rate=args.max_contamination_rate,
+        familywise_benchmark_bounds=args.familywise_benchmark_bounds)
     # The ledger is deliberately derived from the scan's canonical hashes,
     # not from the text again: the training pipeline's ledger lookup uses
     # exactly those digests.
@@ -506,6 +566,9 @@ def main(argv=None) -> int:
         dataset_revision=resolved_dataset,
         split_fractions={"val_frac": args.val_frac,
                          "test_frac": args.test_frac},
+        normalization=_TEXT_NORMALIZATIONS[args.text_normalization],
+        min_match_tokens=args.min_match_tokens,
+        min_match_fraction=args.min_match_fraction,
     )
     protocol["requested_dataset_revision"] = args.dataset_revision
     protocol["requested_tokenizer_revision"] = args.tokenizer_revision
@@ -545,7 +608,7 @@ def main(argv=None) -> int:
             f"than {args.ngram_size} tokens), so an n-gram scan cannot detect "
             "their contamination; lower --ngram-size or inspect them separately")
     report = {
-        "schema": "adasquash.benchmark_contamination.v1",
+        "schema": "adasquash.benchmark_contamination.v2",
         "hypothesis": args.hypothesis,
         "status": "failed" if problems else "finished",
         "protocol": protocol,
@@ -602,6 +665,11 @@ def main(argv=None) -> int:
               f"one-sided {args.confidence:.1%} bound "
               f"{_bound_text(bound['upper_bound'])}"
               f" ({bound['scope']})")
+        if scan.get("below_threshold_documents"):
+            print(f"[decontam] NOTE: {scan['below_threshold_documents']} additional "
+                  "document(s) overlap a benchmark but fall below the extent rule "
+                  "(--min-match-tokens / --min-match-fraction); they are reported "
+                  "in scan.below_threshold_documents, not counted as contaminated")
     for name, row in sorted(bound["by_benchmark"].items()):
         print(f"[decontam]   {name}: {row['contaminated_documents']}/"
               f"{row['documents']} documents, upper bound "
@@ -619,6 +687,11 @@ def main(argv=None) -> int:
               f"{scan['contaminated_documents']} contaminated training document(s); "
               "no pre-registered threshold was exceeded (use "
               "--fail-on-any-contamination or --max-contamination-rate to gate)")
+    elif scan.get("below_threshold_documents"):
+        print("[decontam] no document met the extent rule, but "
+              f"{scan['below_threshold_documents']} document(s) had a shorter "
+              "benchmark overlap; this is not a clean scan under the any-overlap "
+              "definition")
     else:
         print("[decontam] no benchmark overlap found in the scanned training documents")
     return 0

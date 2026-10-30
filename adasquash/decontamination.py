@@ -35,7 +35,7 @@ import numbers
 import unicodedata
 from statistics import NormalDist
 
-DECONTAMINATION_VERSION = 1
+DECONTAMINATION_VERSION = 2
 DEFAULT_NGRAM_SIZE = 13
 
 # Fields that commonly hold the evaluated text.  The extractor is deliberately
@@ -373,10 +373,19 @@ def build_ngram_index(benchmarks: dict, ngram_size: int = DEFAULT_NGRAM_SIZE) ->
 
 
 def find_ngram_matches(tokens, index: NgramIndex) -> dict:
-    """Which benchmarks a token sequence overlaps, and where.
+    """Which benchmarks a token sequence overlaps, and how extensively.
 
     One pass over the document: every n-gram is looked up in the inverted
     index, so the cost is O(tokens + matched n-grams), not O(benchmark size).
+
+    Besides the any-overlap verdict, the report carries the extent of the
+    overlap: the longest run of consecutive matching n-grams (in tokens) and
+    the fraction of the document's tokens covered by a match. A single shared
+    13-gram in a long document and a copied benchmark question both produce an
+    ``matched`` verdict, but only the latter produces a large run/coverage.
+    That distinction matters when the benchmark audit is used as a gate: an
+    incidental stock phrase should not be reported in the same units as a
+    reproduced question-and-answer pair.
     """
     if not isinstance(index, NgramIndex):
         raise ValueError("index must be an NgramIndex")
@@ -389,11 +398,27 @@ def find_ngram_matches(tokens, index: NgramIndex) -> dict:
     _validate_token_ids(sequence)
     n = index.ngram_size
     stats = {
-        name: {"matched_ngrams": 0, "occurrences": 0, "first_position": None}
+        name: {"matched_ngrams": 0, "occurrences": 0, "first_position": None,
+               "longest_match_tokens": 0, "matched_token_coverage": 0.0}
         for name in index.benchmarks
     }
     matched_by_benchmark = {name: set() for name in index.benchmarks}
+    # Consecutive matching n-grams describe a run of overlapping windows.
+    # Coverage is the union of the individual token spans, not the sum of the
+    # runs: two matching windows separated by a single non-matching window can
+    # still overlap in their token span, and summing runs would then report a
+    # coverage above 1.0.
+    runs = {name: 0 for name in index.benchmarks}
+    active = set()
+    covered = {name: 0 for name in index.benchmarks}
+    covered_end = {name: None for name in index.benchmarks}
+    longest_run = {name: 0 for name in index.benchmarks}
+    global_run = 0
+    global_longest_run = 0
+    global_covered = 0
+    global_covered_end = None
     first_position = None
+    last_position = None
     if len(sequence) >= n:
         for start in range(len(sequence) - n + 1):
             ngram = tuple(sequence[start:start + n])
@@ -402,23 +427,56 @@ def find_ngram_matches(tokens, index: NgramIndex) -> dict:
             except TypeError:
                 raise ValueError(
                     "token ids must be hashable (integers, not lists)") from None
-            if not owners:
-                continue
-            if first_position is None:
-                first_position = start
-            for name in owners:
+            span_end = start + n - 1
+            if owners:
+                global_run += 1
+                global_longest_run = max(global_longest_run, global_run)
+                last_position = start
+                if first_position is None:
+                    first_position = start
+                union_start = (start if global_covered_end is None
+                               else max(start, global_covered_end + 1))
+                global_covered += max(0, span_end - union_start + 1)
+                global_covered_end = span_end
+            elif global_run:
+                global_run = 0
+            stale = active - (owners or set())
+            for name in stale:
+                runs[name] = 0
+            active.difference_update(stale)
+            for name in owners or ():
+                runs[name] += 1
+                active.add(name)
+                longest_run[name] = max(longest_run[name], runs[name])
+                union_start = (start if covered_end[name] is None
+                               else max(start, covered_end[name] + 1))
+                covered[name] += max(0, span_end - union_start + 1)
+                covered_end[name] = span_end
                 matched_by_benchmark[name].add(ngram)
                 stats[name]["occurrences"] += 1
                 if stats[name]["first_position"] is None:
                     stats[name]["first_position"] = start
+    total_tokens = len(sequence)
     for name, ngrams in matched_by_benchmark.items():
         stats[name]["matched_ngrams"] = len(ngrams)
+        stats[name]["longest_match_tokens"] = (
+            longest_run[name] + n - 1 if longest_run[name] else 0)
+        stats[name]["matched_token_coverage"] = (
+            covered[name] / total_tokens if total_tokens else 0.0)
+        indexed = len(index.ngrams_by_benchmark.get(name, ()))
+        stats[name]["benchmark_ngram_coverage"] = (
+            len(ngrams) / indexed if indexed else 0.0)
     matched = sorted(name for name, row in stats.items() if row["matched_ngrams"])
     return {
         "matched": bool(matched),
         "benchmarks": matched,
         "by_benchmark": stats,
         "first_position": first_position,
+        "last_position": last_position,
+        "longest_match_tokens": (
+            global_longest_run + n - 1 if global_longest_run else 0),
+        "matched_token_coverage": (
+            global_covered / total_tokens if total_tokens else 0.0),
     }
 
 
@@ -494,7 +552,9 @@ def _digest_from_document(document: dict):
 
 
 def scan_token_documents(documents, index: NgramIndex, *,
-                         max_examples: int = 100, exhaustive: bool = True) -> dict:
+                         max_examples: int = 100, exhaustive: bool = True,
+                         min_match_tokens: int = 0,
+                         min_match_fraction: float = 0.0) -> dict:
     """Scan cleaned training documents against a benchmark n-gram index.
 
     ``documents`` yields mappings with ``tokens`` (required), and optionally
@@ -502,23 +562,52 @@ def scan_token_documents(documents, index: NgramIndex, *,
     document contributes its canonical digest to ``contaminated_hashes`` (a
     sorted hex list) even when the example list is capped, so the returned
     ledger is complete for the documents that were actually scanned.
+
+    ``min_match_tokens`` / ``min_match_fraction`` turn the any-n-gram default
+    into a pre-registered extent rule: a document only counts as contaminated
+    for a benchmark when its longest matching run covers at least that many
+    tokens and at least that fraction of the document.  The defaults preserve
+    the historical any-overlap verdict; documents that overlap but miss the
+    rule are counted in ``below_threshold_documents`` instead of silently
+    disappearing from the audit.
     """
     if not isinstance(index, NgramIndex):
         raise ValueError("index must be an NgramIndex")
     limit = _nonnegative_int(max_examples, "max_examples")
     if not isinstance(exhaustive, bool):
         raise ValueError(f"exhaustive must be a bool, got {exhaustive!r}")
+    min_match_tokens = _nonnegative_int(min_match_tokens, "min_match_tokens")
+    if _is_bool(min_match_fraction) or not isinstance(min_match_fraction, (int, float)):
+        raise ValueError(
+            f"min_match_fraction must be a number in [0, 1], got {min_match_fraction!r}")
+    try:
+        min_match_fraction = float(min_match_fraction)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"min_match_fraction must be a number in [0, 1], got {min_match_fraction!r}") from None
+    if not math.isfinite(min_match_fraction) or not 0.0 <= min_match_fraction <= 1.0:
+        raise ValueError(
+            f"min_match_fraction must be finite and in [0, 1], got {min_match_fraction!r}")
     by_benchmark = {
         name: {"documents_scanned": 0, "contaminated_documents": 0,
-               "matched_ngram_occurrences": 0}
+               "below_threshold_documents": 0, "matched_ngram_occurrences": 0,
+               "max_longest_match_tokens": 0, "max_matched_token_coverage": 0.0,
+               "max_benchmark_ngram_coverage": 0.0}
         for name in index.benchmarks
     }
     documents_scanned = 0
     tokens_scanned = 0
     contaminated_documents = 0
+    below_threshold_documents = 0
     missing_digest_documents = 0
     examples: list = []
     hashes: set = set()
+
+    def _qualifies(row: dict) -> bool:
+        return bool(row["matched_ngrams"]) and (
+            row["longest_match_tokens"] >= min_match_tokens
+            and row["matched_token_coverage"] >= min_match_fraction)
+
     for position, document in enumerate(documents):
         if not isinstance(document, dict):
             raise ValueError(
@@ -542,12 +631,29 @@ def scan_token_documents(documents, index: NgramIndex, *,
         match = find_ngram_matches(tokens, index)
         documents_scanned += 1
         tokens_scanned += len(tokens)
+        qualifying = []
         for name, row in match["by_benchmark"].items():
             by_benchmark[name]["documents_scanned"] += 1
-            if row["matched_ngrams"]:
+            if not row["matched_ngrams"]:
+                continue
+            by_benchmark[name]["max_longest_match_tokens"] = max(
+                by_benchmark[name]["max_longest_match_tokens"],
+                row["longest_match_tokens"])
+            by_benchmark[name]["max_matched_token_coverage"] = max(
+                by_benchmark[name]["max_matched_token_coverage"],
+                row["matched_token_coverage"])
+            by_benchmark[name]["max_benchmark_ngram_coverage"] = max(
+                by_benchmark[name]["max_benchmark_ngram_coverage"],
+                row["benchmark_ngram_coverage"])
+            if _qualifies(row):
+                qualifying.append(name)
                 by_benchmark[name]["contaminated_documents"] += 1
                 by_benchmark[name]["matched_ngram_occurrences"] += row["occurrences"]
-        if not match["matched"]:
+            else:
+                by_benchmark[name]["below_threshold_documents"] += 1
+        if not qualifying:
+            if match["matched"]:
+                below_threshold_documents += 1
             continue
         contaminated_documents += 1
         digest = _digest_from_document(document)
@@ -561,16 +667,21 @@ def scan_token_documents(documents, index: NgramIndex, *,
         if len(examples) < limit:
             example = {
                 "doc_index": document.get("doc_index", position),
-                "benchmarks": match["benchmarks"],
+                "benchmarks": sorted(qualifying),
                 "matched_ngrams": sum(
-                    row["matched_ngrams"] for row in match["by_benchmark"].values()),
+                    row["matched_ngrams"] for name, row
+                    in match["by_benchmark"].items() if name in qualifying),
                 "matched_ngram_occurrences": sum(
-                    row["occurrences"] for row in match["by_benchmark"].values()),
+                    row["occurrences"] for name, row
+                    in match["by_benchmark"].items() if name in qualifying),
                 "first_position": match["first_position"],
+                "last_position": match["last_position"],
+                "longest_match_tokens": match["longest_match_tokens"],
+                "matched_token_coverage": match["matched_token_coverage"],
                 "canonical_digest": None if digest is None else digest.hex(),
                 "by_benchmark": {
                     name: dict(row) for name, row in match["by_benchmark"].items()
-                    if row["matched_ngrams"]},
+                    if name in qualifying},
             }
             text = document.get("text")
             if isinstance(text, str):
@@ -591,11 +702,14 @@ def scan_token_documents(documents, index: NgramIndex, *,
     return {
         "version": DECONTAMINATION_VERSION,
         "ngram_size": index.ngram_size,
+        "min_match_tokens": min_match_tokens,
+        "min_match_fraction": min_match_fraction,
         "exhaustive": exhaustive,
         "lower_bound": not exhaustive,
         "documents_scanned": documents_scanned,
         "tokens_scanned": tokens_scanned,
         "contaminated_documents": contaminated_documents,
+        "below_threshold_documents": below_threshold_documents,
         "missing_digest_documents": missing_digest_documents,
         "contaminated_hashes": sorted(digest.hex() for digest in hashes),
         "any": any_row,
@@ -606,7 +720,8 @@ def scan_token_documents(documents, index: NgramIndex, *,
 
 
 def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
-                             max_rate: float | None = None) -> dict:
+                             max_rate: float | None = None,
+                             familywise_benchmark_bounds: bool = False) -> dict:
     """Turn a scan report into a stated bound (and, optionally, a verdict).
 
     The bound is one-sided and applies to the documents that were actually
@@ -614,7 +729,15 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
     extrapolated to the whole corpus; that distinction is the difference
     between "we found no contamination in the sample" and "the corpus is
     clean".
+
+    With ``familywise_benchmark_bounds`` the per-benchmark bounds use a
+    Bonferroni adjustment, so they are simultaneous at the requested
+    confidence rather than marginal.  The any-benchmark bound is unchanged.
     """
+    if not isinstance(familywise_benchmark_bounds, bool):
+        raise ValueError(
+            "familywise_benchmark_bounds must be a bool, got "
+            f"{familywise_benchmark_bounds!r}")
     if not isinstance(report, dict):
         raise ValueError("report must be a mapping")
     scanned = report.get("documents_scanned")
@@ -624,6 +747,14 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
     if contaminated > scanned:
         raise ValueError(
             f"contaminated_documents={contaminated} cannot exceed scanned={scanned}")
+    below_threshold = report.get("below_threshold_documents")
+    below_threshold = (_nonnegative_int(below_threshold, "below_threshold_documents")
+                       if below_threshold is not None else None)
+    if below_threshold is not None and contaminated + below_threshold > scanned:
+        raise ValueError(
+            f"contaminated_documents={contaminated} + "
+            f"below_threshold_documents={below_threshold} cannot exceed "
+            f"scanned={scanned}")
     if _is_bool(confidence) or not isinstance(confidence, (int, float)):
         raise ValueError(f"confidence must be a number in (0, 1), got {confidence!r}")
     try:
@@ -666,6 +797,13 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
         raise ValueError(
             f"report.by_benchmark must be a mapping or None, got "
             f"{type(raw_benchmarks).__name__}")
+    n_benchmarks = len(raw_benchmarks)
+    # Bonferroni: each of the m marginal intervals uses alpha/m, so the
+    # probability that *any* per-benchmark interval misses is at most alpha.
+    # This does not require the benchmark rows to be independent.
+    per_benchmark_confidence = (
+        1.0 - (1.0 - confidence) / n_benchmarks
+        if familywise_benchmark_bounds and n_benchmarks else confidence)
     for name in sorted(raw_benchmarks, key=str):
         if not isinstance(name, str) or not name.strip():
             raise ValueError(
@@ -682,14 +820,16 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
                 f"by_benchmark[{name!r}] flags {flagged} documents but only "
                 f"{row_documents} were scanned")
         observed = None if row_documents == 0 else flagged / row_documents
-        upper = wilson_upper_bound(flagged, row_documents, confidence)
+        upper = wilson_upper_bound(
+            flagged, row_documents, per_benchmark_confidence)
         passes = None
         if max_rate is not None:
             passes = upper is not None and upper <= max_rate
             if not passes:
                 problems.append(
                     f"benchmark {name!r}: {flagged}/{row_documents} scanned training "
-                    f"documents overlap; the one-sided {confidence:.1%} upper bound "
+                    f"documents overlap; the one-sided "
+                    f"{per_benchmark_confidence:.1%} upper bound "
                     f"{'is undefined (nothing scanned)' if upper is None else f'{upper:.4%}'} "
                     f"does not certify <= {max_rate:.4%}")
         rows[name] = {
@@ -719,12 +859,27 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
         notes.append(
             "the scan covered a prefix only; the bound applies to the scanned "
             "documents, not to the unsampled remainder")
-    if len(rows) > 1:
+    min_tokens = report.get("min_match_tokens")
+    min_fraction = report.get("min_match_fraction")
+    if (min_tokens not in (None, 0)) or (min_fraction not in (None, 0, 0.0)):
         notes.append(
-            f"the per-benchmark bounds are marginal at confidence {confidence:.1%}; "
-            f"with {len(rows)} benchmarks a simultaneous family-wise claim needs a "
-            "multiplicity correction, so read the per-benchmark verdicts as "
-            "screening results and the any-benchmark bound as the overall bound")
+            "the verdict uses an extent rule (longest matching run >= "
+            f"{min_tokens} tokens and >= {min_fraction} of the document); "
+            "documents with a shorter overlap are counted separately as "
+            "below-threshold rather than certified clean")
+    if len(rows) > 1:
+        if familywise_benchmark_bounds:
+            notes.append(
+                f"the per-benchmark bounds use a Bonferroni adjustment "
+                f"({len(rows)} benchmarks, {per_benchmark_confidence:.4%} each), "
+                f"so they are simultaneous at confidence >= {confidence:.1%}; "
+                "the any-benchmark bound remains a separate marginal bound")
+        else:
+            notes.append(
+                f"the per-benchmark bounds are marginal at confidence {confidence:.1%}; "
+                f"with {len(rows)} benchmarks a simultaneous family-wise claim needs a "
+                "multiplicity correction, so read the per-benchmark verdicts as "
+                "screening results and the any-benchmark bound as the overall bound")
     return {
         "method": "wilson_score_upper_bound",
         "confidence": confidence,
@@ -732,9 +887,17 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
         "certifies_population": bool(exhaustive and upper is not None),
         "documents_scanned": scanned,
         "contaminated_documents": contaminated,
+        "below_threshold_documents": below_threshold,
         "observed_rate": None if scanned == 0 else contaminated / scanned,
         "upper_bound": upper,
         "passes_max_rate": passes_any,
+        "multiplicity": {
+            "method": ("bonferroni" if familywise_benchmark_bounds
+                       and n_benchmarks > 1 else "none"),
+            "benchmarks": n_benchmarks,
+            "familywise_confidence": confidence,
+            "per_benchmark_confidence": per_benchmark_confidence,
+        },
         "any": {
             "documents": scanned,
             "contaminated_documents": contaminated,
@@ -778,16 +941,43 @@ def contamination_protocol(*, ngram_size: int, benchmarks: dict,
                             dataset: str | None = None,
                             dataset_config=None,
                             dataset_revision=None,
-                            split_fractions: dict | None = None) -> dict:
-    """The identity an audit result depends on, as a JSON-safe mapping."""
+                            split_fractions: dict | None = None,
+                            normalization: str = "unicode_nfkc_casefold_whitespace",
+                            min_match_tokens: int = 0,
+                            min_match_fraction: float = 0.0) -> dict:
+    """The identity an audit result depends on, as a JSON-safe mapping.
+
+    ``normalization`` must describe the transformation actually applied before
+    tokenization.  Recording a normalization that the scanner does not perform
+    would make two materially different protocols share a digest.
+    """
     n = _positive_int(ngram_size, "ngram_size")
     if not isinstance(benchmarks, dict) or not benchmarks:
         raise ValueError("benchmarks must be a non-empty mapping")
+    if not isinstance(normalization, str) or not normalization.strip():
+        raise ValueError(
+            f"normalization must be a non-empty string, got {normalization!r}")
+    min_match_tokens = _nonnegative_int(min_match_tokens, "min_match_tokens")
+    if _is_bool(min_match_fraction) or not isinstance(min_match_fraction, (int, float)):
+        raise ValueError(
+            f"min_match_fraction must be a number in [0, 1], got {min_match_fraction!r}")
+    try:
+        min_match_fraction = float(min_match_fraction)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"min_match_fraction must be a number in [0, 1], got {min_match_fraction!r}") from None
+    if not math.isfinite(min_match_fraction) or not 0.0 <= min_match_fraction <= 1.0:
+        raise ValueError(
+            f"min_match_fraction must be finite and in [0, 1], got {min_match_fraction!r}")
     fingerprint = benchmark_fingerprint(benchmarks)
     return {
         "version": DECONTAMINATION_VERSION,
         "ngram_size": n,
-        "normalization": "unicode_nfkc_casefold_whitespace",
+        "normalization": normalization,
+        "extent_rule": {
+            "min_match_tokens": min_match_tokens,
+            "min_match_fraction": min_match_fraction,
+        },
         "benchmarks": fingerprint,
         "tokenizer": tokenizer,
         "tokenizer_revision": tokenizer_revision,
