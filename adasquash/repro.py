@@ -920,6 +920,14 @@ def environment_info() -> dict:
             "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
             "hash_randomization": bool(sys.flags.hash_randomization),
             "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            # BLAS/OpenMP overrides change the reduction order too. The
+            # actual torch count is above; these say whether the process
+            # inherited a host-specific pin that a rerun elsewhere would not.
+            "thread_env": {
+                name: os.environ.get(name)
+                for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                             "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+            },
         },
     }
     info["device_names"] = (
@@ -929,16 +937,30 @@ def environment_info() -> dict:
     return info
 
 
+def command_record(argv=None) -> dict:
+    """The exact command line and working directory that produced a run.
+
+    `hyperparameters` records the *parsed* values, which cannot distinguish an
+    explicit flag from a config/default and drops launcher-level details. The
+    raw argv makes "rerun this experiment" a copy-paste operation and lets an
+    auditor see which flags were actually typed.
+    """
+    return {
+        "argv": list(sys.argv if argv is None else argv),
+        "cwd": str(Path.cwd()),
+    }
+
+
 def collect_run_metadata(seed: int | None = None, extra: dict | None = None,
                         hyperparameters: dict | None = None,
                         data_version=None, training_curves=None,
                         results: dict | None = None) -> dict:
     """Metadata block attached to every run manifest.
 
-    The block carries `RUN_MANIFEST_SCHEMA`, the code revision, the full
-    environment identity (including the numeric flags compared by
-    `execution_identity_mismatches`), the seed and optional experiment
-    payloads. `hyperparameters`, `data_version`, `training_curves` and
+    The block carries `RUN_MANIFEST_SCHEMA`, the code revision, the exact
+    command line, the full environment identity (including the numeric flags
+    compared by `execution_identity_mismatches`), the seed and optional
+    experiment payloads. `hyperparameters`, `data_version`, `training_curves` and
     `results` are
     optional convenience fields so a caller can record the full experiment
     (code version, hyperparameters, seed, data version, training curves and
@@ -951,6 +973,7 @@ def collect_run_metadata(seed: int | None = None, extra: dict | None = None,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "seed": None if seed is None else _strict_seed(seed),
         "git": git_revision(),
+        "command": command_record(),
         "environment": environment_info(),
     }
     if hyperparameters is not None:
@@ -1239,6 +1262,7 @@ __all__ = [
     "apply_deterministic_algorithms",
     "artifact_record",
     "collect_run_metadata",
+    "command_record",
     "deterministic_algorithms_context",
     "environment_info",
     "execution_identity_mismatches",

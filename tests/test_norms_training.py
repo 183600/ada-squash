@@ -1022,5 +1022,141 @@ def test_lm_harness_reports_missing_dependency():
     with pytest.raises(RuntimeError, match="lm-eval not installed"):
         evaluate_lm_harness(None, ["mmlu"])
 
+def _final_state(run_dir: Path) -> dict:
+    ckpt = torch.load(run_dir / "ckpt_final.pt", map_location="cpu",
+                      weights_only=False)
+    return ckpt["model"]
+
+
+def _loss_trajectory(run_dir: Path) -> list:
+    rows = [json.loads(line) for line in
+            (run_dir / "train.jsonl").read_text().splitlines()]
+    return [(int(row["step"]), float(row["loss"])) for row in rows
+            if "loss" in row and "step" in row]
+
+
+def _assert_states_identical(first: dict, second: dict) -> None:
+    assert set(first) == set(second)
+    for name in first:
+        assert torch.equal(first[name], second[name]), (
+            f"state tensor {name!r} differs between the two runs")
+
+
+def test_same_seed_reproduces_the_training_trajectory(tmp_path, monkeypatch):
+    """The reproducibility contract: one seed, one trajectory.
+
+    Two fresh runs of the same driver, same seed and same data stream must
+    produce the same per-step losses and the same final weights. Comparing
+    only the final loss would hide divergence that cancels, and comparing
+    only a manifest would not prove the optimizer actually took the same
+    steps.
+    """
+    kwargs = ["--save-every", "100", "--no-sanity-check"]
+    _tiny_train_run(tmp_path / "a", monkeypatch, 4, kwargs)
+    _tiny_train_run(tmp_path / "b", monkeypatch, 4, kwargs)
+    assert _loss_trajectory(tmp_path / "a") == _loss_trajectory(tmp_path / "b")
+    _assert_states_identical(_final_state(tmp_path / "a"),
+                             _final_state(tmp_path / "b"))
+
+
+def test_different_seed_changes_the_trajectory(tmp_path, monkeypatch):
+    """Guard against the same-seed test passing on a no-op training loop."""
+    kwargs = ["--save-every", "100", "--no-sanity-check"]
+    _tiny_train_run(tmp_path / "a", monkeypatch, 4, kwargs)
+    _tiny_train_run(tmp_path / "b", monkeypatch, 4,
+                    [*kwargs, "--seed", "43"])
+    first = _final_state(tmp_path / "a")
+    second = _final_state(tmp_path / "b")
+    assert set(first) == set(second)
+    assert any(not torch.equal(first[name], second[name]) for name in first)
+    assert _loss_trajectory(tmp_path / "a") != _loss_trajectory(tmp_path / "b")
+
+
+def test_resume_is_bit_identical_to_an_uninterrupted_run(tmp_path, monkeypatch):
+    """`--resume` must continue the run, not merely restart it nearby.
+
+    A run is checkpointed at step 3 and resumed to step 5 from a *different*
+    output directory. The uninterrupted 5-step run is the reference. Matching
+    weights and per-step losses at steps 4-5 requires the model, optimizer,
+    scheduler, RNG states, data position and checkpoint-selection state to all
+    be restored exactly - the property the manifest advertises as "continues
+    as if uninterrupted", which a test of the scalar counters alone cannot
+    establish.
+    """
+    _tiny_train_run(tmp_path / "full", monkeypatch, 5,
+                    ["--save-every", "3", "--no-sanity-check"])
+    checkpoint = tmp_path / "full" / "ckpt_000003.pt"
+    assert checkpoint.exists()
+    _tiny_train_run(tmp_path / "resumed", monkeypatch, 5,
+                    ["--save-every", "100", "--no-sanity-check",
+                     "--resume", str(checkpoint)])
+
+    _assert_states_identical(_final_state(tmp_path / "full"),
+                             _final_state(tmp_path / "resumed"))
+    full_rows = dict(_loss_trajectory(tmp_path / "full"))
+    resumed_rows = dict(_loss_trajectory(tmp_path / "resumed"))
+    for step in (4, 5):
+        assert resumed_rows[step] == full_rows[step], (
+            f"post-resume loss at step {step} differs from the uninterrupted run")
+    full_ckpt = torch.load(tmp_path / "full" / "ckpt_final.pt",
+                           map_location="cpu", weights_only=False)
+    resumed_ckpt = torch.load(tmp_path / "resumed" / "ckpt_final.pt",
+                              map_location="cpu", weights_only=False)
+    assert resumed_ckpt["data_position"] == full_ckpt["data_position"]
+
+
+def test_unknown_config_keys_are_fatal_in_strict_mode(tmp_path):
+    """A config typo must not silently train the parser default.
+
+    `learning_rate:` is not a recognized option; the non-strict path warns for
+    backward compatibility, while the production entrypoints pass strict=True
+    so the run fails before spending compute on a protocol the author did not
+    specify.
+    """
+    from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
+
+    cfg = tmp_path / "typo.yaml"
+    cfg.write_text("norm: dyt\nleraning_rate: 0.1\n", encoding="utf-8")
+    p = argparse.ArgumentParser()
+    p.add_argument("--norm", default="dytcd")
+    with pytest.raises(ValueError, match="leraning_rate"):
+        apply_config_to_parser(p, str(cfg), _TRAIN_CONFIG_ALIASES, strict=True)
+    apply_config_to_parser(p, str(cfg), _TRAIN_CONFIG_ALIASES)
+    assert p.parse_args([]).norm == "dyt"
+
+    allowed = tmp_path / "allowed.yaml"
+    allowed.write_text("norm: dyt\nablations: []\n", encoding="utf-8")
+    apply_config_to_parser(p, str(allowed), _TRAIN_CONFIG_ALIASES, strict=True,
+                           allowed_unknown=("ablations",))
+    assert p.parse_args([]).norm == "dyt"
+
+
+def test_require_pinned_data_revision_fails_closed(tmp_path, monkeypatch,
+                                                   capsys):
+    """Branch names are not data versions; the strict flag rejects them."""
+    from scripts.train_gpt2 import unpinned_data_revisions
+
+    assert len(unpinned_data_revisions(None, None)) == 2
+    assert len(unpinned_data_revisions("main", "v1")) == 2
+    assert unpinned_data_revisions("a" * 40, "b" * 40) == []
+
+    with pytest.raises(SystemExit) as excinfo:
+        _tiny_train_run(tmp_path / "blocked", monkeypatch, 1,
+                        ["--no-sanity-check",
+                         "--require-pinned-data-revision"])
+    assert excinfo.value.code == 2
+    assert not (tmp_path / "blocked").exists()
+    assert "--require-pinned-data-revision" in capsys.readouterr().err
+
+    # The strict flag must accept an actually pinned protocol, otherwise it
+    # is just a wall in front of every legitimate run.
+    _tiny_train_run(tmp_path / "pinned", monkeypatch, 1,
+                    ["--no-sanity-check",
+                     "--require-pinned-data-revision",
+                     "--dataset-revision", "a" * 40,
+                     "--tokenizer-revision", "b" * 40])
+    assert (tmp_path / "pinned" / "train.jsonl").exists()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -49,17 +49,31 @@ def _config_bool(value):
         return value.strip().lower() in ('true', 'yes', 'on', '1')
     return None
 
-def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
+def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None,
+                           strict: bool = False,
+                           allowed_unknown: tuple[str, ...] = ()):
+    """Fold a YAML config into `parser` defaults.
+
+    `strict=True` turns a key the parser does not know into an error instead
+    of a printed warning. A typo such as `learning_rate:` in a config is then
+    rejected before training rather than silently leaving the default in
+    place: the run would otherwise execute a protocol nobody wrote while the
+    manifest records the default as if it were the intended value.
+    `allowed_unknown` names keys a caller consumes outside argparse (for
+    example the ablation runner's `ablations` block).
+    """
     if not path:
         return
     cfg = load_yaml_config(path)
     aliases = aliases or {}
+    allowed_unknown = frozenset(allowed_unknown)
     known = {a.dest for a in parser._actions}
     unknown = []
     for key, value in cfg.items():
         dest, invert = aliases.get(key, (key, False))
         if dest not in known:
-            unknown.append(key)
+            if key not in allowed_unknown:
+                unknown.append(key)
             continue
         if invert:
             # `use_layerscale: 0` / `bf16: "false"` must not remain a truthy
@@ -80,6 +94,13 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None):
             value = bool_value
         parser.set_defaults(**{dest: value})
     if unknown:
+        message = (f"config '{path}' contains key(s) the parser does not "
+                   f"understand: {sorted(unknown)}")
+        if strict:
+            raise ValueError(
+                message + '; fix or remove them (an unrecognized key would '
+                          'otherwise be silently ignored and the run would use '
+                          'the default instead of the intended value)')
         print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
 _TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False), 'k_min': ('k_min', False), 'shared_depth_schedule': ('shared_depth_schedule', False)}
 
@@ -329,3 +350,19 @@ _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tok
 _LEDGER_ARGS = ('exclude_hash_file', 'exclude_test_hash_file',
                 'exclude_train_hash_file',
                 'exclude_group_file', 'exclude_test_group_file')
+
+def unpinned_data_revisions(dataset_revision, tokenizer_revision) -> list:
+    """Requested data revisions that are not immutable Hub commit hashes.
+
+    A branch or tag can move between two supposedly identical runs, so a
+    confirmatory protocol must pin both the dataset and the tokenizer to a
+    concrete commit *before* the run starts. The resolved value recorded in
+    the manifest proves what this run read; it does not let a later rerun
+    reconstruct the same command-line protocol.
+    """
+    problems = []
+    for flag, value in (('--dataset-revision', dataset_revision),
+                        ('--tokenizer-revision', tokenizer_revision)):
+        if not _is_pinned_revision(value):
+            problems.append(f'{flag} is not a full 40-hex commit hash: {value!r}')
+    return problems

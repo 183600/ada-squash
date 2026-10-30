@@ -1544,7 +1544,11 @@ def main():
     p.add_argument('--schedule-seed', type=int, default=0, help='seed of the randomized complete-block launch schedule; the schedule is written to run_schedule.json and its order is recorded per launch')
     p.add_argument('--no-randomize-order', dest='randomize_order', action='store_false', help='launch cells in the input depth/norm/seed order instead of a randomized complete-block schedule; order drift is then confounded with depth')
     p.add_argument('--threads-per-run', type=int, default=1, help='OMP/MKL/OpenBLAS/etc thread cap for each child (0 = inherit the parent environment); 1 avoids oversubscription when cells share a host, raise it for a single serial run')
-    apply_config_to_parser(p, known.config, _SWEEP_CONFIG_ALIASES)
+    try:
+        apply_config_to_parser(p, known.config, _SWEEP_CONFIG_ALIASES,
+                               strict=True)
+    except ValueError as exc:
+        p.error(str(exc))
     args = p.parse_args()
     if not args.depths:
         p.error('--depths must not be empty: a sweep with no depth has no cells to run')

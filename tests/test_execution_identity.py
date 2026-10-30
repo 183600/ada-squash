@@ -171,6 +171,13 @@ def test_collected_manifest_carries_a_schema_and_complete_identity():
     metadata = collect_run_metadata(seed=7)
     assert metadata['schema'] == RUN_MANIFEST_SCHEMA
     assert metadata['environment']['device_names'] == []
+    # The raw argv is the copy-paste record of what was actually run; the
+    # parsed hyperparameters alone cannot tell a flag from a default.
+    assert metadata['command']['argv'] == sys.argv
+    assert metadata['command']['cwd'] == str(Path.cwd())
+    assert set(metadata['environment']['rng_config']['thread_env']) == {
+        'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+        'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'}
     copied = json.loads(json.dumps(metadata))
     # The test checkout itself is dirty; a dirty tree is deliberately an
     # incomparability, so compare the recorded fields with the dirt flag

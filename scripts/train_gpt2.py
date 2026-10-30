@@ -28,7 +28,7 @@ from adasquash.repro import (TRAINING_RECIPE_KEYS, TrainStreamFingerprint,
                              artifact_record, collect_run_metadata,
                              file_fingerprint, finish_metadata, save_run_manifest,
                              set_all_seeds, training_recipe_mismatches)
-from scripts.data_pipeline import (build_dataloader, configure_data_options, _is_pinned_revision,
+from scripts.data_pipeline import (build_dataloader, configure_data_options,
                                    resolve_dataset_revision, resolve_tokenizer_revision)
 
 from scripts.train_config import (_ARCH_ARGS,
@@ -57,6 +57,7 @@ from scripts.train_config import (_ARCH_ARGS,
     load_yaml_config,
     restore_monitor_args,
     restore_schedule_args,
+    unpinned_data_revisions,
 )
 from scripts.train_runtime import (DEFAULT_SEED,
     _MODEL_SHAPES,
@@ -158,6 +159,7 @@ def main():
     p.add_argument('--dataset-config', default='sample-10BT')
     p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) to pin; recorded in the run manifest so the trained-on data version is auditable (None = upstream default branch, which can move)')
     p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) to pin; recorded in the run manifest (None = upstream default branch)')
+    p.add_argument('--require-pinned-data-revision', action='store_true', help='fail before training unless --dataset-revision and --tokenizer-revision are full 40-hex Hub commit hashes; a branch/tag can move, so a rerun from the logged command would silently read different data (the resolved snapshot is recorded either way)')
     p.add_argument('--val-frac', type=float, default=0.005, help='chronological held-out validation fraction of the document stream (split order is train=oldest, then val, then test; never shuffled)')
     p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction of the document stream, evaluated once at the end only with --final-test-eval')
     p.add_argument('--num-documents', type=int, default=None, help='total documents in the stream; required when the dataset reports no size')
@@ -217,7 +219,11 @@ def main():
     p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this run tests; recorded in the run manifest (and checkpoint args) so a result can be audited against the claim it was meant to support, the same contract the ablation matrix enforces per row')
     p.add_argument('--resume', default=None, help='checkpoint to resume from')
     p.add_argument('--resume-skip-data', action='store_true', help='do NOT fast-forward the training dataloader past the batches the checkpoint already consumed (the resumed run then replays training data)')
-    apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES)
+    try:
+        apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES,
+                               strict=True)
+    except ValueError as exc:
+        p.error(str(exc))
     args = p.parse_args()
     for name, value, minimum in (
         ('--batch-size', args.batch_size, 1),
@@ -267,6 +273,13 @@ def main():
     if args.max_doc_chars and args.min_doc_chars > args.max_doc_chars:
         p.error(f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
                 f'{args.max_doc_chars}; no document could pass the cleaner')
+    if args.require_pinned_data_revision:
+        unpinned = unpinned_data_revisions(args.dataset_revision,
+                                           args.tokenizer_revision)
+        if unpinned:
+            p.error('--require-pinned-data-revision: ' + '; '.join(unpinned)
+                    + ' (resolving at load time pins this run but not a rerun '
+                      'from the same command; pin concrete commits instead)')
     # A seed supplied by --config is a default, not an explicit CLI override:
     # otherwise resuming a seed-42 checkpoint with a config (`seed: 7`) keeps
     # seed 7, reseeds the data stream and fast-forwards `data_position` along

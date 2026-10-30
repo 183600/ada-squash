@@ -111,7 +111,11 @@ def main():
     p.add_argument('--output-dir', default='runs/ablation')
     p.add_argument('--force', action='store_true')
     p.add_argument('--allow-uncertified', action='store_true', help='allow running with <3 seeds (certification will be disabled); by default <3 seeds is an error')
-    apply_config_to_parser(p, known.config)
+    try:
+        apply_config_to_parser(p, known.config, strict=True,
+                               allowed_unknown=('ablations',))
+    except ValueError as exc:
+        p.error(str(exc))
     args = p.parse_args()
     if not args.simple_baselines_enabled and (args.auto_simple_baselines
                                               or args.require_simple_baselines):
