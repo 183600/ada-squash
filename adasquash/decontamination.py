@@ -657,8 +657,15 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
                 "digest, so a training-exclusion ledger cannot remove them")
     rows: dict = {}
     raw_benchmarks = report.get("by_benchmark")
-    if not isinstance(raw_benchmarks, dict):
+    if raw_benchmarks is None:
         raw_benchmarks = {}
+    elif not isinstance(raw_benchmarks, dict):
+        # A malformed per-benchmark table must not silently disappear: the
+        # overall bound could still certify while every per-benchmark claim
+        # was never evaluated.
+        raise ValueError(
+            f"report.by_benchmark must be a mapping or None, got "
+            f"{type(raw_benchmarks).__name__}")
     for name in sorted(raw_benchmarks, key=str):
         if not isinstance(name, str) or not name.strip():
             raise ValueError(
