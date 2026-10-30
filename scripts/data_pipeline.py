@@ -76,6 +76,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
+from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
 from adasquash.repro import seed_worker
 
 # Defaults chosen so that "just run the trainer" already reserves a small,
@@ -132,14 +133,6 @@ DEFAULT_DATA_OPTIONS = {
 }
 
 _active_data_options = dict(DEFAULT_DATA_OPTIONS)
-
-
-def _is_boolean_scalar(value) -> bool:
-    """Python and NumPy booleans (``np.bool_`` is not a Python bool)."""
-    if isinstance(value, bool):
-        return True
-    cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
 
 
 def _int_option(name: str, value, minimum: int, *, allow_none: bool = False):

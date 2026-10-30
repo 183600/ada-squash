@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from fractions import Fraction
 from typing import Optional
 
+from ._validation import is_boolean_scalar as _is_boolean_value
 from .metrics import student_t_ppf
 
 __all__ = [
@@ -35,13 +36,6 @@ __all__ = [
 DEFAULT_MIN_LOSS_GAIN = 0.01
 DEFAULT_MAX_COST_RATIO = 1.25
 
-
-def _is_boolean_value(value) -> bool:
-    """Python and NumPy booleans (``isinstance(np.bool_, bool)`` is False)."""
-    if isinstance(value, bool):
-        return True
-    cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
 
 # Two-sided 95% Student-t critical values, by degrees of freedom. Efficiency
 # measurements usually have very few rounds (the benchmark defaults to 3), so

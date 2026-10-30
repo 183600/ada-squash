@@ -7,6 +7,8 @@ import random
 from statistics import NormalDist
 from typing import Optional, Sequence
 
+from ._validation import is_boolean_scalar as _is_boolean_value
+
 _Z_95 = 1.959963984540054
 MIN_SEEDS_FOR_SIGNIFICANCE = 3
 # Above this many degrees of freedom the first-order normal expansion below
@@ -23,19 +25,6 @@ _MCNEMAR_NORMAL_MIN = 100000
 # Negatives-per-positive ratio above which the FPR denominator makes ROC-AUC
 # optimistic and PR-AUC (average precision) is the appropriate summary.
 _EXTREME_IMBALANCE = 1000.0
-
-
-def _is_boolean_value(value) -> bool:
-    """Python and NumPy booleans.
-
-    ``isinstance(np.bool_(True), bool)`` is False; without this check a NumPy
-    boolean is silently coerced to 1/0 by ``int()`` and can enter a count or a
-    multiplicity family as a real observation.
-    """
-    if isinstance(value, bool):
-        return True
-    cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
 
 
 def _as_real(value) -> Optional[float]:

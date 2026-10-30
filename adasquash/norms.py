@@ -54,6 +54,18 @@ def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     return t.sum(dim=tuple(range(t.ndim - 1)))
 _REDUCE_CHUNK_ELEMS = 1 << 22
 
+def _chunked_product_sum(a2: torch.Tensor, b2: torch.Tensor, step: int, acc_dtype: torch.dtype) -> torch.Tensor:
+    """Row-chunked sum of products accumulated in ``acc_dtype``.
+
+    Both inputs are 2-D; each chunk is a row block, so the temporary block
+    never covers the whole leading dimension at once.
+    """
+    total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a2.device)
+    for start in range(0, a2.shape[0], step):
+        part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc_dtype)
+        total.add_(part)
+    return total
+
 def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim <= 1:
         return a * b
@@ -69,12 +81,7 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if rows <= step:
             return _sum_leading_dims(a * b)
         acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
-        a2 = a.view(rows, -1)
-        b2 = b.view(rows, -1)
-        total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a.device)
-        for start in range(0, rows, step):
-            part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc_dtype)
-            total.add_(part)
+        total = _chunked_product_sum(a.view(rows, -1), b.view(rows, -1), step, acc_dtype)
         if total.dtype != a.dtype:
             total = total.to(a.dtype)
         return total
@@ -82,16 +89,27 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         rows = a.numel() // a.shape[-1]
         step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
         acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
-        a2 = a.reshape(rows, -1)
-        b2 = b.reshape(rows, -1)
-        total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a.device)
-        for start in range(0, rows, step):
-            part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc_dtype)
-            total.add_(part)
+        total = _chunked_product_sum(a.reshape(rows, -1), b.reshape(rows, -1), step, acc_dtype)
         if total.dtype != a.dtype:
             total = total.to(a.dtype)
         return total
     return _sum_leading_dims(a * b)
+
+def _effective_decay_rate(k, k_min):
+    """Depth-decay rate, optionally floored at ``k_min``.
+
+    ``None`` keeps the historical unconstrained rate; a tensor rate is
+    clamped without leaving autograd.
+    """
+    if k_min is None:
+        return k
+    if isinstance(k, torch.Tensor):
+        return k.clamp(min=k_min)
+    return max(float(k), float(k_min))
+
+def _depth_alpha(alpha_0, k, depth_ratio: float) -> torch.Tensor:
+    """``alpha_0 * exp(-k * depth_ratio)`` for the depth-conditioned norms."""
+    return alpha_0 * torch.exp(-k * depth_ratio)
 
 def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.is_contiguous() and b.is_contiguous():
@@ -106,14 +124,15 @@ def register_norm(name: str):
         return cls
     return _decorator
 
-def _softsign_core(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False):
-    """Compute shared intermediates for softsign forward/backward.
+def _softsign_core(xs: torch.Tensor, p, scale=None):
+    """Compute the shared intermediates for softsign forward/backward.
 
-    Returns (t, lo, r, u) where:
-      t = |xs| or |xs * scale|
-      lo = clamp(t, max=1)
-      r = 1 / clamp(t, min=1)
-      u = lo * r = min(|x|, 1) / max(|x|, 1)  (always <= 1)
+    Returns ``(t, lo, r, u, p)`` where:
+      t  = |xs| or |xs * scale|
+      lo = clamp(t, max=1) = min(t, 1)
+      r  = 1 / clamp(t, min=1) = 1 / max(t, 1)
+      u  = lo * r in [0, 1]
+      p  = the scalar-exponent form of ``p``
     """
     p = _as_scalar_exponent(p)
     if scale is None:
@@ -135,7 +154,7 @@ def _compute_s_from_u(u: torch.Tensor, p) -> torch.Tensor:
 
 
 def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False) -> torch.Tensor:
-    t, lo, r, u, p = _softsign_core(xs, p, scale, scale_nonneg)
+    t, lo, r, u, p = _softsign_core(xs, p, scale)
     s = _compute_s_from_u(u, p)
     out = s.mul_(lo).copysign_(xs)
     if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
@@ -144,7 +163,7 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False)
 
 
 def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True, scale=None, scale_nonneg: bool=False):
-    t, lo, r, u, p = _softsign_core(xs, p, scale, scale_nonneg)
+    t, lo, r, u, p = _softsign_core(xs, p, scale)
     a = None
     if need_u:
         # `lo` only feeds `phi`; when that output is not requested it is not
@@ -444,16 +463,11 @@ class DyTD(_SquashedAffine):
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
     def _k_effective(self):
-        k = self.k
-        if self.k_min is None:
-            return k
-        if isinstance(k, torch.Tensor):
-            return k.clamp(min=self.k_min)
-        return max(float(k), float(self.k_min))
+        return _effective_decay_rate(self.k, self.k_min)
 
     @property
     def alpha_l(self) -> torch.Tensor:
-        return self.alpha_0 * torch.exp(-self._k_effective() * self._depth_ratio)
+        return _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _DyTDForward.apply(x, self.alpha_0, self._k_effective(), self.gamma, self.beta, self._depth_ratio)
@@ -526,16 +540,11 @@ class DyTDTanh(nn.Module):
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
     def _k_effective(self):
-        k = self.k
-        if self.k_min is None:
-            return k
-        if isinstance(k, torch.Tensor):
-            return k.clamp(min=self.k_min)
-        return max(float(k), float(self.k_min))
+        return _effective_decay_rate(self.k, self.k_min)
 
     @property
     def alpha_l(self) -> torch.Tensor:
-        return self.alpha_0 * torch.exp(-self._k_effective() * self._depth_ratio)
+        return _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi = torch.tanh(self.alpha_l * x)
@@ -619,16 +628,11 @@ class DyTCD(_SquashedAffine):
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
     def _k_effective(self):
-        k = self.k
-        if self.k_min is None:
-            return k
-        if isinstance(k, torch.Tensor):
-            return k.clamp(min=self.k_min)
-        return max(float(k), float(self.k_min))
+        return _effective_decay_rate(self.k, self.k_min)
 
     @property
     def alpha_per_channel(self) -> torch.Tensor:
-        scale = self.alpha_0 * torch.exp(-self._k_effective() * self._depth_ratio)
+        scale = _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
         return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -756,16 +760,11 @@ class DyTCDTanh(nn.Module):
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
     def _k_effective(self):
-        k = self.k
-        if self.k_min is None:
-            return k
-        if isinstance(k, torch.Tensor):
-            return k.clamp(min=self.k_min)
-        return max(float(k), float(self.k_min))
+        return _effective_decay_rate(self.k, self.k_min)
 
     @property
     def alpha_per_channel(self) -> torch.Tensor:
-        scale = self.alpha_0 * torch.exp(-self._k_effective() * self._depth_ratio)
+        scale = _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
         return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -5,6 +5,8 @@ from typing import Optional, Dict
 import torch
 import torch.nn as nn
 
+from ._validation import is_boolean_scalar as _is_boolean_scalar
+
 class MaxAbsMeter:
 
     def __init__(self):
@@ -276,18 +278,6 @@ def markov_batch(rng: torch.Generator, ignore_index: int, batch_size: int, seq_l
         spike = torch.rand((batch_size, seq_len), generator=rng, device=device) < 0.03
         x[spike] = outlier_id
     return (x, y)
-
-def _is_boolean_scalar(value) -> bool:
-    """Python and NumPy booleans.
-
-    ``isinstance(np.bool_(True), bool)`` is False; without this check a NumPy
-    boolean is silently coerced to 1.0 by ``float()`` and enters the loss EMA
-    as a real observation.
-    """
-    if isinstance(value, bool):
-        return True
-    cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
 
 class LossSpikeCounter:
 

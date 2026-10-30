@@ -14,17 +14,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
 from adasquash.metrics import wilson_interval
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.data_pipeline import (DocumentCleaner, _is_token_row,
                                    canonical_document_hash, document_hash,
                                    extract_group_value, group_hash, load_document_stream)
-def _is_boolean_scalar(value) -> bool:
-    """Python and NumPy booleans (``np.bool_`` is not a Python bool)."""
-    if isinstance(value, bool):
-        return True
-    cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
 
 
 def _strict_bool_option(value, name: str, *, allow_none: bool = False):

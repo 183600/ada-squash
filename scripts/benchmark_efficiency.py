@@ -58,6 +58,7 @@ from adasquash.model import (
     clear_cast_weight_cache,
     clear_ce_scratch_cache,
 )
+from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 
 _BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
@@ -70,14 +71,6 @@ def _is_cuda(device: str) -> bool:
 def _sync(device: str) -> None:
     if _is_cuda(device):
         torch.cuda.synchronize(device)
-
-
-def _is_boolean_scalar(value) -> bool:
-    """Python and NumPy booleans (``np.bool_`` is not a Python bool)."""
-    if isinstance(value, bool):
-        return True
-    cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
 
 
 def _count_option(value, name: str, minimum: int) -> int:

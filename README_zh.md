@@ -2,7 +2,7 @@
 
 > 面向超深与低精度 Transformer 的免统计自适应压缩
 
-[English](README.md) | **中文说明**
+[English](README.md) | **中文说明** | [设计说明](docs/design_notes.md)
 
 本仓库是 DyT++ 提案的实验代码库：一族*免统计*归一化层，沿三条正交轴推广
 Dynamic Tanh（DyT, Zhu et al. 2025）：
@@ -21,16 +21,39 @@ Dynamic Tanh（DyT, Zhu et al. 2025）：
 归一化——在对齐有效 logit 尺度的前提下，谁更抗离群通道、谁更有注意力
 表达力？*（两者给出的 logit 上界相同，见 DyT-QK 一节。）
 
+配置与脚本中的 `norm_name` 取值为 `ln`、`rmsnorm`、`dyt`、`dyts`、
+`dytp`、`dytc`、`dytd`、`dytcd` 以及对应的消融变体；QK 压缩通过
+`qk_norm: dytqk` 单独选择。
+
+## 目录
+
+- [仓库结构](#仓库结构)
+- [快速开始](#快速开始)
+- [阶段 1：FineWeb-Edu 上的 GPT-2 124M](#阶段-1fineweb-edu-上的-gpt-2-124m)
+- [阶段 2：LLaMA-tiny 1.1B 深度扫描](#阶段-2llama-tiny-11b-深度扫描)
+- [阶段 3：特殊实验](#阶段-3特殊实验)
+- [消融](#消融)
+- [方法速查](#方法速查)
+- [指标](#指标)
+- [引用](#引用)
+- [License](#license)
+
 ## 仓库结构
 
 ```
 ada-squash/
 ├── adasquash/        # 可导入的包
-│   ├── __init__.py
 │   ├── norms.py        # LayerNorm, RMSNorm, DyT(-S/-P/-C/-D/-CD/-DI), QKSquash
-│   ├── attention.py    # 带可选 QK 压缩的因果自注意力
-│   ├── model.py        # GPT 风格解码器，可选 RoPE，深度可配置
-│   └── utils.py        # ActivationStats, KurtosisMeter, LossSpikeCounter, ...
+│   ├── attention.py    # 带可选 QK 压缩与 RoPE 的因果自注意力
+│   ├── model.py        # GPT 风格解码器、融合损失、深度可配置
+│   ├── utils.py        # ActivationStats, KurtosisMeter, LossSpikeCounter, ...
+│   ├── diagnostics.py  # 训练/验证曲线诊断与 NaN/Inf 排查
+│   ├── efficiency.py   # 参数/FLOP 核算与效率判定
+│   ├── repro.py        # 随机种子、运行清单、执行身份
+│   ├── design.py       # 运行调度、排除策略、前瞻性功效规划
+│   ├── decontamination.py  # 基准 n-gram 扫描与污染上界
+│   ├── metrics*.py     # 假设检验、元分析、分类指标
+│   └── ablation/       # 矩阵、运行器、对比、分析与 CLI
 ├── scripts/           # CLI 入口
 │   ├── train_gpt2.py             # 阶段 1 驱动（GPT-2 124M, FineWeb-Edu, 独立验证集）
 │   ├── train_llama_depth_sweep.py# 阶段 2 深度扫描（12/24/48/96，含 dytdi 对照）
@@ -40,9 +63,10 @@ ada-squash/
 │   ├── check_fp8_stability.py   # 阶段 3b：模拟 FP8 上溢/下溢（含适用范围声明）
 │   ├── check_w8a8_ppl.py       # 阶段 3c：训练后 W8A8 PPL 恶化（独立保留集）
 │   └── run_needle.py            # 阶段 3d：大海捞针扫描（按位置分解）
-├── tests/
-│   └── test_norms.py            # 形状/dtype/梯度/调度健全性测试
-├── configs/                    # YAML 配置（见 configs/）
+├── tests/             # 全量 pytest 套件：kernel、方法、设计、去污染
+├── configs/           # YAML 配置（见 configs/）
+├── docs/design_notes.md  # 固定设计决策 D1-D6 与质量门禁
+├── ci_gate.py         # 语法 + 设计固定项 + 全量 pytest 门禁
 ├── requirements.txt
 └── README.md
 ```
@@ -67,6 +91,41 @@ python -m pytest tests/ -v
 上界、checkpoint 往返、指标实现，以及——由于本仓库每个归一化层都是手写
 autograd kernel——把每个 kernel 与普通 autograd 的独立重组逐参数对拍，
 且从*随机化*参数集出发，避免在 `gamma=1, beta=0` 初始化下对拍流于形式。
+
+### 设计门禁
+
+固定设计决策见 [`docs/design_notes.md`](docs/design_notes.md)。改动
+kernel 或模型后，运行与 CI 相同的门禁：
+
+```bash
+python3 ci_gate.py
+```
+
+它会解析全部 Python 文件、按源码检查 `【固定】` 设计项 D1–D6，然后运行
+完整的 `tests/` 套件。`--syntax-only` 只运行解析层。
+
+### 直接使用包
+
+```python
+import torch
+from adasquash import GPT, GPTConfig, build_norm, generalized_softsign
+
+# 单个归一化层。
+norm = build_norm("dytcd", dim=128)
+x = torch.randn(2, 8, 128)
+print(norm(x).shape)                    # torch.Size([2, 8, 128])
+
+# 公共广义 softsign 入口（p=2 为默认的平滑形式）。
+print(generalized_softsign(torch.randn(4), 2.0))
+
+# 与实验使用同一套 Block/norm 接线的小型解码器。
+cfg = GPTConfig(vocab_size=256, dim=128, n_layers=2, n_heads=4, max_seq_len=16)
+model = GPT(cfg)
+tokens = torch.randint(0, cfg.vocab_size, (2, 16))
+targets = torch.randint(0, cfg.vocab_size, (2, 16))
+logits, loss = model(tokens, targets=targets)
+print(logits.shape, float(loss.detach()))
+```
 
 ### 阶段 1：FineWeb-Edu 上的 GPT-2 124M
 
@@ -256,8 +315,8 @@ python scripts/ablation.py --config configs/ablation-matrix.yaml --seeds 42 43 4
 及其机制；第二层：其余单轴、对照与 QK 对比，只有第一层至少一项成立才检验）。
 不在计划中的检验只作为探索性结果报告。每个对比还附带留一 seed 的 jackknife
 （去掉任一 seed 后效应符号是否仍在），以及 `--equivalence-margin <delta>` 开启
-的 TOST 等价性检验——"两个设置相同"因此是一个有检验的结论，而不是" superiority
-检验不显著"。析因交互项按双侧报告，避免把拮抗交互误读成"协同不显著"。
+的 TOST 等价性检验——“两个设置相同”因此是一个有检验的结论，而不是“优越性
+检验不显著”。析因交互项按双侧报告，避免把拮抗交互误读成“协同不显著”。
 
 ## 方法速查
 

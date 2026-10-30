@@ -31,6 +31,8 @@ from typing import Optional, Sequence
 
 import torch
 
+from ._validation import is_boolean_scalar as _is_boolean_scalar
+
 __all__ = [
     "NAN_TRIAGE_ORDER",
     "DEFAULT_CURVE_THRESHOLDS",
@@ -63,14 +65,6 @@ DEFAULT_CURVE_THRESHOLDS = {
     # sample means, so their difference has se = sqrt(se_first^2 + se_last^2).
     "noise_z": 2.0,
 }
-
-
-def _is_boolean_scalar(value) -> bool:
-    """Python and NumPy booleans (``np.bool_`` is not a Python bool)."""
-    if isinstance(value, bool):
-        return True
-    cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
 
 
 def _threshold_int(value, name: str, minimum: int) -> int:

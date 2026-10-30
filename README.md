@@ -1,7 +1,6 @@
 # DyT++ / AdaSquash
 
-**English** | [中文说明](README_zh.md)
-
+**English** | [中文说明](README_zh.md) | [设计说明](docs/design_notes.md)
 
 > Adaptive Squashing without Statistics for Ultra-Deep and Low-Precision Transformers
 
@@ -25,16 +24,40 @@ is: *element-wise saturation vs vector normalization — which handles
 outlier channels and attention expressivity better, at matched effective
 logit scale?* (Both bound the logit identically; see the DyT-QK section.)
 
+The `norm_name` values used by configs and scripts are `ln`, `rmsnorm`,
+`dyt`, `dyts`, `dytp`, `dytc`, `dytd`, `dytcd`, and their controlled
+ablation variants. QK squashing is selected separately through
+`qk_norm: dytqk`.
+
+## Contents
+
+- [Repository layout](#repository-layout)
+- [Quick start](#quick-start)
+- [Phase 1: GPT-2 124M on FineWeb-Edu](#phase-1-gpt-2-124m-on-fineweb-edu)
+- [Phase 2: LLaMA-tiny 1.1B with depth sweep](#phase-2-llama-tiny-11b-with-depth-sweep)
+- [Phase 3: special experiments](#phase-3-special-experiments)
+- [Ablations](#ablations)
+- [Method reference](#method-reference)
+- [Metrics](#metrics)
+- [Citation](#citation)
+- [License](#license)
+
 ## Repository layout
 
 ```
 ada-squash/
 ├── adasquash/        # importable package
-│   ├── __init__.py
 │   ├── norms.py        # LayerNorm, RMSNorm, DyT(-S/-P/-C/-D/-CD/-DI), QKSquash
-│   ├── attention.py    # CausalSelfAttention with optional QK-squashing
-│   ├── model.py        # GPT-style decoder, RoPE optional, configurable depth
-│   └── utils.py        # ActivationStats, KurtosisMeter, LossSpikeCounter, ...
+│   ├── attention.py    # CausalSelfAttention with optional QK-squashing and RoPE
+│   ├── model.py        # GPT-style decoder, fused losses, configurable depth
+│   ├── utils.py        # ActivationStats, KurtosisMeter, LossSpikeCounter, ...
+│   ├── diagnostics.py  # train/val curve diagnosis and NaN/Inf triage
+│   ├── efficiency.py   # parameter/FLOP accounting and efficiency verdicts
+│   ├── repro.py        # seeds, run manifests, execution identity
+│   ├── design.py       # run schedules, exclusion policy, prospective power
+│   ├── decontamination.py  # benchmark n-gram scans and contamination bounds
+│   ├── metrics*.py     # hypothesis tests, meta-analysis, classification metrics
+│   └── ablation/       # matrix, runner, contrasts, analysis and CLI
 ├── scripts/           # CLI entrypoints
 │   ├── train_gpt2.py             # Phase 1 driver (GPT-2 124M, FineWeb-Edu, held-out val)
 │   ├── train_llama_depth_sweep.py# Phase 2 depth sweep (12/24/48/96, incl. the dytdi control)
@@ -44,9 +67,10 @@ ada-squash/
 │   ├── check_fp8_stability.py   # Phase 3b: simulated FP8 overflow / underflow (scoped)
 │   ├── check_w8a8_ppl.py       # Phase 3c: post-training W8A8 PPL drop (held-out)
 │   └── run_needle.py            # Phase 3d: needle-in-a-haystack sweep (per-position)
-├── tests/
-│   └── test_norms.py            # shape/dtype/gradient/schedule sanity
-├── configs/                    # YAML configs (see configs/)
+├── tests/             # full pytest suite: kernels, methods, design, decontamination
+├── configs/           # YAML configs (see configs/)
+├── docs/design_notes.md  # fixed design decisions D1-D6 and quality gate
+├── ci_gate.py         # syntax + design-pin + full-pytest gate
 ├── requirements.txt
 └── README.md
 ```
@@ -73,6 +97,43 @@ implementation, and — since every norm here is a hand-written autograd kernel
 — a per-parameter comparison of each kernel against an independent
 recomposition in plain autograd, run from a *randomized* parameter set so the
 check is not vacuous at the `gamma=1, beta=0` initialization.
+
+### Design gate
+
+The fixed design decisions are listed in
+[`docs/design_notes.md`](docs/design_notes.md). Before trusting a change to
+the kernels or the model, run the same gate used by CI:
+
+```bash
+python3 ci_gate.py
+```
+
+It parses every Python file, checks the `【固定】` design pins D1–D6 against
+the source, and then runs the full `tests/` suite. `--syntax-only` runs just
+the parser layer.
+
+### Use the package directly
+
+```python
+import torch
+from adasquash import GPT, GPTConfig, build_norm, generalized_softsign
+
+# A single normalization layer.
+norm = build_norm("dytcd", dim=128)
+x = torch.randn(2, 8, 128)
+print(norm(x).shape)                    # torch.Size([2, 8, 128])
+
+# The public generalized-softsign entry point (p=2 is the smooth default).
+print(generalized_softsign(torch.randn(4), 2.0))
+
+# A small decoder with the same block/norm wiring as the experiments.
+cfg = GPTConfig(vocab_size=256, dim=128, n_layers=2, n_heads=4, max_seq_len=16)
+model = GPT(cfg)
+tokens = torch.randint(0, cfg.vocab_size, (2, 16))
+targets = torch.randint(0, cfg.vocab_size, (2, 16))
+logits, loss = model(tokens, targets=targets)
+print(logits.shape, float(loss.detach()))
+```
 
 ### Phase 1: GPT-2 124M on FineWeb-Edu
 

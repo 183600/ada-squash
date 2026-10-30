@@ -512,19 +512,18 @@ class Block(nn.Module):
             self.ls1 = nn.Parameter(torch.full((cfg.dim,), cfg.layerscale_init))
             self.ls2 = nn.Parameter(torch.full((cfg.dim,), cfg.layerscale_init))
 
+    def _residual(self, x: torch.Tensor, branch_out: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        if self.use_layerscale:
+            return _LayerScaleResidual.apply(x, branch_out, scale)
+        return x + branch_out
+
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor]=None, return_stats: bool=False):
         h = self.norm1(x)
         attn_out, logit_stats = self.attn(h, freqs_cis=freqs_cis, return_stats=return_stats)
-        if self.use_layerscale:
-            x = _LayerScaleResidual.apply(x, attn_out, self.ls1)
-        else:
-            x = x + attn_out
+        x = self._residual(x, attn_out, self.ls1 if self.use_layerscale else None)
         h = self.norm2(x)
         mlp_out = self.mlp(h)
-        if self.use_layerscale:
-            x = _LayerScaleResidual.apply(x, mlp_out, self.ls2)
-        else:
-            x = x + mlp_out
+        x = self._residual(x, mlp_out, self.ls2 if self.use_layerscale else None)
         return (x, logit_stats)
 
 class _SwiGLU(torch.autograd.Function):

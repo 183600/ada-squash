@@ -50,6 +50,8 @@ from pathlib import Path
 
 import torch
 
+from ._validation import is_boolean_scalar as _is_boolean_scalar
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_MANIFEST_SCHEMA = "adasquash.run_manifest.v1"
 
@@ -397,18 +399,6 @@ def compare_train_streams(reference: dict, other: dict) -> dict:
         "problems": problems,
         "reason": None,
     }
-
-
-def _is_boolean_scalar(value) -> bool:
-    """Python and NumPy booleans; both are not seeds/measurements.
-
-    ``isinstance(np.bool_(True), bool)`` is False, so a NumPy boolean would
-    otherwise pass into ``int()`` as 1/0 and silently seed a different run.
-    """
-    if isinstance(value, bool):
-        return True
-    cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
 
 
 def _strict_seed(seed) -> int:
