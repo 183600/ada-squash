@@ -103,7 +103,9 @@ __all__ = [
 
 
 def _validate_seed(seed) -> int:
-    if isinstance(seed, bool) or not isinstance(seed, int):
+    # Accept integral NumPy scalars too: they are exact integer seeds, while
+    # a float (even an integral one) is not a seed identity.
+    if isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
         raise ValueError(f'schedule seed must be an integer, got {seed!r}')
     return int(seed)
 
