@@ -40,6 +40,11 @@ beta2: 0.95
 grad_clip: 1.0
 bf16: true
 
+# Held-out validation: every cell uses the validation slice of its own
+# FineWeb-Edu stream, with the same period and batch count across depths.
+val_every: 500
+val_batches: 16
+
 output_dir: runs/depth-sweep
 log_every: 20
 stats_every: 500

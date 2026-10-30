@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import math
+import numbers
 import os
 import random
 import subprocess
@@ -49,6 +50,72 @@ def _config_bool(value):
         return value.strip().lower() in ('true', 'yes', 'on', '1')
     return None
 
+def _coerce_config_scalar(action, value, path: str, key: str):
+    """Apply argparse's `type`/`choices` contract to one YAML value.
+
+    `apply_config_to_parser` writes YAML values straight into parser defaults,
+    which bypasses argparse's conversion and validation. A typo such as
+    `norm: dytcc` or `batch_size: "32"` would otherwise survive until the
+    model or training loop fails, after the run has already started.
+    """
+    if action.const is True or action.const is False:
+        parsed = _config_bool(value)
+        if parsed is None:
+            raise ValueError(
+                f"config '{path}': {key}={value!r} is not a boolean")
+        return parsed
+    if action.type is int:
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise ValueError(
+                f"config '{path}': {key}={value!r} must be an integer")
+        converted = int(value)
+    elif action.type is float:
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise ValueError(
+                f"config '{path}': {key}={value!r} must be a real number")
+        converted = float(value)
+    elif action.type is str:
+        if not isinstance(value, str):
+            raise ValueError(
+                f"config '{path}': {key}={value!r} must be a string")
+        converted = value
+    elif action.type is not None:
+        try:
+            converted = action.type(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"config '{path}': {key}={value!r} is not valid for "
+                f"{action.dest}") from exc
+    else:
+        converted = value
+    if action.choices is not None and converted not in action.choices:
+        raise ValueError(
+            f"config '{path}': {key}={value!r} is not one of "
+            f"{list(action.choices)}")
+    return converted
+
+def _coerce_config_value(action, value, path: str, key: str):
+    """Validate one config value against its parser action."""
+    if value is None:
+        nullable = action.default is None or (
+            action.choices is not None and None in action.choices)
+        if nullable:
+            return None
+        raise ValueError(
+            f"config '{path}': {key} is null but the option is not nullable")
+    if action.nargs in ('+', '*') or isinstance(action.nargs, int) and action.nargs > 1:
+        if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"config '{path}': {key}={value!r} must be a list")
+        converted = [_coerce_config_scalar(action, item, path, key)
+                     for item in value]
+        if isinstance(action.nargs, int) and action.nargs > 1 and len(converted) != action.nargs:
+            raise ValueError(
+                f"config '{path}': {key} expects {action.nargs} values, "
+                f"got {len(converted)}")
+        return converted
+    return _coerce_config_scalar(action, value, path, key)
+
 def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None,
                            strict: bool = False,
                            allowed_unknown: tuple[str, ...] = ()):
@@ -67,7 +134,10 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None,
     cfg = load_yaml_config(path)
     aliases = aliases or {}
     allowed_unknown = frozenset(allowed_unknown)
-    known = {a.dest for a in parser._actions}
+    actions_by_dest: dict[str, list] = {}
+    for action in parser._actions:
+        actions_by_dest.setdefault(action.dest, []).append(action)
+    known = set(actions_by_dest)
     unknown = []
     for key, value in cfg.items():
         dest, invert = aliases.get(key, (key, False))
@@ -92,6 +162,13 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None,
                 raise ValueError(
                     f"config '{path}': {key}={value!r} is not a boolean")
             value = bool_value
+        else:
+            actions = actions_by_dest[dest]
+            action = next(
+                (candidate for candidate in actions
+                 if candidate.type is not None or candidate.choices is not None),
+                actions[0])
+            value = _coerce_config_value(action, value, path, key)
         parser.set_defaults(**{dest: value})
     if unknown:
         message = (f"config '{path}' contains key(s) the parser does not "

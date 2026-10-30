@@ -121,10 +121,15 @@ def open_validation_split(args):
     return open_data_split('validation', args)
 
 
-def main():
+def build_arg_parser(argv=None):
+    """Build the training CLI and fold in `--config` defaults.
+
+    Exposed separately so config-contract tests validate the exact parser the
+    trainer uses instead of re-implementing its option table.
+    """
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=None)
-    known, _ = pre.parse_known_args()
+    known, _ = pre.parse_known_args(argv)
     p = argparse.ArgumentParser()
     p.add_argument('--config', default=None, help='YAML run config; CLI flags override it')
     p.add_argument('--model', choices=['gpt2-124m', 'gpt2-350m', 'llama-1b'], default='gpt2-124m')
@@ -224,6 +229,10 @@ def main():
                                strict=True)
     except ValueError as exc:
         p.error(str(exc))
+    return p, known.config
+
+def main():
+    p, config_path = build_arg_parser()
     args = p.parse_args()
     for name, value, minimum in (
         ('--batch-size', args.batch_size, 1),
@@ -284,7 +293,7 @@ def main():
     # otherwise resuming a seed-42 checkpoint with a config (`seed: 7`) keeps
     # seed 7, reseeds the data stream and fast-forwards `data_position` along
     # a different stream than the one the checkpoint recorded.
-    seed_names = _explicit_arg_names(sys.argv[1:], p, known.config)
+    seed_names = _explicit_arg_names(sys.argv[1:], p, config_path)
     seed_explicit = bool(seed_names & {'seed', 'seeds'})
     # CLI precedence: `--seeds` typed on the command line must not be replaced
     # by a `seed:` value that only came from --config. The deprecated --seed
@@ -311,7 +320,7 @@ def main():
         launch_multi_seed(args, seeds)
         return
     args.seed = seeds[0]
-    explicit = frozenset(_explicit_arg_names(sys.argv[1:], p, known.config) | {name for name in _SCHEDULE_ARGS + _MONITOR_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)})
+    explicit = frozenset(_explicit_arg_names(sys.argv[1:], p, config_path) | {name for name in _SCHEDULE_ARGS + _MONITOR_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)})
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     resume_ckpt = None
     run_args: dict = {}
@@ -774,6 +783,8 @@ def main():
     try:
         run_manifest = collect_run_metadata(seed=args.seed)
         run_manifest['hyperparameters'] = vars(args)
+        run_manifest['config_file'] = (file_fingerprint(args.config)
+                                       if args.config else None)
         run_manifest['status'] = 'running'
         if args.hypothesis:
             run_manifest['hypothesis'] = args.hypothesis

@@ -1469,11 +1469,12 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
     log.close()
     return proc
 
-def main():
-    from scripts.train_gpt2 import _explicit_arg_names, apply_config_to_parser
+def build_arg_parser(argv=None):
+    """Build the sweep CLI and fold in `--config` defaults."""
+    from scripts.train_gpt2 import apply_config_to_parser
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=None)
-    known, _ = pre.parse_known_args()
+    known, _ = pre.parse_known_args(argv)
     p = argparse.ArgumentParser()
     p.add_argument('--config', default=None, help='YAML run config; CLI flags override it')
     p.add_argument('--model', default='llama-1b')
@@ -1550,6 +1551,11 @@ def main():
                                strict=True)
     except ValueError as exc:
         p.error(str(exc))
+    return p, known.config
+
+def main():
+    from scripts.train_gpt2 import _explicit_arg_names
+    p, config_path = build_arg_parser()
     args = p.parse_args()
     if not args.depths:
         p.error('--depths must not be empty: a sweep with no depth has no cells to run')
@@ -1574,7 +1580,7 @@ def main():
         p.error(f'--max-parallel {args.max_parallel} must be >= 1')
     if args.threads_per_run < 0:
         p.error(f'--threads-per-run {args.threads_per_run} must be >= 0')
-    seed_names = _explicit_arg_names(sys.argv[1:], p, known.config)
+    seed_names = _explicit_arg_names(sys.argv[1:], p, config_path)
     if args.seed is not None and ('seed' in seed_names or 'seeds' not in seed_names):
         raw_seeds = [args.seed]
     else:
@@ -1602,6 +1608,8 @@ def main():
     sweep_launch_id = f'{int(time.time())}-{os.getpid()}'
     sweep_manifest = collect_run_metadata(seed=seeds[0])
     sweep_manifest['hyperparameters'] = vars(args)
+    sweep_manifest['config_file'] = (file_fingerprint(args.config)
+                                     if args.config else None)
     sweep_manifest['seeds'] = seeds
     sweep_manifest['launch_id'] = sweep_launch_id
     sweep_manifest['grid'] = {

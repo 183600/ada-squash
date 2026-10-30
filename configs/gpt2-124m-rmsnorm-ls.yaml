@@ -7,6 +7,10 @@ qk_norm: null
 use_layerscale: true
 layerscale_init: 1.0e-5
 
+hypothesis: RMSNorm plus LayerScale isolates the residual gate under a no-mean normalization baseline.
+
+seeds: [42, 43, 44]
+
 dataset: HuggingFaceFW/fineweb-edu
 dataset_config: sample-10BT
 tokenizer: gpt2

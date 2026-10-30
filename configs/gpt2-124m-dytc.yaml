@@ -15,6 +15,8 @@ use_layerscale: false
 # Seeds are the unit of replication (>= 3), because one run cannot separate
 # the normalization effect from run-to-run noise. Pass `--seeds <one>` for the
 # single-run layout in place, or the `--seed N` shorthand.
+hypothesis: The per-channel alpha axis alone improves held-out loss over scalar-alpha DyT at matched activation and LayerScale.
+
 seeds: [42, 43, 44]
 
 dataset: HuggingFaceFW/fineweb-edu

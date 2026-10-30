@@ -21,6 +21,8 @@ layerscale_init: 1.0e-5
 # Seeds are the unit of replication (>= 3), because one run cannot separate
 # the normalization effect from run-to-run noise. Pass `--seeds <one>` for the
 # single-run layout in place, or the `--seed N` shorthand.
+hypothesis: Combining the per-channel and depth axes improves held-out loss over either single-axis variant under the same recipe.
+
 seeds: [42, 43, 44]
 
 dataset: HuggingFaceFW/fineweb-edu

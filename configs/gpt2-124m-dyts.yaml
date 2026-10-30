@@ -8,6 +8,10 @@ learnable_p: false
 qk_norm: null
 use_layerscale: false
 
+hypothesis: Scalar-alpha generalized softsign improves held-out loss over scalar-alpha tanh DyT at matched LayerScale.
+
+seeds: [42, 43, 44]
+
 dataset: HuggingFaceFW/fineweb-edu
 dataset_config: sample-10BT
 tokenizer: gpt2

@@ -12,6 +12,8 @@ learnable_k: true
 qk_norm: null
 use_layerscale: false
 
+hypothesis: The DyT-D depth-decay gain survives without LayerScale, so it is not explained by the residual gate alone.
+
 seeds: [42, 43, 44]
 
 dataset: HuggingFaceFW/fineweb-edu
@@ -30,6 +32,14 @@ beta1: 0.9
 beta2: 0.95
 grad_clip: 1.0
 bf16: true
+
+# Held-out validation: the same disjoint wikitext test slice as the other
+# Phase 1 configs, so every controlled contrast selects on the same stream.
+val_every: 500
+val_batches: 16
+val_dataset: Salesforce/wikitext
+val_dataset_config: wikitext-103-raw-v1
+val_split: test
 
 output_dir: runs/gpt2-124m-dytd-no-ls
 log_every: 20

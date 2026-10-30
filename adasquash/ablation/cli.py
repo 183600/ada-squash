@@ -54,10 +54,11 @@ from .runner import (aggregate_seed_summaries, cached_seed_matches, _load_summar
                      run_one, run_order_audit)
 from .runner import _PROTOCOL_MODEL_VOCAB
 
-def main():
+def build_arg_parser(argv=None):
+    """Build the ablation CLI, its config-derived rows, and YAML defaults."""
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=None)
-    known, _ = pre.parse_known_args()
+    known, _ = pre.parse_known_args(argv)
     ablations = dict(ABLATIONS)
     hypotheses = dict(ABLATION_HYPOTHESES)
     if known.config:
@@ -116,6 +117,10 @@ def main():
                                allowed_unknown=('ablations',))
     except ValueError as exc:
         p.error(str(exc))
+    return p, known.config, ablations, hypotheses
+
+def main():
+    p, config_path, ablations, hypotheses = build_arg_parser()
     args = p.parse_args()
     if not args.simple_baselines_enabled and (args.auto_simple_baselines
                                               or args.require_simple_baselines):
@@ -157,7 +162,7 @@ def main():
     # A `seed:` supplied by --config is a parser default, not an explicit CLI
     # override: an explicit `--seeds 42 43 44` must not be replaced by one
     # config-seeded value (same precedence rule as train_gpt2.py).
-    seed_names = _explicit_arg_names(sys.argv[1:], p, known.config)
+    seed_names = _explicit_arg_names(sys.argv[1:], p, config_path)
     if args.seed is not None and ('seed' in seed_names or 'seeds' not in seed_names):
         raw_seeds = [args.seed]
     else:
@@ -746,6 +751,8 @@ def main():
     manifest = dict(run_metadata)
     manifest['git'] = git_revision()
     manifest['hyperparameters'] = vars(args)
+    manifest['config_file'] = (file_fingerprint(args.config)
+                               if args.config else None)
     manifest['seeds'] = seeds
     manifest['matrix_validation'] = matrix_report
     manifest['rows'] = [row['name'] for row in ordered]

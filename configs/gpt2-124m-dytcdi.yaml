@@ -11,6 +11,10 @@ qk_norm: null
 use_layerscale: true
 layerscale_init: 1.0e-5
 
+hypothesis: Depth-initialized but freely learned alpha captures the DyT-CD gain, separating the depth reparameterization from the initialization prior.
+
+seeds: [42, 43, 44]
+
 dataset: HuggingFaceFW/fineweb-edu
 dataset_config: sample-10BT
 tokenizer: gpt2

@@ -7,6 +7,10 @@ alpha_jitter: 0.0
 qk_norm: null
 use_layerscale: false
 
+hypothesis: Per-channel alpha under tanh improves held-out loss over scalar-alpha tanh DyT at matched LayerScale.
+
+seeds: [42, 43, 44]
+
 dataset: HuggingFaceFW/fineweb-edu
 dataset_config: sample-10BT
 tokenizer: gpt2
