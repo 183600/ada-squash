@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import json
 import math
+import numbers
 import os
 import sys
 import time
@@ -252,8 +253,8 @@ def _robustness_note(entry: dict) -> str:
 
 
 def _is_seed_id(value) -> bool:
-    """A seed id is an int; 42.9/True must not be paired with seed 42/1."""
-    return isinstance(value, int) and not isinstance(value, bool)
+    """A seed id is an integer scalar; 42.9/True must not pair with 42/1."""
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
 
 
 def _seed_key_id(value):

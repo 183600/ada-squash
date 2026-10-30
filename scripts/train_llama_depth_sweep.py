@@ -28,6 +28,7 @@ approximation would use 1.64 and turn noise into "wins".
 import argparse
 import json
 import math
+import numbers
 import os
 import subprocess
 import sys
@@ -68,8 +69,8 @@ def _finite(value) -> bool:
 
 
 def _is_seed_id(value) -> bool:
-    """A seed id is an integer; bool/fractional/string values are not."""
-    return isinstance(value, int) and not isinstance(value, bool)
+    """A seed id is an integer scalar; bool/fractional/string values are not."""
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
 
 
 def _normalize_seed_ids(seeds) -> list[int]:

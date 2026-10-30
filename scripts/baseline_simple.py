@@ -64,6 +64,7 @@ by `scripts/ablation.py`, which then annotates every row of
 import argparse
 import json
 import math
+import numbers
 import sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
@@ -450,8 +451,8 @@ def _finite_number(value) -> bool:
 
 
 def _is_seed_id(value) -> bool:
-    """A seed id is an int; 42.9/True must not become seed 42/1."""
-    return isinstance(value, int) and not isinstance(value, bool)
+    """A seed id is an integer scalar; 42.9/True must not become seed 42/1."""
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
 
 
 def _row_seed_losses(row: dict, duplicates: set | None = None) -> dict:

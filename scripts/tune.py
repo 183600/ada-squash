@@ -65,6 +65,7 @@ import argparse
 import copy
 import json
 import math
+import numbers
 import sys
 from collections import Counter
 from pathlib import Path
@@ -109,8 +110,8 @@ def _cell_key(lr: float, weight_decay: float, multi_wd: bool) -> str:
 
 
 def _is_seed_id(value) -> bool:
-    """A seed id is an int; 42.9/True must not be paired with seed 42/1."""
-    return isinstance(value, int) and not isinstance(value, bool)
+    """A seed id is an integer scalar; 42.9/True must not pair with 42/1."""
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
 
 
 def _cache_batch_losses_finite(summary: dict) -> bool:
