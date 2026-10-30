@@ -247,12 +247,62 @@ class NgramIndex:
         # Public direct construction bypasses `build_ngram_index`; a fractional
         # or zero geometry silently changes every comparison the index serves.
         self.ngram_size = _positive_int(ngram_size, "ngram_size")
-        self.ngrams_by_benchmark = {
-            name: frozenset(ngrams) for name, ngrams in ngrams_by_benchmark.items()}
-        self.documents_by_benchmark = dict(documents_by_benchmark)
-        self.tokens_by_benchmark = dict(tokens_by_benchmark)
-        self.documents_without_ngrams_by_benchmark = dict(
-            documents_without_ngrams_by_benchmark or {})
+        for label, mapping in (
+                ("ngrams_by_benchmark", ngrams_by_benchmark),
+                ("documents_by_benchmark", documents_by_benchmark),
+                ("tokens_by_benchmark", tokens_by_benchmark)):
+            if not isinstance(mapping, dict):
+                raise ValueError(f"{label} must be a mapping, got {type(mapping).__name__}")
+        self.ngrams_by_benchmark = {}
+        for name, ngrams in ngrams_by_benchmark.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"benchmark name must be a non-empty string, got {name!r}")
+            try:
+                frozen = frozenset(ngrams)
+            except TypeError:
+                raise ValueError(
+                    f"ngrams for benchmark {name!r} must be an iterable of "
+                    "token tuples") from None
+            for ngram in frozen:
+                if not isinstance(ngram, tuple) or len(ngram) != self.ngram_size:
+                    raise ValueError(
+                        f"benchmark {name!r} contains an n-gram that is not a "
+                        f"{self.ngram_size}-token tuple: {ngram!r}")
+                _validate_token_ids(ngram)
+            self.ngrams_by_benchmark[name] = frozen
+        names = set(self.ngrams_by_benchmark)
+        for label, mapping in (
+                ("documents_by_benchmark", documents_by_benchmark),
+                ("tokens_by_benchmark", tokens_by_benchmark)):
+            if set(mapping) != names:
+                raise ValueError(
+                    f"{label} keys must match the benchmark names exactly, got "
+                    f"{sorted(set(mapping) ^ names, key=str)!r}")
+        without = dict(documents_without_ngrams_by_benchmark or {})
+        if not set(without) <= names:
+            raise ValueError(
+                "documents_without_ngrams_by_benchmark names unknown "
+                f"benchmark(s): {sorted(set(without) - names, key=str)!r}")
+        self.documents_by_benchmark = {}
+        self.tokens_by_benchmark = {}
+        self.documents_without_ngrams_by_benchmark = {}
+        for name in names:
+            documents = _nonnegative_int(
+                documents_by_benchmark[name],
+                f"documents_by_benchmark[{name!r}]")
+            tokens = _nonnegative_int(
+                tokens_by_benchmark[name], f"tokens_by_benchmark[{name!r}]")
+            missing = _nonnegative_int(
+                without.get(name, 0),
+                f"documents_without_ngrams_by_benchmark[{name!r}]")
+            if missing > documents:
+                raise ValueError(
+                    f"benchmark {name!r} has {missing} documents without "
+                    f"n-grams but only {documents} documents")
+            self.documents_by_benchmark[name] = documents
+            self.tokens_by_benchmark[name] = tokens
+            self.documents_without_ngrams_by_benchmark[name] = missing
         ngram_to_benchmarks: dict = {}
         for name, ngrams in self.ngrams_by_benchmark.items():
             for ngram in ngrams:
