@@ -498,7 +498,10 @@ def max_p_combination(pvalues: Sequence[Optional[float]]) -> Optional[float]:
     """
     valid = []
     for p in pvalues:
-        if p is None or _is_boolean_value(p):
+        if (p is None or _is_boolean_value(p)
+                or isinstance(p, (str, bytes, bytearray))):
+            # A numeric string is not a test result; accepting it here would
+            # turn malformed evidence into a passing intersection-union test.
             continue
         try:
             value = float(p)
@@ -824,7 +827,11 @@ def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
     # are still rejected, and non-numeric / non-finite values stay None.
     indexed = []
     for i, p in enumerate(pvalues):
-        if p is None or _is_boolean_value(p):
+        if (p is None or _is_boolean_value(p)
+                or isinstance(p, (str, bytes, bytearray))):
+            # A numeric string is not a test result: `float("0.01")` would
+            # let a malformed artifact enter the correction family as a
+            # maximally significant p-value.
             continue
         try:
             value = float(p)
