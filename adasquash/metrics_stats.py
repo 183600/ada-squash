@@ -359,6 +359,11 @@ def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
     for value in values:
         if value is None or _is_boolean_value(value):
             continue
+        if isinstance(value, (str, bytes, bytearray)):
+            # A numeric string is not an observed loss: `float("1.0")` would
+            # let a malformed log record enter the mean and its interval.
+            n_unusable += 1
+            continue
         try:
             raw.append(float(value))
         except (TypeError, ValueError, OverflowError):
