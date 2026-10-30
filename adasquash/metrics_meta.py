@@ -586,11 +586,41 @@ def welch_z_one_sided(
     a = _real_values(a, "a")
     b = _real_values(b, "b")
     margin = _validate_margin(margin)
-    if len(a) < 2 or len(b) < 2:
-        return {"mean_delta": None, "z": None, "p_one_sided": None,
-                "n": [len(a), len(b)], "paired": False}
+    n_input = [len(a), len(b)]
+    excluded = []
+    for arm_name, values in (("a", a), ("b", b)):
+        for index, value in enumerate(values):
+            if not math.isfinite(value):
+                excluded.append({
+                    "arm": arm_name,
+                    "index": index,
+                    "value": value,
+                    "reason": "non-finite observation",
+                })
+    if excluded:
+        a = [value for value in a if math.isfinite(value)]
+        b = [value for value in b if math.isfinite(value)]
+    na, nb = len(a), len(b)
+    out = {
+        "mean_delta": None,
+        "z": None,
+        "p_one_sided": None,
+        "n": [na, nb],
+        "n_input": n_input,
+        "n_excluded": len(excluded),
+        "excluded": excluded,
+        "paired": False,
+        "test": "welch_z",
+    }
+    if excluded:
+        out["note"] = (
+            f"{len(excluded)} of {sum(n_input)} observation(s) excluded "
+            "because the value was NaN or infinite; each arm is filtered "
+            "independently for this unpaired test")
+    if na < 2 or nb < 2:
+        return out
     ma, sa, mb, sb, scale = _welch_arm_statistics(a, b)
-    se = math.hypot(sa / math.sqrt(len(a)), sb / math.sqrt(len(b)))
+    se = math.hypot(sa / math.sqrt(na), sb / math.sqrt(nb))
     delta = ma - mb
     margin_test = margin / scale
     if se == 0.0:
@@ -598,13 +628,12 @@ def welch_z_one_sided(
             float("inf") if delta + margin_test > 0.0 else 0.0)
     else:
         z = (delta + margin_test) / se
-    return {
+    out.update({
         "mean_delta": delta * scale,
         "z": z,
         "p_one_sided": _p_one_sided_from_z(z),
-        "n": [len(a), len(b)],
-        "paired": False,
-    }
+    })
+    return out
 
 
 def welch_t_one_sided(
