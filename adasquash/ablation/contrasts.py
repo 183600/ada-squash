@@ -25,8 +25,9 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
                                paired_design_summary, paired_randomization_test,
-                               paired_t_one_sided, student_t_ppf, tost_paired,
-                               two_sided_p_from_t, welch_t_one_sided)
+                               paired_t_one_sided, ratio_effect_report,
+                               student_t_ppf, tost_paired, two_sided_p_from_t,
+                               welch_t_one_sided)
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import (_explicit_arg_names, apply_config_to_parser,
@@ -54,7 +55,10 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
     helpful; a point-estimate win inside the seed noise remains visible as
     `mechanism_helps=True, mechanism_helps_significantly=False`. This is what
     backs the claim that each axis of the main proposal is load-bearing on
-    its own, not merely correlated with the others. Returns None when no
+    its own, not merely correlated with the others. The percentage PPL cost
+    of a removal also carries a paired interval (`ppl_delta_pct_ci_95`):
+    PPL = exp(loss), so exponentiating the paired loss interval gives the
+    uncertainty for the ratio of geometric-mean PPLs. Returns None when no
     declared contrast has both rows with a usable val_loss.
     """
     spec = LOO_SPEC if spec is None else spec
@@ -92,6 +96,11 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 'ppl_full': None,
                 'ppl_reference': None,
                 'ppl_delta_pct': None,
+                'ppl_ratio_paired': None,
+                'ppl_ratio_ci_95': None,
+                'ppl_delta_pct_paired': None,
+                'ppl_delta_pct_ci_95': None,
+                'ppl_interval_basis': None,
                 'mechanism_helps': False,
                 'mechanism_helps_significantly': False,
                 'test': None,
@@ -157,6 +166,17 @@ def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: fl
                 entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
                 entry['delta_paired_mean'] = test['mean_delta']
                 entry['n'] = test['n']
+                if all(_finite_metric(test.get(key)) for key in
+                       ('mean_delta', 'ci_low', 'ci_high')):
+                    effect = ratio_effect_report(
+                        test['mean_delta'], test['ci_low'], test['ci_high'])
+                    entry.update({
+                        'ppl_ratio_paired': effect['ratio'],
+                        'ppl_ratio_ci_95': effect['ratio_ci'],
+                        'ppl_delta_pct_paired': effect['percent_change'],
+                        'ppl_delta_pct_ci_95': effect['percent_change_ci'],
+                        'ppl_interval_basis': effect['note'],
+                    })
                 # Keep the mechanism direction on the same shared-seed
                 # estimate the p-value tests, not the all-seed mean.
                 if test['mean_delta'] is not None:
@@ -437,6 +457,9 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
         ratio_str = '' if ratio is None else f" delta/seed_std={ratio:.2f}"
         ppl = entry.get('ppl_delta_pct')
         ppl_str = '' if ppl is None else f" dPPL={ppl:+.2f}%"
+        ppl_ci = entry.get('ppl_delta_pct_ci_95')
+        if ppl_ci is not None and all(_finite_metric(value) for value in ppl_ci):
+            ppl_str += f" (paired ci [{ppl_ci[0]:+.1f}, {ppl_ci[1]:+.1f}]%)"
         power_warn = ''
         if entry.get('within_seed_noise'):
             power_warn += ' [DELTA WITHIN SEED NOISE]'

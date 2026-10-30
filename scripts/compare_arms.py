@@ -22,7 +22,16 @@ more aggregates, pairs them by training seed, and reports:
   confidence interval for the mean: the CI says where the mean is, the PI says
   how far a replication can still land;
 * both loss and perplexity (`exp(loss)`) deltas, because the papers quote
-  PPL while the seed variance lives in loss;
+  PPL while the seed variance lives in loss; the paired PPL ratio carries the
+  exp of the paired loss interval (a ratio of geometric-mean PPLs, not an
+  interval invented from the arithmetic PPL difference);
+* an endpoint policy. `final_val_loss` is the fixed-horizon held-out pass and
+  is the only aggregate metric this tool can certify: `best_val_loss` is the
+  minimum over repeated validation passes (a selected extreme, so its mean
+  and paired test are optimistically biased), and `aggregate.json` does not
+  record the sealed batch pairing needed to certify `test_loss`. Both remain
+  reportable as descriptive results; the sealed endpoint is tested by
+  `scripts/compare_sealed_tests.py`;
 * a protocol audit across arms: identical model shape, fixed final step and
   resolved data version. If the arms differ on those, the comparison is
   reported but never certified, no matter how small the p-value;
@@ -52,13 +61,59 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
                                paired_design_summary, paired_randomization_test,
-                               paired_t_one_sided, student_t_ppf,
-                               tost_design_summary, tost_paired)
+                               paired_t_one_sided, ratio_effect_report,
+                               student_t_ppf, tost_design_summary, tost_paired)
 from adasquash.repro import (compare_train_streams,
                              execution_identity_mismatches,
                              training_recipe_mismatches)
 
 _LOSS_METRICS = ('final_val_loss', 'best_val_loss', 'test_loss')
+
+# Not every loss-shaped number is the same estimand. A confirmatory comparison
+# needs an endpoint whose value was fixed before the data used to test it was
+# seen; `aggregate.json` can supply that only for the fixed-step final pass.
+_METRIC_POLICY = {
+    'final_val_loss': {
+        'estimand': 'held-out loss at the fixed final training step',
+        'selection': 'none: every arm is scored at the same pre-specified step',
+        'data_dependent': False,
+        'certifiable_from_aggregate': True,
+        'reason': ('the fixed-step held-out pass is not selected on the data '
+                   'used to compare the arms'),
+        'required_evidence': 'aggregate.json with one shared final validation step',
+    },
+    'best_val_loss': {
+        'estimand': 'minimum held-out loss over checkpoint-selection passes',
+        'selection': ('the reported value is the minimum of repeated noisy '
+                      'passes over the same validation split'),
+        'data_dependent': True,
+        'certifiable_from_aggregate': False,
+        'reason': ('best_val_loss is a selected extreme, so its mean and paired '
+                   't-test are optimistically biased; a small p-value does not '
+                   'correct the selection'),
+        'required_evidence': ('compare final_val_loss at the fixed step, or use '
+                              'the sealed test via scripts/compare_sealed_tests.py'),
+    },
+    'test_loss': {
+        'estimand': 'sealed-test loss of the best-validation checkpoint',
+        'selection': ('checkpoint selection uses validation rather than test, '
+                      'but aggregate.json does not record the sealed batch pairing'),
+        'data_dependent': False,
+        'certifiable_from_aggregate': False,
+        'reason': ('aggregate.json stores per-seed test losses without the '
+                   'sealed-batch identity, so the arms may have been scored on '
+                   'different test batches'),
+        'required_evidence': ('scripts/compare_sealed_tests.py, which verifies '
+                              'per-batch pairing, run provenance and execution identity'),
+    },
+}
+
+
+def _metric_policy(metric: str) -> dict:
+    """The estimand/evidence contract for one aggregate loss metric."""
+    if metric not in _METRIC_POLICY:
+        raise ValueError(f'metric must be one of {_LOSS_METRICS}')
+    return dict(_METRIC_POLICY[metric])
 
 
 def _finite(value) -> bool:
@@ -430,6 +485,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         raise ValueError('compare_arms needs at least two named aggregates')
     if metric not in _LOSS_METRICS:
         raise ValueError(f'metric must be one of {_LOSS_METRICS}')
+    metric_policy = _metric_policy(metric)
     alpha_value = _finite_number(alpha)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
         raise ValueError('alpha must be finite and strictly between 0 and 1')
@@ -684,6 +740,10 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         entry = {
             'name': name,
             'norm': cand['norm'],
+            'metric': metric,
+            'metric_estimand': metric_policy['estimand'],
+            'metric_certifiable_from_aggregate': (
+                metric_policy['certifiable_from_aggregate']),
             'mean': cand['mean'],
             'std': cand['std'],
             'stderr': cand['stderr'],
@@ -709,6 +769,14 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             'ppl_arm': None if cand['mean'] is None else _safe_exp(cand['mean']),
             'ppl_delta': None,
             'ppl_delta_pct': None,
+            # The paired version uses only the shared seeds and is the ratio
+            # of their geometric-mean PPLs; its interval is the exp of the
+            # paired loss interval (not a bootstrap of arithmetic PPLs).
+            'ppl_ratio_paired': None,
+            'ppl_ratio_ci_95': None,
+            'ppl_delta_pct_paired': None,
+            'ppl_delta_pct_ci_95': None,
+            'ppl_interval_basis': None,
             'test': None,
             'test_basis': None,
             'p_one_sided': None,
@@ -798,6 +866,17 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                 'delta_ci_95': [test['ci_low'], test['ci_high']],
                 'n': test['n'],
             })
+            if all(_finite(test.get(key)) for key in
+                   ('mean_delta', 'ci_low', 'ci_high')):
+                effect = ratio_effect_report(
+                    test['mean_delta'], test['ci_low'], test['ci_high'])
+                entry.update({
+                    'ppl_ratio_paired': effect['ratio'],
+                    'ppl_ratio_ci_95': effect['ratio_ci'],
+                    'ppl_delta_pct_paired': effect['percent_change'],
+                    'ppl_delta_pct_ci_95': effect['percent_change_ci'],
+                    'ppl_interval_basis': effect['note'],
+                })
             if test.get('df'):
                 # The test is H1 mean(delta) < -margin. The smallest raw
                 # effect that clears both the margin and the noise is
@@ -918,8 +997,14 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                           and len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE)
             selection_ok = (not reference_data_dependent
                             or entry['selection_adjustment_complete'])
-            entry['certifiable'] = bool(both_clean and pair_protocol_ok and selection_ok)
-            if not pair_protocol_ok:
+            metric_ok = metric_policy['certifiable_from_aggregate']
+            entry['certifiable'] = bool(
+                metric_ok and both_clean and pair_protocol_ok and selection_ok)
+            if not metric_ok:
+                entry['certification_basis'] = (
+                    'descriptive only: ' + metric_policy['reason']
+                    + '; required evidence: ' + metric_policy['required_evidence'])
+            elif not pair_protocol_ok:
                 entry['certification_basis'] = (
                     'not certifiable: this pair differs on a controlled protocol field '
                     f'({"; ".join(pair_problems)})')
@@ -939,8 +1024,11 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         else:
             entry['test_basis'] = 'insufficient_shared_seeds'
             entry['certification_basis'] = (
-                f'{len(common)} shared seed(s); a paired test needs at least 2, '
-                f'and only >= {MIN_SEEDS_FOR_SIGNIFICANCE} can certify')
+                ('descriptive only: ' + metric_policy['reason']
+                 + '; required evidence: ' + metric_policy['required_evidence'])
+                if not metric_policy['certifiable_from_aggregate'] else
+                (f'{len(common)} shared seed(s); a paired test needs at least 2, '
+                 f'and only >= {MIN_SEEDS_FOR_SIGNIFICANCE} can certify'))
         if common:
             deltas = [cand['values'][seed] - ref['values'][seed]
                       for seed in common]
@@ -989,6 +1077,7 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
 
     return {
         'metric': metric,
+        'metric_policy': metric_policy,
         'alpha': alpha,
         'margin': margin,
         'equivalence_margin': equivalence_margin,
@@ -1040,7 +1129,8 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         },
         'multiple_comparison': (
             f'Holm-Bonferroni over the {len(family)} candidate arm(s) tested '
-            f'against {reference!r}; `certified` requires >= '
+            f'against {reference!r}; `certified` requires an endpoint that is '
+            f'certifiable from aggregate.json, >= '
             f'{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds, a clean protocol, a '
             f'complete reference-selection pool when the reference was '
             f'data-selected, and the adjusted p < {alpha}'),
@@ -1049,7 +1139,8 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                     'two across-seed stds; `within_seed_noise` is a warning, not a '
                     'p-value. PPL deltas use exp(loss) and are reported for the '
                     'paper-facing number, while the test is run on loss (its natural '
-                    'variance scale).'),
+                    'variance scale); `ppl_delta_pct_paired` is the exp of the paired '
+                    'loss interval and therefore a geometric-mean PPL ratio.'),
     }
 
 
@@ -1058,6 +1149,11 @@ def print_comparison(comparison: dict) -> None:
     print(f"[arms] metric={comparison['metric']} reference={ref} "
           f"mean={comparison['reference_mean']:.4f} "
           f"+/- {comparison['reference_std'] if comparison['reference_std'] is not None else 'n/a'}")
+    policy = comparison.get('metric_policy') or {}
+    if policy and not policy.get('certifiable_from_aggregate', True):
+        print(f"[arms] NOTE: {comparison['metric']} is descriptive only: "
+              f"{policy.get('reason')}; required evidence: "
+              f"{policy.get('required_evidence')}")
     protocol = comparison['protocol']
     if not protocol['ok']:
         # Certification is decided per reference/candidate pair. A third arm
@@ -1099,6 +1195,9 @@ def print_comparison(comparison: dict) -> None:
         ratio_str = '' if ratio is None else f' delta/seed_std={ratio:.2f}'
         ppl = entry.get('ppl_delta_pct')
         ppl_str = '' if ppl is None else f' dPPL={ppl:+.2f}%'
+        ppl_ci = entry.get('ppl_delta_pct_ci_95')
+        if ppl_ci is not None and all(_finite(value) for value in ppl_ci):
+            ppl_str += f' (paired ci [{ppl_ci[0]:+.1f}, {ppl_ci[1]:+.1f}]%)'
         noise = ' [WITHIN SEED NOISE]' if entry.get('within_seed_noise') else ''
         note = '' if entry.get('certifiable') else f" [{entry.get('certification_basis')}]"
         if (selection.get('data_dependent') and selection.get('pool_size', 0) > 1
@@ -1159,7 +1258,10 @@ def main(argv=None) -> None:
                         'intersection-union selection correction and requires '
                         '--reference to be one of them')
     p.add_argument('--metric', default='final_val_loss', choices=_LOSS_METRICS,
-                   help='held-out metric to compare (default: the fixed-step final validation loss)')
+                   help='held-out metric to compare (default: the fixed-step final '
+                        'validation loss, the only aggregate metric that can certify; '
+                        'best_val_loss is a selected extreme and test_loss needs '
+                        'scripts/compare_sealed_tests.py for sealed-batch pairing)')
     p.add_argument('--alpha', type=float, default=0.05,
                    help='one-sided significance level (Holm-adjusted over candidates)')
     p.add_argument('--margin', type=float, default=0.0,

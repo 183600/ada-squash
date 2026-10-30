@@ -33,6 +33,7 @@ from adasquash.metrics import (
     ndcg_at_k,
     paired_t_one_sided,
     paired_trend_test,
+    ratio_effect_report,
     recall_at_k,
     roc_auc,
     student_t_cdf,
@@ -348,12 +349,29 @@ def check_meta_analysis():
           label='meta stderr from ci')
 
 
+def check_ratio_effect():
+    # PPL = exp(loss); the ratio of geometric-mean PPLs is exp of the mean
+    # log-ratio, so the interval endpoints must be exponentiated, not the
+    # arithmetic PPL difference.
+    out = ratio_effect_report(-0.2, -0.3, -0.1)
+    close(out['ratio'], math.exp(-0.2), label='ratio effect point')
+    close(out['ratio_ci'][0], math.exp(-0.3), label='ratio effect low')
+    close(out['ratio_ci'][1], math.exp(-0.1), label='ratio effect high')
+    close(out['percent_change'], 100.0 * (math.exp(-0.2) - 1.0),
+          label='ratio effect percent')
+    close(out['percent_change_ci'][0], 100.0 * (math.exp(-0.3) - 1.0),
+          label='ratio effect percent low')
+    close(out['percent_change_ci'][1], 100.0 * (math.exp(-0.1) - 1.0),
+          label='ratio effect percent high')
+
+
 def main():
     check_ranking()
     check_ranking_at_k()
     check_f1()
     check_statistics()
     check_meta_analysis()
+    check_ratio_effect()
     print(f'[metrics-selfcheck] ok: {CHECKS} independent numerical checks passed')
 
 

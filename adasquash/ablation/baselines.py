@@ -25,8 +25,9 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
                                paired_design_summary, paired_randomization_test,
-                               paired_t_one_sided, student_t_ppf, tost_paired,
-                               two_sided_p_from_t, welch_t_one_sided)
+                               paired_t_one_sided, ratio_effect_report,
+                               student_t_ppf, tost_paired, two_sided_p_from_t,
+                               welch_t_one_sided)
 from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
 from scripts.train_gpt2 import (_explicit_arg_names, apply_config_to_parser,
@@ -61,7 +62,11 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
     value is 2.92, not the normal 1.64. `margin` is the smallest loss
     improvement treated as meaningful, and every entry carries a two-sided
     95% interval for the delta (`delta_ci_95`) so a win smaller than its own
-    precision is visible as such. Because every row is tested against the
+    precision is visible as such. The PPL improvement also carries a paired
+    interval (`ppl_delta_pct_ci_95`): because PPL = exp(loss), the exp of the
+    paired loss interval is the uncertainty for the ratio of geometric-mean
+    PPLs, rather than an interval-less percentage computed from arithmetic
+    PPL means. Because every row is tested against the
     *same* reference, the per-row p-values are a family of tests and are
     Holm-Bonferroni adjusted over the matrix before anything is called
     significant: `beats_reference_significantly` requires the adjusted
@@ -160,6 +165,11 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             'ppl_row': None,
             'ppl_delta': None,
             'ppl_delta_pct': None,
+            'ppl_ratio_paired': None,
+            'ppl_ratio_ci_95': None,
+            'ppl_delta_pct_paired': None,
+            'ppl_delta_pct_ci_95': None,
+            'ppl_interval_basis': None,
             'beats_reference': bool(delta < -margin),
             'beats_reference_significantly': False,
             'test': None,
@@ -224,6 +234,17 @@ def baseline_comparison(summaries: list, baseline_names, margin: float=0.0, alph
             entry['delta_ci_95'] = [test['ci_low'], test['ci_high']]
             entry['delta_paired_mean'] = test['mean_delta']
             entry['n'] = test['n']
+            if all(_finite_metric(test.get(key)) for key in
+                   ('mean_delta', 'ci_low', 'ci_high')):
+                effect = ratio_effect_report(
+                    test['mean_delta'], test['ci_low'], test['ci_high'])
+                entry.update({
+                    'ppl_ratio_paired': effect['ratio'],
+                    'ppl_ratio_ci_95': effect['ratio_ci'],
+                    'ppl_delta_pct_paired': effect['percent_change'],
+                    'ppl_delta_pct_ci_95': effect['percent_change_ci'],
+                    'ppl_interval_basis': effect['note'],
+                })
             # The direction must come from the same paired shared-seed
             # estimate as the p-value. The all-seed mean can have the
             # opposite sign when the arms have different seed sets, which
@@ -453,6 +474,9 @@ def print_baseline_comparison(comparison: dict | None) -> None:
         ratio_str = '' if ratio is None else f" delta/seed_std={ratio:.2f}"
         ppl = entry.get('ppl_delta_pct')
         ppl_str = '' if ppl is None else f" dPPL={ppl:+.2f}%"
+        ppl_ci = entry.get('ppl_delta_pct_ci_95')
+        if ppl_ci is not None and all(_finite_metric(value) for value in ppl_ci):
+            ppl_str += f" (paired ci [{ppl_ci[0]:+.1f}, {ppl_ci[1]:+.1f}]%)"
         power_warn = ''
         if entry.get('within_seed_noise'):
             power_warn += ' [DELTA WITHIN SEED NOISE]'

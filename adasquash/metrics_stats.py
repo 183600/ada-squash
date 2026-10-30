@@ -469,6 +469,62 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
     return out
 
 
+def ratio_effect_report(mean_log_ratio, ci_low, ci_high) -> dict:
+    """Report a log-scale effect as a ratio / percent change with its interval.
+
+    A metric stored on a log scale (cross-entropy loss) is often quoted on a
+    ratio scale (perplexity). ``PPL = exp(loss)``, so a difference of mean
+    losses is a *ratio of geometric-mean PPLs*, and ``exp`` is monotone:
+    the interval for the mean log ratio maps endpoint by endpoint. This is the
+    honest uncertainty for a PPL improvement. Exponentiating the difference of
+    two arithmetic-mean PPLs would instead report the wrong estimand with no
+    interval at all.
+
+    The three inputs must be finite, ordered, and the point estimate must lie
+    inside the interval. A malformed interval is rejected rather than silently
+    producing a valid-looking ratio whose endpoints do not bracket it. An
+    overflow to ``inf`` (a loss difference beyond the float range) is kept as
+    ``inf`` instead of raising, because it is a truthful upper bound.
+    """
+    values = {}
+    for name, value in (("mean_log_ratio", mean_log_ratio),
+                        ("ci_low", ci_low), ("ci_high", ci_high)):
+        real = _as_real(value)
+        if real is None or not math.isfinite(real):
+            raise ValueError(f"{name} must be a finite real number, got {value!r}")
+        values[name] = real
+    mean = values["mean_log_ratio"]
+    low = values["ci_low"]
+    high = values["ci_high"]
+    if low > high:
+        raise ValueError(
+            f"ci_low must not exceed ci_high, got {low!r} > {high!r}")
+    if not low <= mean <= high:
+        raise ValueError(
+            f"the point estimate {mean!r} must lie inside [{low!r}, {high!r}]")
+
+    def _exp(value: float) -> float:
+        try:
+            return math.exp(value)
+        except OverflowError:
+            return math.inf
+
+    ratio = _exp(mean)
+    ratio_low = _exp(low)
+    ratio_high = _exp(high)
+    return {
+        "mean_log_ratio": mean,
+        "ratio": ratio,
+        "ratio_ci": [ratio_low, ratio_high],
+        "percent_change": 100.0 * (ratio - 1.0),
+        "percent_change_ci": [100.0 * (ratio_low - 1.0),
+                              100.0 * (ratio_high - 1.0)],
+        "note": ("ratio of geometric-mean PPLs: exp of the paired mean-loss "
+                 "difference; the interval is the exp of the loss interval, "
+                 "not a difference of arithmetic-mean PPLs"),
+    }
+
+
 def max_p_combination(pvalues: Sequence[Optional[float]]) -> Optional[float]:
     """Intersection-union p-value for "all of these one-sided tests reject".
 

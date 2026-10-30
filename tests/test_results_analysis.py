@@ -12,6 +12,13 @@ Two failure modes are pinned here:
   (intersection-union max-p), and that combined p-value is what enters the
   certification family.
 
+The same logic applies to the endpoint: a value selected on the evaluation
+data (best_val_loss) or measured without a verified sealed-batch pairing
+(test_loss) may be reported, but only the fixed-step final_val_loss can
+certify from aggregate.json. PPL ratios inherit the paired loss interval,
+because exponentiating a difference of arithmetic-mean PPLs would be a
+different, interval-less estimand.
+
 These are pure-Python, synthetic-seed tests; no checkpoint is needed.
 """
 from __future__ import annotations
@@ -28,7 +35,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import (max_p_combination, mean_ci,
-                               mean_prediction_interval, student_t_ppf)
+                               mean_prediction_interval, ratio_effect_report,
+                               student_t_ppf)
 from adasquash.repro import TRAINING_RECIPE_KEYS
 
 SEEDS = (42, 43, 44)
@@ -54,6 +62,14 @@ def _aggregate(values):
         'data_versions_by_seed': {str(seed): dict(version) for seed in values},
         'data_ledgers_by_seed': {str(seed): dict(ledger) for seed in values},
     }
+
+
+def _aggregate_metric(values, metric):
+    """The same complete aggregate, with one additional per-seed metric."""
+    agg = _aggregate(values)
+    for record in agg['per_seed']:
+        record[metric] = values[record['seed']]
+    return agg
 
 
 def _manifest(agg):
@@ -275,3 +291,142 @@ def test_trend_test_reports_a_slope_replication_interval():
     assert low < out['mean_slope_per_dose'] < high
     assert 0.5 < out['slope_same_direction_probability'] <= 1.0
     assert out['slope_prediction_interval_95'][0] < out['slope_ci_95'][0]
+
+
+# ---------------------------------------------------------------------------
+# Endpoint/estimand policy: a loss-shaped number is not automatically a
+# confirmatory endpoint
+# ---------------------------------------------------------------------------
+def test_final_val_loss_is_the_certifiable_aggregate_endpoint():
+    from scripts.compare_arms import compare_arms
+
+    arms, manifests = _arms()
+    out = compare_arms(arms, reference='base-fast', manifests=manifests,
+                       require_recipe=True)
+    policy = out['metric_policy']
+    assert out['metric'] == 'final_val_loss'
+    assert policy['data_dependent'] is False
+    assert policy['certifiable_from_aggregate'] is True
+    row = [entry for entry in out['rows'] if entry['name'] == 'candidate'][0]
+    assert row['metric_certifiable_from_aggregate'] is True
+    assert row['certifiable'] is True
+
+
+def test_best_val_loss_cannot_certify_its_own_selection():
+    from scripts.compare_arms import compare_arms
+
+    arms = {
+        'reference': _aggregate_metric({seed: 2.0 for seed in SEEDS},
+                                       'best_val_loss'),
+        'candidate': _aggregate_metric({seed: 1.0 for seed in SEEDS},
+                                       'best_val_loss'),
+    }
+    manifests = {name: _manifest(agg) for name, agg in arms.items()}
+    out = compare_arms(arms, reference='reference', metric='best_val_loss',
+                       manifests=manifests, require_recipe=True)
+    row = out['rows'][0]
+    assert out['metric_policy']['data_dependent'] is True
+    assert out['metric_policy']['certifiable_from_aggregate'] is False
+    assert row['p_one_sided'] == 0.0       # numerically significant ...
+    assert row['certifiable'] is False     # ... but selected on the same data
+    assert row['certified'] is False
+    assert row['p_one_sided_holm'] is None
+    assert 'selected extreme' in row['certification_basis']
+
+
+def test_aggregate_test_loss_requires_the_sealed_pairing_audit():
+    from scripts.compare_arms import compare_arms
+
+    arms = {
+        'reference': _aggregate_metric({seed: 2.0 for seed in SEEDS},
+                                       'test_loss'),
+        'candidate': _aggregate_metric({seed: 1.0 for seed in SEEDS},
+                                       'test_loss'),
+    }
+    manifests = {name: _manifest(agg) for name, agg in arms.items()}
+    out = compare_arms(arms, reference='reference', metric='test_loss',
+                       manifests=manifests, require_recipe=True)
+    row = out['rows'][0]
+    assert out['metric_policy']['certifiable_from_aggregate'] is False
+    assert row['p_one_sided'] == 0.0
+    assert row['certifiable'] is False
+    assert row['certified'] is False
+    assert 'compare_sealed_tests.py' in row['certification_basis']
+
+
+# ---------------------------------------------------------------------------
+# Headline PPL improvement carries the interval of its own estimand
+# ---------------------------------------------------------------------------
+def test_ratio_effect_report_is_the_exp_of_the_log_interval():
+    out = ratio_effect_report(-0.20, -0.30, -0.10)
+    assert out['ratio'] == pytest.approx(math.exp(-0.20))
+    assert out['ratio_ci'] == pytest.approx([math.exp(-0.30), math.exp(-0.10)])
+    assert out['percent_change'] == pytest.approx(
+        100.0 * (math.exp(-0.20) - 1.0))
+    assert out['percent_change_ci'] == pytest.approx([
+        100.0 * (math.exp(-0.30) - 1.0),
+        100.0 * (math.exp(-0.10) - 1.0)])
+    assert 'geometric-mean' in out['note']
+
+
+def test_ratio_effect_report_rejects_a_malformed_interval():
+    with pytest.raises(ValueError, match='ci_low'):
+        ratio_effect_report(0.0, 0.1, -0.1)
+    with pytest.raises(ValueError, match='inside'):
+        ratio_effect_report(0.5, -0.1, 0.1)
+    with pytest.raises(ValueError, match='finite'):
+        ratio_effect_report(float('nan'), -0.1, 0.1)
+
+
+def test_compare_arms_reports_the_paired_ppl_interval():
+    from scripts.compare_arms import compare_arms
+
+    arms = {
+        'reference': _aggregate({42: 2.00, 43: 2.10, 44: 1.95}),
+        'candidate': _aggregate({42: 1.80, 43: 2.00, 44: 1.90}),
+    }
+    manifests = {name: _manifest(agg) for name, agg in arms.items()}
+    out = compare_arms(arms, reference='reference', manifests=manifests,
+                       require_recipe=True)
+    row = out['rows'][0]
+    low, high = row['delta_ci_95']
+    assert row['ppl_ratio_ci_95'] == pytest.approx(
+        [math.exp(low), math.exp(high)])
+    assert row['ppl_delta_pct_ci_95'] == pytest.approx(
+        [100.0 * (math.exp(low) - 1.0), 100.0 * (math.exp(high) - 1.0)])
+    assert row['ppl_delta_pct_paired'] == pytest.approx(
+        100.0 * (math.exp(row['delta_paired_mean']) - 1.0))
+    assert 'geometric-mean' in row['ppl_interval_basis']
+
+
+def test_ablation_reports_the_paired_ppl_interval():
+    from scripts.ablation import baseline_comparison
+
+    baseline = _row('baseline', {42: 2.00, 43: 2.10, 44: 1.95})
+    candidate = _row('candidate', {42: 1.80, 43: 2.00, 44: 1.90})
+    out = baseline_comparison([baseline, candidate], ['baseline'])
+    row = out['rows'][0]
+    low, high = row['delta_ci_95']
+    assert row['ppl_ratio_ci_95'] == pytest.approx(
+        [math.exp(low), math.exp(high)])
+    assert row['ppl_delta_pct_ci_95'] == pytest.approx(
+        [100.0 * (math.exp(low) - 1.0), 100.0 * (math.exp(high) - 1.0)])
+    assert 'geometric-mean' in row['ppl_interval_basis']
+
+
+def test_leave_one_out_reports_the_paired_ppl_interval():
+    from scripts.ablation import leave_one_out_comparison
+
+    full = _row('dytcd_full', {42: 1.40, 43: 1.41, 44: 1.39})
+    removed = _row('dytcd_no_perchannel', {42: 1.55, 43: 1.54, 44: 1.56})
+    spec = {'dytcd_full': {
+        'per_channel_delta': {
+            'row': 'dytcd_no_perchannel', 'diff': ('learnable_delta',)}}}
+    out = leave_one_out_comparison([full, removed], spec=spec)
+    entry = out['rows'][0]
+    low, high = entry['delta_ci_95']
+    assert entry['ppl_ratio_ci_95'] == pytest.approx(
+        [math.exp(low), math.exp(high)])
+    assert entry['ppl_delta_pct_ci_95'] == pytest.approx(
+        [100.0 * (math.exp(low) - 1.0), 100.0 * (math.exp(high) - 1.0)])
+    assert 'geometric-mean' in entry['ppl_interval_basis']
