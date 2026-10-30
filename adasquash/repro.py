@@ -37,6 +37,7 @@ invariants).
 """
 import hashlib
 import json
+import numbers
 import os
 import platform
 import random
@@ -418,14 +419,13 @@ def _strict_seed(seed) -> int:
     Out-of-range integers are rejected here, before ``set_all_seeds`` mutates
     the Python/NumPy/TF streams and then fails inside ``torch.manual_seed``.
     """
-    if _is_boolean_scalar(seed):
-        raise ValueError(f"seed must be an integer, got bool {seed!r}")
-    try:
-        converted = int(seed)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f"seed must be an integer, got {seed!r}") from None
-    if converted != seed:
+    if _is_boolean_scalar(seed) or not isinstance(seed, numbers.Integral):
+        # An integral float (1.0) or Decimal is not a seed identity even
+        # though ``int`` would accept it: the manifest would record a
+        # different type than the caller requested, and two spellings of the
+        # same run must not silently compare equal.
         raise ValueError(f"seed must be an integer, got {seed!r}")
+    converted = int(seed)
     if converted < -(2 ** 63) or converted > 2 ** 64 - 1:
         raise ValueError(f"seed must be in [-2**63, 2**64 - 1], got {seed!r}")
     return converted
