@@ -490,6 +490,151 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
         print(f"[loo] WARNING: rows with <3 seeds cannot separate effect from noise on their own: "
               f"{comparison['rows_with_fewer_than_3_seeds']}")
 
+def _conditional_effect_entry(base: dict, effect: str, factor: str, context: dict,
+                              gate_open: bool, per_seed: dict, common: list,
+                              margin: float, alpha: float, formula: str) -> dict:
+    """One simple effect of `factor` inside a fixed context of the other axes.
+
+    Simple effects answer "does this factor help *here*?", which the pooled
+    main effect and the interaction term cannot: a main effect can be zero
+    while the factor helps in one arm and hurts in the other. They are only
+    certified when the corresponding interaction survives its two-sided Holm
+    family; otherwise they stay descriptive and say so explicitly.
+    """
+    per_seed = {str(seed): value for seed, value in per_seed.items()}
+    values = [per_seed[str(seed)] for seed in common]
+    test = paired_t_one_sided(values, [0.0] * len(values), margin=margin,
+                              alpha=alpha)
+    replicated = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
+    mean_delta = sum(values) / len(values)
+    entry = dict(
+        base, effect=effect, kind='simple_effect', term_factors=[factor],
+        conditional_factor=factor, conditional_context=dict(context),
+        analysis_role='conditional_follow_up',
+        interaction_gate_open=bool(gate_open),
+        conditional_test_status=('tested_follow_up' if gate_open
+                                 else 'descriptive_no_interaction'),
+        formula=formula, shared_seeds=common, n_seeds=len(common),
+        delta_seed_mean=mean_delta,
+        per_seed_delta=dict(per_seed),
+        n_seeds_favoring=sum(value < 0.0 for value in values),
+        n_seeds_tied=sum(value == 0.0 for value in values),
+        n_seeds_against=sum(value > 0.0 for value in values),
+        effect_helps=bool(mean_delta < -margin),
+        effect_helps_significantly=False,
+        test=test['test'],
+        test_basis=('seed_means' if replicated
+                    else f'seed_means_{len(common)}_descriptive'),
+        replicated_across_seeds=replicated,
+        p_one_sided=test['p_one_sided'],
+        p_one_sided_holm=None,
+        p_two_sided=None,
+        p_two_sided_holm=None,
+        interaction_direction=None,
+        interaction_differs_significantly=None,
+        t=test['t'], df=test['df'],
+        delta_ci_95=[test['ci_low'], test['ci_high']],
+        n=test['n'])
+    effect_row = {'per_seed': [
+        {'seed': int(seed), 'val_loss': per_seed[str(seed)]}
+        for seed in common]}
+    zero_row = {'per_seed': [
+        {'seed': int(seed), 'val_loss': 0.0} for seed in common]}
+    entry.update(_paired_effect_summary(
+        effect_row, zero_row, common, test, alpha=alpha, margin=margin))
+    entry.update(_robustness_for_deltas(
+        {str(seed): float(per_seed[str(seed)]) for seed in common},
+        alpha=alpha, equivalence_margin=0.0, margin=margin))
+    paired_std = entry.get('paired_delta_std')
+    if (isinstance(paired_std, (int, float)) and paired_std > 0.0
+            and entry.get('delta_seed_mean') is not None):
+        entry['delta_over_paired_std'] = abs(mean_delta) / paired_std
+        entry['within_paired_seed_noise'] = bool(abs(mean_delta) < paired_std)
+    else:
+        entry['delta_over_paired_std'] = None
+        entry['within_paired_seed_noise'] = None
+    return entry
+
+
+def _finalize_conditional_effects(rows: list, conditional_rows: list,
+                                  alpha: float) -> list:
+    """Gate simple effects on the interaction family and Holm-test the open ones.
+
+    A factor's simple effects are confirmatory follow-ups only when at least
+    one interaction involving that factor differs significantly in the
+    two-sided interaction family. That gate is what stops "simple effects"
+    from becoming an unregistered second look at every cell: when the axes
+    are additive, the conditional estimates are descriptive.
+    """
+    interactions = [entry for entry in rows
+                    if entry.get('kind') == 'interaction'
+                    and not entry.get('skipped')]
+    for entry in conditional_rows:
+        factor = entry['conditional_factor']
+        gate_open = any(
+            row.get('design') == entry.get('design')
+            and factor in (row.get('term_factors') or ())
+            and row.get('interaction_differs_significantly')
+            for row in interactions)
+        entry['interaction_gate_open'] = bool(gate_open)
+        entry['conditional_test_status'] = ('tested_follow_up' if gate_open
+                                            else 'descriptive_no_interaction')
+    follow_up = [entry for entry in conditional_rows
+                 if entry.get('interaction_gate_open')
+                 and entry.get('replicated_across_seeds')]
+    adjusted = holm_adjust([entry['p_one_sided'] for entry in follow_up])
+    for entry, p_holm in zip(follow_up, adjusted):
+        entry['p_one_sided_holm'] = p_holm
+        entry['effect_helps_significantly'] = bool(
+            entry['effect_helps'] and p_holm is not None and p_holm < alpha)
+    return follow_up
+
+
+def _conditional_effects_summary(conditional_rows: list, follow_up: list) -> dict:
+    by_factor: dict = {}
+    for entry in conditional_rows:
+        factor = f"{entry.get('design')}:{entry['conditional_factor']}"
+        info = by_factor.setdefault(factor, {
+            'gate_open': False,
+            'n_simple_effects': 0,
+            'n_tested_follow_up': 0,
+            'n_descriptive_gate_closed': 0,
+            'n_descriptive_under_replicated': 0,
+        })
+        info['n_simple_effects'] += 1
+        if entry.get('interaction_gate_open'):
+            info['gate_open'] = True
+            if entry.get('replicated_across_seeds'):
+                info['n_tested_follow_up'] += 1
+            else:
+                info['n_descriptive_under_replicated'] += 1
+        else:
+            info['n_descriptive_gate_closed'] += 1
+    return {
+        'protocol': (
+            'simple effects of each factor within every level/context of the '
+            'other factor(s). They are pre-registered conditional follow-ups: '
+            'a factor\'s simple effects are Holm-tested only when at least one '
+            'interaction involving that factor survives the two-sided '
+            'interaction family; otherwise they are descriptive '
+            '(conditional_test_status=descriptive_no_interaction). They are '
+            'not counted as new study-level confirmatory claims.'),
+        'factors': by_factor,
+        'n_simple_effects': len(conditional_rows),
+        'n_tested_follow_up': len(follow_up),
+        'n_descriptive_gate_closed': sum(
+            not entry.get('interaction_gate_open')
+            for entry in conditional_rows),
+        'n_descriptive_under_replicated': sum(
+            entry.get('interaction_gate_open')
+            and not entry.get('replicated_across_seeds')
+            for entry in conditional_rows),
+        'multiple_comparison': (
+            f'Holm-Bonferroni over {len(follow_up)} interaction-gated simple '
+            'effect(s) using the one-sided p-value'),
+    }
+
+
 def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=0.0,
                          alpha: float=0.05,
                          equivalence_margin: float=0.0) -> dict | None:
@@ -504,7 +649,10 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
     because either axis helps" from "the combination is special". Every term
     uses the same shared seed set across all four cells and the same
     small-sample paired t-test as the other comparisons; only >= 3 shared
-    seeds enter the Holm family. Returns None when no design has all cells.
+    seeds enter the Holm family. The interaction-gated simple effects of each
+    factor inside each level of the other factor are appended as conditional
+    follow-ups, so a pooled main effect cannot hide an effect that reverses
+    sign across contexts. Returns None when no design has all cells.
     """
     spec = FACTORIAL_SPEC if spec is None else spec
     usable = {r['name']: r for r in summaries
@@ -550,6 +698,7 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
             main_values = [sum(vals) / len(vals) for vals in zip(*arm_values.values())]
             effects[factor] = {
                 'kind': 'main_effect',
+                'term_factors': [factor],
                 'formula': 'mean over both arms of the other factor: on - off',
                 'arm_effects': {name: {'mean_delta': sum(vals) / len(vals),
                                        'per_seed_delta': dict(zip(map(str, common), vals))}
@@ -569,6 +718,7 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
             ]
             effects[f'{first}_x_{second}'] = {
                 'kind': 'interaction',
+                'term_factors': [first, second],
                 'formula': (f'effect of {first} with {second} on minus effect of {first} '
                             f'with {second} off; negative = synergy'),
                 'per_seed_values': dict(zip(map(str, common), interaction_values)),
@@ -589,6 +739,7 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                 two_sided_test['t'], two_sided_test['df'])
             replicated = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
             entry = dict(base_entry, effect=effect_name, kind=effect['kind'],
+                         term_factors=list(effect.get('term_factors') or ()),
                          formula=effect['formula'], shared_seeds=common,
                          n_seeds=len(common),
                          delta_seed_mean=effect['delta_seed_mean'],
@@ -664,6 +815,46 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
         entry['p_two_sided_holm'] = p_holm
         entry['interaction_differs_significantly'] = bool(
             p_holm is not None and p_holm < alpha)
+    conditional_rows: list = []
+    for main in rows:
+        if main.get('skipped') or main.get('kind') != 'main_effect':
+            continue
+        design = spec[main['design']]
+        factor = main['effect']
+        others = [name for name in design['factors'] if name != factor]
+        if len(others) != 1:
+            continue
+        other = others[0]
+        other_pairs = design['factors'][other].get('pairs') or ()
+        for index, (off_cell, on_cell) in enumerate(
+                design['factors'][factor].get('pairs') or ()):
+            other_level = ('off', 'on')[index] if index < 2 else str(index)
+            for pair_index, pair in enumerate(other_pairs):
+                if len(pair) != 2 or pair_index >= 2:
+                    continue
+                if off_cell == pair[0]:
+                    other_level = 'off'
+                    break
+                if off_cell == pair[1]:
+                    other_level = 'on'
+                    break
+            arm = (main.get('arm_effects') or {}).get(f'{off_cell}->{on_cell}')
+            if not arm:
+                continue
+            conditional_rows.append(_conditional_effect_entry(
+                dict(base_entry, design=main['design'],
+                     cells=dict(design['cells']),
+                     context=design.get('context')),
+                effect=f'{factor}@{other}={other_level}', factor=factor,
+                context={other: other_level}, gate_open=False,
+                per_seed=arm['per_seed_delta'], common=main['shared_seeds'],
+                margin=margin, alpha=alpha,
+                formula=(f'effect of {factor} on - off within '
+                         f'{other}={other_level} (simple effect)')))
+    follow_up = _finalize_conditional_effects(rows, conditional_rows, alpha)
+    rows.extend(conditional_rows)
+    conditional_summary = _conditional_effects_summary(
+        conditional_rows, follow_up)
     tested_descriptively = [entry['effect'] for entry in rows
                             if entry.get('p_one_sided') is not None
                             and not entry.get('replicated_across_seeds')]
@@ -682,6 +873,7 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
             f'Holm-Bonferroni over {len(interaction_family)} seed-replicated interaction '
             'term(s) using the two-sided p-value; `interaction_differs_significantly` '
             'covers synergy and antagonism'),
+        'conditional_effects': conditional_summary,
         'designs': spec,
         'rows': rows,
         'rows_tested_descriptively_only': tested_descriptively,
@@ -711,6 +903,10 @@ def print_factorial_comparison(comparison: dict | None) -> None:
             if abs(entry['delta_seed_mean']) < mde:
                 power_warn += ' [UNDERPOWERED: |delta| < mde80]'
         note = '' if entry['replicated_across_seeds'] else ' [descriptive only, not certified]'
+        if entry.get('kind') == 'simple_effect':
+            note += (f" [simple effect; interaction gate "
+                     f"{'open' if entry.get('interaction_gate_open') else 'closed'}; "
+                     f"{entry.get('conditional_test_status')}]")
         interaction = ''
         if entry.get('kind') == 'interaction':
             p2 = entry.get('p_two_sided')
@@ -726,6 +922,15 @@ def print_factorial_comparison(comparison: dict | None) -> None:
               f"helps={entry['effect_helps']} "
               f"significant={entry['effect_helps_significantly']}{note}{power_warn}"
               f"{interaction}{_robustness_note(entry)}")
+    conditional = comparison.get('conditional_effects') or {}
+    if conditional:
+        open_factors = sorted(
+            factor for factor, info in (conditional.get('factors') or {}).items()
+            if (info or {}).get('gate_open'))
+        print(f"[factorial] conditional effects: {conditional.get('n_tested_follow_up')} "
+              f"tested follow-up(s) (gate open for {open_factors or 'no factor'}), "
+              f"{conditional.get('n_descriptive_gate_closed')} descriptive "
+              f"(gate closed)")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[factorial] NOTE: terms with fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared "
               f"seeds are described but never certified: "
@@ -785,6 +990,8 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
     only returns a verdict when a positive `equivalence_margin` was
     pre-specified: "no significant interaction" is not evidence that the axes
     are additive, whereas an equivalence test within a stated loss margin is.
+    Simple effects of each factor in every context of the other two are added
+    as interaction-gated conditional follow-ups.
     """
     spec = THREE_WAY_FACTORIAL_SPEC if spec is None else spec
     usable = {r['name']: r for r in summaries
@@ -792,6 +999,7 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
               and _finite_metric(r.get('val_loss'))}
     rows: list = []
     design_reports: dict = {}
+    conditional_rows: list = []
     for design_name, design in spec.items():
         factors = tuple(design.get('factors') or ())
         levels = design.get('levels') or {}
@@ -929,6 +1137,33 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
                     entry['orthogonal_within_margin'] = bool(
                         equivalence.get('equivalent'))
             rows.append(entry)
+        for factor in factors:
+            others = [name for name in factors if name != factor]
+            off_level, on_level = levels[factor]
+            for combo in itertools.product(
+                    *(levels[name] for name in others)):
+                context = dict(zip(others, combo))
+                off_assignment = dict(context, **{factor: off_level})
+                on_assignment = dict(context, **{factor: on_level})
+                off_key = '|'.join(
+                    f'{name}={off_assignment[name]}' for name in factors)
+                on_key = '|'.join(
+                    f'{name}={on_assignment[name]}' for name in factors)
+                per_seed = {
+                    seed: (seed_values[on_key][seed]
+                           - seed_values[off_key][seed])
+                    for seed in common}
+                context_label = '|'.join(
+                    f'{name}={context[name]}' for name in others)
+                conditional_rows.append(_conditional_effect_entry(
+                    dict(base, design=design_name, cells=dict(cells)),
+                    effect=f'{factor}@{context_label}', factor=factor,
+                    context=context, gate_open=False, per_seed=per_seed,
+                    common=common, margin=margin, alpha=alpha,
+                    formula=(f'effect of {factor} on - off within '
+                             + ', '.join(f'{name}={context[name]}'
+                                         for name in others)
+                             + ' (simple effect)')))
     if not rows:
         return None
     family = [entry for entry in rows
@@ -946,6 +1181,10 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
         entry['p_two_sided_holm'] = p_holm
         entry['interaction_differs_significantly'] = bool(
             p_holm is not None and p_holm < alpha)
+    follow_up = _finalize_conditional_effects(rows, conditional_rows, alpha)
+    rows.extend(conditional_rows)
+    conditional_summary = _conditional_effects_summary(
+        conditional_rows, follow_up)
     pairwise = [entry for entry in interaction_family
                 if len(entry.get('term_factors') or ()) == 2]
     triple = [entry for entry in interaction_family
@@ -1012,6 +1251,7 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
             f'Holm-Bonferroni over {len(interaction_family)} seed-replicated '
             'interaction(s) using the two-sided p-value; covers negative and '
             'positive interactions'),
+        'conditional_effects': conditional_summary,
         'orthogonality': {
             'margin': equivalence_margin,
             'interactions': interactions_block,
@@ -1052,6 +1292,10 @@ def print_three_way_factorial_comparison(comparison: dict | None) -> None:
         ci_str = '' if ci is None else f"ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}] "
         note = ('' if entry['replicated_across_seeds']
                 else ' [descriptive only, not certified]')
+        if entry.get('kind') == 'simple_effect':
+            note += (f" [simple effect; interaction gate "
+                     f"{'open' if entry.get('interaction_gate_open') else 'closed'}; "
+                     f"{entry.get('conditional_test_status')}]")
         interaction = ''
         if entry.get('kind') == 'interaction':
             interaction = (
@@ -1075,6 +1319,16 @@ def print_three_way_factorial_comparison(comparison: dict | None) -> None:
           f"margin={orthogonality.get('margin')}")
     if orthogonality.get('note'):
         print(f"[factorial3] note: {orthogonality['note']}")
+    conditional = comparison.get('conditional_effects') or {}
+    if conditional:
+        open_factors = sorted(
+            factor for factor, info in (conditional.get('factors') or {}).items()
+            if (info or {}).get('gate_open'))
+        print(f"[factorial3] conditional effects: "
+              f"{conditional.get('n_tested_follow_up')} tested follow-up(s) "
+              f"(gate open for {open_factors or 'no factor'}), "
+              f"{conditional.get('n_descriptive_gate_closed')} descriptive "
+              f"(gate closed)")
     if comparison.get('rows_tested_descriptively_only'):
         print(f"[factorial3] NOTE: terms with fewer than "
               f"{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds are described but "

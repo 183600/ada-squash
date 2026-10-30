@@ -217,6 +217,48 @@ def test_three_way_reports_antagonism_two_sidedly():
     assert interaction['effect_helps_significantly'] is False
 
 
+def test_simple_effects_are_gated_per_factor_in_the_2x2x2():
+    # Only per_channel x depth interacts (and only when both are on). The
+    # per_channel and depth gates open; activation has no surviving
+    # interaction, so its simple effects remain descriptive.
+    def value(assignment):
+        extra = 0.10 if (assignment['per_channel'] == 'on'
+                         and assignment['depth'] == 'on') else 0.0
+        return _additive()(assignment) + extra
+
+    spec, _ = _synthetic_design()
+    report = three_way_factorial_comparison(
+        _row_values(spec, value), spec=spec, equivalence_margin=0.02)
+    simple = {row['effect']: row for row in report['rows']
+              if row.get('kind') == 'simple_effect'}
+    assert len(simple) == 12
+    assert simple['per_channel@depth=off|activation=softsign'][
+        'delta_seed_mean'] == pytest.approx(-0.10)
+    assert simple['per_channel@depth=on|activation=softsign'][
+        'delta_seed_mean'] == pytest.approx(0.0)
+    assert simple['depth@per_channel=off|activation=tanh'][
+        'delta_seed_mean'] == pytest.approx(-0.20)
+    assert simple['depth@per_channel=on|activation=tanh'][
+        'delta_seed_mean'] == pytest.approx(-0.10)
+    for factor in ('per_channel', 'depth'):
+        assert report['conditional_effects']['factors'][
+            f'synthetic:{factor}']['gate_open'] is True
+    assert (report['conditional_effects']['factors']['synthetic:activation']
+            ['gate_open']) is False
+    for effect, entry in simple.items():
+        if effect.startswith('activation@'):
+            assert entry['interaction_gate_open'] is False
+            assert entry['conditional_test_status'] == (
+                'descriptive_no_interaction')
+            assert entry['p_one_sided_holm'] is None
+        else:
+            assert entry['interaction_gate_open'] is True
+            assert entry['conditional_test_status'] == 'tested_follow_up'
+            assert entry['p_one_sided_holm'] is not None
+    assert report['conditional_effects']['n_tested_follow_up'] == 8
+    assert report['conditional_effects']['n_descriptive_gate_closed'] == 4
+
+
 def test_orthogonality_is_not_inferred_without_an_equivalence_margin():
     spec, _ = _synthetic_design()
     report = three_way_factorial_comparison(
@@ -256,8 +298,27 @@ def test_cross_axis_interactions_are_pre_registered_and_reach_study_level():
     # 2x2x2 main effects must not be double-counted in the study family.
     assert 'factorial3:synthetic:per_channel' not in ids
     assert 'factorial3:synthetic:depth' not in ids
+    # Every simple effect is pre-registered as an interaction-gated follow-up,
+    # but explicitly not counted in the study-level family.
+    simple = [entry for entry in plan['contrasts']
+              if entry['kind'] == 'simple_effect']
+    assert len(simple) == 12
+    for entry in simple:
+        assert entry['counted_in_study_family'] is False
+        assert entry['tier'] == 2
+        assert entry['tier_role'] == 'conditional_follow_up'
+        assert entry['family'] == 'conditional_follow_up'
 
     study = study_level_correction({'factorial3': report}, plan)
+    assert study['n_conditional_follow_up'] == 12
+    assert study['n_in_study_family'] == 4
+    simple_records = [entry for entry in study['rows']
+                      if entry['tier'] == 'conditional_follow_up']
+    assert len(simple_records) == 12
+    assert all(entry['confirmed_at_study_level'] is False
+               for entry in simple_records)
+    assert all('conditional follow-up' in entry['excluded_from_study_family']
+               for entry in simple_records)
     unresolved = set(study['unresolved_plan_contrasts'])
     for first, second in itertools.combinations(FACTORS, 2):
         assert f'factorial3:synthetic:{first}_x_{second}' not in unresolved

@@ -25,7 +25,13 @@ Comparison protocol (what the runner guarantees, and checks)
   rather than an eyeballed delta. `check_factorial` additionally verifies the
   four cells of each `FACTORIAL_SPEC` design, and `factorial_comparison`
   reports the two main effects and their interaction, so a synergy claim is
-  tested rather than inferred from Full's point estimate.
+  tested rather than inferred from Full's point estimate. It also reports
+  interaction-gated simple effects: the effect of each factor inside every
+  level of the other factor. Those conditional follow-ups are pre-registered
+  but excluded from the study-level family, and are only Holm-tested when an
+  interaction involving that factor is significant; otherwise they are
+  explicitly descriptive, so a pooled main effect can no longer hide an
+  effect that reverses sign across contexts.
 * **Cross-axis (2x2x2) interactions and tested orthogonality.**
   `check_three_way_factorial` verifies the union of the softsign and tanh
   2x2 designs as one complete 2x2x2 factorial over per-channel, depth and

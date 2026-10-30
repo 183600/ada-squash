@@ -288,6 +288,98 @@ def test_factorial_reports_antagonism_instead_of_hiding_it():
     assert interaction['effect_helps_significantly'] is False
 
 
+def test_factorial_reports_simple_effects_when_the_interaction_is_significant():
+    # per_channel effect = -0.10 at depth=off and -0.20 at depth=on; depth
+    # effect = -0.20 at per_channel=off and -0.30 at per_channel=on. The
+    # pooled main effects hide that context dependence; the simple effects
+    # make it explicit and are certified because the interaction survives.
+    out = factorial_comparison(_factorial_cells(1.40), spec=_factorial_spec())
+    simple = {row['effect']: row for row in out['rows']
+              if row.get('kind') == 'simple_effect'}
+    assert set(simple) == {
+        'per_channel@depth=off', 'per_channel@depth=on',
+        'depth@per_channel=off', 'depth@per_channel=on'}
+    assert simple['per_channel@depth=off']['delta_seed_mean'] == pytest.approx(-0.10)
+    assert simple['per_channel@depth=on']['delta_seed_mean'] == pytest.approx(-0.20)
+    assert simple['depth@per_channel=off']['delta_seed_mean'] == pytest.approx(-0.20)
+    assert simple['depth@per_channel=on']['delta_seed_mean'] == pytest.approx(-0.30)
+    for entry in simple.values():
+        assert entry['interaction_gate_open'] is True
+        assert entry['conditional_test_status'] == 'tested_follow_up'
+        assert entry['analysis_role'] == 'conditional_follow_up'
+        assert entry['p_one_sided_holm'] is not None
+        assert entry['effect_helps_significantly'] is True
+        assert entry['conditional_context'] in (
+            {'depth': 'off'}, {'depth': 'on'},
+            {'per_channel': 'off'}, {'per_channel': 'on'})
+    assert out['conditional_effects']['n_tested_follow_up'] == 4
+    assert out['conditional_effects']['n_descriptive_gate_closed'] == 0
+
+
+def test_factorial_simple_effects_stay_descriptive_without_an_interaction():
+    # Additive fixture: the interaction is zero, so there is no licence to
+    # test every cell contrast after the fact. The simple effects are still
+    # reported, but explicitly not certified.
+    out = factorial_comparison(_factorial_cells(1.50), spec=_factorial_spec())
+    interaction = [row for row in out['rows']
+                   if row['kind'] == 'interaction'][0]
+    assert interaction['interaction_differs_significantly'] is False
+    simple = [row for row in out['rows']
+              if row.get('kind') == 'simple_effect']
+    assert len(simple) == 4
+    for entry in simple:
+        assert entry['interaction_gate_open'] is False
+        assert entry['conditional_test_status'] == 'descriptive_no_interaction'
+        assert entry['p_one_sided_holm'] is None
+        assert entry['effect_helps_significantly'] is False
+    assert out['conditional_effects']['n_tested_follow_up'] == 0
+    assert out['conditional_effects']['n_descriptive_gate_closed'] == 4
+
+
+def test_simple_effects_are_pre_registered_but_not_double_counted():
+    spec = _factorial_spec()
+    cells = spec['per_channel_x_depth_softsign']['cells']
+    rows = {name: {'norm_name': 'dytcd'} for name in cells.values()}
+    hypotheses = {name: 'h' for name in rows}
+    matrix_report = {
+        'leave_one_out': {}, 'qk_axis': {},
+        'factorial': {
+            'per_channel_x_depth_softsign': {
+                'factors': spec['per_channel_x_depth_softsign']['factors'],
+                'cells': cells,
+            },
+        },
+    }
+    plan = build_analysis_plan(
+        rows, hypotheses, matrix_report, list(rows), 'gpt2-124m', SEEDS)
+    by_id = {entry['id']: entry for entry in plan['contrasts']}
+    simple_ids = {effect
+                  for effect in ('per_channel@depth=off',
+                                 'per_channel@depth=on',
+                                 'depth@per_channel=off',
+                                 'depth@per_channel=on')}
+    for effect in simple_ids:
+        entry = by_id[f'factorial:per_channel_x_depth_softsign:{effect}']
+        assert entry['kind'] == 'simple_effect'
+        assert entry['counted_in_study_family'] is False
+        assert entry['tier'] == 2
+        assert entry['tier_role'] == 'conditional_follow_up'
+    out = factorial_comparison(_factorial_cells(1.40), spec=spec)
+    study = study_level_correction({'factorial': out}, plan)
+    # Only the two main effects and the interaction form the study family;
+    # the four conditional follow-ups are reported but not counted.
+    assert study['n_in_study_family'] == 3
+    assert study['n_conditional_follow_up'] == 4
+    follow_ups = [entry for entry in study['rows']
+                  if entry['id'].split(':', 2)[-1] in simple_ids]
+    assert len(follow_ups) == 4
+    for entry in follow_ups:
+        assert entry['tier'] == 'conditional_follow_up'
+        assert entry['confirmed_at_study_level'] is False
+        assert entry['downgraded_by_study_level'] is False
+        assert 'conditional follow-up' in entry['excluded_from_study_family']
+
+
 # ---------------------------------------------------------------------------
 # Pre-registered plan + study-level gatekeeping
 # ---------------------------------------------------------------------------

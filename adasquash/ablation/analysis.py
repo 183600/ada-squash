@@ -35,7 +35,28 @@ from scripts.train_gpt2 import (_explicit_arg_names, apply_config_to_parser,
                                 build_optimizer, load_yaml_config)
 
 from .common import _finite_metric, _is_seed_id
-from .matrix import PRIMARY_FACTORIAL_DESIGN, PRIMARY_MAIN_ROW
+from .matrix import (PRIMARY_FACTORIAL_DESIGN, PRIMARY_MAIN_ROW,
+                     _parse_three_way_cell_key)
+
+
+def _factorial_levels(info: dict, factor_names) -> dict:
+    """Two levels per factor, from the report or inferred from cell keys."""
+    info = info or {}
+    declared = dict(info.get('levels') or {})
+    cells = info.get('cells') or {}
+    levels: dict = {}
+    for factor in factor_names:
+        values = [str(value) for value in (declared.get(factor) or ())]
+        if len(values) != 2:
+            values = []
+            for key in cells:
+                value = _parse_three_way_cell_key(key).get(factor)
+                if value is not None and value not in values:
+                    values.append(value)
+        if len(values) != 2:
+            return {}
+        levels[factor] = values
+    return levels
 
 def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         baseline_names, model_name: str, seeds,
@@ -156,6 +177,26 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                 'hypothesis': (f'{first} and {second} interact (synergy or '
                                f'antagonism) in {design}'),
             })
+            for factor, other in ((first, second), (second, first)):
+                for level in ('off', 'on'):
+                    _add({
+                        'id': f'factorial:{design}:{factor}@{other}={level}',
+                        'family': 'conditional_follow_up',
+                        'kind': 'simple_effect',
+                        'design': design,
+                        'factor': factor,
+                        'conditional_context': {other: level},
+                        'metric': 'val_loss',
+                        'sided': 'one_sided',
+                        # Pre-registered, but a conditional follow-up must not
+                        # double-count a contrast already in the study family
+                        # (e.g. Full vs Full-minus-per-channel is the
+                        # per-channel simple effect at depth=on).
+                        'counted_in_study_family': False,
+                        'hypothesis': (f'{factor} lowers held-out val_loss '
+                                       f'within {other}={level} in {design} '
+                                       f'(interaction-gated follow-up)'),
+                    })
     # The 2x2x2 design adds the two interactions that involve the activation
     # family and the three-way term. Main effects are deliberately not
     # re-registered: they are already pre-registered by the two 2x2 designs,
@@ -191,6 +232,29 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                 'hypothesis': (f'the {first} x {second} interaction differs '
                                f'between the two levels of {third} in {design}'),
             })
+        factor_levels = _factorial_levels(info, factor_names)
+        if factor_levels:
+            for factor in factor_names:
+                others = [name for name in factor_names if name != factor]
+                for combo in itertools.product(
+                        *(factor_levels[name] for name in others)):
+                    context = dict(zip(others, combo))
+                    label = '|'.join(
+                        f'{name}={context[name]}' for name in others)
+                    _add({
+                        'id': f'factorial3:{design}:{factor}@{label}',
+                        'family': 'conditional_follow_up',
+                        'kind': 'simple_effect',
+                        'design': design,
+                        'factor': factor,
+                        'conditional_context': context,
+                        'metric': 'val_loss',
+                        'sided': 'one_sided',
+                        'counted_in_study_family': False,
+                        'hypothesis': (f'{factor} lowers held-out val_loss '
+                                       f'within {label} in {design} '
+                                       f'(interaction-gated follow-up)'),
+                    })
     for host, info in sorted((matrix_report.get('qk_axis') or {}).items()):
         info = info or {}
         _add({
@@ -222,6 +286,10 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     # rate at alpha without making every exploratory sweep compete with the
     # primary claim for the same alpha budget.
     for entry in contrasts:
+        if entry.get('counted_in_study_family') is False:
+            entry['tier'] = 2
+            entry['tier_role'] = 'conditional_follow_up'
+            continue
         primary = (
             (entry['family'] == 'baseline'
              and entry.get('candidate') == PRIMARY_MAIN_ROW)
@@ -310,6 +378,16 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
 
 def _finite_p(value):
     return float(value) if _finite_metric(value) else None
+
+
+def _conditional_follow_up_reason(entry: dict) -> str:
+    status = entry.get('conditional_test_status')
+    gate = entry.get('interaction_gate_open')
+    return (
+        'conditional follow-up (interaction-gated simple effect); '
+        'pre-registered but not counted as a new study-level confirmatory '
+        f'claim (interaction gate={"open" if gate else "closed"}, '
+        f'conditional_test_status={status})')
 
 
 def study_level_correction(comparisons: dict, plan: dict | None,
@@ -417,8 +495,11 @@ def study_level_correction(comparisons: dict, plan: dict | None,
         if entry.get('skipped') or not entry.get('design'):
             continue
         is_interaction = entry.get('kind') == 'interaction'
+        is_simple = (entry.get('kind') == 'simple_effect'
+                     or entry.get('analysis_role') == 'conditional_follow_up')
         _record(
-            f"factorial:{entry['design']}:{entry['effect']}", 'factorial',
+            f"factorial:{entry['design']}:{entry['effect']}",
+            'conditional_follow_up' if is_simple else 'factorial',
             entry.get('p_two_sided') if is_interaction else entry.get('p_one_sided'),
             (entry.get('p_two_sided_holm') if is_interaction
              else entry.get('p_one_sided_holm')),
@@ -429,14 +510,19 @@ def study_level_correction(comparisons: dict, plan: dict | None,
              else entry.get('effect_helps_significantly')),
             replicated=entry.get('replicated_across_seeds'),
             test_basis=entry.get('test_basis'),
-            effect=entry.get('delta_seed_mean'))
+            effect=entry.get('delta_seed_mean'),
+            excluded_reason=(_conditional_follow_up_reason(entry)
+                             if is_simple else None))
     factorial3 = comparisons.get('factorial3') or {}
     for entry in factorial3.get('rows', []) or []:
         if entry.get('skipped') or not entry.get('design'):
             continue
         is_interaction = entry.get('kind') == 'interaction'
+        is_simple = (entry.get('kind') == 'simple_effect'
+                     or entry.get('analysis_role') == 'conditional_follow_up')
         _record(
-            f"factorial3:{entry['design']}:{entry['effect']}", 'factorial3',
+            f"factorial3:{entry['design']}:{entry['effect']}",
+            'conditional_follow_up' if is_simple else 'factorial3',
             entry.get('p_two_sided') if is_interaction else entry.get('p_one_sided'),
             (entry.get('p_two_sided_holm') if is_interaction
              else entry.get('p_one_sided_holm')),
@@ -447,7 +533,9 @@ def study_level_correction(comparisons: dict, plan: dict | None,
              else entry.get('effect_helps_significantly')),
             replicated=entry.get('replicated_across_seeds'),
             test_basis=entry.get('test_basis'),
-            effect=entry.get('delta_seed_mean'))
+            effect=entry.get('delta_seed_mean'),
+            excluded_reason=(_conditional_follow_up_reason(entry)
+                             if is_simple else None))
     qk = comparisons.get('qk_axis') or {}
     for entry in qk.get('rows', []) or []:
         if entry.get('skipped') or not entry.get('host'):
@@ -508,13 +596,21 @@ def study_level_correction(comparisons: dict, plan: dict | None,
     unresolved = sorted(set(planned) - resolved_ids)
     eligible = [record for record in registered
                 if record.get('excluded_from_study_family') is None
+                and (planned.get(record['id']) or {}).get(
+                    'counted_in_study_family', True) is not False
                 and record.get('replicated_across_seeds')
                 and record.get('p_one_sided_or_two_sided') is not None]
     eligible_ids = {record['id'] for record in eligible}
     for record in registered:
         if record['id'] not in eligible_ids:
             if record.get('excluded_from_study_family') is None:
-                if not record.get('replicated_across_seeds'):
+                if (planned.get(record['id']) or {}).get(
+                        'counted_in_study_family', True) is False:
+                    record['excluded_from_study_family'] = (
+                        'pre-registered conditional follow-up '
+                        '(counted_in_study_family=False); its parent factorial '
+                        'term already carries the study-level test')
+                elif not record.get('replicated_across_seeds'):
                     record['excluded_from_study_family'] = (
                         f'fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds; '
                         'descriptive only')
@@ -573,12 +669,15 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             planned_entry = planned.get(record['id'])
             if planned_entry is None:
                 record['tier'] = 'unregistered'
+            elif planned_entry.get('counted_in_study_family', True) is False:
+                record['tier'] = 'conditional_follow_up'
             else:
                 record['tier'] = ('primary' if planned_entry.get('tier', 1) == 1
                                   else 'secondary')
         record['downgraded_by_study_level'] = bool(
             record['family_local_significant']
-            and not record['confirmed_at_study_level'])
+            and not record['confirmed_at_study_level']
+            and record.get('tier') != 'conditional_follow_up')
     secondary_gate_closed = sorted(
         record['id'] for record in secondary if not secondary_allowed)
     local_significant = sorted(record['id'] for record in registered
@@ -603,6 +702,9 @@ def study_level_correction(comparisons: dict, plan: dict | None,
         'n_in_study_family': len(primary) + len(secondary),
         'n_primary_tests': len(primary),
         'n_secondary_tests': len(secondary),
+        'n_conditional_follow_up': sum(
+            record.get('tier') == 'conditional_follow_up'
+            for record in records),
         'primary_gate_open': bool(primary_gate_open),
         'primary_gate_status': primary_gate_status,
         'n_confirmed_primary': sum(
@@ -631,7 +733,9 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             'study-level correction is visible rather than silent. '
             'Exploratory/unregistered contrasts are never promoted: they receive '
             'Benjamini-Hochberg q-values for a stated FDR and remain '
-            'hypothesis-generating'),
+            'hypothesis-generating. Pre-registered interaction-gated simple '
+            'effects are conditional follow-ups: they are excluded from the '
+            'study family and never counted as new confirmatory claims'),
         'rows': records,
     }
 
@@ -643,7 +747,8 @@ def print_study_level_correction(comparison: dict | None) -> None:
     print(f"[study] {comparison['n_in_study_family']}/{comparison['n_planned_contrasts']} "
           f"pre-registered contrast(s) tested "
           f"(primary={comparison['n_primary_tests']}, "
-          f"secondary={comparison['n_secondary_tests']}); "
+          f"secondary={comparison['n_secondary_tests']}, "
+          f"conditional_follow_up={comparison.get('n_conditional_follow_up', 0)}); "
           f"family-local significant={len(comparison['family_local_significant'])}, "
           f"study-level confirmed={comparison['n_confirmed_at_study_level']} "
           f"(primary gate {comparison.get('primary_gate_status', 'open').upper()}; "
