@@ -249,6 +249,10 @@ def diagnose_train_val_curve(
     gap_widen = _threshold_float(
         thresholds.get("gap_widen_rel"), "gap_widen_rel", 0.0)
     noise_z = _threshold_float(thresholds.get("noise_z"), "noise_z", 0.0)
+    # Optional vocabulary context must not crash the report: a JSON integer
+    # beyond the float range, a boolean or a string cannot be a finite ln(V).
+    # Treat an unusable value as absent rather than inventing a floor.
+    log_vocab = _finite_float_or_none(log_vocab_size)
 
     n_train_input = len(train_losses)
     n_val_input = len(val_losses)
@@ -507,13 +511,13 @@ def diagnose_train_val_curve(
     elif train_trend == "flat" and val_trend == "flat":
         classification = "underfitting_or_stalled"
         floor_note = ""
-        if log_vocab_size is not None and val_losses:
+        if log_vocab is not None and val_losses:
             floor_note = (
                 f" (validation loss {val_losses[-1]:.4f} vs uniform-guess "
-                f"ln(V)={float(log_vocab_size):.4f}: "
+                f"ln(V)={log_vocab:.4f}: "
                 + ("far below the uniform floor, so this may be the corpus "
                    "entropy floor rather than underfitting"
-                   if val_losses[-1] < 0.7 * float(log_vocab_size)
+                   if val_losses[-1] < 0.7 * log_vocab
                    else "still near the uniform-guess floor, so the model has "
                         "not learned the signal yet")
                 + ")"
@@ -559,7 +563,9 @@ def diagnose_train_val_curve(
             "val_steps_tail": val_steps[-effective_window:],
             "train_losses_tail": train_losses[-effective_window:],
             "val_losses_tail": val_losses[-effective_window:],
-            "log_vocab_size": log_vocab_size,
+            "log_vocab_size": log_vocab,
+            "log_vocab_size_ignored": (log_vocab_size is not None
+                                       and log_vocab is None),
             "gap_alignment": gap_alignment,
             "gap_points": gap_points,
             "val_change": val_change,
