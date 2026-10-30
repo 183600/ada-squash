@@ -104,6 +104,10 @@ def _validate_alpha(alpha, name: str = "alpha") -> float:
     """
     if _is_boolean_value(alpha):
         raise ValueError(f"{name} must be a probability, got bool {alpha!r}")
+    if isinstance(alpha, (str, bytes, bytearray)):
+        # A numeric string is not a probability: `float("0.05")` would
+        # silently set the significance level from a malformed config value.
+        raise ValueError(f"{name} must be a probability, got {alpha!r}")
     try:
         value = float(alpha)
     except (TypeError, ValueError, OverflowError):
@@ -1039,7 +1043,8 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
 
 
 def _validate_design_inputs(std, alpha: float, power: float) -> tuple[float, float, float]:
-    if _is_boolean_value(std) or std is None:
+    if (_is_boolean_value(std) or std is None
+            or isinstance(std, (str, bytes, bytearray))):
         raise ValueError(f"paired standard deviation must be a number, got {std!r}")
     try:
         std = float(std)
@@ -1050,7 +1055,8 @@ def _validate_design_inputs(std, alpha: float, power: float) -> tuple[float, flo
         raise ValueError(
             f"paired standard deviation must be finite and >= 0, got {std!r}")
     for name, value in (("alpha", alpha), ("power", power)):
-        if _is_boolean_value(value):
+        if (_is_boolean_value(value)
+                or isinstance(value, (str, bytes, bytearray))):
             raise ValueError(f"{name} must be a probability, got {value!r}")
         try:
             value = float(value)
