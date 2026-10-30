@@ -22,6 +22,7 @@ from adasquash.design import (classify_run_exclusions,
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE,
+                               _validate_alpha,
                                benjamini_hochberg_adjust, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
@@ -347,6 +348,7 @@ def study_level_correction(comparisons: dict, plan: dict | None,
     """
     if not isinstance(plan, dict):
         return None
+    alpha = _validate_alpha(alpha)
     planned = {entry['id']: entry for entry in plan.get('contrasts', [])
                if isinstance(entry, dict) and entry.get('id')}
     records: list = []
