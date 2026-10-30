@@ -692,9 +692,14 @@ def _batch_data_report(model, x: torch.Tensor, y: torch.Tensor) -> dict:
     if y.numel() and target_integer_ids and target_dtype_ok:
         # A negative id is invalid whether or not the vocabulary upper bound
         # is known; ignore_index is the only negative value the loss accepts.
-        in_range = (target_ids == ignore_index) | (target_ids >= 0)
+        # ignore_index itself may be a positive sentinel outside the
+        # vocabulary (cross-entropy ignores it before the class bounds are
+        # applied), so it must be excluded from the upper-bound test too.
         if known_vocab:
-            in_range = in_range & (target_ids < vocab_size)
+            in_range = ((target_ids == ignore_index)
+                        | ((target_ids >= 0) & (target_ids < vocab_size)))
+        else:
+            in_range = (target_ids == ignore_index) | (target_ids >= 0)
         targets_valid = bool(in_range.all().item())
     if x.numel() and input_integer_ids and input_dtype_ok:
         # Embedding ids are never allowed to be negative. When the vocabulary
