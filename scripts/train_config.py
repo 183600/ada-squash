@@ -73,7 +73,12 @@ def _coerce_config_scalar(action, value, path: str, key: str):
         if isinstance(value, bool) or not isinstance(value, numbers.Real):
             raise ValueError(
                 f"config '{path}': {key}={value!r} must be a real number")
-        converted = float(value)
+        try:
+            converted = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"config '{path}': {key}={value!r} cannot be represented "
+                "as a float") from None
     elif action.type is str:
         if not isinstance(value, str):
             raise ValueError(
@@ -82,7 +87,7 @@ def _coerce_config_scalar(action, value, path: str, key: str):
     elif action.type is not None:
         try:
             converted = action.type(value)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
                 f"config '{path}': {key}={value!r} is not valid for "
                 f"{action.dest}") from exc
@@ -94,11 +99,23 @@ def _coerce_config_scalar(action, value, path: str, key: str):
             f"{list(action.choices)}")
     return converted
 
-def _coerce_config_value(action, value, path: str, key: str):
-    """Validate one config value against its parser action."""
+def _coerce_config_value(action, value, path: str, key: str, actions=None):
+    """Validate one config value against its parser action(s).
+
+    A destination can have several actions: ``--k-min`` is a float option and
+    ``--no-k-min`` is a ``store_const`` action with ``const=None`` on the same
+    ``dest``. Nullability must consider every action, not just the typed one
+    chosen for non-null values; otherwise the YAML spelling of the documented
+    ``--no-k-min`` option is rejected as non-nullable.
+    """
     if value is None:
-        nullable = action.default is None or (
-            action.choices is not None and None in action.choices)
+        candidates = actions if actions is not None else (action,)
+        nullable = any(
+            candidate.default is None
+            or (candidate.choices is not None and None in candidate.choices)
+            or (candidate.nargs == 0 and candidate.const is None)
+            for candidate in candidates
+        )
         if nullable:
             return None
         raise ValueError(
@@ -109,6 +126,9 @@ def _coerce_config_value(action, value, path: str, key: str):
                 f"config '{path}': {key}={value!r} must be a list")
         converted = [_coerce_config_scalar(action, item, path, key)
                      for item in value]
+        if action.nargs == '+' and not converted:
+            raise ValueError(
+                f"config '{path}': {key} must contain at least one value")
         if isinstance(action.nargs, int) and action.nargs > 1 and len(converted) != action.nargs:
             raise ValueError(
                 f"config '{path}': {key} expects {action.nargs} values, "
@@ -168,7 +188,7 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None,
                 (candidate for candidate in actions
                  if candidate.type is not None or candidate.choices is not None),
                 actions[0])
-            value = _coerce_config_value(action, value, path, key)
+            value = _coerce_config_value(action, value, path, key, actions)
         parser.set_defaults(**{dest: value})
     if unknown:
         message = (f"config '{path}' contains key(s) the parser does not "
