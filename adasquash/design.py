@@ -1182,12 +1182,17 @@ def run_exclusion_audit(runs: Sequence[Mapping],
         seed = record.get('seed')
         # A boolean/float/string is not an independent replication id. It
         # must not inflate the per-arm seed count just because it can be
-        # stringified; treat it as a structural failure instead.
+        # stringified; treat it as a structural failure instead. Accept
+        # integral NumPy scalars like `_validate_seed`: they are exact integer
+        # seed identities, and normalizing through `int` makes int/np.int64
+        # duplicates compare equal.
         valid_seed = (seed is None
-                      or (isinstance(seed, int) and not isinstance(seed, bool)))
+                      or (isinstance(seed, numbers.Integral)
+                          and not isinstance(seed, bool)))
         if seed is not None and not valid_seed:
             invalid_seed_ids.append(f'{record["arm"]}::seed={seed!r}')
         if seed is not None and valid_seed:
+            seed = int(seed)
             key = (record['arm'], str(seed))
             if key in seen_seed_keys:
                 duplicate_seeds.append(f'{record["arm"]}::seed={seed}')
