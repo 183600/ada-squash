@@ -1095,7 +1095,8 @@ def paired_required_n(std: float, effect: float, alpha: float = 0.05,
     deterministic).
     """
     std, alpha, power = _validate_design_inputs(std, alpha, power)
-    if _is_boolean_value(effect) or effect is None:
+    if (_is_boolean_value(effect) or effect is None
+            or isinstance(effect, (str, bytes, bytearray))):
         raise ValueError(f"effect must be a positive number, got {effect!r}")
     try:
         effect = float(effect)
@@ -1157,7 +1158,8 @@ def paired_design_summary(std: float, n: int, margin: float = 0.0,
         "note": ("pass a positive pre-specified margin to compute the pairs "
                  "needed for that smallest effect of interest"),
     }
-    if _is_boolean_value(margin) or margin is None:
+    if (_is_boolean_value(margin) or margin is None
+            or isinstance(margin, (str, bytes, bytearray))):
         return out
     try:
         margin = float(margin)
