@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from adasquash.design import (design_readiness_audit, normalize_exclusion_policy,
+                              paired_sd_evidence_audit,
                               randomized_complete_block_schedule,
                               run_exclusion_audit, schedule_balance_report,
                               simulate_paired_design)
@@ -90,6 +91,8 @@ def build_arg_parser(argv=None):
     p.add_argument('--schedule-seed', type=int, default=0, help='seed of the randomized complete-block execution schedule; the schedule is frozen in analysis_plan.json before training, so changing it changes the pre-registration fingerprint')
     p.add_argument('--no-randomize-order', dest='randomize_order', action='store_false', help='keep the matrix row order instead of a randomized complete-block schedule (the order is then recorded as not randomized; order drift cannot be separated from the arm)')
     p.add_argument('--assumed-paired-sd', type=float, default=None, help='pre-run assumption for the paired across-seed SD (e.g. from a pilot); with --baseline-margin this makes the design-readiness audit check planned power before launching runs')
+    p.add_argument('--paired-sd-evidence', default=None, help='pilot calibration JSON from scripts/calibrate_paired_sd.py; when --assumed-paired-sd is omitted the conservative upper confidence bound is used, the calibration fingerprint is frozen in analysis_plan.json, and pilot/confirmatory seed overlap fails the readiness audit')
+    p.add_argument('--require-variance-evidence', action='store_true', help='fail before training unless --paired-sd-evidence supplies a pilot-based planning SD (the planning variance otherwise has no provenance)')
     p.add_argument('--expected-attrition', type=float, default=0.0, help='pre-run expected fraction of planned runs lost to pre-specified protocol failures; a complete pair needs both arms, so the readiness audit plans for n*(1-attrition)^2 analyzable pairs and freezes this assumption in analysis_plan.json')
     p.add_argument('--sequential-looks', type=int, default=0, help='freeze a group-sequential monitoring plan with this many interim looks over the planned seeds (0 = off); looking after every run and stopping when p < alpha is optional stopping, so the look counts and spending function are part of analysis_plan.json')
     p.add_argument('--sequential-spending', choices=('obrien-fleming', 'pocock'), default='obrien-fleming', help='alpha-spending function for --sequential-looks (O Brien-Fleming spends little early; Pocock is closer to equal per look)')
@@ -184,6 +187,42 @@ def main():
                 f'distinct seed counts than {len(seeds)} planned seeds allow; '
                 f'at most {max_looks} look(s) are possible above the '
                 f'{MIN_SEEDS_FOR_SIGNIFICANCE}-seed certification minimum')
+    paired_sd_evidence = None
+    if args.paired_sd_evidence:
+        evidence_path = Path(args.paired_sd_evidence)
+        try:
+            paired_sd_evidence = json.loads(evidence_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            p.error(f'--paired-sd-evidence {args.paired_sd_evidence} is not '
+                    f'readable JSON: {exc}')
+        if not isinstance(paired_sd_evidence, dict):
+            p.error('--paired-sd-evidence must contain a JSON object produced '
+                    'by scripts/calibrate_paired_sd.py')
+        if args.assumed_paired_sd is None:
+            recommended = paired_sd_evidence.get('recommended_paired_sd')
+            if (isinstance(recommended, bool)
+                    or not isinstance(recommended, (int, float))
+                    or not math.isfinite(float(recommended))
+                    or float(recommended) < 0.0):
+                p.error('--paired-sd-evidence has no finite '
+                        'recommended_paired_sd; rerun the pilot calibration or '
+                        'pass --assumed-paired-sd explicitly')
+            args.assumed_paired_sd = float(recommended)
+            print(f'[design] using the pilot upper confidence bound '
+                  f'{args.assumed_paired_sd:g} as the planning paired SD')
+        try:
+            precheck = paired_sd_evidence_audit(
+                paired_sd_evidence, args.assumed_paired_sd, seeds)
+        except ValueError as exc:
+            p.error(f'--paired-sd-evidence is not a valid calibration record: '
+                    f'{exc}')
+        if not precheck['fingerprint_verified']:
+            p.error('--paired-sd-evidence failed its fingerprint check: the '
+                    'record no longer matches the pilot differences it froze')
+    elif args.require_variance_evidence:
+        p.error('--require-variance-evidence needs --paired-sd-evidence: '
+                'without a pilot calibration the planning variance has no '
+                'provenance')
     try:
         matrix_report = validate_matrix(ablations, hypotheses, args.model)
     except ValueError as exc:
@@ -233,6 +272,7 @@ def main():
         equivalence_margin=args.equivalence_margin, run_schedule=run_schedule,
         exclusion_policy=exclusion_policy,
         expected_attrition=args.expected_attrition,
+        paired_sd_evidence=paired_sd_evidence,
         sequential_looks=args.sequential_looks,
         sequential_spending=args.sequential_spending)
     matrix_report['analysis_plan'] = analysis_plan
@@ -296,7 +336,9 @@ def main():
         assumed_paired_sd=args.assumed_paired_sd, alpha=args.alpha,
         identity_controls=control_pairs, exclusion_policy=exclusion_policy,
         n_confirmatory_tests=n_confirmatory_tests,
-        expected_attrition=args.expected_attrition)
+        expected_attrition=args.expected_attrition,
+        paired_sd_evidence=paired_sd_evidence,
+        require_variance_evidence=args.require_variance_evidence)
     if run_schedule is not None:
         design_readiness['schedule_balance'] = schedule_balance_report(
             run_schedule, arm_of=schedule_arm_of)
@@ -808,6 +850,7 @@ def main():
     manifest['three_way_factorial_comparison'] = three_way
     manifest['qk_axis_comparison'] = qk_axis
     manifest['analysis_plan'] = analysis_plan
+    manifest['paired_sd_evidence'] = paired_sd_evidence
     manifest['study_level_tests'] = study
     manifest['sequential_monitoring'] = sequential_monitoring
     manifest['run_schedule'] = run_schedule

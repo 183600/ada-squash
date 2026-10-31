@@ -56,6 +56,16 @@ This module supplies the reusable, pure-Python pieces:
     The equivalence counterpart. A superiority power formula evaluated at the
     equivalence margin answers the wrong question, so TOST claims get their
     own family-level and attrition-inflated sample-size plan.
+``paired_sd_calibration``
+    Turns pilot runs into a *provenance-carrying* planning variance. A pilot
+    point estimate is itself uncertain, so the helper reports the sample and
+    robust SD, a one-sided upper confidence bound, and whether the pilot seeds
+    overlap the confirmatory seeds (using the same seed twice would make the
+    "independent" replication a re-analysis of one run).
+``paired_sd_evidence_audit``
+    Checks a frozen calibration against the SD actually used for planning:
+    an optimistic point estimate below the pilot's upper bound is a design
+    failure, while an SD at or above it is conservative and admissible.
 ``simulate_paired_design``
     A Monte-Carlo calibration of the actual paired-test code: empirical
     type-I error under a synthetic null and empirical power under a known
@@ -88,7 +98,8 @@ import random
 from fractions import Fraction
 from typing import Iterable, Mapping, Optional, Sequence
 
-from .metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, paired_design_summary,
+from .metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, chi2_sf,
+                      mean_std_stderr, paired_design_summary,
                       paired_required_n, paired_t_one_sided,
                       tost_design_summary, tost_paired, tost_required_n)
 
@@ -106,6 +117,8 @@ __all__ = [
     'design_readiness_audit',
     'prospective_power_plan',
     'tost_power_plan',
+    'paired_sd_calibration',
+    'paired_sd_evidence_audit',
     'simulate_paired_design',
 ]
 
@@ -1592,6 +1605,442 @@ def tost_power_plan(paired_sd: float, n_pairs: int,
     }
 
 
+PAIRED_SD_CALIBRATION_SCHEMA = 'adasquash.paired_sd_calibration.v1'
+
+
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    middle = n // 2
+    if n % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _chi2_lower_quantile(probability: float, df: float) -> float:
+    """``x`` with ``P(chi2_df <= x) == probability``.
+
+    The upper confidence bound for a variance needs the lower chi-square
+    quantile, and the repository deliberately has no scipy dependency. The
+    survival function is already implemented for the power tests, so invert
+    it by bisection instead of adding a second approximation with its own
+    error.
+    """
+    if not 0.0 < probability < 1.0:
+        raise ValueError(
+            f'chi-square probability must be strictly between 0 and 1, got '
+            f'{probability!r}')
+    if not math.isfinite(df) or df <= 0.0:
+        raise ValueError(f'chi-square df must be positive and finite, got {df!r}')
+    target_tail = 1.0 - probability
+    lo = 0.0
+    hi = max(1.0, df)
+    for _ in range(400):
+        if chi2_sf(hi, df) <= target_tail:
+            break
+        hi *= 2.0
+        if not math.isfinite(hi):
+            raise ValueError(
+                'chi-square quantile overflowed; the confidence level is too '
+                'close to 1 for the available precision')
+    else:
+        raise ValueError('chi-square quantile did not converge')
+    for _ in range(400):
+        mid = (lo + hi) / 2.0
+        if mid == lo or mid == hi:
+            break
+        if chi2_sf(mid, df) > target_tail:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def _paired_sd_fingerprint(payload: Mapping) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()
+
+
+def paired_sd_calibration(differences, *,
+                          pilot_seeds: Optional[Iterable] = None,
+                          confirmatory_seeds: Optional[Iterable] = None,
+                          confidence: float = 0.90,
+                          min_pairs: int = 2) -> dict:
+    """Estimate the planning paired SD from *pilot* runs, with provenance.
+
+    Two design mistakes are easy to make before a confirmatory launch:
+
+    * the planned SD is a single lucky number from a handful of pilot seeds.
+      The sample SD of a small pilot is itself very uncertain, so planning at
+      the point estimate is optimistic: the realised power is below target
+      whenever the true SD is larger. This helper returns the sample SD, a
+      robust MAD-based SD, and a one-sided ``confidence`` upper bound. The
+      upper bound is the recommended planning value because it is the value
+      the pilot data do not rule out.
+    * the same seed is used in the pilot and in the confirmatory study. That
+      is not independent replication: the two "runs" share the initialization
+      and data order, and the pilot outcome can leak into the planning
+      decision. ``confirmatory_seeds`` is compared with the pilot seeds and an
+      overlap is reported (the readiness audit then fails closed).
+
+    ``differences`` is an iterable of paired differences in the reports'
+    sign convention (candidate minus reference; negative means the candidate
+    has the lower loss). Each item may be a finite number or a mapping with
+    ``difference``/``delta`` and an optional integer ``seed``. If the items
+    carry no seed, pass ``pilot_seeds`` alongside; otherwise the seed
+    provenance is recorded as unknown rather than invented.
+
+    This is a preparation artifact, not a result: the pilot mean is reported
+    for auditing but must not be used as the confirmatory effect size or to
+    choose the scientifically important margin after seeing it.
+    """
+    if isinstance(differences, (str, bytes, bytearray)) or isinstance(differences, Mapping):
+        raise ValueError('differences must be an iterable of paired differences')
+    try:
+        raw_items = list(differences)
+    except TypeError:
+        raise ValueError(
+            'differences must be an iterable of paired differences') from None
+    confidence_value = _finite_float(confidence)
+    if confidence_value is None or not 0.5 < confidence_value < 1.0:
+        raise ValueError(
+            f'confidence must be strictly between 0.5 and 1, got {confidence!r}')
+    if (isinstance(min_pairs, bool)
+            or not isinstance(min_pairs, numbers.Integral) or min_pairs < 2):
+        raise ValueError(f'min_pairs must be an integer >= 2, got {min_pairs!r}')
+    min_pairs = int(min_pairs)
+
+    seed_list = None
+    if pilot_seeds is not None:
+        if isinstance(pilot_seeds, (str, bytes)):
+            raise ValueError('pilot_seeds must be an iterable of integer seeds')
+        seed_list = [_validate_seed(seed) for seed in pilot_seeds]
+    confirmatory = None
+    if confirmatory_seeds is not None:
+        if isinstance(confirmatory_seeds, (str, bytes)):
+            raise ValueError(
+                'confirmatory_seeds must be an iterable of integer seeds')
+        confirmatory = [_validate_seed(seed) for seed in confirmatory_seeds]
+        if len(set(confirmatory)) != len(confirmatory):
+            raise ValueError('confirmatory_seeds must be unique')
+
+    values: list[float] = []
+    seeds: list[Optional[int]] = []
+    for index, item in enumerate(raw_items):
+        item_seed = None
+        if isinstance(item, Mapping):
+            if 'difference' in item:
+                raw_value = item.get('difference')
+            elif 'delta' in item:
+                raw_value = item.get('delta')
+            else:
+                raise ValueError(
+                    f'difference record {index} needs a "difference" (or '
+                    f'"delta") field')
+            item_seed = item.get('seed')
+        else:
+            raw_value = item
+        value = _finite_float(raw_value)
+        if value is None:
+            raise ValueError(
+                f'paired difference {index} must be a finite real number, got '
+                f'{raw_value!r}')
+        if item_seed is not None:
+            item_seed = _validate_seed(item_seed)
+        if seed_list is not None:
+            if index >= len(seed_list):
+                raise ValueError(
+                    'pilot_seeds must have one entry per paired difference')
+            if item_seed is not None and item_seed != seed_list[index]:
+                raise ValueError(
+                    f'difference record {index} carries seed {item_seed}, but '
+                    f'pilot_seeds[{index}] is {seed_list[index]}')
+            item_seed = seed_list[index]
+        values.append(float(value))
+        seeds.append(item_seed)
+    if seed_list is not None and len(seed_list) != len(values):
+        raise ValueError(
+            f'pilot_seeds has {len(seed_list)} entries for {len(values)} '
+            f'paired difference(s)')
+    if len(values) < min_pairs:
+        raise ValueError(
+            f'a paired-SD calibration needs at least {min_pairs} finite pair(s), '
+            f'got {len(values)}')
+    present_seeds = [seed for seed in seeds if seed is not None]
+    if len(set(present_seeds)) != len(present_seeds):
+        duplicates = sorted({seed for seed in present_seeds
+                             if present_seeds.count(seed) > 1})
+        raise ValueError(
+            f'pilot seeds must identify independent runs; duplicated: {duplicates}')
+    if present_seeds and len(present_seeds) != len(values):
+        raise ValueError(
+            'either every pilot difference must carry its seed or none may; '
+            'a partial seed table cannot prove seed-level independence')
+
+    stats = mean_std_stderr(values)
+    if stats is None:
+        raise ValueError('the pilot differences have no finite statistics')
+    n = int(stats['n'])
+    mean = float(stats['mean'])
+    sd = float(stats['std'])
+    df = n - 1
+    if sd == 0.0:
+        upper = 0.0
+        robust_sd = 0.0
+    else:
+        lower_quantile = _chi2_lower_quantile(1.0 - confidence_value, float(df))
+        factor = math.sqrt(df / lower_quantile)
+        candidate = sd * factor
+        upper = candidate if math.isfinite(candidate) else None
+        try:
+            median = _median(values)
+            mad = _median([abs(value - median) for value in values])
+            robust = 1.4826 * mad
+            robust_sd = robust if math.isfinite(robust) else None
+        except (OverflowError, ValueError):
+            robust_sd = None
+
+    if sd == 0.0:
+        # Identical pilot differences estimate zero variance, and the formal
+        # upper bound is also zero. Planning at zero would make every sample
+        # size look sufficient, so the calibration refuses to recommend it.
+        recommended = None
+        recommended_basis = 'zero_variance_pilot_not_usable'
+    elif upper is None:
+        # A finite point estimate is still a better fallback than refusing to
+        # produce any planning value, but the report says the bound overflowed.
+        recommended = sd if math.isfinite(sd) else None
+        recommended_basis = 'point_estimate_after_bound_overflow'
+    else:
+        recommended = upper
+        recommended_basis = 'one_sided_upper_confidence_bound'
+
+    pilot_seed_list = present_seeds if present_seeds else []
+    overlap = None
+    disjoint = None
+    if pilot_seed_list and confirmatory is not None:
+        overlap = sorted(set(pilot_seed_list).intersection(confirmatory))
+        disjoint = not overlap
+    payload = {
+        'differences': values,
+        'pilot_seeds': pilot_seed_list,
+        'confirmatory_seeds': confirmatory,
+        'confidence': confidence_value,
+        'min_pairs': min_pairs,
+        'n_pairs': n,
+        'mean_delta': mean,
+        'paired_sd': sd,
+        'recommended_paired_sd': recommended,
+    }
+    fingerprint = _paired_sd_fingerprint(payload)
+    return {
+        'schema': PAIRED_SD_CALIBRATION_SCHEMA,
+        'fingerprint': fingerprint,
+        'source': 'pilot',
+        'differences': values,
+        'pilot_seeds': pilot_seed_list,
+        'confirmatory_seeds': confirmatory,
+        'n_pairs': n,
+        'min_pairs': min_pairs,
+        'df': df,
+        'mean_delta': mean,
+        'paired_sd': sd,
+        'robust_paired_sd': robust_sd,
+        'confidence': confidence_value,
+        'sd_upper_confidence_bound': upper,
+        'recommended_paired_sd': recommended,
+        'recommended_basis': recommended_basis,
+        'zero_variance': bool(sd == 0.0),
+        'seed_overlap': overlap,
+        'seeds_disjoint': disjoint,
+        'note': (
+            'plan at the upper confidence bound, not the pilot point estimate; '
+            'the pilot mean is descriptive and must not be used to choose the '
+            'smallest effect of interest after seeing it'),
+    }
+
+
+def paired_sd_evidence_audit(evidence: Mapping,
+                             assumed_paired_sd=None,
+                             confirmatory_seeds: Optional[Iterable] = None,
+                             *, tolerance: float = 0.05,
+                             min_pilot_pairs: int = 3) -> dict:
+    """Check the frozen pilot calibration against the SD used for planning.
+
+    The evidence is recomputed from its recorded differences rather than
+    trusting the stored summary fields. A mismatch between the stored
+    fingerprint and the recomputation is a failure: an edited calibration is
+    no longer the artifact the pre-registration named. The assumed planning
+    SD is then compared with the pilot's upper confidence bound:
+
+    * below the bound (outside ``tolerance``) is a failure, because the
+      planned power is optimistic relative to what the pilot can support;
+    * at or above the bound passes; being above it is conservative and is
+      noted rather than punished.
+
+    Seed overlap with the confirmatory seeds fails as well: reusing a pilot
+    seed in the confirmatory analysis is not independent replication.
+    """
+    if not isinstance(evidence, Mapping):
+        raise ValueError(
+            f'paired-SD evidence must be a mapping, got '
+            f'{type(evidence).__name__}')
+    if evidence.get('schema') != PAIRED_SD_CALIBRATION_SCHEMA:
+        raise ValueError(
+            f'paired-SD evidence schema must be '
+            f'{PAIRED_SD_CALIBRATION_SCHEMA!r}, got {evidence.get("schema")!r}')
+    tolerance_value = _finite_float(tolerance)
+    if tolerance_value is None or not 0.0 <= tolerance_value < 1.0:
+        raise ValueError(
+            f'tolerance must be a finite probability in [0, 1), got '
+            f'{tolerance!r}')
+    if (isinstance(min_pilot_pairs, bool)
+            or not isinstance(min_pilot_pairs, numbers.Integral)
+            or min_pilot_pairs < 2):
+        raise ValueError(
+            f'min_pilot_pairs must be an integer >= 2, got '
+            f'{min_pilot_pairs!r}')
+    min_pilot_pairs = int(min_pilot_pairs)
+
+    stored_fingerprint = evidence.get('fingerprint')
+    try:
+        recomputed = paired_sd_calibration(
+            evidence.get('differences'),
+            pilot_seeds=evidence.get('pilot_seeds'),
+            confirmatory_seeds=evidence.get('confirmatory_seeds'),
+            confidence=evidence.get('confidence'),
+            min_pairs=evidence.get('min_pairs'))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f'paired-SD evidence is not a valid calibration record: {exc}') from None
+    fingerprint_verified = (
+        isinstance(stored_fingerprint, str)
+        and stored_fingerprint == recomputed['fingerprint'])
+    checks: list[dict] = []
+
+    def add(check_id: str, status: str, detail: str) -> None:
+        checks.append({'id': check_id, 'status': status, 'detail': detail})
+
+    if fingerprint_verified:
+        add('fingerprint', 'pass',
+            'stored fingerprint matches the recorded pilot differences')
+    else:
+        add('fingerprint', 'fail',
+            'stored fingerprint is missing or does not match the recorded '
+            'pilot differences; the calibration was edited after it was frozen')
+
+    n_pairs = int(recomputed['n_pairs'])
+    if n_pairs < min_pilot_pairs:
+        add('pilot_replication', 'warn',
+            f'{n_pairs} pilot pair(s) is a very small variance pilot; the '
+            f'upper bound is wide and the design should not be read as '
+            f'precisely powered (recommended >= {min_pilot_pairs})')
+    else:
+        add('pilot_replication', 'pass',
+            f'{n_pairs} pilot pair(s) supply the variance calibration')
+
+    confirm = None
+    if confirmatory_seeds is not None:
+        if isinstance(confirmatory_seeds, (str, bytes)):
+            raise ValueError(
+                'confirmatory_seeds must be an iterable of integer seeds')
+        confirm = [_validate_seed(seed) for seed in confirmatory_seeds]
+        if len(set(confirm)) != len(confirm):
+            raise ValueError('confirmatory_seeds must be unique')
+    stored_confirm = recomputed.get('confirmatory_seeds')
+    overlap = recomputed.get('seed_overlap')
+    disjoint = recomputed.get('seeds_disjoint')
+    pilot_seeds = recomputed.get('pilot_seeds') or []
+    if confirm is not None and pilot_seeds:
+        overlap = sorted(set(pilot_seeds).intersection(confirm))
+        disjoint = not overlap
+    if not pilot_seeds:
+        add('seed_disjointness', 'warn',
+            'the pilot differences carry no seed provenance, so independence '
+            'from the confirmatory seeds cannot be verified')
+    elif disjoint is None:
+        add('seed_disjointness', 'warn',
+            'confirmatory seeds were not supplied, so pilot/confirmatory seed '
+            'overlap cannot be checked')
+    elif disjoint:
+        add('seed_disjointness', 'pass',
+            f'pilot seeds {pilot_seeds} are disjoint from the confirmatory '
+            f'seeds {confirm if confirm is not None else stored_confirm}')
+    else:
+        add('seed_disjointness', 'fail',
+            f'pilot seed(s) {overlap} are reused in the confirmatory design; '
+            f'this is not independent replication and lets a pilot outcome '
+            f'enter the confirmatory analysis')
+
+    recommended = recomputed.get('recommended_paired_sd')
+    if recomputed.get('zero_variance'):
+        add('variance_estimate', 'warn',
+            'the pilot paired differences have exactly zero variance; a zero '
+            'planning SD is not credible from a small pilot and makes any '
+            'sample size look sufficient')
+    if assumed_paired_sd is None:
+        if recommended is None:
+            add('planning_sd', 'fail',
+                'no planning SD was supplied and the pilot calibration has no '
+                'finite upper confidence bound')
+        else:
+            add('planning_sd', 'warn',
+                f'no planning SD was supplied; the pilot recommends '
+                f'{recommended:g}, but the design audit did not use it')
+    else:
+        assumed = _finite_float(assumed_paired_sd)
+        if assumed is None or assumed < 0.0:
+            add('planning_sd', 'fail',
+                f'assumed paired SD must be a finite number >= 0, got '
+                f'{assumed_paired_sd!r}')
+        elif recommended is None or not math.isfinite(float(recommended)):
+            add('planning_sd', 'fail',
+                'the pilot calibration has no finite planning SD to compare '
+                'against')
+        else:
+            lower = float(recommended) * (1.0 - tolerance_value)
+            upper = float(recommended) * (1.0 + tolerance_value)
+            if assumed < lower:
+                add('planning_sd', 'fail',
+                    f'assumed paired SD={assumed:g} is below the pilot upper '
+                    f'confidence bound {float(recommended):g} (tolerance '
+                    f'{tolerance_value:.0%}); the planned power is optimistic')
+            elif assumed > upper:
+                add('planning_sd', 'pass',
+                    f'assumed paired SD={assumed:g} is above the pilot upper '
+                    f'confidence bound {float(recommended):g}; the plan is '
+                    f'conservative')
+            else:
+                add('planning_sd', 'pass',
+                    f'assumed paired SD={assumed:g} matches the pilot upper '
+                    f'confidence bound {float(recommended):g} within '
+                    f'{tolerance_value:.0%}')
+
+    n_fail = sum(1 for check in checks if check['status'] == 'fail')
+    n_warn = sum(1 for check in checks if check['status'] == 'warn')
+    status = 'fail' if n_fail else ('warn' if n_warn else 'pass')
+    return {
+        'schema': 'adasquash.paired_sd_evidence_audit.v1',
+        'status': status,
+        'checks': checks,
+        'n_fail': n_fail,
+        'n_warn': n_warn,
+        'evidence_fingerprint': recomputed['fingerprint'],
+        'stored_fingerprint': stored_fingerprint,
+        'fingerprint_verified': fingerprint_verified,
+        'n_pilot_pairs': n_pairs,
+        'paired_sd': recomputed['paired_sd'],
+        'recommended_paired_sd': recommended,
+        'assumed_paired_sd': assumed_paired_sd,
+        'seed_overlap': overlap,
+        'seeds_disjoint': disjoint,
+        'note': (
+            'a confirmatory plan should use the pilot upper confidence bound; '
+            'the point estimate is reported for comparison only'),
+    }
+
+
 def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                            hypotheses: Mapping[str, str],
                            schedule: Optional[dict] = None,
@@ -1606,7 +2055,9 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                            identity_controls: Sequence[Sequence[str]] = (),
                            exclusion_policy: Optional[Mapping] = None,
                            n_confirmatory_tests: int = 1,
-                           expected_attrition: float = 0.0) -> dict:
+                           expected_attrition: float = 0.0,
+                           paired_sd_evidence: Optional[Mapping] = None,
+                           require_variance_evidence: bool = False) -> dict:
     """Pre-flight design checklist, written before any run starts.
 
     Failures are structural and should stop a confirmatory launch; warnings are
@@ -1623,11 +2074,20 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     ``equivalence_margin`` is supplied the audit adds a separate
     ``equivalence_power`` check based on :func:`tost_power_plan`; the
     superiority formula is not reused for a TOST claim.
+
+    ``paired_sd_evidence`` is a :func:`paired_sd_calibration` record from
+    pilot runs. When supplied, the audit adopts its conservative upper bound
+    if no ``assumed_paired_sd`` was given, checks that the planning SD is not
+    below that bound, and fails on pilot/confirmatory seed overlap. Set
+    ``require_variance_evidence`` to make a missing calibration a structural
+    failure instead of leaving the planning variance unproven.
     """
     names = list(rows.keys()) if isinstance(rows, Mapping) else list(rows)
     checks: list[dict] = []
     planned_power = None
     planned_equivalence_power = None
+    paired_sd_evidence_report = None
+    effective_paired_sd = assumed_paired_sd
 
     def add(check_id: str, status: str, detail: str) -> None:
         checks.append({'id': check_id, 'status': status, 'detail': detail})
@@ -1666,6 +2126,50 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             f'{len(seeds)} seed(s) {seeds}: need >= {min_seeds} distinct integer seeds')
     elif min_seeds_valid:
         add('replication', 'pass', f'{len(seeds)} distinct seeds: {seeds}')
+
+    # The planning variance is a design assumption, so it needs provenance too.
+    # A pilot point estimate is optimistic and cannot be checked after the
+    # fact; a frozen calibration with disjoint seeds can.
+    confirm_for_evidence = (integral_seeds
+                            if len(integral_seeds) == len(seeds) else None)
+    if paired_sd_evidence is None:
+        if require_variance_evidence:
+            add('variance_evidence', 'fail',
+                'no paired-SD calibration was supplied; the planning variance '
+                'has no pilot provenance and --require-variance-evidence is set')
+    else:
+        try:
+            adoption = paired_sd_evidence_audit(
+                paired_sd_evidence, None, confirm_for_evidence)
+        except ValueError as exc:
+            add('variance_evidence', 'fail',
+                f'invalid paired-SD calibration: {exc}')
+        else:
+            if effective_paired_sd is None:
+                recommended = adoption.get('recommended_paired_sd')
+                if (recommended is not None
+                        and isinstance(recommended, numbers.Real)
+                        and not isinstance(recommended, bool)
+                        and math.isfinite(float(recommended))):
+                    effective_paired_sd = float(recommended)
+            try:
+                paired_sd_evidence_report = paired_sd_evidence_audit(
+                    paired_sd_evidence, effective_paired_sd,
+                    confirm_for_evidence)
+            except ValueError as exc:
+                add('variance_evidence', 'fail',
+                    f'invalid paired-SD calibration: {exc}')
+            else:
+                status = paired_sd_evidence_report['status']
+                detail = '; '.join(
+                    f'{check["id"]}: {check["detail"]}'
+                    for check in paired_sd_evidence_report['checks']
+                    if check['status'] != 'pass')
+                if not detail:
+                    detail = ('pilot calibration and planning SD agree, and '
+                              'pilot seeds are disjoint from the confirmatory '
+                              'design')
+                add('variance_evidence', status, detail)
 
     missing = sorted(name for name in names if not str(hypotheses.get(name) or '').strip())
     if missing:
@@ -1716,16 +2220,16 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         add('power', 'fail',
             f'invalid n_confirmatory_tests {n_confirmatory_tests!r}: must be a '
             'positive integer')
-    elif assumed_paired_sd is None:
+    elif effective_paired_sd is None:
         add('power', 'warn',
             'no assumed paired SD supplied; planned power for the smallest effect '
             'cannot be checked before the run (the comparison report still '
             'reports the observed MDE afterwards)')
     else:
-        sd = _finite_float(assumed_paired_sd)
+        sd = _finite_float(effective_paired_sd)
         target = margin
         if sd is None or sd < 0.0:
-            add('power', 'fail', f'invalid assumed paired SD {assumed_paired_sd!r}')
+            add('power', 'fail', f'invalid assumed paired SD {effective_paired_sd!r}')
         elif target <= 0.0:
             if equivalence_margin <= 0.0:
                 add('power', 'warn',
@@ -1773,11 +2277,11 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                         f'at paired SD={sd:g} and family alpha '
                         f'{plan["family_alpha"]:.4g}')
 
-    if equivalence_margin > 0.0 and assumed_paired_sd is not None:
-        eq_sd = _finite_float(assumed_paired_sd)
+    if equivalence_margin > 0.0 and effective_paired_sd is not None:
+        eq_sd = _finite_float(effective_paired_sd)
         if eq_sd is None or eq_sd < 0.0:
             add('equivalence_power', 'fail',
-                f'invalid assumed paired SD {assumed_paired_sd!r}')
+                f'invalid assumed paired SD {effective_paired_sd!r}')
         elif n_pairs < 2:
             add('equivalence_power', 'fail',
                 f'{n_pairs} distinct seed(s): at least 2 paired observations '
@@ -1958,6 +2462,8 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         'planned_equivalence_power': planned_equivalence_power,
         'n_confirmatory_tests': n_confirmatory_tests,
         'expected_attrition': expected_attrition,
+        'assumed_paired_sd': effective_paired_sd,
+        'paired_sd_evidence_audit': paired_sd_evidence_report,
         'exclusion_policy': canonical_policy,
         'exclusion_policy_fingerprint': policy_fingerprint,
         'note': ('failures block a confirmatory launch; warnings are recorded so a '

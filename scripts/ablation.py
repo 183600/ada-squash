@@ -78,6 +78,12 @@ Comparison protocol (what the runner guarantees, and checks)
   structural failure into a pre-training error. When a margin and an assumed
   SD are supplied, the same file calibrates the actual paired-test code on
   synthetic data (`simulate_paired_design`) instead of trusting its formula.
+  If the SD is estimated from pilot runs, `scripts/calibrate_paired_sd.py`
+  freezes the pilot differences and a one-sided upper confidence bound;
+  `--paired-sd-evidence` adopts that conservative value (unless an SD is
+  supplied explicitly), hashes it into `analysis_plan.json`, and fails on
+  pilot/confirmatory seed overlap. `--require-variance-evidence` makes a
+  missing pilot calibration a pre-training error.
 * **Pre-specified attrition policy.** `exclusion_policy.json` fixes which runs
   may leave the primary contrast (missing run, protocol/provenance mismatch,
   non-finite loss) and which are retained with a sensitivity flag (a diverged

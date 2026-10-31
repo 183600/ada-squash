@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+from collections.abc import Mapping
 
 from adasquash.design import exclusion_policy_fingerprint, normalize_exclusion_policy
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, _validate_alpha,
@@ -40,6 +41,7 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         run_schedule: dict | None=None,
                         exclusion_policy: dict | None=None,
                         expected_attrition: float=0.0,
+                        paired_sd_evidence: dict | None=None,
                         sequential_looks: int=0,
                         sequential_spending: str='obrien-fleming') -> dict:
     """Freeze the confirmatory contrast registry *before* any training starts.
@@ -70,7 +72,10 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     experiment, not a re-analysis. The expected run-attrition assumption used
     to size the design is frozen in the same payload: it is the denominator
     the planned power was computed against, so changing it after seeing how
-    many runs were lost would be a post-hoc design change.
+    many runs were lost would be a post-hoc design change. The pilot variance
+    calibration is frozen in the same payload when supplied: the planning SD
+    and the pilot/confirmatory seed separation are design assumptions, not
+    re-analysis choices.
     """
     baseline_set = set(baseline_names or [])
     contrasts: list = []
@@ -329,6 +334,16 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
             len(normalized_seeds), n_looks=sequential_looks,
             alpha=float(alpha), n_tests=primary_tests,
             spending=sequential_spending)
+    if paired_sd_evidence is not None:
+        if not isinstance(paired_sd_evidence, Mapping):
+            raise ValueError(
+                f'paired_sd_evidence must be a mapping, got '
+                f'{type(paired_sd_evidence).__name__}')
+        try:
+            json.dumps(paired_sd_evidence, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'paired_sd_evidence must be JSON-serializable: {exc}') from None
     payload = {
         'model': model_name,
         'seeds': normalized_seeds,
@@ -356,6 +371,8 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         'run_schedule': run_schedule,
         'contrasts': contrasts,
     }
+    if paired_sd_evidence is not None:
+        payload['paired_sd_evidence'] = paired_sd_evidence
     if sequential_plan is not None:
         payload['sequential_monitoring'] = sequential_plan
     fingerprint = hashlib.sha256(
