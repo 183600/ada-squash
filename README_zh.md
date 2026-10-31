@@ -83,14 +83,19 @@ pip install lm-eval
 
 ### 健全性测试
 
+运行全量套件：
+
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -q
 ```
 
 覆盖形状/dtype 保持、softsign 有界性、深度调度单调性、QK 压缩 logit
 上界、checkpoint 往返、指标实现，以及——由于本仓库每个归一化层都是手写
 autograd kernel——把每个 kernel 与普通 autograd 的独立重组逐参数对拍，
 且从*随机化*参数集出发，避免在 `gamma=1, beta=0` 初始化下对拍流于形式。
+
+编辑某个 kernel 时，可用 `python3 -m pytest tests/test_norms.py -q`
+获得更快的聚焦反馈；下方的完整 `python3 ci_gate.py` 仍是最终判定。
 
 ### 设计门禁
 

@@ -1,37 +1,14 @@
 from __future__ import annotations
+
 import dataclasses
-import hashlib
 import itertools
 import json
-import math
-import os
-import sys
-import time
-from collections import Counter
-from pathlib import Path
-import torch
-from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
-from adasquash.attention import clear_logit_scratch_cache
-from adasquash.design import (classify_run_exclusions,
-                               design_readiness_audit,
-                               exclusion_policy_fingerprint, normalize_exclusion_policy,
-                               order_drift_report,
-                               randomized_complete_block_schedule,
-                               run_exclusion_audit,
-                               schedule_balance_report, simulate_paired_design)
-from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
-from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
-from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
-                               leave_one_out_jackknife, mean_prediction_interval,
-                               mean_std_stderr, max_p_combination,
-                               paired_design_summary, paired_randomization_test,
-                               paired_t_one_sided, student_t_ppf, tost_paired,
-                               two_sided_p_from_t, welch_t_one_sided)
-from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
-from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
-from scripts.train_gpt2 import (_explicit_arg_names, apply_config_to_parser,
-                                build_optimizer, load_yaml_config)
 
+import torch
+
+from adasquash import build_gpt_124m
+from adasquash.model import build_gpt_350m, build_llama_tiny_1b
+from scripts.train_config import load_yaml_config
 
 ABLATIONS = {'ln_baseline': {'norm_name': 'ln'}, 'rmsnorm_baseline': {'norm_name': 'rmsnorm'}, 'dyt_no_perchannel': {'norm_name': 'dyt'}, 'dytc_perchannel_tanh_k0': {'norm_name': 'dytcd_tanh', 'k_init': 0.0, 'learnable_k': False}, 'dytd_tanh_k0': {'norm_name': 'dytd_tanh', 'k_init': 0.0, 'learnable_k': False}, 'dytcd_full': {'norm_name': 'dytcd'}, 'dytcd_no_perchannel': {'norm_name': 'dytcd', 'learnable_delta': False}, 'dytcd_k0_no_depth_schedule': {'norm_name': 'dytcd', 'k_init': 0.0, 'learnable_k': False}, 'dytcd_no_perchannel_no_depth': {'norm_name': 'dytcd', 'learnable_delta': False, 'k_init': 0.0, 'learnable_k': False}, 'dytd_k0_no_depth_schedule': {'norm_name': 'dytd', 'k_init': 0.0, 'learnable_k': False}, 'dytd_full': {'norm_name': 'dytd'}, 'dytd_tanh_full': {'norm_name': 'dytd_tanh'}, 'dytcd_no_ls': {'norm_name': 'dytcd', 'use_layerscale': False}, 'dytcd_no_softsign': {'norm_name': 'dytcd_tanh'}, 'dytcd_fixed_p': {'norm_name': 'dytcd', 'p_init': 2.0, 'learnable_p': False}, 'dytcd_ls1e5': {'norm_name': 'dytcd', 'layerscale_init': 1e-05}, 'dytcd_ls1e3': {'norm_name': 'dytcd', 'layerscale_init': 0.001}, 'dytc_p1_softsign': {'norm_name': 'dytc', 'p_init': 1.0, 'learnable_p': False, 'alpha_jitter': 0.0}, 'dytc_p2_softsign': {'norm_name': 'dytc', 'p_init': 2.0, 'learnable_p': False, 'alpha_jitter': 0.0}, 'dytc_p4_softsign': {'norm_name': 'dytc', 'p_init': 4.0, 'learnable_p': False, 'alpha_jitter': 0.0}, 'dytc_plearnable': {'norm_name': 'dytc', 'p_init': 2.0, 'learnable_p': True, 'alpha_jitter': 0.0}, 'dytc_hardtanh_eq': {'norm_name': 'dytc', 'p_init': 64.0, 'learnable_p': False, 'alpha_jitter': 0.0}, 'dyt_alpha_0.3': {'norm_name': 'dyt', 'alpha_init': 0.3}, 'dyt_alpha_0.5': {'norm_name': 'dyt', 'alpha_init': 0.5}, 'dyt_alpha_1.0': {'norm_name': 'dyt', 'alpha_init': 1.0}, 'rmsnorm_qk': {'norm_name': 'rmsnorm', 'qk_norm': 'dytqk'}, 'rmsnorm_qknorm': {'norm_name': 'rmsnorm', 'qk_norm': 'qknorm'}, 'ln_qk': {'norm_name': 'ln', 'qk_norm': 'dytqk'}, 'ln_qknorm': {'norm_name': 'ln', 'qk_norm': 'qknorm'}, 'dytcd_qk': {'norm_name': 'dytcd', 'qk_norm': 'dytqk'}, 'dytcd_qknorm': {'norm_name': 'dytcd', 'qk_norm': 'qknorm'}, 'ln': {'norm_name': 'ln', 'use_layerscale': False}, 'ln_ls': {'norm_name': 'ln'}, 'rmsnorm': {'norm_name': 'rmsnorm', 'use_layerscale': False}, 'rmsnorm_ls': {'norm_name': 'rmsnorm'}, 'dyt': {'norm_name': 'dyt', 'alpha_init': 0.5, 'use_layerscale': False}, 'dyts': {'norm_name': 'dyts', 'p_init': 2.0, 'learnable_p': False, 'alpha_init': 0.5, 'use_layerscale': False}, 'dytp': {'norm_name': 'dytp', 'alpha_init': 0.5, 'alpha_jitter': 0.0, 'use_layerscale': False}, 'dytc': {'norm_name': 'dytc', 'p_init': 2.0, 'learnable_p': False, 'alpha_init': 0.5, 'alpha_jitter': 0.0, 'use_layerscale': False}, 'dyt_ls': {'norm_name': 'dyt', 'alpha_init': 0.5, 'use_layerscale': True, 'layerscale_init': 1e-05}, 'dytd': {'norm_name': 'dytd', 'alpha_0': 0.9, 'k_init': 1.0, 'k_min': 0.0, 'use_layerscale': True, 'layerscale_init': 1e-05}, 'dytdi': {'norm_name': 'dytdi', 'alpha_0': 0.9, 'k_init': 1.0, 'use_layerscale': True, 'layerscale_init': 1e-05}, 'dytd_shared': {'norm_name': 'dytd', 'alpha_0': 0.9, 'k_init': 1.0, 'k_min': 0.0, 'shared_depth_schedule': True, 'use_layerscale': True, 'layerscale_init': 1e-05}, 'dytc_ls': {'norm_name': 'dytc', 'alpha_init': 0.5, 'alpha_jitter': 0.0, 'p_init': 2.0, 'learnable_p': True, 'use_layerscale': True, 'layerscale_init': 1e-05}, 'dytcdi': {'norm_name': 'dytcdi', 'alpha_0': 0.9, 'k_init': 1.0, 'p_init': 2.0, 'learnable_p': True, 'alpha_jitter': 0.0, 'use_layerscale': True, 'layerscale_init': 1e-05}, 'dytcd': {'norm_name': 'dytcd', 'alpha_0': 0.9, 'k_init': 1.0, 'k_min': 0.0, 'p_init': 2.0, 'learnable_p': True, 'alpha_jitter': 0.0, 'use_layerscale': True, 'layerscale_init': 1e-05}}
 # Every row must state *why* it is run (the scientific hypothesis it tests),

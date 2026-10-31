@@ -1,4 +1,3 @@
-from __future__ import annotations
 """Experimental-design preparation for the training studies.
 
 The comparison reports answer statistical questions *after* the runs exist:
@@ -78,13 +77,16 @@ arm left below the replication minimum a hard failure).
 for the depth/norm grid.  ``--no-randomize-order`` is the recorded opt-out in
 both runners.
 """
+
+from __future__ import annotations
+
 import hashlib
 import json
 import math
 import numbers
 import random
 from fractions import Fraction
-from typing import Callable, Iterable, Mapping, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 from .metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, paired_design_summary,
                       paired_required_n, paired_t_one_sided,

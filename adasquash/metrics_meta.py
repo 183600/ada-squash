@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import functools
 import math
-import numbers
 import random
-from typing import Optional, Sequence
+from typing import Sequence
 
 from .metrics_stats import (MIN_SEEDS_FOR_SIGNIFICANCE,
                          _RANDOMIZATION_EXACT_MAX, _as_real,

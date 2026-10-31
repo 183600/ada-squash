@@ -1,87 +1,47 @@
 from __future__ import annotations
+
 import argparse
-import hashlib
 import json
 import math
 import os
 import random
-import subprocess
 import sys
 import time
-from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
 import torch
-import torch.nn as nn
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from adasquash import GPTConfig, GPT, count_parameters, ActivationStats, LossSpikeCounter
+
+from adasquash import (ActivationStats, GPT, GPTConfig, LossSpikeCounter,
+                       count_parameters)
 from adasquash.attention import clear_logit_scratch_cache
-from adasquash.diagnostics import diagnose_train_val_curve, parameter_finite_report, tensor_finite_report, triage_nonfinite
+from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.metrics import mean_ci, mean_std_stderr
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
+from adasquash.model import (build_gpt_124m, build_gpt_350m,
+                             build_llama_tiny_1b, clear_cast_weight_cache,
+                             clear_ce_scratch_cache)
 from adasquash.norms import NORM_REGISTRY
-from adasquash.repro import (TRAINING_RECIPE_KEYS, TrainStreamFingerprint,
-                             artifact_record, collect_run_metadata,
-                             file_fingerprint, finish_metadata, save_run_manifest,
-                             set_all_seeds, training_recipe_mismatches)
-from scripts.data_pipeline import (build_dataloader, configure_data_options,
-                                   resolve_dataset_revision, resolve_tokenizer_revision)
+from adasquash.repro import (TrainStreamFingerprint, artifact_record,
+                             collect_run_metadata, file_fingerprint,
+                             save_run_manifest, set_all_seeds)
+from scripts.data_pipeline import build_dataloader, configure_data_options
 
-from scripts.train_config import (_ARCH_ARGS,
-    _DATA_ARGS,
-    _LEDGER_ARGS,
-    _MONITOR_ARGS,
-    _NUMERIC_ARGS,
-    _RESUME_RUN_ARGS,
-    _SCHEDULE_ARGS,
-    _TRAIN_CONFIG_ALIASES,
-    _WITHIN_ARM_PROTOCOL_KEYS,
-    _adamw_fused_supported,
-    _assert_checkpoint_finite,
-    _atomic_torch_save,
-    _checkpoint_nonfinite,
-    _config_bool,
-    _explicit_arg_names,
-    _load_checkpoint_cpu,
-    _optional_dest,
-    _restore_run_args,
-    _snapshot_rng_state,
-    apply_config_to_parser,
-    build_lr_lambda,
-    build_optimizer,
-    cosine_schedule,
-    load_yaml_config,
-    restore_monitor_args,
-    restore_schedule_args,
-    unpinned_data_revisions,
-)
-from scripts.train_runtime import (DEFAULT_SEED,
-    _MODEL_SHAPES,
-    _data_ledger_fingerprints,
-    _fast_forward_validation_stream,
-    _heldout_batch_fingerprint,
-    _is_event_count,
-    _is_finite_number,
-    _is_no_decay_group,
-    _is_seed_id,
-    _ledger_identity,
-    _manifest_data_version,
-    _manifest_ledger_fingerprints,
-    _normalize_seed_ids,
-    aggregate_seed_runs,
-    apply_explicit_optimizer_args,
-    evaluate_heldout,
-    launch_multi_seed,
-    load_model_state_dict,
-    preflight_arch_args,
-    restore_data_args,
-    run_error_analysis,
-    seed_run_dir,
-)
+from scripts.train_config import (_DATA_ARGS, _LEDGER_ARGS, _MONITOR_ARGS,
+    _RESUME_RUN_ARGS, _SCHEDULE_ARGS, _TRAIN_CONFIG_ALIASES,
+    _assert_checkpoint_finite, _atomic_torch_save, _checkpoint_nonfinite,
+    _explicit_arg_names, _load_checkpoint_cpu, _snapshot_rng_state,
+    apply_config_to_parser, build_lr_lambda, build_optimizer,
+    restore_monitor_args, restore_schedule_args, unpinned_data_revisions)
+from scripts.train_runtime import (DEFAULT_SEED, _data_ledger_fingerprints,
+    _fast_forward_validation_stream, _is_finite_number, _ledger_identity,
+    _normalize_seed_ids, apply_explicit_optimizer_args, evaluate_heldout,
+    launch_multi_seed, load_model_state_dict, preflight_arch_args,
+    restore_data_args, run_error_analysis)
 
 def open_data_split(split: str, args, seq_len: int | None = None,
                     dataset_name: str | None = None,

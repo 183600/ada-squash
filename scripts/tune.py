@@ -1025,7 +1025,7 @@ def main():
         # comes from the same table the ablation rows use, so the check
         # exercises this model shape.
         from scripts.sanity_overfit import run_preflight
-        from scripts.train_gpt2 import _MODEL_SHAPES
+        from scripts.train_runtime import _MODEL_SHAPES
         n_layers, dim, n_heads = _MODEL_SHAPES.get(args.model, _MODEL_SHAPES['gpt2-124m'])
         run_preflight(sorted(set(args.arms)) or ['dytcd'], args.seeds[0], base,
                       arch_args=['--dim', str(dim), '--n-layers', str(n_layers),

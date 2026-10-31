@@ -1,4 +1,3 @@
-from __future__ import annotations
 """Uncertainty-aware evaluation metrics shared by the experiment scripts.
 
 Why this module exists
@@ -68,6 +67,9 @@ honest:
 Everything is pure `math` (no scipy/sklearn), so the training scripts can run
 in a minimal environment.
 """
+
+from __future__ import annotations
+
 import functools
 import math
 import numbers

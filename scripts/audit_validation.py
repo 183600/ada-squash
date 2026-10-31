@@ -1,25 +1,12 @@
 from __future__ import annotations
-import argparse
-import json
-import math
-import numbers
-import sys
-from array import array
-from collections import Counter
-from pathlib import Path
-from statistics import NormalDist
 
-import numpy as np
+import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
-from adasquash.metrics import wilson_interval
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
-from scripts.data_pipeline import (DocumentCleaner, _is_token_row,
-                                   canonical_document_hash, document_hash,
-                                   extract_group_value, group_hash, load_document_stream)
 
 
 def _strict_bool_option(value, name: str, *, allow_none: bool = False):

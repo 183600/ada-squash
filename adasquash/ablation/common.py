@@ -1,38 +1,17 @@
 from __future__ import annotations
-import dataclasses
-import hashlib
-import itertools
-import json
+
 import math
 import numbers
-import os
-import sys
-import time
-from collections import Counter
 from pathlib import Path
-import torch
-from adasquash import build_gpt_124m, count_parameters, ActivationStats, LossSpikeCounter, markov_batch
-from adasquash.attention import clear_logit_scratch_cache
-from adasquash.design import (classify_run_exclusions,
-                               design_readiness_audit,
-                               exclusion_policy_fingerprint, normalize_exclusion_policy,
-                               order_drift_report,
-                               randomized_complete_block_schedule,
-                               run_exclusion_audit,
-                               schedule_balance_report, simulate_paired_design)
-from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
-from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
-from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
-                               leave_one_out_jackknife, mean_prediction_interval,
-                               mean_std_stderr, max_p_combination,
-                               paired_design_summary, paired_randomization_test,
+
+from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE,
+                               leave_one_out_jackknife,
+                               mean_prediction_interval, mean_std_stderr,
+                               paired_design_summary,
+                               paired_randomization_test,
                                paired_t_one_sided, student_t_ppf,
                                tost_design_summary, tost_paired,
-                               two_sided_p_from_t, welch_t_one_sided)
-from adasquash.model import build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
-from adasquash.repro import artifact_record, collect_run_metadata, file_fingerprint, finish_metadata, git_revision, save_run_manifest, set_all_seeds
-from scripts.train_gpt2 import (_explicit_arg_names, apply_config_to_parser,
-                                build_optimizer, load_yaml_config)
+                               welch_t_one_sided)
 
 ROOT = Path(__file__).resolve().parents[2]
 

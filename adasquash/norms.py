@@ -235,6 +235,18 @@ def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
 class _SquashedAffine(nn.Module):
     pass
 
+def _init_depth_schedule(module, layer_idx, num_layers, alpha_0, k_init,
+                         learnable_k, k_min):
+    module.layer_idx = layer_idx
+    module.num_layers = max(1, num_layers)
+    module._depth_ratio = float(layer_idx) / float(module.num_layers)
+    module.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
+    if learnable_k:
+        module.k = nn.Parameter(torch.tensor(float(k_init)))
+    else:
+        module.register_buffer('k', torch.tensor(float(k_init)))
+    module.k_min = k_min
+
 class _GeneralizedSoftsign(torch.autograd.Function):
 
     @staticmethod
@@ -445,20 +457,13 @@ class DyTD(_SquashedAffine):
 
     def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, k_min: Optional[float]=0.0):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.num_layers = max(1, num_layers)
-        self._depth_ratio = float(layer_idx) / float(self.num_layers)
-        self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
-        if learnable_k:
-            self.k = nn.Parameter(torch.tensor(float(k_init)))
-        else:
-            self.register_buffer('k', torch.tensor(float(k_init)))
         # Depth-decay rate floor. ``None`` restores the old unconstrained
         # behaviour (k may go negative and alpha_l then *grows* with depth);
         # the default 0.0 keeps the schedule non-increasing in depth, so the
         # "depth-conditioned" claim holds not only at init but for every
         # point the optimizer visits.
-        self.k_min = k_min
+        _init_depth_schedule(self, layer_idx, num_layers, alpha_0, k_init,
+                             learnable_k, k_min)
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
@@ -527,15 +532,8 @@ class DyTDTanh(nn.Module):
 
     def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, k_min: Optional[float]=0.0):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.num_layers = max(1, num_layers)
-        self._depth_ratio = float(layer_idx) / float(self.num_layers)
-        self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
-        if learnable_k:
-            self.k = nn.Parameter(torch.tensor(float(k_init)))
-        else:
-            self.register_buffer('k', torch.tensor(float(k_init)))
-        self.k_min = k_min
+        _init_depth_schedule(self, layer_idx, num_layers, alpha_0, k_init,
+                             learnable_k, k_min)
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
@@ -601,15 +599,8 @@ class DyTCD(_SquashedAffine):
 
     def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, p_init: float=2.0, learnable_p: bool=True, beta: bool=True, learnable_delta: bool=True, k_min: Optional[float]=0.0):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.num_layers = max(1, num_layers)
-        self._depth_ratio = float(layer_idx) / float(self.num_layers)
-        self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
-        if learnable_k:
-            self.k = nn.Parameter(torch.tensor(float(k_init)))
-        else:
-            self.register_buffer('k', torch.tensor(float(k_init)))
-        self.k_min = k_min
+        _init_depth_schedule(self, layer_idx, num_layers, alpha_0, k_init,
+                             learnable_k, k_min)
         if learnable_delta:
             self.delta = nn.Parameter(torch.zeros(dim))
         else:
@@ -743,15 +734,8 @@ class DyTCDTanh(nn.Module):
 
     def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, learnable_delta: bool=True, k_min: Optional[float]=0.0):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.num_layers = max(1, num_layers)
-        self._depth_ratio = float(layer_idx) / float(self.num_layers)
-        self.alpha_0 = nn.Parameter(torch.tensor(float(alpha_0)))
-        if learnable_k:
-            self.k = nn.Parameter(torch.tensor(float(k_init)))
-        else:
-            self.register_buffer('k', torch.tensor(float(k_init)))
-        self.k_min = k_min
+        _init_depth_schedule(self, layer_idx, num_layers, alpha_0, k_init,
+                             learnable_k, k_min)
         if learnable_delta:
             self.delta = nn.Parameter(torch.zeros(dim))
         else:

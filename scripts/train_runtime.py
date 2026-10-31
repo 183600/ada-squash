@@ -1,40 +1,28 @@
 from __future__ import annotations
-import argparse
+
 import hashlib
 import json
 import math
 import numbers
 import os
-import random
 import subprocess
 import sys
-import time
 from collections import Counter
-from contextlib import nullcontext
 from pathlib import Path
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
 import torch
-import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
-from adasquash import GPTConfig, GPT, count_parameters, ActivationStats, LossSpikeCounter
-from adasquash.attention import clear_logit_scratch_cache
-from adasquash.diagnostics import diagnose_train_val_curve, parameter_finite_report, tensor_finite_report, triage_nonfinite
-from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
-from adasquash.metrics import mean_ci, mean_std_stderr
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
-from adasquash.norms import NORM_REGISTRY
-from adasquash.repro import (TRAINING_RECIPE_KEYS, TrainStreamFingerprint,
-                             artifact_record, collect_run_metadata,
-                             file_fingerprint, finish_metadata, save_run_manifest,
-                             set_all_seeds, training_recipe_mismatches)
-from scripts.data_pipeline import (build_dataloader, configure_data_options, _is_pinned_revision,
-                                   resolve_dataset_revision, resolve_tokenizer_revision)
-from scripts.train_config import (_DATA_ARGS, _LEDGER_ARGS,
-                                        _MONITOR_ARGS, _RESUME_RUN_ARGS,
-                                        _SCHEDULE_ARGS,
-                                        _WITHIN_ARM_PROTOCOL_KEYS)
+
+from adasquash.metrics import mean_std_stderr
+from adasquash.repro import (artifact_record, collect_run_metadata,
+                             file_fingerprint, finish_metadata,
+                             save_run_manifest, training_recipe_mismatches)
+from scripts.data_pipeline import (_is_pinned_revision,
+                                   resolve_dataset_revision,
+                                   resolve_tokenizer_revision)
+from scripts.train_config import _DATA_ARGS, _LEDGER_ARGS, _WITHIN_ARM_PROTOCOL_KEYS
 
 def _ledger_identity(path):
     if not path:

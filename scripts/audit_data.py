@@ -98,14 +98,12 @@ from array import array
 from collections import Counter
 from fractions import Fraction
 from pathlib import Path
-from statistics import NormalDist
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import wilson_interval
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.data_pipeline import (DocumentCleaner, _is_token_row,
                                    canonical_document_hash, document_hash,
@@ -116,26 +114,12 @@ from scripts.audit_validation import (_is_boolean_scalar,
     _strict_bool_option,
     _strict_int_option,
 )
-from scripts.audit_near_duplicate import (_NEAR_DUP_BANDS,
-    _NEAR_DUP_MASK,
-    _NEAR_DUP_MAX_SHINGLES,
-    _NEAR_DUP_PERMUTATIONS,
-    _NEAR_DUP_ROWS,
-    _NEAR_DUP_SHINGLE_BASE,
-    _band_key,
-    _has_shingle_sketch,
-    _near_dup_permutations,
-    _splitmix64,
-    minhash_signature,
-    near_duplicate_leakage,
-    near_duplicate_ledger_additions,
-    near_duplicate_record,
-    near_duplicate_scan_bound,
-    near_duplicate_train_budget,
-    near_duplicate_train_ledger_hashes,
-    token_shingles,
-    within_split_near_duplicates,
-)
+from scripts.audit_near_duplicate import (_NEAR_DUP_MAX_SHINGLES,
+    minhash_signature, near_duplicate_leakage,
+    near_duplicate_ledger_additions, near_duplicate_record,
+    near_duplicate_scan_bound, near_duplicate_train_budget,
+    near_duplicate_train_ledger_hashes, token_shingles,
+    within_split_near_duplicates)
 
 
 

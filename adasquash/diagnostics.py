@@ -1,4 +1,3 @@
-from __future__ import annotations
 """Training-curve diagnosis and the ordered NaN/Inf triage.
 
 Why this module exists
@@ -23,6 +22,9 @@ Everything here is import-light (torch only) so the training entrypoints can
 call it at the moment of failure; the pure classification functions take
 plain dicts/lists and are unit-testable without a model.
 """
+
+from __future__ import annotations
+
 import bisect
 import math
 from collections.abc import Mapping

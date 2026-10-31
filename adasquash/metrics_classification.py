@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import functools
 import math
-import numbers
-import random
 from typing import Optional, Sequence
 
 from .metrics_stats import (_EXTREME_IMBALANCE,

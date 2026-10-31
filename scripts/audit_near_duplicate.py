@@ -1,11 +1,8 @@
 from __future__ import annotations
-import argparse
-import json
+
 import math
 import numbers
 import sys
-from array import array
-from collections import Counter
 from fractions import Fraction
 from pathlib import Path
 from statistics import NormalDist
@@ -16,13 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import wilson_interval
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
-from scripts.data_pipeline import (DocumentCleaner, _is_token_row,
-                                   canonical_document_hash, document_hash,
-                                   extract_group_value, group_hash, load_document_stream)
-from scripts.audit_validation import (_is_boolean_scalar,
-                                        _strict_bool_option,
-                                        _strict_int_option)
+from scripts.audit_validation import (_is_boolean_scalar, _strict_bool_option,
+                                      _strict_int_option)
 
 # ---------------------------------------------------------------------------
 # Near-duplicate contamination

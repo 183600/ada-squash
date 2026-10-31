@@ -5,8 +5,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .norms import (build_norm, NORM_REGISTRY, _reduce_products,
-                    _sum_leading_dims, DyTD, DyTDTanh, DyTCD, DyTCDTanh)
+from .norms import (build_norm, _reduce_products, DyTD, DyTDTanh, DyTCD,
+                    DyTCDTanh)
 from .attention import CausalSelfAttention, _make_linear, _skip_init
 
 @dataclass

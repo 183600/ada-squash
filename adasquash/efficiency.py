@@ -1,4 +1,3 @@
-from __future__ import annotations
 """Efficiency accounting: parameters, FLOPs and the accuracy/cost verdict.
 
 * `parameter_breakdown` splits a model's parameters by role (embedding /
@@ -14,6 +13,9 @@ from __future__ import annotations
 The functions are pure (config/model in, dict out) so ablation and sweep
 runners can attach the numbers to their summaries.
 """
+
+from __future__ import annotations
+
 import math
 import numbers
 from collections import defaultdict

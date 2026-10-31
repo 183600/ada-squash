@@ -87,8 +87,10 @@ pip install lm-eval
 
 ### Sanity tests
 
+Run the complete suite:
+
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -q
 ```
 
 These cover shape/dtype preservation, softsign boundedness, depth schedule
@@ -97,6 +99,10 @@ implementation, and — since every norm here is a hand-written autograd kernel
 — a per-parameter comparison of each kernel against an independent
 recomposition in plain autograd, run from a *randomized* parameter set so the
 check is not vacuous at the `gamma=1, beta=0` initialization.
+
+While editing a kernel, `python3 -m pytest tests/test_norms.py -q` gives a
+focused feedback loop; the full `python3 ci_gate.py` run below remains the
+authoritative check.
 
 ### Design gate
 
