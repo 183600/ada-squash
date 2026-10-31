@@ -459,11 +459,12 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
             positions_valid = False
             continue
         position = entry.get('position')
-        if (isinstance(position, bool) or not isinstance(position, int)
+        if (isinstance(position, bool)
+                or not isinstance(position, numbers.Integral)
                 or position < 0):
             positions_valid = False
         else:
-            positions.append(position)
+            positions.append(int(position))
     if not positions_valid:
         structural.append('positions are not a contiguous 0..n-1 range '
                           '(missing or non-integer position)')
@@ -520,14 +521,16 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         })
         bucket['count'] += 1
         position = entry.get('position')
-        if (not isinstance(position, bool) and isinstance(position, int)
+        if (not isinstance(position, bool)
+                and isinstance(position, numbers.Integral)
                 and position >= 0):
-            bucket['positions'].append(position)
+            bucket['positions'].append(int(position))
         block = entry.get('block')
-        if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+        if (isinstance(block, bool)
+                or not isinstance(block, numbers.Integral) or block < 0):
             blocks_valid = False
         else:
-            bucket['blocks'].add(block)
+            bucket['blocks'].add(int(block))
     if not blocks_valid:
         structural.append('one or more entries have a missing or non-integer block')
     n = len(entries)
@@ -566,12 +569,20 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         if not isinstance(entry, dict):
             continue
         block = entry.get('block')
-        if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+        if (isinstance(block, bool)
+                or not isinstance(block, numbers.Integral) or block < 0):
             continue
+        block = int(block)
         arm = str(_arm_of(entry))
         counts = block_arm_counts.setdefault(block, {})
         counts[arm] = counts.get(arm, 0) + 1
     declared_blocks = schedule.get('n_blocks')
+    declared_blocks_valid = (
+        isinstance(declared_blocks, numbers.Integral)
+        and not isinstance(declared_blocks, bool)
+        and declared_blocks > 0)
+    if declared_blocks_valid:
+        declared_blocks = int(declared_blocks)
     is_rcbd = schedule.get('schema') == 'adasquash.rcbd_schedule.v1'
     declared_missing = []
     declared_extra = []
@@ -592,17 +603,14 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
                 'the realized schedule does not cover the declared RCBD '
                 f'treatment(s): missing {declared_missing}, extra {declared_extra}')
     looks_complete = is_rcbd or (
-        isinstance(declared_blocks, int) and not isinstance(declared_blocks, bool)
-        and declared_blocks > 0 and bool(per_arm)
+        declared_blocks_valid and bool(per_arm)
         and sorted(block_arm_counts) == list(range(declared_blocks))
         and all(bucket['count'] == declared_blocks
                 and bucket['n_blocks'] == declared_blocks
                 for bucket in per_arm.values()))
     complete_block_design = None
     if looks_complete:
-        block_index_valid = (isinstance(declared_blocks, int)
-                             and not isinstance(declared_blocks, bool)
-                             and declared_blocks > 0)
+        block_index_valid = declared_blocks_valid
         coverage_ok = (
             block_index_valid
             and sorted(block_arm_counts) == list(range(declared_blocks))
@@ -631,7 +639,7 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         'schema': 'adasquash.schedule_balance.v1',
         'schedule_fingerprint': schedule.get('fingerprint'),
         'n_units': n,
-        'n_blocks': schedule.get('n_blocks'),
+        'n_blocks': declared_blocks,
         'block_sizes': schedule.get('block_sizes'),
         'overall_mean_position': overall_mean,
         'per_arm': per_arm,
@@ -731,8 +739,11 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
     distinct positions, returns ``status='insufficient_data'`` instead of a
     misleading p-value.
     """
-    if isinstance(permutations, bool) or not isinstance(permutations, int) or permutations < 1:
+    if (isinstance(permutations, bool)
+            or not isinstance(permutations, numbers.Integral)
+            or permutations < 1):
         raise ValueError(f'permutations must be a positive integer, got {permutations!r}')
+    permutations = int(permutations)
     alpha_value = _finite_float(alpha)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
         raise ValueError(f'alpha must be strictly between 0 and 1, got {alpha!r}')
@@ -960,7 +971,8 @@ def normalize_exclusion_policy(policy: Optional[Mapping] = None) -> dict:
             f"exclusion policy schema must be {EXCLUSION_POLICY_SCHEMA!r}, "
             f"got {policy.get('schema')!r}")
     version = policy.get('version', 1)
-    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+    if (isinstance(version, bool)
+            or not isinstance(version, numbers.Integral) or version < 1):
         raise ValueError(f'exclusion policy version must be a positive integer, got {version!r}')
     raw_rules = policy.get('rules')
     if (not isinstance(raw_rules, Sequence) or isinstance(raw_rules, (str, bytes))
@@ -1156,8 +1168,10 @@ def run_exclusion_audit(runs: Sequence[Mapping],
     legitimately hit one arm, but an arm that lost most of its runs must not
     be read as a clean mean over the survivors.
     """
-    if isinstance(min_seeds, bool) or not isinstance(min_seeds, int) or min_seeds < 1:
+    if (isinstance(min_seeds, bool)
+            or not isinstance(min_seeds, numbers.Integral) or min_seeds < 1):
         raise ValueError(f'min_seeds must be a positive integer, got {min_seeds!r}')
+    min_seeds = int(min_seeds)
     canonical = normalize_exclusion_policy(policy)
     fingerprint = exclusion_policy_fingerprint(canonical)
     classified = classify_run_exclusions(runs, canonical)
@@ -1324,8 +1338,10 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
     sd = _finite_float(paired_sd)
     if sd is None or sd < 0.0:
         raise ValueError(f'paired_sd must be a finite number >= 0, got {paired_sd!r}')
-    if isinstance(n_pairs, bool) or not isinstance(n_pairs, int) or n_pairs < 2:
+    if (isinstance(n_pairs, bool)
+            or not isinstance(n_pairs, numbers.Integral) or n_pairs < 2):
         raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
+    n_pairs = int(n_pairs)
     margin_value = _finite_float(margin)
     if margin_value is None or margin_value <= 0.0:
         raise ValueError(f'margin must be a finite number > 0, got {margin!r}')
@@ -1335,15 +1351,19 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
     power_value = _finite_float(power)
     if power_value is None or not 0.0 < power_value < 1.0:
         raise ValueError(f'power must be strictly between 0 and 1, got {power!r}')
-    if isinstance(n_tests, bool) or not isinstance(n_tests, int) or n_tests < 1:
+    if (isinstance(n_tests, bool)
+            or not isinstance(n_tests, numbers.Integral) or n_tests < 1):
         raise ValueError(f'n_tests must be a positive integer, got {n_tests!r}')
+    n_tests = int(n_tests)
     attrition = _finite_float(expected_attrition)
     if attrition is None or not 0.0 <= attrition < 1.0:
         raise ValueError(
             f'expected_attrition must be a probability in [0, 1), got '
             f'{expected_attrition!r}')
-    if isinstance(max_pairs, bool) or not isinstance(max_pairs, int) or max_pairs < 2:
+    if (isinstance(max_pairs, bool)
+            or not isinstance(max_pairs, numbers.Integral) or max_pairs < 2):
         raise ValueError(f'max_pairs must be an integer >= 2, got {max_pairs!r}')
+    max_pairs = int(max_pairs)
 
     try:
         family_alpha = alpha_value / n_tests
@@ -1450,8 +1470,10 @@ def tost_power_plan(paired_sd: float, n_pairs: int,
     if sd is None or sd < 0.0:
         raise ValueError(
             f'paired_sd must be a finite number >= 0, got {paired_sd!r}')
-    if isinstance(n_pairs, bool) or not isinstance(n_pairs, int) or n_pairs < 2:
+    if (isinstance(n_pairs, bool)
+            or not isinstance(n_pairs, numbers.Integral) or n_pairs < 2):
         raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
+    n_pairs = int(n_pairs)
     margin_value = _finite_float(equivalence_margin)
     if margin_value is None or margin_value <= 0.0:
         raise ValueError(
@@ -1466,18 +1488,21 @@ def tost_power_plan(paired_sd: float, n_pairs: int,
     if power_value is None or not 0.0 < power_value < 1.0:
         raise ValueError(
             f'power must be strictly between 0 and 1, got {power!r}')
-    if isinstance(n_tests, bool) or not isinstance(n_tests, int) or n_tests < 1:
+    if (isinstance(n_tests, bool)
+            or not isinstance(n_tests, numbers.Integral) or n_tests < 1):
         raise ValueError(
             f'n_tests must be a positive integer, got {n_tests!r}')
+    n_tests = int(n_tests)
     attrition = _finite_float(expected_attrition)
     if attrition is None or not 0.0 <= attrition < 1.0:
         raise ValueError(
             f'expected_attrition must be a probability in [0, 1), got '
             f'{expected_attrition!r}')
-    if (isinstance(max_pairs, bool) or not isinstance(max_pairs, int)
-            or max_pairs < 2):
+    if (isinstance(max_pairs, bool)
+            or not isinstance(max_pairs, numbers.Integral) or max_pairs < 2):
         raise ValueError(
             f'max_pairs must be an integer >= 2, got {max_pairs!r}')
+    max_pairs = int(max_pairs)
 
     try:
         family_alpha = alpha_value / n_tests
@@ -1611,7 +1636,8 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     # "truth value is ambiguous" before any check can run. A None default is
     # the only case that means "no seeds".
     seeds = [] if seeds is None else list(seeds)
-    min_seeds_valid = (isinstance(min_seeds, int) and not isinstance(min_seeds, bool)
+    min_seeds_valid = (isinstance(min_seeds, numbers.Integral)
+                       and not isinstance(min_seeds, bool)
                        and min_seeds >= 1)
     if not min_seeds_valid:
         # A floor of 0 (or a bool) would switch off both the replication check
@@ -1620,6 +1646,8 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             f'invalid min_seeds {min_seeds!r}: must be a positive integer; '
             f'using {MIN_SEEDS_FOR_SIGNIFICANCE}')
         min_seeds = MIN_SEEDS_FOR_SIGNIFICANCE
+    else:
+        min_seeds = int(min_seeds)
     # The power check must use the number of *distinct* observations the
     # paired test will actually have, not the raw list length (duplicate seeds
     # are the same run and the replication check above rejects them). NumPy
@@ -1670,9 +1698,11 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
 
     alpha_value = _finite_float(alpha)
     target_power_value = _finite_float(target_power)
-    n_tests_valid = (isinstance(n_confirmatory_tests, int)
+    n_tests_valid = (isinstance(n_confirmatory_tests, numbers.Integral)
                      and not isinstance(n_confirmatory_tests, bool)
                      and n_confirmatory_tests >= 1)
+    if n_tests_valid:
+        n_confirmatory_tests = int(n_confirmatory_tests)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
         add('power', 'fail', f'invalid alpha {alpha!r}')
     elif equivalence_margin > 0.0 and alpha_value >= 0.5:
@@ -1960,10 +1990,14 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
     Monte-Carlo error is reported so a "0.049" is not over-read: with
     ``reps=2000`` the standard error of a 0.05 rate is about 0.005.
     """
-    if isinstance(n_pairs, bool) or not isinstance(n_pairs, int) or n_pairs < 2:
+    if (isinstance(n_pairs, bool)
+            or not isinstance(n_pairs, numbers.Integral) or n_pairs < 2):
         raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
-    if isinstance(reps, bool) or not isinstance(reps, int) or reps < 100:
+    n_pairs = int(n_pairs)
+    if (isinstance(reps, bool)
+            or not isinstance(reps, numbers.Integral) or reps < 100):
         raise ValueError(f'reps must be an integer >= 100, got {reps!r}')
+    reps = int(reps)
     effect_value = _finite_float(effect)
     paired_sd_value = _finite_float(paired_sd)
     if effect_value is None:
