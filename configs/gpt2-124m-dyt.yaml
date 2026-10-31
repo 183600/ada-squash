@@ -9,6 +9,9 @@ norm: dyt
 # isolate the LayerScale component, and configs/gpt2-124m-dytcd-tanh.yaml to
 # isolate the activation family.
 alpha_init: 0.5
+alpha_jitter: 0.0
+p_init: 2.0
+learnable_p: false
 qk_norm: null
 use_layerscale: false
 

@@ -1209,7 +1209,8 @@ def test_ablation_matrix_contrasts_are_single_variable():
     """
     import dataclasses
     root = Path(__file__).resolve().parent.parent
-    from scripts.ablation import load_ablations_from_config, effective_config_key
+    from scripts.ablation import (check_factorial, effective_config_key,
+                                  load_ablations_from_config)
 
     rows = load_ablations_from_config(str(root / "configs" / "ablation-matrix.yaml"))
 
@@ -1223,13 +1224,26 @@ def test_ablation_matrix_contrasts_are_single_variable():
         ca, cb = cfg_of(a), cfg_of(b)
         return sorted(k for k in ca if ca[k] != cb[k])
 
-    # Factorial: activation family x per-channel, LS held off. (p_init
-    # coincides at 2.0, so it does not show up as a differing axis; the
-    # learnable_p flag differs but is a no-op for the tanh cell.)
-    assert diff_axes("dyt", "dyts") == ["learnable_p", "norm_name"]
-    assert diff_axes("dyt", "dytp") == ["alpha_jitter", "norm_name"]
-    assert diff_axes("dyts", "dytc") == ["alpha_jitter", "norm_name"]
-    assert diff_axes("dytp", "dytc") == ["learnable_p", "norm_name"]
+    # Factorial: activation family x per-channel, LS held off. The shared
+    # context is explicit in every cell, including the no-op flags for the
+    # tanh arm, so each adjacent pair changes only the norm readout.
+    assert diff_axes("dyt", "dyts") == ["norm_name"]
+    assert diff_axes("dyt", "dytp") == ["norm_name"]
+    assert diff_axes("dyts", "dytc") == ["norm_name"]
+    assert diff_axes("dytp", "dytc") == ["norm_name"]
+
+    # The fixed-p softsign sweep is run under the same LS-off dytc context;
+    # the p=2 reference is therefore the dytc cell itself.
+    assert diff_axes("dytc", "dytc_p2_softsign") == []
+    assert diff_axes("dytc_p2_softsign", "dytc_p1_softsign") == ["p_init"]
+    assert diff_axes("dytc_p2_softsign", "dytc_p4_softsign") == ["p_init"]
+    assert diff_axes("dytc_p2_softsign", "dytc_hardtanh_eq") == ["p_init"]
+    assert diff_axes("dytc_p2_softsign", "dytc_plearnable") == ["learnable_p"]
+    factorial = check_factorial(rows, "gpt2-124m")
+    assert factorial["activation_x_per_channel_flat"]["factors"][
+        "activation"]["diff"] == ["norm_name"]
+    assert factorial["activation_x_per_channel_flat"]["factors"][
+        "per_channel"]["diff"] == ["norm_name"]
 
     # Depth axis at matched LS: reparameterization, init-only control, shared.
     assert diff_axes("dyt_ls", "dytd") == ["norm_name"]

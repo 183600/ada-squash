@@ -68,6 +68,51 @@ def test_phase1_configs_declare_replication_validation_and_hypothesis():
         output_dirs.add(output_dir)
 
 
+def test_phase1_activation_factorial_cells_are_single_variable():
+    import dataclasses
+
+    import torch
+
+    from adasquash.model import GPT, GPTConfig
+    from scripts.train_gpt2 import build_arg_parser
+
+    def model_cfg(name):
+        parser, _ = build_arg_parser(
+            ['--config', str(CONFIG_DIR / f'gpt2-124m-{name}.yaml')])
+        args = parser.parse_args([])
+        kwargs = dict(
+            norm_name=args.norm, qk_norm=args.qk_norm,
+            qk_alpha_init=args.qk_alpha_init,
+            use_layerscale=not args.no_layerscale,
+            alpha_0=args.alpha_0, k_init=args.k_init, k_min=args.k_min,
+            shared_depth_schedule=args.shared_depth_schedule,
+            alpha_init=args.alpha_init, p_init=args.p_init,
+            learnable_p=not args.no_learnable_p,
+            learnable_k=not args.no_learnable_k,
+            learnable_delta=not args.no_learnable_delta,
+            beta=args.beta, alpha_jitter=args.alpha_jitter,
+            gradient_checkpointing=args.gradient_checkpointing)
+        if args.layerscale_init is not None:
+            kwargs['layerscale_init'] = args.layerscale_init
+        if args.tie_embeddings is not None:
+            kwargs['tie_word_embeddings'] = args.tie_embeddings
+        with torch.device('meta'):
+            return dataclasses.asdict(GPT(GPTConfig(
+                vocab_size=256, dim=64, n_layers=2, n_heads=4,
+                max_seq_len=32, **kwargs)).cfg)
+
+    cfgs = {name: model_cfg(name) for name in ('dyt', 'dyts', 'dytp', 'dytc')}
+
+    def diff_axes(a, b):
+        ca, cb = cfgs[a], cfgs[b]
+        return sorted(k for k in ca if ca[k] != cb[k])
+
+    assert diff_axes('dyt', 'dyts') == ['norm_name']
+    assert diff_axes('dyt', 'dytp') == ['norm_name']
+    assert diff_axes('dyts', 'dytc') == ['norm_name']
+    assert diff_axes('dytp', 'dytc') == ['norm_name']
+
+
 def test_sweep_and_ablation_configs_declare_replication_and_protocol():
     sweep = _load(CONFIG_DIR / 'llama-1b-depth-sweep.yaml')
     assert len(sweep.get('seeds', [])) >= 3

@@ -1,8 +1,9 @@
 model: gpt2-124m
 norm: dytc
 alpha_init: 0.5
+alpha_jitter: 0.0
 p_init: 2.0
-learnable_p: true
+learnable_p: false
 qk_norm: null
 # LayerScale off, like the ln / rmsnorm / dyt configs: DyT-C is the
 # per-channel axis only, so per-channel comparisons against those rows change

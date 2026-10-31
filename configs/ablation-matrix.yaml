@@ -223,11 +223,13 @@ ablations:
       also beats this comparator, not just the no-QK row.
 
   # --- Softsign family (saturation sharpness p) ---
+  # Single variable: p, under dytc, LayerScale off.
   - name: dytc_p1_softsign
     norm: dytc
     p_init: 1.0
     learnable_p: false
     alpha_jitter: 0.0
+    use_layerscale: false
     hypothesis: >
       Softsign sharpness matters: p=1 (classic softsign) is worse than p=2
       on this outlier-heavy corpus.
@@ -236,6 +238,7 @@ ablations:
     p_init: 2.0
     learnable_p: false
     alpha_jitter: 0.0
+    use_layerscale: false
     hypothesis: >
       p=2 (smooth softsign) is the best fixed saturation exponent of
       {1, 2, 4}: enough outlier compression without gradient starvation.
@@ -244,6 +247,7 @@ ablations:
     p_init: 4.0
     learnable_p: false
     alpha_jitter: 0.0
+    use_layerscale: false
     hypothesis: >
       p=4 saturates harder than p=2; the hypothesis is that this hurts
       gradient flow through large activations and loses to p=2.
@@ -252,6 +256,7 @@ ablations:
     p_init: 2.0
     learnable_p: true
     alpha_jitter: 0.0
+    use_layerscale: false
     hypothesis: >
       A learnable p adapts the saturation steepness per layer and beats
       every fixed p in the sweep (otherwise fixing p is the simpler, better
@@ -261,6 +266,7 @@ ablations:
     p_init: 64.0
     learnable_p: false
     alpha_jitter: 0.0
+    use_layerscale: false
     hypothesis: >
       The p -> infinity limit (hard tanh) starves gradients outside [-1, 1]
       and loses to finite p.
@@ -322,6 +328,9 @@ ablations:
       Scalar-alpha tanh DyT without LayerScale: the scalar-tanh reference cell of the activation x per-channel factorial.
     norm: dyt
     alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: false
     use_layerscale: false
 
   - name: dyts
@@ -329,6 +338,7 @@ ablations:
       Scalar-alpha generalized softsign without LayerScale: dyt -> dyts isolates the activation family at fixed scalar alpha.
     norm: dyts
     alpha_init: 0.5
+    alpha_jitter: 0.0
     p_init: 2.0
     learnable_p: false
     use_layerscale: false
@@ -339,6 +349,8 @@ ablations:
     norm: dytp
     alpha_init: 0.5
     alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: false
     use_layerscale: false
 
   - name: dytc
@@ -350,8 +362,6 @@ ablations:
     p_init: 2.0
     learnable_p: false
     use_layerscale: false
-
-  # Softsign exponent sweep (single variable: p, under dytc, LS off)
 
   - name: dyt_ls
     hypothesis: >

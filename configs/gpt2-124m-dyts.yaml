@@ -3,6 +3,7 @@ model: gpt2-124m
 # the activation-family factorial (dyt -> dyts isolates tanh -> softsign).
 norm: dyts
 alpha_init: 0.5
+alpha_jitter: 0.0
 p_init: 2.0
 learnable_p: false
 qk_norm: null
