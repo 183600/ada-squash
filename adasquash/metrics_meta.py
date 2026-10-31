@@ -268,7 +268,11 @@ def _ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
         my = sum(ys) / n
         sxx = sum((x - mx) ** 2 for x in xs)
         if sxx == 0.0:
-            return None
+            if len(set(xs)) <= 1:
+                return None
+            # Tiny but distinct x values can square to zero even though the
+            # slope is well defined; the scaled fit avoids that underflow.
+            return _scaled_ols_slope_and_r2(xs, ys)
         sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
         slope = sxy / sxx
         intercept = my - slope * mx
