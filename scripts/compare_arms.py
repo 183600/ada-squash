@@ -51,6 +51,7 @@ candidate family against one reference. This is the Phase-1 counterpart of
 import argparse
 import json
 import math
+import numbers
 import sys
 from pathlib import Path
 
@@ -109,6 +110,11 @@ _METRIC_POLICY = {
 }
 
 
+def _is_seed_id(value) -> bool:
+    """A Python/NumPy integer seed, rejecting booleans and fractions."""
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+
 def _metric_policy(metric: str) -> dict:
     """The estimand/evidence contract for one aggregate loss metric."""
     if metric not in _METRIC_POLICY:
@@ -117,7 +123,7 @@ def _metric_policy(metric: str) -> dict:
 
 
 def _finite(value) -> bool:
-    if (not isinstance(value, (int, float)) or isinstance(value, bool)):
+    if not isinstance(value, numbers.Real) or isinstance(value, bool):
         return False
     try:
         converted = float(value)
@@ -144,7 +150,7 @@ def _seed_values(agg: dict, metric: str) -> dict[int, float]:
             if not isinstance(record, dict):
                 continue
             seed = record.get('seed')
-            if (not isinstance(seed, int) or isinstance(seed, bool)):
+            if not _is_seed_id(seed):
                 continue
             value = record.get(metric)
             if _finite(value):
@@ -171,9 +177,10 @@ def _seed_record_problems(agg: dict) -> list[str]:
             malformed.append(repr(record))
             continue
         seed = record.get('seed')
-        if isinstance(seed, bool) or not isinstance(seed, int):
+        if not _is_seed_id(seed):
             malformed.append(repr(seed))
             continue
+        seed = int(seed)
         if seed in seen:
             duplicates.add(seed)
         seen.add(seed)
@@ -188,13 +195,12 @@ def _seed_record_problems(agg: dict) -> list[str]:
             problems.append('declared seed list is not a list')
         else:
             malformed_declared = [value for value in declared
-                                  if isinstance(value, bool)
-                                  or not isinstance(value, int)]
+                                  if not _is_seed_id(value)]
             if malformed_declared:
                 problems.append(
                     f'malformed declared seed id(s) {malformed_declared}')
             else:
-                declared_set = set(declared)
+                declared_set = {int(value) for value in declared}
                 if len(declared_set) != len(declared):
                     problems.append(
                         f'duplicate declared seed id(s) {sorted(declared)}')
@@ -224,8 +230,8 @@ def _per_seed_ids(agg: dict) -> set[str]:
             if not isinstance(record, dict):
                 continue
             seed = record.get('seed')
-            if isinstance(seed, int) and not isinstance(seed, bool):
-                out.add(str(seed))
+            if _is_seed_id(seed):
+                out.add(str(int(seed)))
     return out
 
 
@@ -346,9 +352,9 @@ def _final_step(agg: dict):
         # A bool/float/list spelling is not a step count. Comparison against
         # the set form let `1` and `True` collapse into one value, so whether a
         # malformed aggregate looked consistent depended on record order.
-        if not isinstance(step, int) or isinstance(step, bool):
+        if not _is_seed_id(step):
             return None
-        steps.append(step)
+        steps.append(int(step))
     if not steps or len(set(steps)) != 1:
         return None
     step = steps[0]
@@ -421,7 +427,7 @@ def _manifest_replication_problem(agg: dict, manifest: dict | None) -> str | Non
         for seed in values:
             # A JSON float/bool is not a seed id; `int(42.5)` would silently
             # truncate it and `int(True)` would accept a boolean as one seed.
-            if isinstance(seed, bool) or not isinstance(seed, int):
+            if not _is_seed_id(seed):
                 return None
             out.append(int(seed))
         if len(set(out)) != len(out):
