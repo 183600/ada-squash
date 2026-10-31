@@ -4,6 +4,7 @@ import math
 import numbers
 from pathlib import Path
 
+from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE,
                                leave_one_out_jackknife,
                                mean_prediction_interval, mean_std_stderr,
@@ -16,13 +17,13 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE,
 ROOT = Path(__file__).resolve().parents[2]
 
 def _finite_metric(value) -> bool:
-    """A loss may be pooled/tested only when it is a finite number.
+    """A loss may be pooled/tested only when it is a finite real scalar.
 
-    `isinstance(value, (int, float))` alone admits NaN/Inf from a diverged
-    run; NaN then propagates through the seed mean (and the paired tests),
-    silently poisoning the row's pooled val_loss.
+    Exact `(int, float)` checks admit NaN/Inf from a diverged run and miss
+    NumPy integer/float scalars produced by analysis code; both would silently
+    poison or drop a row's pooled val_loss.
     """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if _is_boolean_scalar(value) or not isinstance(value, numbers.Real):
         return False
     try:
         return math.isfinite(float(value))
@@ -231,9 +232,14 @@ def _robustness_note(entry: dict) -> str:
     return ''.join(parts)
 
 
+def _is_integer_scalar(value) -> bool:
+    """A Python/NumPy integer, rejecting booleans and fractional values."""
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+
 def _is_seed_id(value) -> bool:
     """A seed id is an integer scalar; 42.9/True must not pair with 42/1."""
-    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+    return _is_integer_scalar(value)
 
 
 def _seed_key_id(value):
@@ -372,8 +378,8 @@ def _row_n_seeds(row) -> int:
             or isinstance(row.get('seeds'), list)):
         return 0
     declared = row.get('n_seeds')
-    if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 0:
-        return declared
+    if _is_integer_scalar(declared) and declared >= 0:
+        return int(declared)
     return 1
 
 

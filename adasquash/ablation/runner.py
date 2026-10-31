@@ -21,7 +21,7 @@ from adasquash.model import clear_cast_weight_cache, clear_ce_scratch_cache
 from adasquash.repro import collect_run_metadata, set_all_seeds
 from scripts.train_gpt2 import build_optimizer
 
-from .common import _finite_metric, _is_seed_id
+from .common import _finite_metric, _is_integer_scalar, _is_seed_id
 from .matrix import (DEFAULT_SEEDS, _MODEL_BUILDERS, install_residual_outlier)
 
 def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: dict | None=None, hypothesis: str | None=None, seed: int | None=None, order_info: dict | None=None):
@@ -418,9 +418,8 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
         'elapsed_s': sum(float(p['elapsed_s']) for p in per_seed
                          if _finite_metric(p.get('elapsed_s'))),
         # Measured cost of the arm, carried next to the loss delta.
-        'tokens_processed': sum(p['tokens_processed'] for p in per_seed
-                                if isinstance(p.get('tokens_processed'), int)
-                                and not isinstance(p.get('tokens_processed'), bool)),
+        'tokens_processed': sum(int(p['tokens_processed']) for p in per_seed
+                                if _is_integer_scalar(p.get('tokens_processed'))),
         'tokens_per_second': None if tps_stats is None else tps_stats['mean'],
         'tokens_per_second_seed_std': (tps_stats['std'] if tps_stats and len(tps_vals) >= 2 else None),
         'peak_device_memory_mb': _mean_of('peak_device_memory_mb'),

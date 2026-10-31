@@ -9,7 +9,7 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, _validate_alpha,
                                benjamini_hochberg_adjust, holm_adjust)
 from adasquash.sequential import group_sequential_plan
 
-from .common import _finite_metric, _is_seed_id
+from .common import _finite_metric, _is_integer_scalar, _is_seed_id
 from .matrix import (PRIMARY_FACTORIAL_DESIGN, PRIMARY_MAIN_ROW,
                      _parse_three_way_cell_key)
 
@@ -316,11 +316,11 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     if len(set(normalized_seeds)) != len(normalized_seeds):
         raise ValueError(
             f'analysis-plan seeds must be unique, got {seeds!r}')
-    if isinstance(sequential_looks, bool) or not isinstance(sequential_looks, int) \
-            or sequential_looks < 0:
+    if not _is_integer_scalar(sequential_looks) or sequential_looks < 0:
         raise ValueError(
             f'sequential_looks must be a non-negative integer, got '
             f'{sequential_looks!r}')
+    sequential_looks = int(sequential_looks)
     sequential_plan = None
     if sequential_looks:
         primary_tests = max(

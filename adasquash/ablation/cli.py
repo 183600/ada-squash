@@ -24,7 +24,7 @@ from .baselines import (attach_baseline_tuning,
                         attach_simple_baseline_calibration, baseline_comparison,
                         load_baseline_tuning, load_simple_baselines,
                         print_baseline_comparison, run_simple_baseline_calibration)
-from .common import _is_seed_id
+from .common import _is_integer_scalar, _is_seed_id
 from .contrasts import (factorial_comparison, leave_one_out_comparison,
                         print_factorial_comparison,
                         print_leave_one_out_comparison,
@@ -170,8 +170,10 @@ def main():
               f'(a repeated seed is the same run, not an independent replication)')
     if len(seeds) < 3 and not args.allow_uncertified:
         p.error(f'{len(seeds)} seed(s) selected: certification requires >= 3 independent seeds; use --allow-uncertified to run anyway (results will be descriptive only)')
-    if isinstance(args.sequential_looks, bool) or args.sequential_looks < 0:
+    if (not _is_integer_scalar(args.sequential_looks)
+            or args.sequential_looks < 0):
         p.error(f'--sequential-looks {args.sequential_looks} must be a non-negative integer')
+    args.sequential_looks = int(args.sequential_looks)
     if args.sequential_looks > 0 and len(seeds) < MIN_SEEDS_FOR_SIGNIFICANCE:
         p.error('--sequential-looks needs at least '
                 f'{MIN_SEEDS_FOR_SIGNIFICANCE} planned seeds: an interim look '
