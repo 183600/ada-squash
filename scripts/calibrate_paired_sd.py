@@ -18,6 +18,7 @@ mean after reading it.
 """
 import argparse
 import json
+import numbers
 import sys
 from pathlib import Path
 
@@ -67,25 +68,28 @@ def _loss_by_seed(row, name):
         raise ValueError(f'row {name!r} has no per_seed table')
     losses = {}
     unusable = {}
+    seen = set()
     for entry in per_seed:
         if not isinstance(entry, dict):
             continue
         seed = entry.get('seed')
-        if isinstance(seed, bool) or not isinstance(seed, int):
+        if isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
             continue
+        seed = int(seed)
+        if seed in seen:
+            raise ValueError(f'row {name!r} lists seed {seed} more than once')
+        seen.add(seed)
         if entry.get('exclusion_status') == 'excluded':
             unusable[seed] = 'excluded by the pre-specified policy'
             continue
         loss = entry.get('val_loss')
-        if isinstance(loss, bool) or not isinstance(loss, (int, float)):
+        if isinstance(loss, bool) or not isinstance(loss, numbers.Real):
             unusable[seed] = 'missing val_loss'
             continue
         loss = float(loss)
         if loss != loss or loss in (float('inf'), float('-inf')):
             unusable[seed] = 'non-finite val_loss'
             continue
-        if seed in losses:
-            raise ValueError(f'row {name!r} lists seed {seed} more than once')
         losses[seed] = loss
     if not losses:
         raise ValueError(f'row {name!r} has no finite per-seed val_loss values')
