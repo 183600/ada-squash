@@ -206,8 +206,10 @@ def block_randomized_schedule(units: Iterable[str], block_size: Optional[int] = 
     n = len(ids)
     if block_size is None:
         block_size = n if n <= 8 else max(1, math.ceil(math.sqrt(n)))
-    if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1:
+    if (isinstance(block_size, bool) or not isinstance(block_size, numbers.Integral)
+            or block_size < 1):
         raise ValueError(f'block_size must be a positive integer, got {block_size!r}')
+    block_size = int(block_size)
 
     order: list[str] = []
     entries: list[dict] = []
