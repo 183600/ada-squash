@@ -6,6 +6,7 @@ import numbers
 import sys
 from array import array
 from collections import Counter
+from fractions import Fraction
 from pathlib import Path
 from statistics import NormalDist
 
@@ -466,6 +467,223 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
     }
 
 
+def within_split_near_duplicates(records, *, threshold: float = 0.8,
+                                 margin: float = 0.05, shingle_size: int = 8,
+                                 max_examples: int = 20,
+                                 exhaustive: bool = True,
+                                 truncated: bool = False) -> dict:
+    """Find later documents that near-duplicate an earlier document in one split.
+
+    Cross-split leakage is only one way duplication enters an experiment.
+    A training corpus can contain the same content several times (mirrored
+    pages, reworded templates, abridged copies), and those repetitions are
+    not cross-split contamination.  They still change what a "trained on N
+    tokens" claim means: repeated content receives extra optimisation
+    weight, and the effective number of distinct training tokens is smaller
+    than the packed-stream budget.  This function quantifies that redundancy
+    on the *training* side with the same deterministic MinHash/LSH machinery
+    used for cross-split leakage.
+
+    Documents are compared only with documents that occur earlier in the
+    stream.  The later copy is the one reported (and can be excluded from
+    training), so the first occurrence is always kept, matching the
+    chronological, order-preserving split policy.  The scan is a diagnostic:
+    finding redundancy is not by itself a leakage failure, but the returned
+    ``flagged_tokens`` / ``total_tokens`` ratio feeds an honest unique-token
+    budget and a pre-registered ``--max-train-near-dup-rate`` gate.
+    """
+    if _is_boolean_scalar(threshold):
+        raise ValueError(
+            f"near-duplicate threshold must be in (0, 1], got {threshold!r}")
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"near-duplicate threshold must be in (0, 1], got {threshold!r}") from None
+    if not (math.isfinite(threshold) and 0.0 < threshold <= 1.0):
+        raise ValueError(f"near-duplicate threshold must be in (0, 1], got {threshold}")
+    if _is_boolean_scalar(margin):
+        raise ValueError(
+            f"near-duplicate margin must be in [0, 1), got {margin!r}")
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"near-duplicate margin must be in [0, 1), got {margin!r}") from None
+    if not (math.isfinite(margin) and 0.0 <= margin < 1.0):
+        raise ValueError(f"near-duplicate margin must be in [0, 1), got {margin}")
+    shingle_size = _strict_int_option(shingle_size, "shingle_size", 1)
+    max_examples = _strict_int_option(max_examples, "max_examples", 0)
+    exhaustive = bool(_strict_bool_option(exhaustive, "exhaustive"))
+    truncated = bool(_strict_bool_option(truncated, "truncated"))
+    try:
+        records = list(records)
+    except TypeError:
+        raise ValueError(
+            f"records must be an iterable of near-duplicate records, got "
+            f"{type(records).__name__}") from None
+
+    def _tokens(record) -> int:
+        value = record.get("n_tokens") if isinstance(record, dict) else None
+        if (isinstance(value, numbers.Integral)
+                and not isinstance(value, bool) and value > 0):
+            return int(value)
+        return 0
+
+    signatures = np.zeros((len(records), _NEAR_DUP_PERMUTATIONS),
+                          dtype=np.uint64)
+    has_sketch = []
+    for position, record in enumerate(records):
+        if not _has_shingle_sketch(record):
+            continue
+        signature = record.get("signature")
+        try:
+            values = np.asarray(signature, dtype=np.uint64)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"record {position} has a non-numeric MinHash signature") from None
+        if values.shape != (_NEAR_DUP_PERMUTATIONS,):
+            raise ValueError(
+                f"record {position} has {values.size} MinHash values; expected "
+                f"{_NEAR_DUP_PERMUTATIONS}")
+        signatures[position] = values
+        has_sketch.append(position)
+
+    screening = max(0.0, threshold - margin)
+    index: dict = {}
+    earlier_doc_indices = np.empty(len(has_sketch), dtype=np.int64)
+    n_earlier = 0
+    flagged_docs: set = set()
+    flagged_digests: set = set()
+    missing_digest_positions: set = set()
+    borderline_docs: set = set()
+    examples = []
+    borderline_examples = []
+    candidate_pairs = 0
+    flagged_pairs = 0
+    borderline_pairs = 0
+    total_tokens = sum(_tokens(record) for record in records)
+
+    for position in has_sketch:
+        record = records[position]
+        candidates = set()
+        for band in range(_NEAR_DUP_BANDS):
+            candidates.update(index.get(
+                _band_key(record["signature"], band), ()))
+        if candidates:
+            candidate_pairs += len(candidates)
+            candidate_ids = np.fromiter(sorted(candidates), dtype=np.int64,
+                                        count=len(candidates))
+            earlier_positions = earlier_doc_indices[:n_earlier][candidate_ids]
+            sims = (signatures[earlier_positions] == signatures[position]).mean(axis=1)
+            hits = np.flatnonzero(sims >= float(threshold))
+            borderline = np.flatnonzero((sims >= screening)
+                                        & (sims < float(threshold)))
+            if borderline.size:
+                borderline_pairs += int(borderline.size)
+                borderline_docs.add(position)
+                if len(borderline_examples) < max_examples:
+                    best_pos = int(np.argmax(sims[borderline]))
+                    sim_pos = int(borderline[best_pos])
+                    earlier_i = int(earlier_positions[sim_pos])
+                    borderline_examples.append({
+                        "earlier_document_index": int(
+                            records[earlier_i].get("doc_index", earlier_i)),
+                        "later_document_index": int(
+                            record.get("doc_index", position)),
+                        "estimated_jaccard": round(float(sims[sim_pos]), 4),
+                    })
+            if hits.size:
+                flagged_pairs += int(hits.size)
+                flagged_docs.add(position)
+                digest = record.get("canonical_digest")
+                if isinstance(digest, str) and digest:
+                    flagged_digests.add(digest.lower())
+                else:
+                    missing_digest_positions.add(position)
+                if len(examples) < max_examples:
+                    best_pos = int(np.argmax(sims[hits]))
+                    sim_pos = int(hits[best_pos])
+                    earlier_i = int(earlier_positions[sim_pos])
+                    examples.append({
+                        "earlier_document_index": int(
+                            records[earlier_i].get("doc_index", earlier_i)),
+                        "later_document_index": int(
+                            record.get("doc_index", position)),
+                        "estimated_jaccard": round(float(sims[sim_pos]), 4),
+                        "earlier_n_tokens": _tokens(records[earlier_i]),
+                        "later_n_tokens": _tokens(record),
+                    })
+        for band in range(_NEAR_DUP_BANDS):
+            index.setdefault(
+                _band_key(record["signature"], band), []).append(n_earlier)
+        earlier_doc_indices[n_earlier] = position
+        n_earlier += 1
+
+    flagged_tokens = sum(_tokens(records[position]) for position in flagged_docs)
+    flagged_document_indices = sorted(
+        int(records[position].get("doc_index", position))
+        for position in flagged_docs)
+    missing_document_indices = sorted(
+        int(records[position].get("doc_index", position))
+        for position in missing_digest_positions)
+    scan_exhaustive = bool(exhaustive and not truncated)
+    notes = []
+    if flagged_docs:
+        fraction = flagged_tokens / total_tokens if total_tokens else None
+        notes.append(
+            f"{len(flagged_docs)} train document(s) near-duplicate an earlier "
+            f"train document ({flagged_tokens} sketched token(s)"
+            + (f", {fraction:.4%} of the sketched train tokens" if fraction is not None
+               else "")
+            + "); this is training-data redundancy, not cross-split leakage, "
+              "and it reduces the number of distinct training tokens. Flagged "
+              "documents are subtracted in full; when the scan is exhaustive, "
+              "that makes the adjusted unique-token budget a conservative "
+              "lower bound on the distinct tokens")
+    if borderline_pairs:
+        notes.append(
+            f"{borderline_pairs} within-split pair(s) are within {margin:g} "
+            f"Jaccard of the {threshold:g} threshold (screening >= {screening:g}); "
+            "they are reported for inspection but are not counted as duplicates")
+    if missing_digest_positions:
+        notes.append(
+            f"{len(missing_digest_positions)} flagged train document(s) carry no "
+            "canonical digest and cannot be excluded through a hash ledger")
+    if not scan_exhaustive:
+        notes.append(
+            "the within-split scan covered a sampled/truncated prefix, so the "
+            "redundancy count and flagged-token total are lower bounds")
+    return {
+        "enabled": True,
+        "threshold_jaccard": float(threshold),
+        "borderline_margin": margin,
+        "screening_jaccard": screening,
+        "estimator": "minhash_lsh",
+        "shingle_size": int(shingle_size),
+        "documents": len(records),
+        "documents_with_sketch": len(has_sketch),
+        "candidate_pairs": int(candidate_pairs),
+        "flagged_pairs": int(flagged_pairs),
+        "flagged_documents": len(flagged_docs),
+        "flagged_document_indices": flagged_document_indices,
+        "flagged_digests": sorted(flagged_digests),
+        "flagged_tokens": int(flagged_tokens),
+        "total_tokens": int(total_tokens),
+        "redundant_token_fraction": (
+            flagged_tokens / total_tokens if total_tokens else None),
+        "borderline_pairs": int(borderline_pairs),
+        "borderline_documents": len(borderline_docs),
+        "borderline_examples": borderline_examples,
+        "examples": examples,
+        "missing_digest_documents": len(missing_digest_positions),
+        "missing_digest_document_indices": missing_document_indices,
+        "exhaustive": scan_exhaustive,
+        "lower_bound": not scan_exhaustive,
+        "notes": notes,
+    }
+
+
 def near_duplicate_scan_bound(report: dict, *, confidence: float = 0.95,
                               max_rate=None) -> dict:
     """Quantify what a near-duplicate scan *failed to find*.
@@ -661,5 +879,135 @@ def near_duplicate_ledger_additions(report: dict) -> dict:
                 continue
             additions[role].add(raw)
     return {"hashes": additions, "missing_digest_documents": missing}
+
+
+def near_duplicate_train_ledger_hashes(report: dict) -> dict:
+    """Canonical digests of later within-train near-duplicates.
+
+    The training split already consumes an ``exclude_train_hash_file`` ledger
+    (the benchmark-decontamination channel).  Writing the later copy of each
+    redundant train document into that same ledger drops the copy while
+    keeping the first occurrence, so the run's unique-token budget matches
+    the audited one.  Digests that are malformed or the wrong width cannot
+    match ``DocumentCleaner``'s 16-byte lookup and are counted as missing
+    instead of being written as inert ledger entries.
+    """
+    if not isinstance(report, dict):
+        raise ValueError(f"report must be a mapping, got {type(report).__name__}")
+    hashes = set()
+    missing = int(report.get("missing_digest_documents") or 0)
+    for digest in report.get("flagged_digests") or []:
+        try:
+            raw = bytes.fromhex(str(digest))
+        except (TypeError, ValueError):
+            missing += 1
+            continue
+        if len(raw) != 16:
+            missing += 1
+            continue
+        hashes.add(raw)
+    return {"hashes": hashes, "missing_digest_documents": missing}
+
+
+def near_duplicate_train_budget(budget: dict | None,
+                                redundancy: dict | None) -> dict:
+    """Subtract near-duplicate train tokens from the effective token budget.
+
+    A packed-stream budget counts every token of every kept document.  When
+    the corpus repeats the same content, the model does not see that many
+    distinct tokens: the later copies re-weight content it already saw.  The
+    redundancy scan measures the flagged fraction among the documents it
+    actually sketched, and this function applies that fraction to the
+    estimated effective train-token budget.  When either measurement is a
+    prefix/sample, the adjusted budget is explicitly labelled as an
+    extrapolation; an unavailable scan returns ``None`` rather than silently
+    treating the corpus as duplicate-free.
+    """
+    if budget is not None and not isinstance(budget, dict):
+        raise ValueError(
+            f"budget must be a mapping or None, got {type(budget).__name__}")
+    if redundancy is not None and not isinstance(redundancy, dict):
+        raise ValueError(
+            f"redundancy must be a mapping or None, got {type(redundancy).__name__}")
+    budget = budget or {}
+    redundancy = redundancy or {}
+    enabled = bool(_strict_bool_option(
+        redundancy.get("enabled", False), "redundancy.enabled", allow_none=True))
+    total_raw = redundancy.get("total_tokens")
+    flagged_raw = redundancy.get("flagged_tokens")
+    total = _strict_int_option(
+        0 if total_raw is None else total_raw, "redundancy.total_tokens", 0)
+    flagged = _strict_int_option(
+        0 if flagged_raw is None else flagged_raw, "redundancy.flagged_tokens", 0)
+    if flagged > total:
+        raise ValueError(
+            f"redundancy.flagged_tokens={flagged} exceeds "
+            f"redundancy.total_tokens={total}; a flagged subset cannot be "
+            "larger than the scanned tokens")
+    estimated = budget.get("estimated_effective_tokens")
+    if estimated is not None:
+        if _is_boolean_scalar(estimated):
+            raise ValueError(
+                "budget.estimated_effective_tokens must be numeric or None, "
+                f"got {estimated!r}")
+        if isinstance(estimated, numbers.Integral):
+            estimated = int(estimated)
+        else:
+            try:
+                estimated = float(estimated)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    "budget.estimated_effective_tokens must be numeric or None, "
+                    f"got {estimated!r}") from None
+            if not math.isfinite(estimated):
+                raise ValueError(
+                    "budget.estimated_effective_tokens must be finite, "
+                    f"got {estimated!r}")
+        if estimated < 0:
+            raise ValueError(
+                "budget.estimated_effective_tokens must be >= 0, "
+                f"got {estimated!r}")
+    budget_exhaustive = bool(_strict_bool_option(
+        budget.get("exhaustive", False), "budget.exhaustive", allow_none=True))
+    redundancy_exhaustive = bool(_strict_bool_option(
+        redundancy.get("exhaustive", False), "redundancy.exhaustive",
+        allow_none=True))
+    scan_exhaustive = bool(budget_exhaustive and redundancy_exhaustive)
+    result = {
+        "enabled": enabled,
+        "estimated_effective_tokens": estimated,
+        "estimated_redundant_tokens": None,
+        "estimated_unique_tokens": None,
+        "redundant_token_fraction": None,
+        "total_tokens": total,
+        "flagged_tokens": flagged,
+        "unique_tokens_are_lower_bound": False,
+        "basis": "not_available",
+        "exhaustive": scan_exhaustive,
+    }
+    if not enabled or estimated is None or total <= 0:
+        return result
+    fraction = Fraction(flagged, total)
+    try:
+        redundant = float(estimated * fraction)
+    except OverflowError:
+        redundant = math.inf if flagged else 0.0
+    try:
+        unique = float(Fraction(estimated) * (1 - fraction))
+    except OverflowError:
+        unique = math.inf
+    result.update(
+        estimated_redundant_tokens=redundant,
+        estimated_unique_tokens=unique,
+        redundant_token_fraction=float(fraction),
+        # Subtracting every flagged document in full over-counts redundancy
+        # when copies overlap each other, so the adjusted count is a lower
+        # bound on the true distinct-token count.  A sampled scan extrapolates
+        # instead, which is why that case is not labelled a lower bound.
+        unique_tokens_are_lower_bound=bool(flagged > 0 and scan_exhaustive),
+        basis=("observed" if scan_exhaustive
+               else "extrapolated_from_sampled_prefix"),
+    )
+    return result
 
 

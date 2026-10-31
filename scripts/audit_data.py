@@ -30,6 +30,14 @@ Reads a bounded sample of the train / validation / test splits produced by
   canonical digests of flagged held-out documents into the existing
   `--write-train-hash-file` / `--write-val-hash-file` ledgers so the trainer
   can drop them instead of only reporting them;
+* training-data redundancy: the same scan also compares every train document
+  with earlier train documents, because mirrored/reworded copies are not
+  cross-split leakage but do reduce the number of *distinct* tokens behind a
+  "trained on N tokens" claim.  The report carries the flagged-token fraction,
+  a one-sided bound, and an adjusted unique-token budget; `--max-train-near-dup-rate`
+  makes the redundancy tolerance pre-registered, and `--write-train-near-dup-file`
+  emits the later copies as an `--exclude-train-hash-file` ledger so the run
+  keeps the first occurrence and its token budget matches the audit;
 * group hygiene (`--group-key`): documents sharing a grouping unit (same
   user / item / source page) must not straddle any split boundary. The audit
   counts held-out documents whose group occurs in an earlier split and fails
@@ -74,7 +82,10 @@ by `--exclude-group-file` / `--exclude-test-group-file`, so a group lying on
 an earlier side is dropped whole from the later sides. A full ledger requires
 `--n-docs 0`; with a bounded sample the file covers only the sampled prefix,
 and the run records `*.exhaustive = false` and warns instead of implying full
-coverage.
+coverage.  `--exclude-train-hash-file` replays a training-side exclusion
+ledger (benchmark contamination or the near-duplicate ledger above) while
+auditing, so the effective train token and redundancy budgets describe the
+same corpus the run actually fits.
 
 This script only *reads* data; it never trains or writes to a split.
 """
@@ -98,7 +109,8 @@ from adasquash.metrics import wilson_interval
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.data_pipeline import (DocumentCleaner, _is_token_row,
                                    canonical_document_hash, document_hash,
-                                   extract_group_value, group_hash, load_document_stream)
+                                   extract_group_value, group_hash,
+                                   load_document_stream, load_hash_file)
 
 from scripts.audit_validation import (_is_boolean_scalar,
     _strict_bool_option,
@@ -119,12 +131,15 @@ from scripts.audit_near_duplicate import (_NEAR_DUP_BANDS,
     near_duplicate_ledger_additions,
     near_duplicate_record,
     near_duplicate_scan_bound,
+    near_duplicate_train_budget,
+    near_duplicate_train_ledger_hashes,
     token_shingles,
+    within_split_near_duplicates,
 )
 
 
 
-def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, known_hashes_exhaustive=True, known_hashes_extra_exhaustive=True, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, known_groups_exhaustive=True, known_groups_extra_exhaustive=True, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None, near_dup=False, near_dup_shingle=8, near_dup_max_docs=4000, near_dup_max_shingles=_NEAR_DUP_MAX_SHINGLES):
+def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, min_doc_chars, max_doc_chars, dedup, known_hashes=None, known_hashes_extra=None, known_hashes_exhaustive=True, known_hashes_extra_exhaustive=True, collect_hashes=True, group_key=None, known_groups=None, known_groups_extra=None, known_groups_exhaustive=True, known_groups_extra_exhaustive=True, collect_groups=True, exclude_hashes=None, exclude_group_hashes=None, exclude_train_hashes=None, near_dup=False, near_dup_shingle=8, near_dup_max_docs=4000, near_dup_max_shingles=_NEAR_DUP_MAX_SHINGLES):
     stream, report = load_document_stream(dataset, dataset_config, name, options)
     cleaner = DocumentCleaner(dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars)
     # The pipeline checks the cross-split group/document ledgers *before* the
@@ -136,7 +151,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     effective_cleaner = DocumentCleaner(
         dedup=dedup, min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars,
         exclude_hashes=exclude_hashes, group_key=group_key,
-        exclude_group_hashes=exclude_group_hashes)
+        exclude_group_hashes=exclude_group_hashes,
+        exclude_train_hashes=exclude_train_hashes)
     # One machine-word int per document. `lengths` is the pre-ledger (raw)
     # view; `effective_lengths` is what the run actually consumes and is what
     # the held-out token-budget estimate is based on.
@@ -378,7 +394,8 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     # on the true overlap, not evidence that the splits are disjoint.
     stats['exhaustive'] = not capped
     effective_stats = effective_cleaner.report()
-    if exclude_hashes is not None or exclude_group_hashes is not None:
+    if (exclude_hashes is not None or exclude_group_hashes is not None
+            or exclude_train_hashes is not None):
         stats['ledger_documents_dropped'] = (
             int(effective_stats.get('dropped_cross_split_duplicate', 0))
             + int(effective_stats.get('dropped_cross_split_group', 0)))
@@ -386,6 +403,9 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
     else:
         stats['ledger_documents_dropped'] = None
         stats['effective_documents_kept'] = stats.get('documents_kept', len(lengths))
+    stats['training_exclusions_dropped'] = (
+        int(effective_stats.get('dropped_training_exclusion', 0))
+        if exclude_train_hashes is not None else None)
     stats['duplicate_overlap_with_train'] = overlap if known_hashes is not None else None
     stats['duplicate_overlap_with_validation'] = overlap_extra if known_hashes_extra is not None else None
     # A sampled current split *or* a sampled known prefix both make the count
@@ -929,7 +949,7 @@ def _write_hash_ledger(path, hashes: set, n_docs: int, split_name: str,
           f'{" (exhaustive)" if exhaustive else " (SAMPLED PREFIX ONLY)"}')
     if not exhaustive:
         print(f'[audit] WARNING: the ledger covers at most the first {n_docs} '
-              f'{split_name} documents; consumed as a cross-split exclude ledger it '
+              f'{split_name} documents; consumed as an exclude ledger it '
               f'only drops duplicates of that prefix. Re-run with --n-docs 0 for a full ledger.',
               file=sys.stderr)
     return info
@@ -971,6 +991,7 @@ def main():
     p.add_argument('--no-dedup', dest='dedup', action='store_false')
     p.add_argument('--write-train-hash-file', default=None, help='write the hashes of the sampled training documents here; feed the file to train_gpt2.py --exclude-hash-file so validation/test drop exact duplicates of training documents (use --n-docs 0 for a full ledger)')
     p.add_argument('--write-val-hash-file', default=None, help='write the hashes of the sampled validation documents here; feed the file to train_gpt2.py --exclude-test-hash-file so the sealed test drops exact duplicates of validation documents (a val/test duplicate makes the selection split and the final split non-disjoint; use --n-docs 0 for a full ledger)')
+    p.add_argument('--exclude-train-hash-file', default=None, help='training-side exclusion ledger (e.g. scripts/audit_benchmark_contamination.py --write-train-exclusion-file, or this script --write-train-near-dup-file); apply it to the TRAIN split while auditing so the reported effective train token/redundancy budget matches the run that consumes it (ignored for held-out splits)')
     p.add_argument('--group-key', default=None, help='optional grouping-unit field (top-level name or dotted path such as "meta.url"); held-out documents whose group occurs in an earlier split are counted as leakage (same semantics as train_gpt2.py --group-key)')
     p.add_argument('--write-train-group-file', default=None, help='write the grouping-unit hashes of the sampled training documents here; feed the file to train_gpt2.py --exclude-group-file so validation/test drop every document whose group was seen in train (requires --group-key; use --n-docs 0 for a full ledger)')
     p.add_argument('--write-val-group-file', default=None, help='write the grouping-unit hashes of the sampled validation documents here; feed the file to train_gpt2.py --exclude-test-group-file so the sealed test drops every document whose group was seen in validation (requires --group-key; use --n-docs 0 for a full ledger)')
@@ -984,7 +1005,9 @@ def main():
     p.add_argument('--near-dup-max-docs', type=int, default=4000, help='maximum documents sketched per split; the scan is then a prefix and reports itself as a lower bound (default 4000)')
     p.add_argument('--near-dup-max-shingles', type=int, default=_NEAR_DUP_MAX_SHINGLES, help='bottom-k token shingles used per document (default %(default)s); bounds the sketch cost on very long documents')
     p.add_argument('--max-near-dup-rate', type=float, default=None, help='pre-registered tolerable fraction of held-out documents with a cross-split near-duplicate (e.g. 0.001); fail when the one-sided confidence upper bound on the scanned documents exceeds it (omit for report-only; requires --near-dup)')
+    p.add_argument('--max-train-near-dup-rate', type=float, default=None, help='pre-registered tolerable fraction of sketched TRAIN documents that near-duplicate an earlier train document (training-data redundancy, not leakage); fail when the one-sided upper confidence bound exceeds it (omit for report-only; requires --near-dup)')
     p.add_argument('--append-near-dup-to-ledgers', action='store_true', help='append the canonical digests of flagged held-out near-duplicates to the --write-train-hash-file / --write-val-hash-file ledgers, so the training run drops them from validation/test instead of only reporting them (requires --near-dup and at least one ledger output)')
+    p.add_argument('--write-train-near-dup-file', default=None, help='write the canonical digests of later TRAIN documents that near-duplicate an earlier train document; feed the file to train_gpt2.py --exclude-train-hash-file so the run keeps only the first copy and its unique-token budget matches the audit (requires --near-dup; use --n-docs 0 for a full ledger)')
     p.add_argument('--min-eval-tokens', type=int, default=0, help='fail when the estimated effective tokens of validation or test fall below this floor (0 = report only); the estimate is exact when --n-docs 0, otherwise extrapolated from the sampled prefix')
     p.add_argument('--min-eval-docs', type=int, default=0, help='fail when the estimated effective document count of validation or test falls below this floor (0 = report only)')
     p.add_argument('--scheduled-train-tokens', type=int, default=0, help='planned unique training tokens (max_steps * batch_size * grad_accum * seq_len); when > 0, compare it with the estimated effective train-split budget so a silently recycled training stream is visible')
@@ -1048,6 +1071,33 @@ def main():
                 f'--max-near-dup-rate {args.max_near_dup_rate} must be finite and in [0, 1]')
         if not args.near_dup:
             raise SystemExit('--max-near-dup-rate requires the near-duplicate scan (do not pass --no-near-dup)')
+    if args.max_train_near_dup_rate is not None:
+        if not (math.isfinite(args.max_train_near_dup_rate)
+                and 0.0 <= args.max_train_near_dup_rate <= 1.0):
+            raise SystemExit(
+                f'--max-train-near-dup-rate {args.max_train_near_dup_rate} '
+                'must be finite and in [0, 1]')
+        if not args.near_dup:
+            raise SystemExit('--max-train-near-dup-rate requires the near-duplicate scan (do not pass --no-near-dup)')
+    if args.write_train_near_dup_file and not args.near_dup:
+        raise SystemExit('--write-train-near-dup-file requires the near-duplicate scan (do not pass --no-near-dup)')
+    if args.exclude_train_hash_file:
+        if not Path(args.exclude_train_hash_file).is_file():
+            raise SystemExit(
+                f'--exclude-train-hash-file {args.exclude_train_hash_file} '
+                'does not exist or is not a file')
+        exclusion_path = Path(args.exclude_train_hash_file).resolve()
+        for flag, output_path in (
+                ('--write-train-hash-file', args.write_train_hash_file),
+                ('--write-val-hash-file', args.write_val_hash_file),
+                ('--write-train-group-file', args.write_train_group_file),
+                ('--write-val-group-file', args.write_val_group_file),
+                ('--write-train-near-dup-file', args.write_train_near_dup_file)):
+            if output_path and Path(output_path).resolve() == exclusion_path:
+                raise SystemExit(
+                    f'--exclude-train-hash-file and {flag} must name different '
+                    'files: the audit reads the first and overwrites the second, '
+                    'which would drop the pre-existing exclusions')
     if args.append_near_dup_to_ledgers:
         if not args.near_dup:
             raise SystemExit('--append-near-dup-to-ledgers requires the near-duplicate scan (do not pass --no-near-dup)')
@@ -1082,6 +1132,14 @@ def main():
     val_ledger_info = None
     train_group_ledger_info = None
     val_group_ledger_info = None
+    train_exclusion_hashes = (load_hash_file(args.exclude_train_hash_file)
+                              if args.exclude_train_hash_file else None)
+    train_exclusion_ledger_info = (
+        {'path': str(args.exclude_train_hash_file),
+         'n_hashes': len(train_exclusion_hashes),
+         'fingerprint': file_fingerprint(args.exclude_train_hash_file),
+         'applied_to_split': 'train'}
+        if args.exclude_train_hash_file else None)
     # A zero held-out fraction disables that split in the data pipeline; audit
     # the splits the run actually has instead of requesting empty ones.
     active_splits = [name for name in ('train', 'validation', 'test')
@@ -1128,6 +1186,8 @@ def main():
             collect_groups=(name in ('train', 'validation')),
             exclude_hashes=exclude_hashes,
             exclude_group_hashes=exclude_groups,
+            exclude_train_hashes=(train_exclusion_hashes
+                                  if name == 'train' else None),
             near_dup=args.near_dup,
             near_dup_shingle=args.near_dup_shingle,
             near_dup_max_docs=args.near_dup_max_docs,
@@ -1262,6 +1322,57 @@ def main():
     near_dup_bound = near_duplicate_scan_bound(
         near_dup_report, max_rate=args.max_near_dup_rate)
     near_dup_report['scan_bound'] = near_dup_bound
+    if args.near_dup:
+        train_near_dup = within_split_near_duplicates(
+            near_records.get('train') or [],
+            threshold=args.near_dup_threshold,
+            margin=args.near_dup_margin,
+            shingle_size=args.near_dup_shingle,
+            exhaustive=bool((splits.get('train') or {}).get('exhaustive', False)),
+            truncated=bool((near_meta.get('train') or {}).get('truncated', False)))
+        train_near_dup['scan_by_split'] = near_meta.get('train')
+        train_near_dup['scan_bound'] = near_duplicate_scan_bound(
+            {'enabled': True,
+             'exhaustive': train_near_dup['exhaustive'],
+             'by_later_split': {'train': {
+                 'documents': train_near_dup['documents'],
+                 'flagged_documents': train_near_dup['flagged_documents']}}},
+            max_rate=args.max_train_near_dup_rate)
+        near_dup_report['within_split'] = {'train': train_near_dup}
+    else:
+        train_near_dup = {
+            'enabled': False,
+            'documents': 0,
+            'documents_with_sketch': 0,
+            'flagged_documents': 0,
+            'flagged_tokens': 0,
+            'total_tokens': 0,
+            'redundant_token_fraction': None,
+            'exhaustive': False,
+            'lower_bound': False,
+            'notes': ['the within-train near-duplicate scan was disabled by --no-near-dup'],
+            'scan_bound': None,
+        }
+    train_unique_budget = near_duplicate_train_budget(train_budget, train_near_dup)
+    train_unique_wrap = train_wrap_status(
+        {'estimated_effective_tokens': train_unique_budget['estimated_unique_tokens'],
+         'basis': train_unique_budget['basis'],
+         'exhaustive': train_unique_budget['exhaustive']},
+        scheduled_train_tokens)
+    train_near_dup_ledger_info = None
+    if args.write_train_near_dup_file:
+        train_additions = near_duplicate_train_ledger_hashes(train_near_dup)
+        train_near_dup_ledger_info = _write_hash_ledger(
+            args.write_train_near_dup_file, train_additions['hashes'],
+            args.n_docs, 'train-near-duplicate',
+            exhaustive=train_near_dup.get('exhaustive', False))
+        train_near_dup_ledger_info['missing_digest_documents'] = int(
+            train_additions['missing_digest_documents'])
+        if train_additions['missing_digest_documents']:
+            train_near_dup.setdefault('notes', []).append(
+                f"{train_additions['missing_digest_documents']} flagged train "
+                "near-duplicate(s) had no usable canonical digest and were not "
+                "written to the exclusion ledger")
     if args.append_near_dup_to_ledgers:
         additions = near_duplicate_ledger_additions(near_dup_report)
         coverage = ('audited_split' if near_dup_report.get('exhaustive')
@@ -1300,7 +1411,12 @@ def main():
            'held_out_eval_budget': held_out_eval,
            'train_token_budget': train_budget,
            'train_stream_wrap': train_wrap,
+           'train_near_duplicate_redundancy': train_near_dup,
+           'train_unique_token_budget': train_unique_budget,
+           'train_unique_stream_wrap': train_unique_wrap,
            'near_duplicate_leakage': near_dup_report,
+           'train_near_dup_ledger': train_near_dup_ledger_info,
+           'train_exclusion_ledger': train_exclusion_ledger_info,
            'train_hash_ledger': train_ledger_info,
            'validation_hash_ledger': val_ledger_info,
            'train_group_ledger': train_group_ledger_info,
@@ -1316,6 +1432,10 @@ def main():
         if name != 'train':
             line += (f" effective_kept={stats['effective_documents_kept']} "
                      f"ledger_dropped={stats['ledger_documents_dropped']}")
+        elif stats.get('training_exclusions_dropped') is not None:
+            line += (f" effective_kept={stats['effective_documents_kept']} "
+                     f"training_exclusions_dropped="
+                     f"{stats['training_exclusions_dropped']}")
         if args.group_key:
             line += (f" group_overlap_with_train={stats.get('group_overlap_with_train')} "
                      f"group_overlap_with_validation={stats.get('group_overlap_with_validation')}")
@@ -1349,6 +1469,40 @@ def main():
                   f"effective train tokens (coverage {train_wrap['coverage_ratio']:.2f}x); "
                   "the loader will start another pass and reuse documents, so the run is "
                   "not a single-epoch token budget")
+    if train_near_dup.get('enabled'):
+        print(f"[audit] train near-dup redundancy: "
+              f"{train_near_dup['flagged_documents']}/{train_near_dup['documents']} "
+              f"sketched document(s) duplicate an earlier train document "
+              f"({train_near_dup['flagged_tokens']} flagged token(s) of "
+              f"{train_near_dup['total_tokens']})")
+        bound = ((train_near_dup.get('scan_bound') or {}).get('by_later_split') or {}).get('train')
+        if bound and bound.get('upper_bound') is not None:
+            print(f"[audit] train near-dup bound: {bound['flagged_documents']}/"
+                  f"{bound['documents']} flagged (observed {bound['observed_rate']:.4%}), "
+                  f"one-sided {bound['confidence']:.1%} upper bound "
+                  f"{bound['upper_bound']:.4%} on the {bound['scope'].replace('_', ' ')}")
+        for note in train_near_dup.get('notes') or []:
+            print(f"[audit] NOTE: {note}")
+    if train_unique_budget.get('estimated_unique_tokens') is not None:
+        print(f"[audit] train unique-token budget: ~"
+              f"{_fmt_budget(train_unique_budget['estimated_unique_tokens'])} distinct "
+              f"tokens after subtracting ~"
+              f"{_fmt_budget(train_unique_budget['estimated_redundant_tokens'])} "
+              f"near-duplicate tokens ({train_unique_budget['basis']})")
+        if train_unique_wrap['wrap_expected']:
+            print(f"[audit] NOTE: the scheduled {scheduled_train_tokens} training tokens exceed "
+                  f"the estimated ~{_fmt_budget(train_unique_wrap['estimated_effective_tokens'])} "
+                  f"distinct train tokens (coverage {train_unique_wrap['coverage_ratio']:.2f}x); "
+                  "even though the packed stream may not wrap, repeated near-duplicate "
+                  "content is being optimised more often than the token count implies")
+    if train_near_dup_ledger_info is not None:
+        print(f"[audit] train near-dup ledger: {train_near_dup_ledger_info['n_hashes']} "
+              f"exclusion(s) in {train_near_dup_ledger_info['path']} "
+              f"({'exhaustive' if train_near_dup_ledger_info['exhaustive'] else 'SAMPLED PREFIX ONLY'})")
+    if train_exclusion_ledger_info is not None:
+        print(f"[audit] train exclusion ledger: {train_exclusion_ledger_info['n_hashes']} "
+              f"hash(es) from {train_exclusion_ledger_info['path']} applied to the "
+              "train split before the budget/redundancy scan")
     for name, budget in token_budgets.items():
         print(f"[audit] {name} token budget: ~"
               f"{_fmt_budget(budget['estimated_effective_tokens'])} effective tokens over ~"
@@ -1472,6 +1626,13 @@ def main():
                 f"{info['n_docs_limit']} documents of its split, so a run consuming it "
                 f"still accepts cross-split duplicates/groups beyond that prefix "
                 f"(re-run with --n-docs 0 for a full ledger)")
+    if train_near_dup_ledger_info and not train_near_dup_ledger_info.get('exhaustive'):
+        problems.append(
+            f"the train-near-duplicate ledger {train_near_dup_ledger_info['path']} "
+            f"covers only the first {train_near_dup_ledger_info['n_docs_limit']} "
+            "documents of the train split, so a run consuming it still trains on "
+            "redundant copies beyond that prefix (re-run with --n-docs 0 for a "
+            "full ledger)")
     sampled_short = []
     for name, stats in splits.items():
         report_count = (reports.get(name) or {}).get('count')
@@ -1578,6 +1739,7 @@ def main():
             "raise the test token budget so the advertised interval is the one reported")
     problems.extend(near_dup_report.get('problems') or [])
     problems.extend((near_dup_report.get('scan_bound') or {}).get('problems') or [])
+    problems.extend((train_near_dup.get('scan_bound') or {}).get('problems') or [])
     # The report itself must carry the verdict. It was written before the
     # leakage/sanity checks ran, so a failed audit's data_audit.json used to
     # look like a clean report with no problems while only the separate
@@ -1597,7 +1759,12 @@ def main():
         'held_out_eval_budget': held_out_eval,
         'train_token_budget': train_budget,
         'train_stream_wrap': train_wrap,
+        'train_near_duplicate_redundancy': train_near_dup,
+        'train_unique_token_budget': train_unique_budget,
+        'train_unique_stream_wrap': train_unique_wrap,
         'near_duplicate_leakage': near_dup_report,
+        'train_near_dup_ledger': train_near_dup_ledger_info,
+        'train_exclusion_ledger': train_exclusion_ledger_info,
         'train_hash_ledger': train_ledger_info,
         'validation_hash_ledger': val_ledger_info,
         'train_group_ledger': train_group_ledger_info,

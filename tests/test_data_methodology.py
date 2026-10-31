@@ -11,6 +11,9 @@ the newer data-quality guarantees:
 * token-shingle MinHash near-duplicate detection catches cross-split
   contamination that exact/canonical document hashes miss, while still
   reporting a sampled scan as a lower bound;
+* within-train near-duplicate redundancy is measured separately from
+  cross-split leakage: later copies can be excluded, and the effective token
+  budget is reduced to a distinct-token estimate;
 * the held-out *evaluation* budget is expressed in distinct packed batches,
   so a validation pass that would cycle its loader (and count repeated
   windows as independent) is visible before a run.
@@ -27,16 +30,20 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from adasquash.repro import compare_train_streams
-from scripts.audit_data import (eval_batch_capacity, evaluation_reuse_status,
-                                packed_window_count, split_token_budget,
+from scripts.audit_data import (_collect_split, eval_batch_capacity,
+                                evaluation_reuse_status, packed_window_count,
+                                split_token_budget,
                                 minhash_signature, near_duplicate_leakage,
                                 near_duplicate_ledger_additions,
                                 near_duplicate_record,
-                                near_duplicate_scan_bound, token_shingles,
-                                train_wrap_status)
+                                near_duplicate_scan_bound,
+                                near_duplicate_train_budget,
+                                near_duplicate_train_ledger_hashes,
+                                token_shingles, train_wrap_status,
+                                within_split_near_duplicates)
 from scripts.data_pipeline import (canonical_document_hash,
-                                   configure_data_options, get_data_options,
-                                   split_document_boundaries,
+                                   configure_data_options, document_hash,
+                                   get_data_options, split_document_boundaries,
                                    validate_data_options)
 
 
@@ -735,3 +742,180 @@ def test_compare_arms_reports_a_train_stream_mismatch_without_certifying():
     row = out['rows'][0]
     assert any('identity was not established' in problem
                for problem in row['protocol_problems'])
+
+
+# ---------------------------------------------------------------------------
+# Within-train near-duplicate redundancy
+# ---------------------------------------------------------------------------
+def test_within_split_near_duplicates_flags_only_the_later_train_copy():
+    base = list(range(200))
+    reworded = base[:95] + [9000, 9001, 9002, 9003, 9004] + base[100:]
+    first = near_duplicate_record(
+        base, canonical_digest=canonical_document_hash("first"))
+    first["doc_index"] = 0
+    later = near_duplicate_record(
+        reworded, canonical_digest=canonical_document_hash("later"))
+    later["doc_index"] = 1
+    unrelated = near_duplicate_record(
+        list(range(1000, 1300)),
+        canonical_digest=canonical_document_hash("unrelated"))
+    unrelated["doc_index"] = 2
+    report = within_split_near_duplicates([first, later, unrelated])
+    assert report["flagged_documents"] == 1
+    assert report["flagged_pairs"] == 1
+    assert report["flagged_document_indices"] == [1]
+    assert report["flagged_digests"] == [canonical_document_hash("later").hex()]
+    assert report["flagged_tokens"] == len(reworded)
+    assert report["total_tokens"] == len(base) + len(reworded) + 300
+    assert report["redundant_token_fraction"] == pytest.approx(
+        len(reworded) / (len(base) + len(reworded) + 300))
+    assert report["examples"][0]["earlier_document_index"] == 0
+    assert report["examples"][0]["later_document_index"] == 1
+    assert any("training-data redundancy" in note for note in report["notes"])
+    # The first occurrence is never the one reported for exclusion.
+    assert report["flagged_document_indices"] != [0]
+
+
+def test_within_split_near_duplicates_leaves_unrelated_documents_clean():
+    first = near_duplicate_record(
+        list(range(200)), canonical_digest=canonical_document_hash("a"))
+    first["doc_index"] = 0
+    second = near_duplicate_record(
+        list(range(1000, 1200)), canonical_digest=canonical_document_hash("b"))
+    second["doc_index"] = 1
+    report = within_split_near_duplicates([first, second])
+    assert report["flagged_documents"] == 0
+    assert report["flagged_pairs"] == 0
+    assert report["flagged_tokens"] == 0
+    assert report["redundant_token_fraction"] == 0.0
+    assert report["notes"] == []
+
+
+def test_within_split_near_duplicates_marks_a_sampled_scan_as_a_lower_bound():
+    record = near_duplicate_record(list(range(200)),
+                                   canonical_digest=canonical_document_hash("x"))
+    report = within_split_near_duplicates([record], exhaustive=False)
+    assert report["exhaustive"] is False
+    assert report["lower_bound"] is True
+    assert any("lower bounds" in note for note in report["notes"])
+    truncated = within_split_near_duplicates([record], truncated=True)
+    assert truncated["exhaustive"] is False
+    assert truncated["lower_bound"] is True
+
+
+def test_within_split_near_duplicates_reports_missing_digests():
+    record = near_duplicate_record(list(range(200)))
+    report = within_split_near_duplicates([record, record])
+    assert report["flagged_documents"] == 1
+    assert report["missing_digest_documents"] == 1
+    assert any("cannot be excluded" in note for note in report["notes"])
+
+
+def test_near_duplicate_train_budget_subtracts_the_flagged_fraction():
+    budget = {"estimated_effective_tokens": 1000, "basis": "observed",
+              "exhaustive": True}
+    redundancy = {"enabled": True, "total_tokens": 1000,
+                  "flagged_tokens": 250, "exhaustive": True}
+    adjusted = near_duplicate_train_budget(budget, redundancy)
+    assert adjusted["estimated_effective_tokens"] == 1000
+    assert adjusted["estimated_redundant_tokens"] == 250
+    assert adjusted["estimated_unique_tokens"] == 750
+    assert adjusted["redundant_token_fraction"] == pytest.approx(0.25)
+    assert adjusted["unique_tokens_are_lower_bound"] is True
+    assert adjusted["basis"] == "observed"
+    assert adjusted["exhaustive"] is True
+
+    sampled = near_duplicate_train_budget(
+        budget, {**redundancy, "exhaustive": False})
+    assert sampled["basis"] == "extrapolated_from_sampled_prefix"
+    assert sampled["exhaustive"] is False
+    assert sampled["estimated_unique_tokens"] == 750
+    assert sampled["unique_tokens_are_lower_bound"] is False
+
+    unknown = near_duplicate_train_budget(
+        budget, {"enabled": False, "total_tokens": 0, "flagged_tokens": 0})
+    assert unknown["estimated_unique_tokens"] is None
+    assert unknown["basis"] == "not_available"
+    assert near_duplicate_train_budget(None, None)["estimated_unique_tokens"] is None
+
+    with pytest.raises(ValueError):
+        near_duplicate_train_budget(
+            budget, {"enabled": True, "total_tokens": 10, "flagged_tokens": 11})
+    with pytest.raises(ValueError):
+        near_duplicate_train_budget(
+            {"estimated_effective_tokens": -1}, redundancy)
+
+
+def test_near_duplicate_train_ledger_hashes_are_cleaner_compatible():
+    digest = canonical_document_hash("redundant train document")
+    report = {
+        "flagged_digests": [digest.hex(), "not-hex", "00"],
+        "missing_digest_documents": 2,
+    }
+    additions = near_duplicate_train_ledger_hashes(report)
+    assert additions["hashes"] == {digest}
+    # One malformed hex string, one wrong-width digest and two digest-less
+    # flagged documents are all counted as unledgerable.
+    assert additions["missing_digest_documents"] == 4
+
+
+def test_train_near_duplicate_ledger_drops_the_later_copy_from_training():
+    from scripts.data_pipeline import DocumentCleaner
+
+    first_text = " ".join(f"token{i}" for i in range(200))
+    later_text = " ".join(f"token{i}" for i in range(95)) + " changed " + " ".join(
+        f"token{i}" for i in range(100, 200))
+    first = near_duplicate_record(
+        list(range(200)), canonical_digest=canonical_document_hash(first_text))
+    later = near_duplicate_record(
+        list(range(95)) + [9000] + list(range(100, 200)),
+        canonical_digest=canonical_document_hash(later_text))
+    report = within_split_near_duplicates([first, later])
+    additions = near_duplicate_train_ledger_hashes(report)
+    cleaner = DocumentCleaner(dedup=False,
+                              exclude_train_hashes=additions["hashes"])
+    assert cleaner({"text": first_text}) == first_text
+    assert cleaner({"text": later_text}) is None
+    assert cleaner.report()["dropped_training_exclusion"] == 1
+
+
+def test_collect_split_applies_the_training_exclusion_ledger(monkeypatch):
+    import scripts.audit_data as audit_module
+
+    texts = ["alpha beta gamma", "delta epsilon zeta"]
+    documents = [{"text": text} for text in texts]
+
+    def fake_load_document_stream(dataset, dataset_config, split, options):
+        return iter(documents), {"split": split, "count": len(documents)}
+
+    monkeypatch.setattr(audit_module, "load_document_stream",
+                        fake_load_document_stream)
+
+    class FakeTokenizer:
+        vocab_size = 100
+
+        def __call__(self, texts, add_special_tokens=False):
+            def encode(text):
+                return [ord(char) % 50 + 1 for char in text]
+
+            if isinstance(texts, str):
+                return {"input_ids": encode(texts)}
+            return {"input_ids": [encode(text) for text in texts]}
+
+    ledger = {document_hash(texts[1]),
+              canonical_document_hash(texts[1])}
+    (stats, tokens, report, hashes, lengths, groups, tokens_effective,
+     near_records, near_meta) = _collect_split(
+        "train", "fake", None, FakeTokenizer(), {}, 0, 0, 0, False,
+        exclude_train_hashes=ledger)
+
+    assert stats["documents_kept"] == 2
+    assert stats["effective_documents_kept"] == 1
+    assert stats["training_exclusions_dropped"] == 1
+    assert stats["ledger_documents_dropped"] == 0
+    assert stats["tokens_total"] == sum(len(text) for text in texts)
+    assert stats["tokens_total_effective"] == len(texts[0])
+    assert document_hash(texts[1]) not in hashes
+    assert canonical_document_hash(texts[1]) not in hashes
+    assert document_hash(texts[0]) in hashes
+    assert near_meta["enabled"] is False
