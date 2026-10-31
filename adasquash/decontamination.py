@@ -490,7 +490,7 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     n = _nonnegative_int(trials, "trials")
     if k > n:
         raise ValueError(f"successes={k} cannot exceed trials={n}")
-    if _is_bool(confidence) or not isinstance(confidence, (int, float)):
+    if _is_bool(confidence) or not isinstance(confidence, numbers.Real):
         raise ValueError(f"confidence must be a number in (0, 1), got {confidence!r}")
     try:
         confidence = float(confidence)
@@ -578,7 +578,7 @@ def scan_token_documents(documents, index: NgramIndex, *,
         raise ValueError(f"exhaustive must be a bool, got {exhaustive!r}")
     exhaustive = bool(exhaustive)
     min_match_tokens = _nonnegative_int(min_match_tokens, "min_match_tokens")
-    if _is_bool(min_match_fraction) or not isinstance(min_match_fraction, (int, float)):
+    if _is_bool(min_match_fraction) or not isinstance(min_match_fraction, numbers.Real):
         raise ValueError(
             f"min_match_fraction must be a number in [0, 1], got {min_match_fraction!r}")
     try:
@@ -757,7 +757,7 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
             f"contaminated_documents={contaminated} + "
             f"below_threshold_documents={below_threshold} cannot exceed "
             f"scanned={scanned}")
-    if _is_bool(confidence) or not isinstance(confidence, (int, float)):
+    if _is_bool(confidence) or not isinstance(confidence, numbers.Real):
         raise ValueError(f"confidence must be a number in (0, 1), got {confidence!r}")
     try:
         confidence = float(confidence)
@@ -767,7 +767,7 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
     if not math.isfinite(confidence) or not 0.0 < confidence < 1.0:
         raise ValueError(f"confidence must be finite and in (0, 1), got {confidence!r}")
     if max_rate is not None:
-        if _is_bool(max_rate) or not isinstance(max_rate, (int, float)):
+        if _is_bool(max_rate) or not isinstance(max_rate, numbers.Real):
             raise ValueError(f"max_rate must be a number in [0, 1], got {max_rate!r}")
         try:
             max_rate = float(max_rate)
@@ -962,7 +962,7 @@ def contamination_protocol(*, ngram_size: int, benchmarks: dict,
         raise ValueError(
             f"normalization must be a non-empty string, got {normalization!r}")
     min_match_tokens = _nonnegative_int(min_match_tokens, "min_match_tokens")
-    if _is_bool(min_match_fraction) or not isinstance(min_match_fraction, (int, float)):
+    if _is_bool(min_match_fraction) or not isinstance(min_match_fraction, numbers.Real):
         raise ValueError(
             f"min_match_fraction must be a number in [0, 1], got {min_match_fraction!r}")
     try:
