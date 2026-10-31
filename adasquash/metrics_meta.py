@@ -1356,6 +1356,7 @@ def scale_replication_summary(observations: Sequence[dict],
                              'reason': f'non-finite delta {delta!r}'})
             continue
         key = (scale, metric, contrast)
+        certified = obs.get('certified')
         record = {
             'scale': scale,
             'metric': metric,
@@ -1363,8 +1364,8 @@ def scale_replication_summary(observations: Sequence[dict],
             'delta': delta_value,
             # Only an explicit boolean True certifies a scale. `bool("False")`
             # is True, so a malformed/legacy string must not be promoted into
-            # a multi-scale certification.
-            'certified': obs.get('certified') is True,
+            # a multi-scale certification; a NumPy boolean is still explicit.
+            'certified': (_is_boolean_value(certified) and bool(certified)),
             'n_seeds': obs.get('n_seeds'),
             # `dict.get(key, fallback)` only falls back when the key is
             # absent. A producer that emits `p_one_sided: None` alongside a

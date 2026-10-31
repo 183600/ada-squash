@@ -48,6 +48,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import scale_replication_summary
+from adasquash._validation import is_boolean_scalar
+
+
+def _explicit_true(value) -> bool:
+    return is_boolean_scalar(value) and bool(value)
 
 
 def _finite(value) -> bool:
@@ -74,7 +79,7 @@ def _same_scale_confirmed(entry: dict) -> bool:
     masquerade as two replications. ``is False`` let a malformed string such
     as ``"false"`` through, so any present non-True value fails closed.
     """
-    return 'same_scale' not in entry or entry.get('same_scale') is True
+    return 'same_scale' not in entry or _explicit_true(entry.get('same_scale'))
 
 
 def _reported_p(primary, fallback):
@@ -201,7 +206,7 @@ def _observation_from_pair(entry: dict, candidate: str, reference: str,
         # Only an explicit boolean True certifies a scale. `bool("False")`
         # is True, so a malformed/legacy string must not inherit a
         # certification the producer never asserted.
-        'certified': (entry.get('significant') is True
+        'certified': (_explicit_true(entry.get('significant'))
                       if orientation == 'candidate_vs_reference' else False),
         'p_one_sided': (_reported_p(entry.get('p_holm'), entry.get('p_one_sided'))
                         if orientation == 'candidate_vs_reference' else None),
@@ -255,8 +260,9 @@ def _observations_from_moe(data: dict, candidate: str, reference: str,
             # delta, so separate per-scale artifacts share one contrast id.
             'contrast': f'{candidate} vs {reference}',
             'delta': delta,
-            'certified': ((row.get('beats_reference_significantly') is True)
-                          if orientation == 'candidate_vs_reference' else False),
+            'certified': (_explicit_true(
+                row.get('beats_reference_significantly'))
+                if orientation == 'candidate_vs_reference' else False),
             'p_one_sided': (_reported_p(row.get('p_one_sided_holm'),
                                         row.get('p_one_sided'))
                             if orientation == 'candidate_vs_reference' else None),
