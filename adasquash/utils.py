@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+import numbers
 from collections import defaultdict, deque, OrderedDict
 from typing import Optional, Dict
 import torch
@@ -348,8 +349,8 @@ class LossSpikeCounter:
             n_spikes = 0
         elif isinstance(raw_n, bool):
             return False
-        elif isinstance(raw_n, int):
-            n_spikes = raw_n
+        elif isinstance(raw_n, numbers.Integral):
+            n_spikes = int(raw_n)
         elif (isinstance(raw_n, float) and math.isfinite(raw_n)
                 and raw_n.is_integer()):
             n_spikes = int(raw_n)
@@ -364,7 +365,7 @@ class LossSpikeCounter:
             self.ema = None
             self.n_spikes = 0
             return True
-        if not (isinstance(ema, (int, float)) and not isinstance(ema, bool)):
+        if (isinstance(ema, bool) or not isinstance(ema, numbers.Real)):
             return False
         try:
             ema_value = float(ema)
