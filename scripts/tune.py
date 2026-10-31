@@ -268,7 +268,7 @@ def _trial_record(summary: dict, lr: float, seed: int, weight_decay: float | Non
 
 
 def _finite_number(value) -> bool:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         return False
     try:
         return math.isfinite(float(value))

@@ -60,7 +60,7 @@ def _finite(value) -> bool:
     would poison the cell mean while looking like a complete seed. A huge
     JSON integer has no finite float conversion, so it is not usable either.
     """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         return False
     try:
         return math.isfinite(float(value))

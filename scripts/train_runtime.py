@@ -379,7 +379,7 @@ def _is_event_count(value) -> bool:
 
 def _is_finite_number(value) -> bool:
     """A real scalar with a finite float image (huge JSON ints are not)."""
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         return False
     try:
         return math.isfinite(float(value))
