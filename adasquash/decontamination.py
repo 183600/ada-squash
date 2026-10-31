@@ -574,8 +574,9 @@ def scan_token_documents(documents, index: NgramIndex, *,
     if not isinstance(index, NgramIndex):
         raise ValueError("index must be an NgramIndex")
     limit = _nonnegative_int(max_examples, "max_examples")
-    if not isinstance(exhaustive, bool):
+    if not _is_bool(exhaustive):
         raise ValueError(f"exhaustive must be a bool, got {exhaustive!r}")
+    exhaustive = bool(exhaustive)
     min_match_tokens = _nonnegative_int(min_match_tokens, "min_match_tokens")
     if _is_bool(min_match_fraction) or not isinstance(min_match_fraction, (int, float)):
         raise ValueError(
@@ -734,10 +735,11 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
     Bonferroni adjustment, so they are simultaneous at the requested
     confidence rather than marginal.  The any-benchmark bound is unchanged.
     """
-    if not isinstance(familywise_benchmark_bounds, bool):
+    if not _is_bool(familywise_benchmark_bounds):
         raise ValueError(
             "familywise_benchmark_bounds must be a bool, got "
             f"{familywise_benchmark_bounds!r}")
+    familywise_benchmark_bounds = bool(familywise_benchmark_bounds)
     if not isinstance(report, dict):
         raise ValueError("report must be a mapping")
     scanned = report.get("documents_scanned")
@@ -775,8 +777,10 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
         if not math.isfinite(max_rate) or not 0.0 <= max_rate <= 1.0:
             raise ValueError(f"max_rate must be finite and in [0, 1], got {max_rate!r}")
     exhaustive = report.get("exhaustive")
-    if exhaustive is not None and not isinstance(exhaustive, bool):
+    if exhaustive is not None and not _is_bool(exhaustive):
         raise ValueError(f"report.exhaustive must be a bool or None, got {exhaustive!r}")
+    if exhaustive is not None:
+        exhaustive = bool(exhaustive)
     scope = "audited_corpus" if exhaustive else "scanned_prefix"
     problems: list = []
     missing_digest = report.get("missing_digest_documents")
