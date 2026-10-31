@@ -42,6 +42,15 @@ Comparison protocol (what the runner guarantees, and checks)
   certified only when every interaction is equivalent within a pre-specified
   loss margin - a non-significant interaction is reported as such, not
   relabelled as additivity.
+* **Ordered hyper-parameter sweeps.** `DOSE_RESPONSE_SPEC` freezes the
+  reference, dose grid and declared single-knob difference for the softsign
+  `p` and DyT `alpha` initialization sweeps. `check_dose_response` rejects a
+  confounded, aliased, duplicate-dose or unordered sweep before training;
+  `dose_response_comparison` runs the same paired seed-level test for every
+  non-reference level, Holm-adjusts those tests plus an optional monotone
+  trend (for `p`, on `log2(p)`), and reports the post-hoc best level with
+  its cross-seed stability. The winner is explicitly not a confirmatory
+  claim: only the pre-registered level contrasts and trend are.
 * **Statistical reliability.** Every row is replicated over >= 3 seeds by
   default and reported as mean +/- std across seeds; the row-vs-baseline
   significance test is a one-sided paired Student-t test on the per-seed

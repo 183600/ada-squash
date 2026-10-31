@@ -4,15 +4,16 @@ import itertools
 import math
 
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
-                               paired_t_one_sided, ratio_effect_report,
-                               two_sided_p_from_t)
+                               paired_t_one_sided, paired_trend_test,
+                               ratio_effect_report, two_sided_p_from_t)
 
 from .common import (_basis_counted_in_family, _finite_metric,
                      _paired_effect_summary, _paired_row_test, _per_seed_deltas,
                      _robustness_for_deltas, _robustness_note, _row_n_seeds,
                      _row_std, _run_identity, _safe_exp, _seed_means)
-from .matrix import (FACTORIAL_SPEC, LOO_SPEC, QK_AXIS_SPEC,
-                     THREE_WAY_FACTORIAL_SPEC, _parse_three_way_cell_key)
+from .matrix import (DOSE_RESPONSE_SPEC, FACTORIAL_SPEC, LOO_SPEC,
+                     QK_AXIS_SPEC, THREE_WAY_FACTORIAL_SPEC,
+                     _parse_three_way_cell_key)
 
 def leave_one_out_comparison(summaries: list, spec: dict | None=None, margin: float=0.0,
                              alpha: float=0.05,
@@ -398,6 +399,509 @@ def print_qk_axis_comparison(comparison: dict | None) -> None:
     if not cross.get('certified_at_multiple_hosts'):
         print('[qk] NOTE: the QK axis is not certified at multiple hosts; report any effect '
               'with the host it was measured on (single-host scope), not as a general result')
+
+def _dose_value(value: float, transform: str) -> float:
+    if transform == 'log2':
+        return math.log2(value)
+    if transform == 'log10':
+        return math.log10(value)
+    if transform == 'ln':
+        return math.log(value)
+    return float(value)
+
+def _dose_response_trend(design_name: str, design: dict, levels: list,
+                         usable: dict, parent_of: dict, alpha: float) -> dict | None:
+    trend_spec = design.get('trend')
+    if not trend_spec:
+        return None
+    trend_rows = list(trend_spec.get('levels') or ())
+    reference_name = design.get('reference')
+    reference = usable.get(reference_name)
+    row_by_name = {level.get('row'): level for level in levels}
+    entry = {
+        'id': f'dose_response:{design_name}:trend',
+        'design': design_name,
+        'kind': 'trend',
+        'axis': design.get('axis'),
+        'reference': reference_name,
+        'levels': trend_rows,
+        'labels': [row_by_name[name].get('label') for name in trend_rows
+                   if name in row_by_name],
+        'raw_doses': None,
+        'doses': None,
+        'alternative': trend_spec.get('alternative', 'two_sided'),
+        'dose_transform': trend_spec.get('dose_transform', 'identity'),
+        'sided': ('two_sided'
+                  if trend_spec.get('alternative') == 'two_sided'
+                  else 'one_sided'),
+        'hypothesis': trend_spec.get('hypothesis'),
+        'n_seeds': 0,
+        'n_doses': len(trend_rows),
+        'seeds_used': [],
+        'excluded_seeds': {},
+        'mean_slope_per_dose': None,
+        'slope_ci_95': [None, None],
+        'p_lower': None,
+        'p_upper': None,
+        'p_one_sided': None,
+        'p_two_sided': None,
+        'p_one_sided_holm': None,
+        'direction_observed': False,
+        'trend_detected': False,
+        'trend_significant': False,
+        'certifiable': False,
+        'seed_jackknife': None,
+        'slope_randomization_test': None,
+        'note': None,
+        'skipped': None,
+    }
+    if reference is None:
+        entry['skipped'] = f"reference row '{reference_name}' has no usable val_loss"
+        return entry
+    absent = [name for name in trend_rows if name not in row_by_name]
+    if absent:
+        entry['skipped'] = f"trend level(s) {absent} are absent from the sweep"
+        return entry
+    row_objects = [usable.get(name) for name in trend_rows]
+    missing = [name for name, row in zip(trend_rows, row_objects)
+               if row is None]
+    if missing:
+        entry['skipped'] = f"row(s) {missing} have no usable val_loss"
+        return entry
+    reference_name = reference.get('name')
+    aliases = [name for name, row in zip(trend_rows, row_objects)
+               if name != reference_name
+               and _run_identity(row, parent_of)
+               == _run_identity(reference, parent_of)]
+    if aliases:
+        entry['skipped'] = (
+            f"trend level(s) {aliases} are the reference run under another "
+            f"name; a vacuous dose cannot enter the slope")
+        return entry
+    reference_seeds = _seed_means(reference)
+    seed_maps = [_seed_means(row) for row in row_objects]
+    common = sorted(set(reference_seeds).intersection(*(
+        set(seed_map) for seed_map in seed_maps))) if seed_maps else []
+    if len(common) < 2:
+        entry['skipped'] = (
+            f'only {len(common)} shared seed(s) across the trend rows; a '
+            f'slope needs at least two')
+        return entry
+    raw_doses = [float(row_by_name[name]['dose']) for name in trend_rows]
+    transform = entry['dose_transform']
+    doses = [_dose_value(dose, transform) for dose in raw_doses]
+    deltas = {
+        seed: [float(seed_map[seed] - reference_seeds[seed])
+               for seed_map in seed_maps]
+        for seed in common
+    }
+    trend = paired_trend_test(doses, deltas, alpha=alpha)
+    entry.update({
+        'raw_doses': raw_doses,
+        'doses': doses,
+        'n_seeds': trend.get('n_seeds', 0),
+        'n_doses': trend.get('n_doses', len(doses)),
+        'seeds_used': trend.get('seeds_used', []),
+        'excluded_seeds': trend.get('excluded_seeds', {}),
+        'mean_slope_per_dose': trend.get('mean_slope_per_dose'),
+        'slope_ci_95': trend.get('slope_ci_95', [None, None]),
+        'p_lower': trend.get('p_one_sided'),
+        'certifiable': bool(trend.get('certifiable')),
+        'seed_jackknife': trend.get('seed_jackknife'),
+        'slope_randomization_test': trend.get('slope_randomization_test'),
+        'note': trend.get('note'),
+    })
+    p_lower = entry['p_lower']
+    if p_lower is not None:
+        entry['p_upper'] = max(0.0, min(1.0, 1.0 - float(p_lower)))
+    entry['p_two_sided'] = two_sided_p_from_t(
+        trend.get('t'), trend.get('df'))
+    slope = entry['mean_slope_per_dose']
+    alternative = entry['alternative']
+    if alternative == 'increasing_loss':
+        entry['p_one_sided'] = entry['p_upper']
+        entry['direction_observed'] = bool(
+            slope is not None and slope > 0.0)
+    elif alternative == 'decreasing_loss':
+        entry['p_one_sided'] = entry['p_lower']
+        entry['direction_observed'] = bool(
+            slope is not None and slope < 0.0)
+    else:
+        entry['direction_observed'] = bool(
+            entry['p_two_sided'] is not None
+            and entry['p_two_sided'] < alpha)
+    p_claim = (entry['p_two_sided'] if alternative == 'two_sided'
+               else entry['p_one_sided'])
+    entry['trend_detected'] = bool(
+        entry['certifiable'] and p_claim is not None and p_claim < alpha
+        and entry['direction_observed'])
+    return entry
+
+def dose_response_comparison(summaries: list, spec: dict | None=None,
+                             margin: float=0.0, alpha: float=0.05,
+                             equivalence_margin: float=0.0) -> dict | None:
+    """Analyse ordered ablation sweeps against a pre-registered reference.
+
+    A hyper-parameter sweep is not a bag of pairwise rows. This function
+    compares every level with the declared reference using the same paired
+    seed-level test as the rest of the matrix, Holm-adjusts the level tests
+    (and an optional monotone trend) within the sweep, and reports the
+    post-hoc best level separately from the confirmatory contrasts. A
+    ``trend`` block tests whether the candidate-reference delta moves with
+    the dose on a transformed grid (for example ``log2(p)``); the p-value is
+    oriented to the pre-registered alternative, so "harder saturation hurts"
+    is a one-sided claim rather than a sign read off the point estimate.
+    The best level is always descriptive: selecting the minimum after seeing
+    the losses is a winner's-curse decision, and the report says whether that
+    winner is stable across seeds and whether it is the reference or an
+    interior level. Sweeps with fewer than three shared seeds stay
+    descriptive, and missing/alias levels are reported as skipped rather than
+    silently dropped.
+    """
+    spec = DOSE_RESPONSE_SPEC if spec is None else spec
+    usable = {r['name']: r for r in summaries
+              if isinstance(r, dict) and 'name' in r
+              and _finite_metric(r.get('val_loss'))}
+    parent_of = {r['name']: r['reused_from'] for r in summaries
+                 if isinstance(r, dict) and 'name' in r
+                 and isinstance(r.get('reused_from'), str)}
+    designs: dict[str, dict] = {}
+    all_rows: list = []
+    all_trends: list = []
+    for design_name, design in spec.items():
+        design = design or {}
+        reference_name = design.get('reference')
+        reference = usable.get(reference_name)
+        levels: list = []
+        for level in design.get('levels') or ():
+            row_name = level.get('row')
+            row = usable.get(row_name)
+            entry = {
+                'id': f'dose_response:{design_name}:{row_name}',
+                'design': design_name,
+                'kind': 'dose_response_level',
+                'axis': design.get('axis'),
+                'label': level.get('label'),
+                'dose': level.get('dose'),
+                'row': row_name,
+                'reference': reference_name,
+                'is_reference': bool(level.get('is_reference')),
+                'hypothesis': design.get('hypothesis'),
+                'candidate_val_loss': None if row is None else row['val_loss'],
+                'reference_val_loss': (None if reference is None
+                                       else reference['val_loss']),
+                'delta_candidate_minus_reference': None,
+                'delta_paired_mean': None,
+                'effect_helps': False,
+                'effect_helps_significantly': False,
+                'test': None,
+                'test_basis': None,
+                'paired_seeds': [],
+                'replicated_across_seeds': False,
+                'significance_basis': None,
+                'excluded_from_family': None,
+                'p_one_sided': None,
+                'p_one_sided_holm': None,
+                't': None,
+                'df': None,
+                'delta_ci_95': None,
+                'n_seeds_favoring': None,
+                'n_seeds_tied': None,
+                'n_seeds_against': None,
+                'per_seed_delta': None,
+                'paired_delta_std': None,
+                'minimum_detectable_delta_95_power80': None,
+                'seed_jackknife': None,
+                'equivalence': None,
+                'randomization_test': None,
+                'skipped': None,
+            }
+            if entry['is_reference']:
+                entry['delta_candidate_minus_reference'] = (
+                    None if row is None or reference is None
+                    else row['val_loss'] - reference['val_loss'])
+                levels.append(entry)
+                continue
+            if row is None:
+                entry['skipped'] = f"row '{row_name}' has no usable val_loss"
+                levels.append(entry)
+                continue
+            if reference is None:
+                entry['skipped'] = (
+                    f"reference row '{reference_name}' has no usable val_loss")
+                levels.append(entry)
+                continue
+            entry['delta_candidate_minus_reference'] = (
+                row['val_loss'] - reference['val_loss'])
+            entry['effect_helps'] = bool(
+                entry['delta_candidate_minus_reference'] < -margin)
+            if _run_identity(row, parent_of) == _run_identity(reference, parent_of):
+                entry['skipped'] = (
+                    f"'{row_name}' and '{reference_name}' are the same run "
+                    f"(reused summary); the level contrast is vacuous")
+                levels.append(entry)
+                continue
+            test, basis, common = _paired_row_test(
+                row, reference, margin=margin, alpha=alpha)
+            entry['test_basis'] = basis
+            entry['paired_seeds'] = common
+            entry['replicated_across_seeds'] = _basis_counted_in_family(
+                basis, len(common))
+            if test is not None:
+                entry.update({
+                    'test': test['test'],
+                    'p_one_sided': test['p_one_sided'],
+                    't': test['t'],
+                    'df': test['df'],
+                    'delta_ci_95': [test['ci_low'], test['ci_high']],
+                    'delta_paired_mean': test['mean_delta'],
+                    'n': test['n'],
+                })
+                if test['mean_delta'] is not None:
+                    entry['effect_helps'] = bool(
+                        test['mean_delta'] < -margin)
+            entry.update(_paired_effect_summary(
+                row, reference, common, test, alpha=alpha, margin=margin))
+            entry.update(_robustness_for_deltas(
+                _per_seed_deltas(row, reference, common),
+                alpha=alpha, equivalence_margin=equivalence_margin,
+                margin=margin))
+            if entry['test'] is not None and not entry['replicated_across_seeds']:
+                entry['significance_basis'] = (
+                    f'descriptive only: {len(common)} shared seed(s), fewer '
+                    f'than the required {MIN_SEEDS_FOR_SIGNIFICANCE}, so the '
+                    f'level effect cannot be certified; not counted in the '
+                    f'Holm family')
+            levels.append(entry)
+        trend = _dose_response_trend(
+            design_name, design, levels, usable, parent_of, alpha)
+        family = [entry for entry in levels
+                  if not entry['is_reference']
+                  and entry['replicated_across_seeds']
+                  and entry.get('excluded_from_family') is None]
+        if trend is not None and trend['certifiable'] and not trend['skipped']:
+            family.append(trend)
+        adjusted = holm_adjust([
+            (entry['p_two_sided'] if entry.get('kind') == 'trend'
+             and entry.get('sided') == 'two_sided' else entry['p_one_sided'])
+            for entry in family])
+        for entry, p_holm in zip(family, adjusted):
+            entry['p_one_sided_holm'] = p_holm
+            if entry.get('kind') == 'trend':
+                p_claim = (entry['p_two_sided']
+                           if entry.get('sided') == 'two_sided'
+                           else entry['p_one_sided'])
+                entry['trend_significant'] = bool(
+                    entry['direction_observed'] and p_holm is not None
+                    and p_holm < alpha)
+                entry['trend_detected'] = entry['trend_significant']
+            else:
+                paired_delta = entry.get('delta_paired_mean')
+                entry['effect_helps_significantly'] = bool(
+                    paired_delta is not None and paired_delta < -margin
+                    and p_holm is not None and p_holm < alpha)
+        level_candidates = [
+            entry for entry in levels
+            if not entry['skipped']
+            and _finite_metric(entry.get('candidate_val_loss'))]
+        best = None
+        best_mean = None
+        best_by_seed: dict[str, str] = {}
+        common: list = []
+        stable = None
+        interior = None
+        if level_candidates:
+            seed_maps = {
+                entry['row']: _seed_means(usable[entry['row']])
+                for entry in level_candidates}
+            common = sorted(set.intersection(*(
+                set(seed_map) for seed_map in seed_maps.values())))
+            if len(common) >= 2:
+                common_means = {
+                    entry['row']: (sum(seed_maps[entry['row']][seed]
+                                       for seed in common) / len(common))
+                    for entry in level_candidates}
+                best = min(level_candidates,
+                           key=lambda entry: (common_means[entry['row']],
+                                              entry['row']))
+                best_mean = common_means[best['row']]
+                for seed in common:
+                    winner = min(level_candidates,
+                                 key=lambda entry: (
+                                     seed_maps[entry['row']][seed],
+                                     entry['row']))
+                    best_by_seed[str(seed)] = winner['row']
+                if len(best_by_seed) >= MIN_SEEDS_FOR_SIGNIFICANCE:
+                    stable = all(row == best['row']
+                                 for row in best_by_seed.values())
+                order = [entry['row'] for entry in levels]
+                position = (order.index(best['row'])
+                            if best['row'] in order else None)
+                if position is not None and len(order) >= 3:
+                    interior = bool(0 < position < len(order) - 1)
+        best_level = None
+        best_selection = None
+        if best is not None:
+            best_level = {
+                'row': best['row'],
+                'label': best['label'],
+                'dose': best['dose'],
+                'val_loss': best_mean,
+                'val_loss_all_seeds': best['candidate_val_loss'],
+                'is_reference': best['is_reference'],
+                'delta_vs_reference': best.get(
+                    'delta_candidate_minus_reference'),
+                'effect_helps': best.get('effect_helps'),
+                'p_one_sided': best.get('p_one_sided'),
+                'p_one_sided_holm': best.get('p_one_sided_holm'),
+                'effect_helps_significantly': best.get(
+                    'effect_helps_significantly'),
+                'replicated_across_seeds': best.get(
+                    'replicated_across_seeds'),
+            }
+            best_selection = {
+                'criterion': ('lowest mean held-out val_loss on the seed set '
+                              'shared by every level'),
+                'post_hoc': True,
+                'stable_across_seeds': stable,
+                'minimum_seeds_for_stability': MIN_SEEDS_FOR_SIGNIFICANCE,
+                'n_seeds_compared': len(best_by_seed),
+                'common_seeds': common,
+                'best_level_by_seed': best_by_seed,
+                'is_interior_level': interior,
+                'note': ('the winner is selected after seeing the losses; '
+                         'only the pre-registered level-vs-reference tests '
+                         'and the sweep trend are confirmatory, so the '
+                         'winner must not be reported as a new claim'),
+            }
+        elif level_candidates:
+            best_selection = {
+                'criterion': ('lowest mean held-out val_loss on the seed set '
+                              'shared by every level'),
+                'post_hoc': True,
+                'stable_across_seeds': None,
+                'minimum_seeds_for_stability': MIN_SEEDS_FOR_SIGNIFICANCE,
+                'n_seeds_compared': len(common),
+                'common_seeds': common,
+                'best_level_by_seed': {},
+                'is_interior_level': None,
+                'note': ('no shared seed set across the sweep levels, so a '
+                         'post-hoc winner would compare different runs; no '
+                         'winner is reported'),
+            }
+        design_report = {
+            'reference': reference_name,
+            'axis': design.get('axis'),
+            'hypothesis': design.get('hypothesis'),
+            'levels': levels,
+            'trend': trend,
+            'best_level': best_level,
+            'best_level_selection': best_selection,
+            'n_tested': sum(1 for entry in family
+                            if entry.get('kind') != 'trend'),
+            'n_trend_tested': sum(1 for entry in family
+                                  if entry.get('kind') == 'trend'),
+            'n_levels_significant': sum(
+                entry.get('effect_helps_significantly')
+                for entry in levels if not entry['is_reference']),
+            'n_trends_significant': int(bool(
+                trend is not None and trend.get('trend_significant'))),
+        }
+        designs[design_name] = design_report
+        all_rows.extend(levels)
+        if trend is not None:
+            all_trends.append(trend)
+    if not designs:
+        return None
+    return {
+        'protocol': (
+            'ordered sweep: every non-reference level is compared with the '
+            'declared reference by a one-sided paired seed-level test '
+            '(H1 candidate has lower held-out val_loss); the level tests and '
+            'an optional pre-registered trend are Holm-adjusted within the '
+            'sweep, and only >= '
+            f'{MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds can certify a claim. '
+            'The post-hoc best level is reported separately and is not a '
+            'confirmatory contrast'),
+        'margin': margin,
+        'alpha': alpha,
+        'equivalence_margin': equivalence_margin,
+        'multiple_comparison': (
+            'Holm within each ordered sweep, including its trend when '
+            'certifiable; a level absent from the pre-registered plan is '
+            'still reported but remains exploratory at the study level'),
+        'designs': designs,
+        'rows': all_rows,
+        'trends': all_trends,
+    }
+
+def print_dose_response_comparison(comparison: dict | None) -> None:
+    if comparison is None:
+        print('[sweep] no ordered dose-response sweep available; nothing to test')
+        return
+    for design_name, design in comparison.get('designs', {}).items():
+        print(f"[sweep] {design_name}: reference={design['reference']} "
+              f"axis={design['axis']}")
+        for entry in design.get('levels', []):
+            if entry.get('is_reference'):
+                value = entry.get('candidate_val_loss')
+                value_str = ('n/a' if value is None
+                             else f'{value:.4f}')
+                print(f"[sweep]   {entry['label']}: reference "
+                      f"val_loss={value_str}")
+                continue
+            if entry.get('skipped'):
+                print(f"[sweep]   {entry['label']}: SKIPPED "
+                      f"({entry['skipped']})")
+                continue
+            p = entry.get('p_one_sided')
+            p_holm = entry.get('p_one_sided_holm')
+            p_str = 'n/a' if p is None else f'{p:.3g}'
+            p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
+            ci = entry.get('delta_ci_95')
+            ci_str = ('' if ci is None
+                      else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]")
+            note = ('' if entry['replicated_across_seeds']
+                    else ' [descriptive only, not certified]')
+            print(f"[sweep]   {entry['label']}: "
+                  f"delta={entry['delta_candidate_minus_reference']:+.4f}"
+                  f"{ci_str} p={p_str} p(holm)={p_holm_str} "
+                  f"helps={entry['effect_helps']} "
+                  f"significant={entry['effect_helps_significantly']}"
+                  f"{note}{_robustness_note(entry)}")
+        trend = design.get('trend')
+        if trend is not None:
+            if trend.get('skipped'):
+                print(f"[sweep]   trend: SKIPPED ({trend['skipped']})")
+            else:
+                p = (trend.get('p_two_sided')
+                     if trend.get('sided') == 'two_sided'
+                     else trend.get('p_one_sided'))
+                p_holm = trend.get('p_one_sided_holm')
+                p_str = 'n/a' if p is None else f'{p:.3g}'
+                p_holm_str = 'n/a' if p_holm is None else f'{p_holm:.3g}'
+                ci = trend.get('slope_ci_95')
+                ci_str = ('' if ci is None or ci[0] is None
+                          else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]")
+                slope = trend.get('mean_slope_per_dose')
+                slope_str = 'n/a' if slope is None else f'{slope:+.4f}'
+                print(f"[sweep]   trend({trend['alternative']}, "
+                      f"{trend['dose_transform']}): "
+                      f"slope={slope_str}{ci_str} "
+                      f"p={p_str} p(holm)={p_holm_str} "
+                      f"detected={trend['trend_detected']}"
+                      f"{'' if trend['certifiable'] else ' [descriptive only]'}")
+        best = design.get('best_level')
+        selection = design.get('best_level_selection') or {}
+        if best is not None:
+            print(f"[sweep]   post-hoc best: {best['label']} "
+                  f"val_loss={best['val_loss']:.4f} "
+                  f"stable_across_seeds={selection.get('stable_across_seeds')} "
+                  f"interior={selection.get('is_interior_level')} "
+                  f"(winner's-curse selection; not confirmatory)")
+        elif selection:
+            print(f"[sweep]   post-hoc best: unavailable "
+                  f"({selection.get('note')})")
 
 def print_leave_one_out_comparison(comparison: dict | None) -> None:
     if comparison is None:

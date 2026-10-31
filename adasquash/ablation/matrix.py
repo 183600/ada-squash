@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
+import math
 
 import torch
 
@@ -118,6 +119,53 @@ QK_AXIS_SPEC = {
                 'comparator': 'rmsnorm_qknorm'},
     'dytcd': {'off': 'dytcd_full', 'on': 'dytcd_qk',
               'comparator': 'dytcd_qknorm'},
+}
+
+DOSE_RESPONSE_SPEC = {
+    'softsign_p': {
+        'reference': 'dytc_p2_softsign',
+        'axis': 'p_init',
+        'levels': (
+            {'row': 'dytc_p1_softsign', 'dose': 1.0, 'label': 'p=1'},
+            {'row': 'dytc_p2_softsign', 'dose': 2.0, 'label': 'p=2',
+             'is_reference': True},
+            {'row': 'dytc_p4_softsign', 'dose': 4.0, 'label': 'p=4'},
+            {'row': 'dytc_hardtanh_eq', 'dose': 64.0,
+             'label': 'p=64 (hard-tanh limit)'},
+        ),
+        'declared_diff': ('p_init',),
+        'trend': {
+            'levels': ('dytc_p2_softsign', 'dytc_p4_softsign',
+                       'dytc_hardtanh_eq'),
+            'alternative': 'increasing_loss',
+            'dose_transform': 'log2',
+            'hypothesis': (
+                'Harder saturation from p=2 through p=4 to the p->infinity '
+                'hard-tanh limit raises held-out val_loss monotonically '
+                '(slope of candidate-reference delta > 0).'),
+        },
+        'hypothesis': (
+            'Within the fixed-p softsign sweep, p=2 is the interior optimum: '
+            'p=1 is too sharp, p=4 and the p->infinity hard-tanh limit lose '
+            'to p=2, and the loss rises from p=2 through p=4 to p=64.'),
+    },
+    'dyt_alpha_init': {
+        'reference': 'dyt_alpha_0.5',
+        'axis': 'alpha_init',
+        'levels': (
+            {'row': 'dyt_alpha_0.3', 'dose': 0.3, 'label': 'alpha=0.3'},
+            {'row': 'dyt_alpha_0.5', 'dose': 0.5, 'label': 'alpha=0.5',
+             'is_reference': True},
+            {'row': 'dyt_alpha_1.0', 'dose': 1.0, 'label': 'alpha=1.0'},
+        ),
+        'declared_diff': ('alpha_init',),
+        'trend': None,
+        'hypothesis': (
+            'The DyT alpha initialization materially changes held-out loss; '
+            'both non-reference levels are compared with alpha=0.5, and the '
+            'best level is reported without treating the post-hoc winner as '
+            'a confirmatory claim.'),
+    },
 }
 
 # A complete 2x2 factorial for the two axes the main proposal combines. The
@@ -576,6 +624,241 @@ def check_qk_axis(rows: dict, model_name: str, spec: dict | None=None) -> dict:
         raise ValueError('QK-axis coverage is incomplete: ' + '; '.join(problems))
     return report
 
+def _finite_number(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+def check_dose_response(rows: dict, model_name: str,
+                        spec: dict | None=None) -> dict:
+    """Verify each ordered sweep changes exactly its declared axis.
+
+    A trend across ``p_init`` (or any ordered hyper-parameter) is only
+    interpretable when every level differs from the reference by the same
+    single declared field and the levels are distinct configurations. This
+    rejects a sweep whose "dose" also moves another knob, an alias level that
+    is the same run under a second name, duplicate or unordered doses, and a
+    trend that references a row outside the sweep. The report is frozen into
+    the analysis-plan fingerprint so a post-hoc change to the dose grid is a
+    changed experiment, not a re-analysis.
+    """
+    spec = DOSE_RESPONSE_SPEC if spec is None else spec
+    problems: list[str] = []
+    report: dict = {}
+    for design_name, design in spec.items():
+        design = design or {}
+        reference = design.get('reference')
+        declared = tuple(design.get('declared_diff') or ())
+        raw_levels = list(design.get('levels') or ())
+        if not isinstance(reference, str) or not reference:
+            problems.append(
+                f"ordered sweep '{design_name}' has no reference row")
+            continue
+        if reference not in rows:
+            problems.append(
+                f"ordered sweep '{design_name}' reference row "
+                f"'{reference}' is missing")
+            continue
+        if not declared or not all(isinstance(field, str) and field
+                                   for field in declared):
+            problems.append(
+                f"ordered sweep '{design_name}' has no declared "
+                f"effective-config diff")
+            continue
+        if len(set(declared)) != 1:
+            problems.append(
+                f"ordered sweep '{design_name}' must declare exactly one "
+                f"effective-config field, got {sorted(set(declared))}")
+            continue
+        axis = design.get('axis')
+        if not isinstance(axis, str) or not axis:
+            problems.append(
+                f"ordered sweep '{design_name}' has no axis name")
+            continue
+        if axis != declared[0]:
+            problems.append(
+                f"ordered sweep '{design_name}' axis {axis!r} does not match "
+                f"declared field {declared[0]!r}")
+            continue
+        if not raw_levels:
+            problems.append(f"ordered sweep '{design_name}' has no levels")
+            continue
+        levels: list[dict] = []
+        seen_rows: set[str] = set()
+        seen_doses: set[float] = set()
+        reference_count = 0
+        broken = False
+        for level in raw_levels:
+            if not isinstance(level, dict):
+                problems.append(
+                    f"ordered sweep '{design_name}' has a non-object level")
+                broken = True
+                break
+            row_name = level.get('row')
+            dose = level.get('dose')
+            label = str(level.get('label') or row_name or '')
+            is_reference = bool(level.get('is_reference'))
+            if not isinstance(row_name, str) or not row_name:
+                problems.append(
+                    f"ordered sweep '{design_name}' has a level without a "
+                    f"row name")
+                broken = True
+                break
+            if row_name in seen_rows:
+                problems.append(
+                    f"ordered sweep '{design_name}' repeats row "
+                    f"'{row_name}'")
+                broken = True
+                break
+            seen_rows.add(row_name)
+            if row_name not in rows:
+                problems.append(
+                    f"ordered sweep '{design_name}' references absent row "
+                    f"'{row_name}'")
+                broken = True
+                break
+            if not _finite_number(dose):
+                problems.append(
+                    f"ordered sweep '{design_name}', row '{row_name}': dose "
+                    f"{dose!r} is not finite")
+                broken = True
+                break
+            dose_value = float(dose)
+            if dose_value in seen_doses:
+                problems.append(
+                    f"ordered sweep '{design_name}' repeats dose "
+                    f"{dose_value:g}")
+                broken = True
+                break
+            seen_doses.add(dose_value)
+            if is_reference:
+                reference_count += 1
+                if row_name != reference:
+                    problems.append(
+                        f"ordered sweep '{design_name}' marks '{row_name}' "
+                        f"as the reference but names '{reference}'")
+                    broken = True
+                    break
+            levels.append({
+                'row': row_name,
+                'dose': dose_value,
+                'label': label,
+                'is_reference': is_reference,
+            })
+        if broken:
+            continue
+        if reference_count != 1:
+            problems.append(
+                f"ordered sweep '{design_name}' must mark exactly one "
+                f"reference level, got {reference_count}")
+            continue
+        ordered_doses = [level['dose'] for level in levels]
+        if any(first >= second for first, second in
+               zip(ordered_doses, ordered_doses[1:])):
+            problems.append(
+                f"ordered sweep '{design_name}' doses must be strictly "
+                f"increasing in declaration order, got {ordered_doses}")
+            continue
+        ref_cfg = _effective_cfg(model_name, rows[reference])
+        level_cfgs: dict[str, dict] = {}
+        clean = True
+        for level in levels:
+            row_name = level['row']
+            cfg = _effective_cfg(model_name, rows[row_name])
+            level_cfgs[row_name] = cfg
+            actual = {key for key in set(ref_cfg) | set(cfg)
+                      if ref_cfg.get(key) != cfg.get(key)}
+            if level['is_reference']:
+                if actual:
+                    problems.append(
+                        f"ordered sweep '{design_name}', reference "
+                        f"'{row_name}' differs from itself in {sorted(actual)}")
+                    clean = False
+                    break
+                continue
+            if actual != set(declared):
+                problems.append(
+                    f"ordered sweep '{design_name}', row '{row_name}' vs "
+                    f"reference '{reference}' differ in {sorted(actual)}, "
+                    f"expected exactly {sorted(declared)}")
+                clean = False
+                break
+        if not clean:
+            continue
+        config_keys = {
+            json.dumps(cfg, sort_keys=True) for cfg in level_cfgs.values()}
+        if len(config_keys) != len(level_cfgs):
+            problems.append(
+                f"ordered sweep '{design_name}' contains alias levels: two "
+                f"rows build the same effective model config")
+            continue
+        trend = design.get('trend')
+        trend_report = None
+        if trend is not None:
+            if not isinstance(trend, dict):
+                problems.append(
+                    f"ordered sweep '{design_name}' trend must be an object")
+                continue
+            trend_rows = list(trend.get('levels') or ())
+            alternative = trend.get('alternative', 'two_sided')
+            transform = trend.get('dose_transform', 'identity')
+            if len(trend_rows) < 2:
+                problems.append(
+                    f"ordered sweep '{design_name}' trend needs at least two "
+                    f"levels")
+                continue
+            if len(set(trend_rows)) != len(trend_rows):
+                problems.append(
+                    f"ordered sweep '{design_name}' trend repeats a level")
+                continue
+            absent = sorted(set(trend_rows) - seen_rows)
+            if absent:
+                problems.append(
+                    f"ordered sweep '{design_name}' trend references rows "
+                    f"outside the sweep: {absent}")
+                continue
+            if alternative not in ('increasing_loss', 'decreasing_loss',
+                                   'two_sided'):
+                problems.append(
+                    f"ordered sweep '{design_name}' trend alternative "
+                    f"{alternative!r} is not supported")
+                continue
+            if transform not in ('identity', 'log2', 'log10', 'ln'):
+                problems.append(
+                    f"ordered sweep '{design_name}' trend dose_transform "
+                    f"{transform!r} is not supported")
+                continue
+            dose_by_row = {level['row']: level['dose'] for level in levels}
+            trend_doses = [dose_by_row[row] for row in trend_rows]
+            if transform != 'identity' and any(dose <= 0.0
+                                               for dose in trend_doses):
+                problems.append(
+                    f"ordered sweep '{design_name}' trend uses "
+                    f"{transform} on a non-positive dose")
+                continue
+            trend_report = {
+                'levels': list(trend_rows),
+                'raw_doses': trend_doses,
+                'alternative': alternative,
+                'dose_transform': transform,
+                'hypothesis': trend.get('hypothesis'),
+            }
+        report[design_name] = {
+            'reference': reference,
+            'axis': design.get('axis'),
+            'declared_diff': list(declared),
+            'levels': levels,
+            'trend': trend_report,
+            'hypothesis': design.get('hypothesis'),
+        }
+    if problems:
+        raise ValueError('ordered dose-response coverage is incomplete: '
+                         + '; '.join(problems))
+    return report
+
 def validate_matrix(rows: dict, hypotheses: dict, model_name: str) -> dict:
     """Every static check the matrix must pass before any training starts."""
     missing = []
@@ -590,7 +873,8 @@ def validate_matrix(rows: dict, hypotheses: dict, model_name: str) -> dict:
             'leave_one_out': check_leave_one_out(rows, model_name),
             'factorial': check_factorial(rows, model_name),
             'three_way_factorial': check_three_way_factorial(rows, model_name),
-            'qk_axis': check_qk_axis(rows, model_name)}
+            'qk_axis': check_qk_axis(rows, model_name),
+            'dose_response': check_dose_response(rows, model_name)}
 
 def install_residual_outlier(model, layer_idx: int | None=None,
                              channel: int | None=None, scale: float=25.0):

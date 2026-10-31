@@ -266,6 +266,44 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
             'hypothesis': (f'per-head QK-Norm beats the tanh QK compression on '
                            f'{host}'),
         })
+    for design, info in sorted(
+            (matrix_report.get('dose_response') or {}).items()):
+        info = info or {}
+        reference = info.get('reference')
+        for level in info.get('levels') or []:
+            if level.get('is_reference'):
+                continue
+            _add({
+                'id': f"dose_response:{design}:{level.get('row')}",
+                'family': 'dose_response',
+                'kind': 'dose_response_level',
+                'design': design,
+                'axis': info.get('axis'),
+                'dose': level.get('dose'),
+                'candidate': level.get('row'),
+                'reference': reference,
+                'metric': 'val_loss',
+                'sided': 'one_sided',
+                'hypothesis': (
+                    f"{info.get('hypothesis')} "
+                    f"Level {level.get('label')} vs reference {reference}."),
+            })
+        trend = info.get('trend')
+        if trend:
+            alternative = trend.get('alternative', 'two_sided')
+            _add({
+                'id': f'dose_response:{design}:trend',
+                'family': 'dose_response',
+                'kind': 'trend',
+                'design': design,
+                'axis': info.get('axis'),
+                'factor': info.get('axis'),
+                'metric': 'val_loss',
+                'sided': ('two_sided' if alternative == 'two_sided'
+                          else 'one_sided'),
+                'alternative': alternative,
+                'hypothesis': trend.get('hypothesis'),
+            })
     # Hierarchical gatekeeping: the main proposal's own superiority and
     # mechanism contrasts are the primary family. Only if at least one of
     # them survives its Holm correction may the secondary contrasts (single
@@ -363,7 +401,7 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         'matrix_cells': {
             key: matrix_report.get(key)
             for key in ('leave_one_out', 'factorial', 'three_way_factorial',
-                        'qk_axis')
+                        'qk_axis', 'dose_response')
         },
         # The randomized execution order is part of the pre-registration: a
         # schedule chosen after seeing which arms look good is a design
@@ -568,6 +606,36 @@ def study_level_correction(comparisons: dict, plan: dict | None,
             effect=(entry.get('delta_paired_mean')
                     if entry.get('delta_paired_mean') is not None
                     else entry.get('delta_candidate_minus_reference')))
+    dose_response = comparisons.get('dose_response') or {}
+    for entry in dose_response.get('rows', []) or []:
+        if entry.get('skipped') or entry.get('is_reference'):
+            continue
+        _record(
+            entry['id'], 'dose_response',
+            entry.get('p_one_sided'), entry.get('p_one_sided_holm'),
+            entry.get('effect_helps'),
+            entry.get('effect_helps_significantly'),
+            hypothesis=entry.get('hypothesis'),
+            replicated=entry.get('replicated_across_seeds'),
+            test_basis=entry.get('test_basis'),
+            effect=(entry.get('delta_paired_mean')
+                    if entry.get('delta_paired_mean') is not None
+                    else entry.get('delta_candidate_minus_reference')))
+    for entry in dose_response.get('trends', []) or []:
+        if entry.get('skipped'):
+            continue
+        p_value = (entry.get('p_two_sided')
+                   if entry.get('sided') == 'two_sided'
+                   else entry.get('p_one_sided'))
+        _record(
+            entry['id'], 'dose_response', p_value,
+            entry.get('p_one_sided_holm'),
+            entry.get('direction_observed'),
+            entry.get('trend_significant'),
+            hypothesis=entry.get('hypothesis'),
+            replicated=entry.get('certifiable'),
+            test_basis='paired_trend',
+            effect=entry.get('mean_slope_per_dose'))
 
     registered: list = []
     unregistered: list = []

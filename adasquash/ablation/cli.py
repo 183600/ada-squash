@@ -26,7 +26,9 @@ from .baselines import (attach_baseline_tuning,
                         load_baseline_tuning, load_simple_baselines,
                         print_baseline_comparison, run_simple_baseline_calibration)
 from .common import _is_integer_scalar, _is_seed_id
-from .contrasts import (factorial_comparison, leave_one_out_comparison,
+from .contrasts import (dose_response_comparison, factorial_comparison,
+                        leave_one_out_comparison,
+                        print_dose_response_comparison,
                         print_factorial_comparison,
                         print_leave_one_out_comparison,
                         print_qk_axis_comparison,
@@ -774,14 +776,22 @@ def main():
         with open(base / 'qk_axis_comparison.json', 'w') as f:
             json.dump(qk_axis, f, indent=2)
     print_qk_axis_comparison(qk_axis)
-    # Study-level multiplicity: the four reports above each correct within
-    # their own family, but the paper-level claim is made across all of them.
-    # Pool only the pre-registered confirmatory contrasts and report what the
+    dose_response = dose_response_comparison(
+        comparable, margin=args.baseline_margin, alpha=args.alpha,
+        equivalence_margin=args.equivalence_margin)
+    if dose_response is not None:
+        dose_response['rows_excluded_protocol_mismatch'] = stale_rows
+        with open(base / 'dose_response_comparison.json', 'w') as f:
+            json.dump(dose_response, f, indent=2)
+    print_dose_response_comparison(dose_response)
+    # Study-level multiplicity: the reports above each correct within their
+    # own family, but the paper-level claim is made across all of them. Pool
+    # only the pre-registered confirmatory contrasts and report what the
     # global Holm correction confirms (or demotes).
     study = study_level_correction(
         {'baseline': comparison, 'leave_one_out': loo_comparison,
          'factorial': factorial, 'factorial3': three_way,
-         'qk_axis': qk_axis},
+         'qk_axis': qk_axis, 'dose_response': dose_response},
         analysis_plan, alpha=args.alpha)
     if study is not None:
         with open(base / 'study_level_tests.json', 'w') as f:
@@ -849,6 +859,7 @@ def main():
     manifest['factorial_comparison'] = factorial
     manifest['three_way_factorial_comparison'] = three_way
     manifest['qk_axis_comparison'] = qk_axis
+    manifest['dose_response_comparison'] = dose_response
     manifest['analysis_plan'] = analysis_plan
     manifest['paired_sd_evidence'] = paired_sd_evidence
     manifest['study_level_tests'] = study
@@ -874,6 +885,8 @@ def main():
         'three_way_factorial_comparison': artifact_record(
             base / 'three_way_factorial_comparison.json'),
         'qk_axis_comparison': artifact_record(base / 'qk_axis_comparison.json'),
+        'dose_response_comparison': artifact_record(
+            base / 'dose_response_comparison.json'),
         'study_level_tests': artifact_record(base / 'study_level_tests.json'),
         'sequential_monitoring': (
             artifact_record(base / 'sequential_monitoring.json')
