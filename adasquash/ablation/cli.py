@@ -11,6 +11,8 @@ from adasquash.design import (design_readiness_audit, normalize_exclusion_policy
                               randomized_complete_block_schedule,
                               run_exclusion_audit, schedule_balance_report,
                               simulate_paired_design)
+from adasquash.metrics import MIN_SEEDS_FOR_SIGNIFICANCE
+from adasquash.sequential import audit_paired_contrasts
 from adasquash.repro import (artifact_record, collect_run_metadata,
                              file_fingerprint, finish_metadata, git_revision,
                              save_run_manifest)
@@ -89,6 +91,8 @@ def build_arg_parser(argv=None):
     p.add_argument('--no-randomize-order', dest='randomize_order', action='store_false', help='keep the matrix row order instead of a randomized complete-block schedule (the order is then recorded as not randomized; order drift cannot be separated from the arm)')
     p.add_argument('--assumed-paired-sd', type=float, default=None, help='pre-run assumption for the paired across-seed SD (e.g. from a pilot); with --baseline-margin this makes the design-readiness audit check planned power before launching runs')
     p.add_argument('--expected-attrition', type=float, default=0.0, help='pre-run expected fraction of planned runs lost to pre-specified protocol failures; a complete pair needs both arms, so the readiness audit plans for n*(1-attrition)^2 analyzable pairs and freezes this assumption in analysis_plan.json')
+    p.add_argument('--sequential-looks', type=int, default=0, help='freeze a group-sequential monitoring plan with this many interim looks over the planned seeds (0 = off); looking after every run and stopping when p < alpha is optional stopping, so the look counts and spending function are part of analysis_plan.json')
+    p.add_argument('--sequential-spending', choices=('obrien-fleming', 'pocock'), default='obrien-fleming', help='alpha-spending function for --sequential-looks (O Brien-Fleming spends little early; Pocock is closer to equal per look)')
     p.add_argument('--require-design-ready', action='store_true', help='fail before training when the design-readiness audit has a structural failure (missing replication/hypothesis, incomplete schedule, absent control pair, or underpowered for the stated margin)')
     p.add_argument('--require-plan-lock', action='store_true', help='fail when this invocation would replace an existing analysis_plan.json with a different fingerprint (changed seeds/alpha/margins/hypotheses); without it the drift is recorded and warned about, but the run proceeds')
     p.add_argument('--require-exclusion-audit', action='store_true', help='fail after training when the pre-specified attrition audit finds a duplicate run/seed, an unaccounted exclusion, or an arm left below 3 analyzable seeds; the audit is always written to exclusion_audit.json')
@@ -166,6 +170,18 @@ def main():
               f'(a repeated seed is the same run, not an independent replication)')
     if len(seeds) < 3 and not args.allow_uncertified:
         p.error(f'{len(seeds)} seed(s) selected: certification requires >= 3 independent seeds; use --allow-uncertified to run anyway (results will be descriptive only)')
+    if isinstance(args.sequential_looks, bool) or args.sequential_looks < 0:
+        p.error(f'--sequential-looks {args.sequential_looks} must be a non-negative integer')
+    if args.sequential_looks > 0 and len(seeds) < MIN_SEEDS_FOR_SIGNIFICANCE:
+        p.error('--sequential-looks needs at least '
+                f'{MIN_SEEDS_FOR_SIGNIFICANCE} planned seeds: an interim look '
+                'below the certification minimum cannot certify a contrast')
+    max_looks = len(seeds) - MIN_SEEDS_FOR_SIGNIFICANCE + 1
+    if args.sequential_looks > 0 and args.sequential_looks > max_looks:
+        p.error(f'--sequential-looks {args.sequential_looks} needs more '
+                f'distinct seed counts than {len(seeds)} planned seeds allow; '
+                f'at most {max_looks} look(s) are possible above the '
+                f'{MIN_SEEDS_FOR_SIGNIFICANCE}-seed certification minimum')
     try:
         matrix_report = validate_matrix(ablations, hypotheses, args.model)
     except ValueError as exc:
@@ -214,7 +230,9 @@ def main():
         alpha=args.alpha, margin=args.baseline_margin,
         equivalence_margin=args.equivalence_margin, run_schedule=run_schedule,
         exclusion_policy=exclusion_policy,
-        expected_attrition=args.expected_attrition)
+        expected_attrition=args.expected_attrition,
+        sequential_looks=args.sequential_looks,
+        sequential_spending=args.sequential_spending)
     matrix_report['analysis_plan'] = analysis_plan
     print(f"[plan] {analysis_plan['n_contrasts']} pre-registered confirmatory contrast(s) "
           f"(fingerprint {analysis_plan['fingerprint'][:12]}); every test outside this "
@@ -725,6 +743,40 @@ def main():
         with open(base / 'study_level_tests.json', 'w') as f:
             json.dump(study, f, indent=2)
     print_study_level_correction(study)
+    sequential_monitoring = None
+    sequential_plan = analysis_plan.get('sequential_monitoring')
+    if isinstance(sequential_plan, dict) and isinstance(comparison, dict):
+        contrast_deltas = {}
+        for entry in comparison.get('rows', []) or []:
+            name = entry.get('name')
+            per_seed = entry.get('per_seed_delta')
+            if not name or not isinstance(per_seed, dict):
+                continue
+            ordered = []
+            for seed in sorted(seeds):
+                value = per_seed.get(str(seed), per_seed.get(seed))
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))):
+                    break
+                ordered.append(float(value))
+            first_look_pairs = sequential_plan.get('look_pairs') or [2]
+            if len(ordered) >= first_look_pairs[0]:
+                contrast_deltas[f'baseline:{name}'] = ordered
+        sequential_monitoring = audit_paired_contrasts(
+            contrast_deltas, sequential_plan, margin=args.baseline_margin)
+        with open(base / 'sequential_monitoring.json', 'w') as f:
+            json.dump(sequential_monitoring, f, indent=2)
+        for name, entry in sequential_monitoring['contrasts'].items():
+            if entry.get('optional_stopping_only'):
+                print(f'[sequential] WARNING: {name} crosses an unadjusted '
+                      f'look but not the pre-specified spending threshold; '
+                      f'the result is not certified')
+        print(f"[sequential] {sequential_monitoring['n_contrasts']} contrast(s) "
+              f"audited over {sequential_plan['n_looks']} pre-specified look(s) "
+              f"at pairs={sequential_plan['look_pairs']}: "
+              f"stopped={sequential_monitoring['n_stopped']}, "
+              f"optional-stopping-only="
+              f"{sequential_monitoring['n_optional_stopping_only']}")
     # Execution-order audit: a significant within-arm rank correlation is a
     # design warning, not an arm result. It is written next to the comparisons
     # so a reader can see whether the randomized schedule actually held.
@@ -755,6 +807,7 @@ def main():
     manifest['qk_axis_comparison'] = qk_axis
     manifest['analysis_plan'] = analysis_plan
     manifest['study_level_tests'] = study
+    manifest['sequential_monitoring'] = sequential_monitoring
     manifest['run_schedule'] = run_schedule
     manifest['exclusion_policy'] = exclusion_policy
     manifest['exclusion_audit'] = exclusion_audit
@@ -777,6 +830,9 @@ def main():
             base / 'three_way_factorial_comparison.json'),
         'qk_axis_comparison': artifact_record(base / 'qk_axis_comparison.json'),
         'study_level_tests': artifact_record(base / 'study_level_tests.json'),
+        'sequential_monitoring': (
+            artifact_record(base / 'sequential_monitoring.json')
+            if sequential_monitoring is not None else {'enabled': False}),
         'run_schedule': (artifact_record(base / 'run_schedule.json')
                          if run_schedule is not None else {'enabled': False}),
         'exclusion_policy': artifact_record(base / 'exclusion_policy.json'),

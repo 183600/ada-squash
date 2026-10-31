@@ -72,6 +72,13 @@ from .design import (
     simulate_paired_design,
     tost_power_plan,
 )
+from .sequential import (
+    alpha_spent,
+    audit_paired_contrasts,
+    group_sequential_plan,
+    sequential_monitor,
+    sequential_paired_audit,
+)
 from .decontamination import (
     DEFAULT_NGRAM_SIZE,
     NgramIndex,
@@ -156,6 +163,11 @@ __all__ = [
     'prospective_power_plan',
     'tost_power_plan',
     'simulate_paired_design',
+    'alpha_spent',
+    'group_sequential_plan',
+    'sequential_monitor',
+    'sequential_paired_audit',
+    'audit_paired_contrasts',
     # Benchmark decontamination.
     'DEFAULT_NGRAM_SIZE',
     'NgramIndex',

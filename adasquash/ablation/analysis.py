@@ -7,6 +7,7 @@ import json
 from adasquash.design import exclusion_policy_fingerprint, normalize_exclusion_policy
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, _validate_alpha,
                                benjamini_hochberg_adjust, holm_adjust)
+from adasquash.sequential import group_sequential_plan
 
 from .common import _finite_metric, _is_seed_id
 from .matrix import (PRIMARY_FACTORIAL_DESIGN, PRIMARY_MAIN_ROW,
@@ -38,7 +39,9 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         equivalence_margin: float=0.0,
                         run_schedule: dict | None=None,
                         exclusion_policy: dict | None=None,
-                        expected_attrition: float=0.0) -> dict:
+                        expected_attrition: float=0.0,
+                        sequential_looks: int=0,
+                        sequential_spending: str='obrien-fleming') -> dict:
     """Freeze the confirmatory contrast registry *before* any training starts.
 
     A comparison experiment is only confirmatory if the set of tests is fixed
@@ -56,6 +59,12 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     The baseline reference is a *rule* ("best replicated baseline"), not a
     single row name, because which baseline is strongest is a result of the
     run; the realized reference is recorded in `baseline_comparison.json`.
+    ``sequential_looks`` freezes an optional group-sequential monitoring plan
+    (see `adasquash.sequential`) at the same time: looking at the seeds after
+    every run and stopping when p < alpha is optional stopping, so the look
+    counts, family alpha and spending function are part of this fingerprint
+    whenever monitoring is requested. The default of zero looks adds no key
+    and leaves existing pre-registration fingerprints unchanged.
     The exclusion policy is normalized and hashed into the same fingerprint:
     a rerun that quietly changes which runs may be dropped is a changed
     experiment, not a re-analysis. The expected run-attrition assumption used
@@ -307,6 +316,19 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     if len(set(normalized_seeds)) != len(normalized_seeds):
         raise ValueError(
             f'analysis-plan seeds must be unique, got {seeds!r}')
+    if isinstance(sequential_looks, bool) or not isinstance(sequential_looks, int) \
+            or sequential_looks < 0:
+        raise ValueError(
+            f'sequential_looks must be a non-negative integer, got '
+            f'{sequential_looks!r}')
+    sequential_plan = None
+    if sequential_looks:
+        primary_tests = max(
+            1, sum(1 for entry in contrasts if entry.get('tier') == 1))
+        sequential_plan = group_sequential_plan(
+            len(normalized_seeds), n_looks=sequential_looks,
+            alpha=float(alpha), n_tests=primary_tests,
+            spending=sequential_spending)
     payload = {
         'model': model_name,
         'seeds': normalized_seeds,
@@ -334,6 +356,8 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         'run_schedule': run_schedule,
         'contrasts': contrasts,
     }
+    if sequential_plan is not None:
+        payload['sequential_monitoring'] = sequential_plan
     fingerprint = hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
     return {
