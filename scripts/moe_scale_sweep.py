@@ -19,7 +19,6 @@ Usage (everything after `--` is forwarded verbatim to train_moe_tiny.py):
            --seeds 42 43 44 --max-steps 500 --hypothesis "..."
 """
 import argparse
-import json
 import re
 import subprocess
 import sys
@@ -28,6 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from adasquash.jsonio import save_json_atomic
 from scripts.check_scale_replication import build_observations
 
 # Small, scientifically sensible defaults: same expert count, increasing
@@ -174,8 +174,7 @@ def main(argv=None) -> None:
                               metric=args.metric, min_scales=args.min_scales,
                               alpha=args.alpha)
     output = base / 'scale_replication.json'
-    with open(output, 'w') as f:
-        json.dump(report, f, indent=2)
+    save_json_atomic(output, report)
     print(f"[moe-scale] {report['candidate']} vs {report['reference']} over "
           f"{report['n_scales']} scale(s): {report['scales']}")
     for metric, block in sorted(report['per_metric'].items()):

@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import mean_std_stderr
 from adasquash.repro import (artifact_record, collect_run_metadata,
                              file_fingerprint, finish_metadata,
@@ -937,7 +938,7 @@ def launch_multi_seed(args, seeds) -> None:
             print(f'[seeds][warn] seed={seed} exited rc={rc}; its manifest may be missing and the '
                   f'aggregate will flag it', flush=True)
     agg = aggregate_seed_runs(base, seeds, args.model, args.norm)
-    (base / 'aggregate.json').write_text(json.dumps(agg, indent=2))
+    save_json_atomic(base / 'aggregate.json', agg)
     for label, mean_key, std_key in (('final_val_loss', 'final_val_loss', 'final_val_loss_std'),
                                      ('best_val_loss', 'best_val_loss', 'best_val_loss_std'),
                                      ('test_loss', 'test_loss', 'test_loss_std')):

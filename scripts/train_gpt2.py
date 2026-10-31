@@ -21,6 +21,7 @@ from adasquash import (ActivationStats, GPT, GPTConfig, LossSpikeCounter,
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import mean_ci, mean_std_stderr
 from adasquash.model import (build_gpt_124m, build_gpt_350m,
                              build_llama_tiny_1b, clear_cast_weight_cache,
@@ -1556,8 +1557,7 @@ def main():
                 'batch_size': args.batch_size, 'seq_len': args.seq_len,
             }
             results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if has_best_val else None, 'best_val_loss': best_val_loss if has_best_val else None, 'final_val_loss': last_val_loss, 'final_val_step': last_val_step, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batches_shortfall': max(0, int(args.test_batches) - len(test_batch_losses)), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file, 'exclude_test_hash_file': args.exclude_test_hash_file, 'group_key': args.group_key, 'exclude_group_file': args.exclude_group_file, 'exclude_test_group_file': args.exclude_test_group_file}
-            with open(out_path, 'w') as f:
-                json.dump(results, f, indent=2)
+            save_json_atomic(out_path, results)
             run_manifest.setdefault('artifacts', {})['test_results'] = file_fingerprint(out_path)
             run_manifest['data']['split_reports'] = data_reports
             run_manifest['data'].setdefault('heldout_eval', {}).update({

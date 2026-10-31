@@ -70,6 +70,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import (holm_adjust, mean_std_stderr, paired_t_one_sided,
                                student_t_ppf)
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
@@ -920,8 +921,7 @@ def main():
         'ablation_calibration': {'summaries': str(summaries_path), 'rows': ablation_rows},
     }
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2, default=str))
+    save_json_atomic(out_path, report)
     manifest = collect_run_metadata(seed=args.seeds[0], extra={'hypothesis': args.hypothesis,
                                                                'seeds': list(args.seeds)})
     manifest['hyperparameters'] = vars(args)

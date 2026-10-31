@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
                                paired_t_one_sided, scale_replication_summary)
 from adasquash.model import (MLP, build_gpt_124m, build_gpt_350m,
@@ -1144,11 +1145,10 @@ def main():
         print(f'[fp8] {norm}: {r}')
         results.append(r)
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(results, indent=2))
+    save_json_atomic(out_path, results)
     comparison = compare_fp8_norms(results, alpha=args.alpha, trained=bool(args.ckpt))
     comparison_path = out_path.with_name('comparison.json')
-    comparison_path.write_text(json.dumps(comparison, indent=2))
+    save_json_atomic(comparison_path, comparison)
     scale = comparison.get('scale_replication') or {}
     if scale.get('single_scale_only'):
         print(f"[fp8][scale] WARNING: this comparison covers {scale.get('n_scales', 0)} "

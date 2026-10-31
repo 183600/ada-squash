@@ -16,6 +16,7 @@ from adasquash.design import (classify_run_exclusions,
                               schedule_balance_report)
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import mean_std_stderr
 from adasquash.model import clear_cast_weight_cache, clear_ce_scratch_cache
 from adasquash.repro import collect_run_metadata, set_all_seeds
@@ -261,8 +262,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     summary['curve_diagnosis_history'] = curve_diagnoses
     summary['curve_classification'] = (curve_diagnoses[-1]['classification']
                                        if curve_diagnoses else None)
-    with open(output_dir / 'summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
+    _write_summary(output_dir / 'summary.json', summary)
     final_curve = ''
     if curve_diagnoses:
         last_curve = curve_diagnoses[-1]
@@ -517,9 +517,7 @@ def _load_summary(path: Path):
     return data if isinstance(data, dict) else None
 
 def _write_summary(path: Path, summary: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(summary, f, indent=2)
+    save_json_atomic(path, summary)
 
 # The controlled recipe is more than (model, lr, steps): changing the
 # optimizer type/betas, grad clip, schedule, data generator, outlier strength

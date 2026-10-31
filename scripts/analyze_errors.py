@@ -68,7 +68,6 @@ Corpora
 import argparse
 import heapq
 import itertools
-import json
 import math
 import random
 import sys
@@ -82,6 +81,7 @@ import torch
 
 from adasquash.diagnostics import parameter_finite_report
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import binary_auc_report, f1_from_counts, imbalance_report, mcnemar_test
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import markov_batch
@@ -1263,8 +1263,7 @@ def main():
             print(f"[errors] pos={rec['position']:>5d} gold={rec['gold_text']!r}(p={rec['gold_prob']:.3f}, rank={rec['gold_rank']}) "
                   f"pred={rec['pred_text']!r}(p={rec['pred_prob']:.3f}) cause={rec['primary_cause']} flags={flags}")
             print(f"[errors]   context: ...{rec['context_text']}")
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    Path(out).write_text(json.dumps(report, indent=2, default=str))
+    save_json_atomic(out, report)
     manifest = {
         'run_metadata': report['run_metadata'], 'ckpt': args.ckpt,
         'hypothesis': args.hypothesis,

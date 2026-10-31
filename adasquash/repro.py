@@ -51,6 +51,7 @@ from pathlib import Path
 import torch
 
 from ._validation import is_boolean_scalar as _is_boolean_scalar
+from .jsonio import save_json_atomic
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_MANIFEST_SCHEMA = "adasquash.run_manifest.v1"
@@ -986,12 +987,7 @@ def collect_run_metadata(seed: int | None = None, extra: dict | None = None,
 
 def save_run_manifest(path, metadata: dict) -> Path:
     """Atomically write a run manifest (tmp + rename, so readers never see a partial file)."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(metadata, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    os.replace(tmp, path)
-    return path
+    return save_json_atomic(path, metadata, indent=2, sort_keys=True)
 
 
 def _self_test_seed_determinism() -> bool:
@@ -1265,6 +1261,7 @@ __all__ = [
     "file_fingerprint",
     "finish_metadata",
     "git_revision",
+    "save_json_atomic",
     "save_run_manifest",
     "seed_worker",
     "self_test",

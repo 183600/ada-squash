@@ -1,7 +1,6 @@
 from __future__ import annotations
 import argparse
 import sys
-import json
 import random
 from collections import Counter
 from pathlib import Path
@@ -9,6 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
 from adasquash import GPTConfig, GPT
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import wilson_interval
 from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
@@ -719,8 +719,7 @@ def main():
     results['run_metadata'] = collect_run_metadata(seed=args.seed)
     out = args.output or Path(args.ckpt).parent / 'eval_results.json'
     out_path = Path(out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(results, indent=2, default=str))
+    save_json_atomic(out_path, results)
     # The manifest mirrors what the run needs to be auditable: which checkpoint
     # (hashed), with which args, and what came out. Task scores live in the
     # results file, which is fingerprinted here rather than duplicated.

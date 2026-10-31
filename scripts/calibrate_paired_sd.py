@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.design import paired_sd_calibration
+from adasquash.jsonio import save_json_atomic
 
 
 def _seed_list(value):
@@ -162,8 +163,7 @@ def main(argv=None):
         'reference_unusable_seeds': reference_unusable,
     }
     output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(calibration, indent=2) + '\n')
+    save_json_atomic(output, calibration)
     recommended = calibration['recommended_paired_sd']
     recommended_text = (
         f'{recommended:.6g}' if recommended is not None else 'unavailable')

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from adasquash import markov_batch
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
                                paired_t_one_sided, scale_replication_summary)
 from adasquash.model import MLP
@@ -1048,11 +1049,10 @@ def main():
         print(f'[w8a8] {label}: {r}')
         results.append(r)
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(results, indent=2))
+    save_json_atomic(out_path, results)
     comparison = compare_w8a8_checkpoints(results, alpha=args.alpha)
     comparison_path = out_path.with_name('ppl_comparison.json')
-    comparison_path.write_text(json.dumps(comparison, indent=2))
+    save_json_atomic(comparison_path, comparison)
     scale = comparison.get('scale_replication') or {}
     if scale.get('single_scale_only'):
         print(f"[w8a8][scale] WARNING: this comparison covers {scale.get('n_scales', 0)} "

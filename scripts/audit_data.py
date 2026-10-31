@@ -90,7 +90,6 @@ same corpus the run actually fits.
 This script only *reads* data; it never trains or writes to a split.
 """
 import argparse
-import json
 import math
 import numbers
 import sys
@@ -104,6 +103,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from adasquash.jsonio import save_json_atomic
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.data_pipeline import (DocumentCleaner, _is_token_row,
                                    canonical_document_hash, document_hash,
@@ -1406,8 +1406,7 @@ def main():
            'train_group_ledger': train_group_ledger_info,
            'validation_group_ledger': val_group_ledger_info,
            'train_length_fence': train_fence}
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.output).write_text(json.dumps(out, indent=2, default=str))
+    save_json_atomic(args.output, out)
     for name, stats in splits.items():
         line = (f"[audit] {name}: sampled={stats['documents_sampled']} kept={stats.get('documents_kept', 0)} "
                 f"dropped_empty={stats.get('dropped_empty', 0)} dropped_missing={stats.get('dropped_missing_text', 0)} "
@@ -1730,7 +1729,7 @@ def main():
     # manifest said "failed". Rewrite it now that the complete list exists.
     out['problems'] = problems
     out['status'] = 'failed' if problems else 'finished'
-    Path(args.output).write_text(json.dumps(out, indent=2, default=str))
+    save_json_atomic(args.output, out)
     manifest = {
         'run_metadata': out['run_metadata'],
         'hypothesis': args.hypothesis,

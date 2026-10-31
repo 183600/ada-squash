@@ -39,6 +39,7 @@ sys.path.insert(0, str(ROOT))
 from adasquash.design import (order_drift_report,
                                randomized_complete_block_schedule,
                                schedule_balance_report)
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
                                paired_design_summary, paired_t_one_sided,
                                paired_trend_test, student_t_ppf)
@@ -1459,7 +1460,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
         # aggregator already reads, so a cell's place in time is auditable
         # without re-deriving it from wall-clock logs.
         spec['run_order'] = dict(order_info)
-    (output_dir / 'launch_spec.json').write_text(json.dumps(spec, indent=2))
+    save_json_atomic(output_dir / 'launch_spec.json', spec)
     log = open(output_dir / 'stdout.log', 'w')
     try:
         proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -1649,7 +1650,7 @@ def main():
             for entry in run_schedule['entries']}
         jobs.sort(key=lambda job: order_by_job[
             (f'd{job[0]}-{job[1]}', int(job[3]))]['position'])
-        (base / 'run_schedule.json').write_text(json.dumps(run_schedule, indent=2))
+        save_json_atomic(base / 'run_schedule.json', run_schedule)
         print(f"[sweep][design] randomized complete-block schedule: "
               f"{run_schedule['n_treatments']} cell(s) x {run_schedule['n_blocks']} "
               f"block(s) = {run_schedule['n_units']} launch(es), fingerprint "
@@ -1854,8 +1855,8 @@ def main():
     # writing them before a later cell demotes every cell would leave
     # aggregate.json claiming complete=true for a sweep that is not certifiable.
     for depth, norm, cell_dir in cells:
-        with open(cell_dir / 'aggregate.json', 'w') as f:
-            json.dump(aggs_by_depth[depth][norm], f, indent=2)
+        save_json_atomic(cell_dir / 'aggregate.json',
+                         aggs_by_depth[depth][norm])
     print('[sweep][note] shape covariates: under the equal-parameter scaling dim and n_heads move with '
           'depth by construction, so a cross-depth loss delta confounds depth with width/head count and '
           'must not be read as a pure depth effect (same-depth cross-norm deltas are unaffected); every '
@@ -1864,8 +1865,7 @@ def main():
     print_sweep_comparisons(comparison)
     print_cross_depth_trends(comparison)
     comp_path = base / 'sweep_comparisons.json'
-    with open(comp_path, 'w') as f:
-        json.dump(comparison, f, indent=2)
+    save_json_atomic(comp_path, comparison)
     print(f'[compare] comparisons -> {comp_path}')
     order_audit = None
     if run_schedule is not None:
@@ -1890,8 +1890,7 @@ def main():
                     'value': float(value),
                 })
         order_audit = order_drift_report(observations)
-        with open(base / 'run_order_audit.json', 'w') as f:
-            json.dump(order_audit, f, indent=2)
+        save_json_atomic(base / 'run_order_audit.json', order_audit)
         if order_audit.get('status') == 'tested':
             print(f"[sweep][order] within-cell drift: rho={order_audit['spearman_rho']:+.3f}, "
                   f"p={order_audit['p_two_sided']:.3f}, "

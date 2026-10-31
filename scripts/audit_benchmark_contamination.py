@@ -77,6 +77,7 @@ from adasquash.decontamination import (
     protocol_digest,
     scan_token_documents,
 )
+from adasquash.jsonio import save_json_atomic
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
 from scripts.data_pipeline import (
     DocumentCleaner,
@@ -631,8 +632,7 @@ def main(argv=None) -> int:
         "run_metadata": collect_run_metadata(extra={"hypothesis": args.hypothesis}),
     }
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2, default=str))
+    save_json_atomic(out_path, report)
     manifest = {
         "run_metadata": report["run_metadata"],
         "hypothesis": args.hypothesis,

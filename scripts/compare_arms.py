@@ -58,6 +58,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                leave_one_out_jackknife, mean_prediction_interval,
                                mean_std_stderr, max_p_combination,
@@ -1346,9 +1347,7 @@ def main(argv=None) -> None:
                               reference_pool=args.reference_pool)
     print_comparison(comparison)
     output = Path(args.output) if args.output else paths[0].parent / 'arm_comparison.json'
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, 'w') as f:
-        json.dump(comparison, f, indent=2)
+    save_json_atomic(output, comparison)
     print(f'[arms] wrote {output}')
 
 

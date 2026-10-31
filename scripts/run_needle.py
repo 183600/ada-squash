@@ -1,13 +1,13 @@
 from __future__ import annotations
 import argparse
 import copy
-import json
 import sys
 from collections import Counter
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import holm_adjust, mcnemar_test, mean_ci, paired_t_one_sided, wilson_interval
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from scripts.eval_downstream import (DEFAULT_HAYSTACK, DEFAULT_QUESTION, load_ckpt,
@@ -665,7 +665,7 @@ def main():
         payload['reference_tokenizer'] = ref_tok_name
         payload['reference_tokenizer_revision'] = ref_tok_revision
         payload['comparison'] = comparison
-    Path(out).write_text(json.dumps(payload, indent=2))
+    save_json_atomic(out, payload)
     manifest = collect_run_metadata(seed=seeds[0])
     manifest['hyperparameters'] = vars(args)
     manifest['placement_seeds'] = list(seeds)

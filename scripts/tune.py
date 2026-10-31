@@ -73,6 +73,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
                                paired_t_one_sided, student_t_ppf, welch_t_one_sided)
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
@@ -1105,8 +1106,7 @@ def main():
         'lr_sensitivity': sensitivity,
         'run_metadata': run_metadata,
     }
-    with open(base / 'tuning_summary.json', 'w') as f:
-        json.dump(out, f, indent=2, default=str)
+    save_json_atomic(base / 'tuning_summary.json', out)
     manifest = dict(run_metadata)
     manifest['seed'] = None
     manifest['hyperparameters'] = vars(args)

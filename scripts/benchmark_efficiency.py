@@ -51,6 +51,7 @@ from adasquash.efficiency import (
     parameter_breakdown,
 )
 from adasquash.attention import clear_logit_scratch_cache
+from adasquash.jsonio import save_json_atomic
 from adasquash.model import (
     build_gpt_124m,
     build_gpt_350m,
@@ -769,8 +770,7 @@ def main():
         'run_metadata': collect_run_metadata(seed=args.seed),
     }
     out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(report, indent=2, default=str))
+    save_json_atomic(out, report)
     save_run_manifest(out.with_name('efficiency_manifest.json'), finish_metadata({
         'run_metadata': report['run_metadata'], 'hypothesis': args.hypothesis,
         'config': vars(args), 'results': results, 'tradeoff': tradeoff,

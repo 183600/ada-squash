@@ -47,6 +47,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import scale_replication_summary
 from adasquash._validation import is_boolean_scalar
 
@@ -478,9 +479,7 @@ def main(argv=None) -> None:
         print(f"[scale] excluded observations: {summary['excluded']}", file=sys.stderr)
     if args.output:
         output = Path(args.output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with open(output, 'w') as f:
-            json.dump(report, f, indent=2)
+        save_json_atomic(output, report)
         print(f'[scale] wrote {output}')
 
 

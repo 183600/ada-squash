@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+from adasquash.jsonio import save_json_atomic
 from adasquash.design import (design_readiness_audit, normalize_exclusion_policy,
                               paired_sd_evidence_audit,
                               randomized_complete_block_schedule,
@@ -307,11 +308,9 @@ def main():
                 f'tune the baselines with this recipe and held-back --confirm-seeds.')
     base = Path(args.output_dir)
     base.mkdir(parents=True, exist_ok=True)
-    with open(base / 'exclusion_policy.json', 'w') as f:
-        json.dump(exclusion_policy, f, indent=2)
+    save_json_atomic(base / 'exclusion_policy.json', exclusion_policy)
     if run_schedule is not None:
-        with open(base / 'run_schedule.json', 'w') as f:
-            json.dump(run_schedule, f, indent=2)
+        save_json_atomic(base / 'run_schedule.json', run_schedule)
     schedule_arm_of = (lambda unit: unit.rsplit('::rep=', 1)[0]
                        if '::rep=' in unit else unit)
     control_pairs = []
@@ -363,8 +362,7 @@ def main():
                 n_confirmatory_tests)
             design_readiness['simulated_power_check']['expected_attrition'] = (
                 args.expected_attrition)
-    with open(base / 'design_readiness.json', 'w') as f:
-        json.dump(design_readiness, f, indent=2)
+    save_json_atomic(base / 'design_readiness.json', design_readiness)
     for check in design_readiness['checks']:
         if check['status'] != 'pass':
             print(f"[design] {check['status'].upper()}: {check['id']}: {check['detail']}")
@@ -409,8 +407,7 @@ def main():
                              f'directory for a deliberate re-registration, or drop '
                              f'--require-plan-lock to proceed with the drift recorded.')
         print(f'[plan] WARNING: {message}')
-    with open(plan_path, 'w') as f:
-        json.dump(analysis_plan, f, indent=2)
+    save_json_atomic(plan_path, analysis_plan)
     run_metadata = collect_run_metadata(seed=seeds[0], extra={'seeds': seeds})
     if args.sanity_check:
         from scripts.sanity_overfit import run_preflight
@@ -591,8 +588,7 @@ def main():
         except json.JSONDecodeError:
             previous = []
     ordered = merge_summaries(previous, all_summaries)
-    with open(agg_path, 'w') as f:
-        json.dump(ordered, f, indent=2)
+    save_json_atomic(agg_path, ordered)
     # Accumulated rows whose recorded recipe differs from this invocation are
     # reported but excluded from both comparisons: a delta produced by a
     # different lr/step/batch/seq recipe is not a property of the module.
@@ -635,8 +631,7 @@ def main():
     exclusion_audit = run_exclusion_audit(planned_runs, exclusion_policy)
     exclusion_audit['schedule_fingerprint'] = (
         run_schedule.get('fingerprint') if run_schedule else None)
-    with open(base / 'exclusion_audit.json', 'w') as f:
-        json.dump(exclusion_audit, f, indent=2)
+    save_json_atomic(base / 'exclusion_audit.json', exclusion_audit)
     if exclusion_audit['n_excluded'] or exclusion_audit['n_sensitivity']:
         print(f"[exclusion] {exclusion_audit['n_planned']} planned run(s): "
               f"{exclusion_audit['n_analyzed']} retained, "
@@ -728,8 +723,7 @@ def main():
                   f"'{comparison['baseline_tuning']['how_to_generate']}' and rerun with "
                   '--baseline-tuning (or --require-baseline-tuning to fail closed).')
         comparison['rows_excluded_protocol_mismatch'] = stale_rows
-        with open(base / 'baseline_comparison.json', 'w') as f:
-            json.dump(comparison, f, indent=2)
+        save_json_atomic(base / 'baseline_comparison.json', comparison)
     print_baseline_comparison(comparison)
     # The second half of the ablation contract: each claimed mechanism of the
     # main proposal must be shown to be load-bearing *on its own*, with a
@@ -739,8 +733,7 @@ def main():
                                               equivalence_margin=args.equivalence_margin)
     if loo_comparison is not None:
         loo_comparison['rows_excluded_protocol_mismatch'] = stale_rows
-        with open(base / 'leave_one_out_comparison.json', 'w') as f:
-            json.dump(loo_comparison, f, indent=2)
+        save_json_atomic(base / 'leave_one_out_comparison.json', loo_comparison)
     print_leave_one_out_comparison(loo_comparison)
     # The third half of the contract: Full combines two axes, so report the
     # 2x2 main effects and their interaction rather than inferring synergy
@@ -750,8 +743,7 @@ def main():
                                      equivalence_margin=args.equivalence_margin)
     if factorial is not None:
         factorial['rows_excluded_protocol_mismatch'] = stale_rows
-        with open(base / 'factorial_comparison.json', 'w') as f:
-            json.dump(factorial, f, indent=2)
+        save_json_atomic(base / 'factorial_comparison.json', factorial)
     print_factorial_comparison(factorial)
     # The fourth report closes the "three orthogonal axes" claim: the two 2x2
     # designs estimate per-channel x depth separately per activation family,
@@ -762,8 +754,7 @@ def main():
         equivalence_margin=args.equivalence_margin)
     if three_way is not None:
         three_way['rows_excluded_protocol_mismatch'] = stale_rows
-        with open(base / 'three_way_factorial_comparison.json', 'w') as f:
-            json.dump(three_way, f, indent=2)
+        save_json_atomic(base / 'three_way_factorial_comparison.json', three_way)
     print_three_way_factorial_comparison(three_way)
     # The attention-logits axis (DyT-QK) is independent of the normalization
     # family, so it gets its own per-host attribution and cross-host
@@ -773,16 +764,14 @@ def main():
                                  equivalence_margin=args.equivalence_margin)
     if qk_axis is not None:
         qk_axis['rows_excluded_protocol_mismatch'] = stale_rows
-        with open(base / 'qk_axis_comparison.json', 'w') as f:
-            json.dump(qk_axis, f, indent=2)
+        save_json_atomic(base / 'qk_axis_comparison.json', qk_axis)
     print_qk_axis_comparison(qk_axis)
     dose_response = dose_response_comparison(
         comparable, margin=args.baseline_margin, alpha=args.alpha,
         equivalence_margin=args.equivalence_margin)
     if dose_response is not None:
         dose_response['rows_excluded_protocol_mismatch'] = stale_rows
-        with open(base / 'dose_response_comparison.json', 'w') as f:
-            json.dump(dose_response, f, indent=2)
+        save_json_atomic(base / 'dose_response_comparison.json', dose_response)
     print_dose_response_comparison(dose_response)
     # Study-level multiplicity: the reports above each correct within their
     # own family, but the paper-level claim is made across all of them. Pool
@@ -794,8 +783,7 @@ def main():
          'qk_axis': qk_axis, 'dose_response': dose_response},
         analysis_plan, alpha=args.alpha)
     if study is not None:
-        with open(base / 'study_level_tests.json', 'w') as f:
-            json.dump(study, f, indent=2)
+        save_json_atomic(base / 'study_level_tests.json', study)
     print_study_level_correction(study)
     sequential_monitoring = None
     sequential_plan = analysis_plan.get('sequential_monitoring')
@@ -818,8 +806,8 @@ def main():
                 contrast_deltas[f'baseline:{name}'] = ordered
         sequential_monitoring = audit_paired_contrasts(
             contrast_deltas, sequential_plan, margin=args.baseline_margin)
-        with open(base / 'sequential_monitoring.json', 'w') as f:
-            json.dump(sequential_monitoring, f, indent=2)
+        save_json_atomic(base / 'sequential_monitoring.json',
+                         sequential_monitoring)
         for name, entry in sequential_monitoring['contrasts'].items():
             if entry.get('optional_stopping_only'):
                 print(f'[sequential] WARNING: {name} crosses an unadjusted '
@@ -835,8 +823,7 @@ def main():
     # design warning, not an arm result. It is written next to the comparisons
     # so a reader can see whether the randomized schedule actually held.
     order_audit = run_order_audit(comparable, run_schedule)
-    with open(base / 'run_order_audit.json', 'w') as f:
-        json.dump(order_audit, f, indent=2)
+    save_json_atomic(base / 'run_order_audit.json', order_audit)
     manifest = dict(run_metadata)
     manifest['git'] = git_revision()
     manifest['hyperparameters'] = vars(args)

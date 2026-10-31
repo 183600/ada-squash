@@ -43,6 +43,7 @@ from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust,
                                paired_t_one_sided, student_t_ppf,
                                scale_replication_summary)
 from adasquash.model import GPTConfig, build_norm_kwargs, fused_cross_entropy_mean, clear_ce_scratch_cache, clear_cast_weight_cache, _LayerScaleResidual
+from adasquash.jsonio import save_json_atomic
 from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 from scripts.data_pipeline import _is_pinned_revision
@@ -711,8 +712,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             s['val_loss'] = val_loss
             s['val_ce'] = val_ce
             s['val_aux'] = val_aux
-        with open(output_dir / 'stats.json', 'w') as f:
-            json.dump(s, f, indent=2, default=str)
+        save_json_atomic(output_dir / 'stats.json', s)
         # Persist the final curve rows before hashing the artifact, so the
         # manifest fingerprint covers the complete history, not a partial flush.
         flush_history()
@@ -1631,8 +1631,7 @@ def main():
         agg['hypothesis'] = args.hypothesis
         agg['norm'] = norm
         summary_path = cell_base / 'seeds_summary.json'
-        with open(summary_path, 'w') as f:
-            json.dump(agg, f, indent=2, default=str)
+        save_json_atomic(summary_path, agg)
         manifest = collect_run_metadata(seed=seeds[0])
         manifest['hyperparameters'] = vars(cell_args)
         manifest['seeds'] = seeds
@@ -1692,8 +1691,7 @@ def main():
                                        alpha=args.alpha, margin=args.margin)
         comparison['hypothesis'] = args.hypothesis
         comparison_path = base / 'norm_comparison.json'
-        with open(comparison_path, 'w') as f:
-            json.dump(comparison, f, indent=2, default=str)
+        save_json_atomic(comparison_path, comparison)
         study = collect_run_metadata(seed=seeds[0])
         study['hyperparameters'] = vars(args)
         study['seeds'] = seeds

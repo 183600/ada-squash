@@ -34,6 +34,38 @@ def _factorial_levels(info: dict, factor_names) -> dict:
         levels[factor] = values
     return levels
 
+ANALYSIS_PLAN_FINGERPRINT_FIELDS = (
+    'model', 'seeds', 'alpha', 'margin', 'equivalence_margin',
+    'baseline_pool', 'expected_attrition', 'exclusion_policy',
+    'exclusion_policy_fingerprint', 'row_configs', 'matrix_cells',
+    'run_schedule', 'contrasts', 'paired_sd_evidence',
+    'sequential_monitoring',
+)
+_ANALYSIS_PLAN_REQUIRED_FIELDS = ANALYSIS_PLAN_FINGERPRINT_FIELDS[:-2]
+
+
+def analysis_plan_fingerprint(plan: dict) -> str:
+    """Recompute a plan's pre-registration hash from its frozen payload.
+
+    The fingerprint must cover every design decision that can change the
+    confirmatory family.  Optional monitoring/calibration blocks are included
+    when present, so a plan written by an older producer still verifies.
+    """
+    if not isinstance(plan, Mapping):
+        raise ValueError(
+            f'analysis plan must be a mapping, got {type(plan).__name__}')
+    missing = [field for field in _ANALYSIS_PLAN_REQUIRED_FIELDS
+               if field not in plan]
+    if missing:
+        raise ValueError(
+            'analysis plan is missing fingerprint field(s): '
+            + ', '.join(missing))
+    payload = {field: plan[field] for field in ANALYSIS_PLAN_FINGERPRINT_FIELDS
+               if field in plan}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+
+
 def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         baseline_names, model_name: str, seeds,
                         alpha: float=0.05, margin: float=0.0,
@@ -413,8 +445,7 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         payload['paired_sd_evidence'] = paired_sd_evidence
     if sequential_plan is not None:
         payload['sequential_monitoring'] = sequential_plan
-    fingerprint = hashlib.sha256(
-        json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+    fingerprint = analysis_plan_fingerprint(payload)
     return {
         'schema': 'adasquash.analysis_plan.v1',
         'fingerprint': fingerprint,
