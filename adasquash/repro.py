@@ -165,9 +165,11 @@ class TrainStreamFingerprint:
 
     def __init__(self, start_step: int = 0,
                  prefix_batches: int = TRAIN_STREAM_PREFIX_BATCHES):
-        if isinstance(start_step, bool) or not isinstance(start_step, int) or start_step < 0:
+        if (isinstance(start_step, bool) or not isinstance(start_step, numbers.Integral)
+                or start_step < 0):
             raise ValueError(f"start_step must be a non-negative integer, got {start_step!r}")
-        if (isinstance(prefix_batches, bool) or not isinstance(prefix_batches, int)
+        if (isinstance(prefix_batches, bool)
+                or not isinstance(prefix_batches, numbers.Integral)
                 or prefix_batches < 1):
             raise ValueError(
                 f"prefix_batches must be a positive integer, got {prefix_batches!r}")
@@ -231,11 +233,12 @@ def _stream_count(record: dict, name: str, minimum: int = 0):
     value = record.get(name)
     if value is None:
         return None
-    if _is_boolean_scalar(value) or not isinstance(value, int) or value < minimum:
+    if (_is_boolean_scalar(value) or not isinstance(value, numbers.Integral)
+            or value < minimum):
         raise ValueError(
             f"train stream record field {name!r} must be an integer >= {minimum}, "
             f"got {value!r}")
-    return value
+    return int(value)
 
 
 def compare_train_streams(reference: dict, other: dict) -> dict:
