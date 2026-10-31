@@ -97,8 +97,12 @@ def alpha_spent(alpha: float, information_fraction: float,
     if t == 1.0:
         return alpha_value
     if method == 'obrien-fleming':
-        z = NormalDist().inv_cdf(1.0 - alpha_value)
-        spent = 1.0 - NormalDist().cdf(z / math.sqrt(t))
+        # Phi(inv_cdf(alpha)/sqrt(t)) is the upper tail of the O'Brien-Fleming
+        # boundary. Computing it this way keeps tiny family alphas (large
+        # Bonferroni test counts) from rounding 1 - alpha to 1.0, which used
+        # to raise StatisticsError, and avoids cancelling 1 - Phi(x) to zero.
+        spent = 0.5 * math.erfc(
+            -NormalDist().inv_cdf(alpha_value) / math.sqrt(2.0 * t))
     else:
         spent = alpha_value * math.log1p((math.e - 1.0) * t)
     return min(alpha_value, max(0.0, spent))
