@@ -919,3 +919,184 @@ def test_collect_split_applies_the_training_exclusion_ledger(monkeypatch):
     assert canonical_document_hash(texts[1]) not in hashes
     assert document_hash(texts[0]) in hashes
     assert near_meta["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Upstream split selection and whole-corpus external validation
+# ---------------------------------------------------------------------------
+class _FakeSplitInfo:
+    def __init__(self, num_examples):
+        self.num_examples = num_examples
+
+
+class _FakeDatasetInfo:
+    def __init__(self, **splits):
+        self.splits = {name: _FakeSplitInfo(n) for name, n in splits.items()}
+
+
+class _FakeStream:
+    def __init__(self, documents, info):
+        self.documents = list(documents)
+        self.info = info
+        self.skipped = 0
+
+    def __iter__(self):
+        return iter(self.documents)
+
+    def skip(self, n):
+        self.skipped = n
+        return _FakeStream(self.documents[n:], self.info)
+
+    def take(self, n):
+        return _FakeStream(self.documents[:n], self.info)
+
+
+def test_infer_num_documents_uses_the_requested_upstream_split():
+    from scripts.data_pipeline import infer_num_documents
+
+    ds = _FakeStream([], _FakeDatasetInfo(train=10, test=1000))
+    assert infer_num_documents(ds) == 10
+    assert infer_num_documents(ds, "test") == 1000
+    assert infer_num_documents(ds, "missing") is None
+
+
+def test_full_split_mode_uses_the_whole_upstream_split():
+    from scripts.data_pipeline import select_stream_split
+
+    documents = [{"text": f"doc-{i}"} for i in range(5)]
+    ds = _FakeStream(documents, _FakeDatasetInfo(train=100, test=5))
+    options = validate_data_options({
+        "split": "validation", "source_split": "test", "split_mode": "full",
+        "val_frac": 0.5, "test_frac": 0.25,
+    })
+    stream, report = select_stream_split(ds, "validation", options)
+    assert list(stream) == documents
+    assert report["source_split"] == "test"
+    assert report["split_mode"] == "full"
+    assert report["start"] == 0
+    assert report["count"] == 5
+    assert report["num_documents"] == 5
+
+
+def test_chronological_mode_still_carves_the_requested_upstream_split():
+    from scripts.data_pipeline import select_stream_split
+
+    documents = [{"text": f"doc-{i}"} for i in range(1000)]
+    ds = _FakeStream(documents, _FakeDatasetInfo(train=10, test=1000))
+    options = validate_data_options({
+        "split": "validation", "source_split": "test",
+        "val_frac": 0.01, "test_frac": 0.01,
+    })
+    stream, report = select_stream_split(ds, "validation", options)
+    assert report["source_split"] == "test"
+    assert report["split_mode"] == "chronological"
+    assert report["start"] == 980
+    assert report["count"] == 10
+    assert list(stream) == documents[980:990]
+
+
+def test_load_document_stream_opens_the_requested_upstream_split(monkeypatch):
+    import scripts.data_pipeline as dp
+
+    calls = {}
+    documents = [{"text": "held-out"}]
+
+    def fake_load_dataset(name, config, split=None, streaming=None, revision=None):
+        calls.update(name=name, config=config, split=split,
+                     streaming=streaming, revision=revision)
+        return _FakeStream(documents, _FakeDatasetInfo(train=10, test=1))
+
+    monkeypatch.setitem(sys.modules, "datasets",
+                        type("FakeDatasets", (), {"load_dataset": staticmethod(fake_load_dataset)}))
+    monkeypatch.setattr(dp, "resolve_dataset_revision",
+                        lambda name, revision: "a" * 40)
+    stream, report = dp.load_document_stream(
+        "fake/corpus", None, "validation",
+        {"source_split": "test", "split_mode": "full"})
+    assert list(stream) == documents
+    assert calls["split"] == "test"
+    assert calls["streaming"] is True
+    assert calls["revision"] == "a" * 40
+    assert report["source_split"] == "test"
+    assert report["count"] == 1
+
+
+def test_open_validation_split_uses_the_whole_named_external_split(monkeypatch):
+    import scripts.train_gpt2 as tg
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def fake_open_data_split(split, args, **kwargs):
+        captured.update(split=split, args=args, **kwargs)
+        return "loader"
+
+    monkeypatch.setattr(tg, "open_data_split", fake_open_data_split)
+    args = SimpleNamespace(
+        val_dataset="Salesforce/wikitext",
+        val_dataset_config="wikitext-103-raw-v1",
+        val_dataset_revision="b" * 40,
+        val_split="test",
+        val_seq_len=512,
+    )
+    assert tg.open_validation_split(args) == "loader"
+    assert captured["split"] == "validation"
+    assert captured["dataset_name"] == "Salesforce/wikitext"
+    assert captured["dataset_config"] == "wikitext-103-raw-v1"
+    assert captured["source_split"] == "test"
+    assert captured["split_mode"] == "full"
+    assert captured["dataset_revision"] == "b" * 40
+    assert captured["seq_len"] == 512
+
+
+def test_materialized_cache_supports_a_full_split_starting_at_zero(tmp_path, monkeypatch):
+    import scripts.data_pipeline as dp
+
+    monkeypatch.setattr(dp, "_split_cache_dir", lambda: tmp_path)
+    report = {
+        "split": "validation", "source_split": "test", "split_mode": "full",
+        "start": 0, "count": 2, "num_documents": 2,
+        "val_frac": 0.005, "test_frac": 0.005,
+        "dataset_revision": None, "dataset_revision_resolved": "a" * 40,
+    }
+    stream = iter([{"text": "first"}, {"text": "second"}])
+    cached, path = dp._materialized_split_stream(
+        stream, "fake/corpus", None, "validation", report)
+    assert path is not None
+    assert list(cached) == [{"text": "first"}, {"text": "second"}]
+    assert report["materialized_cache_fingerprint"]["documents"] == 2
+
+    def fail_if_replayed():
+        raise AssertionError("a valid full-split cache should be reused")
+        yield
+
+    cached_again, path_again = dp._materialized_split_stream(
+        fail_if_replayed(), "fake/corpus", None, "validation", report)
+    assert path_again == path
+    assert list(cached_again) == [{"text": "first"}, {"text": "second"}]
+
+
+def test_open_data_split_does_not_leak_the_training_dataset_revision(monkeypatch):
+    import scripts.train_gpt2 as tg
+    from types import SimpleNamespace
+
+    captured = {}
+    monkeypatch.setattr(tg, "configure_data_options",
+                        lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(tg, "build_dataloader", lambda *args, **kwargs: "loader")
+    args = SimpleNamespace(
+        val_frac=0.005, test_frac=0.005, num_documents=None,
+        dedup=True, min_doc_chars=0, max_doc_chars=0,
+        dataset_revision="train-revision", tokenizer_revision="tokenizer-revision",
+        train_shuffle_buffer=0, num_workers=0, seed=42,
+        dataset="train/corpus", dataset_config="train-config",
+        seq_len=128, batch_size=2, tokenizer="gpt2",
+    )
+    assert tg.open_data_split(
+        "validation", args, dataset_name="val/corpus",
+        dataset_config="val-config", source_split="test", split_mode="full",
+        dataset_revision=None) == "loader"
+    assert captured["source_split"] == "test"
+    assert captured["split_mode"] == "full"
+    assert captured["dataset_revision"] is None
+    assert captured["tokenizer_revision"] == "tokenizer-revision"

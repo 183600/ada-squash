@@ -421,6 +421,8 @@ def restore_monitor_args(args, ckpt_args: dict, explicit: frozenset=frozenset())
 # tokenizer revisions are the data *version*: resuming a run against a moved
 # upstream branch would continue on different data under the same manifest.
 _DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tokenizer_revision',
+              'val_dataset', 'val_dataset_config', 'val_dataset_revision',
+              'val_split', 'val_seq_len',
               'val_frac', 'test_frac', 'num_documents',
               'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file',
               'exclude_test_hash_file', 'exclude_train_hash_file',
@@ -435,7 +437,8 @@ _LEDGER_ARGS = ('exclude_hash_file', 'exclude_test_hash_file',
                 'exclude_train_hash_file',
                 'exclude_group_file', 'exclude_test_group_file')
 
-def unpinned_data_revisions(dataset_revision, tokenizer_revision) -> list:
+def unpinned_data_revisions(dataset_revision, tokenizer_revision,
+                            val_dataset_revision=None, val_dataset=None) -> list:
     """Requested data revisions that are not immutable Hub commit hashes.
 
     A branch or tag can move between two supposedly identical runs, so a
@@ -449,4 +452,8 @@ def unpinned_data_revisions(dataset_revision, tokenizer_revision) -> list:
                         ('--tokenizer-revision', tokenizer_revision)):
         if not _is_pinned_revision(value):
             problems.append(f'{flag} is not a full 40-hex commit hash: {value!r}')
+    if val_dataset and not _is_pinned_revision(val_dataset_revision):
+        problems.append(
+            '--val-dataset-revision is not a full 40-hex commit hash: '
+            f'{val_dataset_revision!r}')
     return problems

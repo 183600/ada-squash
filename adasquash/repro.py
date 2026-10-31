@@ -614,6 +614,8 @@ TRAINING_RECIPE_KEYS = (
     "max_steps", "lr", "min_lr_ratio", "warmup", "weight_decay",
     "beta1", "beta2", "grad_clip", "no_bf16", "gradient_checkpointing",
     "early_stop_patience", "nonfinite_policy", "num_workers",
+    "val_dataset", "val_dataset_config", "val_dataset_revision",
+    "val_split", "val_seq_len",
     "val_frac", "test_frac", "num_documents", "val_every", "val_batches",
     "min_doc_chars", "max_doc_chars", "dedup", "train_shuffle_buffer",
     "exclude_hash_file", "exclude_test_hash_file", "exclude_train_hash_file",

@@ -43,12 +43,21 @@ from scripts.train_runtime import (DEFAULT_SEED, _data_ledger_fingerprints,
     launch_multi_seed, load_model_state_dict, preflight_arch_args,
     restore_data_args, run_error_analysis)
 
+_DATASET_REVISION_FROM_ARGS = object()
+
 def open_data_split(split: str, args, seq_len: int | None = None,
                     dataset_name: str | None = None,
-                    dataset_config: str | None = None):
+                    dataset_config: str | None = None,
+                    source_split: str = 'train',
+                    split_mode: str = 'chronological',
+                    dataset_revision=_DATASET_REVISION_FROM_ARGS):
     """Open one logical split through the shared leakage-safe pipeline."""
+    if dataset_revision is _DATASET_REVISION_FROM_ARGS:
+        dataset_revision = getattr(args, 'dataset_revision', None)
     configure_data_options(
         split=split,
+        source_split=source_split,
+        split_mode=split_mode,
         val_frac=args.val_frac,
         test_frac=args.test_frac,
         num_documents=args.num_documents,
@@ -61,7 +70,7 @@ def open_data_split(split: str, args, seq_len: int | None = None,
         group_key=getattr(args, 'group_key', None),
         exclude_group_file=getattr(args, 'exclude_group_file', None),
         exclude_test_group_file=getattr(args, 'exclude_test_group_file', None),
-        dataset_revision=getattr(args, 'dataset_revision', None),
+        dataset_revision=dataset_revision,
         tokenizer_revision=getattr(args, 'tokenizer_revision', None),
         shuffle_buffer=args.train_shuffle_buffer if split == 'train' else 0,
         num_workers=getattr(args, 'num_workers', 2),
@@ -75,9 +84,13 @@ def open_data_split(split: str, args, seq_len: int | None = None,
 def open_validation_split(args):
     """Open the held-out selection stream, optionally from a distinct corpus."""
     if getattr(args, 'val_dataset', None):
-        return open_data_split(args.val_split, args, seq_len=args.val_seq_len,
-                               dataset_name=args.val_dataset,
-                               dataset_config=args.val_dataset_config)
+        return open_data_split(
+            'validation', args, seq_len=args.val_seq_len,
+            dataset_name=args.val_dataset,
+            dataset_config=args.val_dataset_config,
+            source_split=args.val_split,
+            split_mode='full',
+            dataset_revision=getattr(args, 'val_dataset_revision', None))
     return open_data_split('validation', args)
 
 
@@ -132,7 +145,8 @@ def build_arg_parser(argv=None):
     p.add_argument('--val-batches', type=int, default=10, help='batches per held-out validation pass')
     p.add_argument('--val-dataset', default=None, help='held-out validation corpus, e.g. Salesforce/wikitext; must be disjoint from the training stream (default: the validation slice of --dataset)')
     p.add_argument('--val-dataset-config', default='wikitext-103-raw-v1')
-    p.add_argument('--val-split', default='test', help='logical split of --val-dataset used for selection')
+    p.add_argument('--val-dataset-revision', default=None, help='revision (commit hash) of --val-dataset; independent of --dataset-revision (None = upstream default branch)')
+    p.add_argument('--val-split', default='test', help='upstream split of --val-dataset used whole for selection')
     p.add_argument('--val-seq-len', type=int, default=None, help='validation sequence length (default: the training seq-len)')
     p.add_argument('--early-stop-patience', type=int, default=0, help='stop after this many validation passes without improvement (0 = off)')
     p.add_argument('--fail-on-eval-reuse', action='store_true', help='abort on the first validation pass that has to cycle the held-out loader (fewer distinct batches than --val-batches); repeated batches would make the validation stderr look more precise than it is and turn checkpoint selection into a maximum over reused data')
@@ -223,6 +237,10 @@ def main():
         p.error(f'--grad-clip {args.grad_clip} must be finite and positive')
     if args.val_every < 0:
         p.error(f'--val-every {args.val_every} must be >= 0')
+    if not args.val_split or not args.val_split.strip():
+        p.error('--val-split must be a non-empty upstream split name')
+    if args.val_seq_len is not None and args.val_seq_len < 1:
+        p.error(f'--val-seq-len {args.val_seq_len} must be >= 1')
     if args.early_stop_patience < 0:
         p.error(f'--early-stop-patience {args.early_stop_patience} must be >= 0')
     if args.num_workers < 0:
@@ -243,8 +261,10 @@ def main():
         p.error(f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
                 f'{args.max_doc_chars}; no document could pass the cleaner')
     if args.require_pinned_data_revision:
-        unpinned = unpinned_data_revisions(args.dataset_revision,
-                                           args.tokenizer_revision)
+        unpinned = unpinned_data_revisions(
+            args.dataset_revision, args.tokenizer_revision,
+            getattr(args, 'val_dataset_revision', None),
+            getattr(args, 'val_dataset', None))
         if unpinned:
             p.error('--require-pinned-data-revision: ' + '; '.join(unpinned)
                     + ' (resolving at load time pins this run but not a rerun '

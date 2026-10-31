@@ -48,15 +48,19 @@ def restore_data_args(args, ckpt_args: dict, explicit: frozenset=frozenset()) ->
             continue
         current = getattr(args, name, None)
         if (name in explicit and current != ckpt_args[name]
-                and name in ('dataset_revision', 'tokenizer_revision')):
+                and name in ('dataset_revision', 'tokenizer_revision',
+                             'val_dataset_revision')):
             # The checkpoint records the concrete commit, while the user may
             # legitimately repeat the mutable branch/tag they originally
             # requested. Resolve the request first; if it still names the
             # checkpointed commit this is not a data change.
             try:
-                resolved = (resolve_dataset_revision(args.dataset, current)
-                            if name == 'dataset_revision'
-                            else resolve_tokenizer_revision(args.tokenizer, current))
+                if name == 'dataset_revision':
+                    resolved = resolve_dataset_revision(args.dataset, current)
+                elif name == 'val_dataset_revision':
+                    resolved = resolve_dataset_revision(args.val_dataset, current)
+                else:
+                    resolved = resolve_tokenizer_revision(args.tokenizer, current)
             except Exception:
                 resolved = None
             if resolved == ckpt_args[name]:

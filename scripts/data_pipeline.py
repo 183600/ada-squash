@@ -84,6 +84,8 @@ from adasquash.repro import seed_worker
 # training documents.
 DEFAULT_DATA_OPTIONS = {
     "split": "train",            # logical split: train / validation / test
+    "source_split": "train",     # upstream dataset split to read
+    "split_mode": "chronological",  # carve the source split, or use it whole
     "val_frac": 0.005,           # fraction of the document stream held out
     "test_frac": 0.005,          # sealed until the one-shot final evaluation
     "num_documents": None,       # override when the dataset reports no size
@@ -205,6 +207,15 @@ def validate_data_options(options: dict | None = None) -> dict:
     split = opts.get("split")
     if split not in ("train", "validation", "test"):
         raise ValueError(f"data option split must be train/validation/test, got {split!r}")
+    source_split = opts.get("source_split")
+    if not isinstance(source_split, str) or not source_split.strip():
+        raise ValueError(
+            f"data option source_split must be a non-empty string, got {source_split!r}")
+    opts["source_split"] = source_split.strip()
+    split_mode = opts.get("split_mode")
+    if split_mode not in ("chronological", "full"):
+        raise ValueError(
+            f"data option split_mode must be chronological/full, got {split_mode!r}")
     opts["val_frac"] = _fraction_option("val_frac", opts.get("val_frac"))
     opts["test_frac"] = _fraction_option("test_frac", opts.get("test_frac"))
     if opts["val_frac"] + opts["test_frac"] >= 1.0:
@@ -272,25 +283,25 @@ def get_data_options() -> dict:
     return dict(_active_data_options)
 
 
-def infer_num_documents(ds) -> int | None:
-    """Best-effort total document count of a streaming dataset.
+def infer_num_documents(ds, source_split: str = "train") -> int | None:
+    """Best-effort total document count of a streaming dataset split.
 
     HuggingFace datasets usually publish `num_examples` in the split metadata;
     when they do not (or the object is a stub), the caller must pass
     `num_documents` explicitly so the chronological boundary can be placed.
     """
+    if not isinstance(source_split, str) or not source_split.strip():
+        raise ValueError(
+            f"source_split must be a non-empty string, got {source_split!r}")
+    source_split = source_split.strip()
     info = getattr(ds, "info", None)
     splits = getattr(info, "splits", None)
     if not splits:
         return None
-    # The streaming dataset was loaded with split="train", so only the train
-    # count describes this stream. Falling back to validation/test would
-    # place the chronological boundaries at a different corpus length (and
-    # could select documents that are not in the stream at all).
     try:
-        split_info = splits.get("train")
+        split_info = splits.get(source_split)
     except AttributeError:
-        split_info = splits["train"] if "train" in splits else None
+        split_info = splits[source_split] if source_split in splits else None
     n = getattr(split_info, "num_examples", None) if split_info is not None else None
     # bool is an int subclass; True must not become a one-document stream and
     # silently place the held-out boundary at the wrong place.
@@ -431,18 +442,25 @@ def select_stream_split(ds, split: str, options: dict | None = None):
         opts.update(options)
     if split not in ("train", "validation", "test"):
         raise ValueError(f"unknown split '{split}'")
+    source_split = opts.get("source_split")
+    if not isinstance(source_split, str) or not source_split.strip():
+        raise ValueError(
+            f"source_split must be a non-empty string, got {source_split!r}")
+    source_split = source_split.strip()
+    split_mode = opts.get("split_mode")
+    if split_mode not in ("chronological", "full"):
+        raise ValueError(
+            f"split_mode must be chronological/full, got {split_mode!r}")
     val_frac = _fraction_option("val_frac", opts["val_frac"])
     test_frac = _fraction_option("test_frac", opts["test_frac"])
     if val_frac + test_frac >= 1.0:
         raise ValueError(
             f"val_frac={val_frac} + test_frac={test_frac} leaves no training "
             "documents; the split fractions must sum to less than 1")
-    raw_documents = opts.get("num_documents")
-    num_documents = (_int_option("num_documents", raw_documents, 1)
-                     if raw_documents is not None else infer_num_documents(ds))
     report = {
         "split": split,
-        "num_documents": num_documents,
+        "source_split": source_split,
+        "split_mode": split_mode,
         "val_frac": val_frac,
         "test_frac": test_frac,
         "dedup": _bool_option("dedup", opts["dedup"]),
@@ -451,6 +469,16 @@ def select_stream_split(ds, split: str, options: dict | None = None):
         "dataset_revision": opts.get("dataset_revision"),
         "tokenizer_revision": opts.get("tokenizer_revision"),
     }
+    if split_mode == "full":
+        num_documents = infer_num_documents(ds, source_split)
+        report["num_documents"] = num_documents
+        report.update(start=0, count=num_documents)
+        return ds, report
+    raw_documents = opts.get("num_documents")
+    num_documents = (_int_option("num_documents", raw_documents, 1)
+                     if raw_documents is not None
+                     else infer_num_documents(ds, source_split))
+    report["num_documents"] = num_documents
     if val_frac == 0.0 and test_frac == 0.0:
         if split != "train":
             raise ValueError(
@@ -493,8 +521,13 @@ def load_document_stream(dataset_name: str, dataset_config: str | None, split: s
     requested_revision = opts.get("dataset_revision")
     resolved_revision = resolve_dataset_revision(dataset_name, requested_revision)
     load_revision = resolved_revision or requested_revision
-    ds = load_dataset(dataset_name, dataset_config, split="train", streaming=True,
-                      revision=load_revision)
+    source_split = opts.get("source_split", "train")
+    if not isinstance(source_split, str) or not source_split.strip():
+        raise ValueError(
+            f"source_split must be a non-empty string, got {source_split!r}")
+    source_split = source_split.strip()
+    ds = load_dataset(dataset_name, dataset_config, split=source_split,
+                      streaming=True, revision=load_revision)
     stream, report = select_stream_split(ds, split, opts)
     report["dataset_revision_resolved"] = resolved_revision
     report["dataset_revision_loaded"] = load_revision
@@ -1141,8 +1174,8 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
     cached and directly streamed splits clean identically.
     """
     start, count = report.get("start"), report.get("count")
-    if not start or not count:
-        # No prefix to skip.
+    if start is None or count is None:
+        # No materialized range to cache.
         return stream_ds, None
     root = _split_cache_dir()
     if root is None:
@@ -1158,10 +1191,12 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
         return stream_ds, None
     key = json.dumps(
         {
-            "version": 3,
+            "version": 4,
             "dataset": dataset_name,
             "dataset_config": dataset_config,
             "split": split,
+            "source_split": report.get("source_split"),
+            "split_mode": report.get("split_mode"),
             "dataset_revision": report.get("dataset_revision"),
             "dataset_revision_resolved": resolved_revision,
             "num_documents": report.get("num_documents"),
@@ -1244,7 +1279,7 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
                 pass
     fingerprint = {
         "path": str(cache_path),
-        "version": 3,
+        "version": 4,
         # The full identity that produced the payload. Size+sha alone only
         # prove that the sidecar describes *this file*, not that the file is
         # the split/dataset/revision the current key asked for: a foreign but
@@ -1379,7 +1414,8 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
     requested_revision = opts.get("dataset_revision")
     resolved_revision = resolve_dataset_revision(dataset_name, requested_revision)
     load_revision = resolved_revision or requested_revision
-    stream_ds = load_dataset(dataset_name, dataset_config, split="train",
+    source_split = opts["source_split"]
+    stream_ds = load_dataset(dataset_name, dataset_config, split=source_split,
                              streaming=True, revision=load_revision)
     stream_ds, report = select_stream_split(stream_ds, opts["split"], opts)
     # Pin "latest" to a concrete upstream commit before anything is cached or
