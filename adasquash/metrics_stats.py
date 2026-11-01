@@ -796,7 +796,7 @@ def student_t_cdf(t: float, df: float) -> float:
         # The incomplete-beta CDF loses accuracy for very large df and can
         # overflow in `df + t * t`. The O(1/df) normal expansion keeps the
         # leading t-correction instead of dropping to the pure normal limit.
-        normal = NormalDist().cdf(t)
+        normal = 0.5 * math.erfc(-t / _SQRT_2)
         if abs(t) < 1.0e100:
             correction = (math.exp(-0.5 * t * t) / _SQRT_2PI
                           * (t * t * t + t) / (4.0 * df))
