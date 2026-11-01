@@ -1148,8 +1148,8 @@ def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[floa
         return None
     if math.isinf(t):
         return 0.0
-    lower = student_t_cdf(t, df)
-    return min(1.0, 2.0 * min(lower, 1.0 - lower))
+    tail = student_t_cdf(-abs(t), df)
+    return min(1.0, 2.0 * tail)
 
 
 def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
