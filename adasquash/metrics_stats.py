@@ -388,7 +388,7 @@ def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
     out["ci_low"] = None
     out["ci_high"] = None
     if stats["n"] >= 2:
-        half = student_t_ppf(1.0 - alpha / 2.0, float(stats["n"] - 1)) * stats["stderr"]
+        half = -student_t_ppf(alpha / 2.0, float(stats["n"] - 1)) * stats["stderr"]
         out["ci_low"] = stats["mean"] - half
         out["ci_high"] = stats["mean"] + half
     return out
@@ -457,7 +457,7 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
         return out
     spread_factor = math.sqrt(1.0 + 1.0 / n)
     scale = std * spread_factor
-    half = student_t_ppf(1.0 - alpha / 2.0, df) * scale
+    half = -student_t_ppf(alpha / 2.0, df) * scale
     out["prediction_low"] = mean - half
     out["prediction_high"] = mean + half
     # Divide by `std` before the spread factor so a representable std near
@@ -1103,7 +1103,7 @@ def paired_t_one_sided(
             float("inf") if mean_test + margin_test > 0.0 else 0.0)
     else:
         t = (mean_test + margin_test) / se
-    half = student_t_ppf(1.0 - alpha / 2.0, df) * se
+    half = -student_t_ppf(alpha / 2.0, df) * se
     ci_low = (mean_test - half) * ci_scale
     ci_high = (mean_test + half) * ci_scale
     out = {
@@ -1444,7 +1444,7 @@ def tost_paired(
     p_low = min(1.0, max(0.0, p_low))
     p_high = min(1.0, max(0.0, p_high))
     p_tost = max(p_low, p_high)
-    half = student_t_ppf(1.0 - alpha, df) * se
+    half = -student_t_ppf(alpha, df) * se
     ci_low = (mean_test - half) * ci_scale
     ci_high = (mean_test + half) * ci_scale
     out.update({
