@@ -273,9 +273,14 @@ def randomized_complete_block_schedule(units: Iterable[str], replicates: Iterabl
 
     The block order is time order; the within-block order is a keyed SHA-256
     sort, so it is reproducible and independent of Python's ``random``
-    implementation.  Each row is still replicated over every seed, but the
-    seeds are assigned to blocks through an independent per-unit permutation,
-    so a row is not always the first/last run of a block.
+    implementation.  Each row is still replicated over every seed.  A block
+    uses one seed for *all* of its rows, and the keyed order decides which
+    seed belongs to which block.  That binding is deliberate: the reports pair
+    arms by seed, so if a seed were spread over several blocks the paired
+    difference would also contain a block/time difference and block drift
+    would not cancel.  Independent per-row seed permutations satisfy "each
+    row sees each seed" but break the within-block pairing the analysis
+    assumes.
     """
     seed = _validate_seed(seed)
     if isinstance(units, (str, bytes)) or isinstance(replicates, (str, bytes)):
@@ -296,18 +301,14 @@ def randomized_complete_block_schedule(units: Iterable[str], replicates: Iterabl
     def _hash(*parts) -> str:
         return hashlib.sha256('\x1f'.join(str(part) for part in parts).encode('utf-8')).hexdigest()
 
-    replicate_order = {
-        unit: sorted(replicate_ids,
-                     key=lambda rep, unit=unit: (_hash(seed, 'rep', unit, rep), rep))
-        for unit in unit_ids
-    }
+    block_replicates = sorted(
+        replicate_ids, key=lambda rep: (_hash(seed, 'base', rep), rep))
     entries: list[dict] = []
     order: list[str] = []
-    for block_index in range(len(replicate_ids)):
+    for block_index, replicate in enumerate(block_replicates):
         for unit in sorted(unit_ids,
                            key=lambda unit, block=block_index: (
                                _hash(seed, 'block', block, unit), unit)):
-            replicate = replicate_order[unit][block_index]
             run_id = f'{unit}::rep={replicate}'
             entries.append({'unit': unit, 'replicate': replicate,
                             'run_id': run_id, 'block': block_index,
@@ -321,6 +322,13 @@ def randomized_complete_block_schedule(units: Iterable[str], replicates: Iterabl
     if realized != expected:
         raise ValueError('internal error: the block design does not cover every '
                          'unit x replicate pair exactly once')
+    replicate_blocks: dict[str, set[int]] = {}
+    for entry in entries:
+        replicate_blocks.setdefault(entry['replicate'], set()).add(entry['block'])
+    if any(len(blocks) != 1 for blocks in replicate_blocks.values()):
+        raise ValueError('internal error: a replicate/seed is spread over '
+                         'several time blocks, so seed-paired contrasts would '
+                         'not be within-block')
     payload = {'seed': seed, 'units': unit_ids, 'replicates': replicate_ids,
                'order': order}
     fingerprint = hashlib.sha256(
@@ -339,9 +347,11 @@ def randomized_complete_block_schedule(units: Iterable[str], replicates: Iterabl
         'entries': entries,
         'positions': {run_id: position for position, run_id in enumerate(order)},
         'fingerprint': fingerprint,
-        'protocol': ('randomized complete block design: one run of every treatment '
-                     'per time block, each treatment gets every replicate once '
-                     'across blocks, within-block order is a keyed SHA-256 sort'),
+        'protocol': ('randomized complete block design: one time block per '
+                     'replicate/seed, every treatment runs once in every block, '
+                     'the seed-to-block assignment and the within-block order '
+                     'are keyed SHA-256 sorts, so a seed-paired contrast is '
+                     'always within-block'),
     }
 
 
@@ -577,7 +587,14 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     # appear exactly once. The check only applies when the schedule looks
     # like an RCBD (each arm has one run per block), so a generic blocked
     # order with unequal arm counts is not misclassified.
+    is_rcbd = schedule.get('schema') == 'adasquash.rcbd_schedule.v1'
+    has_replicates = is_rcbd or any(
+        isinstance(entry, dict) and entry.get('replicate') is not None
+        for entry in entries)
     block_arm_counts: dict[int, dict[str, int]] = {}
+    block_replicate_counts: dict[int, dict[str, int]] = {}
+    realized_replicates: set[str] = set()
+    replicate_entries_valid = True
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -589,6 +606,15 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         arm = str(_arm_of(entry))
         counts = block_arm_counts.setdefault(block, {})
         counts[arm] = counts.get(arm, 0) + 1
+        if not has_replicates:
+            continue
+        replicate = entry.get('replicate')
+        if not isinstance(replicate, str) or not replicate.strip():
+            replicate_entries_valid = False
+            continue
+        realized_replicates.add(replicate)
+        rep_counts = block_replicate_counts.setdefault(block, {})
+        rep_counts[replicate] = rep_counts.get(replicate, 0) + 1
     declared_blocks = schedule.get('n_blocks')
     declared_blocks_valid = (
         isinstance(declared_blocks, numbers.Integral)
@@ -596,7 +622,50 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         and declared_blocks > 0)
     if declared_blocks_valid:
         declared_blocks = int(declared_blocks)
-    is_rcbd = schedule.get('schema') == 'adasquash.rcbd_schedule.v1'
+    replicate_block_aligned = None
+    replicate_blocks: dict[str, list[int]] = {}
+    if has_replicates:
+        if not replicate_entries_valid:
+            block_replicate_counts = {}
+            structural.append(
+                'one or more entries have a missing or non-empty string '
+                'replicate id; seed-by-block alignment cannot be checked')
+        else:
+            raw_replicates = schedule.get('replicates')
+            declared_replicates = {
+                str(rep) for rep in raw_replicates
+                if str(rep).strip()
+            } if isinstance(raw_replicates, list) else set()
+            replicate_ids = sorted(declared_replicates | realized_replicates)
+            blocks = sorted(block_replicate_counts)
+            if replicate_ids and blocks:
+                complete_counts = {}
+                for block in blocks:
+                    counts = {rep: 0 for rep in replicate_ids}
+                    for rep, value in block_replicate_counts[block].items():
+                        counts[rep] = value
+                    complete_counts[block] = counts
+                block_replicate_counts = complete_counts
+                replicate_blocks = {
+                    rep: [block for block, counts in complete_counts.items()
+                          if counts.get(rep, 0) > 0]
+                    for rep in sorted(realized_replicates)
+                }
+                if replicate_blocks:
+                    replicate_block_aligned = all(
+                        len(rep_blocks) == 1
+                        for rep_blocks in replicate_blocks.values())
+                split = {rep: rep_blocks
+                         for rep, rep_blocks in replicate_blocks.items()
+                         if len(rep_blocks) > 1}
+                if split:
+                    structural.append(
+                        f'replicate/seed(s) {sorted(split)} appear in multiple '
+                        f'time blocks ({split}); a seed-paired arm contrast then '
+                        f'also contains a block/time difference, so block drift '
+                        f'does not cancel')
+            else:
+                block_replicate_counts = {}
     declared_missing = []
     declared_extra = []
     raw_units = schedule.get('units')
@@ -658,6 +727,11 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         'per_arm': per_arm,
         'block_arm_counts': {str(block): counts
                              for block, counts in sorted(block_arm_counts.items())},
+        'block_replicate_counts': {str(block): counts
+                                   for block, counts in sorted(
+                                       block_replicate_counts.items())},
+        'replicate_blocks': replicate_blocks,
+        'replicate_block_aligned': replicate_block_aligned,
         'complete_block_design': complete_block_design,
         'arms_with_extreme_mean_position': sorted(extreme_counts),
         'balanced': not structural,
@@ -2372,6 +2446,20 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         except ValueError as exc:
             add('schedule', 'fail', f'malformed run schedule: {exc}')
         else:
+            alignment = balance.get('replicate_block_aligned')
+            if alignment is True:
+                add('schedule_replicate_block_alignment', 'pass',
+                    'every replicate/seed stays inside one time block, so '
+                    'seed-paired arm contrasts are within-block')
+            elif alignment is False:
+                split = {rep: blocks for rep, blocks in
+                         (balance.get('replicate_blocks') or {}).items()
+                         if len(blocks) != 1}
+                add('schedule_replicate_block_alignment', 'fail',
+                    f'replicate/seed(s) {sorted(split)} are not bound to one '
+                    f'time block ({split}); seed-paired arm contrasts then '
+                    f'also contain a block/time difference, so regenerate the '
+                    f'frozen schedule with one block per seed')
             raw_order = schedule.get('order')
             if not isinstance(raw_order, list):
                 add('schedule', 'fail',

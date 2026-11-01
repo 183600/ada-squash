@@ -283,6 +283,61 @@ def test_balance_flags_an_rcbd_that_is_not_crossed():
                for warning in report['warnings'])
 
 
+def test_each_seed_runs_in_exactly_one_time_block():
+    units = [f'row{i}' for i in range(10)]
+    replicates = ['42', '43', '44']
+    schedule = randomized_complete_block_schedule(units, replicates, seed=7)
+    report = schedule_balance_report(schedule)
+    assert report['complete_block_design'] is True
+    assert report['replicate_block_aligned'] is True
+    assert set(report['replicate_blocks']) == set(replicates)
+    assert all(len(blocks) == 1
+               for blocks in report['replicate_blocks'].values())
+    for unit in units:
+        assert sorted(entry['replicate'] for entry in schedule['entries']
+                      if entry['unit'] == unit) == replicates
+    for block in range(len(replicates)):
+        assert len({entry['replicate'] for entry in schedule['entries']
+                    if entry['block'] == block}) == 1
+
+
+def test_balance_flags_a_seed_spread_over_time_blocks():
+    # Every block contains every arm once and every arm receives every seed,
+    # but seed 42 (and 43/44) is split across blocks. A seed-paired contrast
+    # would therefore also contain a block/time difference.
+    layout = [('a', '42', 0), ('b', '43', 0), ('c', '44', 0),
+              ('a', '43', 1), ('b', '44', 1), ('c', '42', 1),
+              ('a', '44', 2), ('b', '42', 2), ('c', '43', 2)]
+    entries = [{'unit': unit, 'replicate': replicate, 'block': block,
+                'run_id': f'{unit}::rep={replicate}', 'position': position}
+               for position, (unit, replicate, block) in enumerate(layout)]
+    schedule = {
+        'schema': 'adasquash.rcbd_schedule.v1',
+        'n_units': len(entries),
+        'n_blocks': 3,
+        'block_sizes': [3, 3, 3],
+        'units': ['a', 'b', 'c'],
+        'replicates': ['42', '43', '44'],
+        'entries': entries,
+        'order': [entry['run_id'] for entry in entries],
+    }
+    report = schedule_balance_report(schedule)
+    assert report['complete_block_design'] is True
+    assert report['replicate_block_aligned'] is False
+    assert report['balanced'] is False
+    assert any('appear in multiple time blocks' in warning
+               for warning in report['warnings'])
+
+    rows = {'a': {}, 'b': {}, 'c': {}}
+    readiness = design_readiness_audit(
+        [42, 43, 44], rows, {name: 'h' for name in rows}, schedule=schedule,
+        expected_units=schedule['order'], margin=0.05,
+        identity_controls=[('a', 'b')])
+    by_id = {check['id']: check for check in readiness['checks']}
+    assert by_id['schedule_replicate_block_alignment']['status'] == 'fail'
+    assert readiness['ready'] is False
+
+
 def test_readiness_fails_when_the_frozen_schedule_is_edited():
     schedule = randomized_complete_block_schedule(
         ['arm0', 'arm1'], ['0', '1', '2'], seed=1)
