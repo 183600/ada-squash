@@ -17,12 +17,12 @@ Dynamic Tanh (DyT, Zhu et al. 2025) along three orthogonal axes:
 | **DyT-CD** | both (the main proposal)  | DyT-C + DyT-D combined                     | ultra-deep, MoE, FP8 |
 | **DyT-QK** | attention logits (Variant C) | scalar squashing of Q/K before dot product | long-context logit explosion |
 
-The core hypothesis: statistic-free element-wise adaptive squashing can
-stand in for statistic-based normalization while adding **<0.1% additional
-parameters**. For the QK variant the sharper, honest form of the question
-is: *element-wise saturation vs vector normalization — which handles
-outlier channels and attention expressivity better, at matched effective
-logit scale?* (Both bound the logit identically; see the DyT-QK section.)
+The core hypothesis is that statistic-free, element-wise adaptive squashing
+can replace statistic-based normalization with **<0.1% additional parameters**.
+For the QK variant the more precise formulation is: *element-wise saturation
+versus vector normalization — which better handles outlier channels and
+attention expressivity at a matched effective logit scale?* Both approaches
+bound logits identically; see the DyT-QK section.
 
 The `norm_name` values used by configs and scripts are `ln`, `rmsnorm`,
 `dyt`, `dyts`, `dytp`, `dytc`, `dytd`, `dytcd`, and their controlled
@@ -124,15 +124,15 @@ the parser layer.
 import torch
 from adasquash import GPT, GPTConfig, build_norm, generalized_softsign
 
-# A single normalization layer.
+# Instantiate a single normalization layer.
 norm = build_norm("dytcd", dim=128)
 x = torch.randn(2, 8, 128)
 print(norm(x).shape)                    # torch.Size([2, 8, 128])
 
-# The public generalized-softsign entry point (p=2 is the smooth default).
+# Public entry point for the generalized softsign (p=2 is the smooth default).
 print(generalized_softsign(torch.randn(4), 2.0))
 
-# A small decoder with the same block/norm wiring as the experiments.
+# Minimal decoder using the same block and norm wiring as the experiments.
 cfg = GPTConfig(vocab_size=256, dim=128, n_layers=2, n_heads=4, max_seq_len=16)
 model = GPT(cfg)
 tokens = torch.randint(0, cfg.vocab_size, (2, 16))

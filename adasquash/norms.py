@@ -336,6 +336,13 @@ def _apply_affine(phi: torch.Tensor, gamma: torch.Tensor, beta) -> torch.Tensor:
     return phi.mul_(gamma)
 
 
+def _grad_beta(beta, grad_out, need_beta: bool):
+    """Return summed gradient for ``beta`` if required, else ``None``."""
+    if beta is not None and need_beta:
+        return _sum_leading_dims(grad_out)
+    return None
+
+
 def _tanh_squash_forward(x: torch.Tensor, alpha, gamma: torch.Tensor, beta) -> torch.Tensor:
     """``gamma * tanh(alpha * x) (+ beta)`` as one fused step."""
     return _apply_affine(x.mul(alpha).tanh_(), gamma, beta)
@@ -570,9 +577,7 @@ class _DyTCForward(torch.autograd.Function):
                 grad_alpha = _reduce_products(grad_x_scaled, x)
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha)
-        grad_beta = None
-        if beta is not None and ctx.needs_input_grad[4]:
-            grad_beta = _sum_leading_dims(grad_out)
+        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[4])
         return (grad_x, grad_alpha, grad_p, grad_gamma, grad_beta)
 
 @register_norm("dytd")
@@ -629,9 +634,7 @@ class _DyTDForward(torch.autograd.Function):
         grad_x = w
         grad_alpha_0 = grad_a * exp_kdr if ctx.needs_input_grad[1] else None
         grad_k = -grad_a * a * depth_ratio if ctx.needs_input_grad[2] else None
-        grad_beta = None
-        if beta is not None and ctx.needs_input_grad[4]:
-            grad_beta = _sum_leading_dims(grad_out)
+        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[4])
         return (grad_x, grad_alpha_0, grad_k, grad_gamma, grad_beta, None)
 
 @register_norm("dytd_tanh")
@@ -700,9 +703,7 @@ class _DyTForward(torch.autograd.Function):
         grad_alpha = _dot_all(w, x) if ctx.needs_input_grad[1] else None
         w.mul_(alpha)
         grad_x = w
-        grad_beta = None
-        if beta is not None and ctx.needs_input_grad[3]:
-            grad_beta = _sum_leading_dims(grad_out)
+        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[3])
         return (grad_x, grad_alpha, grad_gamma, grad_beta)
 
 @register_norm("dytcd")
@@ -807,9 +808,7 @@ class _DyTCDForward(torch.autograd.Function):
                             grad_k = -grad_scale * scale * depth_ratio
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha_c)
-        grad_beta = None
-        if beta is not None and ctx.needs_input_grad[6]:
-            grad_beta = _sum_leading_dims(grad_out)
+        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[6])
         return (grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None)
 
 @register_norm("dytcd_tanh")
@@ -919,9 +918,7 @@ class _DyTSForward(torch.autograd.Function):
                 grad_alpha = _dot_all(grad_x_scaled, x)
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha)
-        grad_beta = None
-        if beta is not None and ctx.needs_input_grad[4]:
-            grad_beta = _sum_leading_dims(grad_out)
+        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[4])
         return (grad_x, grad_alpha, grad_p, grad_gamma, grad_beta)
 
 @register_norm("dytp")
@@ -961,9 +958,7 @@ class _DyTPForward(torch.autograd.Function):
         w, grad_gamma = _tanh_squash_backward(x, alpha, gamma, grad_out, ctx.needs_input_grad[2])
         grad_alpha = _reduce_products(w, x) if ctx.needs_input_grad[1] else None
         grad_x = w.mul_(alpha) if ctx.needs_input_grad[0] else None
-        grad_beta = None
-        if beta is not None and ctx.needs_input_grad[3]:
-            grad_beta = _sum_leading_dims(grad_out)
+        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[3])
         return (grad_x, grad_alpha, grad_gamma, grad_beta)
 
 @register_norm("dytdi")

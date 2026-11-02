@@ -16,10 +16,9 @@ Dynamic Tanh（DyT, Zhu et al. 2025）：
 | **DyT-CD** | 两者结合（主提案） | DyT-C + DyT-D | 超深模型、MoE、FP8 |
 | **DyT-QK** | 注意力 logits（变体 C） | Q/K 点积前的标量压缩 | 长上下文 logit 爆炸 |
 
-核心假设：免统计的逐元素自适应压缩可以在仅增加 **<0.1% 参数** 的前提下
-替代基于统计的归一化。对 QK 变体，问题的诚实表述是：*逐元素饱和 vs 向量
-归一化——在对齐有效 logit 尺度的前提下，谁更抗离群通道、谁更有注意力
-表达力？*（两者给出的 logit 上界相同，见 DyT-QK 一节。）
+核心假设是免统计的逐元素自适应压缩可以在仅增加 **<0.1% 参数** 的前提下替代基于统计的归一化。
+对 QK 变体，更精确的表述是：*逐元素饱和 vs 向量归一化——在对齐有效 logit 尺度时，谁更抗离群通道、谁更有注意力表达力？*
+两者给出的 logit 上界相同，详见 DyT-QK 一节。
 
 配置与脚本中的 `norm_name` 取值为 `ln`、`rmsnorm`、`dyt`、`dyts`、
 `dytp`、`dytc`、`dytd`、`dytcd` 以及对应的消融变体；QK 压缩通过
@@ -115,15 +114,15 @@ python3 ci_gate.py
 import torch
 from adasquash import GPT, GPTConfig, build_norm, generalized_softsign
 
-# 单个归一化层。
+# 实例化单个归一化层。
 norm = build_norm("dytcd", dim=128)
 x = torch.randn(2, 8, 128)
 print(norm(x).shape)                    # torch.Size([2, 8, 128])
 
-# 公共广义 softsign 入口（p=2 为默认的平滑形式）。
+# 广义 softsign 的公共入口（p=2 为平滑默认值）。
 print(generalized_softsign(torch.randn(4), 2.0))
 
-# 与实验使用同一套 Block/norm 接线的小型解码器。
+# 与实验使用相同 Block 与归一化接线的小型解码器。
 cfg = GPTConfig(vocab_size=256, dim=128, n_layers=2, n_heads=4, max_seq_len=16)
 model = GPT(cfg)
 tokens = torch.randint(0, cfg.vocab_size, (2, 16))
