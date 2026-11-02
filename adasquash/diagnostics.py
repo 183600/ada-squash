@@ -27,17 +27,17 @@ from __future__ import annotations
 
 import bisect
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from fractions import Fraction
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 
 from ._validation import is_boolean_scalar as _is_boolean_scalar
 
 __all__ = [
-    "NAN_TRIAGE_ORDER",
     "DEFAULT_CURVE_THRESHOLDS",
+    "NAN_TRIAGE_ORDER",
     "classify_nan_stage",
     "diagnose_train_val_curve",
     "first_nonfinite_module",
@@ -240,7 +240,7 @@ def diagnose_train_val_curve(
     under ``evidence``.
     """
     if thresholds is not None and not isinstance(thresholds, Mapping):
-        raise ValueError('curve thresholds must be a mapping')
+        raise ValueError("curve thresholds must be a mapping")
     thresholds = {**DEFAULT_CURVE_THRESHOLDS, **(thresholds or {})}
     window = _threshold_int(thresholds.get("window"), "window", 1)
     # A relative change needs two points. `relative_change` already enforces

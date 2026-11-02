@@ -17,10 +17,12 @@ reciprocal-on-``max(|x|, 1)`` formulation of the softsign core are fixed
 design decisions - see ``docs/design_notes.md``.
 """
 from __future__ import annotations
+
 import math
 from typing import Optional
+
 import torch
-import torch.nn as nn
+from torch import nn
 
 # Registry of the norm families, keyed by the ``norm_name`` values the
 # configs and scripts pass around (``build_norm`` resolves them).
@@ -56,7 +58,7 @@ def _as_scalar_exponent(p):
 
     Other tensors (including every CUDA tensor) are returned unchanged.
     """
-    if isinstance(p, torch.Tensor) and p.device.type == 'cpu' and p.numel() == 1:
+    if isinstance(p, torch.Tensor) and p.device.type == "cpu" and p.numel() == 1:
         return float(p)
     return p
 
@@ -75,7 +77,7 @@ def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
     correction is a no-op; non-CPU tensors keep the multiply unconditionally.
     `signbit` (rather than `< 0`) is what makes `-0.0` count as negative.
     """
-    if scale.device.type != 'cpu':
+    if scale.device.type != "cpu":
         return True
     return bool(torch.signbit(scale).any())
 
@@ -392,7 +394,7 @@ def _init_depth_schedule(module, layer_idx, num_layers, alpha_0, k_init,
     if learnable_k:
         module.k = nn.Parameter(torch.tensor(float(k_init)))
     else:
-        module.register_buffer('k', torch.tensor(float(k_init)))
+        module.register_buffer("k", torch.tensor(float(k_init)))
     module.k_min = k_min
 
 class _GeneralizedSoftsign(torch.autograd.Function):
@@ -722,11 +724,11 @@ class DyTCD(_SquashedAffine):
             # grad == False` and returns no gradient for it - which keeps the
             # depth schedule, the softsign activation and LayerScale identical
             # to the full model. (Frozen `k` / `p` already use this pattern.)
-            self.register_buffer('delta', torch.zeros(dim))
+            self.register_buffer("delta", torch.zeros(dim))
         if learnable_p:
             self.p = nn.Parameter(torch.tensor(float(p_init)))
         else:
-            self.register_buffer('p', torch.tensor(float(p_init)))
+            self.register_buffer("p", torch.tensor(float(p_init)))
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
@@ -835,7 +837,7 @@ class DyTCDTanh(nn.Module):
         if learnable_delta:
             self.delta = nn.Parameter(torch.zeros(dim))
         else:
-            self.register_buffer('delta', torch.zeros(dim))
+            self.register_buffer("delta", torch.zeros(dim))
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
@@ -1041,4 +1043,4 @@ class QKSquash(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
         return _QKSquashTanh.apply(q, k, self.alpha_q, self.alpha_k)
-__all__ = ['NORM_REGISTRY', 'register_norm', 'build_norm', 'generalized_softsign', 'LayerNorm', 'RMSNorm', 'DyT', 'DyTS', 'DyTP', 'DyTC', 'DyTD', 'DyTDTanh', 'DyTDI', 'DyTCD', 'DyTCDTanh', 'DyTCDI', 'QKSquash']
+__all__ = ["NORM_REGISTRY", "DyT", "DyTC", "DyTCD", "DyTCDI", "DyTCDTanh", "DyTD", "DyTDI", "DyTDTanh", "DyTP", "DyTS", "LayerNorm", "QKSquash", "RMSNorm", "build_norm", "generalized_softsign", "register_norm"]

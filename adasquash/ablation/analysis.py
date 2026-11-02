@@ -6,20 +6,23 @@ import json
 from collections.abc import Mapping
 
 from adasquash.design import exclusion_policy_fingerprint, normalize_exclusion_policy
-from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, _validate_alpha,
-                               benjamini_hochberg_adjust, holm_adjust)
+from adasquash.metrics import (
+    MIN_SEEDS_FOR_SIGNIFICANCE,
+    _validate_alpha,
+    benjamini_hochberg_adjust,
+    holm_adjust,
+)
 from adasquash.sequential import group_sequential_plan
 
 from .common import _finite_metric, _is_integer_scalar, _is_seed_id
-from .matrix import (PRIMARY_FACTORIAL_DESIGN, PRIMARY_MAIN_ROW,
-                     _parse_three_way_cell_key)
+from .matrix import PRIMARY_FACTORIAL_DESIGN, PRIMARY_MAIN_ROW, _parse_three_way_cell_key
 
 
 def _factorial_levels(info: dict, factor_names) -> dict:
     """Two levels per factor, from the report or inferred from cell keys."""
     info = info or {}
-    declared = dict(info.get('levels') or {})
-    cells = info.get('cells') or {}
+    declared = dict(info.get("levels") or {})
+    cells = info.get("cells") or {}
     levels: dict = {}
     for factor in factor_names:
         values = [str(value) for value in (declared.get(factor) or ())]
@@ -35,11 +38,11 @@ def _factorial_levels(info: dict, factor_names) -> dict:
     return levels
 
 ANALYSIS_PLAN_FINGERPRINT_FIELDS = (
-    'model', 'seeds', 'alpha', 'margin', 'equivalence_margin',
-    'baseline_pool', 'expected_attrition', 'exclusion_policy',
-    'exclusion_policy_fingerprint', 'row_configs', 'matrix_cells',
-    'run_schedule', 'contrasts', 'paired_sd_evidence',
-    'sequential_monitoring',
+    "model", "seeds", "alpha", "margin", "equivalence_margin",
+    "baseline_pool", "expected_attrition", "exclusion_policy",
+    "exclusion_policy_fingerprint", "row_configs", "matrix_cells",
+    "run_schedule", "contrasts", "paired_sd_evidence",
+    "sequential_monitoring",
 )
 _ANALYSIS_PLAN_REQUIRED_FIELDS = ANALYSIS_PLAN_FINGERPRINT_FIELDS[:-2]
 
@@ -53,17 +56,17 @@ def analysis_plan_fingerprint(plan: dict) -> str:
     """
     if not isinstance(plan, Mapping):
         raise ValueError(
-            f'analysis plan must be a mapping, got {type(plan).__name__}')
+            f"analysis plan must be a mapping, got {type(plan).__name__}")
     missing = [field for field in _ANALYSIS_PLAN_REQUIRED_FIELDS
                if field not in plan]
     if missing:
         raise ValueError(
-            'analysis plan is missing fingerprint field(s): '
-            + ', '.join(missing))
+            "analysis plan is missing fingerprint field(s): "
+            + ", ".join(missing))
     payload = {field: plan[field] for field in ANALYSIS_PLAN_FINGERPRINT_FIELDS
                if field in plan}
     return hashlib.sha256(
-        json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+        json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
@@ -75,7 +78,7 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         expected_attrition: float=0.0,
                         paired_sd_evidence: dict | None=None,
                         sequential_looks: int=0,
-                        sequential_spending: str='obrien-fleming') -> dict:
+                        sequential_spending: str="obrien-fleming") -> dict:
     """Freeze the confirmatory contrast registry *before* any training starts.
 
     A comparison experiment is only confirmatory if the set of tests is fixed
@@ -119,8 +122,8 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         # host-level QK contrast). It is one test, so the pre-registration and
         # the study-level Holm family must count it once; otherwise the
         # duplicated p-value doubles its weight and inflates the family size.
-        if entry.get('kind') in ('superiority', 'mechanism_removal'):
-            pair = (entry.get('candidate'), entry.get('reference'))
+        if entry.get("kind") in ("superiority", "mechanism_removal"):
+            pair = (entry.get("candidate"), entry.get("reference"))
             if pair[0] is not None and pair[1] is not None:
                 if pair in seen_directional_pairs:
                     return
@@ -130,7 +133,7 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     for name in sorted(rows):
         if name in baseline_set:
             continue
-        if not str(hypotheses.get(name) or '').strip():
+        if not str(hypotheses.get(name) or "").strip():
             # `validate_matrix` already rejects this, but a direct call must
             # not silently drop a contrast from the pre-registration: a plan
             # that omits a row would let the missing hypothesis disappear and
@@ -139,21 +142,21 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                 f"ablation row '{name}' has no stated scientific hypothesis; "
                 "the analysis plan must not silently omit it")
         _add({
-            'id': f'baseline:{name}',
-            'family': 'baseline',
-            'kind': 'superiority',
-            'candidate': name,
-            'reference': 'best_replicated_baseline',
-            'metric': 'val_loss',
-            'sided': 'one_sided',
-            'hypothesis': hypotheses.get(name),
+            "id": f"baseline:{name}",
+            "family": "baseline",
+            "kind": "superiority",
+            "candidate": name,
+            "reference": "best_replicated_baseline",
+            "metric": "val_loss",
+            "sided": "one_sided",
+            "hypothesis": hypotheses.get(name),
         })
-    qk_axis_report = matrix_report.get('qk_axis') or {}
+    qk_axis_report = matrix_report.get("qk_axis") or {}
     qk_on_off_pairs = {
-        (info.get('on'), info.get('off')) for info in qk_axis_report.values()
+        (info.get("on"), info.get("off")) for info in qk_axis_report.values()
         if isinstance(info, dict)}
     for full_name, mechanisms in sorted(
-            (matrix_report.get('leave_one_out') or {}).items()):
+            (matrix_report.get("leave_one_out") or {}).items()):
         for mechanism, reference in sorted((mechanisms or {}).items()):
             if (full_name, reference) in qk_on_off_pairs:
                 # Canonicalised by the host-level QK-axis contrast below: the
@@ -161,61 +164,61 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                 # not pre-register it twice.
                 continue
             _add({
-                'id': f'loo:{full_name}:{mechanism}',
-                'family': 'leave_one_out',
-                'kind': 'mechanism_removal',
-                'candidate': full_name,
-                'reference': reference,
-                'metric': 'val_loss',
-                'sided': 'one_sided',
-                'hypothesis': (f'removing {mechanism} from {full_name} raises '
-                               f'held-out val_loss'),
+                "id": f"loo:{full_name}:{mechanism}",
+                "family": "leave_one_out",
+                "kind": "mechanism_removal",
+                "candidate": full_name,
+                "reference": reference,
+                "metric": "val_loss",
+                "sided": "one_sided",
+                "hypothesis": (f"removing {mechanism} from {full_name} raises "
+                               f"held-out val_loss"),
             })
-    for design, info in sorted((matrix_report.get('factorial') or {}).items()):
-        factor_names = list((info or {}).get('factors') or {})
+    for design, info in sorted((matrix_report.get("factorial") or {}).items()):
+        factor_names = list((info or {}).get("factors") or {})
         for factor in factor_names:
             _add({
-                'id': f'factorial:{design}:{factor}',
-                'family': 'factorial',
-                'kind': 'main_effect',
-                'design': design,
-                'factor': factor,
-                'metric': 'val_loss',
-                'sided': 'one_sided',
-                'hypothesis': f'{factor} lowers held-out val_loss in {design}',
+                "id": f"factorial:{design}:{factor}",
+                "family": "factorial",
+                "kind": "main_effect",
+                "design": design,
+                "factor": factor,
+                "metric": "val_loss",
+                "sided": "one_sided",
+                "hypothesis": f"{factor} lowers held-out val_loss in {design}",
             })
         if len(factor_names) == 2:
             first, second = factor_names
             _add({
-                'id': f'factorial:{design}:{first}_x_{second}',
-                'family': 'factorial',
-                'kind': 'interaction',
-                'design': design,
-                'factor': f'{first}_x_{second}',
-                'metric': 'val_loss',
-                'sided': 'two_sided',
-                'hypothesis': (f'{first} and {second} interact (synergy or '
-                               f'antagonism) in {design}'),
+                "id": f"factorial:{design}:{first}_x_{second}",
+                "family": "factorial",
+                "kind": "interaction",
+                "design": design,
+                "factor": f"{first}_x_{second}",
+                "metric": "val_loss",
+                "sided": "two_sided",
+                "hypothesis": (f"{first} and {second} interact (synergy or "
+                               f"antagonism) in {design}"),
             })
             for factor, other in ((first, second), (second, first)):
-                for level in ('off', 'on'):
+                for level in ("off", "on"):
                     _add({
-                        'id': f'factorial:{design}:{factor}@{other}={level}',
-                        'family': 'conditional_follow_up',
-                        'kind': 'simple_effect',
-                        'design': design,
-                        'factor': factor,
-                        'conditional_context': {other: level},
-                        'metric': 'val_loss',
-                        'sided': 'one_sided',
+                        "id": f"factorial:{design}:{factor}@{other}={level}",
+                        "family": "conditional_follow_up",
+                        "kind": "simple_effect",
+                        "design": design,
+                        "factor": factor,
+                        "conditional_context": {other: level},
+                        "metric": "val_loss",
+                        "sided": "one_sided",
                         # Pre-registered, but a conditional follow-up must not
                         # double-count a contrast already in the study family
                         # (e.g. Full vs Full-minus-per-channel is the
                         # per-channel simple effect at depth=on).
-                        'counted_in_study_family': False,
-                        'hypothesis': (f'{factor} lowers held-out val_loss '
-                                       f'within {other}={level} in {design} '
-                                       f'(interaction-gated follow-up)'),
+                        "counted_in_study_family": False,
+                        "hypothesis": (f"{factor} lowers held-out val_loss "
+                                       f"within {other}={level} in {design} "
+                                       f"(interaction-gated follow-up)"),
                     })
     # The 2x2x2 design adds the two interactions that involve the activation
     # family and the three-way term. Main effects are deliberately not
@@ -225,32 +228,32 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     # interaction terms are different estimands from the within-family 2x2
     # interactions, so they are new tests, not duplicates.
     for design, info in sorted(
-            (matrix_report.get('three_way_factorial') or {}).items()):
-        factor_names = list((info or {}).get('factors') or [])
+            (matrix_report.get("three_way_factorial") or {}).items()):
+        factor_names = list((info or {}).get("factors") or [])
         for first, second in itertools.combinations(factor_names, 2):
             _add({
-                'id': f'factorial3:{design}:{first}_x_{second}',
-                'family': 'factorial3',
-                'kind': 'interaction',
-                'design': design,
-                'factor': f'{first}_x_{second}',
-                'metric': 'val_loss',
-                'sided': 'two_sided',
-                'hypothesis': (f'{first} and {second} interact when the third '
-                               f'axis is pooled over in {design}'),
+                "id": f"factorial3:{design}:{first}_x_{second}",
+                "family": "factorial3",
+                "kind": "interaction",
+                "design": design,
+                "factor": f"{first}_x_{second}",
+                "metric": "val_loss",
+                "sided": "two_sided",
+                "hypothesis": (f"{first} and {second} interact when the third "
+                               f"axis is pooled over in {design}"),
             })
         if len(factor_names) == 3:
             first, second, third = factor_names
             _add({
-                'id': (f'factorial3:{design}:{first}_x_{second}_x_{third}'),
-                'family': 'factorial3',
-                'kind': 'interaction',
-                'design': design,
-                'factor': f'{first}_x_{second}_x_{third}',
-                'metric': 'val_loss',
-                'sided': 'two_sided',
-                'hypothesis': (f'the {first} x {second} interaction differs '
-                               f'between the two levels of {third} in {design}'),
+                "id": (f"factorial3:{design}:{first}_x_{second}_x_{third}"),
+                "family": "factorial3",
+                "kind": "interaction",
+                "design": design,
+                "factor": f"{first}_x_{second}_x_{third}",
+                "metric": "val_loss",
+                "sided": "two_sided",
+                "hypothesis": (f"the {first} x {second} interaction differs "
+                               f"between the two levels of {third} in {design}"),
             })
         factor_levels = _factorial_levels(info, factor_names)
         if factor_levels:
@@ -259,82 +262,82 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                 for combo in itertools.product(
                         *(factor_levels[name] for name in others)):
                     context = dict(zip(others, combo))
-                    label = '|'.join(
-                        f'{name}={context[name]}' for name in others)
+                    label = "|".join(
+                        f"{name}={context[name]}" for name in others)
                     _add({
-                        'id': f'factorial3:{design}:{factor}@{label}',
-                        'family': 'conditional_follow_up',
-                        'kind': 'simple_effect',
-                        'design': design,
-                        'factor': factor,
-                        'conditional_context': context,
-                        'metric': 'val_loss',
-                        'sided': 'one_sided',
-                        'counted_in_study_family': False,
-                        'hypothesis': (f'{factor} lowers held-out val_loss '
-                                       f'within {label} in {design} '
-                                       f'(interaction-gated follow-up)'),
+                        "id": f"factorial3:{design}:{factor}@{label}",
+                        "family": "conditional_follow_up",
+                        "kind": "simple_effect",
+                        "design": design,
+                        "factor": factor,
+                        "conditional_context": context,
+                        "metric": "val_loss",
+                        "sided": "one_sided",
+                        "counted_in_study_family": False,
+                        "hypothesis": (f"{factor} lowers held-out val_loss "
+                                       f"within {label} in {design} "
+                                       f"(interaction-gated follow-up)"),
                     })
-    for host, info in sorted((matrix_report.get('qk_axis') or {}).items()):
+    for host, info in sorted((matrix_report.get("qk_axis") or {}).items()):
         info = info or {}
         _add({
-            'id': f'qk:{host}:qk_vs_off',
-            'family': 'qk_axis',
-            'kind': 'superiority',
-            'candidate': info.get('on'),
-            'reference': info.get('off'),
-            'metric': 'val_loss',
-            'sided': 'one_sided',
-            'hypothesis': f'tanh QK compression lowers held-out val_loss on {host}',
+            "id": f"qk:{host}:qk_vs_off",
+            "family": "qk_axis",
+            "kind": "superiority",
+            "candidate": info.get("on"),
+            "reference": info.get("off"),
+            "metric": "val_loss",
+            "sided": "one_sided",
+            "hypothesis": f"tanh QK compression lowers held-out val_loss on {host}",
         })
         _add({
-            'id': f'qk:{host}:qknorm_vs_qk',
-            'family': 'qk_axis',
-            'kind': 'comparator',
-            'candidate': info.get('comparator'),
-            'reference': info.get('on'),
-            'metric': 'val_loss',
-            'sided': 'one_sided',
-            'hypothesis': (f'per-head QK-Norm beats the tanh QK compression on '
-                           f'{host}'),
+            "id": f"qk:{host}:qknorm_vs_qk",
+            "family": "qk_axis",
+            "kind": "comparator",
+            "candidate": info.get("comparator"),
+            "reference": info.get("on"),
+            "metric": "val_loss",
+            "sided": "one_sided",
+            "hypothesis": (f"per-head QK-Norm beats the tanh QK compression on "
+                           f"{host}"),
         })
     for design, info in sorted(
-            (matrix_report.get('dose_response') or {}).items()):
+            (matrix_report.get("dose_response") or {}).items()):
         info = info or {}
-        reference = info.get('reference')
-        for level in info.get('levels') or []:
-            if level.get('is_reference'):
+        reference = info.get("reference")
+        for level in info.get("levels") or []:
+            if level.get("is_reference"):
                 continue
             _add({
-                'id': f"dose_response:{design}:{level.get('row')}",
-                'family': 'dose_response',
-                'kind': 'dose_response_level',
-                'design': design,
-                'axis': info.get('axis'),
-                'dose': level.get('dose'),
-                'candidate': level.get('row'),
-                'reference': reference,
-                'metric': 'val_loss',
-                'sided': 'one_sided',
-                'hypothesis': (
+                "id": f"dose_response:{design}:{level.get('row')}",
+                "family": "dose_response",
+                "kind": "dose_response_level",
+                "design": design,
+                "axis": info.get("axis"),
+                "dose": level.get("dose"),
+                "candidate": level.get("row"),
+                "reference": reference,
+                "metric": "val_loss",
+                "sided": "one_sided",
+                "hypothesis": (
                     f"{info.get('hypothesis')} "
                     f"Level {level.get('label')} vs reference {reference}."),
             })
-        trend = info.get('trend')
+        trend = info.get("trend")
         if trend:
-            alternative = trend.get('alternative', 'two_sided')
+            alternative = trend.get("alternative", "two_sided")
             _add({
-                'id': f'dose_response:{design}:trend',
-                'family': 'dose_response',
-                'kind': 'trend',
-                'design': design,
-                'axis': info.get('axis'),
-                'factor': info.get('axis'),
-                'metric': 'val_loss',
-                'sided': ('two_sided' if alternative == 'two_sided'
-                          else 'one_sided'),
-                'alternative': alternative,
-                'hypothesis': trend.get('hypothesis'),
+                "id": f"dose_response:{design}:trend",
+                "family": "dose_response",
+                "kind": "trend",
+                "design": design,
+                "axis": info.get("axis"),
+                "factor": info.get("axis"),
+                "metric": "val_loss",
+                "sided": ("two_sided" if alternative == "two_sided"
+                          else "one_sided"),
+                "alternative": alternative,
+                "hypothesis": trend.get("hypothesis"),
             })
     # Hierarchical gatekeeping: the main proposal's own superiority and
     # mechanism contrasts are the primary family. Only if at least one of
@@ -344,20 +347,20 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     # rate at alpha without making every exploratory sweep compete with the
     # primary claim for the same alpha budget.
     for entry in contrasts:
-        if entry.get('counted_in_study_family') is False:
-            entry['tier'] = 2
-            entry['tier_role'] = 'conditional_follow_up'
+        if entry.get("counted_in_study_family") is False:
+            entry["tier"] = 2
+            entry["tier_role"] = "conditional_follow_up"
             continue
         primary = (
-            (entry['family'] == 'baseline'
-             and entry.get('candidate') == PRIMARY_MAIN_ROW)
-            or (entry['family'] == 'leave_one_out'
-                and entry.get('candidate') == PRIMARY_MAIN_ROW)
-            or (entry['family'] == 'factorial'
-                and entry.get('design') == PRIMARY_FACTORIAL_DESIGN)
+            (entry["family"] == "baseline"
+             and entry.get("candidate") == PRIMARY_MAIN_ROW)
+            or (entry["family"] == "leave_one_out"
+                and entry.get("candidate") == PRIMARY_MAIN_ROW)
+            or (entry["family"] == "factorial"
+                and entry.get("design") == PRIMARY_FACTORIAL_DESIGN)
         )
-        entry['tier'] = 1 if primary else 2
-        entry['tier_role'] = 'primary' if primary else 'secondary'
+        entry["tier"] = 1 if primary else 2
+        entry["tier_role"] = "primary" if primary else "secondary"
     # The exclusion policy is a design decision too: changing which runs may
     # be dropped changes the analysed sample, so it belongs in the same
     # fingerprint as the contrasts and the randomized schedule.
@@ -365,41 +368,41 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     if (not _finite_metric(expected_attrition)
             or not 0.0 <= float(expected_attrition) < 1.0):
         raise ValueError(
-            f'expected_attrition must be a finite probability in [0, 1), '
-            f'got {expected_attrition!r}')
+            f"expected_attrition must be a finite probability in [0, 1), "
+            f"got {expected_attrition!r}")
     if not _finite_metric(alpha) or not 0.0 < float(alpha) < 1.0:
         raise ValueError(
-            f'analysis-plan alpha must be a finite number strictly between '
-            f'0 and 1, got {alpha!r}')
+            f"analysis-plan alpha must be a finite number strictly between "
+            f"0 and 1, got {alpha!r}")
     if not _finite_metric(margin) or float(margin) < 0.0:
         raise ValueError(
-            f'analysis-plan margin must be a finite number >= 0, '
-            f'got {margin!r}')
+            f"analysis-plan margin must be a finite number >= 0, "
+            f"got {margin!r}")
     if not _finite_metric(equivalence_margin) or float(equivalence_margin) < 0.0:
         raise ValueError(
-            f'analysis-plan equivalence_margin must be a finite number >= 0, '
-            f'got {equivalence_margin!r}')
+            f"analysis-plan equivalence_margin must be a finite number >= 0, "
+            f"got {equivalence_margin!r}")
     if float(equivalence_margin) > 0.0 and float(alpha) >= 0.5:
         raise ValueError(
-            'analysis-plan equivalence_margin > 0 requires alpha < 0.5 so '
-            f'the TOST interval 1 - 2*alpha is positive, got alpha={alpha!r}')
+            "analysis-plan equivalence_margin > 0 requires alpha < 0.5 so "
+            f"the TOST interval 1 - 2*alpha is positive, got alpha={alpha!r}")
     seeds = list(seeds or [])
     if not all(_is_seed_id(seed) for seed in seeds):
         raise ValueError(
-            f'analysis-plan seeds must be integer ids, got {seeds!r}')
+            f"analysis-plan seeds must be integer ids, got {seeds!r}")
     normalized_seeds = [int(seed) for seed in seeds]
     if len(set(normalized_seeds)) != len(normalized_seeds):
         raise ValueError(
-            f'analysis-plan seeds must be unique, got {seeds!r}')
+            f"analysis-plan seeds must be unique, got {seeds!r}")
     if not _is_integer_scalar(sequential_looks) or sequential_looks < 0:
         raise ValueError(
-            f'sequential_looks must be a non-negative integer, got '
-            f'{sequential_looks!r}')
+            f"sequential_looks must be a non-negative integer, got "
+            f"{sequential_looks!r}")
     sequential_looks = int(sequential_looks)
     sequential_plan = None
     if sequential_looks:
         primary_tests = max(
-            1, sum(1 for entry in contrasts if entry.get('tier') == 1))
+            1, sum(1 for entry in contrasts if entry.get("tier") == 1))
         sequential_plan = group_sequential_plan(
             len(normalized_seeds), n_looks=sequential_looks,
             alpha=float(alpha), n_tests=primary_tests,
@@ -407,56 +410,56 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     if paired_sd_evidence is not None:
         if not isinstance(paired_sd_evidence, Mapping):
             raise ValueError(
-                f'paired_sd_evidence must be a mapping, got '
-                f'{type(paired_sd_evidence).__name__}')
+                f"paired_sd_evidence must be a mapping, got "
+                f"{type(paired_sd_evidence).__name__}")
         try:
             json.dumps(paired_sd_evidence, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f'paired_sd_evidence must be JSON-serializable: {exc}') from None
+                f"paired_sd_evidence must be JSON-serializable: {exc}") from None
     payload = {
-        'model': model_name,
-        'seeds': normalized_seeds,
-        'alpha': float(alpha),
-        'margin': float(margin),
-        'equivalence_margin': float(equivalence_margin),
-        'baseline_pool': sorted(baseline_set),
-        'expected_attrition': float(expected_attrition),
-        'exclusion_policy': exclusion_policy,
-        'exclusion_policy_fingerprint': exclusion_policy_fingerprint(exclusion_policy),
+        "model": model_name,
+        "seeds": normalized_seeds,
+        "alpha": float(alpha),
+        "margin": float(margin),
+        "equivalence_margin": float(equivalence_margin),
+        "baseline_pool": sorted(baseline_set),
+        "expected_attrition": float(expected_attrition),
+        "exclusion_policy": exclusion_policy,
+        "exclusion_policy_fingerprint": exclusion_policy_fingerprint(exclusion_policy),
         # The contrast *ids* alone do not identify the experiment: two
         # matrices can reuse the same row names and hypotheses while changing
         # a model knob (e.g. alpha_init), or can map a factorial design to
         # different cells. Hash those definitions too, or a post-hoc model
         # change would not move the pre-registration fingerprint.
-        'row_configs': {name: rows.get(name) for name in sorted(rows)},
-        'matrix_cells': {
+        "row_configs": {name: rows.get(name) for name in sorted(rows)},
+        "matrix_cells": {
             key: matrix_report.get(key)
-            for key in ('leave_one_out', 'factorial', 'three_way_factorial',
-                        'qk_axis', 'dose_response')
+            for key in ("leave_one_out", "factorial", "three_way_factorial",
+                        "qk_axis", "dose_response")
         },
         # The randomized execution order is part of the pre-registration: a
         # schedule chosen after seeing which arms look good is a design
         # degree of freedom exactly like choosing the contrasts afterwards.
-        'run_schedule': run_schedule,
-        'contrasts': contrasts,
+        "run_schedule": run_schedule,
+        "contrasts": contrasts,
     }
     if paired_sd_evidence is not None:
-        payload['paired_sd_evidence'] = paired_sd_evidence
+        payload["paired_sd_evidence"] = paired_sd_evidence
     if sequential_plan is not None:
-        payload['sequential_monitoring'] = sequential_plan
+        payload["sequential_monitoring"] = sequential_plan
     fingerprint = analysis_plan_fingerprint(payload)
     return {
-        'schema': 'adasquash.analysis_plan.v1',
-        'fingerprint': fingerprint,
-        'n_contrasts': len(contrasts),
-        'contrast_ids': [entry['id'] for entry in contrasts],
+        "schema": "adasquash.analysis_plan.v1",
+        "fingerprint": fingerprint,
+        "n_contrasts": len(contrasts),
+        "contrast_ids": [entry["id"] for entry in contrasts],
         **payload,
-        'protocol': (
-            'confirmatory contrasts are fixed before training and identified by '
-            '`id`; the study-level Holm correction admits only these ids, so a '
-            'realized test absent from this plan is exploratory and cannot be '
-            'counted as a confirmed claim'),
+        "protocol": (
+            "confirmatory contrasts are fixed before training and identified by "
+            "`id`; the study-level Holm correction admits only these ids, so a "
+            "realized test absent from this plan is exploratory and cannot be "
+            "counted as a confirmed claim"),
     }
 
 
@@ -465,8 +468,8 @@ def _finite_p(value):
 
 
 def _conditional_follow_up_reason(entry: dict) -> str:
-    status = entry.get('conditional_test_status')
-    gate = entry.get('interaction_gate_open')
+    status = entry.get("conditional_test_status")
+    gate = entry.get("interaction_gate_open")
     return (
         'conditional follow-up (interaction-gated simple effect); '
         'pre-registered but not counted as a new study-level confirmatory '
@@ -511,352 +514,352 @@ def study_level_correction(comparisons: dict, plan: dict | None,
     if not isinstance(plan, dict):
         return None
     alpha = _validate_alpha(alpha)
-    planned = {entry['id']: entry for entry in plan.get('contrasts', [])
-               if isinstance(entry, dict) and entry.get('id')}
+    planned = {entry["id"]: entry for entry in plan.get("contrasts", [])
+               if isinstance(entry, dict) and entry.get("id")}
     records: list = []
 
     def _record(cid, family, p, family_p, claim_direction, family_significant,
                 *, hypothesis=None, replicated=False, test_basis=None,
                 effect=None, excluded_reason=None):
         records.append({
-            'id': cid,
-            'family': family,
-            'p_one_sided_or_two_sided': _finite_p(p),
-            'p_family_holm': _finite_p(family_p),
-            'claim_direction_observed': bool(claim_direction),
-            'family_local_significant': bool(family_significant),
-            'replicated_across_seeds': bool(replicated),
-            'test_basis': test_basis,
-            'effect': effect,
-            'hypothesis': hypothesis,
-            'excluded_from_study_family': excluded_reason,
-            'p_study_holm': None,
-            'q_value_bh': None,
-            'exploratory_fdr_significant': False,
-            'confirmed_at_study_level': False,
-            'downgraded_by_study_level': False,
+            "id": cid,
+            "family": family,
+            "p_one_sided_or_two_sided": _finite_p(p),
+            "p_family_holm": _finite_p(family_p),
+            "claim_direction_observed": bool(claim_direction),
+            "family_local_significant": bool(family_significant),
+            "replicated_across_seeds": bool(replicated),
+            "test_basis": test_basis,
+            "effect": effect,
+            "hypothesis": hypothesis,
+            "excluded_from_study_family": excluded_reason,
+            "p_study_holm": None,
+            "q_value_bh": None,
+            "exploratory_fdr_significant": False,
+            "confirmed_at_study_level": False,
+            "downgraded_by_study_level": False,
         })
 
-    baseline = comparisons.get('baseline') or {}
-    for entry in baseline.get('rows', []) or []:
-        name = entry.get('name')
+    baseline = comparisons.get("baseline") or {}
+    for entry in baseline.get("rows", []) or []:
+        name = entry.get("name")
         if not name:
             continue
         _record(
-            f'baseline:{name}', 'baseline',
-            (entry.get('p_inferential')
-             if entry.get('p_inferential') is not None
-             else entry.get('p_one_sided')),
-            entry.get('p_one_sided_holm'), entry.get('beats_reference'),
-            entry.get('beats_reference_significantly'),
-            hypothesis=entry.get('hypothesis'),
-            replicated=entry.get('replicated_across_seeds'),
-            test_basis=entry.get('test_basis'),
+            f"baseline:{name}", "baseline",
+            (entry.get("p_inferential")
+             if entry.get("p_inferential") is not None
+             else entry.get("p_one_sided")),
+            entry.get("p_one_sided_holm"), entry.get("beats_reference"),
+            entry.get("beats_reference_significantly"),
+            hypothesis=entry.get("hypothesis"),
+            replicated=entry.get("replicated_across_seeds"),
+            test_basis=entry.get("test_basis"),
             # The certifying p-value is the paired shared-seed test, so the
             # study-level effect must be that same paired delta. Falling back
             # to the all-seed difference can even reverse its sign.
-            effect=(entry.get('delta_paired_mean')
-                    if entry.get('delta_paired_mean') is not None
-                    else entry.get('delta_vs_reference')),
-            excluded_reason=entry.get('excluded_from_family'))
-    loo = comparisons.get('leave_one_out') or {}
-    for entry in loo.get('rows', []) or []:
-        if entry.get('skipped') or not entry.get('full'):
+            effect=(entry.get("delta_paired_mean")
+                    if entry.get("delta_paired_mean") is not None
+                    else entry.get("delta_vs_reference")),
+            excluded_reason=entry.get("excluded_from_family"))
+    loo = comparisons.get("leave_one_out") or {}
+    for entry in loo.get("rows", []) or []:
+        if entry.get("skipped") or not entry.get("full"):
             continue
         _record(
-            f"loo:{entry['full']}:{entry['mechanism']}", 'leave_one_out',
-            entry.get('p_one_sided'), entry.get('p_one_sided_holm'),
-            entry.get('mechanism_helps'),
-            entry.get('mechanism_helps_significantly'),
-            replicated=entry.get('replicated_across_seeds'),
-            test_basis=entry.get('test_basis'),
-            effect=(entry.get('delta_paired_mean')
-                    if entry.get('delta_paired_mean') is not None
-                    else entry.get('delta_full_minus_reference')),
-            excluded_reason=entry.get('excluded_from_family'))
-    factorial = comparisons.get('factorial') or {}
-    for entry in factorial.get('rows', []) or []:
-        if entry.get('skipped') or not entry.get('design'):
+            f"loo:{entry['full']}:{entry['mechanism']}", "leave_one_out",
+            entry.get("p_one_sided"), entry.get("p_one_sided_holm"),
+            entry.get("mechanism_helps"),
+            entry.get("mechanism_helps_significantly"),
+            replicated=entry.get("replicated_across_seeds"),
+            test_basis=entry.get("test_basis"),
+            effect=(entry.get("delta_paired_mean")
+                    if entry.get("delta_paired_mean") is not None
+                    else entry.get("delta_full_minus_reference")),
+            excluded_reason=entry.get("excluded_from_family"))
+    factorial = comparisons.get("factorial") or {}
+    for entry in factorial.get("rows", []) or []:
+        if entry.get("skipped") or not entry.get("design"):
             continue
-        is_interaction = entry.get('kind') == 'interaction'
-        is_simple = (entry.get('kind') == 'simple_effect'
-                     or entry.get('analysis_role') == 'conditional_follow_up')
+        is_interaction = entry.get("kind") == "interaction"
+        is_simple = (entry.get("kind") == "simple_effect"
+                     or entry.get("analysis_role") == "conditional_follow_up")
         _record(
             f"factorial:{entry['design']}:{entry['effect']}",
-            'conditional_follow_up' if is_simple else 'factorial',
-            entry.get('p_two_sided') if is_interaction else entry.get('p_one_sided'),
-            (entry.get('p_two_sided_holm') if is_interaction
-             else entry.get('p_one_sided_holm')),
-            (entry.get('interaction_direction') not in
-             (None, 'additive_or_within_margin'))
-            if is_interaction else entry.get('effect_helps'),
-            (entry.get('interaction_differs_significantly') if is_interaction
-             else entry.get('effect_helps_significantly')),
-            replicated=entry.get('replicated_across_seeds'),
-            test_basis=entry.get('test_basis'),
-            effect=entry.get('delta_seed_mean'),
+            "conditional_follow_up" if is_simple else "factorial",
+            entry.get("p_two_sided") if is_interaction else entry.get("p_one_sided"),
+            (entry.get("p_two_sided_holm") if is_interaction
+             else entry.get("p_one_sided_holm")),
+            (entry.get("interaction_direction") not in
+             (None, "additive_or_within_margin"))
+            if is_interaction else entry.get("effect_helps"),
+            (entry.get("interaction_differs_significantly") if is_interaction
+             else entry.get("effect_helps_significantly")),
+            replicated=entry.get("replicated_across_seeds"),
+            test_basis=entry.get("test_basis"),
+            effect=entry.get("delta_seed_mean"),
             excluded_reason=(_conditional_follow_up_reason(entry)
                              if is_simple else None))
-    factorial3 = comparisons.get('factorial3') or {}
-    for entry in factorial3.get('rows', []) or []:
-        if entry.get('skipped') or not entry.get('design'):
+    factorial3 = comparisons.get("factorial3") or {}
+    for entry in factorial3.get("rows", []) or []:
+        if entry.get("skipped") or not entry.get("design"):
             continue
-        is_interaction = entry.get('kind') == 'interaction'
-        is_simple = (entry.get('kind') == 'simple_effect'
-                     or entry.get('analysis_role') == 'conditional_follow_up')
+        is_interaction = entry.get("kind") == "interaction"
+        is_simple = (entry.get("kind") == "simple_effect"
+                     or entry.get("analysis_role") == "conditional_follow_up")
         _record(
             f"factorial3:{entry['design']}:{entry['effect']}",
-            'conditional_follow_up' if is_simple else 'factorial3',
-            entry.get('p_two_sided') if is_interaction else entry.get('p_one_sided'),
-            (entry.get('p_two_sided_holm') if is_interaction
-             else entry.get('p_one_sided_holm')),
-            (entry.get('interaction_direction') not in
-             (None, 'additive_or_within_margin'))
-            if is_interaction else entry.get('effect_helps'),
-            (entry.get('interaction_differs_significantly') if is_interaction
-             else entry.get('effect_helps_significantly')),
-            replicated=entry.get('replicated_across_seeds'),
-            test_basis=entry.get('test_basis'),
-            effect=entry.get('delta_seed_mean'),
+            "conditional_follow_up" if is_simple else "factorial3",
+            entry.get("p_two_sided") if is_interaction else entry.get("p_one_sided"),
+            (entry.get("p_two_sided_holm") if is_interaction
+             else entry.get("p_one_sided_holm")),
+            (entry.get("interaction_direction") not in
+             (None, "additive_or_within_margin"))
+            if is_interaction else entry.get("effect_helps"),
+            (entry.get("interaction_differs_significantly") if is_interaction
+             else entry.get("effect_helps_significantly")),
+            replicated=entry.get("replicated_across_seeds"),
+            test_basis=entry.get("test_basis"),
+            effect=entry.get("delta_seed_mean"),
             excluded_reason=(_conditional_follow_up_reason(entry)
                              if is_simple else None))
-    qk = comparisons.get('qk_axis') or {}
-    for entry in qk.get('rows', []) or []:
-        if entry.get('skipped') or not entry.get('host'):
+    qk = comparisons.get("qk_axis") or {}
+    for entry in qk.get("rows", []) or []:
+        if entry.get("skipped") or not entry.get("host"):
             continue
         _record(
-            f"qk:{entry['host']}:{entry['contrast']}", 'qk_axis',
-            entry.get('p_one_sided'), entry.get('p_one_sided_holm'),
-            entry.get('effect_helps'), entry.get('effect_helps_significantly'),
-            hypothesis=entry.get('hypothesis'),
-            replicated=entry.get('replicated_across_seeds'),
-            test_basis=entry.get('test_basis'),
+            f"qk:{entry['host']}:{entry['contrast']}", "qk_axis",
+            entry.get("p_one_sided"), entry.get("p_one_sided_holm"),
+            entry.get("effect_helps"), entry.get("effect_helps_significantly"),
+            hypothesis=entry.get("hypothesis"),
+            replicated=entry.get("replicated_across_seeds"),
+            test_basis=entry.get("test_basis"),
             # `delta_paired_mean` is always present on a QK row (None until
             # the paired test runs), so `dict.get(key, fallback)` would drop
             # a finite descriptive candidate-reference delta on untested rows.
-            effect=(entry.get('delta_paired_mean')
-                    if entry.get('delta_paired_mean') is not None
-                    else entry.get('delta_candidate_minus_reference')))
-    dose_response = comparisons.get('dose_response') or {}
-    for entry in dose_response.get('rows', []) or []:
-        if entry.get('skipped') or entry.get('is_reference'):
+            effect=(entry.get("delta_paired_mean")
+                    if entry.get("delta_paired_mean") is not None
+                    else entry.get("delta_candidate_minus_reference")))
+    dose_response = comparisons.get("dose_response") or {}
+    for entry in dose_response.get("rows", []) or []:
+        if entry.get("skipped") or entry.get("is_reference"):
             continue
         _record(
-            entry['id'], 'dose_response',
-            entry.get('p_one_sided'), entry.get('p_one_sided_holm'),
-            entry.get('effect_helps'),
-            entry.get('effect_helps_significantly'),
-            hypothesis=entry.get('hypothesis'),
-            replicated=entry.get('replicated_across_seeds'),
-            test_basis=entry.get('test_basis'),
-            effect=(entry.get('delta_paired_mean')
-                    if entry.get('delta_paired_mean') is not None
-                    else entry.get('delta_candidate_minus_reference')))
-    for entry in dose_response.get('trends', []) or []:
-        if entry.get('skipped'):
+            entry["id"], "dose_response",
+            entry.get("p_one_sided"), entry.get("p_one_sided_holm"),
+            entry.get("effect_helps"),
+            entry.get("effect_helps_significantly"),
+            hypothesis=entry.get("hypothesis"),
+            replicated=entry.get("replicated_across_seeds"),
+            test_basis=entry.get("test_basis"),
+            effect=(entry.get("delta_paired_mean")
+                    if entry.get("delta_paired_mean") is not None
+                    else entry.get("delta_candidate_minus_reference")))
+    for entry in dose_response.get("trends", []) or []:
+        if entry.get("skipped"):
             continue
-        p_value = (entry.get('p_two_sided')
-                   if entry.get('sided') == 'two_sided'
-                   else entry.get('p_one_sided'))
+        p_value = (entry.get("p_two_sided")
+                   if entry.get("sided") == "two_sided"
+                   else entry.get("p_one_sided"))
         _record(
-            entry['id'], 'dose_response', p_value,
-            entry.get('p_one_sided_holm'),
-            entry.get('direction_observed'),
-            entry.get('trend_significant'),
-            hypothesis=entry.get('hypothesis'),
-            replicated=entry.get('certifiable'),
-            test_basis='paired_trend',
-            effect=entry.get('mean_slope_per_dose'))
+            entry["id"], "dose_response", p_value,
+            entry.get("p_one_sided_holm"),
+            entry.get("direction_observed"),
+            entry.get("trend_significant"),
+            hypothesis=entry.get("hypothesis"),
+            replicated=entry.get("certifiable"),
+            test_basis="paired_trend",
+            effect=entry.get("mean_slope_per_dose"))
 
     registered: list = []
     unregistered: list = []
     for record in records:
-        planned_entry = planned.get(record['id'])
+        planned_entry = planned.get(record["id"])
         if planned_entry is None:
-            record['excluded_from_study_family'] = (
-                'not present in the pre-registered analysis plan '
-                '(exploratory/unregistered)')
-            unregistered.append(record['id'])
+            record["excluded_from_study_family"] = (
+                "not present in the pre-registered analysis plan "
+                "(exploratory/unregistered)")
+            unregistered.append(record["id"])
         else:
-            record['plan_kind'] = planned_entry.get('kind')
+            record["plan_kind"] = planned_entry.get("kind")
             registered.append(record)
     unregistered_records = [record for record in records
-                            if record['id'] in set(unregistered)
-                            and record['p_one_sided_or_two_sided'] is not None]
+                            if record["id"] in set(unregistered)
+                            and record["p_one_sided_or_two_sided"] is not None]
     unregistered_q = benjamini_hochberg_adjust(
-        [record['p_one_sided_or_two_sided']
+        [record["p_one_sided_or_two_sided"]
          for record in unregistered_records])
     for record, q_value in zip(unregistered_records, unregistered_q):
-        record['q_value_bh'] = q_value
-        record['exploratory_fdr_significant'] = bool(
+        record["q_value_bh"] = q_value
+        record["exploratory_fdr_significant"] = bool(
             q_value is not None and q_value < alpha)
     exploratory_fdr = {
-        'method': 'benjamini-hochberg-step-up',
-        'alpha': float(alpha),
-        'n_tested': len(unregistered_records),
-        'n_discoveries': sum(
-            record['exploratory_fdr_significant']
+        "method": "benjamini-hochberg-step-up",
+        "alpha": float(alpha),
+        "n_tested": len(unregistered_records),
+        "n_discoveries": sum(
+            record["exploratory_fdr_significant"]
             for record in unregistered_records),
-        'discoveries': sorted(
-            record['id'] for record in unregistered_records
-            if record['exploratory_fdr_significant']),
-        'note': ('q-values control the false-discovery rate among the '
-                 'exploratory/unregistered contrasts only; they are '
-                 'hypothesis-generating and do not become confirmatory claims. '
-                 'The BH guarantee assumes independence or positive regression '
-                 'dependence'),
+        "discoveries": sorted(
+            record["id"] for record in unregistered_records
+            if record["exploratory_fdr_significant"]),
+        "note": ("q-values control the false-discovery rate among the "
+                 "exploratory/unregistered contrasts only; they are "
+                 "hypothesis-generating and do not become confirmatory claims. "
+                 "The BH guarantee assumes independence or positive regression "
+                 "dependence"),
     }
-    resolved_ids = {record['id'] for record in registered}
+    resolved_ids = {record["id"] for record in registered}
     unresolved = sorted(set(planned) - resolved_ids)
     eligible = [record for record in registered
-                if record.get('excluded_from_study_family') is None
-                and (planned.get(record['id']) or {}).get(
-                    'counted_in_study_family', True) is not False
-                and record.get('replicated_across_seeds')
-                and record.get('p_one_sided_or_two_sided') is not None]
-    eligible_ids = {record['id'] for record in eligible}
+                if record.get("excluded_from_study_family") is None
+                and (planned.get(record["id"]) or {}).get(
+                    "counted_in_study_family", True) is not False
+                and record.get("replicated_across_seeds")
+                and record.get("p_one_sided_or_two_sided") is not None]
+    eligible_ids = {record["id"] for record in eligible}
     for record in registered:
-        if record['id'] not in eligible_ids:
-            if record.get('excluded_from_study_family') is None:
-                if (planned.get(record['id']) or {}).get(
-                        'counted_in_study_family', True) is False:
-                    record['excluded_from_study_family'] = (
-                        'pre-registered conditional follow-up '
-                        '(counted_in_study_family=False); its parent factorial '
-                        'term already carries the study-level test')
-                elif not record.get('replicated_across_seeds'):
-                    record['excluded_from_study_family'] = (
-                        f'fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds; '
-                        'descriptive only')
-                elif record.get('p_one_sided_or_two_sided') is None:
-                    record['excluded_from_study_family'] = 'no testable p-value'
+        if record["id"] not in eligible_ids:
+            if record.get("excluded_from_study_family") is None:
+                if (planned.get(record["id"]) or {}).get(
+                        "counted_in_study_family", True) is False:
+                    record["excluded_from_study_family"] = (
+                        "pre-registered conditional follow-up "
+                        "(counted_in_study_family=False); its parent factorial "
+                        "term already carries the study-level test")
+                elif not record.get("replicated_across_seeds"):
+                    record["excluded_from_study_family"] = (
+                        f"fewer than {MIN_SEEDS_FOR_SIGNIFICANCE} shared seeds; "
+                        "descriptive only")
+                elif record.get("p_one_sided_or_two_sided") is None:
+                    record["excluded_from_study_family"] = "no testable p-value"
     planned_primary_ids = {
         contrast_id for contrast_id, entry in planned.items()
-        if (entry or {}).get('tier', 1) == 1}
+        if (entry or {}).get("tier", 1) == 1}
     resolved_primary = [record for record in registered
-                        if record['id'] in planned_primary_ids]
+                        if record["id"] in planned_primary_ids]
     primary = [record for record in eligible
-               if record['id'] in planned_primary_ids]
+               if record["id"] in planned_primary_ids]
     secondary = [record for record in eligible
-                 if (planned.get(record['id']) or {}).get('tier', 1) == 2]
+                 if (planned.get(record["id"]) or {}).get("tier", 1) == 2]
     primary_adjusted = holm_adjust(
-        [record['p_one_sided_or_two_sided'] for record in primary])
+        [record["p_one_sided_or_two_sided"] for record in primary])
     for record, p_holm in zip(primary, primary_adjusted):
-        record['tier'] = 'primary'
-        record['p_study_holm'] = p_holm
-        record['confirmed_at_study_level'] = bool(
-            record['claim_direction_observed'] and p_holm is not None
+        record["tier"] = "primary"
+        record["p_study_holm"] = p_holm
+        record["confirmed_at_study_level"] = bool(
+            record["claim_direction_observed"] and p_holm is not None
             and p_holm < alpha)
     primary_gate_open = any(
-        record['confirmed_at_study_level'] for record in primary)
+        record["confirmed_at_study_level"] for record in primary)
     # A focused run (e.g. only the QK rows) has no resolved primary contrast
     # at all. That is not a failed gate: the gate is only meaningful when the
     # primary family was part of the study. But a primary contrast that *was*
     # planned and resolved yet became ineligible (e.g. under-replicated) is a
     # closed gate, not an absent one: it must not license secondary claims.
     if not planned_primary_ids or not resolved_primary:
-        primary_gate_status = 'not_applicable_no_primary_tests'
+        primary_gate_status = "not_applicable_no_primary_tests"
     elif not primary or not primary_gate_open:
-        primary_gate_status = 'closed'
+        primary_gate_status = "closed"
     else:
-        primary_gate_status = 'open'
-    secondary_allowed = primary_gate_status in ('open',
-                                                'not_applicable_no_primary_tests')
+        primary_gate_status = "open"
+    secondary_allowed = primary_gate_status in ("open",
+                                                "not_applicable_no_primary_tests")
     if secondary_allowed:
         secondary_adjusted = holm_adjust(
-            [record['p_one_sided_or_two_sided'] for record in secondary])
+            [record["p_one_sided_or_two_sided"] for record in secondary])
     else:
         secondary_adjusted = [None] * len(secondary)
     for record, p_holm in zip(secondary, secondary_adjusted):
-        record['tier'] = 'secondary'
-        record['p_study_holm'] = p_holm
-        record['confirmed_at_study_level'] = bool(
-            secondary_allowed and record['claim_direction_observed']
+        record["tier"] = "secondary"
+        record["p_study_holm"] = p_holm
+        record["confirmed_at_study_level"] = bool(
+            secondary_allowed and record["claim_direction_observed"]
             and p_holm is not None and p_holm < alpha)
         if not secondary_allowed:
-            record['gate_status'] = (
-                'secondary family not tested: no primary contrast survived '
-                'its gatekeeping correction, so the study has no confirmed '
-                'primary claim to license secondary claims')
+            record["gate_status"] = (
+                "secondary family not tested: no primary contrast survived "
+                "its gatekeeping correction, so the study has no confirmed "
+                "primary claim to license secondary claims")
     for record in records:
-        if 'tier' not in record:
-            planned_entry = planned.get(record['id'])
+        if "tier" not in record:
+            planned_entry = planned.get(record["id"])
             if planned_entry is None:
-                record['tier'] = 'unregistered'
-            elif planned_entry.get('counted_in_study_family', True) is False:
-                record['tier'] = 'conditional_follow_up'
+                record["tier"] = "unregistered"
+            elif planned_entry.get("counted_in_study_family", True) is False:
+                record["tier"] = "conditional_follow_up"
             else:
-                record['tier'] = ('primary' if planned_entry.get('tier', 1) == 1
-                                  else 'secondary')
-        record['downgraded_by_study_level'] = bool(
-            record['family_local_significant']
-            and not record['confirmed_at_study_level']
-            and record.get('tier') != 'conditional_follow_up')
+                record["tier"] = ("primary" if planned_entry.get("tier", 1) == 1
+                                  else "secondary")
+        record["downgraded_by_study_level"] = bool(
+            record["family_local_significant"]
+            and not record["confirmed_at_study_level"]
+            and record.get("tier") != "conditional_follow_up")
     secondary_gate_closed = sorted(
-        record['id'] for record in secondary if not secondary_allowed)
-    local_significant = sorted(record['id'] for record in registered
-                               if record.get('family_local_significant'))
-    study_significant = sorted(record['id'] for record in primary + secondary
-                               if record.get('confirmed_at_study_level'))
+        record["id"] for record in secondary if not secondary_allowed)
+    local_significant = sorted(record["id"] for record in registered
+                               if record.get("family_local_significant"))
+    study_significant = sorted(record["id"] for record in primary + secondary
+                               if record.get("confirmed_at_study_level"))
     downgraded = [
-        {'id': record['id'],
-         'family': record['family'],
-         'tier': record.get('tier'),
-         'p_family_holm': record['p_family_holm'],
-         'p_study_holm': record['p_study_holm']}
-        for record in primary + secondary if record['downgraded_by_study_level']
+        {"id": record["id"],
+         "family": record["family"],
+         "tier": record.get("tier"),
+         "p_family_holm": record["p_family_holm"],
+         "p_study_holm": record["p_study_holm"]}
+        for record in primary + secondary if record["downgraded_by_study_level"]
     ]
-    records.sort(key=lambda record: record['id'])
+    records.sort(key=lambda record: record["id"])
     return {
-        'schema': 'adasquash.study_level_tests.v1',
-        'analysis_plan_fingerprint': plan.get('fingerprint'),
-        'alpha': float(alpha),
-        'n_planned_contrasts': len(planned),
-        'n_registered_tests': len(registered),
-        'n_in_study_family': len(primary) + len(secondary),
-        'n_primary_tests': len(primary),
-        'n_secondary_tests': len(secondary),
-        'n_conditional_follow_up': sum(
-            record.get('tier') == 'conditional_follow_up'
+        "schema": "adasquash.study_level_tests.v1",
+        "analysis_plan_fingerprint": plan.get("fingerprint"),
+        "alpha": float(alpha),
+        "n_planned_contrasts": len(planned),
+        "n_registered_tests": len(registered),
+        "n_in_study_family": len(primary) + len(secondary),
+        "n_primary_tests": len(primary),
+        "n_secondary_tests": len(secondary),
+        "n_conditional_follow_up": sum(
+            record.get("tier") == "conditional_follow_up"
             for record in records),
-        'primary_gate_open': bool(primary_gate_open),
-        'primary_gate_status': primary_gate_status,
-        'n_confirmed_primary': sum(
-            record.get('confirmed_at_study_level') for record in primary),
-        'n_confirmed_secondary': sum(
-            record.get('confirmed_at_study_level') for record in secondary),
-        'n_confirmed_at_study_level': len(study_significant),
-        'family_local_significant': local_significant,
-        'study_level_significant': study_significant,
-        'downgraded_by_study_level': downgraded,
-        'secondary_not_tested_gate_closed': secondary_gate_closed,
-        'unregistered_contrasts': sorted(unregistered),
-        'exploratory_fdr': exploratory_fdr,
-        'unresolved_plan_contrasts': unresolved,
-        'protocol': (
-            'hierarchical Holm gatekeeping over the pre-registered confirmatory '
-            'contrasts. Tier 1 (primary) = the main proposal vs the best baseline, '
-            'its leave-one-out mechanisms, and the main softsign factorial. Only '
-            'if >= 1 primary contrast survives does the secondary tier (single-axis '
-            'variants, control factorials, QK axis, hyper-parameter sweeps) get '
-            'tested at alpha; both tiers are Holm-corrected within themselves. '
-            '`confirmed_at_study_level` additionally requires the claimed '
-            'direction. Interactions use the two-sided p-value, everything else '
-            'the one-sided p-value matching its directional hypothesis. '
-            'Family-local adjusted p-values are retained, so a demotion by the '
-            'study-level correction is visible rather than silent. '
-            'Exploratory/unregistered contrasts are never promoted: they receive '
-            'Benjamini-Hochberg q-values for a stated FDR and remain '
-            'hypothesis-generating. Pre-registered interaction-gated simple '
-            'effects are conditional follow-ups: they are excluded from the '
-            'study family and never counted as new confirmatory claims'),
-        'rows': records,
+        "primary_gate_open": bool(primary_gate_open),
+        "primary_gate_status": primary_gate_status,
+        "n_confirmed_primary": sum(
+            record.get("confirmed_at_study_level") for record in primary),
+        "n_confirmed_secondary": sum(
+            record.get("confirmed_at_study_level") for record in secondary),
+        "n_confirmed_at_study_level": len(study_significant),
+        "family_local_significant": local_significant,
+        "study_level_significant": study_significant,
+        "downgraded_by_study_level": downgraded,
+        "secondary_not_tested_gate_closed": secondary_gate_closed,
+        "unregistered_contrasts": sorted(unregistered),
+        "exploratory_fdr": exploratory_fdr,
+        "unresolved_plan_contrasts": unresolved,
+        "protocol": (
+            "hierarchical Holm gatekeeping over the pre-registered confirmatory "
+            "contrasts. Tier 1 (primary) = the main proposal vs the best baseline, "
+            "its leave-one-out mechanisms, and the main softsign factorial. Only "
+            "if >= 1 primary contrast survives does the secondary tier (single-axis "
+            "variants, control factorials, QK axis, hyper-parameter sweeps) get "
+            "tested at alpha; both tiers are Holm-corrected within themselves. "
+            "`confirmed_at_study_level` additionally requires the claimed "
+            "direction. Interactions use the two-sided p-value, everything else "
+            "the one-sided p-value matching its directional hypothesis. "
+            "Family-local adjusted p-values are retained, so a demotion by the "
+            "study-level correction is visible rather than silent. "
+            "Exploratory/unregistered contrasts are never promoted: they receive "
+            "Benjamini-Hochberg q-values for a stated FDR and remain "
+            "hypothesis-generating. Pre-registered interaction-gated simple "
+            "effects are conditional follow-ups: they are excluded from the "
+            "study family and never counted as new confirmatory claims"),
+        "rows": records,
     }
 
 
 def print_study_level_correction(comparison: dict | None) -> None:
     if comparison is None:
-        print('[study] no analysis plan; study-level multiplicity correction skipped')
+        print("[study] no analysis plan; study-level multiplicity correction skipped")
         return
     print(f"[study] {comparison['n_in_study_family']}/{comparison['n_planned_contrasts']} "
           f"pre-registered contrast(s) tested "
@@ -867,24 +870,24 @@ def print_study_level_correction(comparison: dict | None) -> None:
           f"study-level confirmed={comparison['n_confirmed_at_study_level']} "
           f"(primary gate {comparison.get('primary_gate_status', 'open').upper()}; "
           f"plan {str(comparison.get('analysis_plan_fingerprint'))[:12]})")
-    for entry in comparison.get('downgraded_by_study_level') or []:
+    for entry in comparison.get("downgraded_by_study_level") or []:
         print(f"[study] DOWNGRADED {entry['id']}: family p_holm="
               f"{entry['p_family_holm']} -> study p_holm={entry['p_study_holm']} "
               f"(not confirmed once the whole study is corrected)")
-    if comparison.get('secondary_not_tested_gate_closed'):
+    if comparison.get("secondary_not_tested_gate_closed"):
         print(f"[study] secondary contrasts not tested (primary gate closed): "
               f"{comparison['secondary_not_tested_gate_closed']}")
-    if comparison.get('unregistered_contrasts'):
-        ids = comparison['unregistered_contrasts']
+    if comparison.get("unregistered_contrasts"):
+        ids = comparison["unregistered_contrasts"]
         preview = f"{ids[:8]}{' ...' if len(ids) > 8 else ''}"
         print(f"[study] unregistered/exploratory ({len(ids)}, not in the plan, "
               f"not counted): {preview}")
-        fdr = comparison.get('exploratory_fdr') or {}
+        fdr = comparison.get("exploratory_fdr") or {}
         print(f"[study] exploratory BH-FDR: {fdr.get('n_discoveries', 0)}/"
               f"{fdr.get('n_tested', 0)} q<{fdr.get('alpha', comparison['alpha'])} "
               f"(hypothesis-generating only)")
-    if comparison.get('unresolved_plan_contrasts'):
-        ids = comparison['unresolved_plan_contrasts']
+    if comparison.get("unresolved_plan_contrasts"):
+        ids = comparison["unresolved_plan_contrasts"]
         preview = f"{ids[:8]}{' ...' if len(ids) > 8 else ''}"
         print(f"[study] pre-registered but not realized ({len(ids)}; full list in "
               f"study_level_tests.json): {preview}")

@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """Efficiency/accuracy trade-off benchmark for the norm variants.
 
 A point-estimate loss win is only half the evidence; the other half is what
@@ -43,6 +44,8 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
+from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
+from adasquash.attention import clear_logit_scratch_cache
 from adasquash.efficiency import (
     DEFAULT_MAX_COST_RATIO,
     DEFAULT_MIN_LOSS_GAIN,
@@ -50,7 +53,6 @@ from adasquash.efficiency import (
     efficiency_verdict,
     parameter_breakdown,
 )
-from adasquash.attention import clear_logit_scratch_cache
 from adasquash.jsonio import save_json_atomic
 from adasquash.model import (
     build_gpt_124m,
@@ -59,14 +61,19 @@ from adasquash.model import (
     clear_cast_weight_cache,
     clear_ce_scratch_cache,
 )
-from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
+from adasquash.repro import (
+    collect_run_metadata,
+    file_fingerprint,
+    finish_metadata,
+    save_run_manifest,
+    set_all_seeds,
+)
 
-_BUILDERS = {'gpt2-124m': build_gpt_124m, 'gpt2-350m': build_gpt_350m, 'llama-1b': build_llama_tiny_1b}
+_BUILDERS = {"gpt2-124m": build_gpt_124m, "gpt2-350m": build_gpt_350m, "llama-1b": build_llama_tiny_1b}
 
 
 def _is_cuda(device: str) -> bool:
-    return torch.device(device).type == 'cuda'
+    return torch.device(device).type == "cuda"
 
 
 def _sync(device: str) -> None:
@@ -117,10 +124,10 @@ def measure_timed(fn, iters: int, warmup: int, device: str) -> dict:
             fn()
             times.append((time.perf_counter() - t0) * 1000.0)
     return {
-        'mean_ms': statistics.fmean(times),
-        'median_ms': statistics.median(times),
-        'std_ms': statistics.pstdev(times) if len(times) > 1 else 0.0,
-        'n_iters': len(times),
+        "mean_ms": statistics.fmean(times),
+        "median_ms": statistics.median(times),
+        "std_ms": statistics.pstdev(times) if len(times) > 1 else 0.0,
+        "n_iters": len(times),
     }
 
 
@@ -176,8 +183,8 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     tokens = args.batch_size * args.seq_len
 
     autocast_ctx = (
-        torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-        if (args.bf16 and _is_cuda(device)) else torch.autocast(device_type='cpu', enabled=False)
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if (args.bf16 and _is_cuda(device)) else torch.autocast(device_type="cpu", enabled=False)
     )
 
     def forward():
@@ -206,24 +213,24 @@ def benchmark_norm(model_name: str, norm: str, args, device: str, measure_heavy:
     measured = measured_forward_flops(forward, tokens) if measure_heavy else None
     breakdown = parameter_breakdown(model)
     return {
-        'norm': norm,
-        'n_params': breakdown['total'],
-        'parameter_breakdown': breakdown,
-        'norm_share_of_total': breakdown['norm_share_of_total'],
-        'analytic_flops': flops,
-        'measured_forward_flops_per_token': measured,
-        'forward_latency_ms_per_token': fwd_timing['mean_ms'] / tokens,
-        'forward_latency_ms': fwd_timing,
-        'training_latency_ms_per_token': train_timing['mean_ms'] / tokens,
-        'training_latency_ms': train_timing,
-        'forward_tokens_per_second': tokens / (fwd_timing['mean_ms'] / 1000.0),
-        'training_tokens_per_second': tokens / (train_timing['mean_ms'] / 1000.0),
-        'peak_inference_memory_mb': fwd_mem,
-        'peak_training_memory_mb': train_mem,
+        "norm": norm,
+        "n_params": breakdown["total"],
+        "parameter_breakdown": breakdown,
+        "norm_share_of_total": breakdown["norm_share_of_total"],
+        "analytic_flops": flops,
+        "measured_forward_flops_per_token": measured,
+        "forward_latency_ms_per_token": fwd_timing["mean_ms"] / tokens,
+        "forward_latency_ms": fwd_timing,
+        "training_latency_ms_per_token": train_timing["mean_ms"] / tokens,
+        "training_latency_ms": train_timing,
+        "forward_tokens_per_second": tokens / (fwd_timing["mean_ms"] / 1000.0),
+        "training_tokens_per_second": tokens / (train_timing["mean_ms"] / 1000.0),
+        "peak_inference_memory_mb": fwd_mem,
+        "peak_training_memory_mb": train_mem,
     }
 
 
-_LATENCY_MEAN_KEYS = ('forward_latency_ms_per_token', 'training_latency_ms_per_token')
+_LATENCY_MEAN_KEYS = ("forward_latency_ms_per_token", "training_latency_ms_per_token")
 
 
 def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
@@ -241,57 +248,57 @@ def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
         raise ValueError("norms must be a non-empty list")
     out = []
     for norm in norms:
-        norm_rows = [r for r in rows if isinstance(r, dict) and r.get('norm') == norm]
+        norm_rows = [r for r in rows if isinstance(r, dict) and r.get("norm") == norm]
         if len(norm_rows) != rounds:
             raise ValueError(
-                f'norm {norm!r} has {len(norm_rows)} measured round(s), expected {rounds}; '
-                'refusing to average an incomplete interleaved benchmark')
+                f"norm {norm!r} has {len(norm_rows)} measured round(s), expected {rounds}; "
+                "refusing to average an incomplete interleaved benchmark")
         # Counting rows is not enough: two samples of round 1 and none of round
         # 2 would still pass a length check while leaving the interleaving (and
         # therefore the drift cancellation) unverified.
-        raw_rounds = [r.get('round') for r in norm_rows]
+        raw_rounds = [r.get("round") for r in norm_rows]
         measured_rounds = set(raw_rounds)
         valid_rounds = all(
             isinstance(value, int) and not isinstance(value, bool)
             and 0 <= value < rounds for value in raw_rounds)
         if not valid_rounds or measured_rounds != set(range(rounds)):
             raise ValueError(
-                f'norm {norm!r} measured round(s) '
-                f'{sorted(measured_rounds, key=repr)} but expected '
-                f'0..{rounds - 1}; refusing to average a mis-numbered round set')
+                f"norm {norm!r} measured round(s) "
+                f"{sorted(measured_rounds, key=repr)} but expected "
+                f"0..{rounds - 1}; refusing to average a mis-numbered round set")
         base = dict(norm_rows[0])
         for key in _LATENCY_MEAN_KEYS:
             base[key] = sum(r[key] for r in norm_rows) / len(norm_rows)
-        base['forward_latency_ms'] = {
-            'mean_ms': sum(r['forward_latency_ms']['mean_ms'] for r in norm_rows) / len(norm_rows),
-            'median_ms': sum(r['forward_latency_ms']['median_ms'] for r in norm_rows) / len(norm_rows),
-            'std_ms': sum(r['forward_latency_ms']['std_ms'] for r in norm_rows) / len(norm_rows),
-            'n_iters': norm_rows[0]['forward_latency_ms']['n_iters'],
-            'n_rounds': len(norm_rows),
+        base["forward_latency_ms"] = {
+            "mean_ms": sum(r["forward_latency_ms"]["mean_ms"] for r in norm_rows) / len(norm_rows),
+            "median_ms": sum(r["forward_latency_ms"]["median_ms"] for r in norm_rows) / len(norm_rows),
+            "std_ms": sum(r["forward_latency_ms"]["std_ms"] for r in norm_rows) / len(norm_rows),
+            "n_iters": norm_rows[0]["forward_latency_ms"]["n_iters"],
+            "n_rounds": len(norm_rows),
         }
-        base['training_latency_ms'] = {
-            'mean_ms': sum(r['training_latency_ms']['mean_ms'] for r in norm_rows) / len(norm_rows),
-            'median_ms': sum(r['training_latency_ms']['median_ms'] for r in norm_rows) / len(norm_rows),
-            'std_ms': sum(r['training_latency_ms']['std_ms'] for r in norm_rows) / len(norm_rows),
-            'n_iters': norm_rows[0]['training_latency_ms']['n_iters'],
-            'n_rounds': len(norm_rows),
+        base["training_latency_ms"] = {
+            "mean_ms": sum(r["training_latency_ms"]["mean_ms"] for r in norm_rows) / len(norm_rows),
+            "median_ms": sum(r["training_latency_ms"]["median_ms"] for r in norm_rows) / len(norm_rows),
+            "std_ms": sum(r["training_latency_ms"]["std_ms"] for r in norm_rows) / len(norm_rows),
+            "n_iters": norm_rows[0]["training_latency_ms"]["n_iters"],
+            "n_rounds": len(norm_rows),
         }
-        base['latency_by_round'] = [{'round': r['round'],
-                                     'forward_ms': r['forward_latency_ms'],
-                                     'training_ms': r['training_latency_ms']}
+        base["latency_by_round"] = [{"round": r["round"],
+                                     "forward_ms": r["forward_latency_ms"],
+                                     "training_ms": r["training_latency_ms"]}
                                     for r in norm_rows]
         # Throughput is a derived rate: averaging per-round tokens/sec gives a
         # different (and latency-inconsistent) number than the rate implied by
         # the averaged latency. Recompute it from the aggregate, so the
         # reported tok/s and ms/token describe the same measurement.
-        base['forward_tokens_per_second'] = (
-            1000.0 / base['forward_latency_ms_per_token']
-            if base['forward_latency_ms_per_token'] > 0.0 else float('inf'))
-        base['training_tokens_per_second'] = (
-            1000.0 / base['training_latency_ms_per_token']
-            if base['training_latency_ms_per_token'] > 0.0 else float('inf'))
-        base['peak_inference_memory_mb'] = norm_rows[0]['peak_inference_memory_mb']
-        base['peak_training_memory_mb'] = norm_rows[0]['peak_training_memory_mb']
+        base["forward_tokens_per_second"] = (
+            1000.0 / base["forward_latency_ms_per_token"]
+            if base["forward_latency_ms_per_token"] > 0.0 else float("inf"))
+        base["training_tokens_per_second"] = (
+            1000.0 / base["training_latency_ms_per_token"]
+            if base["training_latency_ms_per_token"] > 0.0 else float("inf"))
+        base["peak_inference_memory_mb"] = norm_rows[0]["peak_inference_memory_mb"]
+        base["peak_training_memory_mb"] = norm_rows[0]["peak_training_memory_mb"]
         out.append(base)
     return out
 
@@ -307,21 +314,21 @@ def paired_training_cost_stats(cand_bench: dict, ref_bench: dict) -> dict:
     """
     def _by_round(bench, key):
         return {
-            int(r['round']): float(r[key]['mean_ms'])
-            for r in (bench.get('latency_by_round') or [])
-            if r.get(key) and r[key].get('mean_ms') is not None
+            int(r["round"]): float(r[key]["mean_ms"])
+            for r in (bench.get("latency_by_round") or [])
+            if r.get(key) and r[key].get("mean_ms") is not None
         }
 
-    cand = _by_round(cand_bench, 'training_ms')
-    ref = _by_round(ref_bench, 'training_ms')
+    cand = _by_round(cand_bench, "training_ms")
+    ref = _by_round(ref_bench, "training_ms")
     ratios = [cand[r] / ref[r] for r in sorted(set(cand) & set(ref))
               if ref[r] > 0.0 and math.isfinite(cand[r])
               and math.isfinite(ref[r])]
-    out = {'n_rounds': len(ratios), 'mean_ratio': None, 'stderr': None}
+    out = {"n_rounds": len(ratios), "mean_ratio": None, "stderr": None}
     if ratios:
-        out['mean_ratio'] = statistics.fmean(ratios)
+        out["mean_ratio"] = statistics.fmean(ratios)
     if len(ratios) >= 2:
-        out['stderr'] = statistics.stdev(ratios) / math.sqrt(len(ratios))
+        out["stderr"] = statistics.stdev(ratios) / math.sqrt(len(ratios))
     return out
 
 
@@ -339,7 +346,7 @@ def _summary_rows(summaries_path: str) -> list:
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        rows = data.get('rows') or data.get('summaries') or []
+        rows = data.get("rows") or data.get("summaries") or []
         return rows if isinstance(rows, list) else []
     return []
 
@@ -357,9 +364,9 @@ def load_losses(summaries_path: str) -> dict:
     rows = _summary_rows(summaries_path)
     out = {}
     for row in rows:
-        if (isinstance(row, dict) and row.get('name') is not None
-                and _finite_number(row.get('val_loss'))):
-            out[row['name']] = float(row['val_loss'])
+        if (isinstance(row, dict) and row.get("name") is not None
+                and _finite_number(row.get("val_loss"))):
+            out[row["name"]] = float(row["val_loss"])
     return out
 
 
@@ -368,8 +375,8 @@ def load_row_cfgs(summaries_path: str) -> dict:
     rows = _summary_rows(summaries_path)
     out = {}
     for row in rows:
-        if isinstance(row, dict) and row.get('name') is not None and isinstance(row.get('cfg'), dict):
-            out[row['name']] = row['cfg']
+        if isinstance(row, dict) and row.get("name") is not None and isinstance(row.get("cfg"), dict):
+            out[row["name"]] = row["cfg"]
     return out
 
 
@@ -381,13 +388,13 @@ def load_row_models(summaries_path: str) -> dict:
     gpt2-124m benchmark merely because its cfg dict is identical.
     """
     rows = _summary_rows(summaries_path)
-    return {row['name']: row.get('model') for row in rows
-            if isinstance(row, dict) and row.get('name') is not None}
+    return {row["name"]: row.get("model") for row in rows
+            if isinstance(row, dict) and row.get("name") is not None}
 
 
 def _cfg_key(model_name: str, cfg_kwargs: dict) -> str:
     """Canonical identity of the model a config builds (like the ablation runner)."""
-    with torch.device('meta'):
+    with torch.device("meta"):
         cfg = _BUILDERS[model_name](**cfg_kwargs).cfg
     return json.dumps(dataclasses.asdict(cfg), sort_keys=True)
 
@@ -404,10 +411,10 @@ def load_significance(comparison_path, expected_reference: str | None = None) ->
     instead of silently attaching it to the candidate.
     """
     out = {
-        'rows': {},
-        'reference': None,
-        'reference_matches': expected_reference is None,
-        'path': str(comparison_path) if comparison_path else None,
+        "rows": {},
+        "reference": None,
+        "reference_matches": expected_reference is None,
+        "path": str(comparison_path) if comparison_path else None,
     }
     if not comparison_path or not Path(comparison_path).exists():
         return out
@@ -419,20 +426,20 @@ def load_significance(comparison_path, expected_reference: str | None = None) ->
         return out
     if not isinstance(data, dict):
         return out
-    out['reference'] = data.get('reference')
+    out["reference"] = data.get("reference")
     if expected_reference is not None:
-        out['reference_matches'] = data.get('reference') == expected_reference
-    rows = data.get('rows') or []
+        out["reference_matches"] = data.get("reference") == expected_reference
+    rows = data.get("rows") or []
     if not isinstance(rows, list):
         rows = []
     for row in rows:
-        if isinstance(row, dict) and row.get('name') is not None:
-            out['rows'][row['name']] = {
-                'beats_reference_significantly': row.get('beats_reference_significantly'),
-                'p_one_sided': row.get('p_one_sided'),
-                'p_one_sided_holm': row.get('p_one_sided_holm'),
-                'delta_vs_reference': row.get('delta_vs_reference'),
-                'n_seeds': row.get('n_seeds'),
+        if isinstance(row, dict) and row.get("name") is not None:
+            out["rows"][row["name"]] = {
+                "beats_reference_significantly": row.get("beats_reference_significantly"),
+                "p_one_sided": row.get("p_one_sided"),
+                "p_one_sided_holm": row.get("p_one_sided_holm"),
+                "delta_vs_reference": row.get("delta_vs_reference"),
+                "n_seeds": row.get("n_seeds"),
             }
     return out
 
@@ -440,16 +447,16 @@ def load_significance(comparison_path, expected_reference: str | None = None) ->
 def print_table(results: list, reference: str | None) -> None:
     header = f"{'norm':>8s} {'params':>10s} {'norm%':>7s} {'fwd ms/tok':>11s} {'train ms/tok':>13s} {'tok/s':>10s}"
     print(header)
-    print('-' * len(header))
+    print("-" * len(header))
     for r in results:
         print(f"{r['norm']:>8s} {r['n_params']:>10d} {100.0 * r['norm_share_of_total']:>6.3f}% "
               f"{r['forward_latency_ms_per_token']:>11.4f} {r['training_latency_ms_per_token']:>13.4f} "
               f"{r['forward_tokens_per_second']:>10.1f}")
-    if reference and reference in {r['norm'] for r in results}:
-        ref = next(r for r in results if r['norm'] == reference)
+    if reference and reference in {r["norm"] for r in results}:
+        ref = next(r for r in results if r["norm"] == reference)
         print(f"\n[cost] ratios vs reference '{reference}' (1.0 = identical):")
         for r in results:
-            if r['norm'] == reference:
+            if r["norm"] == reference:
                 continue
             print(f"[cost] {r['norm']:>8s} params={r['n_params'] / ref['n_params']:.4f}x "
                   f"fwd_latency={r['forward_latency_ms_per_token'] / ref['forward_latency_ms_per_token']:.4f}x "
@@ -458,62 +465,62 @@ def print_table(results: list, reference: str | None) -> None:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--model', choices=sorted(_BUILDERS), default='gpt2-124m')
-    p.add_argument('--norms', nargs='+', default=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
-    p.add_argument('--seq-len', type=int, default=512)
-    p.add_argument('--batch-size', type=int, default=4)
-    p.add_argument('--iters', type=int, default=10)
-    p.add_argument('--warmup', type=int, default=3)
-    p.add_argument('--rounds', type=int, default=3, help='interleaved passes over the norms; each pass measures every norm once and alternates forward/reverse order, so a monotone thermal/clock drift is spread over all norms instead of loading onto the ones measured last. Each norm reports the mean of its per-round means (>= 1; more rounds = more drift cancellation)')
-    p.add_argument('--lr', type=float, default=6e-4)
-    p.add_argument('--include-optimizer', action='store_true', help='include the optimizer step in the training latency')
-    p.add_argument('--bf16', action='store_true', help='run the timed passes under bf16 autocast (CUDA only)')
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--device', default=None)
-    p.add_argument('--reference', default='ln', help='reference norm for the cost ratios')
+    p.add_argument("--model", choices=sorted(_BUILDERS), default="gpt2-124m")
+    p.add_argument("--norms", nargs="+", default=["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"])
+    p.add_argument("--seq-len", type=int, default=512)
+    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--iters", type=int, default=10)
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--rounds", type=int, default=3, help="interleaved passes over the norms; each pass measures every norm once and alternates forward/reverse order, so a monotone thermal/clock drift is spread over all norms instead of loading onto the ones measured last. Each norm reports the mean of its per-round means (>= 1; more rounds = more drift cancellation)")
+    p.add_argument("--lr", type=float, default=6e-4)
+    p.add_argument("--include-optimizer", action="store_true", help="include the optimizer step in the training latency")
+    p.add_argument("--bf16", action="store_true", help="run the timed passes under bf16 autocast (CUDA only)")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", default=None)
+    p.add_argument("--reference", default="ln", help="reference norm for the cost ratios")
     # ratio-adjusted accuracy comparison (optional)
-    p.add_argument('--summaries', default=None, help='ablation all_summaries.json to join held-out losses with the measured cost')
-    p.add_argument('--comparison', default=None, help='baseline_comparison.json for significance gates; defaults to the sibling of --summaries')
-    p.add_argument('--reference-name', default='ln_baseline', help='baseline row in --summaries')
-    p.add_argument('--candidate', nargs='+', default=[], help='candidate row names in --summaries to judge against the reference')
-    p.add_argument('--min-loss-gain', type=float, default=DEFAULT_MIN_LOSS_GAIN)
-    p.add_argument('--max-cost-ratio', type=float, default=DEFAULT_MAX_COST_RATIO)
-    p.add_argument('--max-component-ratio', type=float, default=None,
-                   help='allowed candidate/reference ratio for each secondary cost axis '
-                        '(params, FLOPs, forward latency, peak memory); defaults to --max-cost-ratio')
-    p.add_argument('--require-viable', action='store_true', help='exit 1 when a candidate is not viable at the given margins')
-    p.add_argument('--output', default='runs/efficiency/efficiency.json')
-    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this benchmark tests (e.g. "DyT-CD reaches a lower loss per point of training cost than RMSNorm at the same lr"); recorded in the report and manifest so the tradeoff verdict is auditable against a claim')
+    p.add_argument("--summaries", default=None, help="ablation all_summaries.json to join held-out losses with the measured cost")
+    p.add_argument("--comparison", default=None, help="baseline_comparison.json for significance gates; defaults to the sibling of --summaries")
+    p.add_argument("--reference-name", default="ln_baseline", help="baseline row in --summaries")
+    p.add_argument("--candidate", nargs="+", default=[], help="candidate row names in --summaries to judge against the reference")
+    p.add_argument("--min-loss-gain", type=float, default=DEFAULT_MIN_LOSS_GAIN)
+    p.add_argument("--max-cost-ratio", type=float, default=DEFAULT_MAX_COST_RATIO)
+    p.add_argument("--max-component-ratio", type=float, default=None,
+                   help="allowed candidate/reference ratio for each secondary cost axis "
+                        "(params, FLOPs, forward latency, peak memory); defaults to --max-cost-ratio")
+    p.add_argument("--require-viable", action="store_true", help="exit 1 when a candidate is not viable at the given margins")
+    p.add_argument("--output", default="runs/efficiency/efficiency.json")
+    p.add_argument("--hypothesis", default=None, help='the scientific hypothesis this benchmark tests (e.g. "DyT-CD reaches a lower loss per point of training cost than RMSNorm at the same lr"); recorded in the report and manifest so the tradeoff verdict is auditable against a claim')
     args = p.parse_args()
-    for flag, value in (('--seq-len', args.seq_len),
-                        ('--batch-size', args.batch_size),
-                        ('--iters', args.iters),
-                        ('--rounds', args.rounds)):
+    for flag, value in (("--seq-len", args.seq_len),
+                        ("--batch-size", args.batch_size),
+                        ("--iters", args.iters),
+                        ("--rounds", args.rounds)):
         if value < 1:
-            p.error(f'{flag} {value} must be >= 1')
+            p.error(f"{flag} {value} must be >= 1")
     if args.warmup < 0:
-        p.error(f'--warmup {args.warmup} must be >= 0')
+        p.error(f"--warmup {args.warmup} must be >= 0")
     if not args.norms:
-        p.error('--norms must not be empty')
+        p.error("--norms must not be empty")
     duplicate_norms = sorted({norm for norm in args.norms
                               if args.norms.count(norm) > 1})
     if duplicate_norms:
-        p.error(f'--norms contains duplicates: {duplicate_norms}; a repeated norm is '
-                'measured twice and breaks the interleaved round accounting')
+        p.error(f"--norms contains duplicates: {duplicate_norms}; a repeated norm is "
+                "measured twice and breaks the interleaved round accounting")
     if not math.isfinite(args.min_loss_gain) or args.min_loss_gain < 0.0:
-        p.error(f'--min-loss-gain {args.min_loss_gain} must be finite and >= 0')
+        p.error(f"--min-loss-gain {args.min_loss_gain} must be finite and >= 0")
     if not math.isfinite(args.max_cost_ratio) or args.max_cost_ratio <= 0.0:
-        p.error(f'--max-cost-ratio {args.max_cost_ratio} must be finite and > 0')
+        p.error(f"--max-cost-ratio {args.max_cost_ratio} must be finite and > 0")
     if (args.max_component_ratio is not None
             and (not math.isfinite(args.max_component_ratio)
                  or args.max_component_ratio <= 0.0)):
-        p.error(f'--max-component-ratio {args.max_component_ratio} must be finite and > 0')
-    device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        p.error(f"--max-component-ratio {args.max_component_ratio} must be finite and > 0")
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     set_all_seeds(args.seed)
-    print(f'[bench] model={args.model} device={device} batch={args.batch_size} seq={args.seq_len} '
-          f'iters={args.iters} warmup={args.warmup} bf16={args.bf16 and _is_cuda(device)}')
+    print(f"[bench] model={args.model} device={device} batch={args.batch_size} seq={args.seq_len} "
+          f"iters={args.iters} warmup={args.warmup} bf16={args.bf16 and _is_cuda(device)}")
     if args.hypothesis:
-        print(f'[hypothesis] {args.hypothesis}')
+        print(f"[hypothesis] {args.hypothesis}")
     else:
         print('[hypothesis] none stated: pass --hypothesis "..." so this tradeoff verdict is auditable as a test of a claim, not a sweep')
     rounds = int(args.rounds)
@@ -522,10 +529,10 @@ def main():
     for r_i in range(rounds):
         order = list(args.norms) if r_i % 2 == 0 else list(reversed(args.norms))
         measurement_order.append(order)
-        print(f'[bench] round {r_i + 1}/{rounds} order: {order}')
+        print(f"[bench] round {r_i + 1}/{rounds} order: {order}")
         for norm in order:
             row = benchmark_norm(args.model, norm, args, device, measure_heavy=(r_i == 0))
-            row['round'] = r_i
+            row["round"] = r_i
             raw_rows.append(row)
     results = aggregate_benchmark_rounds(raw_rows, args.norms, rounds)
     for r in results:
@@ -543,11 +550,11 @@ def main():
             raise SystemExit(1)
         comparison_path = args.comparison
         if comparison_path is None:
-            sibling = Path(args.summaries).with_name('baseline_comparison.json')
+            sibling = Path(args.summaries).with_name("baseline_comparison.json")
             comparison_path = str(sibling) if sibling.exists() else None
         sig_bundle = load_significance(comparison_path, expected_reference=args.reference_name)
-        significance = sig_bundle['rows']
-        if significance and sig_bundle['reference_matches']:
+        significance = sig_bundle["rows"]
+        if significance and sig_bundle["reference_matches"]:
             print(f"[tradeoff] significance gate -> {comparison_path} "
                   f"(reference row: {sig_bundle['reference']})")
         elif significance:
@@ -569,7 +576,7 @@ def main():
         # differs beyond that base (qk_norm / activation / parameterization
         # variants) gets a proxy measurement: flagged per row instead of
         # silently substituting the model.
-        by_norm = {r['norm']: r for r in results}
+        by_norm = {r["norm"]: r for r in results}
         cand_cfgs = load_row_cfgs(args.summaries)
         cand_models = load_row_models(args.summaries)
         # The loss delta uses --reference-name while the cost ratio uses
@@ -577,12 +584,12 @@ def main():
         # tradeoff mixes a gain against one model with a cost against
         # another. A missing reference cfg is unknown, not a match.
         ref_cfg = cand_cfgs.get(args.reference_name)
-        if not isinstance(ref_cfg, dict) or not ref_cfg.get('norm_name'):
+        if not isinstance(ref_cfg, dict) or not ref_cfg.get("norm_name"):
             print(f"[tradeoff] FAIL: reference row '{args.reference_name}' has no recorded "
                   f"cfg/norm_name in {args.summaries}; the cost reference cannot be "
                   f"tied to the loss reference", file=sys.stderr)
             raise SystemExit(1)
-        ref_norm = str(ref_cfg['norm_name'])
+        ref_norm = str(ref_cfg["norm_name"])
         if ref_norm != args.reference:
             print(f"[tradeoff] FAIL: loss reference row '{args.reference_name}' is norm "
                   f"'{ref_norm}' but the cost reference is '{args.reference}'; this "
@@ -601,7 +608,7 @@ def main():
                 return True
             try:
                 return (_cfg_key(args.model, cfg)
-                        != _cfg_key(args.model, {'norm_name': norm}))
+                        != _cfg_key(args.model, {"norm_name": norm}))
             except Exception:
                 # If the canonical config key cannot even be computed, the
                 # measurement is unverified. That is a proxy (fail closed),
@@ -620,14 +627,14 @@ def main():
         for cand in args.candidate:
             cand_loss = losses.get(cand)
             if cand_loss is None:
-                rows.append({'candidate': cand, 'error': 'no val_loss in summaries'})
+                rows.append({"candidate": cand, "error": "no val_loss in summaries"})
                 continue
-            cand_norm = cand.split('_')[0].replace('-', '')
-            cand_norm = 'ln' if cand_norm == 'ln' else cand_norm
+            cand_norm = cand.split("_")[0].replace("-", "")
+            cand_norm = "ln" if cand_norm == "ln" else cand_norm
             cand_bench = by_norm.get(cand_norm)
             ref_bench = by_norm.get(args.reference)
             if cand_bench is None or ref_bench is None:
-                rows.append({'candidate': cand, 'error': f'missing benchmark for norm {cand_norm!r} or reference {args.reference!r}'})
+                rows.append({"candidate": cand, "error": f"missing benchmark for norm {cand_norm!r} or reference {args.reference!r}"})
                 continue
             cand_cfg = cand_cfgs.get(cand)
             # Without the row's cfg the benchmark cannot prove that the
@@ -638,23 +645,23 @@ def main():
                                            cand_models.get(cand))
                              or ref_cost_is_proxy)
             if cost_is_proxy:
-                owner = ('candidate' if _cfg_is_proxy(cand_cfg, cand_norm,
+                owner = ("candidate" if _cfg_is_proxy(cand_cfg, cand_norm,
                                                        cand_models.get(cand))
-                         else 'reference')
+                         else "reference")
                 print(f"[tradeoff][warn] {cand}: the benchmark has no row for the exact "
                       f"{owner} architecture; cost is measured on the base model "
                       f"(proxy cost)")
             loss_improvement = losses[args.reference_name] - cand_loss
             cost_ratio_of_means = (
-                cand_bench['training_latency_ms_per_token']
-                / ref_bench['training_latency_ms_per_token'])
+                cand_bench["training_latency_ms_per_token"]
+                / ref_bench["training_latency_ms_per_token"])
             cost_stats = paired_training_cost_stats(cand_bench, ref_bench)
             # Use the paired per-round ratio as the point estimate whenever
             # it exists: the stderr below is the stderr of *that* estimator.
             # Centering a ratio-of-means with the stderr of the mean per-round
             # ratio would mix two different quantities in one interval.
-            cost_ratio = (cost_stats['mean_ratio']
-                          if cost_stats.get('mean_ratio') is not None
+            cost_ratio = (cost_stats["mean_ratio"]
+                          if cost_stats.get("mean_ratio") is not None
                           else cost_ratio_of_means)
 
             def _ratio(key):
@@ -666,117 +673,117 @@ def main():
             # Every measured axis is part of the verdict; an unmeasured axis
             # is None, never silently "passing".
             components = {
-                'params': _ratio('n_params'),
-                'analytic_flops_forward_per_token': (
-                    (cand_bench.get('analytic_flops') or {}).get('forward_per_token')
-                    / (ref_bench.get('analytic_flops') or {}).get('forward_per_token')
-                    if (cand_bench.get('analytic_flops') and ref_bench.get('analytic_flops')
-                        and (ref_bench.get('analytic_flops') or {}).get('forward_per_token'))
+                "params": _ratio("n_params"),
+                "analytic_flops_forward_per_token": (
+                    (cand_bench.get("analytic_flops") or {}).get("forward_per_token")
+                    / (ref_bench.get("analytic_flops") or {}).get("forward_per_token")
+                    if (cand_bench.get("analytic_flops") and ref_bench.get("analytic_flops")
+                        and (ref_bench.get("analytic_flops") or {}).get("forward_per_token"))
                     else None),
-                'forward_latency': _ratio('forward_latency_ms_per_token'),
-                'training_latency': cost_ratio,
-                'peak_inference_memory': _ratio('peak_inference_memory_mb'),
-                'peak_training_memory': _ratio('peak_training_memory_mb'),
+                "forward_latency": _ratio("forward_latency_ms_per_token"),
+                "training_latency": cost_ratio,
+                "peak_inference_memory": _ratio("peak_inference_memory_mb"),
+                "peak_training_memory": _ratio("peak_training_memory_mb"),
             }
             sig = significance.get(cand)
             verdict = efficiency_verdict(loss_improvement, cost_ratio,
                                          min_loss_gain=args.min_loss_gain,
                                          max_cost_ratio=args.max_cost_ratio,
-                                         cost_name='training_latency',
+                                         cost_name="training_latency",
                                          cost_components=components,
                                          max_component_ratio=args.max_component_ratio,
                                          statistically_significant=(
                                              None if sig is None
-                                             else sig.get('beats_reference_significantly')),
-                                         cost_ratio_stderr=cost_stats.get('stderr'),
-                                         cost_ratio_n=cost_stats.get('n_rounds'),
+                                             else sig.get("beats_reference_significantly")),
+                                         cost_ratio_stderr=cost_stats.get("stderr"),
+                                         cost_ratio_n=cost_stats.get("n_rounds"),
                                          cost_is_proxy=cost_is_proxy)
             # Keep the comparison metadata on the verdict for auditing; the
             # viability decision itself (including the fail-closed treatment of
             # missing significance evidence) is made inside efficiency_verdict.
             if sig:
-                verdict['p_one_sided_holm'] = sig['p_one_sided_holm']
-                verdict['n_seeds'] = sig['n_seeds']
+                verdict["p_one_sided_holm"] = sig["p_one_sided_holm"]
+                verdict["n_seeds"] = sig["n_seeds"]
             rows.append({
-                'candidate': cand,
-                'candidate_norm': cand_norm,
-                'candidate_cfg': cand_cfg,
-                'reference_row': args.reference_name,
-                'reference_norm': args.reference,
-                'candidate_val_loss': cand_loss,
-                'reference_val_loss': losses[args.reference_name],
-                'significance': sig,
-                'cost_ratio_per_round': cost_stats,
-                'cost_ratio_of_means': cost_ratio_of_means,
-                'cost_model_norm': cand_norm,
-                'reference_cost_is_proxy': ref_cost_is_proxy,
-                'cost_is_proxy': cost_is_proxy,
-                'verdict': verdict,
+                "candidate": cand,
+                "candidate_norm": cand_norm,
+                "candidate_cfg": cand_cfg,
+                "reference_row": args.reference_name,
+                "reference_norm": args.reference,
+                "candidate_val_loss": cand_loss,
+                "reference_val_loss": losses[args.reference_name],
+                "significance": sig,
+                "cost_ratio_per_round": cost_stats,
+                "cost_ratio_of_means": cost_ratio_of_means,
+                "cost_model_norm": cand_norm,
+                "reference_cost_is_proxy": ref_cost_is_proxy,
+                "cost_is_proxy": cost_is_proxy,
+                "verdict": verdict,
             })
         tradeoff = {
-            'summaries': args.summaries,
-            'comparison': comparison_path,
-            'comparison_reference_row': sig_bundle['reference'],
-            'comparison_reference_matches': bool(sig_bundle['reference_matches']),
-            'reference_row': args.reference_name,
-            'reference_norm': args.reference,
-            'min_loss_gain': args.min_loss_gain,
-            'max_cost_ratio': args.max_cost_ratio,
-            'rows': rows,
-            'cost_model': ("each candidate's cost is measured on the base norm taken "
+            "summaries": args.summaries,
+            "comparison": comparison_path,
+            "comparison_reference_row": sig_bundle["reference"],
+            "comparison_reference_matches": bool(sig_bundle["reference_matches"]),
+            "reference_row": args.reference_name,
+            "reference_norm": args.reference,
+            "min_loss_gain": args.min_loss_gain,
+            "max_cost_ratio": args.max_cost_ratio,
+            "rows": rows,
+            "cost_model": ("each candidate's cost is measured on the base norm taken "
                            "from its row name; rows whose trained architecture differs "
                            "beyond that base (e.g. qk_norm or activation variants) record "
                            "cost_is_proxy=true (including rows whose cfg is unavailable) and their cost ratio is a proxy"),
         }
         for row in rows:
-            if row.get('error'):
+            if row.get("error"):
                 print(f"[tradeoff] {row['candidate']}: {row['error']}")
                 continue
-            v = row['verdict']
+            v = row["verdict"]
             sig_str = f" significance={v.get('significance_status', 'no_evidence')}"
-            if v.get('p_one_sided_holm') is not None:
+            if v.get("p_one_sided_holm") is not None:
                 sig_str += f" (p_holm={v['p_one_sided_holm']})"
-            proxy_str = ' [proxy cost]' if row.get('cost_is_proxy') else ''
+            proxy_str = " [proxy cost]" if row.get("cost_is_proxy") else ""
             print(f"[tradeoff] {row['candidate']}: val_loss={row['candidate_val_loss']:.4f} vs "
                   f"{row['reference_row']}={row['reference_val_loss']:.4f} "
                   f"gain={v['loss_improvement']:+.4f} cost={v['cost_ratio']:.3f}x "
                   f"cost/loss_point={v['cost_per_loss_point'] and round(v['cost_per_loss_point'], 3)} "
                   f"viable={v['viable']}{sig_str} ({v['reason']}){proxy_str}")
         if args.require_viable:
-            not_viable = [row['candidate'] for row in rows if row.get('verdict', {}).get('viable') is not True]
+            not_viable = [row["candidate"] for row in rows if row.get("verdict", {}).get("viable") is not True]
             if not_viable:
                 raise SystemExit(f'[tradeoff] --require-viable: {len(not_viable)} candidate(s) not viable '
                                  f'or not evaluable: {", ".join(not_viable)}')
 
     report = {
-        'model': args.model,
-        'device': device,
-        'hypothesis': args.hypothesis,
-        'config': vars(args),
-        'results': results,
-        'tradeoff': tradeoff,
-        'rounds': rounds,
-        'measurement_order': measurement_order,
-        'method': {
-            'latency': (f"per norm, the mean of {rounds} interleaved round mean(s) over {args.iters} timed iterations "
+        "model": args.model,
+        "device": device,
+        "hypothesis": args.hypothesis,
+        "config": vars(args),
+        "results": results,
+        "tradeoff": tradeoff,
+        "rounds": rounds,
+        "measurement_order": measurement_order,
+        "method": {
+            "latency": (f"per norm, the mean of {rounds} interleaved round mean(s) over {args.iters} timed iterations "
                         f"after {args.warmup} warmup each; rounds alternate forward/reverse norm order so drift is "
                         f"not confounded with norm identity (raw per-round timings in latency_by_round); "
                         f"per token = per step / (batch*seq)"),
-            'flops': 'analytic = matmul FLOPs per token; measured = torch FlopCounterMode forward',
-            'memory': 'peak CUDA allocated; null on CPU',
-            'inputs': ('common random numbers: one Generator seeded with --seed '
-                       'draws the x/y for every norm'),
+            "flops": "analytic = matmul FLOPs per token; measured = torch FlopCounterMode forward",
+            "memory": "peak CUDA allocated; null on CPU",
+            "inputs": ("common random numbers: one Generator seeded with --seed "
+                       "draws the x/y for every norm"),
         },
-        'run_metadata': collect_run_metadata(seed=args.seed),
+        "run_metadata": collect_run_metadata(seed=args.seed),
     }
     out = Path(args.output)
     save_json_atomic(out, report)
-    save_run_manifest(out.with_name('efficiency_manifest.json'), finish_metadata({
-        'run_metadata': report['run_metadata'], 'hypothesis': args.hypothesis,
-        'config': vars(args), 'results': results, 'tradeoff': tradeoff,
-    }, artifacts={'efficiency_report': file_fingerprint(out)}))
-    print(f'[bench] report -> {out}')
+    save_run_manifest(out.with_name("efficiency_manifest.json"), finish_metadata({
+        "run_metadata": report["run_metadata"], "hypothesis": args.hypothesis,
+        "config": vars(args), "results": results, "tradeoff": tradeoff,
+    }, artifacts={"efficiency_report": file_fingerprint(out)}))
+    print(f"[bench] report -> {out}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -11,16 +11,17 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.optim import AdamW
 
 from adasquash.diagnostics import parameter_finite_report, tensor_finite_report
 from adasquash.repro import TRAINING_RECIPE_KEYS
 from scripts.data_pipeline import _is_pinned_revision
 
+
 def load_yaml_config(path: str) -> dict:
     import yaml
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise ValueError(f"config '{path}' must be a mapping, got {type(data)}")
@@ -33,8 +34,8 @@ def _config_bool(value):
     if isinstance(value, (int, float)) and value in (0, 1):
         return bool(value)
     if isinstance(value, str) and value.strip().lower() in (
-            'true', 'yes', 'on', '1', 'false', 'no', 'off', '0'):
-        return value.strip().lower() in ('true', 'yes', 'on', '1')
+            "true", "yes", "on", "1", "false", "no", "off", "0"):
+        return value.strip().lower() in ("true", "yes", "on", "1")
     return None
 
 def _coerce_config_scalar(action, value, path: str, key: str):
@@ -107,13 +108,13 @@ def _coerce_config_value(action, value, path: str, key: str, actions=None):
             return None
         raise ValueError(
             f"config '{path}': {key} is null but the option is not nullable")
-    if action.nargs in ('+', '*') or isinstance(action.nargs, int) and action.nargs > 1:
+    if action.nargs in ("+", "*") or (isinstance(action.nargs, int) and action.nargs > 1):
         if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
             raise ValueError(
                 f"config '{path}': {key}={value!r} must be a list")
         converted = [_coerce_config_scalar(action, item, path, key)
                      for item in value]
-        if action.nargs == '+' and not converted:
+        if action.nargs == "+" and not converted:
             raise ValueError(
                 f"config '{path}': {key} must contain at least one value")
         if isinstance(action.nargs, int) and action.nargs > 1 and len(converted) != action.nargs:
@@ -161,7 +162,7 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None,
                     f"config '{path}': {key}={value!r} is not a boolean; "
                     f"cannot map it to {dest}")
             value = not bool_value
-        elif dest in ('tie_embeddings', 'beta'):
+        elif dest in ("tie_embeddings", "beta"):
             # Positive-form boolean options have the same YAML aliases; a raw
             # `"false"` string is truthy and would silently enable the option.
             bool_value = _config_bool(value)
@@ -182,11 +183,11 @@ def apply_config_to_parser(parser, path: str | None, aliases: dict | None=None,
                    f"understand: {sorted(unknown)}")
         if strict:
             raise ValueError(
-                message + '; fix or remove them (an unrecognized key would '
-                          'otherwise be silently ignored and the run would use '
-                          'the default instead of the intended value)')
-        print(f'[config] {path}: ignoring unknown keys {sorted(unknown)}')
-_TRAIN_CONFIG_ALIASES = {'use_layerscale': ('no_layerscale', True), 'learnable_p': ('no_learnable_p', True), 'learnable_k': ('no_learnable_k', True), 'learnable_delta': ('no_learnable_delta', True), 'tie_word_embeddings': ('tie_embeddings', False), 'bf16': ('no_bf16', True), 'beta': ('beta', False), 'alpha_jitter': ('alpha_jitter', False), 'k_min': ('k_min', False), 'shared_depth_schedule': ('shared_depth_schedule', False)}
+                message + "; fix or remove them (an unrecognized key would "
+                          "otherwise be silently ignored and the run would use "
+                          "the default instead of the intended value)")
+        print(f"[config] {path}: ignoring unknown keys {sorted(unknown)}")
+_TRAIN_CONFIG_ALIASES = {"use_layerscale": ("no_layerscale", True), "learnable_p": ("no_learnable_p", True), "learnable_k": ("no_learnable_k", True), "learnable_delta": ("no_learnable_delta", True), "tie_word_embeddings": ("tie_embeddings", False), "bf16": ("no_bf16", True), "beta": ("beta", False), "alpha_jitter": ("alpha_jitter", False), "k_min": ("k_min", False), "shared_depth_schedule": ("shared_depth_schedule", False)}
 
 def _optional_dest(parser, option: str):
     """`dest` of an option spelling, including argparse's unambiguous prefixes.
@@ -219,13 +220,13 @@ def _explicit_arg_names(argv, parser, config_path=None) -> frozenset:
     """
     names = set()
     for token in argv:
-        if token == '--':
+        if token == "--":
             break
-        if token.startswith('--'):
+        if token.startswith("--"):
             # Resolve through argparse, not the exact option-string table:
             # argparse accepts unambiguous prefixes (`--val-f` for
             # `--val-frac`) and that spelling is just as explicit.
-            dest = _optional_dest(parser, token.split('=', 1)[0])
+            dest = _optional_dest(parser, token.split("=", 1)[0])
             if dest is not None:
                 names.add(dest)
     return frozenset(names)
@@ -239,15 +240,15 @@ def _snapshot_rng_state() -> dict:
     weights makes a resume continue the same stochastic run instead of
     restarting the streams from `--seed`.
     """
-    state = {'torch_cpu': torch.get_rng_state(), 'python': random.getstate()}
+    state = {"torch_cpu": torch.get_rng_state(), "python": random.getstate()}
     try:
         import numpy as _np
     except ImportError:
         pass
     else:
-        state['numpy'] = _np.random.get_state()
+        state["numpy"] = _np.random.get_state()
     if torch.cuda.is_available():
-        state['torch_cuda'] = torch.cuda.get_rng_state_all()
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
     return state
 
 
@@ -257,7 +258,7 @@ def _atomic_torch_save(obj, path: Path) -> None:
     Writing straight to the target means a crash or full disk leaves a
     truncated file where a usable checkpoint used to be.
     """
-    tmp = path.with_name(path.name + '.tmp')
+    tmp = path.with_name(path.name + ".tmp")
     try:
         torch.save(obj, tmp)
         os.replace(tmp, path)
@@ -279,10 +280,10 @@ def _checkpoint_nonfinite(model, opt) -> list:
     """
     failures: list = []
     report = parameter_finite_report(model)
-    if not report['finite']:
-        for entry in report['nonfinite_parameters']:
+    if not report["finite"]:
+        for entry in report["nonfinite_parameters"]:
             failures.append(f"parameter {entry['name']} (nan={entry['n_nan']}, inf={entry['n_inf']})")
-        for entry in report['nonfinite_buffers']:
+        for entry in report["nonfinite_buffers"]:
             failures.append(f"buffer {entry['name']} (nan={entry['n_nan']}, inf={entry['n_inf']})")
     names = {id(p): name for name, p in model.named_parameters()}
     for param, state in opt.state.items():
@@ -293,7 +294,7 @@ def _checkpoint_nonfinite(model, opt) -> list:
             if not (value.is_floating_point() or value.is_complex()):
                 continue
             finite = tensor_finite_report(value.detach())
-            if not finite['finite']:
+            if not finite["finite"]:
                 failures.append(
                     f"optimizer {name}.{key} (nan={finite['n_nan']}, inf={finite['n_inf']})")
     return failures
@@ -303,14 +304,14 @@ def _assert_checkpoint_finite(model, opt, path: Path, step: int) -> None:
     failures = _checkpoint_nonfinite(model, opt)
     if not failures:
         return
-    shown = '; '.join(failures[:10])
-    more = '' if len(failures) <= 10 else f' (+{len(failures) - 10} more)'
+    shown = "; ".join(failures[:10])
+    more = "" if len(failures) <= 10 else f" (+{len(failures) - 10} more)"
     raise SystemExit(
-        f'[ckpt] refusing to write {path} at step {step}: non-finite training state '
-        f'({shown}{more}). The previous checkpoint is kept. Restore it and run the '
-        f'NaN triage on the step that produced the overflow (data -> fp32 math -> '
-        f'mixed precision -> gradients) instead of persisting a checkpoint that is '
-        f'already corrupted.')
+        f"[ckpt] refusing to write {path} at step {step}: non-finite training state "
+        f"({shown}{more}). The previous checkpoint is kept. Restore it and run the "
+        f"NaN triage on the step that produced the overflow (data -> fp32 math -> "
+        f"mixed precision -> gradients) instead of persisting a checkpoint that is "
+        f"already corrupted.")
 
 
 def _load_checkpoint_cpu(path) -> dict:
@@ -320,9 +321,9 @@ def _load_checkpoint_cpu(path) -> dict:
     been copied.
     """
     try:
-        return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
+        return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     except (RuntimeError, ValueError):
-        return torch.load(path, map_location='cpu', weights_only=False)
+        return torch.load(path, map_location="cpu", weights_only=False)
 
 _ADAMW_FUSED_CPU_SUPPORTED: bool | None = None
 
@@ -332,7 +333,7 @@ def _adamw_fused_supported(device: torch.device) -> bool:
     CUDA always has one; CPU support depends on the build, so a one-element
     probe decides portability without special-casing torch versions.
     """
-    if device.type == 'cuda':
+    if device.type == "cuda":
         return True
     global _ADAMW_FUSED_CPU_SUPPORTED
     if _ADAMW_FUSED_CPU_SUPPORTED is None:
@@ -351,11 +352,11 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float, beta1: flo
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim < 2 or 'norm' in name or 'delta' in name or ('ls1' in name) or ('ls2' in name) or name.endswith('.bias'):
+        if p.ndim < 2 or "norm" in name or "delta" in name or ("ls1" in name) or ("ls2" in name) or name.endswith(".bias"):
             no_decay.append(p)
         else:
             decay.append(p)
-    groups = [{'params': decay, 'weight_decay': weight_decay}, {'params': no_decay, 'weight_decay': 0.0}]
+    groups = [{"params": decay, "weight_decay": weight_decay}, {"params": no_decay, "weight_decay": 0.0}]
     devices = {p.device for p in decay + no_decay}
     fused = len(devices) == 1 and _adamw_fused_supported(next(iter(devices)))
     return AdamW(groups, lr=lr, betas=(beta1, beta2), fused=fused)
@@ -375,10 +376,10 @@ def build_lr_lambda(args):
         return lambda s: cosine_schedule(
             s, max(1, args.max_steps - 1), 0, args.min_lr_ratio)
     return lambda s: cosine_schedule(s + 1, args.max_steps, args.warmup, args.min_lr_ratio)
-_SCHEDULE_ARGS = ('max_steps', 'warmup', 'min_lr_ratio', 'lr', 'weight_decay', 'beta1', 'beta2', 'grad_clip', 'grad_accum')
-_MONITOR_ARGS = ('val_every', 'val_batches', 'early_stop_patience')
-_ARCH_ARGS = ('model', 'norm', 'qk_norm', 'qk_alpha_init', 'no_layerscale', 'layerscale_init', 'tie_embeddings', 'no_learnable_p', 'no_learnable_k', 'no_learnable_delta', 'beta', 'alpha_0', 'k_init', 'k_min', 'shared_depth_schedule', 'alpha_init', 'p_init', 'alpha_jitter', 'gradient_checkpointing')
-_NUMERIC_ARGS = ('compile', 'compile_mode', 'no_bf16')
+_SCHEDULE_ARGS = ("max_steps", "warmup", "min_lr_ratio", "lr", "weight_decay", "beta1", "beta2", "grad_clip", "grad_accum")
+_MONITOR_ARGS = ("val_every", "val_batches", "early_stop_patience")
+_ARCH_ARGS = ("model", "norm", "qk_norm", "qk_alpha_init", "no_layerscale", "layerscale_init", "tie_embeddings", "no_learnable_p", "no_learnable_k", "no_learnable_delta", "beta", "alpha_0", "k_init", "k_min", "shared_depth_schedule", "alpha_init", "p_init", "alpha_jitter", "gradient_checkpointing")
+_NUMERIC_ARGS = ("compile", "compile_mode", "no_bf16")
 _RESUME_RUN_ARGS = _ARCH_ARGS + _NUMERIC_ARGS
 # A within-arm aggregation must compare the whole run identity, not only the
 # optimizer/data recipe: two seeds that trained the same shape with different
@@ -420,22 +421,22 @@ def restore_monitor_args(args, ckpt_args: dict, explicit: frozenset=frozenset())
 # changes which documents are trained on and which are held out. The dataset /
 # tokenizer revisions are the data *version*: resuming a run against a moved
 # upstream branch would continue on different data under the same manifest.
-_DATA_ARGS = ('dataset', 'dataset_config', 'dataset_revision', 'tokenizer', 'tokenizer_revision',
-              'val_dataset', 'val_dataset_config', 'val_dataset_revision',
-              'val_split', 'val_seq_len',
-              'val_frac', 'test_frac', 'num_documents',
-              'dedup', 'min_doc_chars', 'max_doc_chars', 'exclude_hash_file',
-              'exclude_test_hash_file', 'exclude_train_hash_file',
-              'group_key', 'exclude_group_file',
-              'exclude_test_group_file', 'train_shuffle_buffer',
+_DATA_ARGS = ("dataset", "dataset_config", "dataset_revision", "tokenizer", "tokenizer_revision",
+              "val_dataset", "val_dataset_config", "val_dataset_revision",
+              "val_split", "val_seq_len",
+              "val_frac", "test_frac", "num_documents",
+              "dedup", "min_doc_chars", "max_doc_chars", "exclude_hash_file",
+              "exclude_test_hash_file", "exclude_train_hash_file",
+              "group_key", "exclude_group_file",
+              "exclude_test_group_file", "train_shuffle_buffer",
               # These define the stream geometry: the resumed run must read the
               # same document windows with the same batch/sequence shape, or
               # `data_position` no longer points at the same tokens.
-              'seq_len', 'batch_size', 'num_workers')
+              "seq_len", "batch_size", "num_workers")
 
-_LEDGER_ARGS = ('exclude_hash_file', 'exclude_test_hash_file',
-                'exclude_train_hash_file',
-                'exclude_group_file', 'exclude_test_group_file')
+_LEDGER_ARGS = ("exclude_hash_file", "exclude_test_hash_file",
+                "exclude_train_hash_file",
+                "exclude_group_file", "exclude_test_group_file")
 
 def unpinned_data_revisions(dataset_revision, tokenizer_revision,
                             val_dataset_revision=None, val_dataset=None) -> list:
@@ -448,12 +449,12 @@ def unpinned_data_revisions(dataset_revision, tokenizer_revision,
     reconstruct the same command-line protocol.
     """
     problems = []
-    for flag, value in (('--dataset-revision', dataset_revision),
-                        ('--tokenizer-revision', tokenizer_revision)):
+    for flag, value in (("--dataset-revision", dataset_revision),
+                        ("--tokenizer-revision", tokenizer_revision)):
         if not _is_pinned_revision(value):
-            problems.append(f'{flag} is not a full 40-hex commit hash: {value!r}')
+            problems.append(f"{flag} is not a full 40-hex commit hash: {value!r}")
     if val_dataset and not _is_pinned_revision(val_dataset_revision):
         problems.append(
-            '--val-dataset-revision is not a full 40-hex commit hash: '
-            f'{val_dataset_revision!r}')
+            "--val-dataset-revision is not a full 40-hex commit hash: "
+            f"{val_dataset_revision!r}")
     return problems

@@ -1,20 +1,36 @@
 from __future__ import annotations
+
 import argparse
-import sys
 import random
+import sys
 from collections import Counter
 from pathlib import Path
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
-from adasquash import GPTConfig, GPT
+
+from adasquash import GPT, GPTConfig
 from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import wilson_interval
-from adasquash.model import build_gpt_124m, build_gpt_350m, build_llama_tiny_1b, clear_ce_scratch_cache, clear_cast_weight_cache
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
+from adasquash.model import (
+    build_gpt_124m,
+    build_gpt_350m,
+    build_llama_tiny_1b,
+    clear_cast_weight_cache,
+    clear_ce_scratch_cache,
+)
+from adasquash.repro import (
+    collect_run_metadata,
+    file_fingerprint,
+    finish_metadata,
+    save_run_manifest,
+    set_all_seeds,
+)
+
 
 def _strip_compile_prefix(state):
-    prefix = '_orig_mod.'
+    prefix = "_orig_mod."
     if not any(k.startswith(prefix) for k in state):
         return state
     return {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state.items()}
@@ -27,14 +43,14 @@ def _load_checkpoint_cpu(path: str) -> dict:
     the weights, and only `args` travels back to the caller.
     """
     try:
-        return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
+        return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     except (RuntimeError, ValueError):
-        return torch.load(path, map_location='cpu', weights_only=False)
+        return torch.load(path, map_location="cpu", weights_only=False)
 
-def load_ckpt(path: str, device: str='cuda'):
+def load_ckpt(path: str, device: str="cuda"):
     ckpt = _load_checkpoint_cpu(path)
-    args = ckpt['args']
-    model_cfg = dict(norm_name=args['norm'], qk_norm=args.get('qk_norm'), qk_alpha_init=args.get('qk_alpha_init', 1.0), use_layerscale=not args.get('no_layerscale', False), alpha_0=args.get('alpha_0', 0.9), k_init=args.get('k_init', 1.0), alpha_init=args.get('alpha_init', 0.5), p_init=args.get('p_init', 2.0), learnable_p=not args.get('no_learnable_p', False), learnable_k=not args.get('no_learnable_k', False), learnable_delta=not args.get('no_learnable_delta', False), beta=args.get('beta', True))
+    args = ckpt["args"]
+    model_cfg = dict(norm_name=args["norm"], qk_norm=args.get("qk_norm"), qk_alpha_init=args.get("qk_alpha_init", 1.0), use_layerscale=not args.get("no_layerscale", False), alpha_0=args.get("alpha_0", 0.9), k_init=args.get("k_init", 1.0), alpha_init=args.get("alpha_init", 0.5), p_init=args.get("p_init", 2.0), learnable_p=not args.get("no_learnable_p", False), learnable_k=not args.get("no_learnable_k", False), learnable_delta=not args.get("no_learnable_delta", False), beta=args.get("beta", True))
     # Protocol fields that change the *function* the checkpoint implements
     # must be restored, not defaulted: `k_min=None` (--no-k-min) permits a
     # learned negative k, while the default clamps k at 0, and a shared depth
@@ -42,41 +58,41 @@ def load_ckpt(path: str, device: str='cuda'):
     # the defaults silently evaluates a different model or rejects the
     # checkpoint's own keys. An absent old checkpoint key keeps the historic
     # default; an explicit None is preserved.
-    model_cfg['k_min'] = args.get('k_min', 0.0)
-    model_cfg['shared_depth_schedule'] = args.get('shared_depth_schedule', False)
+    model_cfg["k_min"] = args.get("k_min", 0.0)
+    model_cfg["shared_depth_schedule"] = args.get("shared_depth_schedule", False)
     # alpha_jitter only perturbs initial parameters, and init=False makes it
     # inert here; gradient_checkpointing only changes the training backward
     # path. Neither changes the loaded function, so they are intentionally
     # not part of the evaluation reconstruction.
-    if args.get('layerscale_init') is not None:
-        model_cfg['layerscale_init'] = args['layerscale_init']
-    if args.get('tie_embeddings') is not None:
-        model_cfg['tie_word_embeddings'] = args['tie_embeddings']
-    elif 'no_tie_embeddings' in args:
-        model_cfg['tie_word_embeddings'] = not args['no_tie_embeddings']
+    if args.get("layerscale_init") is not None:
+        model_cfg["layerscale_init"] = args["layerscale_init"]
+    if args.get("tie_embeddings") is not None:
+        model_cfg["tie_word_embeddings"] = args["tie_embeddings"]
+    elif "no_tie_embeddings" in args:
+        model_cfg["tie_word_embeddings"] = not args["no_tie_embeddings"]
     # The checkpoint's weights overwrite every parameter, so the model is
     # built with `init=False` straight on the target device.
     with torch.device(device):
-        if args['model'] == 'gpt2-124m':
+        if args["model"] == "gpt2-124m":
             model = build_gpt_124m(init=False, **model_cfg)
-        elif args['model'] == 'gpt2-350m':
+        elif args["model"] == "gpt2-350m":
             model = build_gpt_350m(init=False, **model_cfg)
         else:
             model = build_llama_tiny_1b(init=False, **model_cfg)
-    depth = args.get('_depth_override')
-    dim = args.get('_dim_override')
-    heads = args.get('_heads_override')
+    depth = args.get("_depth_override")
+    dim = args.get("_dim_override")
+    heads = args.get("_heads_override")
     if depth or dim or heads:
         cfg_dict = {k: getattr(model.cfg, k) for k in vars(model.cfg)}
         if depth:
-            cfg_dict['n_layers'] = depth
+            cfg_dict["n_layers"] = depth
         if dim:
-            cfg_dict['dim'] = dim
+            cfg_dict["dim"] = dim
         if heads:
-            cfg_dict['n_heads'] = heads
+            cfg_dict["n_heads"] = heads
         with torch.device(device):
             model = GPT(GPTConfig(**cfg_dict), init=False)
-    model.load_state_dict(_strip_compile_prefix(ckpt['model']))
+    model.load_state_dict(_strip_compile_prefix(ckpt["model"]))
     # Keep the training step with the args: a checkpoint can be `ckpt_best.pt`
     # (selected at a different step per run) or a mid-run save, so two
     # checkpoints sharing `max_steps` are not necessarily the same point in
@@ -85,12 +101,12 @@ def load_ckpt(path: str, device: str='cuda'):
     # step.
     if isinstance(args, dict):
         args = dict(args)
-        step = ckpt.get('step')
-        args['_checkpoint_step'] = int(step) if isinstance(step, int) and not isinstance(step, bool) else None
+        step = ckpt.get("step")
+        args["_checkpoint_step"] = int(step) if isinstance(step, int) and not isinstance(step, bool) else None
     # Drop the heavyweight entries; only `args` travels back to the caller.
-    ckpt.pop('model', None)
-    ckpt.pop('optimizer', None)
-    ckpt.pop('scheduler', None)
+    ckpt.pop("model", None)
+    ckpt.pop("optimizer", None)
+    ckpt.pop("scheduler", None)
     model.to(device)
     model.eval()
     # Evaluation switches between models in-process (per-task loops, sweeps);
@@ -120,8 +136,8 @@ class AdaSquashLM:
         # lm_eval.api.model.LM. The property below also serves the plain
         # wrapper used without lm-eval installed.
         self._device = next(model.parameters()).device
-        cfg = getattr(model, 'cfg', None)
-        self.max_length = int(getattr(cfg, 'max_seq_len', 2048))
+        cfg = getattr(model, "cfg", None)
+        self.max_length = int(getattr(cfg, "max_seq_len", 2048))
         self.apply_chat_template = False
 
     @property
@@ -133,7 +149,7 @@ class AdaSquashLM:
         # Honor the caller's flag: the harness passes it through, and silently
         # forcing `False` would tokenize a special-token request differently.
         ids = self.tokenizer(
-            string, add_special_tokens=bool(add_special_tokens))['input_ids']
+            string, add_special_tokens=bool(add_special_tokens))["input_ids"]
         if left_truncate_len is not None and len(ids) > left_truncate_len:
             ids = ids[len(ids) - left_truncate_len:]
         return list(ids)
@@ -232,13 +248,13 @@ class AdaSquashLM:
             context, gen_kwargs = req.args[:2]
             if not isinstance(gen_kwargs, dict):
                 gen_kwargs = {}
-            raw_until = list(gen_kwargs.get('until', [])) + [
-                s for s in stops if s not in gen_kwargs.get('until', [])]
+            raw_until = list(gen_kwargs.get("until", [])) + [
+                s for s in stops if s not in gen_kwargs.get("until", [])]
             # An empty stop string is a no-op in the final trimming loop; it
             # must not count as "already generated the stop" on the first
             # token and truncate the generation to length one.
             until = [s for s in raw_until if isinstance(s, str) and s]
-            max_toks = int(gen_kwargs.get('max_gen_toks', self.max_gen_toks))
+            max_toks = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks))
             # A request for more tokens than the positional table can hold is
             # capped, not allowed to run past `max_seq_len` and crash on the
             # first forward whose prefix is already full.
@@ -252,7 +268,7 @@ class AdaSquashLM:
                 if eos is not None:
                     ids = [int(eos)]
                 elif max_toks > 0:
-                    out.append('')
+                    out.append("")
                     continue
             generated: list = []
             with torch.no_grad():
@@ -281,14 +297,14 @@ def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16,
     numeric metric the harness reports for the task.
     """
     try:
-        import lm_eval  # noqa: F401
+        import lm_eval
         from lm_eval import simple_evaluate
     except ImportError as e:
-        raise RuntimeError('lm-eval not installed. `pip install lm-eval`.') from e
+        raise RuntimeError("lm-eval not installed. `pip install lm-eval`.") from e
     if tokenizer is None or isinstance(tokenizer, str):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer or 'gpt2', revision=tokenizer_revision)
+            tokenizer or "gpt2", revision=tokenizer_revision)
     # lm-eval 0.4.x requires a real lm_eval.api.model.LM instance and raises
     # TypeError for a duck-typed wrapper. Mix the fixed primitives in at call
     # time so this module still imports (and the needle path still runs) when
@@ -304,13 +320,13 @@ def evaluate_lm_harness(model, tasks: list[str], batch_size: int=16,
     report = simple_evaluate(model=lm_obj, tasks=list(tasks), batch_size=batch_size,
                              bootstrap_iters=0)
     results = {}
-    for task, metrics in (report.get('results') or {}).items():
+    for task, metrics in (report.get("results") or {}).items():
         results[task] = {k: v for k, v in metrics.items()
                          if isinstance(v, (int, float)) and not isinstance(v, bool)}
     return results
-DEFAULT_NEEDLE = 'The magic number is 12345.'
-DEFAULT_QUESTION = '\n\nWhat is the magic number? The magic number is'
-DEFAULT_HAYSTACK = 'Many sentences follow. '
+DEFAULT_NEEDLE = "The magic number is 12345."
+DEFAULT_QUESTION = "\n\nWhat is the magic number? The magic number is"
+DEFAULT_HAYSTACK = "Many sentences follow. "
 
 def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
     """The tokenizer identity the checkpoint was trained with, else the fallback.
@@ -319,23 +335,23 @@ def _checkpoint_tokenizer(ckpt_args: dict, fallback_name: str):
     branch/tag the user requested; otherwise a moved branch silently
     tokenizes the evaluation differently from training.
     """
-    name = ckpt_args.get('tokenizer') or fallback_name
-    revision = (ckpt_args.get('tokenizer_revision_resolved')
-                or ckpt_args.get('tokenizer_revision'))
+    name = ckpt_args.get("tokenizer") or fallback_name
+    revision = (ckpt_args.get("tokenizer_revision_resolved")
+                or ckpt_args.get("tokenizer_revision"))
     return name, revision
 
 
 def needle_target_ids(tokenizer, needle: str=DEFAULT_NEEDLE) -> list:
-    secret = needle.strip().rstrip('.!?').split()
-    secret = secret[-1] if secret else ''
+    secret = needle.strip().rstrip(".!?").split()
+    secret = secret[-1] if secret else ""
     if not secret:
         return []
-    return tokenizer(' ' + secret, add_special_tokens=False)['input_ids']
+    return tokenizer(" " + secret, add_special_tokens=False)["input_ids"]
 
 def needle_decode_overhead(tokenizer, needle: str=DEFAULT_NEEDLE) -> int:
     return max(0, len(needle_target_ids(tokenizer, needle)) - 1)
 
-def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str='cuda', seed: int=0, return_counts: bool=False, decode_batch: int=8, return_details: bool=False, random_haystack: bool=False, haystack_vocab_size: int | None=None, needle_present: bool=True):
+def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_prompt: str=DEFAULT_HAYSTACK, context_len: int=4096, n_trials: int=5, device: str="cuda", seed: int=0, return_counts: bool=False, decode_batch: int=8, return_details: bool=False, random_haystack: bool=False, haystack_vocab_size: int | None=None, needle_present: bool=True):
     """Exact-match accuracy of the secret over `n_trials` independent placements.
 
     `random_haystack=True` replaces the repeated `haystack_prompt` filler with
@@ -389,31 +405,31 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     """
     rng = random.Random(seed)
     tok = tokenizer
-    needle_ids = tok(needle, add_special_tokens=False)['input_ids']
-    prompt_ids = tok(haystack_prompt, add_special_tokens=False)['input_ids']
-    question_ids = tok(DEFAULT_QUESTION, add_special_tokens=False)['input_ids']
+    needle_ids = tok(needle, add_special_tokens=False)["input_ids"]
+    prompt_ids = tok(haystack_prompt, add_special_tokens=False)["input_ids"]
+    question_ids = tok(DEFAULT_QUESTION, add_special_tokens=False)["input_ids"]
     target_ids = needle_target_ids(tok, needle)
     inserted = list(needle_ids) if needle_present else []
     haystack_vocab = None
     if random_haystack:
         raw_vocab = (haystack_vocab_size if haystack_vocab_size is not None
-                     else getattr(getattr(model, 'cfg', None), 'vocab_size', 0))
+                     else getattr(getattr(model, "cfg", None), "vocab_size", 0))
         try:
             haystack_vocab = int(raw_vocab)
         except (TypeError, ValueError):
             haystack_vocab = 0
         if haystack_vocab <= 0:
-            raise ValueError('random_haystack needs a positive haystack_vocab_size or a model cfg.vocab_size')
-    model_limit = getattr(getattr(model, 'cfg', None), 'max_seq_len', None)
+            raise ValueError("random_haystack needs a positive haystack_vocab_size or a model cfg.vocab_size")
+    model_limit = getattr(getattr(model, "cfg", None), "max_seq_len", None)
     if model_limit is not None and context_len > model_limit:
         raise ValueError(f"context_len={context_len} exceeds the model's max_seq_len={model_limit}; raise max_seq_len (and retrain) or lower the context length - there is no valid result at this length")
     overhead = max(0, len(target_ids) - 1)
     if model_limit is not None and context_len + overhead > model_limit:
         raise ValueError(f"context_len={context_len} + {overhead} scoring positions for the {len(target_ids)}-token secret exceeds the model's max_seq_len={model_limit}; scoring the last token would index past the positional table - lower the context length by at least {context_len + overhead - model_limit}")
     if not target_ids:
-        raise ValueError(f'could not derive a secret to score from needle={needle!r}')
+        raise ValueError(f"could not derive a secret to score from needle={needle!r}")
     if not random_haystack and len(prompt_ids) == 0:
-        raise ValueError('haystack_prompt tokenizes to zero tokens')
+        raise ValueError("haystack_prompt tokenizes to zero tokens")
     # Every trial uses the same fix-up RNG order as the sequential version, so
     # batching (which only groups independent trials) changes no placement.
     contexts: list = []
@@ -421,11 +437,11 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         body_len = context_len - len(inserted) - len(question_ids)
         if random_haystack:
             if body_len < 0:
-                raise ValueError(f'context_len={context_len} is too short to hold the question ({len(question_ids)} tok) and a random haystack')
+                raise ValueError(f"context_len={context_len} is too short to hold the question ({len(question_ids)} tok) and a random haystack")
             body = [rng.randrange(haystack_vocab) for _ in range(body_len)]
         else:
             if body_len < len(prompt_ids):
-                raise ValueError(f'context_len={context_len} is too short to hold the needle ({len(inserted)} tok) + question ({len(question_ids)} tok) + one haystack repeat ({len(prompt_ids)} tok)')
+                raise ValueError(f"context_len={context_len} is too short to hold the needle ({len(inserted)} tok) + question ({len(question_ids)} tok) + one haystack repeat ({len(prompt_ids)} tok)")
             n_repeats, remainder = divmod(body_len, len(prompt_ids))
             # Fill the final partial repeat too: flooring alone left the context
             # up to one prompt shorter than the requested length, so trials were
@@ -436,12 +452,12 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         contexts.append((pos, full))
     n_run = len(contexts)
     if n_run == 0:
-        raise ValueError('needle test produced no trials')
+        raise ValueError("needle test produced no trials")
     n_correct = 0
     trial_correct: list = []
     failures: list = []
     details: list = []
-    last_logits = getattr(model, 'last_position_logits', None)
+    last_logits = getattr(model, "last_position_logits", None)
     decode_batch = max(1, int(decode_batch))
     with torch.inference_mode():
         for b0 in range(0, n_run, decode_batch):
@@ -488,34 +504,34 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                         in_context = bool((buf[i, :n] == nxt_i).any().item())
                         prefix_ok = len(generated[i]) - 1
                         if prefix_ok == 0:
-                            cause = 'retrieval_miss'
+                            cause = "retrieval_miss"
                         elif in_context:
-                            cause = 'context_copy'
+                            cause = "context_copy"
                         else:
-                            cause = 'decode_drift'
+                            cause = "decode_drift"
                         if rank < 5:
-                            confidence = 'near_miss'
+                            confidence = "near_miss"
                         elif top_prob >= 0.5:
-                            confidence = 'confident_wrong'
+                            confidence = "confident_wrong"
                         else:
-                            confidence = 'diffuse'
+                            confidence = "diffuse"
                         failures.append({
-                            'trial': b0 + i,
-                            'needle_position': group[i][0],
-                            'context_len': seq_len,
-                            'failure_step': prefix_ok,
-                            'n_target_tokens': len(target_ids),
-                            'generated_ids': [int(v) for v in generated[i]],
-                            'expected_id': int(want),
-                            'predicted_id': nxt_i,
-                            'expected_rank': rank,
-                            'expected_prob': float(probs[want].item()),
-                            'predicted_prob': top_prob,
-                            'logit_margin_over_expected': float(
+                            "trial": b0 + i,
+                            "needle_position": group[i][0],
+                            "context_len": seq_len,
+                            "failure_step": prefix_ok,
+                            "n_target_tokens": len(target_ids),
+                            "generated_ids": [int(v) for v in generated[i]],
+                            "expected_id": int(want),
+                            "predicted_id": nxt_i,
+                            "expected_rank": rank,
+                            "expected_prob": float(probs[want].item()),
+                            "predicted_prob": top_prob,
+                            "logit_margin_over_expected": float(
                                 (row_logits[nxt_i] - row_logits[want]).item()),
-                            'predicted_in_context': in_context,
-                            'cause': cause,
-                            'confidence': confidence,
+                            "predicted_in_context": in_context,
+                            "cause": cause,
+                            "confidence": confidence,
                         })
                         failed[i] = True
                     for pos, i in enumerate(active):
@@ -536,29 +552,29 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                 n += 1
             n_correct += sum(not f for f in failed)
             trial_correct.extend(not f for f in failed)
-            decode = getattr(tok, 'decode', None)
+            decode = getattr(tok, "decode", None)
             for i, (pos, _) in enumerate(group):
                 # Position is relative to the full evaluated context; the
                 # haystack body excludes the needle+question tokens, so
                 # dividing by it inflated late-placement fractions.
                 pos_frac = pos / max(1, context_len)
-                generated_text = ''
+                generated_text = ""
                 if generated[i] and callable(decode):
                     try:
                         generated_text = decode([int(v) for v in generated[i]])
                     except Exception:
-                        generated_text = ''
+                        generated_text = ""
                 details.append({
-                    'trial': b0 + i,
-                    'pos_frac': pos_frac,
-                    'bucket': ('early' if pos_frac < 1 / 3
-                               else 'middle' if pos_frac < 2 / 3 else 'late'),
-                    'correct': bool(not failed[i]),
-                    'needle_present': bool(needle_present),
-                    'generated': generated_text,
+                    "trial": b0 + i,
+                    "pos_frac": pos_frac,
+                    "bucket": ("early" if pos_frac < 1 / 3
+                               else "middle" if pos_frac < 2 / 3 else "late"),
+                    "correct": bool(not failed[i]),
+                    "needle_present": bool(needle_present),
+                    "generated": generated_text,
                 })
     if n_run == 0:
-        raise ValueError('needle test produced no trials')
+        raise ValueError("needle test produced no trials")
     acc = n_correct / n_run
     if return_details:
         # Position-resolved coverage: a scalar accuracy can hide a model that
@@ -568,41 +584,41 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
         return acc, details
     if return_counts:
         low, high = wilson_interval(n_correct, n_run)
-        return {'accuracy': acc, 'n_correct': n_correct, 'n_trials': n_run,
-                'trial_correct': trial_correct, 'seed': seed,
-                'ci95_low': low, 'ci95_high': high,
-                'ci_basis': 'wilson_within_single_placement_draw',
-                'failures': failures,
-                'failure_causes': dict(Counter(f['cause'] for f in failures)),
-                'failure_confidence': dict(Counter(f['confidence'] for f in failures))}
+        return {"accuracy": acc, "n_correct": n_correct, "n_trials": n_run,
+                "trial_correct": trial_correct, "seed": seed,
+                "ci95_low": low, "ci95_high": high,
+                "ci_basis": "wilson_within_single_placement_draw",
+                "failures": failures,
+                "failure_causes": dict(Counter(f["cause"] for f in failures)),
+                "failure_confidence": dict(Counter(f["confidence"] for f in failures))}
     return acc
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt', required=True)
-    p.add_argument('--tasks', nargs='+', default=[], help='lm-eval tasks to request (none by default). The in-script AdaSquashLM wrapper runs them directly against the raw GPT; if lm-eval is missing or the task run fails, the result is recorded as failed rather than as an empty successful evaluation.')
-    p.add_argument('--batch-size', type=int, default=16)
-    p.add_argument('--needle-test', action='store_true', help='also run needle-in-haystack')
-    p.add_argument('--needle-context-len', type=int, default=None, help="needle context length (default: the checkpoint's trained seq_len, or its max_seq_len minus the positions the secret's decode needs when the checkpoint records no seq_len - so a model trained short is not silently evaluated at an extrapolated length; asking for more than max_seq_len raises)")
-    p.add_argument('--tokenizer', default=None, help="tokenizer name; default: the checkpoint's recorded tokenizer, else gpt2")
-    p.add_argument('--tokenizer-revision', default=None, help="tokenizer revision; default: the checkpoint's recorded revision (an explicit flag wins)")
-    p.add_argument('--decode-batch', type=int, default=8, help='independent needle trials decoded per forward pass (each step still recomputes the whole prefix)')
-    p.add_argument('--seed', type=int, default=0, help='seed for the needle-position and generation RNGs')
-    p.add_argument('--output', default=None)
-    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this evaluation tests; recorded in the manifest so a pass/fail is auditable as a test of a claim rather than a fishing trip')
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--tasks", nargs="+", default=[], help="lm-eval tasks to request (none by default). The in-script AdaSquashLM wrapper runs them directly against the raw GPT; if lm-eval is missing or the task run fails, the result is recorded as failed rather than as an empty successful evaluation.")
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--needle-test", action="store_true", help="also run needle-in-haystack")
+    p.add_argument("--needle-context-len", type=int, default=None, help="needle context length (default: the checkpoint's trained seq_len, or its max_seq_len minus the positions the secret's decode needs when the checkpoint records no seq_len - so a model trained short is not silently evaluated at an extrapolated length; asking for more than max_seq_len raises)")
+    p.add_argument("--tokenizer", default=None, help="tokenizer name; default: the checkpoint's recorded tokenizer, else gpt2")
+    p.add_argument("--tokenizer-revision", default=None, help="tokenizer revision; default: the checkpoint's recorded revision (an explicit flag wins)")
+    p.add_argument("--decode-batch", type=int, default=8, help="independent needle trials decoded per forward pass (each step still recomputes the whole prefix)")
+    p.add_argument("--seed", type=int, default=0, help="seed for the needle-position and generation RNGs")
+    p.add_argument("--output", default=None)
+    p.add_argument("--hypothesis", default=None, help="the scientific hypothesis this evaluation tests; recorded in the manifest so a pass/fail is auditable as a test of a claim rather than a fishing trip")
     args = p.parse_args()
     if not args.tasks and not args.needle_test:
         # An evaluation with neither benchmarks nor the needle test measures
         # nothing; writing a finished manifest for it would let an empty run
         # be cited as an evaluation.
-        p.error('nothing to evaluate: pass --tasks and/or --needle-test')
+        p.error("nothing to evaluate: pass --tasks and/or --needle-test")
     if args.batch_size < 1:
-        p.error(f'--batch-size {args.batch_size} must be >= 1')
+        p.error(f"--batch-size {args.batch_size} must be >= 1")
     if args.decode_batch < 1:
-        p.error(f'--decode-batch {args.decode_batch} must be >= 1')
+        p.error(f"--decode-batch {args.decode_batch} must be >= 1")
     if args.needle_context_len is not None and args.needle_context_len < 1:
-        p.error(f'--needle-context-len {args.needle_context_len} must be >= 1')
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        p.error(f"--needle-context-len {args.needle_context_len} must be >= 1")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     set_all_seeds(args.seed)
     model, model_args = load_ckpt(args.ckpt, device=device)
     print(f"[eval] loaded {args.ckpt} | norm={model_args['norm']} | n_layers={model.cfg.n_layers}")
@@ -616,15 +632,15 @@ def main():
         # silently overriding the flag evaluates a different model.
         tok_name = args.tokenizer
         recorded_revision = (
-            (model_args.get('tokenizer_revision_resolved')
-             or model_args.get('tokenizer_revision'))
-            if model_args.get('tokenizer') == args.tokenizer else None)
+            (model_args.get("tokenizer_revision_resolved")
+             or model_args.get("tokenizer_revision"))
+            if model_args.get("tokenizer") == args.tokenizer else None)
     else:
-        tok_name, recorded_revision = _checkpoint_tokenizer(model_args, 'gpt2')
+        tok_name, recorded_revision = _checkpoint_tokenizer(model_args, "gpt2")
     tok_revision = (args.tokenizer_revision if args.tokenizer_revision is not None
                     else recorded_revision)
-    results = {'ckpt': args.ckpt, 'norm': model_args['norm'], 'tasks': {},
-               'tokenizer': tok_name, 'tokenizer_revision': tok_revision}
+    results = {"ckpt": args.ckpt, "norm": model_args["norm"], "tasks": {},
+               "tokenizer": tok_name, "tokenizer_revision": tok_revision}
     if args.tasks:
         try:
             res = evaluate_lm_harness(model, args.tasks, args.batch_size,
@@ -632,7 +648,7 @@ def main():
                                       tokenizer_revision=tok_revision)
             if not isinstance(res, dict):
                 raise TypeError(
-                    f'lm-eval returned {type(res).__name__}, not a task mapping')
+                    f"lm-eval returned {type(res).__name__}, not a task mapping")
             # `evaluate_lm_harness` filters non-numeric fields, so a requested
             # task can be present yet carry no measured metric (or be absent
             # entirely). Treat that as a failed request rather than setting
@@ -646,29 +662,29 @@ def main():
             ]
             if missing:
                 raise RuntimeError(
-                    f'lm-eval returned no numeric metric for task(s) {missing}')
-            results['tasks'].update(res)
-            results['tasks_ran'] = True
+                    f"lm-eval returned no numeric metric for task(s) {missing}")
+            results["tasks"].update(res)
+            results["tasks_ran"] = True
         except Exception as e:
             # A requested benchmark that did not run must not be written out as
             # an empty-but-successful result: that is how "evaluated on MMLU"
             # gets claimed with zero scores behind it. Catch every failure
             # (including the TypeError an incompatible lm-eval version raises)
             # so the results/manifest still record the failed task request.
-            print(f'[eval] lm-eval path failed ({type(e).__name__}): {e}',
+            print(f"[eval] lm-eval path failed ({type(e).__name__}): {e}",
                   file=sys.stderr)
-            results['tasks_ran'] = False
-            results['tasks_error'] = f'{type(e).__name__}: {e}'
+            results["tasks_ran"] = False
+            results["tasks_error"] = f"{type(e).__name__}: {e}"
     else:
-        results['tasks_ran'] = None
+        results["tasks_ran"] = None
     if args.needle_test:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(tok_name, revision=tok_revision)
         # Pin the concrete commit the tokenizer resolved to, not only the
         # mutable request: exact-match needle accuracy depends on it.
-        results['tokenizer_revision_resolved'] = (
-            getattr(tok, '_commit_hash', None) or tok_revision)
-        trained_seq_len = model_args.get('seq_len')
+        results["tokenizer_revision_resolved"] = (
+            getattr(tok, "_commit_hash", None) or tok_revision)
+        trained_seq_len = model_args.get("seq_len")
         trained_seq_len = int(trained_seq_len) if isinstance(trained_seq_len, int) else None
         needle_overhead = needle_decode_overhead(tok)
         max_scoreable = max(1, model.cfg.max_seq_len - needle_overhead)
@@ -678,7 +694,7 @@ def main():
         # extrapolation, so the trained length is the honest default.
         if args.needle_context_len is not None:
             ctx_len = args.needle_context_len
-            ctx_source = 'cli'
+            ctx_source = "cli"
         elif trained_seq_len is not None:
             # Scoring needs `needle_overhead` extra forward positions beyond
             # the prompt, so the prompt default must leave that room inside
@@ -686,68 +702,68 @@ def main():
             # already an extrapolation and trips the warning below.
             ctx_len = max(1, min(trained_seq_len - needle_overhead,
                                  max_scoreable))
-            ctx_source = 'trained_seq_len'
+            ctx_source = "trained_seq_len"
         else:
             ctx_len = max_scoreable
-            ctx_source = 'max_seq_len'
-        results['needle_trained_seq_len'] = trained_seq_len
-        results['needle_ctx_source'] = ctx_source
+            ctx_source = "max_seq_len"
+        results["needle_trained_seq_len"] = trained_seq_len
+        results["needle_ctx_source"] = ctx_source
         if trained_seq_len is not None and ctx_len + needle_overhead > trained_seq_len:
-            results['needle_ctx_exceeds_trained_seq_len'] = True
-            print(f'[eval][warn] needle context length {ctx_len} + {needle_overhead} scoring '
-                  f'positions exceeds the trained seq_len={trained_seq_len}: the result '
-                  f'measures positional extrapolation, not in-distribution long-context '
-                  f'accuracy', file=sys.stderr)
+            results["needle_ctx_exceeds_trained_seq_len"] = True
+            print(f"[eval][warn] needle context length {ctx_len} + {needle_overhead} scoring "
+                  f"positions exceeds the trained seq_len={trained_seq_len}: the result "
+                  f"measures positional extrapolation, not in-distribution long-context "
+                  f"accuracy", file=sys.stderr)
         needle = needle_in_haystack(model, tok, context_len=ctx_len, device=device, seed=args.seed, return_counts=True, decode_batch=args.decode_batch)
-        results['needle_acc'] = needle['accuracy']
-        results['needle_acc_basis'] = 'single_placement_seed'
-        results['needle_acc_note'] = (
-            'accuracy is one placement draw; its Wilson interval covers trial noise within '
-            'that draw, not placement-to-placement variability. Run several --seed values '
-            '(and pair arms by seed) before claiming a placement-level difference.')
-        results['needle'] = needle
-        results['needle_ctx_len'] = ctx_len
+        results["needle_acc"] = needle["accuracy"]
+        results["needle_acc_basis"] = "single_placement_seed"
+        results["needle_acc_note"] = (
+            "accuracy is one placement draw; its Wilson interval covers trial noise within "
+            "that draw, not placement-to-placement variability. Run several --seed values "
+            "(and pair arms by seed) before claiming a placement-level difference.")
+        results["needle"] = needle
+        results["needle_ctx_len"] = ctx_len
         print(f"[eval] needle-in-haystack accuracy @ {ctx_len} = {needle['accuracy']:.3f} "
               f"({needle['n_correct']}/{needle['n_trials']}, 95% CI [{needle['ci95_low']:.3f}, {needle['ci95_high']:.3f}])")
-        if needle['failure_causes']:
+        if needle["failure_causes"]:
             print(f"[eval] needle failure causes: {needle['failure_causes']} "
                   f"confidence: {needle['failure_confidence']} "
                   f"(per-trial bad-case records in the results JSON)")
-    results['seed'] = args.seed
-    results['hypothesis'] = args.hypothesis
-    results['hyperparameters'] = vars(args)
-    results['run_metadata'] = collect_run_metadata(seed=args.seed)
-    out = args.output or Path(args.ckpt).parent / 'eval_results.json'
+    results["seed"] = args.seed
+    results["hypothesis"] = args.hypothesis
+    results["hyperparameters"] = vars(args)
+    results["run_metadata"] = collect_run_metadata(seed=args.seed)
+    out = args.output or Path(args.ckpt).parent / "eval_results.json"
     out_path = Path(out)
     save_json_atomic(out_path, results)
     # The manifest mirrors what the run needs to be auditable: which checkpoint
     # (hashed), with which args, and what came out. Task scores live in the
     # results file, which is fingerprinted here rather than duplicated.
-    manifest = dict(results['run_metadata'])
-    manifest['hyperparameters'] = vars(args)
-    manifest['hypothesis'] = args.hypothesis
-    manifest['checkpoint'] = file_fingerprint(args.ckpt)
-    manifest['results_file'] = file_fingerprint(out)
-    manifest['summary'] = {k: results[k] for k in
-                           ('norm', 'tasks_ran', 'needle_acc', 'needle_acc_basis',
-                            'needle_ctx_len',
-                            'needle_ctx_source', 'needle_trained_seq_len',
-                            'tokenizer', 'tokenizer_revision',
-                            'tokenizer_revision_resolved') if k in results}
-    if args.tasks and not results.get('tasks_ran', False):
+    manifest = dict(results["run_metadata"])
+    manifest["hyperparameters"] = vars(args)
+    manifest["hypothesis"] = args.hypothesis
+    manifest["checkpoint"] = file_fingerprint(args.ckpt)
+    manifest["results_file"] = file_fingerprint(out)
+    manifest["summary"] = {k: results[k] for k in
+                           ("norm", "tasks_ran", "needle_acc", "needle_acc_basis",
+                            "needle_ctx_len",
+                            "needle_ctx_source", "needle_trained_seq_len",
+                            "tokenizer", "tokenizer_revision",
+                            "tokenizer_revision_resolved") if k in results}
+    if args.tasks and not results.get("tasks_ran", False):
         # A requested benchmark that did not run is an incomplete evaluation;
         # the manifest must not claim completion (the SystemExit below says
         # the same thing to the caller).
-        manifest['status'] = 'failed'
+        manifest["status"] = "failed"
     else:
         manifest = finish_metadata(manifest)
-    save_run_manifest(Path(out).with_name('eval_manifest.json'), manifest)
+    save_run_manifest(Path(out).with_name("eval_manifest.json"), manifest)
     if args.hypothesis:
-        print(f'[eval][hypothesis] {args.hypothesis}')
-    print(f'[eval] results saved to {out}')
-    if args.tasks and not results.get('tasks_ran', False):
-        print(f'[eval] ERROR: tasks {args.tasks} were requested but lm-eval did not run them; '
-              f'nothing about {args.tasks} was measured (see tasks_error in {out})', file=sys.stderr)
+        print(f"[eval][hypothesis] {args.hypothesis}")
+    print(f"[eval] results saved to {out}")
+    if args.tasks and not results.get("tasks_ran", False):
+        print(f"[eval] ERROR: tasks {args.tasks} were requested but lm-eval did not run them; "
+              f"nothing about {args.tasks} was measured (see tasks_error in {out})", file=sys.stderr)
         raise SystemExit(2)
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

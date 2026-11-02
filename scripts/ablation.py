@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """Controlled ablation matrix for the DyT++ / AdaSquash proposal.
 
 Comparison protocol (what the runner guarantees, and checks)
@@ -143,8 +144,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.ablation import *  # noqa: F401,F403
-from adasquash.ablation.cli import main  # noqa: F401
+from adasquash.ablation import *  # noqa: F403
+from adasquash.ablation.cli import main
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

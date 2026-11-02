@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """Reproducibility and experiment-tracking helpers.
 
 `set_all_seeds` fixes every RNG a run touches (Python, NumPy, torch, CUDA,
@@ -990,6 +991,81 @@ def save_run_manifest(path, metadata: dict) -> Path:
     return save_json_atomic(path, metadata, indent=2, sort_keys=True)
 
 
+def validate_run_manifest(metadata: dict) -> dict:
+    """Validate a run manifest against the reproducibility contract.
+
+    Returns ``{"valid": bool, "problems": list[str]}``. A manifest is valid only
+    when it carries the registered schema, a code revision (commit + dirty
+    flag), the exact command line, the full environment fingerprint, and an
+    integer seed -- the fields that make a run traceable and comparable after
+    the fact. Missing or malformed fields are reported as problems rather than
+    raised, so callers can decide whether to fail closed or merely warn.
+    """
+    problems: list[str] = []
+
+    if not isinstance(metadata, dict):
+        return {"valid": False, "problems": ["run manifest is not a mapping"]}
+
+    if metadata.get("schema") != RUN_MANIFEST_SCHEMA:
+        problems.append(
+            f"manifest schema {metadata.get('schema')!r} != {RUN_MANIFEST_SCHEMA!r}")
+
+    seed = metadata.get("seed")
+    if not (isinstance(seed, int) and not isinstance(seed, bool)):
+        problems.append(f"manifest seed must be an integer, got {seed!r}")
+
+    git = metadata.get("git")
+    if not isinstance(git, Mapping):
+        problems.append("manifest missing 'git' block (commit + dirty flag)")
+    else:
+        if not isinstance(git.get("commit"), str) or not git["commit"].strip():
+            problems.append("manifest 'git.commit' missing or empty")
+        if "dirty" not in git:
+            problems.append("manifest 'git.dirty' missing (working-tree state unknown)")
+        elif not isinstance(git["dirty"], bool):
+            problems.append(f"manifest 'git.dirty' must be boolean, got {git['dirty']!r}")
+
+    command = metadata.get("command")
+    if not isinstance(command, Mapping):
+        problems.append("manifest missing 'command' block (argv + cwd)")
+    else:
+        if not isinstance(command.get("argv"), list) or not command.get("argv"):
+            problems.append("manifest 'command.argv' missing or empty")
+        if not isinstance(command.get("cwd"), str) or not command["cwd"].strip():
+            problems.append("manifest 'command.cwd' missing or empty")
+
+    environment = metadata.get("environment")
+    if not isinstance(environment, Mapping):
+        problems.append("manifest missing 'environment' block (software/hardware fingerprint)")
+    else:
+        rng = environment.get("rng_config")
+        if not isinstance(rng, Mapping):
+            problems.append("manifest 'environment.rng_config' missing")
+        else:
+            required_rng = (
+                "torch_num_threads", "torch_num_interop_threads",
+                "cudnn_deterministic", "cudnn_benchmark",
+                "tf32_matmul_allowed", "tf32_cudnn_allowed",
+                "deterministic_algorithms", "deterministic_algorithms_warn_only",
+                "pythonhashseed_at_process_start", "pythonhashseed",
+                "hash_randomization",
+            )
+            for key in required_rng:
+                if key not in rng:
+                    problems.append(f"manifest 'environment.rng_config.{key}' missing")
+
+    created = metadata.get("created_utc")
+    if not isinstance(created, str) or not created.strip():
+        problems.append("manifest 'created_utc' missing or empty")
+
+    return {"valid": not problems, "problems": problems}
+
+
+_MANIFEST_ESSENTIAL_FIELDS = (
+    "schema", "created_utc", "seed", "git", "command", "environment",
+)
+
+
 def _self_test_seed_determinism() -> bool:
     import numpy as np
 
@@ -1046,19 +1122,19 @@ def _self_test_manifest_roundtrip() -> bool:
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / 'nested' / 'run_manifest.json'
+        path = Path(tmp) / "nested" / "run_manifest.json"
         metadata = collect_run_metadata(seed=5)
         save_run_manifest(path, metadata)
         loaded = json.loads(path.read_text())
-        if not (path.exists() and loaded.get('seed') == 5):
+        if not (path.exists() and loaded.get("seed") == 5):
             return False
-        if (path.parent / (path.name + '.tmp')).exists():
+        if (path.parent / (path.name + ".tmp")).exists():
             return False
-        rng = loaded.get('environment', {}).get('rng_config', {})
+        rng = loaded.get("environment", {}).get("rng_config", {})
         required = (
-            'torch_num_threads', 'cudnn_deterministic', 'tf32_matmul_allowed',
-            'deterministic_algorithms', 'pythonhashseed_at_process_start',
-            'pythonhashseed', 'hash_randomization',
+            "torch_num_threads", "cudnn_deterministic", "tf32_matmul_allowed",
+            "deterministic_algorithms", "pythonhashseed_at_process_start",
+            "pythonhashseed", "hash_randomization",
         )
         return all(key in rng for key in required)
 
@@ -1067,7 +1143,7 @@ def _self_test_split_boundaries() -> bool:
     from scripts.data_pipeline import split_document_boundaries
 
     bounds = split_document_boundaries(1000, 0.005, 0.005)
-    train, val, test = bounds['train'], bounds['validation'], bounds['test']
+    train, val, test = bounds["train"], bounds["validation"], bounds["test"]
     contiguous = (train[0] == 0 and val[0] == train[0] + train[1]
                   and test[0] == val[0] + val[1]
                   and test[0] + test[1] == 1000)
@@ -1151,54 +1227,54 @@ def _self_test_execution_identity() -> bool:
     """A mismatched/dirty/unknown identity must never verify as comparable."""
     def manifest(**environment_overrides):
         environment = {
-            'python': '3.12.0',
-            'platform': 'Linux-test',
-            'torch': '2.14.1',
-            'numpy': '2.5.4',
-            'transformers': '4.44.0',
-            'datasets': '2.20.0',
-            'tokenizers': '0.19.1',
-            'pyyaml': '6.0.1',
-            'cuda_available': False,
-            'cuda_version': None,
-            'cudnn_version': None,
-            'device_names': [],
-            'rng_config': {
-                'torch_num_threads': 4,
-                'torch_num_interop_threads': 1,
-                'cudnn_deterministic': True,
-                'cudnn_benchmark': False,
-                'tf32_matmul_allowed': False,
-                'tf32_cudnn_allowed': False,
-                'deterministic_algorithms': False,
-                'deterministic_algorithms_warn_only': False,
-                'cublas_workspace_config': ':4096:8',
-                'hash_randomization': True,
-                'pythonhashseed_at_process_start': None,
+            "python": "3.12.0",
+            "platform": "Linux-test",
+            "torch": "2.14.1",
+            "numpy": "2.5.4",
+            "transformers": "4.44.0",
+            "datasets": "2.20.0",
+            "tokenizers": "0.19.1",
+            "pyyaml": "6.0.1",
+            "cuda_available": False,
+            "cuda_version": None,
+            "cudnn_version": None,
+            "device_names": [],
+            "rng_config": {
+                "torch_num_threads": 4,
+                "torch_num_interop_threads": 1,
+                "cudnn_deterministic": True,
+                "cudnn_benchmark": False,
+                "tf32_matmul_allowed": False,
+                "tf32_cudnn_allowed": False,
+                "deterministic_algorithms": False,
+                "deterministic_algorithms_warn_only": False,
+                "cublas_workspace_config": ":4096:8",
+                "hash_randomization": True,
+                "pythonhashseed_at_process_start": None,
             },
         }
         environment.update(environment_overrides)
-        return {'git': {'commit': 'abc123', 'dirty': False},
-                'environment': environment}
+        return {"git": {"commit": "abc123", "dirty": False},
+                "environment": environment}
 
     clean = manifest()
     same = execution_identity_mismatches(clean, manifest())
     different_commit = execution_identity_mismatches(
-        clean, {'git': {'commit': 'def456', 'dirty': False},
-                'environment': clean['environment']})
+        clean, {"git": {"commit": "def456", "dirty": False},
+                "environment": clean["environment"]})
     dirty = manifest()
-    dirty['git']['dirty'] = True
+    dirty["git"]["dirty"] = True
     dirty_check = execution_identity_mismatches(clean, dirty)
     unknown = execution_identity_mismatches(
-        clean, {'git': {'commit': 'abc123', 'dirty': False}})
+        clean, {"git": {"commit": "abc123", "dirty": False}})
     return bool(
-        same['comparable'] and same['identical'] and not same['problems']
-        and different_commit['mismatches'].get('git.commit')
-        and not different_commit['comparable']
-        and not dirty_check['comparable']
-        and 'dirty' in ' '.join(dirty_check['problems'])
-        and not unknown['comparable']
-        and unknown['unknown']
+        same["comparable"] and same["identical"] and not same["problems"]
+        and different_commit["mismatches"].get("git.commit")
+        and not different_commit["comparable"]
+        and not dirty_check["comparable"]
+        and "dirty" in " ".join(dirty_check["problems"])
+        and not unknown["comparable"]
+        and unknown["unknown"]
     )
 
 
@@ -1215,20 +1291,20 @@ def self_test(verbose: bool = True) -> dict:
     (`python3 -m adasquash.repro --self-test`).
     """
     checks = {
-        'seed_determinism_python_numpy_torch': _self_test_seed_determinism(),
-        'worker_seeding_derived_and_distinct': _self_test_worker_seeding(),
-        'worker_numpy_seeding': _self_test_worker_numpy_seeding(),
-        'seed_contract_flags_and_hashseed': _self_test_seed_contract_flags(),
-        'dataloader_reproducible': _self_test_dataloader_reproducibility(),
-        'manifest_atomic_roundtrip_with_determinism_fields': _self_test_manifest_roundtrip(),
-        'split_boundaries_chronological_and_disjoint': _self_test_split_boundaries(),
-        'execution_identity_fails_closed': _self_test_execution_identity(),
-        'deterministic_algorithms_optin': _self_test_deterministic_algorithms_optin(),
+        "seed_determinism_python_numpy_torch": _self_test_seed_determinism(),
+        "worker_seeding_derived_and_distinct": _self_test_worker_seeding(),
+        "worker_numpy_seeding": _self_test_worker_numpy_seeding(),
+        "seed_contract_flags_and_hashseed": _self_test_seed_contract_flags(),
+        "dataloader_reproducible": _self_test_dataloader_reproducibility(),
+        "manifest_atomic_roundtrip_with_determinism_fields": _self_test_manifest_roundtrip(),
+        "split_boundaries_chronological_and_disjoint": _self_test_split_boundaries(),
+        "execution_identity_fails_closed": _self_test_execution_identity(),
+        "deterministic_algorithms_optin": _self_test_deterministic_algorithms_optin(),
     }
     if verbose:
         for name, ok in checks.items():
             print(f"[repro-self-test] {'ok' if ok else 'FAIL'}: {name}")
-    checks['passed'] = all(v for v in checks.values())
+    checks["passed"] = all(v for v in checks.values())
     return checks
 
 
@@ -1236,42 +1312,43 @@ def _main(argv=None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--self-test', action='store_true',
-                        help='run the reproducibility-infrastructure regression checks')
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the reproducibility-infrastructure regression checks")
     args = parser.parse_args(argv)
     if not args.self_test:
         parser.print_help()
         return 2
     result = self_test()
     print(f"[repro-self-test] {'PASS' if result['passed'] else 'FAIL'}")
-    return 0 if result['passed'] else 1
+    return 0 if result["passed"] else 1
 
 
 __all__ = [
+    "EXECUTION_IDENTITY_KEYS",
     "REPO_ROOT",
     "RUN_MANIFEST_SCHEMA",
+    "TRAINING_RECIPE_KEYS",
+    "TRAIN_STREAM_FINGERPRINT_VERSION",
+    "TRAIN_STREAM_PREFIX_BATCHES",
+    "TrainStreamFingerprint",
     "apply_deterministic_algorithms",
     "artifact_record",
     "collect_run_metadata",
     "command_record",
+    "compare_train_streams",
     "deterministic_algorithms_context",
     "environment_info",
     "execution_identity_mismatches",
-    "EXECUTION_IDENTITY_KEYS",
     "file_fingerprint",
     "finish_metadata",
     "git_revision",
     "save_json_atomic",
     "save_run_manifest",
     "seed_worker",
+    "validate_run_manifest",
     "self_test",
-    "training_recipe_mismatches",
-    "TRAINING_RECIPE_KEYS",
-    "TrainStreamFingerprint",
-    "compare_train_streams",
-    "TRAIN_STREAM_FINGERPRINT_VERSION",
-    "TRAIN_STREAM_PREFIX_BATCHES",
     "set_all_seeds",
+    "training_recipe_mismatches",
 ]
 
 if __name__ == "__main__":

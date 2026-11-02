@@ -16,45 +16,76 @@ sys.path.insert(0, str(ROOT))
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
-from adasquash import (ActivationStats, GPT, GPTConfig, LossSpikeCounter,
-                       count_parameters)
+from adasquash import GPT, ActivationStats, GPTConfig, LossSpikeCounter, count_parameters
 from adasquash.attention import clear_logit_scratch_cache
 from adasquash.diagnostics import diagnose_train_val_curve, triage_nonfinite
 from adasquash.efficiency import analytic_flops_per_token, parameter_breakdown
 from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import mean_ci, mean_std_stderr
-from adasquash.model import (build_gpt_124m, build_gpt_350m,
-                             build_llama_tiny_1b, clear_cast_weight_cache,
-                             clear_ce_scratch_cache)
+from adasquash.model import (
+    build_gpt_124m,
+    build_gpt_350m,
+    build_llama_tiny_1b,
+    clear_cast_weight_cache,
+    clear_ce_scratch_cache,
+)
 from adasquash.norms import NORM_REGISTRY
-from adasquash.repro import (TrainStreamFingerprint, artifact_record,
-                             collect_run_metadata, file_fingerprint,
-                             save_run_manifest, set_all_seeds)
+from adasquash.repro import (
+    TrainStreamFingerprint,
+    artifact_record,
+    collect_run_metadata,
+    file_fingerprint,
+    save_run_manifest,
+    set_all_seeds,
+)
 from scripts.data_pipeline import build_dataloader, configure_data_options
-
-from scripts.train_config import (_DATA_ARGS, _LEDGER_ARGS, _MONITOR_ARGS,
-    _RESUME_RUN_ARGS, _SCHEDULE_ARGS, _TRAIN_CONFIG_ALIASES,
-    _assert_checkpoint_finite, _atomic_torch_save, _checkpoint_nonfinite,
-    _explicit_arg_names, _load_checkpoint_cpu, _snapshot_rng_state,
-    apply_config_to_parser, build_lr_lambda, build_optimizer,
-    restore_monitor_args, restore_schedule_args, unpinned_data_revisions)
-from scripts.train_runtime import (DEFAULT_SEED, _data_ledger_fingerprints,
-    _fast_forward_validation_stream, _is_finite_number, _ledger_identity,
-    _normalize_seed_ids, apply_explicit_optimizer_args, evaluate_heldout,
-    launch_multi_seed, load_model_state_dict, preflight_arch_args,
-    restore_data_args, run_error_analysis)
+from scripts.train_config import (
+    _DATA_ARGS,
+    _LEDGER_ARGS,
+    _MONITOR_ARGS,
+    _RESUME_RUN_ARGS,
+    _SCHEDULE_ARGS,
+    _TRAIN_CONFIG_ALIASES,
+    _assert_checkpoint_finite,
+    _atomic_torch_save,
+    _checkpoint_nonfinite,
+    _explicit_arg_names,
+    _load_checkpoint_cpu,
+    _snapshot_rng_state,
+    apply_config_to_parser,
+    build_lr_lambda,
+    build_optimizer,
+    restore_monitor_args,
+    restore_schedule_args,
+    unpinned_data_revisions,
+)
+from scripts.train_runtime import (
+    DEFAULT_SEED,
+    _data_ledger_fingerprints,
+    _fast_forward_validation_stream,
+    _is_finite_number,
+    _ledger_identity,
+    _normalize_seed_ids,
+    apply_explicit_optimizer_args,
+    evaluate_heldout,
+    launch_multi_seed,
+    load_model_state_dict,
+    preflight_arch_args,
+    restore_data_args,
+    run_error_analysis,
+)
 
 _DATASET_REVISION_FROM_ARGS = object()
 
 def open_data_split(split: str, args, seq_len: int | None = None,
                     dataset_name: str | None = None,
                     dataset_config: str | None = None,
-                    source_split: str = 'train',
-                    split_mode: str = 'chronological',
+                    source_split: str = "train",
+                    split_mode: str = "chronological",
                     dataset_revision=_DATASET_REVISION_FROM_ARGS):
     """Open one logical split through the shared leakage-safe pipeline."""
     if dataset_revision is _DATASET_REVISION_FROM_ARGS:
-        dataset_revision = getattr(args, 'dataset_revision', None)
+        dataset_revision = getattr(args, "dataset_revision", None)
     configure_data_options(
         split=split,
         source_split=source_split,
@@ -65,16 +96,16 @@ def open_data_split(split: str, args, seq_len: int | None = None,
         dedup=args.dedup,
         min_doc_chars=args.min_doc_chars,
         max_doc_chars=args.max_doc_chars,
-        exclude_hash_file=getattr(args, 'exclude_hash_file', None),
-        exclude_test_hash_file=getattr(args, 'exclude_test_hash_file', None),
-        exclude_train_hash_file=getattr(args, 'exclude_train_hash_file', None),
-        group_key=getattr(args, 'group_key', None),
-        exclude_group_file=getattr(args, 'exclude_group_file', None),
-        exclude_test_group_file=getattr(args, 'exclude_test_group_file', None),
+        exclude_hash_file=getattr(args, "exclude_hash_file", None),
+        exclude_test_hash_file=getattr(args, "exclude_test_hash_file", None),
+        exclude_train_hash_file=getattr(args, "exclude_train_hash_file", None),
+        group_key=getattr(args, "group_key", None),
+        exclude_group_file=getattr(args, "exclude_group_file", None),
+        exclude_test_group_file=getattr(args, "exclude_test_group_file", None),
         dataset_revision=dataset_revision,
-        tokenizer_revision=getattr(args, 'tokenizer_revision', None),
-        shuffle_buffer=args.train_shuffle_buffer if split == 'train' else 0,
-        num_workers=getattr(args, 'num_workers', 2),
+        tokenizer_revision=getattr(args, "tokenizer_revision", None),
+        shuffle_buffer=args.train_shuffle_buffer if split == "train" else 0,
+        num_workers=getattr(args, "num_workers", 2),
         seed=args.seed,
     )
     return build_dataloader(dataset_name or args.dataset,
@@ -84,15 +115,15 @@ def open_data_split(split: str, args, seq_len: int | None = None,
 
 def open_validation_split(args):
     """Open the held-out selection stream, optionally from a distinct corpus."""
-    if getattr(args, 'val_dataset', None):
+    if getattr(args, "val_dataset", None):
         return open_data_split(
-            'validation', args, seq_len=args.val_seq_len,
+            "validation", args, seq_len=args.val_seq_len,
             dataset_name=args.val_dataset,
             dataset_config=args.val_dataset_config,
             source_split=args.val_split,
-            split_mode='full',
-            dataset_revision=getattr(args, 'val_dataset_revision', None))
-    return open_data_split('validation', args)
+            split_mode="full",
+            dataset_revision=getattr(args, "val_dataset_revision", None))
+    return open_data_split("validation", args)
 
 
 def build_arg_parser(argv=None):
@@ -102,30 +133,30 @@ def build_arg_parser(argv=None):
     trainer uses instead of re-implementing its option table.
     """
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument('--config', default=None)
+    pre.add_argument("--config", default=None)
     known, _ = pre.parse_known_args(argv)
     p = argparse.ArgumentParser()
-    p.add_argument('--config', default=None, help='YAML run config; CLI flags override it')
-    p.add_argument('--model', choices=['gpt2-124m', 'gpt2-350m', 'llama-1b'], default='gpt2-124m')
-    p.add_argument('--norm', default='dytcd', choices=sorted(NORM_REGISTRY))
-    p.add_argument('--qk-norm', default=None, choices=[None, 'qknorm', 'dytqk'])
-    p.add_argument('--qk-alpha-init', type=float, default=1.0, help='initial alpha_q / alpha_k for --qk-norm dytqk')
-    p.add_argument('--no-layerscale', action='store_true')
-    p.add_argument('--layerscale-init', type=float, default=None)
-    p.add_argument('--alpha-0', type=float, default=0.9)
-    p.add_argument('--alpha-init', type=float, default=0.5)
-    p.add_argument('--k-init', type=float, default=1.0)
-    p.add_argument('--k-min', type=float, default=0.0, help='floor on the per-norm depth-decay rate k of dytd/dytcd (keeps the depth schedule non-increasing); use --no-k-min to restore the old unconstrained k')
-    p.add_argument('--no-k-min', dest='k_min', action='store_const', const=None)
-    p.add_argument('--shared-depth-schedule', action='store_true', help='share one (alpha_0, k) pair across every dytd/dytcd norm so the depth law is a genuine cross-layer schedule instead of a per-layer initialization prior')
-    p.add_argument('--p-init', type=float, default=2.0)
-    p.add_argument('--no-learnable-p', action='store_true')
-    p.add_argument('--no-learnable-k', action='store_true')
-    p.add_argument('--no-learnable-delta', action='store_true', help='freeze the DyT-CD per-channel deviation at zero (controlled per-channel off)')
-    p.add_argument('--no-beta', dest='beta', action='store_false', help='disable output affine bias in DyT-family norms')
-    p.add_argument('--alpha-jitter', type=float, default=0.05, help='per-channel alpha init jitter for DyTC (0 for deterministic)')
-    p.add_argument('--gradient-checkpointing', action='store_true', help='enable gradient checkpointing')
-    p.add_argument('--tie-embeddings', dest='tie_embeddings', action='store_true', default=None, help='tie input/output embeddings (default: GPT-2 yes, LLaMA no)')
+    p.add_argument("--config", default=None, help="YAML run config; CLI flags override it")
+    p.add_argument("--model", choices=["gpt2-124m", "gpt2-350m", "llama-1b"], default="gpt2-124m")
+    p.add_argument("--norm", default="dytcd", choices=sorted(NORM_REGISTRY))
+    p.add_argument("--qk-norm", default=None, choices=[None, "qknorm", "dytqk"])
+    p.add_argument("--qk-alpha-init", type=float, default=1.0, help="initial alpha_q / alpha_k for --qk-norm dytqk")
+    p.add_argument("--no-layerscale", action="store_true")
+    p.add_argument("--layerscale-init", type=float, default=None)
+    p.add_argument("--alpha-0", type=float, default=0.9)
+    p.add_argument("--alpha-init", type=float, default=0.5)
+    p.add_argument("--k-init", type=float, default=1.0)
+    p.add_argument("--k-min", type=float, default=0.0, help="floor on the per-norm depth-decay rate k of dytd/dytcd (keeps the depth schedule non-increasing); use --no-k-min to restore the old unconstrained k")
+    p.add_argument("--no-k-min", dest="k_min", action="store_const", const=None)
+    p.add_argument("--shared-depth-schedule", action="store_true", help="share one (alpha_0, k) pair across every dytd/dytcd norm so the depth law is a genuine cross-layer schedule instead of a per-layer initialization prior")
+    p.add_argument("--p-init", type=float, default=2.0)
+    p.add_argument("--no-learnable-p", action="store_true")
+    p.add_argument("--no-learnable-k", action="store_true")
+    p.add_argument("--no-learnable-delta", action="store_true", help="freeze the DyT-CD per-channel deviation at zero (controlled per-channel off)")
+    p.add_argument("--no-beta", dest="beta", action="store_false", help="disable output affine bias in DyT-family norms")
+    p.add_argument("--alpha-jitter", type=float, default=0.05, help="per-channel alpha init jitter for DyTC (0 for deterministic)")
+    p.add_argument("--gradient-checkpointing", action="store_true", help="enable gradient checkpointing")
+    p.add_argument("--tie-embeddings", dest="tie_embeddings", action="store_true", default=None, help="tie input/output embeddings (default: GPT-2 yes, LLaMA no)")
     # Both spellings must share the *same* default. `store_false` alone would
     # default this dest to True while `--tie-embeddings` defaults to None; the
     # resume explicitness test compares the parsed value with
@@ -133,72 +164,72 @@ def build_arg_parser(argv=None):
     # explicitly overridden even when the flag was never typed, skipping the
     # checkpoint value (an untied checkpoint then rebuilds tied and its
     # optimizer state no longer loads).
-    p.add_argument('--no-tie-embeddings', dest='tie_embeddings', action='store_false', default=None)
-    p.add_argument('--dataset', default='HuggingFaceFW/fineweb-edu')
-    p.add_argument('--dataset-config', default='sample-10BT')
-    p.add_argument('--dataset-revision', default=None, help='dataset revision (commit hash) to pin; recorded in the run manifest so the trained-on data version is auditable (None = upstream default branch, which can move)')
-    p.add_argument('--tokenizer-revision', default=None, help='tokenizer revision (commit hash) to pin; recorded in the run manifest (None = upstream default branch)')
-    p.add_argument('--require-pinned-data-revision', action='store_true', help='fail before training unless --dataset-revision and --tokenizer-revision are full 40-hex Hub commit hashes; a branch/tag can move, so a rerun from the logged command would silently read different data (the resolved snapshot is recorded either way)')
-    p.add_argument('--val-frac', type=float, default=0.005, help='chronological held-out validation fraction of the document stream (split order is train=oldest, then val, then test; never shuffled)')
-    p.add_argument('--test-frac', type=float, default=0.005, help='sealed test fraction of the document stream, evaluated once at the end only with --final-test-eval')
-    p.add_argument('--num-documents', type=int, default=None, help='total documents in the stream; required when the dataset reports no size')
-    p.add_argument('--val-every', type=int, default=500, help='run a held-out validation pass every N optimizer steps (0 disables; 0 is not recommended)')
-    p.add_argument('--val-batches', type=int, default=10, help='batches per held-out validation pass')
-    p.add_argument('--val-dataset', default=None, help='held-out validation corpus, e.g. Salesforce/wikitext; must be disjoint from the training stream (default: the validation slice of --dataset)')
-    p.add_argument('--val-dataset-config', default='wikitext-103-raw-v1')
-    p.add_argument('--val-dataset-revision', default=None, help='revision (commit hash) of --val-dataset; independent of --dataset-revision (None = upstream default branch)')
-    p.add_argument('--val-split', default='test', help='upstream split of --val-dataset used whole for selection')
-    p.add_argument('--val-seq-len', type=int, default=None, help='validation sequence length (default: the training seq-len)')
-    p.add_argument('--early-stop-patience', type=int, default=0, help='stop after this many validation passes without improvement (0 = off)')
-    p.add_argument('--fail-on-eval-reuse', action='store_true', help='abort on the first validation pass that has to cycle the held-out loader (fewer distinct batches than --val-batches); repeated batches would make the validation stderr look more precise than it is and turn checkpoint selection into a maximum over reused data')
-    p.add_argument('--nonfinite-policy', choices=['abort', 'skip'], default='abort', help='what to do when a training loss is NaN/Inf: abort (default) runs the ordered data->math->precision->gradient triage and stops; skip runs the triage and discards only that step (5 consecutive non-finite steps still abort)')
-    p.add_argument('--final-test-eval', action='store_true', help='after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first); per-batch losses and the data-pairing block are stored in test_results.json so scripts/compare_sealed_tests.py can test two arms on the shared sealed batches')
-    p.add_argument('--allow-test-rerun', action='store_true', help='permit a second one-shot evaluation of the sealed test split in the same output dir (breaks the seal: the test set becomes an implicit validation set)')
-    p.add_argument('--allow-missing-split-ledgers', action='store_true', help='proceed with --final-test-eval even though the cross-split document/group ledgers are missing; the sealed test set is then not proven disjoint from train/validation, so the score is not a valid held-out estimate (debugging only)')
-    p.add_argument('--test-batches', type=int, default=20, help='batches for the one-shot final test evaluation')
-    p.add_argument('--error-analysis', action='store_true', help='after training, run scripts/analyze_errors.py on the best-validation checkpoint over the validation split: prints the mispredicted samples with their cause taxonomy (the main source of the next hypothesis) and records error_analysis_validation.json in the manifest')
-    p.add_argument('--error-analysis-batches', type=int, default=8, help='held-out batches scanned by --error-analysis')
-    p.add_argument('--error-analysis-examples', type=int, default=20, help='misclassified examples printed per cause bucket by --error-analysis')
-    p.add_argument('--error-analysis-confidence', type=float, default=0.8, help='pred_prob at/above which a wrong token is a confident blind spot in --error-analysis')
-    p.add_argument('--min-doc-chars', type=int, default=0, help='drop documents shorter than this many characters (0 = keep all non-empty)')
-    p.add_argument('--max-doc-chars', type=int, default=0, help='drop documents longer than this many characters (0 = no length-outlier cap)')
-    p.add_argument('--no-dedup', dest='dedup', action='store_false', help='disable duplicate document removal (exact and canonical text)')
-    p.add_argument('--exclude-hash-file', default=None, help='training-document hash ledger (scripts/audit_data.py --write-train-hash-file); held-out documents whose exact or canonical text also occurs in train are dropped from validation/test, never from train')
-    p.add_argument('--exclude-test-hash-file', default=None, help='validation-document hash ledger (scripts/audit_data.py --write-val-hash-file); the sealed test split drops documents whose exact or canonical text also occurs in validation, so the selection split and the final split are disjoint (ignored for train/validation)')
-    p.add_argument('--exclude-train-hash-file', default=None, help='training-side exclusion ledger (scripts/audit_benchmark_contamination.py --write-train-exclusion-file); documents whose exact or canonical text is listed are dropped from the TRAINING split, so benchmark-contaminated text is never fitted. Ignored for validation/test, whose slices must not change')
-    p.add_argument('--group-key', default=None, help='optional grouping-unit field (top-level name or dotted path such as "meta.url"); with a group ledger a held-out document whose group was seen on an earlier side is dropped whole, so a user/item/page cannot straddle a split boundary')
-    p.add_argument('--exclude-group-file', default=None, help='training-group hash ledger (scripts/audit_data.py --write-train-group-file --group-key K); validation/test drop every document whose group occurs in train, never train itself')
-    p.add_argument('--exclude-test-group-file', default=None, help='validation-group hash ledger (scripts/audit_data.py --write-val-group-file --group-key K); the sealed test split drops every document whose group occurs in validation, so no group straddles the selection/final boundary (ignored for train/validation)')
-    p.add_argument('--train-shuffle-buffer', type=int, default=0, help='shuffle window over packed TRAINING batches (0 = off); never applied to validation or test')
-    p.add_argument('--num-workers', type=int, default=2, help='DataLoader worker processes (0 = everything in the parent process); with dedup enabled each worker scans and hashes the whole stream, so raising this multiplies CPU work rather than throughput')
-    p.add_argument('--seq-len', type=int, default=1024)
-    p.add_argument('--batch-size', type=int, default=32, help='per-device micro batch')
-    p.add_argument('--grad-accum', type=int, default=1)
-    p.add_argument('--tokenizer', default='gpt2')
-    p.add_argument('--max-steps', type=int, default=10000)
-    p.add_argument('--lr', type=float, default=0.0006)
-    p.add_argument('--min-lr-ratio', type=float, default=0.1)
-    p.add_argument('--warmup', type=int, default=500)
-    p.add_argument('--weight-decay', type=float, default=0.1)
-    p.add_argument('--beta1', type=float, default=0.9)
-    p.add_argument('--beta2', type=float, default=0.95)
-    p.add_argument('--grad-clip', type=float, default=1.0)
-    p.add_argument('--no-bf16', action='store_true', help='disable bf16 autocast')
-    p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given (single-seed default: 42)')
-    p.add_argument('--seeds', nargs='+', type=int, default=None, help='independent replication seeds for Phase 1: each seed is a full training run under <output-dir>/seed{N}/ and Mean +/- Std across seeds is written to <output-dir>/aggregate.json (seeds are the unit of replication; >= 3 recommended, because a single run cannot separate a norm effect from run-to-run noise). One seed runs in place, exactly as before. Phase 1 configs ship seeds: [42, 43, 44].')
-    p.add_argument('--compile', action='store_true', help='enable torch.compile')
-    p.add_argument('--compile-mode', default='reduce-overhead', choices=['default', 'reduce-overhead', 'max-autotune'])
-    p.add_argument('--sanity-check', dest='sanity_check', action='store_true', default=True, help='run the small-batch overfit sanity check (scripts/sanity_overfit.py) before training and abort if it fails (default: on; a model that cannot overfit one batch has a gradient/loss bug and must not start a full run)')
-    p.add_argument('--no-sanity-check', dest='sanity_check', action='store_false', help='skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. offline runs where the preflight cannot be spawned)')
-    p.add_argument('--output-dir', default='runs/gpt2-124m-dytcd')
-    p.add_argument('--log-every', type=int, default=20)
-    p.add_argument('--stats-every', type=int, default=500)
-    p.add_argument('--save-every', type=int, default=2000)
-    p.add_argument('--wandb-project', default=None)
-    p.add_argument('--run-name', default=None)
-    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this run tests; recorded in the run manifest (and checkpoint args) so a result can be audited against the claim it was meant to support, the same contract the ablation matrix enforces per row')
-    p.add_argument('--resume', default=None, help='checkpoint to resume from')
-    p.add_argument('--resume-skip-data', action='store_true', help='do NOT fast-forward the training dataloader past the batches the checkpoint already consumed (the resumed run then replays training data)')
+    p.add_argument("--no-tie-embeddings", dest="tie_embeddings", action="store_false", default=None)
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
+    p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--dataset-revision", default=None, help="dataset revision (commit hash) to pin; recorded in the run manifest so the trained-on data version is auditable (None = upstream default branch, which can move)")
+    p.add_argument("--tokenizer-revision", default=None, help="tokenizer revision (commit hash) to pin; recorded in the run manifest (None = upstream default branch)")
+    p.add_argument("--require-pinned-data-revision", action="store_true", help="fail before training unless --dataset-revision and --tokenizer-revision are full 40-hex Hub commit hashes; a branch/tag can move, so a rerun from the logged command would silently read different data (the resolved snapshot is recorded either way)")
+    p.add_argument("--val-frac", type=float, default=0.005, help="chronological held-out validation fraction of the document stream (split order is train=oldest, then val, then test; never shuffled)")
+    p.add_argument("--test-frac", type=float, default=0.005, help="sealed test fraction of the document stream, evaluated once at the end only with --final-test-eval")
+    p.add_argument("--num-documents", type=int, default=None, help="total documents in the stream; required when the dataset reports no size")
+    p.add_argument("--val-every", type=int, default=500, help="run a held-out validation pass every N optimizer steps (0 disables; 0 is not recommended)")
+    p.add_argument("--val-batches", type=int, default=10, help="batches per held-out validation pass")
+    p.add_argument("--val-dataset", default=None, help="held-out validation corpus, e.g. Salesforce/wikitext; must be disjoint from the training stream (default: the validation slice of --dataset)")
+    p.add_argument("--val-dataset-config", default="wikitext-103-raw-v1")
+    p.add_argument("--val-dataset-revision", default=None, help="revision (commit hash) of --val-dataset; independent of --dataset-revision (None = upstream default branch)")
+    p.add_argument("--val-split", default="test", help="upstream split of --val-dataset used whole for selection")
+    p.add_argument("--val-seq-len", type=int, default=None, help="validation sequence length (default: the training seq-len)")
+    p.add_argument("--early-stop-patience", type=int, default=0, help="stop after this many validation passes without improvement (0 = off)")
+    p.add_argument("--fail-on-eval-reuse", action="store_true", help="abort on the first validation pass that has to cycle the held-out loader (fewer distinct batches than --val-batches); repeated batches would make the validation stderr look more precise than it is and turn checkpoint selection into a maximum over reused data")
+    p.add_argument("--nonfinite-policy", choices=["abort", "skip"], default="abort", help="what to do when a training loss is NaN/Inf: abort (default) runs the ordered data->math->precision->gradient triage and stops; skip runs the triage and discards only that step (5 consecutive non-finite steps still abort)")
+    p.add_argument("--final-test-eval", action="store_true", help="after training, evaluate the sealed test split exactly once (restores the best-validation checkpoint first); per-batch losses and the data-pairing block are stored in test_results.json so scripts/compare_sealed_tests.py can test two arms on the shared sealed batches")
+    p.add_argument("--allow-test-rerun", action="store_true", help="permit a second one-shot evaluation of the sealed test split in the same output dir (breaks the seal: the test set becomes an implicit validation set)")
+    p.add_argument("--allow-missing-split-ledgers", action="store_true", help="proceed with --final-test-eval even though the cross-split document/group ledgers are missing; the sealed test set is then not proven disjoint from train/validation, so the score is not a valid held-out estimate (debugging only)")
+    p.add_argument("--test-batches", type=int, default=20, help="batches for the one-shot final test evaluation")
+    p.add_argument("--error-analysis", action="store_true", help="after training, run scripts/analyze_errors.py on the best-validation checkpoint over the validation split: prints the mispredicted samples with their cause taxonomy (the main source of the next hypothesis) and records error_analysis_validation.json in the manifest")
+    p.add_argument("--error-analysis-batches", type=int, default=8, help="held-out batches scanned by --error-analysis")
+    p.add_argument("--error-analysis-examples", type=int, default=20, help="misclassified examples printed per cause bucket by --error-analysis")
+    p.add_argument("--error-analysis-confidence", type=float, default=0.8, help="pred_prob at/above which a wrong token is a confident blind spot in --error-analysis")
+    p.add_argument("--min-doc-chars", type=int, default=0, help="drop documents shorter than this many characters (0 = keep all non-empty)")
+    p.add_argument("--max-doc-chars", type=int, default=0, help="drop documents longer than this many characters (0 = no length-outlier cap)")
+    p.add_argument("--no-dedup", dest="dedup", action="store_false", help="disable duplicate document removal (exact and canonical text)")
+    p.add_argument("--exclude-hash-file", default=None, help="training-document hash ledger (scripts/audit_data.py --write-train-hash-file); held-out documents whose exact or canonical text also occurs in train are dropped from validation/test, never from train")
+    p.add_argument("--exclude-test-hash-file", default=None, help="validation-document hash ledger (scripts/audit_data.py --write-val-hash-file); the sealed test split drops documents whose exact or canonical text also occurs in validation, so the selection split and the final split are disjoint (ignored for train/validation)")
+    p.add_argument("--exclude-train-hash-file", default=None, help="training-side exclusion ledger (scripts/audit_benchmark_contamination.py --write-train-exclusion-file); documents whose exact or canonical text is listed are dropped from the TRAINING split, so benchmark-contaminated text is never fitted. Ignored for validation/test, whose slices must not change")
+    p.add_argument("--group-key", default=None, help='optional grouping-unit field (top-level name or dotted path such as "meta.url"); with a group ledger a held-out document whose group was seen on an earlier side is dropped whole, so a user/item/page cannot straddle a split boundary')
+    p.add_argument("--exclude-group-file", default=None, help="training-group hash ledger (scripts/audit_data.py --write-train-group-file --group-key K); validation/test drop every document whose group occurs in train, never train itself")
+    p.add_argument("--exclude-test-group-file", default=None, help="validation-group hash ledger (scripts/audit_data.py --write-val-group-file --group-key K); the sealed test split drops every document whose group occurs in validation, so no group straddles the selection/final boundary (ignored for train/validation)")
+    p.add_argument("--train-shuffle-buffer", type=int, default=0, help="shuffle window over packed TRAINING batches (0 = off); never applied to validation or test")
+    p.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes (0 = everything in the parent process); with dedup enabled each worker scans and hashes the whole stream, so raising this multiplies CPU work rather than throughput")
+    p.add_argument("--seq-len", type=int, default=1024)
+    p.add_argument("--batch-size", type=int, default=32, help="per-device micro batch")
+    p.add_argument("--grad-accum", type=int, default=1)
+    p.add_argument("--tokenizer", default="gpt2")
+    p.add_argument("--max-steps", type=int, default=10000)
+    p.add_argument("--lr", type=float, default=0.0006)
+    p.add_argument("--min-lr-ratio", type=float, default=0.1)
+    p.add_argument("--warmup", type=int, default=500)
+    p.add_argument("--weight-decay", type=float, default=0.1)
+    p.add_argument("--beta1", type=float, default=0.9)
+    p.add_argument("--beta2", type=float, default=0.95)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--no-bf16", action="store_true", help="disable bf16 autocast")
+    p.add_argument("--seed", type=int, default=None, help="deprecated single-seed shorthand; overrides --seeds when given (single-seed default: 42)")
+    p.add_argument("--seeds", nargs="+", type=int, default=None, help="independent replication seeds for Phase 1: each seed is a full training run under <output-dir>/seed{N}/ and Mean +/- Std across seeds is written to <output-dir>/aggregate.json (seeds are the unit of replication; >= 3 recommended, because a single run cannot separate a norm effect from run-to-run noise). One seed runs in place, exactly as before. Phase 1 configs ship seeds: [42, 43, 44].")
+    p.add_argument("--compile", action="store_true", help="enable torch.compile")
+    p.add_argument("--compile-mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
+    p.add_argument("--sanity-check", dest="sanity_check", action="store_true", default=True, help="run the small-batch overfit sanity check (scripts/sanity_overfit.py) before training and abort if it fails (default: on; a model that cannot overfit one batch has a gradient/loss bug and must not start a full run)")
+    p.add_argument("--no-sanity-check", dest="sanity_check", action="store_false", help="skip the pre-flight overfit sanity check (use only when the check itself is the problem, e.g. offline runs where the preflight cannot be spawned)")
+    p.add_argument("--output-dir", default="runs/gpt2-124m-dytcd")
+    p.add_argument("--log-every", type=int, default=20)
+    p.add_argument("--stats-every", type=int, default=500)
+    p.add_argument("--save-every", type=int, default=2000)
+    p.add_argument("--wandb-project", default=None)
+    p.add_argument("--run-name", default=None)
+    p.add_argument("--hypothesis", default=None, help="the scientific hypothesis this run tests; recorded in the run manifest (and checkpoint args) so a result can be audited against the claim it was meant to support, the same contract the ablation matrix enforces per row")
+    p.add_argument("--resume", default=None, help="checkpoint to resume from")
+    p.add_argument("--resume-skip-data", action="store_true", help="do NOT fast-forward the training dataloader past the batches the checkpoint already consumed (the resumed run then replays training data)")
     try:
         apply_config_to_parser(p, known.config, _TRAIN_CONFIG_ALIASES,
                                strict=True)
@@ -210,117 +241,117 @@ def main():
     p, config_path = build_arg_parser()
     args = p.parse_args()
     for name, value, minimum in (
-        ('--batch-size', args.batch_size, 1),
-        ('--seq-len', args.seq_len, 1),
-        ('--grad-accum', args.grad_accum, 1),
-        ('--val-batches', args.val_batches, 1),
-        ('--test-batches', args.test_batches, 1),
-        ('--log-every', args.log_every, 1),
-        ('--stats-every', args.stats_every, 1),
-        ('--save-every', args.save_every, 1),
+        ("--batch-size", args.batch_size, 1),
+        ("--seq-len", args.seq_len, 1),
+        ("--grad-accum", args.grad_accum, 1),
+        ("--val-batches", args.val_batches, 1),
+        ("--test-batches", args.test_batches, 1),
+        ("--log-every", args.log_every, 1),
+        ("--stats-every", args.stats_every, 1),
+        ("--save-every", args.save_every, 1),
     ):
         if value < minimum:
-            p.error(f'{name} {value} must be >= {minimum}')
+            p.error(f"{name} {value} must be >= {minimum}")
     if args.max_steps < 1:
-        p.error(f'--max-steps {args.max_steps} must be >= 1')
+        p.error(f"--max-steps {args.max_steps} must be >= 1")
     if args.warmup < 0:
-        p.error(f'--warmup {args.warmup} must be >= 0')
+        p.error(f"--warmup {args.warmup} must be >= 0")
     if not math.isfinite(args.lr) or args.lr <= 0.0:
-        p.error(f'--lr {args.lr} must be finite and positive')
+        p.error(f"--lr {args.lr} must be finite and positive")
     if not math.isfinite(args.min_lr_ratio) or not 0.0 <= args.min_lr_ratio <= 1.0:
-        p.error(f'--min-lr-ratio {args.min_lr_ratio} must be finite and in [0, 1]')
+        p.error(f"--min-lr-ratio {args.min_lr_ratio} must be finite and in [0, 1]")
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0.0:
-        p.error(f'--weight-decay {args.weight_decay} must be finite and >= 0')
-    for name, value in (('--beta1', args.beta1), ('--beta2', args.beta2)):
+        p.error(f"--weight-decay {args.weight_decay} must be finite and >= 0")
+    for name, value in (("--beta1", args.beta1), ("--beta2", args.beta2)):
         if not math.isfinite(value) or not 0.0 <= value < 1.0:
-            p.error(f'{name} {value} must be finite and in [0, 1)')
+            p.error(f"{name} {value} must be finite and in [0, 1)")
     if not math.isfinite(args.grad_clip) or args.grad_clip <= 0.0:
-        p.error(f'--grad-clip {args.grad_clip} must be finite and positive')
+        p.error(f"--grad-clip {args.grad_clip} must be finite and positive")
     if args.val_every < 0:
-        p.error(f'--val-every {args.val_every} must be >= 0')
+        p.error(f"--val-every {args.val_every} must be >= 0")
     if not args.val_split or not args.val_split.strip():
-        p.error('--val-split must be a non-empty upstream split name')
+        p.error("--val-split must be a non-empty upstream split name")
     if args.val_seq_len is not None and args.val_seq_len < 1:
-        p.error(f'--val-seq-len {args.val_seq_len} must be >= 1')
+        p.error(f"--val-seq-len {args.val_seq_len} must be >= 1")
     if args.early_stop_patience < 0:
-        p.error(f'--early-stop-patience {args.early_stop_patience} must be >= 0')
+        p.error(f"--early-stop-patience {args.early_stop_patience} must be >= 0")
     if args.num_workers < 0:
-        p.error(f'--num-workers {args.num_workers} must be >= 0')
+        p.error(f"--num-workers {args.num_workers} must be >= 0")
     if args.train_shuffle_buffer < 0:
-        p.error(f'--train-shuffle-buffer {args.train_shuffle_buffer} must be >= 0')
-    for name, value in (('--val-frac', args.val_frac), ('--test-frac', args.test_frac)):
+        p.error(f"--train-shuffle-buffer {args.train_shuffle_buffer} must be >= 0")
+    for name, value in (("--val-frac", args.val_frac), ("--test-frac", args.test_frac)):
         if not math.isfinite(value) or not 0.0 <= value < 1.0:
-            p.error(f'{name} {value} must be finite and in [0, 1)')
+            p.error(f"{name} {value} must be finite and in [0, 1)")
     if args.val_frac + args.test_frac >= 1.0:
-        p.error(f'--val-frac {args.val_frac} + --test-frac {args.test_frac} leaves no '
-                'training stream; the split fractions must sum to less than 1')
-    for name, value in (('--min-doc-chars', args.min_doc_chars),
-                        ('--max-doc-chars', args.max_doc_chars)):
+        p.error(f"--val-frac {args.val_frac} + --test-frac {args.test_frac} leaves no "
+                "training stream; the split fractions must sum to less than 1")
+    for name, value in (("--min-doc-chars", args.min_doc_chars),
+                        ("--max-doc-chars", args.max_doc_chars)):
         if value < 0:
-            p.error(f'{name} {value} must be >= 0')
+            p.error(f"{name} {value} must be >= 0")
     if args.max_doc_chars and args.min_doc_chars > args.max_doc_chars:
-        p.error(f'--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars '
-                f'{args.max_doc_chars}; no document could pass the cleaner')
+        p.error(f"--min-doc-chars {args.min_doc_chars} exceeds --max-doc-chars "
+                f"{args.max_doc_chars}; no document could pass the cleaner")
     if args.require_pinned_data_revision:
         unpinned = unpinned_data_revisions(
             args.dataset_revision, args.tokenizer_revision,
-            getattr(args, 'val_dataset_revision', None),
-            getattr(args, 'val_dataset', None))
+            getattr(args, "val_dataset_revision", None),
+            getattr(args, "val_dataset", None))
         if unpinned:
-            p.error('--require-pinned-data-revision: ' + '; '.join(unpinned)
-                    + ' (resolving at load time pins this run but not a rerun '
-                      'from the same command; pin concrete commits instead)')
+            p.error("--require-pinned-data-revision: " + "; ".join(unpinned)
+                    + " (resolving at load time pins this run but not a rerun "
+                      "from the same command; pin concrete commits instead)")
     # A seed supplied by --config is a default, not an explicit CLI override:
     # otherwise resuming a seed-42 checkpoint with a config (`seed: 7`) keeps
     # seed 7, reseeds the data stream and fast-forwards `data_position` along
     # a different stream than the one the checkpoint recorded.
     seed_names = _explicit_arg_names(sys.argv[1:], p, config_path)
-    seed_explicit = bool(seed_names & {'seed', 'seeds'})
+    seed_explicit = bool(seed_names & {"seed", "seeds"})
     # CLI precedence: `--seeds` typed on the command line must not be replaced
     # by a `seed:` value that only came from --config. The deprecated --seed
     # shorthand still wins when it is the explicit one (or when --seeds was
     # not typed at all), matching its documented precedence.
-    if args.seed is not None and ('seed' in seed_names or 'seeds' not in seed_names):
+    if args.seed is not None and ("seed" in seed_names or "seeds" not in seed_names):
         raw_seeds = [args.seed]
     else:
         raw_seeds = list(args.seeds or [DEFAULT_SEED])
     seeds = _normalize_seed_ids(raw_seeds)
     if len(seeds) != len(raw_seeds):
-        print(f'[seeds][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
-              '(a repeated seed is the same run, not an independent replication)')
+        print(f"[seeds][warn] duplicate seeds removed: {raw_seeds} -> {seeds} "
+              "(a repeated seed is the same run, not an independent replication)")
     if len(seeds) < 3:
-        print(f'[seeds][warn] {len(seeds)} seed(s): fewer than 3 independent runs cannot '
-              'separate a norm effect from run-to-run noise; treat the result as provisional',
+        print(f"[seeds][warn] {len(seeds)} seed(s): fewer than 3 independent runs cannot "
+              "separate a norm effect from run-to-run noise; treat the result as provisional",
               file=sys.stderr)
     if len(seeds) > 1:
         if args.resume:
             raise SystemExit(
-                '[seeds] --resume continues one run; combining it with multiple --seeds would '
-                'either resume the same step count into every seed directory or silently ignore '
-                'the requested replication. Resume a single seed with --seed N --resume <ckpt>.')
+                "[seeds] --resume continues one run; combining it with multiple --seeds would "
+                "either resume the same step count into every seed directory or silently ignore "
+                "the requested replication. Resume a single seed with --seed N --resume <ckpt>.")
         launch_multi_seed(args, seeds)
         return
     args.seed = seeds[0]
     explicit = frozenset(_explicit_arg_names(sys.argv[1:], p, config_path) | {name for name in _SCHEDULE_ARGS + _MONITOR_ARGS + _RESUME_RUN_ARGS + _DATA_ARGS if getattr(args, name, None) != p.get_default(name)})
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     resume_ckpt = None
     run_args: dict = {}
     if args.resume:
         resume_ckpt = _load_checkpoint_cpu(args.resume)
-        run_args = resume_ckpt.get('args') or {}
+        run_args = resume_ckpt.get("args") or {}
         # The seed determines the training shuffle order (and, for an old
         # checkpoint without RNG state, the stochastic stream). Treat it like
         # the split-defining args: resume the recorded seed unless the user
         # explicitly asked for a different one.
-        saved_seed = run_args.get('seed')
+        saved_seed = run_args.get("seed")
         if isinstance(saved_seed, int) and not isinstance(saved_seed, bool):
             if seed_explicit:
                 if args.seed != saved_seed:
-                    print(f'[resume] keeping your explicit seed override {args.seed} '
-                          f'(checkpoint seed={saved_seed}); the resumed run differs from '
-                          f'the one it continues')
+                    print(f"[resume] keeping your explicit seed override {args.seed} "
+                          f"(checkpoint seed={saved_seed}); the resumed run differs from "
+                          f"the one it continues")
             elif args.seed != saved_seed:
-                print(f'[resume] seed restored from checkpoint: {args.seed} -> {saved_seed}')
+                print(f"[resume] seed restored from checkpoint: {args.seed} -> {saved_seed}")
                 args.seed = saved_seed
         resume_kept = []
         for name in _RESUME_RUN_ARGS:
@@ -332,8 +363,8 @@ def main():
                 continue
             setattr(args, name, run_args[name])
         if resume_kept:
-            print(f'[resume] keeping your explicit override(s) {sorted(resume_kept)} for the architecture / numeric-format flags as well - the resumed run therefore differs from the one it continues')
-        for env_name, arg_name in (('ADASQUASH_DEPTH_OVERRIDE', '_depth_override'), ('ADASQUASH_DIM_OVERRIDE', '_dim_override'), ('ADASQUASH_HEADS_OVERRIDE', '_heads_override')):
+            print(f"[resume] keeping your explicit override(s) {sorted(resume_kept)} for the architecture / numeric-format flags as well - the resumed run therefore differs from the one it continues")
+        for env_name, arg_name in (("ADASQUASH_DEPTH_OVERRIDE", "_depth_override"), ("ADASQUASH_DIM_OVERRIDE", "_dim_override"), ("ADASQUASH_HEADS_OVERRIDE", "_heads_override")):
             if run_args.get(arg_name) is not None:
                 os.environ[env_name] = str(run_args[arg_name])
     args.bf16 = not args.no_bf16
@@ -341,9 +372,9 @@ def main():
     # The depth sweep feeds its per-cell shape through these env vars (see
     # ADASQUASH_*_OVERRIDE below). Read them *before* the preflight so the
     # check runs on the cell's real architecture rather than the default.
-    depth_override = os.environ.get('ADASQUASH_DEPTH_OVERRIDE')
-    dim_override = os.environ.get('ADASQUASH_DIM_OVERRIDE')
-    heads_override = os.environ.get('ADASQUASH_HEADS_OVERRIDE')
+    depth_override = os.environ.get("ADASQUASH_DEPTH_OVERRIDE")
+    dim_override = os.environ.get("ADASQUASH_DIM_OVERRIDE")
+    heads_override = os.environ.get("ADASQUASH_HEADS_OVERRIDE")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     sanity_report_path = None
@@ -359,35 +390,35 @@ def main():
         run_preflight(args.norm, args.seed, args.output_dir,
                       arch_args=preflight_arch_args(args, depth_override,
                                                     dim_override, heads_override))
-        sanity_report_path = Path(args.output_dir) / 'sanity_overfit.json'
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    dtype = torch.bfloat16 if args.bf16 and device == 'cuda' else torch.float32
-    ctx = torch.amp.autocast(device_type='cuda', dtype=dtype) if dtype != torch.float32 else nullcontext()
+        sanity_report_path = Path(args.output_dir) / "sanity_overfit.json"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if args.bf16 and device == "cuda" else torch.float32
+    ctx = torch.amp.autocast(device_type="cuda", dtype=dtype) if dtype != torch.float32 else nullcontext()
     model_cfg = dict(norm_name=args.norm, qk_norm=args.qk_norm, qk_alpha_init=args.qk_alpha_init, use_layerscale=not args.no_layerscale, alpha_0=args.alpha_0, k_init=args.k_init, k_min=args.k_min, shared_depth_schedule=args.shared_depth_schedule, alpha_init=args.alpha_init, p_init=args.p_init, learnable_p=not args.no_learnable_p, learnable_k=not args.no_learnable_k, learnable_delta=not args.no_learnable_delta, beta=args.beta, alpha_jitter=args.alpha_jitter, gradient_checkpointing=args.gradient_checkpointing)
     if args.layerscale_init is not None:
-        model_cfg['layerscale_init'] = args.layerscale_init
+        model_cfg["layerscale_init"] = args.layerscale_init
     if args.tie_embeddings is not None:
-        model_cfg['tie_word_embeddings'] = args.tie_embeddings
+        model_cfg["tie_word_embeddings"] = args.tie_embeddings
     # Construct with the constructor's init pass disabled:
     # `reset_parameters(args.seed)` below is the run's single, seeded
     # initialization.
     with torch.device(device):
-        if args.model == 'gpt2-124m':
+        if args.model == "gpt2-124m":
             model = build_gpt_124m(init=False, **model_cfg)
-        elif args.model == 'gpt2-350m':
+        elif args.model == "gpt2-350m":
             model = build_gpt_350m(init=False, **model_cfg)
         else:
             model = build_llama_tiny_1b(init=False, **model_cfg)
     if depth_override or dim_override or heads_override:
         cfg_dict = {k: getattr(model.cfg, k) for k in vars(model.cfg)}
         if depth_override:
-            cfg_dict['n_layers'] = int(depth_override)
+            cfg_dict["n_layers"] = int(depth_override)
             args._depth_override = int(depth_override)
         if dim_override:
-            cfg_dict['dim'] = int(dim_override)
+            cfg_dict["dim"] = int(dim_override)
             args._dim_override = int(dim_override)
         if heads_override:
-            cfg_dict['n_heads'] = int(heads_override)
+            cfg_dict["n_heads"] = int(heads_override)
             args._heads_override = int(heads_override)
         print(f"[shape-override] L={cfg_dict['n_layers']} dim={cfg_dict['dim']} n_heads={cfg_dict['n_heads']} (was L={model.cfg.n_layers} dim={model.cfg.dim} n_heads={model.cfg.n_heads})")
         with torch.device(device):
@@ -395,19 +426,19 @@ def main():
     model.reset_parameters(args.seed)
     model.to(device)
     if args.compile:
-        print(f'[compile] enabling torch.compile with mode={args.compile_mode}')
+        print(f"[compile] enabling torch.compile with mode={args.compile_mode}")
         model = torch.compile(model, mode=args.compile_mode)
     n_params = count_parameters(model)
     n_trainable = count_parameters(model, trainable_only=True)
-    print(f'[model] {args.model} | total={n_params / 1000000.0:.2f}M | trainable={n_trainable / 1000000.0:.2f}M | norm={args.norm}')
-    print(f'[model] norm param breakdown: {model.norm_param_count()}')
+    print(f"[model] {args.model} | total={n_params / 1000000.0:.2f}M | trainable={n_trainable / 1000000.0:.2f}M | norm={args.norm}")
+    print(f"[model] norm param breakdown: {model.norm_param_count()}")
     if resume_ckpt is not None:
         data_changed = restore_data_args(args, run_args, explicit=explicit)
         if data_changed:
             kept = [n for n in data_changed if n in explicit]
             adopted = [n for n in data_changed if n not in explicit]
             if adopted:
-                print(f'[resume] data-split args restored from checkpoint: {adopted}')
+                print(f"[resume] data-split args restored from checkpoint: {adopted}")
             if kept:
                 # A different split boundary, dataset revision, cleaning
                 # policy or ledger changes which documents are trained on and
@@ -415,18 +446,18 @@ def main():
                 # documents into validation (or the sealed test), so it is a
                 # leak rather than an override: refuse instead of warning.
                 raise SystemExit(
-                    f'[resume] refusing to resume with explicit data-split '
-                    f'override(s) {sorted(kept)} that differ from the checkpoint: '
-                    f'the resumed run would train/evaluate on a different data '
-                    f'identity than the one it continues (documents the model '
-                    f'already saw could re-enter the held-out splits). Start a '
-                    f'fresh run if the data protocol must change, or drop the '
-                    f'overrides to continue the checkpointed split exactly.')
-        saved_ledgers = resume_ckpt.get('data_ledgers')
+                    f"[resume] refusing to resume with explicit data-split "
+                    f"override(s) {sorted(kept)} that differ from the checkpoint: "
+                    f"the resumed run would train/evaluate on a different data "
+                    f"identity than the one it continues (documents the model "
+                    f"already saw could re-enter the held-out splits). Start a "
+                    f"fresh run if the data protocol must change, or drop the "
+                    f"overrides to continue the checkpointed split exactly.")
+        saved_ledgers = resume_ckpt.get("data_ledgers")
         if saved_ledgers is None:
-            print('[resume] checkpoint predates ledger-content pinning: the split '
-                  'ledger files are not verified, so a replaced ledger could change '
-                  'the held-out documents under the same paths')
+            print("[resume] checkpoint predates ledger-content pinning: the split "
+                  "ledger files are not verified, so a replaced ledger could change "
+                  "the held-out documents under the same paths")
         else:
             current_ledgers = _data_ledger_fingerprints(args)
             ledger_changes = []
@@ -435,42 +466,42 @@ def main():
                 new = current_ledgers.get(name)
                 if old != new:
                     ledger_changes.append({
-                        'role': name,
-                        'checkpoint': old,
-                        'current': new,
+                        "role": name,
+                        "checkpoint": old,
+                        "current": new,
                     })
             if ledger_changes:
                 raise SystemExit(
-                    '[resume] refusing to resume: the cross-split ledger content '
-                    'differs from the checkpoint, so the resumed run would drop a '
-                    f'different set of held-out documents ({ledger_changes}). '
-                    'Restore the original ledger files or start a fresh run with '
-                    'the new split protocol.')
-            print('[resume] cross-split ledger fingerprints match the checkpoint')
+                    "[resume] refusing to resume: the cross-split ledger content "
+                    "differs from the checkpoint, so the resumed run would drop a "
+                    f"different set of held-out documents ({ledger_changes}). "
+                    "Restore the original ledger files or start a fresh run with "
+                    "the new split protocol.")
+            print("[resume] cross-split ledger fingerprints match the checkpoint")
     # Snapshot the ledger content that defines this run's held-out documents
     # *once*, before the loader is built. Recomputing it at every checkpoint
     # would let a ledger replaced mid-run be recorded as if the original
     # stream had used the new content, defeating the resume identity check.
     run_ledgers = _data_ledger_fingerprints(args)
     data_reports: dict = {}
-    loader = open_data_split('train', args)
+    loader = open_data_split("train", args)
     data_iter = iter(loader)
     batches_consumed = 0
-    report = getattr(loader, 'split_report', None)
+    report = getattr(loader, "split_report", None)
     if report:
-        data_reports['train'] = report
+        data_reports["train"] = report
         # Pin the run - and the checkpoints it writes - to the resolved
         # upstream commits, not the mutable revision strings the user typed:
         # a resume after the branch moved must continue on the same documents
         # and the same tokenizer that produced the checkpoint. The split
         # report always carries the resolved values when the Hub was reachable.
-        resolved_revision = report.get('dataset_revision_resolved')
+        resolved_revision = report.get("dataset_revision_resolved")
         if resolved_revision and resolved_revision != args.dataset_revision:
-            print(f'[data] dataset revision pinned: {args.dataset_revision!r} -> {resolved_revision}')
+            print(f"[data] dataset revision pinned: {args.dataset_revision!r} -> {resolved_revision}")
             args.dataset_revision = resolved_revision
-        resolved_tokenizer = report.get('tokenizer_revision_resolved')
+        resolved_tokenizer = report.get("tokenizer_revision_resolved")
         if resolved_tokenizer and resolved_tokenizer != args.tokenizer_revision:
-            print(f'[data] tokenizer revision pinned: {args.tokenizer_revision!r} -> {resolved_tokenizer}')
+            print(f"[data] tokenizer revision pinned: {args.tokenizer_revision!r} -> {resolved_tokenizer}")
             args.tokenizer_revision = resolved_tokenizer
         # The requested revision can be a branch/tag (or None); these fields
         # preserve the concrete commit separately so evaluation tooling can
@@ -478,10 +509,10 @@ def main():
         # same snapshot" instead of certifying an unverifiable comparison.
         args.dataset_revision_resolved = resolved_revision
         args.tokenizer_revision_resolved = resolved_tokenizer
-        print(f'[data] train split: {report}')
+        print(f"[data] train split: {report}")
     val_loader = None
-    val_state: dict = {'iter': None, 'batches_consumed': 0, 'resume_skip': 0}
-    best_val_loss = float('inf')
+    val_state: dict = {"iter": None, "batches_consumed": 0, "resume_skip": 0}
+    best_val_loss = float("inf")
     best_val_step = 0
     val_checks_without_improvement = 0
     last_val_loss = None
@@ -497,53 +528,53 @@ def main():
             kept = [n for n in changed if n in explicit]
             adopted = [n for n in changed if n not in explicit]
             if adopted:
-                print(f'[resume] schedule args restored from checkpoint: {adopted}')
+                print(f"[resume] schedule args restored from checkpoint: {adopted}")
             if kept:
-                print(f'[resume] keeping your explicit override(s) {kept} - the resumed run therefore follows a different schedule than the one it continues')
-        start_step = int(resume_ckpt.get('step', 0))
-        print(f'[resume] {args.resume} -> step {start_step}')
+                print(f"[resume] keeping your explicit override(s) {kept} - the resumed run therefore follows a different schedule than the one it continues")
+        start_step = int(resume_ckpt.get("step", 0))
+        print(f"[resume] {args.resume} -> step {start_step}")
         monitor_changed = restore_monitor_args(args, run_args, explicit=explicit)
         if monitor_changed:
             kept = [n for n in monitor_changed if n in explicit]
             adopted = [n for n in monitor_changed if n not in explicit]
             if adopted:
-                print(f'[resume] monitoring args restored from checkpoint: {adopted}')
+                print(f"[resume] monitoring args restored from checkpoint: {adopted}")
             if kept:
-                print(f'[resume] keeping your explicit monitoring override(s) {kept} - '
-                      f'the resumed run therefore uses a different validation/selection '
-                      f'protocol than the checkpoint it continues')
+                print(f"[resume] keeping your explicit monitoring override(s) {kept} - "
+                      f"the resumed run therefore uses a different validation/selection "
+                      f"protocol than the checkpoint it continues")
         # Restore the stochastic state before the first post-resume batch, so
         # dropout and the Python-side shuffle buffer continue where the saved
         # run stopped instead of restarting from --seed.
-        rng_state = resume_ckpt.get('rng_state')
+        rng_state = resume_ckpt.get("rng_state")
         if rng_state is not None:
-            torch.set_rng_state(rng_state.get('torch_cpu', torch.get_rng_state()))
-            if rng_state.get('torch_cuda') is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
-            if rng_state.get('python') is not None:
-                random.setstate(rng_state['python'])
-            if rng_state.get('numpy') is not None:
+            torch.set_rng_state(rng_state.get("torch_cpu", torch.get_rng_state()))
+            if rng_state.get("torch_cuda") is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
+            if rng_state.get("python") is not None:
+                random.setstate(rng_state["python"])
+            if rng_state.get("numpy") is not None:
                 try:
                     import numpy as _np
                 except ImportError:
                     pass
                 else:
-                    _np.random.set_state(rng_state['numpy'])
-            print('[resume] restored RNG states (torch / cuda / python / numpy) - dropout and any stochastic step continues as if uninterrupted')
+                    _np.random.set_state(rng_state["numpy"])
+            print("[resume] restored RNG states (torch / cuda / python / numpy) - dropout and any stochastic step continues as if uninterrupted")
         else:
-            print('[resume] checkpoint predates RNG-state saving: RNGs restart from --seed, so a run with dropout>0 will not bitwise-continue the original stream')
+            print("[resume] checkpoint predates RNG-state saving: RNGs restart from --seed, so a run with dropout>0 will not bitwise-continue the original stream")
         # The loader is a forward-only stream and does not persist its cursor:
         # without skipping, a resumed run silently retrains on the corpus from
         # the start. `data_position` counts every stream batch consumed (one
         # per gradient-accumulation micro-step), including non-finite steps.
-        saved_position = resume_ckpt.get('data_position')
+        saved_position = resume_ckpt.get("data_position")
         if saved_position is None:
-            print('[resume] checkpoint predates data-position tracking: the stream restarts from the beginning and REPLAYS training data - finish the run with this caveat, or restart from a newer checkpoint')
+            print("[resume] checkpoint predates data-position tracking: the stream restarts from the beginning and REPLAYS training data - finish the run with this caveat, or restart from a newer checkpoint")
         elif args.resume_skip_data:
             batches_consumed = int(saved_position)
-            print(f'[resume] --resume-skip-data: NOT skipping the {saved_position} batches the checkpoint already consumed - the resumed run replays training data (accepted)')
+            print(f"[resume] --resume-skip-data: NOT skipping the {saved_position} batches the checkpoint already consumed - the resumed run replays training data (accepted)")
         else:
-            print(f'[resume] fast-forwarding the dataloader past {saved_position} already-consumed batches (same streaming order, so the resumed run sees fresh data)...')
+            print(f"[resume] fast-forwarding the dataloader past {saved_position} already-consumed batches (same streaming order, so the resumed run sees fresh data)...")
             t_skip = time.time()
             for i in range(int(saved_position)):
                 try:
@@ -552,34 +583,34 @@ def main():
                     data_iter = iter(loader)
                     next(data_iter)
                 if (i + 1) % 1000 == 0:
-                    print(f'  [skip] {i + 1}/{saved_position} batches ({time.time() - t_skip:.0f}s)', flush=True)
+                    print(f"  [skip] {i + 1}/{saved_position} batches ({time.time() - t_skip:.0f}s)", flush=True)
             batches_consumed = int(saved_position)
-            print(f'[resume] data position restored: the next batch is #{int(saved_position) + 1} in the stream')
+            print(f"[resume] data position restored: the next batch is #{int(saved_position) + 1} in the stream")
         # The validation loader is a second forward-only stream. If it
         # restarted at batch 0 after a resume, the next validation pass would
         # read a different held-out slice than an uninterrupted run, so
         # best-checkpoint selection and cross-arm final losses would silently
         # stop being paired. Restore the consumed-batch count and fast-forward
         # the next validation loader past it (the split is deterministic).
-        saved_val_position = resume_ckpt.get('val_batches_consumed')
+        saved_val_position = resume_ckpt.get("val_batches_consumed")
         if saved_val_position is not None:
-            val_state['batches_consumed'] = max(0, int(saved_val_position))
-            val_state['resume_skip'] = max(0, int(saved_val_position))
+            val_state["batches_consumed"] = max(0, int(saved_val_position))
+            val_state["resume_skip"] = max(0, int(saved_val_position))
             print(f'[resume] validation stream position: {val_state["batches_consumed"]} '
                   f'batch(es) already scored; the next pass continues from there')
         elif args.val_every > 0:
-            print('[resume] checkpoint predates validation-position tracking: the '
-                  'validation stream restarts at batch 0, so this run evaluates '
-                  'different held-out slices than an uninterrupted run')
-        saved_last_val = resume_ckpt.get('last_val_loss')
+            print("[resume] checkpoint predates validation-position tracking: the "
+                  "validation stream restarts at batch 0, so this run evaluates "
+                  "different held-out slices than an uninterrupted run")
+        saved_last_val = resume_ckpt.get("last_val_loss")
         if _is_finite_number(saved_last_val):
             last_val_loss = float(saved_last_val)
-            last_val_step = (None if resume_ckpt.get('last_val_step') is None
-                             else int(resume_ckpt['last_val_step']))
-            saved_stderr = resume_ckpt.get('last_val_stderr')
+            last_val_step = (None if resume_ckpt.get("last_val_step") is None
+                             else int(resume_ckpt["last_val_step"]))
+            saved_stderr = resume_ckpt.get("last_val_stderr")
             last_val_stderr = (float(saved_stderr)
                                if _is_finite_number(saved_stderr) else None)
-            saved_batches = resume_ckpt.get('last_val_batches')
+            saved_batches = resume_ckpt.get("last_val_batches")
             if isinstance(saved_batches, list):
                 last_val_batches = [float(v) for v in saved_batches
                                     if _is_finite_number(v)]
@@ -588,24 +619,24 @@ def main():
         # post-resume validation unconditionally overwrite a possibly better
         # `ckpt_best.pt`, which is the checkpoint the final test evaluation
         # restores. Seed it from the historical best instead.
-        best_path = Path(args.output_dir) / 'ckpt_best.pt'
+        best_path = Path(args.output_dir) / "ckpt_best.pt"
         resume_path = Path(args.resume)
         resumed_best = (resume_path.resolve() == best_path.resolve()
-                        or resume_path.name == 'ckpt_best.pt')
+                        or resume_path.name == "ckpt_best.pt")
         best_candidates = []
         # Periodic/final checkpoints carry the historical best tracker too, so
         # resuming one into a fresh output directory does not reset model
         # selection to `inf` (the next validation would then overwrite the
         # real best with a worse checkpoint).
-        saved_best_loss = resume_ckpt.get('best_val_loss')
-        saved_best_step = resume_ckpt.get('best_val_step')
+        saved_best_loss = resume_ckpt.get("best_val_loss")
+        saved_best_step = resume_ckpt.get("best_val_step")
         if _is_finite_number(saved_best_loss):
             best_candidates.append({
-                'val_loss': float(saved_best_loss),
-                'step': (int(saved_best_step)
+                "val_loss": float(saved_best_loss),
+                "step": (int(saved_best_step)
                          if isinstance(saved_best_step, int)
                          and not isinstance(saved_best_step, bool) else 0),
-                'source': 'checkpoint_tracker',
+                "source": "checkpoint_tracker",
             })
         if best_path.exists():
             # Read only the scalar/provenance fields from the existing best
@@ -617,16 +648,16 @@ def main():
             except Exception:
                 prior = None
             if isinstance(prior, dict):
-                raw_loss = prior.get('val_loss')
+                raw_loss = prior.get("val_loss")
                 if _is_finite_number(raw_loss):
                     prior_loss = float(raw_loss)
-                    raw_step = prior.get('step')
+                    raw_step = prior.get("step")
                     prior_step = (int(raw_step) if isinstance(raw_step, int)
                                   and not isinstance(raw_step, bool) else 0)
-                prior_provenance = prior.get('provenance')
+                prior_provenance = prior.get("provenance")
             del prior
             same_run = (prior_provenance is not None
-                        and prior_provenance == resume_ckpt.get('provenance'))
+                        and prior_provenance == resume_ckpt.get("provenance"))
             if not resumed_best and not same_run:
                 # The existing best artifact belongs to another run (or cannot
                 # prove it belongs to this one). Seeding selection from its
@@ -634,87 +665,87 @@ def main():
                 # restore weights this run never selected, while the manifest
                 # reports that other run's best scalar. Remove it and let the
                 # resumed run write its own best after a validation improves.
-                print(f'[resume][warn] {best_path} does not belong to the '
-                      'checkpoint being resumed (provenance differs); '
-                      'discarding the stale best artifact', file=sys.stderr)
+                print(f"[resume][warn] {best_path} does not belong to the "
+                      "checkpoint being resumed (provenance differs); "
+                      "discarding the stale best artifact", file=sys.stderr)
                 try:
                     best_path.unlink()
                 except OSError as exc:
-                    print(f'[resume][warn] could not remove stale {best_path}: '
-                          f'{exc}', file=sys.stderr)
+                    print(f"[resume][warn] could not remove stale {best_path}: "
+                          f"{exc}", file=sys.stderr)
                 prior_loss = prior_step = None
             if resumed_best:
                 # The resumed checkpoint is the best artifact the user chose
                 # to continue. If it is from another run, this output dir's
                 # best file must be replaced or the final test would restore
                 # the wrong model. Same-run artifacts keep the lower loss.
-                resume_loss = resume_ckpt.get('val_loss')
+                resume_loss = resume_ckpt.get("val_loss")
                 resume_loss = (float(resume_loss)
                                if _is_finite_number(resume_loss) else None)
                 same_run = (prior_provenance is not None
-                            and prior_provenance == resume_ckpt.get('provenance'))
+                            and prior_provenance == resume_ckpt.get("provenance"))
                 replace = (prior_loss is None or not same_run
                            or (resume_loss is not None
                                and resume_loss <= prior_loss))
                 if replace and resume_loss is not None:
                     _atomic_torch_save(resume_ckpt, best_path)
-                    prior_loss, prior_step = resume_loss, int(resume_ckpt.get('step', 0))
-                    print(f'[resume] replaced {best_path} with the resumed best '
-                          f'checkpoint (val_loss={resume_loss:.4f})')
+                    prior_loss, prior_step = resume_loss, int(resume_ckpt.get("step", 0))
+                    print(f"[resume] replaced {best_path} with the resumed best "
+                          f"checkpoint (val_loss={resume_loss:.4f})")
                 if resume_loss is not None:
-                    best_candidates.append({'val_loss': resume_loss,
-                                            'step': int(resume_ckpt.get('step', 0))})
+                    best_candidates.append({"val_loss": resume_loss,
+                                            "step": int(resume_ckpt.get("step", 0))})
                 if prior_loss is not None:
-                    best_candidates.append({'val_loss': prior_loss,
-                                            'step': int(prior_step or 0)})
+                    best_candidates.append({"val_loss": prior_loss,
+                                            "step": int(prior_step or 0)})
             elif prior_loss is not None:
                 # A separate best file is the verified selection artifact;
                 # only its recorded scalar may seed the tracker.
-                best_candidates.append({'val_loss': prior_loss,
-                                        'step': int(prior_step or 0)})
+                best_candidates.append({"val_loss": prior_loss,
+                                        "step": int(prior_step or 0)})
             else:
-                print(f'[resume][warn] {best_path} has no finite recorded '
-                      'val_loss; it cannot seed checkpoint selection')
+                print(f"[resume][warn] {best_path} has no finite recorded "
+                      "val_loss; it cannot seed checkpoint selection")
         elif resumed_best:
             # Resume from a best checkpoint into a fresh output directory:
             # keep that selection artifact there, otherwise the final test
             # would silently restore ckpt_final.pt while the manifest still
             # reported the historical best. A non-finite/boolean loss is not a
             # measurement and must not seed selection or be copied as "best".
-            resume_loss = resume_ckpt.get('val_loss')
+            resume_loss = resume_ckpt.get("val_loss")
             if _is_finite_number(resume_loss):
                 best_path.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_torch_save(resume_ckpt, best_path)
-                best_candidates.append({'val_loss': float(resume_loss),
-                                        'step': int(resume_ckpt.get('step', 0))})
-                print(f'[resume] copied the resumed best checkpoint to {best_path}')
+                best_candidates.append({"val_loss": float(resume_loss),
+                                        "step": int(resume_ckpt.get("step", 0))})
+                print(f"[resume] copied the resumed best checkpoint to {best_path}")
             else:
-                print(f'[resume][warn] {best_path} cannot be seeded from the resumed '
-                      f'best checkpoint: val_loss={resume_loss!r} is not a finite '
-                      'number')
+                print(f"[resume][warn] {best_path} cannot be seeded from the resumed "
+                      f"best checkpoint: val_loss={resume_loss!r} is not a finite "
+                      "number")
         if best_candidates:
-            prior_best = min(best_candidates, key=lambda c: c['val_loss'])
-            best_val_loss = float(prior_best['val_loss'])
-            best_val_step = int(prior_best.get('step', 0))
-            print(f'[resume] best-validation tracker seeded with val_loss={best_val_loss:.4f}@{best_val_step} from the previous best checkpoint')
+            prior_best = min(best_candidates, key=lambda c: c["val_loss"])
+            best_val_loss = float(prior_best["val_loss"])
+            best_val_step = int(prior_best.get("step", 0))
+            print(f"[resume] best-validation tracker seeded with val_loss={best_val_loss:.4f}@{best_val_step} from the previous best checkpoint")
         # The early-stop streak is run state like the best tracker: restarting
         # it at 0 would hand a resumed run a fresh patience window, so it can
         # train past the step an uninterrupted run would have stopped at.
         # Older checkpoints do not carry the streak and restart at 0.
-        saved_no_improve = resume_ckpt.get('val_checks_without_improvement')
+        saved_no_improve = resume_ckpt.get("val_checks_without_improvement")
         if saved_no_improve is not None:
             val_checks_without_improvement = max(0, int(saved_no_improve))
-            print(f'[resume] restored early-stop counter: {val_checks_without_improvement} validation check(s) without improvement')
+            print(f"[resume] restored early-stop counter: {val_checks_without_improvement} validation check(s) without improvement")
         elif args.early_stop_patience > 0:
-            print('[resume] checkpoint predates early-stop-counter saving: the no-improvement streak restarts at 0, so a resumed run gets a full --early-stop-patience window')
+            print("[resume] checkpoint predates early-stop-counter saving: the no-improvement streak restarts at 0, so a resumed run gets a full --early-stop-patience window")
     opt = build_optimizer(model, args.lr, args.weight_decay, args.beta1, args.beta2)
     sched = LambdaLR(opt, build_lr_lambda(args))
     if resume_ckpt is not None:
-        load_model_state_dict(model, resume_ckpt['model'])
-        if 'optimizer' in resume_ckpt:
-            opt.load_state_dict(resume_ckpt['optimizer'])
-        if 'scheduler' in resume_ckpt:
-            sched.load_state_dict(resume_ckpt['scheduler'])
+        load_model_state_dict(model, resume_ckpt["model"])
+        if "optimizer" in resume_ckpt:
+            opt.load_state_dict(resume_ckpt["optimizer"])
+        if "scheduler" in resume_ckpt:
+            sched.load_state_dict(resume_ckpt["scheduler"])
         apply_explicit_optimizer_args(opt, sched, args, explicit)
         # A checkpoint written by an older run can carry non-finite weights or
         # Adam moments even though the new save guard would refuse to create
@@ -723,29 +754,29 @@ def main():
         # fail at the resume boundary with the offending tensors named.
         resume_failures = _checkpoint_nonfinite(model, opt)
         if resume_failures:
-            shown = '; '.join(resume_failures[:10])
-            more = '' if len(resume_failures) <= 10 else f' (+{len(resume_failures) - 10} more)'
+            shown = "; ".join(resume_failures[:10])
+            more = "" if len(resume_failures) <= 10 else f" (+{len(resume_failures) - 10} more)"
             raise SystemExit(
-                f'[resume] refusing to continue from {args.resume}: the checkpoint '
-                f'contains non-finite training state ({shown}{more}). Restore an '
-                'earlier finite checkpoint; the NaN triage order is data -> fp32 '
-                'math -> mixed precision -> gradients.')
+                f"[resume] refusing to continue from {args.resume}: the checkpoint "
+                f"contains non-finite training state ({shown}{more}). Restore an "
+                "earlier finite checkpoint; the NaN triage order is data -> fp32 "
+                "math -> mixed precision -> gradients.")
         # Everything heavy has been copied into the live objects; drop the
         # checkpoint's copies. `val_loss` / `step` stay: they are scalars the
         # tracker reads.
-        resume_ckpt.pop('model', None)
-        resume_ckpt.pop('optimizer', None)
-        resume_ckpt.pop('scheduler', None)
+        resume_ckpt.pop("model", None)
+        resume_ckpt.pop("optimizer", None)
+        resume_ckpt.pop("scheduler", None)
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter(rel_threshold=0.2, abs_threshold=0.05)
     if resume_ckpt is not None:
-        if loss_spike.load_state_dict(resume_ckpt.get('loss_spike')):
-            print(f'[resume] restored loss-spike counter (n_spikes={loss_spike.n_spikes})')
-        elif 'n_loss_spikes' in resume_ckpt:
-            loss_spike.n_spikes = int(resume_ckpt['n_loss_spikes'] or 0)
-            print(f'[resume] restored loss-spike counter from n_loss_spikes (n_spikes={loss_spike.n_spikes}, EMA warm restarted)')
+        if loss_spike.load_state_dict(resume_ckpt.get("loss_spike")):
+            print(f"[resume] restored loss-spike counter (n_spikes={loss_spike.n_spikes})")
+        elif "n_loss_spikes" in resume_ckpt:
+            loss_spike.n_spikes = int(resume_ckpt["n_loss_spikes"] or 0)
+            print(f"[resume] restored loss-spike counter from n_loss_spikes (n_spikes={loss_spike.n_spikes}, EMA warm restarted)")
     os.makedirs(args.output_dir, exist_ok=True)
-    log_path = Path(args.output_dir) / 'train.jsonl'
+    log_path = Path(args.output_dir) / "train.jsonl"
     # A resume continues the same run and appends its rows. A fresh run reusing
     # an old output directory must start a new log: appending would mix two
     # runs' step numbers and make the manifest's train.jsonl fingerprint
@@ -755,54 +786,54 @@ def main():
     log_path.touch()
     # One line-buffered handle for the whole run: each written row stays
     # visible to tail -f / crash inspection.
-    log_file = open(log_path, 'a', buffering=1)
-    manifest_path = Path(args.output_dir) / 'run_manifest.json'
+    log_file = open(log_path, "a", buffering=1)
+    manifest_path = Path(args.output_dir) / "run_manifest.json"
     run_manifest: dict = {}
     run_finished = False
     stream_fp = None
     step = 0
     try:
         run_manifest = collect_run_metadata(seed=args.seed)
-        run_manifest['hyperparameters'] = vars(args)
-        run_manifest['config_file'] = (file_fingerprint(args.config)
+        run_manifest["hyperparameters"] = vars(args)
+        run_manifest["config_file"] = (file_fingerprint(args.config)
                                        if args.config else None)
-        run_manifest['status'] = 'running'
+        run_manifest["status"] = "running"
         if args.hypothesis:
-            run_manifest['hypothesis'] = args.hypothesis
-            print(f'[hypothesis] {args.hypothesis}')
-        run_manifest['data'] = {
-            'dataset': args.dataset,
-            'dataset_config': args.dataset_config,
-            'dataset_revision': args.dataset_revision,
-            'tokenizer': args.tokenizer,
-            'tokenizer_revision': args.tokenizer_revision,
-            'split_reports': data_reports,
-            'exclude_hash_file': run_ledgers['exclude_hash_file'],
-            'exclude_test_hash_file': run_ledgers['exclude_test_hash_file'],
-            'exclude_train_hash_file': run_ledgers['exclude_train_hash_file'],
-            'group_key': args.group_key,
-            'exclude_group_file': run_ledgers['exclude_group_file'],
-            'exclude_test_group_file': run_ledgers['exclude_test_group_file'],
-            'config_file': file_fingerprint(args.config) if args.config else None,
+            run_manifest["hypothesis"] = args.hypothesis
+            print(f"[hypothesis] {args.hypothesis}")
+        run_manifest["data"] = {
+            "dataset": args.dataset,
+            "dataset_config": args.dataset_config,
+            "dataset_revision": args.dataset_revision,
+            "tokenizer": args.tokenizer,
+            "tokenizer_revision": args.tokenizer_revision,
+            "split_reports": data_reports,
+            "exclude_hash_file": run_ledgers["exclude_hash_file"],
+            "exclude_test_hash_file": run_ledgers["exclude_test_hash_file"],
+            "exclude_train_hash_file": run_ledgers["exclude_train_hash_file"],
+            "group_key": args.group_key,
+            "exclude_group_file": run_ledgers["exclude_group_file"],
+            "exclude_test_group_file": run_ledgers["exclude_test_group_file"],
+            "config_file": file_fingerprint(args.config) if args.config else None,
         }
         if sanity_report_path is not None:
-            run_manifest['overfit_sanity_check'] = {'enabled': True, **file_fingerprint(sanity_report_path)}
+            run_manifest["overfit_sanity_check"] = {"enabled": True, **file_fingerprint(sanity_report_path)}
         else:
-            run_manifest['overfit_sanity_check'] = {'enabled': False}
+            run_manifest["overfit_sanity_check"] = {"enabled": False}
         if resume_ckpt is not None:
-            run_manifest['resumed_from'] = str(args.resume)
+            run_manifest["resumed_from"] = str(args.resume)
         save_run_manifest(manifest_path, run_manifest)
         provenance = {
-            'git_commit': run_manifest['git']['commit'],
-            'git_dirty': run_manifest['git']['dirty'],
-            'seed': args.seed,
-            'manifest': manifest_path.name,
+            "git_commit": run_manifest["git"]["commit"],
+            "git_dirty": run_manifest["git"]["dirty"],
+            "seed": args.seed,
+            "manifest": manifest_path.name,
         }
-        print(f'[track] run manifest -> {manifest_path}')
+        print(f"[track] run manifest -> {manifest_path}")
         tb = None
         try:
             from torch.utils.tensorboard import SummaryWriter
-            tb = SummaryWriter(log_dir=str(Path(args.output_dir) / 'tb'))
+            tb = SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
         except Exception:
             pass
         if args.wandb_project:
@@ -815,7 +846,7 @@ def main():
         stream_fp = TrainStreamFingerprint(start_step=start_step)
         t0 = time.time()
         tokens_processed = 0
-        if device == 'cuda':
+        if device == "cuda":
             # Measure this run's own training footprint, not the preflight's.
             torch.cuda.reset_peak_memory_stats(device)
         peak_device_memory_mb = None
@@ -840,10 +871,10 @@ def main():
             def _finite_point(value) -> bool:
                 return _is_finite_number(value)
 
-            saved_train = resume_ckpt.get('curve_train')
-            saved_val = resume_ckpt.get('curve_val')
-            saved_stderr = resume_ckpt.get('curve_val_stderr')
-            saved_steps = resume_ckpt.get('curve_steps')
+            saved_train = resume_ckpt.get("curve_train")
+            saved_val = resume_ckpt.get("curve_val")
+            saved_stderr = resume_ckpt.get("curve_val_stderr")
+            saved_steps = resume_ckpt.get("curve_steps")
             lengths = [len(v) for v in (saved_train, saved_val, saved_stderr, saved_steps)
                        if isinstance(v, list)]
             valid_curves = (
@@ -857,18 +888,18 @@ def main():
                 curve_val.extend(float(v) for v in saved_val)
                 curve_val_stderr.extend(None if v is None else float(v) for v in saved_stderr)
                 curve_steps.extend(int(v) for v in saved_steps)
-                print(f'[resume] restored {len(curve_train)} held-out curve point(s) '
-                      f'(last step {curve_steps[-1]}) so the diagnosis reads the full run')
-            saved_window = resume_ckpt.get('train_window')
+                print(f"[resume] restored {len(curve_train)} held-out curve point(s) "
+                      f"(last step {curve_steps[-1]}) so the diagnosis reads the full run")
+            saved_window = resume_ckpt.get("train_window")
             if (isinstance(saved_window, list)
                     and all(_finite_point(v) for v in saved_window)):
                 train_window.extend(float(v) for v in saved_window)
-                print(f'[resume] restored {len(train_window)} training-loss window '
-                      f'value(s); the next curve point covers the whole validation interval')
-            saved_history = resume_ckpt.get('curve_diagnosis_history')
+                print(f"[resume] restored {len(train_window)} training-loss window "
+                      f"value(s); the next curve point covers the whole validation interval")
+            saved_history = resume_ckpt.get("curve_diagnosis_history")
             if isinstance(saved_history, list):
                 diagnosis_history.extend(d for d in saved_history if isinstance(d, dict))
-            saved_diagnosis = resume_ckpt.get('curve_diagnosis')
+            saved_diagnosis = resume_ckpt.get("curve_diagnosis")
             if isinstance(saved_diagnosis, dict):
                 last_diagnosis = saved_diagnosis
         n_nonfinite_losses = 0
@@ -886,40 +917,40 @@ def main():
                     return max(0, int(value))
                 return 0
 
-            n_nonfinite_losses = _saved_count('n_nonfinite_losses')
-            n_nonfinite_gradients = _saved_count('n_nonfinite_gradients')
-            n_nonfinite_val_losses = _saved_count('n_nonfinite_val_losses')
-            nonfinite_streak = _saved_count('nonfinite_streak')
-            nonfinite_val_streak = _saved_count('nonfinite_val_streak')
+            n_nonfinite_losses = _saved_count("n_nonfinite_losses")
+            n_nonfinite_gradients = _saved_count("n_nonfinite_gradients")
+            n_nonfinite_val_losses = _saved_count("n_nonfinite_val_losses")
+            nonfinite_streak = _saved_count("nonfinite_streak")
+            nonfinite_val_streak = _saved_count("nonfinite_val_streak")
             if (n_nonfinite_losses or n_nonfinite_gradients
                     or n_nonfinite_val_losses):
-                print('[resume] restored non-finite event counts: '
-                      f'losses={n_nonfinite_losses}, gradients={n_nonfinite_gradients}, '
-                      f'validation={n_nonfinite_val_losses}')
+                print("[resume] restored non-finite event counts: "
+                      f"losses={n_nonfinite_losses}, gradients={n_nonfinite_gradients}, "
+                      f"validation={n_nonfinite_val_losses}")
 
         def _curve_checkpoint_fields() -> dict:
             return {
-                'train_window': list(train_window),
-                'curve_train': list(curve_train),
-                'curve_val': list(curve_val),
-                'curve_val_stderr': list(curve_val_stderr),
-                'curve_steps': list(curve_steps),
-                'curve_diagnosis': last_diagnosis,
-                'curve_diagnosis_history': list(diagnosis_history),
-                'last_val_loss': last_val_loss,
-                'last_val_step': last_val_step,
-                'last_val_stderr': last_val_stderr,
-                'last_val_batches': list(last_val_batches),
-                'best_val_loss': (float(best_val_loss)
+                "train_window": list(train_window),
+                "curve_train": list(curve_train),
+                "curve_val": list(curve_val),
+                "curve_val_stderr": list(curve_val_stderr),
+                "curve_steps": list(curve_steps),
+                "curve_diagnosis": last_diagnosis,
+                "curve_diagnosis_history": list(diagnosis_history),
+                "last_val_loss": last_val_loss,
+                "last_val_step": last_val_step,
+                "last_val_stderr": last_val_stderr,
+                "last_val_batches": list(last_val_batches),
+                "best_val_loss": (float(best_val_loss)
                                   if math.isfinite(best_val_loss) else None),
-                'best_val_step': int(best_val_step),
-                'val_batches_consumed': int(val_state.get('batches_consumed', 0)),
-                'n_nonfinite_losses': int(n_nonfinite_losses),
-                'n_nonfinite_gradients': int(n_nonfinite_gradients),
-                'n_nonfinite_val_losses': int(n_nonfinite_val_losses),
-                'nonfinite_streak': int(nonfinite_streak),
-                'nonfinite_val_streak': int(nonfinite_val_streak),
-                'data_ledgers': run_ledgers,
+                "best_val_step": int(best_val_step),
+                "val_batches_consumed": int(val_state.get("batches_consumed", 0)),
+                "n_nonfinite_losses": int(n_nonfinite_losses),
+                "n_nonfinite_gradients": int(n_nonfinite_gradients),
+                "n_nonfinite_val_losses": int(n_nonfinite_val_losses),
+                "nonfinite_streak": int(nonfinite_streak),
+                "nonfinite_val_streak": int(nonfinite_val_streak),
+                "data_ledgers": run_ledgers,
             }
 
         def _triage_nonfinite(kind: str, step: int, x_bad, y_bad, bad_value: float,
@@ -937,16 +968,16 @@ def main():
             nonlocal n_nonfinite_losses, n_nonfinite_gradients
             nonlocal n_nonfinite_val_losses, nonfinite_streak
             nonlocal nonfinite_val_streak
-            if kind == 'loss':
+            if kind == "loss":
                 n_nonfinite_losses += 1
                 nonfinite_streak += 1
-            elif kind == 'gradient':
+            elif kind == "gradient":
                 n_nonfinite_gradients += 1
                 nonfinite_streak += 1
             else:
                 n_nonfinite_val_losses += 1
                 nonfinite_val_streak += 1
-            lr_now = opt.param_groups[0]['lr']
+            lr_now = opt.param_groups[0]["lr"]
             was_training = model.training
             if eval_mode:
                 # A held-out point was measured without dropout; re-running the
@@ -956,7 +987,7 @@ def main():
             try:
                 triage = triage_nonfinite(
                     model, x_bad, y_bad,
-                    autocast_dtype=dtype if (args.bf16 and device == 'cuda') else None,
+                    autocast_dtype=dtype if (args.bf16 and device == "cuda") else None,
                     device_type=device,
                     lr=lr_now, grad_clip=args.grad_clip,
                 )
@@ -964,29 +995,29 @@ def main():
                 if eval_mode:
                     model.train(was_training)
             print(f'[nan] step={step + 1} {kind}={bad_value} -> triage stage={triage["stage"]}: {triage["diagnosis"]}', flush=True)
-            for line in triage['recommendations']:
-                print(f'[nan]   fix: {line}')
+            for line in triage["recommendations"]:
+                print(f"[nan]   fix: {line}")
             opt.zero_grad(set_to_none=True)
             event = {
-                'step': step + 1, 'event': f'nonfinite_{kind}', 'value': bad_value,
-                'lr': lr_now, 'triage_stage': triage['stage'],
-                'triage_diagnosis': triage['diagnosis'],
-                'triage_evidence': triage['evidence'],
-                'n_nonfinite_losses': n_nonfinite_losses,
-                'n_nonfinite_gradients': n_nonfinite_gradients,
-                'n_nonfinite_val_losses': n_nonfinite_val_losses,
+                "step": step + 1, "event": f"nonfinite_{kind}", "value": bad_value,
+                "lr": lr_now, "triage_stage": triage["stage"],
+                "triage_diagnosis": triage["diagnosis"],
+                "triage_evidence": triage["evidence"],
+                "n_nonfinite_losses": n_nonfinite_losses,
+                "n_nonfinite_gradients": n_nonfinite_gradients,
+                "n_nonfinite_val_losses": n_nonfinite_val_losses,
             }
             if extra:
                 event.update(extra)
-            log_file.write(json.dumps(event, default=str) + '\n')
+            log_file.write(json.dumps(event, default=str) + "\n")
             log_file.flush()
-            if (args.nonfinite_policy == 'abort'
+            if (args.nonfinite_policy == "abort"
                     or nonfinite_streak >= 5 or nonfinite_val_streak >= 5):
                 where = {
-                    'loss': 'the training loss',
-                    'gradient': 'the gradients after the backward pass',
-                    'validation_loss': 'a held-out validation loss',
-                    'test_loss': 'the sealed test loss',
+                    "loss": "the training loss",
+                    "gradient": "the gradients after the backward pass",
+                    "validation_loss": "a held-out validation loss",
+                    "test_loss": "the sealed test loss",
                 }.get(kind, kind)
                 raise SystemExit(
                     f'[nan] aborting at step {step + 1}: {where} is non-finite and the triage '
@@ -994,8 +1025,8 @@ def main():
                     f'Fix it (or raise --grad-clip / lower --lr) before resuming from the '
                     f'last checkpoint; see the [nan] recommendations above.'
                 )
-            what = 'step' if kind in ('loss', 'gradient') else 'held-out point'
-            print(f'[nan] policy=skip: discarding this {what} (no metric/optimizer update)', flush=True)
+            what = "step" if kind in ("loss", "gradient") else "held-out point"
+            print(f"[nan] policy=skip: discarding this {what} (no metric/optimizer update)", flush=True)
             return triage
 
         while step < args.max_steps:
@@ -1006,9 +1037,9 @@ def main():
                 # `val_loader` to be created would train another whole
                 # validation interval, past the point where the uninterrupted
                 # run stopped.
-                print(f'[early-stop] restored streak {val_checks_without_improvement} '
-                      f'>= patience {args.early_stop_patience} at step {step}; '
-                      'stopping without another update')
+                print(f"[early-stop] restored streak {val_checks_without_improvement} "
+                      f">= patience {args.early_stop_patience} at step {step}; "
+                      "stopping without another update")
                 break
             opt.zero_grad(set_to_none=True)
             attach_stats = (step + 1) % args.stats_every == 0
@@ -1075,7 +1106,7 @@ def main():
                 act_stats.detach()
                 clear_logit_scratch_cache()
             if nonfinite_batch is not None:
-                _triage_nonfinite('loss', step, *nonfinite_batch)
+                _triage_nonfinite("loss", step, *nonfinite_batch)
                 continue
             last_train_loss = loss_val
             # Grad-norm clipping; the value is read only when logging. A
@@ -1091,8 +1122,8 @@ def main():
                 else torch.nn.utils.get_total_norm(model.parameters()))
             if not math.isfinite(grad_norm_check):
                 opt.zero_grad(set_to_none=True)
-                _triage_nonfinite('gradient', step, x, y, loss_val,
-                                  extra={'grad_norm_pre_clip': grad_norm_check})
+                _triage_nonfinite("gradient", step, x, y, loss_val,
+                                  extra={"grad_norm_pre_clip": grad_norm_check})
                 continue
             opt.step()
             nonfinite_streak = 0
@@ -1109,15 +1140,15 @@ def main():
                     and (step % args.val_every == 0 or step == args.max_steps)):
                 if val_loader is None:
                     val_loader = open_validation_split(args)
-                    rval = getattr(val_loader, 'split_report', None)
+                    rval = getattr(val_loader, "split_report", None)
                     if rval:
-                        data_reports['validation'] = rval
-                        print(f'[data] validation split: {rval}')
-                if val_state.get('resume_skip'):
+                        data_reports["validation"] = rval
+                        print(f"[data] validation split: {rval}")
+                if val_state.get("resume_skip"):
                     _fast_forward_validation_stream(val_loader, val_state)
                 val_batch_losses: list = []
                 val_loss = evaluate_heldout(model, val_loader, val_state, args.val_batches, ctx, device, collect=val_batch_losses)
-                reused = val_state.get('last_eval_reused')
+                reused = val_state.get("last_eval_reused")
                 if reused:
                     # The pass re-measured at least one held-out window, so
                     # its collected losses are not independent draws. Keep the
@@ -1126,19 +1157,19 @@ def main():
                     # repeated passes also turns best_val_loss into a maximum
                     # over reused data.
                     val_reuse_events += 1
-                    unique = val_state.get('last_eval_unique_batches')
+                    unique = val_state.get("last_eval_unique_batches")
                     message = (
-                        f'[val][warn] step={step} requested {args.val_batches} '
-                        f'held-out batches but the loader revisited a window: '
-                        f'only {unique} distinct batch(es) were seen. The '
-                        'per-batch stderr and the selected-checkpoint minimum '
-                        'are therefore optimistic. Lower --val-batches or '
-                        'enlarge the validation slice')
+                        f"[val][warn] step={step} requested {args.val_batches} "
+                        f"held-out batches but the loader revisited a window: "
+                        f"only {unique} distinct batch(es) were seen. The "
+                        "per-batch stderr and the selected-checkpoint minimum "
+                        "are therefore optimistic. Lower --val-batches or "
+                        "enlarge the validation slice")
                     if args.fail_on_eval_reuse:
                         raise SystemExit(
-                            f'{message} (--fail-on-eval-reuse). Run '
-                            f'scripts/audit_data.py --fail-on-eval-reuse with the '
-                            'same split/eval settings before the next run.')
+                            f"{message} (--fail-on-eval-reuse). Run "
+                            f"scripts/audit_data.py --fail-on-eval-reuse with the "
+                            "same split/eval settings before the next run.")
                     if val_reuse_events == 1:
                         print(message, file=sys.stderr)
                 if val_loss is None:
@@ -1147,23 +1178,23 @@ def main():
                     # save no best checkpoint), so fail before continuing a run
                     # whose model-selection protocol is already void.
                     raise SystemExit(
-                        f'[val] the validation split produced no batches, so checkpoint selection is '
-                        f'impossible; refusing to continue without a held-out signal. Likely causes: '
-                        f'--num-documents={args.num_documents} is larger than the actual stream (the '
-                        f'chronological boundary points past its end), the dataset/tokenizer revision '
-                        f'changed, or the split fractions leave validation empty. Verify the split '
-                        f'layout with scripts/audit_data.py before re-running.')
+                        f"[val] the validation split produced no batches, so checkpoint selection is "
+                        f"impossible; refusing to continue without a held-out signal. Likely causes: "
+                        f"--num-documents={args.num_documents} is larger than the actual stream (the "
+                        f"chronological boundary points past its end), the dataset/tokenizer revision "
+                        f"changed, or the split fractions leave validation empty. Verify the split "
+                        f"layout with scripts/audit_data.py before re-running.")
                 if val_loss is not None and not math.isfinite(val_loss):
                     # A NaN/Inf held-out mean is a result-analysis failure,
                     # not a number to plot: triage the actual validation
                     # batch through the same ordered path as a training NaN.
-                    bad_val = val_state.get('nonfinite_batch')
+                    bad_val = val_state.get("nonfinite_batch")
                     if bad_val is None:
                         raise SystemExit(
-                            f'[val] step={step} held-out loss is non-finite ({val_loss}) but the '
-                            'offending batch was not captured; refuse to select a checkpoint '
-                            'or extend the curve with a corrupted number.')
-                    _triage_nonfinite('validation_loss', step, *bad_val, eval_mode=True)
+                            f"[val] step={step} held-out loss is non-finite ({val_loss}) but the "
+                            "offending batch was not captured; refuse to select a checkpoint "
+                            "or extend the curve with a corrupted number.")
+                    _triage_nonfinite("validation_loss", step, *bad_val, eval_mode=True)
                     val_loss = None
                 if val_loss is not None:
                     nonfinite_val_streak = 0
@@ -1177,8 +1208,8 @@ def main():
                     # noise estimate at all, so its stderr stays None rather
                     # than a falsely confident 0.
                     val_batch_stats = mean_std_stderr(val_batch_losses)
-                    val_stderr = (val_batch_stats['stderr']
-                                  if val_batch_stats and val_batch_stats['n'] >= 2 else None)
+                    val_stderr = (val_batch_stats["stderr"]
+                                  if val_batch_stats and val_batch_stats["n"] >= 2 else None)
                     last_val_stderr = val_stderr
                     improved = val_loss < best_val_loss
                     if improved:
@@ -1187,12 +1218,12 @@ def main():
                         val_checks_without_improvement = 0
                     else:
                         val_checks_without_improvement += 1
-                    noise_str = '' if val_stderr is None else f' +/- {val_stderr:.4f}'
-                    print(f'[val] step={step} val_loss={val_loss:.4f}{noise_str} best={best_val_loss:.4f}@{best_val_step} (no improvement x{val_checks_without_improvement})', flush=True)
+                    noise_str = "" if val_stderr is None else f" +/- {val_stderr:.4f}"
+                    print(f"[val] step={step} val_loss={val_loss:.4f}{noise_str} best={best_val_loss:.4f}@{best_val_step} (no improvement x{val_checks_without_improvement})", flush=True)
                     if tb:
-                        tb.add_scalar('val/loss', val_loss, step)
+                        tb.add_scalar("val/loss", val_loss, step)
                         if val_stderr is not None:
-                            tb.add_scalar('val/stderr', val_stderr, step)
+                            tb.add_scalar("val/stderr", val_stderr, step)
                     # Curve diagnosis: pair the held-out point with the mean
                     # training loss over the interval it covers, then classify the
                     # regime (overfit / underfit / diverging / healthy) and print
@@ -1209,18 +1240,18 @@ def main():
                         val_stderr=curve_val_stderr,
                     )
                     diagnosis_history.append({
-                        'step': step,
-                        'classification': last_diagnosis['classification'],
-                        'train_trend': last_diagnosis['train_trend'],
-                        'val_trend': last_diagnosis['val_trend'],
-                        'train_relative_change': last_diagnosis['train_relative_change'],
-                        'val_relative_change': last_diagnosis['val_relative_change'],
-                        'generalization_gap': last_diagnosis['generalization_gap'],
-                        'val_stderr': val_stderr,
-                        'val_noise_threshold': last_diagnosis['evidence'].get('val_noise_threshold'),
-                        'val_change_within_noise': last_diagnosis['evidence'].get('val_change_within_noise'),
-                        'gap_change_within_noise': last_diagnosis['evidence'].get('gap_change_within_noise'),
-                        'recommendations': last_diagnosis['recommendations'],
+                        "step": step,
+                        "classification": last_diagnosis["classification"],
+                        "train_trend": last_diagnosis["train_trend"],
+                        "val_trend": last_diagnosis["val_trend"],
+                        "train_relative_change": last_diagnosis["train_relative_change"],
+                        "val_relative_change": last_diagnosis["val_relative_change"],
+                        "generalization_gap": last_diagnosis["generalization_gap"],
+                        "val_stderr": val_stderr,
+                        "val_noise_threshold": last_diagnosis["evidence"].get("val_noise_threshold"),
+                        "val_change_within_noise": last_diagnosis["evidence"].get("val_change_within_noise"),
+                        "gap_change_within_noise": last_diagnosis["evidence"].get("gap_change_within_noise"),
+                        "recommendations": last_diagnosis["recommendations"],
                     })
                     # Save after the curve update, not before it: a checkpoint
                     # must contain the validation point it was selected on and
@@ -1228,47 +1259,47 @@ def main():
                     # would make a resume replay the previous interval's losses
                     # into the next curve point (double counting).
                     if improved:
-                        ckpt_best = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_loss': val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance, **_curve_checkpoint_fields()}
-                        path = Path(args.output_dir) / 'ckpt_best.pt'
+                        ckpt_best = {"step": step, "model": model.state_dict(), "optimizer": opt.state_dict(), "scheduler": sched.state_dict(), "args": vars(args), "loss_spike": loss_spike.state_dict(), "val_loss": val_loss, "val_checks_without_improvement": val_checks_without_improvement, "data_position": batches_consumed, "rng_state": _snapshot_rng_state(), "provenance": provenance, **_curve_checkpoint_fields()}
+                        path = Path(args.output_dir) / "ckpt_best.pt"
                         _assert_checkpoint_finite(model, opt, path, step)
                         _atomic_torch_save(ckpt_best, path)
-                        print(f'[ckpt] saved {path} (val_loss={val_loss:.4f})')
+                        print(f"[ckpt] saved {path} (val_loss={val_loss:.4f})")
                     print(f"[curve] step={step} train_window={train_point:.4f} val={val_loss:.4f}{noise_str} "
                           f"-> {last_diagnosis['classification']} "
                           f"(train {last_diagnosis['train_trend']}, val {last_diagnosis['val_trend']})", flush=True)
-                    if last_diagnosis['classification'] not in ('healthy', 'insufficient_data'):
-                        for line in last_diagnosis['recommendations']:
-                            print(f'[curve]   action: {line}')
+                    if last_diagnosis["classification"] not in ("healthy", "insufficient_data"):
+                        for line in last_diagnosis["recommendations"]:
+                            print(f"[curve]   action: {line}")
                     if tb:
-                        tb.add_scalar('curve/train_window_loss', train_point, step)
-                        tb.add_scalar('curve/generalization_gap', last_diagnosis['generalization_gap'] or 0.0, step)
+                        tb.add_scalar("curve/train_window_loss", train_point, step)
+                        tb.add_scalar("curve/generalization_gap", last_diagnosis["generalization_gap"] or 0.0, step)
                         if val_stderr is not None:
-                            tb.add_scalar('curve/val_stderr', val_stderr, step)
+                            tb.add_scalar("curve/val_stderr", val_stderr, step)
             if step % args.log_every == 0:
-                lr = opt.param_groups[0]['lr']
+                lr = opt.param_groups[0]["lr"]
                 grad_norm = float(grad_norm_t) if grad_norm_t is not None else None
-                line = f'step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}'
+                line = f"step={step:>6d} loss={loss_val:8.4f} lr={lr:.2e}"
                 if grad_norm is not None:
-                    line += f' grad_norm={grad_norm:.3f}'
+                    line += f" grad_norm={grad_norm:.3f}"
                 print(line, flush=True)
-                row = {'step': step, 'loss': loss_val, 'lr': lr, 'n_loss_spikes': loss_spike.n_spikes}
+                row = {"step": step, "loss": loss_val, "lr": lr, "n_loss_spikes": loss_spike.n_spikes}
                 if grad_norm is not None:
-                    row['grad_norm'] = grad_norm
+                    row["grad_norm"] = grad_norm
                 if last_val_loss is not None:
-                    row['val_loss'] = last_val_loss
+                    row["val_loss"] = last_val_loss
                     if last_val_stderr is not None:
-                        row['val_stderr'] = last_val_stderr
+                        row["val_stderr"] = last_val_stderr
                 if last_diagnosis is not None:
-                    row['curve_classification'] = last_diagnosis['classification']
-                    row['curve_train_trend'] = last_diagnosis['train_trend']
-                    row['curve_val_trend'] = last_diagnosis['val_trend']
-                log_file.write(json.dumps(row) + '\n')
+                    row["curve_classification"] = last_diagnosis["classification"]
+                    row["curve_train_trend"] = last_diagnosis["train_trend"]
+                    row["curve_val_trend"] = last_diagnosis["val_trend"]
+                log_file.write(json.dumps(row) + "\n")
                 if tb:
-                    tb.add_scalar('train/loss', loss_val, step)
-                    tb.add_scalar('train/lr', lr, step)
-                    tb.add_scalar('train/n_loss_spikes', loss_spike.n_spikes, step)
+                    tb.add_scalar("train/loss", loss_val, step)
+                    tb.add_scalar("train/lr", lr, step)
+                    tb.add_scalar("train/n_loss_spikes", loss_spike.n_spikes, step)
                     if grad_norm is not None:
-                        tb.add_scalar('train/grad_norm_pre_clip', grad_norm, step)
+                        tb.add_scalar("train/grad_norm_pre_clip", grad_norm, step)
                 if args.wandb_project:
                     import wandb
                     wandb.log(row, step=step)
@@ -1276,45 +1307,45 @@ def main():
                 stats = act_stats.summary()
                 print(f"[stats] {stats.get('__summary__', {})}")
                 if tb:
-                    s = stats.get('__summary__', {})
+                    s = stats.get("__summary__", {})
                     for k, v in s.items():
-                        tb.add_scalar(f'stats/{k}', v, step)
+                        tb.add_scalar(f"stats/{k}", v, step)
             if step % args.save_every == 0 and step > 0:
-                ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'loss_spike': loss_spike.state_dict(), 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance, **_curve_checkpoint_fields()}
-                path = Path(args.output_dir) / f'ckpt_{step:06d}.pt'
+                ckpt = {"step": step, "model": model.state_dict(), "optimizer": opt.state_dict(), "scheduler": sched.state_dict(), "args": vars(args), "loss_spike": loss_spike.state_dict(), "val_checks_without_improvement": val_checks_without_improvement, "data_position": batches_consumed, "rng_state": _snapshot_rng_state(), "provenance": provenance, **_curve_checkpoint_fields()}
+                path = Path(args.output_dir) / f"ckpt_{step:06d}.pt"
                 _assert_checkpoint_finite(model, opt, path, step)
                 _atomic_torch_save(ckpt, path)
-                print(f'[ckpt] saved {path}')
+                print(f"[ckpt] saved {path}")
             if args.early_stop_patience > 0 and val_loader is not None and val_checks_without_improvement >= args.early_stop_patience:
-                print(f'[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}')
+                print(f"[early-stop] validation did not improve for {val_checks_without_improvement} checks (best val_loss={best_val_loss:.4f}@{best_val_step}); stopping at step {step}")
                 break
-        ckpt = {'step': step, 'model': model.state_dict(), 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict(), 'args': vars(args), 'n_loss_spikes': loss_spike.n_spikes, 'loss_spike': loss_spike.state_dict(), 'val_loss': last_val_loss, 'val_checks_without_improvement': val_checks_without_improvement, 'data_position': batches_consumed, 'rng_state': _snapshot_rng_state(), 'provenance': provenance, **_curve_checkpoint_fields()}
-        path = Path(args.output_dir) / 'ckpt_final.pt'
+        ckpt = {"step": step, "model": model.state_dict(), "optimizer": opt.state_dict(), "scheduler": sched.state_dict(), "args": vars(args), "n_loss_spikes": loss_spike.n_spikes, "loss_spike": loss_spike.state_dict(), "val_loss": last_val_loss, "val_checks_without_improvement": val_checks_without_improvement, "data_position": batches_consumed, "rng_state": _snapshot_rng_state(), "provenance": provenance, **_curve_checkpoint_fields()}
+        path = Path(args.output_dir) / "ckpt_final.pt"
         _assert_checkpoint_finite(model, opt, path, step)
         _atomic_torch_save(ckpt, path)
-        print(f'[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s')
-        run_manifest['data']['split_reports'] = data_reports
+        print(f"[done] saved final ckpt to {path}, time = {time.time() - t0:.1f}s")
+        run_manifest["data"]["split_reports"] = data_reports
         # Data-budget provenance for the held-out evaluation: a validation
         # stderr is only interpretable if the pass saw as many distinct
         # batches as it advertises. `unique < requested` means the loader
         # cycled and the collected losses are not independent draws.
         if stream_fp is not None:
-            run_manifest['data']['train_stream'] = stream_fp.record()
-        run_manifest['data']['heldout_eval'] = {
-            'validation_batches_requested': int(args.val_batches),
-            'validation_batches_unique_last_pass': val_state.get('last_eval_unique_batches'),
-            'validation_batches_cycled_last_pass': bool(val_state.get('last_eval_cycled')),
-            'validation_batches_reused_last_pass': val_state.get('last_eval_reused'),
-            'validation_batch_reuse_events': int(val_reuse_events),
-            'validation_passes': len(curve_val),
-            'validation_every_steps': int(args.val_every),
+            run_manifest["data"]["train_stream"] = stream_fp.record()
+        run_manifest["data"]["heldout_eval"] = {
+            "validation_batches_requested": int(args.val_batches),
+            "validation_batches_unique_last_pass": val_state.get("last_eval_unique_batches"),
+            "validation_batches_cycled_last_pass": bool(val_state.get("last_eval_cycled")),
+            "validation_batches_reused_last_pass": val_state.get("last_eval_reused"),
+            "validation_batch_reuse_events": int(val_reuse_events),
+            "validation_passes": len(curve_val),
+            "validation_every_steps": int(args.val_every),
         }
-        run_manifest['status'] = 'finished'
-        run_manifest['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        run_manifest["status"] = "finished"
+        run_manifest["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         flops = analytic_flops_per_token(model.cfg, seq_len=args.seq_len)
         final_val_stats = mean_ci(last_val_batches) if last_val_batches else None
         elapsed_s = time.time() - t0
-        if device == 'cuda':
+        if device == "cuda":
             peak_device_memory_mb = float(
                 torch.cuda.max_memory_allocated(device)) / (1024 ** 2)
         if (last_val_loss is None and resume_ckpt is not None
@@ -1323,23 +1354,23 @@ def main():
             # no update and opens no validation loader, but the checkpoint's
             # weights are exactly the ones validated at this step. Keep that
             # known held-out number instead of reporting final_val_loss=None.
-            resumed_val = resume_ckpt.get('val_loss')
+            resumed_val = resume_ckpt.get("val_loss")
             if _is_finite_number(resumed_val):
                 last_val_loss = float(resumed_val)
                 last_val_step = step
         has_best_val = math.isfinite(best_val_loss)
-        best_ckpt_path = Path(args.output_dir) / 'ckpt_best.pt'
+        best_ckpt_path = Path(args.output_dir) / "ckpt_best.pt"
         if has_best_val and not best_ckpt_path.exists():
             # A best validation number without the weights it selected cannot
             # back a test/evaluation restore; report it as missing rather than
             # letting the final checkpoint masquerade as the best one.
-            print(f'[warn] best_val_loss={best_val_loss:.4f} has no {best_ckpt_path.name} '
-                  'artifact in this output directory; not reporting it as a selected '
-                  'checkpoint', file=sys.stderr)
+            print(f"[warn] best_val_loss={best_val_loss:.4f} has no {best_ckpt_path.name} "
+                  "artifact in this output directory; not reporting it as a selected "
+                  "checkpoint", file=sys.stderr)
             has_best_val = False
-        run_manifest['results'] = {
-            'final_step': step,
-            'last_train_loss': last_train_loss,
+        run_manifest["results"] = {
+            "final_step": step,
+            "last_train_loss": last_train_loss,
             # `best_val_loss` is the minimum over the validation passes: it is the
             # checkpoint-selection statistic, so as a reported generalization
             # estimate it is optimistically biased (the minimum of noisy draws).
@@ -1351,74 +1382,74 @@ def main():
             # so do not erase it merely because this process did not open a
             # validation loader; future arms are compared on the final pass,
             # which remains None until an actual pass has been run.
-            'best_val_loss': best_val_loss if has_best_val else None,
-            'best_val_step': best_val_step if has_best_val else None,
-            'final_val_loss': last_val_loss,
-            'final_val_step': last_val_step,
+            "best_val_loss": best_val_loss if has_best_val else None,
+            "best_val_step": best_val_step if has_best_val else None,
+            "final_val_loss": last_val_loss,
+            "final_val_step": last_val_step,
             # The final pass is a sample mean over batches: its standard error and
             # interval are the resolution of the number quoted above. A delta
             # smaller than the stderr is not evidence of a difference.
-            'final_val_loss_n_batches': len(last_val_batches),
+            "final_val_loss_n_batches": len(last_val_batches),
             # How many of those batch losses were distinct held-out windows:
             # when this is below `final_val_loss_n_batches` the stderr above
             # treats repeated windows as independent draws.
-            'final_val_loss_unique_batches': val_state.get('last_eval_unique_batches'),
-            'final_val_loss_reused_batches': val_state.get('last_eval_reused'),
-            'validation_batch_reuse_events': val_reuse_events,
-            'final_val_loss_std': final_val_stats['std'] if final_val_stats else None,
-            'final_val_loss_stderr': final_val_stats['stderr'] if final_val_stats else None,
-            'final_val_loss_ci_level': final_val_stats['ci_level'] if final_val_stats else None,
-            'final_val_loss_ci_low': final_val_stats['ci_low'] if final_val_stats else None,
-            'final_val_loss_ci_high': final_val_stats['ci_high'] if final_val_stats else None,
-            'n_loss_spikes': loss_spike.n_spikes,
-            'n_nonfinite_losses': n_nonfinite_losses,
-            'n_nonfinite_gradients': n_nonfinite_gradients,
-            'n_nonfinite_val_losses': n_nonfinite_val_losses,
-            'elapsed_s': elapsed_s,
+            "final_val_loss_unique_batches": val_state.get("last_eval_unique_batches"),
+            "final_val_loss_reused_batches": val_state.get("last_eval_reused"),
+            "validation_batch_reuse_events": val_reuse_events,
+            "final_val_loss_std": final_val_stats["std"] if final_val_stats else None,
+            "final_val_loss_stderr": final_val_stats["stderr"] if final_val_stats else None,
+            "final_val_loss_ci_level": final_val_stats["ci_level"] if final_val_stats else None,
+            "final_val_loss_ci_low": final_val_stats["ci_low"] if final_val_stats else None,
+            "final_val_loss_ci_high": final_val_stats["ci_high"] if final_val_stats else None,
+            "n_loss_spikes": loss_spike.n_spikes,
+            "n_nonfinite_losses": n_nonfinite_losses,
+            "n_nonfinite_gradients": n_nonfinite_gradients,
+            "n_nonfinite_val_losses": n_nonfinite_val_losses,
+            "elapsed_s": elapsed_s,
             # Measured cost travels with the accuracy numbers: a loss delta is
             # not interpretable without the throughput / memory it bought.
-            'tokens_processed_this_run': tokens_processed,
-            'tokens_consumed_total': int(batches_consumed) * int(args.batch_size) * int(args.seq_len),
-            'tokens_per_second': (tokens_processed / elapsed_s) if elapsed_s > 0 else None,
-            'peak_device_memory_mb': peak_device_memory_mb,
+            "tokens_processed_this_run": tokens_processed,
+            "tokens_consumed_total": int(batches_consumed) * int(args.batch_size) * int(args.seq_len),
+            "tokens_per_second": (tokens_processed / elapsed_s) if elapsed_s > 0 else None,
+            "peak_device_memory_mb": peak_device_memory_mb,
             # Curve monitoring: the full (train window, val) pairs and the latest
             # classification, so a reviewer can read the regime, not just the end.
-            'curve_train_window_loss': curve_train,
-            'curve_val_loss': curve_val,
-            'curve_val_stderr': curve_val_stderr,
-            'curve_steps': curve_steps,
-            'curve_diagnosis': last_diagnosis,
-            'curve_diagnosis_history': diagnosis_history,
-            'val_batches_consumed': int(val_state.get('batches_consumed', 0)),
+            "curve_train_window_loss": curve_train,
+            "curve_val_loss": curve_val,
+            "curve_val_stderr": curve_val_stderr,
+            "curve_steps": curve_steps,
+            "curve_diagnosis": last_diagnosis,
+            "curve_diagnosis_history": diagnosis_history,
+            "val_batches_consumed": int(val_state.get("batches_consumed", 0)),
             # Model accounting travels with the accuracy numbers.
-            'n_params': n_params,
-            'n_trainable': n_trainable,
+            "n_params": n_params,
+            "n_trainable": n_trainable,
             # Shape accounting: the depth sweep scales dim/heads with depth to hold
             # parameters ~constant, so "depth" is really a depth+width trade-off
             # there. Recording the shape next to the loss keeps that covariance
             # visible in every aggregate instead of inferable only from launcher
             # env vars.
-            'n_layers': int(model.cfg.n_layers),
-            'dim': int(model.cfg.dim),
-            'n_heads': int(model.cfg.n_heads),
-            'parameter_breakdown': parameter_breakdown(model),
-            'flops_per_token_forward': flops['forward_per_token'],
-            'flops_per_token_training_est': flops['training_per_token'],
+            "n_layers": int(model.cfg.n_layers),
+            "dim": int(model.cfg.dim),
+            "n_heads": int(model.cfg.n_heads),
+            "parameter_breakdown": parameter_breakdown(model),
+            "flops_per_token_forward": flops["forward_per_token"],
+            "flops_per_token_training_est": flops["training_per_token"],
         }
         # Point the manifest at the files this run actually produced: the log
         # (content hash, it is small) plus the checkpoints (size+mtime). A
         # result is then traceable to the exact curve/weights behind it.
-        run_manifest['artifacts'] = {
-            'train_jsonl': file_fingerprint(log_path),
-            'checkpoint_final': artifact_record(Path(args.output_dir) / 'ckpt_final.pt'),
+        run_manifest["artifacts"] = {
+            "train_jsonl": file_fingerprint(log_path),
+            "checkpoint_final": artifact_record(Path(args.output_dir) / "ckpt_final.pt"),
         }
         if has_best_val and best_ckpt_path.exists():
-            run_manifest['artifacts']['checkpoint_best'] = artifact_record(best_ckpt_path)
+            run_manifest["artifacts"]["checkpoint_best"] = artifact_record(best_ckpt_path)
         if n_nonfinite_losses or n_nonfinite_gradients or n_nonfinite_val_losses:
-            print(f'[warn] non-finite events handled by --nonfinite-policy '
-                  f'{args.nonfinite_policy}: losses={n_nonfinite_losses}, '
-                  f'gradients={n_nonfinite_gradients}, '
-                  f'validation_losses={n_nonfinite_val_losses}; see train.jsonl event rows')
+            print(f"[warn] non-finite events handled by --nonfinite-policy "
+                  f"{args.nonfinite_policy}: losses={n_nonfinite_losses}, "
+                  f"gradients={n_nonfinite_gradients}, "
+                  f"validation_losses={n_nonfinite_val_losses}; see train.jsonl event rows")
         save_run_manifest(manifest_path, run_manifest)
         # Training (and its manifest) is complete from here on: an optional
         # sealed-test evaluation or a tensorboard close failure below must not
@@ -1430,23 +1461,23 @@ def main():
             # Re-running the evaluation in the same output dir would let the test
             # score steer the next attempt, i.e. turn the sealed set into an
             # implicit validation set, so it is refused unless explicitly allowed.
-            out_path = Path(args.output_dir) / 'test_results.json'
+            out_path = Path(args.output_dir) / "test_results.json"
             if out_path.exists() and (not args.allow_test_rerun):
                 raise SystemExit(
-                    f'[test] {out_path} already exists: the sealed test split has already been '
-                    'evaluated once for this run, and scoring it again would turn it into an '
-                    'implicit validation set. Pass --allow-test-rerun only if you accept that '
-                    'the seal is broken.')
+                    f"[test] {out_path} already exists: the sealed test split has already been "
+                    "evaluated once for this run, and scoring it again would turn it into an "
+                    "implicit validation set. Pass --allow-test-rerun only if you accept that "
+                    "the seal is broken.")
             if args.val_every <= 0:
-                print('[test] WARNING: --val-every 0 disables validation-based selection; '
-                      'the sealed test split reports the final model only and must never be '
-                      'used to pick hyperparameters.', file=sys.stderr)
+                print("[test] WARNING: --val-every 0 disables validation-based selection; "
+                      "the sealed test split reports the final model only and must never be "
+                      "used to pick hyperparameters.", file=sys.stderr)
             if args.dataset and args.test_frac > 0:
                 missing_ledgers = []
                 if not args.exclude_hash_file:
-                    missing_ledgers.append('--exclude-hash-file (train<->test duplicates)')
+                    missing_ledgers.append("--exclude-hash-file (train<->test duplicates)")
                 if args.val_frac > 0 and not args.exclude_test_hash_file:
-                    missing_ledgers.append('--exclude-test-hash-file (validation<->test duplicates)')
+                    missing_ledgers.append("--exclude-test-hash-file (validation<->test duplicates)")
                 if args.group_key:
                     if not args.exclude_group_file:
                         missing_ledgers.append(f"--exclude-group-file (train<->test groups on '{args.group_key}')")
@@ -1460,54 +1491,54 @@ def main():
                     # may sit inside it: refuse unless the user explicitly
                     # accepts an unverified, non-held-out number.
                     raise SystemExit(
-                        '[test] refusing the sealed test evaluation: no cross-split '
-                        'ledger supplied, so ' + ' and '.join(missing_ledgers) +
-                        ' are not dropped and the test split is not proven disjoint '
-                        'from train/validation. Build the ledgers with '
-                        'scripts/audit_data.py --write-train-hash-file / '
-                        '--write-val-hash-file (and --write-train-group-file / '
-                        '--write-val-group-file --group-key K for grouped corpora; '
-                        'use --n-docs 0 for full coverage) and pass them to the run. '
-                        'Pass --allow-missing-split-ledgers only to knowingly '
-                        'produce an unverified, non-held-out score.')
+                        "[test] refusing the sealed test evaluation: no cross-split "
+                        "ledger supplied, so " + " and ".join(missing_ledgers) +
+                        " are not dropped and the test split is not proven disjoint "
+                        "from train/validation. Build the ledgers with "
+                        "scripts/audit_data.py --write-train-hash-file / "
+                        "--write-val-hash-file (and --write-train-group-file / "
+                        "--write-val-group-file --group-key K for grouped corpora; "
+                        "use --n-docs 0 for full coverage) and pass them to the run. "
+                        "Pass --allow-missing-split-ledgers only to knowingly "
+                        "produce an unverified, non-held-out score.")
                 if missing_ledgers:
-                    print('[test] WARNING: no cross-split ledger supplied, so '
-                          + ' and '.join(missing_ledgers) +
-                          ' are not dropped; the sealed test score is NOT a held-out '
-                          'estimate (--allow-missing-split-ledgers).', file=sys.stderr)
-            test_loader = open_data_split('test', args)
-            rtest = getattr(test_loader, 'split_report', None)
+                    print("[test] WARNING: no cross-split ledger supplied, so "
+                          + " and ".join(missing_ledgers) +
+                          " are not dropped; the sealed test score is NOT a held-out "
+                          "estimate (--allow-missing-split-ledgers).", file=sys.stderr)
+            test_loader = open_data_split("test", args)
+            rtest = getattr(test_loader, "split_report", None)
             if rtest:
-                data_reports['test'] = rtest
-                print(f'[data] test split: {rtest}')
-            best_path = Path(args.output_dir) / 'ckpt_best.pt'
+                data_reports["test"] = rtest
+                print(f"[data] test split: {rtest}")
+            best_path = Path(args.output_dir) / "ckpt_best.pt"
             if has_best_val and best_path.exists():
                 best = _load_checkpoint_cpu(best_path)
-                load_model_state_dict(model, best['model'])
-                best_step = int(best.get('step', 0))
-                best_val = float(best.get('val_loss', float('nan')))
+                load_model_state_dict(model, best["model"])
+                best_step = int(best.get("step", 0))
+                best_val = float(best.get("val_loss", float("nan")))
                 # The weights are copied; the optimizer state in the file is
                 # not needed for the test pass.
                 del best
                 print(f"[test] restored best-validation checkpoint (step {best_step}, val_loss={best_val:.4f}) before the one-shot test evaluation")
-            test_state = {'iter': iter(test_loader)}
+            test_state = {"iter": iter(test_loader)}
             test_batch_losses: list = []
             test_loss = evaluate_heldout(model, test_loader, test_state, args.test_batches, ctx, device, collect=test_batch_losses, cycle=False)
             if test_loss is not None and not math.isfinite(test_loss):
-                bad_test = test_state.get('nonfinite_batch')
+                bad_test = test_state.get("nonfinite_batch")
                 if bad_test is None:
                     raise SystemExit(
-                        '[test] the sealed test loss is non-finite but the offending batch was '
-                        'not captured; refusing to write test_results.json so the one-shot seal '
-                        'is not consumed by a corrupted measurement.')
-                _triage_nonfinite('test_loss', step, *bad_test, eval_mode=True)
+                        "[test] the sealed test loss is non-finite but the offending batch was "
+                        "not captured; refusing to write test_results.json so the one-shot seal "
+                        "is not consumed by a corrupted measurement.")
+                _triage_nonfinite("test_loss", step, *bad_test, eval_mode=True)
                 # Even under --nonfinite-policy skip there is no valid number
                 # to write: consuming the seal with NaN would make the final
                 # evaluation unusable and block a clean re-run.
                 raise SystemExit(
-                    '[test] the sealed test loss is non-finite; test_results.json was not '
-                    'written, so the one-shot seal is still intact. Fix the failure localized '
-                    'by the [nan] triage and re-run the final evaluation.')
+                    "[test] the sealed test loss is non-finite; test_results.json was not "
+                    "written, so the one-shot seal is still intact. Fix the failure localized "
+                    "by the [nan] triage and re-run the final evaluation.")
             if test_loss is None:
                 # Writing test_results.json now would consume the one-shot seal
                 # without any measurement: the next run would refuse to evaluate
@@ -1515,14 +1546,14 @@ def main():
                 # number was ever produced. Refuse instead, and leave the seal
                 # intact so the fixed data configuration can be re-evaluated once.
                 raise SystemExit(
-                    '[test] the sealed test split produced no batches; refusing to write '
-                    'test_results.json so the one-shot seal is not consumed by a void '
-                    'evaluation. Check that --num-documents matches the dataset and that the '
-                    'dataset/tokenizer revisions still resolve, then re-run.')
+                    "[test] the sealed test split produced no batches; refusing to write "
+                    "test_results.json so the one-shot seal is not consumed by a void "
+                    "evaluation. Check that --num-documents matches the dataset and that the "
+                    "dataset/tokenizer revisions still resolve, then re-run.")
             if len(test_batch_losses) < args.test_batches:
-                print(f'[test] WARNING: only {len(test_batch_losses)} of the requested '
-                      f'{args.test_batches} test batches were available; the mean and interval '
-                      f'rest on {len(test_batch_losses)} batch(es).', file=sys.stderr)
+                print(f"[test] WARNING: only {len(test_batch_losses)} of the requested "
+                      f"{args.test_batches} test batches were available; the mean and interval "
+                      f"rest on {len(test_batch_losses)} batch(es).", file=sys.stderr)
             test_stats = mean_ci(test_batch_losses)
             # The per-batch losses are kept, not just their mean: they are the
             # resolution of the headline number and, because the held-out loader
@@ -1530,63 +1561,63 @@ def main():
             # same sealed segments - which is what makes their difference a paired
             # sample (`scripts/compare_sealed_tests.py` enforces exactly this).
             pairing = {
-                'dataset': args.dataset, 'dataset_config': args.dataset_config,
-                'dataset_revision': args.dataset_revision,
-                'dataset_revision_resolved': (rtest or {}).get('dataset_revision_resolved'),
-                'tokenizer': args.tokenizer, 'tokenizer_revision': args.tokenizer_revision,
-                'tokenizer_revision_resolved': (rtest or {}).get('tokenizer_revision_resolved'),
-                'num_documents': args.num_documents,
-                'val_frac': args.val_frac, 'test_frac': args.test_frac,
-                'dedup': args.dedup,
-                'min_doc_chars': args.min_doc_chars, 'max_doc_chars': args.max_doc_chars,
-                'exclude_hash_file': args.exclude_hash_file,
-                'exclude_test_hash_file': args.exclude_test_hash_file,
-                'group_key': args.group_key,
-                'exclude_group_file': args.exclude_group_file,
-                'exclude_test_group_file': args.exclude_test_group_file,
-                'ledger_fingerprints': {
-                    'exclude_hash_file': _ledger_identity(args.exclude_hash_file),
-                    'exclude_test_hash_file': _ledger_identity(args.exclude_test_hash_file),
-                    'exclude_group_file': _ledger_identity(args.exclude_group_file),
-                    'exclude_test_group_file': _ledger_identity(args.exclude_test_group_file),
+                "dataset": args.dataset, "dataset_config": args.dataset_config,
+                "dataset_revision": args.dataset_revision,
+                "dataset_revision_resolved": (rtest or {}).get("dataset_revision_resolved"),
+                "tokenizer": args.tokenizer, "tokenizer_revision": args.tokenizer_revision,
+                "tokenizer_revision_resolved": (rtest or {}).get("tokenizer_revision_resolved"),
+                "num_documents": args.num_documents,
+                "val_frac": args.val_frac, "test_frac": args.test_frac,
+                "dedup": args.dedup,
+                "min_doc_chars": args.min_doc_chars, "max_doc_chars": args.max_doc_chars,
+                "exclude_hash_file": args.exclude_hash_file,
+                "exclude_test_hash_file": args.exclude_test_hash_file,
+                "group_key": args.group_key,
+                "exclude_group_file": args.exclude_group_file,
+                "exclude_test_group_file": args.exclude_test_group_file,
+                "ledger_fingerprints": {
+                    "exclude_hash_file": _ledger_identity(args.exclude_hash_file),
+                    "exclude_test_hash_file": _ledger_identity(args.exclude_test_hash_file),
+                    "exclude_group_file": _ledger_identity(args.exclude_group_file),
+                    "exclude_test_group_file": _ledger_identity(args.exclude_test_group_file),
                 },
                 # Worker count is part of the sealed-batch identity: a
                 # streaming loader shards documents across workers, so a
                 # different count can change the batch composition.
-                'num_workers': (rtest or {}).get('num_workers', getattr(args, 'num_workers', None)),
-                'batch_size': args.batch_size, 'seq_len': args.seq_len,
+                "num_workers": (rtest or {}).get("num_workers", getattr(args, "num_workers", None)),
+                "batch_size": args.batch_size, "seq_len": args.seq_len,
             }
-            results = {'step': step, 'seed': args.seed, 'model': args.model, 'norm': args.norm, 'best_val_step': best_val_step if has_best_val else None, 'best_val_loss': best_val_loss if has_best_val else None, 'final_val_loss': last_val_loss, 'final_val_step': last_val_step, 'test_loss': test_loss, 'test_batches': args.test_batches, 'test_batches_seen': len(test_batch_losses), 'test_batches_shortfall': max(0, int(args.test_batches) - len(test_batch_losses)), 'test_batch_losses': test_batch_losses, 'test_loss_std': test_stats['std'], 'test_loss_stderr': test_stats['stderr'], 'test_loss_ci_level': test_stats['ci_level'], 'test_loss_ci_low': test_stats['ci_low'], 'test_loss_ci_high': test_stats['ci_high'], 'pairing': pairing, 'num_documents': args.num_documents, 'val_frac': args.val_frac, 'test_frac': args.test_frac, 'exclude_hash_file': args.exclude_hash_file, 'exclude_test_hash_file': args.exclude_test_hash_file, 'group_key': args.group_key, 'exclude_group_file': args.exclude_group_file, 'exclude_test_group_file': args.exclude_test_group_file}
+            results = {"step": step, "seed": args.seed, "model": args.model, "norm": args.norm, "best_val_step": best_val_step if has_best_val else None, "best_val_loss": best_val_loss if has_best_val else None, "final_val_loss": last_val_loss, "final_val_step": last_val_step, "test_loss": test_loss, "test_batches": args.test_batches, "test_batches_seen": len(test_batch_losses), "test_batches_shortfall": max(0, int(args.test_batches) - len(test_batch_losses)), "test_batch_losses": test_batch_losses, "test_loss_std": test_stats["std"], "test_loss_stderr": test_stats["stderr"], "test_loss_ci_level": test_stats["ci_level"], "test_loss_ci_low": test_stats["ci_low"], "test_loss_ci_high": test_stats["ci_high"], "pairing": pairing, "num_documents": args.num_documents, "val_frac": args.val_frac, "test_frac": args.test_frac, "exclude_hash_file": args.exclude_hash_file, "exclude_test_hash_file": args.exclude_test_hash_file, "group_key": args.group_key, "exclude_group_file": args.exclude_group_file, "exclude_test_group_file": args.exclude_test_group_file}
             save_json_atomic(out_path, results)
-            run_manifest.setdefault('artifacts', {})['test_results'] = file_fingerprint(out_path)
-            run_manifest['data']['split_reports'] = data_reports
-            run_manifest['data'].setdefault('heldout_eval', {}).update({
-                'test_batches_requested': int(args.test_batches),
-                'test_batches_observed': len(test_batch_losses),
-                'test_batches_shortfall': max(0, int(args.test_batches) - len(test_batch_losses)),
+            run_manifest.setdefault("artifacts", {})["test_results"] = file_fingerprint(out_path)
+            run_manifest["data"]["split_reports"] = data_reports
+            run_manifest["data"].setdefault("heldout_eval", {}).update({
+                "test_batches_requested": int(args.test_batches),
+                "test_batches_observed": len(test_batch_losses),
+                "test_batches_shortfall": max(0, int(args.test_batches) - len(test_batch_losses)),
                 # The sealed pass never cycles, so observed == unique.
-                'test_batches_unique': len(test_batch_losses),
+                "test_batches_unique": len(test_batch_losses),
             })
-            run_manifest['results']['test_loss'] = test_loss
-            run_manifest['results']['test_loss_n_batches'] = len(test_batch_losses)
-            run_manifest['results']['test_loss_stderr'] = test_stats['stderr']
-            run_manifest['results']['test_loss_ci_level'] = test_stats['ci_level']
-            run_manifest['results']['test_loss_ci_low'] = test_stats['ci_low']
-            run_manifest['results']['test_loss_ci_high'] = test_stats['ci_high']
+            run_manifest["results"]["test_loss"] = test_loss
+            run_manifest["results"]["test_loss_n_batches"] = len(test_batch_losses)
+            run_manifest["results"]["test_loss_stderr"] = test_stats["stderr"]
+            run_manifest["results"]["test_loss_ci_level"] = test_stats["ci_level"]
+            run_manifest["results"]["test_loss_ci_low"] = test_stats["ci_low"]
+            run_manifest["results"]["test_loss_ci_high"] = test_stats["ci_high"]
             save_run_manifest(manifest_path, run_manifest)
-            ci = ('no interval (a single batch has no degrees of freedom)' if test_stats['ci_low'] is None
+            ci = ("no interval (a single batch has no degrees of freedom)" if test_stats["ci_low"] is None
                   else f"{100 * test_stats['ci_level']:.0f}% CI [{test_stats['ci_low']:.4f}, {test_stats['ci_high']:.4f}]")
             print(f'[test] sealed test split evaluated once: test_loss={test_loss:.4f} '
                   f'(n={len(test_batch_losses)} batches, stderr={test_stats["stderr"]:.4f}, {ci}) -> {out_path}')
         if args.error_analysis:
-            best_path = Path(args.output_dir) / 'ckpt_best.pt'
+            best_path = Path(args.output_dir) / "ckpt_best.pt"
             analysis_ckpt = (best_path if has_best_val and best_path.exists()
-                             else Path(args.output_dir) / 'ckpt_final.pt')
+                             else Path(args.output_dir) / "ckpt_final.pt")
             error_analysis = run_error_analysis(args, analysis_ckpt, Path(args.output_dir))
-            run_manifest['results']['error_analysis'] = error_analysis
-            if error_analysis.get('artifact'):
-                run_manifest.setdefault('artifacts', {})[
-                    'error_analysis_validation'] = error_analysis['artifact']
+            run_manifest["results"]["error_analysis"] = error_analysis
+            if error_analysis.get("artifact"):
+                run_manifest.setdefault("artifacts", {})[
+                    "error_analysis_validation"] = error_analysis["artifact"]
             save_run_manifest(manifest_path, run_manifest)
         if tb:
             tb.close()
@@ -1601,22 +1632,22 @@ def main():
             # that looks like a completed run: mark it and persist whatever
             # was known at the time (the step-by-step curve is already in
             # train.jsonl; these fields make the manifest point at it).
-            run_manifest['status'] = 'interrupted'
-            run_manifest['interrupted_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-            run_manifest['last_step'] = int(step)
-            run_manifest['last_train_loss'] = last_train_loss
-            run_manifest['last_val_loss'] = last_val_loss
+            run_manifest["status"] = "interrupted"
+            run_manifest["interrupted_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            run_manifest["last_step"] = int(step)
+            run_manifest["last_train_loss"] = last_train_loss
+            run_manifest["last_val_loss"] = last_val_loss
             if stream_fp is not None:
-                run_manifest.setdefault('data', {})['train_stream'] = stream_fp.record()
+                run_manifest.setdefault("data", {})["train_stream"] = stream_fp.record()
             # The curve is the artifact a reader needs for an interrupted run;
             # fingerprint whatever made it to disk.
-            run_manifest.setdefault('artifacts', {})['train_jsonl'] = file_fingerprint(log_path)
+            run_manifest.setdefault("artifacts", {})["train_jsonl"] = file_fingerprint(log_path)
             try:
                 save_run_manifest(manifest_path, run_manifest)
-                print(f'[track] run did not finish: manifest marked interrupted at step {step}', flush=True)
+                print(f"[track] run did not finish: manifest marked interrupted at step {step}", flush=True)
             except OSError:
                 pass
     # Drop the per-run scratch caches.
     clear_ce_scratch_cache()
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

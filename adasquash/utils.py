@@ -1,12 +1,15 @@
 from __future__ import annotations
+
 import math
 import numbers
-from collections import defaultdict, deque, OrderedDict
-from typing import Optional, Dict
+from collections import OrderedDict, defaultdict, deque
+from typing import Dict, Optional
+
 import torch
-import torch.nn as nn
+from torch import nn
 
 from ._validation import is_boolean_scalar as _is_boolean_scalar
+
 
 class MaxAbsMeter:
 
@@ -19,7 +22,7 @@ class MaxAbsMeter:
 
     @property
     def value(self) -> float:
-        return -float('inf') if self._peak is None else float(self._peak)
+        return -float("inf") if self._peak is None else float(self._peak)
 
     @staticmethod
     def _abs_max(x: torch.Tensor) -> torch.Tensor:
@@ -43,7 +46,7 @@ class MaxAbsMeter:
                     # A non-finite activation is not a finite peak: record it
                     # as NaN so the corruption is visible instead of being
                     # masked by a finite running maximum.
-                    v = torch.full((), float('nan'), dtype=v.dtype, device=v.device)
+                    v = torch.full((), float("nan"), dtype=v.dtype, device=v.device)
                 # A peak tensor created under torch.inference_mode() cannot be
                 # updated in place once the meter is used outside it. Cloning
                 # drops the inference flag while keeping the running maximum.
@@ -130,8 +133,8 @@ class KurtosisMeter:
             # list casts `torch.linalg.vecdot` to the active low-precision
             # dtype.
             x_var_t, x_mean_t = torch.var_mean(chunk, unbiased=False)
-            xc = torch.sub(chunk, x_mean_t, out=self._workspace('xc', chunk))
-            xc2 = torch.mul(xc, xc, out=self._workspace('xc2', chunk))
+            xc = torch.sub(chunk, x_mean_t, out=self._workspace("xc", chunk))
+            xc2 = torch.mul(xc, xc, out=self._workspace("xc2", chunk))
             parts.append(torch.stack([x_mean_t, x_var_t, torch.linalg.vecdot(xc, xc2), torch.linalg.vecdot(xc2, xc2)]))
             counts.append(count)
         self._pending_stats.append(torch.stack(parts))
@@ -192,7 +195,7 @@ class KurtosisMeter:
             # standardized fourth moment. Reporting 0.0 here would label a
             # one-element activation as exactly Gaussian, the same masking the
             # constant/non-finite branch below avoids.
-            return float('nan')
+            return float("nan")
         var = self.M2 / self.n
         # Excess kurtosis is scale-invariant. An absolute variance floor (the
         # old `var < 1e-12`) reports heavy-tailed but small-magnitude
@@ -201,7 +204,7 @@ class KurtosisMeter:
         # NaN/Inf activation (and a constant one) as exactly Gaussian, hiding
         # the corruption this meter exists to expose.
         if not math.isfinite(var) or var == 0.0:
-            return float('nan')
+            return float("nan")
         return self.M4 / self.n / (var * var) - 3.0
 
 class ActivationStats:
@@ -209,8 +212,8 @@ class ActivationStats:
     def __init__(self, model: nn.Module):
         self.model = model
         self.handles: list = []
-        self.max_abs: Dict[str, MaxAbsMeter] = defaultdict(MaxAbsMeter)
-        self.kurtosis: Dict[str, KurtosisMeter] = defaultdict(KurtosisMeter)
+        self.max_abs: dict[str, MaxAbsMeter] = defaultdict(MaxAbsMeter)
+        self.kurtosis: dict[str, KurtosisMeter] = defaultdict(KurtosisMeter)
 
     def _make_hook(self, name: str):
 
@@ -242,20 +245,20 @@ class ActivationStats:
     def summary(self) -> dict:
         out = {}
         for name in self.max_abs:
-            out[name] = {'max_abs': self.max_abs[name].value, 'excess_kurtosis': self.kurtosis[name].result()}
+            out[name] = {"max_abs": self.max_abs[name].value, "excess_kurtosis": self.kurtosis[name].result()}
         if out:
-            all_max = [v['max_abs'] for v in out.values() if v['max_abs'] != -float('inf')]
-            all_kurt = [v['excess_kurtosis'] for v in out.values()]
-            peak = (float('nan') if any(math.isnan(v) for v in all_max)
+            all_max = [v["max_abs"] for v in out.values() if v["max_abs"] != -float("inf")]
+            all_kurt = [v["excess_kurtosis"] for v in out.values()]
+            peak = (float("nan") if any(math.isnan(v) for v in all_max)
                     else (max(all_max) if all_max else 0.0))
             # A non-finite kurtosis means the activation had no standardized
             # fourth moment (NaN/Inf input, or a constant tensor). Averaging
             # only the finite entries would report a clean number and hide
             # exactly the corruption the meter exposes.
-            mean_kurt = (float('nan')
+            mean_kurt = (float("nan")
                          if any(not math.isfinite(v) for v in all_kurt)
                          else (sum(all_kurt) / len(all_kurt) if all_kurt else 0.0))
-            out['__summary__'] = {'mean_max_abs': sum(all_max) / max(1, len(all_max)), 'max_max_abs': peak, 'max_abs_pre_norm': peak, 'mean_excess_kurtosis_pre_norm': mean_kurt}
+            out["__summary__"] = {"mean_max_abs": sum(all_max) / max(1, len(all_max)), "max_max_abs": peak, "max_abs_pre_norm": peak, "mean_excess_kurtosis_pre_norm": mean_kurt}
         return out
 
 def markov_batch(rng: torch.Generator, ignore_index: int, batch_size: int, seq_len: int, device: str, n_states: int=64, outlier_id: Optional[int]=None, max_jump: int=3):
@@ -335,7 +338,7 @@ class LossSpikeCounter:
         self.history = deque(maxlen=self.history.maxlen)
 
     def state_dict(self) -> dict:
-        return {'ema': self.ema, 'n_spikes': self.n_spikes}
+        return {"ema": self.ema, "n_spikes": self.n_spikes}
 
     def load_state_dict(self, state: Optional[dict]) -> bool:
         if not isinstance(state, dict):
@@ -344,21 +347,19 @@ class LossSpikeCounter:
         # count used to raise after `ema` had already been replaced, leaving
         # the counter half-loaded. A negative count is not a possible state
         # and must not be accepted as one.
-        raw_n = state.get('n_spikes', 0)
+        raw_n = state.get("n_spikes", 0)
         if raw_n is None:
             n_spikes = 0
         elif isinstance(raw_n, bool):
             return False
-        elif isinstance(raw_n, numbers.Integral):
-            n_spikes = int(raw_n)
-        elif (isinstance(raw_n, float) and math.isfinite(raw_n)
+        elif isinstance(raw_n, numbers.Integral) or (isinstance(raw_n, float) and math.isfinite(raw_n)
                 and raw_n.is_integer()):
             n_spikes = int(raw_n)
         else:
             return False
         if n_spikes < 0:
             return False
-        ema = state.get('ema')
+        ema = state.get("ema")
         if ema is None:
             if n_spikes != 0:
                 return False
@@ -393,5 +394,5 @@ def measure_activation_stats(model: nn.Module, batch: torch.Tensor) -> dict:
         stats.detach()
 
 def count_parameters(model: nn.Module, trainable_only: bool=False) -> int:
-    return sum((p.numel() for p in model.parameters() if not trainable_only or p.requires_grad))
-__all__ = ['ActivationStats', 'LossSpikeCounter', 'KurtosisMeter', 'MaxAbsMeter', 'measure_activation_stats', 'markov_batch', 'count_parameters', 'release_kurtosis_workspaces']
+    return sum(p.numel() for p in model.parameters() if not trainable_only or p.requires_grad)
+__all__ = ["ActivationStats", "KurtosisMeter", "LossSpikeCounter", "MaxAbsMeter", "count_parameters", "markov_batch", "measure_activation_stats", "release_kurtosis_workspaces"]

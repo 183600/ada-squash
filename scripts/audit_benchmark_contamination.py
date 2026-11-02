@@ -78,11 +78,18 @@ from adasquash.decontamination import (
     scan_token_documents,
 )
 from adasquash.jsonio import save_json_atomic
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest
+from adasquash.repro import (
+    collect_run_metadata,
+    file_fingerprint,
+    finish_metadata,
+    save_run_manifest,
+)
 from scripts.data_pipeline import (
     DocumentCleaner,
-    canonical_document_hash as pipeline_canonical_document_hash,
     load_document_stream,
+)
+from scripts.data_pipeline import (
+    canonical_document_hash as pipeline_canonical_document_hash,
 )
 
 # Presets only fix the source identifiers; the user still has to pass a

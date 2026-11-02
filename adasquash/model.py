@@ -1,17 +1,20 @@
 from __future__ import annotations
+
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from .norms import (build_norm, _reduce_products, DyTD, DyTDTanh, DyTCD,
-                    DyTCDTanh)
+from torch import nn
+
 from .attention import CausalSelfAttention, _make_linear, _skip_init
+from .norms import DyTCD, DyTCDTanh, DyTD, DyTDTanh, _reduce_products, build_norm
+
 
 @dataclass
 class LayerConfig:
-    norm: str = 'dytcd'
+    norm: str = "dytcd"
     qk_norm: Optional[str] = None
     use_layerscale: bool = True
     layerscale_init: float = 1e-05
@@ -25,7 +28,7 @@ class GPTConfig:
     max_seq_len: int = 1024
     mlp_ratio: float = 4.0
     dropout: float = 0.0
-    norm_name: str = 'dytcd'
+    norm_name: str = "dytcd"
     qk_norm: Optional[str] = None
     qk_alpha_init: float = 1.0
     use_layerscale: bool = True
@@ -152,15 +155,15 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
 # All statistic-free squashing norms (share the ``beta`` affine switch).
 # The factorial cells: {scalar, per-channel} alpha x {tanh, softsign}, plus
 # the depth-conditioned family and its depth-*init* controls.
-_DYT_FAMILY = ('dyt', 'dyts', 'dytp', 'dytc', 'dytd', 'dytd_tanh', 'dytdi', 'dytcd', 'dytcd_tanh', 'dytcdi')
+_DYT_FAMILY = ("dyt", "dyts", "dytp", "dytc", "dytd", "dytd_tanh", "dytdi", "dytcd", "dytcd_tanh", "dytcdi")
 # Norms whose alpha follows (alpha_0, k) at construction time.
-_DEPTH_REPARAM = ('dytd', 'dytd_tanh', 'dytcd', 'dytcd_tanh')
+_DEPTH_REPARAM = ("dytd", "dytd_tanh", "dytcd", "dytcd_tanh")
 # Depth-family norms that accept (layer_idx, num_layers, alpha_0, k_init).
-_DEPTH_FAMILY = _DEPTH_REPARAM + ('dytdi', 'dytcdi')
+_DEPTH_FAMILY = _DEPTH_REPARAM + ("dytdi", "dytcdi")
 # Norms parameterized by the generalized-softsign exponent p.
-_SOFTSIGN_P = ('dyts', 'dytc', 'dytcd', 'dytcdi')
+_SOFTSIGN_P = ("dyts", "dytc", "dytcd", "dytcdi")
 
-def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=False) -> dict:
+def build_norm_kwargs(cfg: GPTConfig, layer_idx: int=0, is_final_norm: bool=False) -> dict:
     kwargs: dict = {}
     is_dyt_family = cfg.norm_name in _DYT_FAMILY
     if cfg.norm_name in _DEPTH_FAMILY:
@@ -171,15 +174,15 @@ def build_norm_kwargs(cfg: 'GPTConfig', layer_idx: int=0, is_final_norm: bool=Fa
             # Only the reparameterized variants own a (learnable) k; the
             # depth-init controls consume (alpha_0, k_init) purely at init.
             kwargs.update(learnable_k=cfg.learnable_k, k_min=cfg.k_min)
-    if cfg.norm_name in ('dytcd', 'dytcd_tanh'):
+    if cfg.norm_name in ("dytcd", "dytcd_tanh"):
         kwargs.update(learnable_delta=cfg.learnable_delta)
     if cfg.norm_name in _SOFTSIGN_P:
         kwargs.update(p_init=cfg.p_init, learnable_p=cfg.learnable_p)
-    if cfg.norm_name in ('dytc', 'dytp'):
+    if cfg.norm_name in ("dytc", "dytp"):
         kwargs.update(alpha_init=cfg.alpha_init, alpha_jitter=cfg.alpha_jitter)
-    if cfg.norm_name in ('dyt', 'dyts'):
+    if cfg.norm_name in ("dyt", "dyts"):
         kwargs.update(alpha_init=cfg.alpha_init)
-    if is_dyt_family and hasattr(cfg, 'beta') and (cfg.beta is not None):
+    if is_dyt_family and hasattr(cfg, "beta") and (cfg.beta is not None):
         kwargs.update(beta=cfg.beta)
     return kwargs
 
@@ -209,7 +212,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
                 buf = _ce_scratch(buf_rows, logits.size(-1), logits.dtype, logits.device)
             log_probs = buf[:end - start]
             torch.log_softmax(logits[start:end], dim=-1, out=log_probs)
-            chunk_loss = F.nll_loss(log_probs, targets[start:end], ignore_index=ignore_index, reduction='sum')
+            chunk_loss = F.nll_loss(log_probs, targets[start:end], ignore_index=ignore_index, reduction="sum")
             total = chunk_loss if total is None else total.add_(chunk_loss)
         count = _valid_target_mask(targets, ignore_index).sum()
         ctx.save_for_backward(logits, targets)
@@ -281,7 +284,7 @@ def _autocast_dtype(device_type: str, *dtypes: torch.dtype) -> torch.dtype:
         if torch.is_autocast_enabled(device_type):
             return torch.get_autocast_dtype(device_type)
     except TypeError:
-        if device_type == 'cuda' and torch.is_autocast_enabled():
+        if device_type == "cuda" and torch.is_autocast_enabled():
             return torch.get_autocast_gpu_dtype()
     fallback = dtypes[0]
     for dt in dtypes[1:]:
@@ -319,7 +322,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
                 cast = cast_buf[:rows]
                 torch.mm(hc, w_t, out=cast)
                 torch.log_softmax(cast, -1, dtype=acc, out=buf)
-            chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction='sum')
+            chunk = F.nll_loss(buf, targets[start:end], ignore_index=ignore_index, reduction="sum")
             total = chunk if total is None else total.add_(chunk)
         count = _valid_target_mask(targets, ignore_index).sum()
         # Backward consumes the same cast weight the forward GEMMs use; the
@@ -664,7 +667,7 @@ class GPT(nn.Module):
             if cfg.learnable_k:
                 self.shared_k = nn.Parameter(torch.tensor(float(cfg.k_init)))
             else:
-                self.register_buffer('shared_k', torch.tensor(float(cfg.k_init)))
+                self.register_buffer("shared_k", torch.tensor(float(cfg.k_init)))
             for m in self.modules():
                 if isinstance(m, (DyTD, DyTDTanh, DyTCD, DyTCDTanh)):
                     m.alpha_0 = self.shared_alpha_0
@@ -675,11 +678,11 @@ class GPT(nn.Module):
             t = torch.arange(cfg.max_seq_len).float()
             freqs = torch.outer(t, freqs)
             freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-            self.register_buffer('freqs_cis', freqs_cis, persistent=False)
+            self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         else:
             self.freqs_cis = None
         if not cfg.rotary:
-            self.register_buffer('_pos_ids', torch.arange(cfg.max_seq_len), persistent=False)
+            self.register_buffer("_pos_ids", torch.arange(cfg.max_seq_len), persistent=False)
         else:
             self._pos_ids = None
 
@@ -694,7 +697,7 @@ class GPT(nn.Module):
         parts in the destination dtype/device. Non-RoPE models have no such
         buffer and take the normal path unchanged.
         """
-        freqs = self._buffers.pop('freqs_cis', None)
+        freqs = self._buffers.pop("freqs_cis", None)
         result = super()._apply(fn, recurse)
         if freqs is not None:
             real = fn(freqs.real)
@@ -705,7 +708,7 @@ class GPT(nn.Module):
                 # still happens in attention._rope_pair_for_dtype.
                 real = real.float()
                 imag = imag.float()
-            self.register_buffer('freqs_cis', torch.complex(real, imag),
+            self.register_buffer("freqs_cis", torch.complex(real, imag),
                                  persistent=False)
         return result
 
@@ -812,24 +815,24 @@ class GPT(nn.Module):
     def norm_param_count(self) -> dict:
         out = {}
         for name, m in self.named_modules():
-            if name == 'norm_f' or name.endswith(('.norm1', '.norm2')):
+            if name == "norm_f" or name.endswith((".norm1", ".norm2")):
                 cls = m.__class__.__name__
                 out.setdefault(cls, 0)
                 for p in m.parameters(recurse=False):
                     out[cls] += p.numel()
         return out
 
-def build_gpt_124m(norm_name: str='dytcd', init: bool=True, **over) -> GPT:
+def build_gpt_124m(norm_name: str="dytcd", init: bool=True, **over) -> GPT:
     cfg = GPTConfig(vocab_size=50304, dim=768, n_layers=12, n_heads=12, max_seq_len=1024, mlp_ratio=4.0, norm_name=norm_name, **over)
     return GPT(cfg, init=init)
 
-def build_gpt_350m(norm_name: str='dytcd', init: bool=True, **over) -> GPT:
+def build_gpt_350m(norm_name: str="dytcd", init: bool=True, **over) -> GPT:
     cfg = GPTConfig(vocab_size=50304, dim=1024, n_layers=24, n_heads=16, max_seq_len=1024, mlp_ratio=4.0, norm_name=norm_name, **over)
     return GPT(cfg, init=init)
 
-def build_llama_tiny_1b(norm_name: str='dytcd', init: bool=True, **over) -> GPT:
-    over.setdefault('tie_word_embeddings', False)
-    over.setdefault('rotary', True)
+def build_llama_tiny_1b(norm_name: str="dytcd", init: bool=True, **over) -> GPT:
+    over.setdefault("tie_word_embeddings", False)
+    over.setdefault("rotary", True)
     cfg = GPTConfig(vocab_size=32000, dim=2048, n_layers=24, n_heads=16, max_seq_len=2048, mlp_ratio=8.0 / 3.0, norm_name=norm_name, **over)
     return GPT(cfg, init=init)
-__all__ = ['GPTConfig', 'LayerConfig', 'Block', 'MLP', 'GPT', 'build_norm_kwargs', 'cross_entropy_mean', 'fused_cross_entropy_mean', 'clear_ce_scratch_cache', 'build_gpt_124m', 'build_gpt_350m', 'build_llama_tiny_1b']
+__all__ = ["GPT", "MLP", "Block", "GPTConfig", "LayerConfig", "build_gpt_124m", "build_gpt_350m", "build_llama_tiny_1b", "build_norm_kwargs", "clear_ce_scratch_cache", "cross_entropy_mean", "fused_cross_entropy_mean"]

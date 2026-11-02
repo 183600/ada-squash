@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """Paired statistical comparison of sealed-test results.
 
 `train_gpt2.py --final-test-eval` opens the sealed test split exactly once per
@@ -43,12 +44,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_ci,
-                               mean_prediction_interval, mean_std_stderr,
-                               paired_t_one_sided, student_t_ppf)
-from adasquash.repro import (collect_run_metadata, execution_identity_mismatches,
-                             finish_metadata, save_run_manifest,
-                             training_recipe_mismatches)
+from adasquash.metrics import (
+    MIN_SEEDS_FOR_SIGNIFICANCE,
+    holm_adjust,
+    mean_ci,
+    mean_prediction_interval,
+    mean_std_stderr,
+    paired_t_one_sided,
+    student_t_ppf,
+)
+from adasquash.repro import (
+    collect_run_metadata,
+    execution_identity_mismatches,
+    finish_metadata,
+    save_run_manifest,
+    training_recipe_mismatches,
+)
 
 PAIRING_KEYS = (
     "dataset", "dataset_config", "dataset_revision",
@@ -572,13 +583,13 @@ def main():
     p.add_argument("--output", default=None, help="write the full comparison (rows + manifests) to this JSON file")
     args = p.parse_args()
     if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
-        p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
+        p.error(f"--alpha {args.alpha} must be finite and strictly between 0 and 1")
     if not math.isfinite(args.margin) or args.margin < 0.0:
-        p.error(f'--margin {args.margin} must be finite and >= 0')
+        p.error(f"--margin {args.margin} must be finite and >= 0")
     if not math.isfinite(args.power) or not 0.0 < args.power < 1.0:
-        p.error(f'--power {args.power} must be finite and strictly between 0 and 1')
+        p.error(f"--power {args.power} must be finite and strictly between 0 and 1")
     if len({Path(c).resolve() for c in args.candidates}) != len(args.candidates):
-        p.error('a candidate path is repeated; each arm must appear once in the comparison')
+        p.error("a candidate path is repeated; each arm must appear once in the comparison")
     reference_path = Path(args.reference)
     ref_arm = load_arm(reference_path)
     ref_seed_means = _seed_means(ref_arm)
@@ -801,8 +812,8 @@ def main():
         if not_comparable:
             # The SystemExit below reports rows that produced no paired test;
             # the manifest must not claim a complete comparison.
-            manifest['status'] = 'failed'
-            manifest['not_comparable_rows'] = list(not_comparable)
+            manifest["status"] = "failed"
+            manifest["not_comparable_rows"] = list(not_comparable)
         else:
             manifest = finish_metadata(manifest)
         save_run_manifest(args.output, manifest)

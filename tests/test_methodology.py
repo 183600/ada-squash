@@ -26,13 +26,22 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from adasquash.metrics import (benjamini_hochberg_adjust,
-                               leave_one_out_jackknife, paired_trend_test,
-                               tost_design_summary, tost_paired, tost_power,
-                               tost_required_n, two_sided_p_from_t)
-from scripts.ablation import (baseline_comparison, build_analysis_plan,
-                              factorial_comparison,
-                              study_level_correction)
+from adasquash.metrics import (
+    benjamini_hochberg_adjust,
+    leave_one_out_jackknife,
+    paired_trend_test,
+    tost_design_summary,
+    tost_paired,
+    tost_power,
+    tost_required_n,
+    two_sided_p_from_t,
+)
+from scripts.ablation import (
+    baseline_comparison,
+    build_analysis_plan,
+    factorial_comparison,
+    study_level_correction,
+)
 
 SEEDS = [42, 43, 44]
 
@@ -44,19 +53,19 @@ def _row(name, values, **extra):
     mean = sum(vals) / len(vals)
     std = statistics.stdev(vals) if len(vals) > 1 else 0.0
     row = {
-        'name': name,
-        'val_loss': mean,
-        'per_seed': [{'seed': seed, 'val_loss': value} for seed, value in items],
-        'n_seeds': len(items),
-        'val_loss_seed_std': std,
-        'val_loss_seed_stderr': std / (len(items) ** 0.5),
+        "name": name,
+        "val_loss": mean,
+        "per_seed": [{"seed": seed, "val_loss": value} for seed, value in items],
+        "n_seeds": len(items),
+        "val_loss_seed_std": std,
+        "val_loss_seed_stderr": std / (len(items) ** 0.5),
     }
     row.update(extra)
     return row
 
 
 def _const(name, value, **extra):
-    return _row(name, {seed: value for seed in SEEDS}, **extra)
+    return _row(name, dict.fromkeys(SEEDS, value), **extra)
 
 
 # ---------------------------------------------------------------------------
@@ -67,47 +76,47 @@ def test_tost_refuses_undefined_requests():
     b = [1.0, 1.0, 1.0]
     for margin in (0.0, -0.1):
         out = tost_paired(a, b, margin)
-        assert out['equivalent'] is None
-        assert out['p_tost'] is None
-        assert 'positive' in out['note']
+        assert out["equivalent"] is None
+        assert out["p_tost"] is None
+        assert "positive" in out["note"]
     out = tost_paired([1.0], [1.0], 0.1)
-    assert out['equivalent'] is None
-    assert '2 paired' in out['note']
+    assert out["equivalent"] is None
+    assert "2 paired" in out["note"]
 
 
 def test_tost_distinguishes_equivalence_from_non_significance():
     # Small, consistent differences: equivalent within a 0.02 margin.
     close = tost_paired([1.000, 1.005, 0.998], [1.0, 1.0, 1.0], margin=0.02)
-    assert close['equivalent'] is True
-    assert close['p_tost'] < 0.05
-    assert close['ci_low'] > -0.02 and close['ci_high'] < 0.02
+    assert close["equivalent"] is True
+    assert close["p_tost"] < 0.05
+    assert close["ci_low"] > -0.02 and close["ci_high"] < 0.02
     # A real difference is not equivalent, even though it is small in absolute
     # terms: the margin is the scientific claim, not a rescaled p-value.
     far = tost_paired([1.2, 1.21, 1.19], [1.0, 1.0, 1.0], margin=0.02)
-    assert far['equivalent'] is False
-    assert far['p_tost'] > 0.05
+    assert far["equivalent"] is False
+    assert far["p_tost"] > 0.05
 
 
 def test_tost_zero_variance_is_deterministic():
     same = tost_paired([1.0] * 3, [1.0] * 3, margin=0.01)
-    assert same['equivalent'] is True
-    assert same['p_tost'] == 0.0
+    assert same["equivalent"] is True
+    assert same["p_tost"] == 0.0
     shifted = tost_paired([1.1] * 3, [1.0] * 3, margin=0.01)
-    assert shifted['equivalent'] is False
-    assert shifted['p_tost'] == 1.0
+    assert shifted["equivalent"] is False
+    assert shifted["p_tost"] == 1.0
 
 
 def test_tost_design_power_is_not_the_superiority_calculation():
     # The TOST rejection region shrinks as the margin approaches the assumed
     # difference; power must fall, not rise as it would for a superiority
     # test of a larger effect.
-    far = tost_power(0.10, 12, margin=0.20)['approximate_power']
-    near = tost_power(0.10, 12, margin=0.11)['approximate_power']
+    far = tost_power(0.10, 12, margin=0.20)["approximate_power"]
+    near = tost_power(0.10, 12, margin=0.11)["approximate_power"]
     assert far > near
     required = tost_required_n(0.10, 0.10)
     assert required is not None and required > 2
-    assert tost_power(0.10, required, 0.10)['approximate_power'] >= 0.8
-    assert (tost_power(0.10, required - 1, 0.10)['approximate_power']
+    assert tost_power(0.10, required, 0.10)["approximate_power"] >= 0.8
+    assert (tost_power(0.10, required - 1, 0.10)["approximate_power"]
             < 0.8)
     # A planning difference outside the margin is not an equivalence design.
     assert tost_required_n(0.10, 0.10, true_delta=0.10) is None
@@ -115,16 +124,16 @@ def test_tost_design_power_is_not_the_superiority_calculation():
 
 def test_tost_design_summary_reports_resolution_and_minimum_margin():
     summary = tost_design_summary(0.05, 10, 0.10)
-    assert summary['margin'] == 0.10
-    assert summary['required_pairs_for_margin'] == (
+    assert summary["margin"] == 0.10
+    assert summary["required_pairs_for_margin"] == (
         tost_required_n(0.05, 0.10))
-    assert summary['adequately_powered_for_equivalence'] is True
-    assert 0.0 < summary['minimum_detectable_equivalence_margin'] < 0.10
+    assert summary["adequately_powered_for_equivalence"] is True
+    assert 0.0 < summary["minimum_detectable_equivalence_margin"] < 0.10
     underpowered = tost_design_summary(0.20, 3, 0.10)
-    assert underpowered['adequately_powered_for_equivalence'] is False
+    assert underpowered["adequately_powered_for_equivalence"] is False
     # The exact TOST verdict remains the certifying result; this block is
     # explicitly labelled as a design approximation.
-    assert 'design' in summary['test']
+    assert "design" in summary["test"]
 
 
 def test_two_sided_p_from_t_is_symmetric_and_bounded():
@@ -132,8 +141,8 @@ def test_two_sided_p_from_t_is_symmetric_and_bounded():
     assert two_sided_p_from_t(3.0, 2.0) == pytest.approx(
         two_sided_p_from_t(-3.0, 2.0))
     assert 0.0 < two_sided_p_from_t(3.0, 2.0) < 1.0
-    assert two_sided_p_from_t(float('inf'), 2.0) == 0.0
-    assert two_sided_p_from_t(float('-inf'), 2.0) == 0.0
+    assert two_sided_p_from_t(float("inf"), 2.0) == 0.0
+    assert two_sided_p_from_t(float("-inf"), 2.0) == 0.0
     assert two_sided_p_from_t(None, 2.0) is None
     assert two_sided_p_from_t(1.0, 0.0) is None
 
@@ -142,112 +151,112 @@ def test_two_sided_p_from_t_is_symmetric_and_bounded():
 # Jackknife robustness
 # ---------------------------------------------------------------------------
 def test_jackknife_reports_a_stable_sign():
-    out = leave_one_out_jackknife([-0.10, -0.11, -0.09], labels=['42', '43', '44'])
-    assert out['sign'] == 'negative'
-    assert out['sign_stable'] is True
-    assert out['influential_labels'] == []
-    assert out['meaningful'] is True
-    assert {item['dropped'] for item in out['per_drop']} == {'42', '43', '44'}
+    out = leave_one_out_jackknife([-0.10, -0.11, -0.09], labels=["42", "43", "44"])
+    assert out["sign"] == "negative"
+    assert out["sign_stable"] is True
+    assert out["influential_labels"] == []
+    assert out["meaningful"] is True
+    assert {item["dropped"] for item in out["per_drop"]} == {"42", "43", "44"}
 
 
 def test_jackknife_flags_the_seed_carrying_the_effect():
     # Two mildly negative seeds and one large positive seed: the full-sample
     # mean is positive, but the negative evidence is the two consistent runs.
     out = leave_one_out_jackknife([-0.01, -0.02, 0.50], labels=[42, 43, 44])
-    assert out['sign'] == 'positive'
-    assert out['sign_stable'] is False
-    assert out['influential_labels'] == [44]
-    dropped_44 = [item for item in out['per_drop'] if item['dropped'] == 44][0]
-    assert dropped_44['mean_without'] < 0.0
+    assert out["sign"] == "positive"
+    assert out["sign_stable"] is False
+    assert out["influential_labels"] == [44]
+    dropped_44 = [item for item in out["per_drop"] if item["dropped"] == 44][0]
+    assert dropped_44["mean_without"] < 0.0
 
 
 def test_jackknife_marks_two_observations_as_not_meaningful():
-    out = leave_one_out_jackknife([-0.1, 0.2], labels=['a', 'b'])
-    assert out['n'] == 2
-    assert out['meaningful'] is False
-    assert out['sign_stable'] is False
+    out = leave_one_out_jackknife([-0.1, 0.2], labels=["a", "b"])
+    assert out["n"] == 2
+    assert out["meaningful"] is False
+    assert out["sign_stable"] is False
 
 
 # ---------------------------------------------------------------------------
 # Comparison reports carry the new blocks
 # ---------------------------------------------------------------------------
 def test_baseline_comparison_adds_equivalence_and_jackknife():
-    baseline = _const('ln_baseline', 2.0)
-    candidate = _row('dytcd_full', {42: 1.5, 43: 1.52, 44: 1.49})
-    near = _row('dytc_near_baseline', {42: 2.001, 43: 1.999, 44: 2.000})
-    out = baseline_comparison([baseline, candidate, near], ['ln_baseline'],
+    baseline = _const("ln_baseline", 2.0)
+    candidate = _row("dytcd_full", {42: 1.5, 43: 1.52, 44: 1.49})
+    near = _row("dytc_near_baseline", {42: 2.001, 43: 1.999, 44: 2.000})
+    out = baseline_comparison([baseline, candidate, near], ["ln_baseline"],
                               equivalence_margin=0.02)
-    by_name = {entry['name']: entry for entry in out['rows']}
-    winner = by_name['dytcd_full']
-    assert winner['beats_reference_significantly'] is True
-    assert winner['seed_jackknife']['sign_stable'] is True
+    by_name = {entry["name"]: entry for entry in out["rows"]}
+    winner = by_name["dytcd_full"]
+    assert winner["beats_reference_significantly"] is True
+    assert winner["seed_jackknife"]["sign_stable"] is True
     # A large superiority difference is *not* equivalent within a tiny margin.
-    assert winner['equivalence']['enabled'] is True
-    assert winner['equivalence']['equivalent'] is False
+    assert winner["equivalence"]["enabled"] is True
+    assert winner["equivalence"]["equivalent"] is False
     # A row that really matches the baseline can be called equivalent, which
     # "not significant" alone would never establish.
-    assert by_name['dytc_near_baseline']['equivalence']['equivalent'] is True
-    assert out['equivalence_margin'] == 0.02
+    assert by_name["dytc_near_baseline"]["equivalence"]["equivalent"] is True
+    assert out["equivalence_margin"] == 0.02
 
 
 def test_leave_one_out_marks_an_explicit_default_as_equivalent():
     from scripts.ablation import leave_one_out_comparison
 
-    full = _const('dytcd_full', 1.50)
-    explicit = _row('dytcd_ls1e5', {42: 1.501, 43: 1.499, 44: 1.500})
-    spec = {'dytcd_full': {
-        'layerscale_explicit_vs_default': {
-            'row': 'dytcd_ls1e5', 'diff': ('layerscale_init',)}}}
+    full = _const("dytcd_full", 1.50)
+    explicit = _row("dytcd_ls1e5", {42: 1.501, 43: 1.499, 44: 1.500})
+    spec = {"dytcd_full": {
+        "layerscale_explicit_vs_default": {
+            "row": "dytcd_ls1e5", "diff": ("layerscale_init",)}}}
     out = leave_one_out_comparison([full, explicit], spec=spec,
                                    equivalence_margin=0.02)
-    entry = [row for row in out['rows']
-             if row['mechanism'] == 'layerscale_explicit_vs_default'][0]
-    assert entry['equivalence']['enabled'] is True
-    assert entry['equivalence']['equivalent'] is True
+    entry = [row for row in out["rows"]
+             if row["mechanism"] == "layerscale_explicit_vs_default"][0]
+    assert entry["equivalence"]["enabled"] is True
+    assert entry["equivalence"]["equivalent"] is True
     # The full-sample mean is exactly zero, so there is no sign to stabilise;
     # the jackknife says so rather than pretending the near-zero deltas have
     # a direction.
-    assert entry['seed_jackknife']['sign_stable'] is None
-    assert entry['seed_jackknife']['influential_labels'] == []
+    assert entry["seed_jackknife"]["sign_stable"] is None
+    assert entry["seed_jackknife"]["influential_labels"] == []
 
 
 def test_leave_one_out_comparison_reports_robustness():
     from scripts.ablation import leave_one_out_comparison
 
-    full = _row('dytcd_full', {42: 1.40, 43: 1.41, 44: 1.39})
-    removed = _row('dytcd_no_perchannel', {42: 1.55, 43: 1.54, 44: 1.56})
+    full = _row("dytcd_full", {42: 1.40, 43: 1.41, 44: 1.39})
+    removed = _row("dytcd_no_perchannel", {42: 1.55, 43: 1.54, 44: 1.56})
     out = leave_one_out_comparison([full, removed], equivalence_margin=0.01)
-    entry = [row for row in out['rows']
-             if row['mechanism'] == 'per_channel_delta'][0]
-    assert entry['mechanism_helps_significantly'] is True
-    assert entry['seed_jackknife']['meaningful'] is True
-    assert entry['equivalence']['enabled'] is True
+    entry = [row for row in out["rows"]
+             if row["mechanism"] == "per_channel_delta"][0]
+    assert entry["mechanism_helps_significantly"] is True
+    assert entry["seed_jackknife"]["meaningful"] is True
+    assert entry["equivalence"]["enabled"] is True
     # Removing the mechanism made the model clearly worse, so the two arms
     # are not equivalent within a 0.01 loss margin.
-    assert entry['equivalence']['equivalent'] is False
-    assert entry['equivalence']['design']['test'] == 'tost_paired_design'
-    assert entry['equivalence']['design']['n'] == 3
+    assert entry["equivalence"]["equivalent"] is False
+    assert entry["equivalence"]["design"]["test"] == "tost_paired_design"
+    assert entry["equivalence"]["design"]["n"] == 3
 
 
 # ---------------------------------------------------------------------------
 # Factorial interaction: two-sided, both directions
 # ---------------------------------------------------------------------------
-def _factorial_spec(design='per_channel_x_depth_softsign'):
+def _factorial_spec(design="per_channel_x_depth_softsign"):
     return {
         design: {
-            'context': 'synthetic',
-            'cells': {'neither': 'neither', 'per_channel': 'per_channel',
-                      'depth': 'depth', 'both': 'both'},
-            'factors': {
-                'per_channel': {
-                    'diff': ('learnable_delta',),
-                    'pairs': (('neither', 'per_channel'),
-                              ('depth', 'both')),
+            "context": "synthetic",
+            "cells": {"neither": "neither", "per_channel": "per_channel",
+                      "depth": "depth", "both": "both"},
+            "factors": {
+                "per_channel": {
+                    "diff": ("learnable_delta",),
+                    "pairs": (("neither", "per_channel"),
+                              ("depth", "both")),
                 },
-                'depth': {
-                    'diff': ('k_init', 'learnable_k'),
-                    'pairs': (('neither', 'depth'),
-                              ('per_channel', 'both')),
+                "depth": {
+                    "diff": ("k_init", "learnable_k"),
+                    "pairs": (("neither", "depth"),
+                              ("per_channel", "both")),
                 },
             },
         },
@@ -256,10 +265,10 @@ def _factorial_spec(design='per_channel_x_depth_softsign'):
 
 def _factorial_cells(both_value):
     return [
-        _const('neither', 1.80),
-        _const('per_channel', 1.70),
-        _const('depth', 1.60),
-        _const('both', both_value),
+        _const("neither", 1.80),
+        _const("per_channel", 1.70),
+        _const("depth", 1.60),
+        _const("both", both_value),
     ]
 
 
@@ -267,11 +276,11 @@ def test_factorial_reports_synergy_as_a_two_sided_interaction():
     # per_channel effect = -0.10 (flat) / -0.20 (depth on); depth effect =
     # -0.20 (flat) / -0.30 (per-channel on): interaction = -0.10 (synergy).
     out = factorial_comparison(_factorial_cells(1.40), spec=_factorial_spec())
-    interaction = [row for row in out['rows']
-                   if row['kind'] == 'interaction'][0]
-    assert interaction['interaction_direction'] == 'synergy'
-    assert interaction['p_two_sided'] is not None
-    assert interaction['interaction_differs_significantly'] is True
+    interaction = [row for row in out["rows"]
+                   if row["kind"] == "interaction"][0]
+    assert interaction["interaction_direction"] == "synergy"
+    assert interaction["p_two_sided"] is not None
+    assert interaction["interaction_differs_significantly"] is True
 
 
 def test_factorial_reports_antagonism_instead_of_hiding_it():
@@ -279,13 +288,13 @@ def test_factorial_reports_antagonism_instead_of_hiding_it():
     # positive interaction; the one-sided synergy test must not call it a
     # success, while the two-sided interaction test still detects it.
     out = factorial_comparison(_factorial_cells(1.60), spec=_factorial_spec())
-    interaction = [row for row in out['rows']
-                   if row['kind'] == 'interaction'][0]
-    assert interaction['interaction_direction'] == 'antagonism'
-    assert interaction['p_two_sided'] is not None
-    assert interaction['interaction_differs_significantly'] is True
-    assert interaction['effect_helps'] is False
-    assert interaction['effect_helps_significantly'] is False
+    interaction = [row for row in out["rows"]
+                   if row["kind"] == "interaction"][0]
+    assert interaction["interaction_direction"] == "antagonism"
+    assert interaction["p_two_sided"] is not None
+    assert interaction["interaction_differs_significantly"] is True
+    assert interaction["effect_helps"] is False
+    assert interaction["effect_helps_significantly"] is False
 
 
 def test_factorial_reports_simple_effects_when_the_interaction_is_significant():
@@ -294,26 +303,26 @@ def test_factorial_reports_simple_effects_when_the_interaction_is_significant():
     # pooled main effects hide that context dependence; the simple effects
     # make it explicit and are certified because the interaction survives.
     out = factorial_comparison(_factorial_cells(1.40), spec=_factorial_spec())
-    simple = {row['effect']: row for row in out['rows']
-              if row.get('kind') == 'simple_effect'}
+    simple = {row["effect"]: row for row in out["rows"]
+              if row.get("kind") == "simple_effect"}
     assert set(simple) == {
-        'per_channel@depth=off', 'per_channel@depth=on',
-        'depth@per_channel=off', 'depth@per_channel=on'}
-    assert simple['per_channel@depth=off']['delta_seed_mean'] == pytest.approx(-0.10)
-    assert simple['per_channel@depth=on']['delta_seed_mean'] == pytest.approx(-0.20)
-    assert simple['depth@per_channel=off']['delta_seed_mean'] == pytest.approx(-0.20)
-    assert simple['depth@per_channel=on']['delta_seed_mean'] == pytest.approx(-0.30)
+        "per_channel@depth=off", "per_channel@depth=on",
+        "depth@per_channel=off", "depth@per_channel=on"}
+    assert simple["per_channel@depth=off"]["delta_seed_mean"] == pytest.approx(-0.10)
+    assert simple["per_channel@depth=on"]["delta_seed_mean"] == pytest.approx(-0.20)
+    assert simple["depth@per_channel=off"]["delta_seed_mean"] == pytest.approx(-0.20)
+    assert simple["depth@per_channel=on"]["delta_seed_mean"] == pytest.approx(-0.30)
     for entry in simple.values():
-        assert entry['interaction_gate_open'] is True
-        assert entry['conditional_test_status'] == 'tested_follow_up'
-        assert entry['analysis_role'] == 'conditional_follow_up'
-        assert entry['p_one_sided_holm'] is not None
-        assert entry['effect_helps_significantly'] is True
-        assert entry['conditional_context'] in (
-            {'depth': 'off'}, {'depth': 'on'},
-            {'per_channel': 'off'}, {'per_channel': 'on'})
-    assert out['conditional_effects']['n_tested_follow_up'] == 4
-    assert out['conditional_effects']['n_descriptive_gate_closed'] == 0
+        assert entry["interaction_gate_open"] is True
+        assert entry["conditional_test_status"] == "tested_follow_up"
+        assert entry["analysis_role"] == "conditional_follow_up"
+        assert entry["p_one_sided_holm"] is not None
+        assert entry["effect_helps_significantly"] is True
+        assert entry["conditional_context"] in (
+            {"depth": "off"}, {"depth": "on"},
+            {"per_channel": "off"}, {"per_channel": "on"})
+    assert out["conditional_effects"]["n_tested_follow_up"] == 4
+    assert out["conditional_effects"]["n_descriptive_gate_closed"] == 0
 
 
 def test_factorial_simple_effects_stay_descriptive_without_an_interaction():
@@ -321,63 +330,63 @@ def test_factorial_simple_effects_stay_descriptive_without_an_interaction():
     # test every cell contrast after the fact. The simple effects are still
     # reported, but explicitly not certified.
     out = factorial_comparison(_factorial_cells(1.50), spec=_factorial_spec())
-    interaction = [row for row in out['rows']
-                   if row['kind'] == 'interaction'][0]
-    assert interaction['interaction_differs_significantly'] is False
-    simple = [row for row in out['rows']
-              if row.get('kind') == 'simple_effect']
+    interaction = [row for row in out["rows"]
+                   if row["kind"] == "interaction"][0]
+    assert interaction["interaction_differs_significantly"] is False
+    simple = [row for row in out["rows"]
+              if row.get("kind") == "simple_effect"]
     assert len(simple) == 4
     for entry in simple:
-        assert entry['interaction_gate_open'] is False
-        assert entry['conditional_test_status'] == 'descriptive_no_interaction'
-        assert entry['p_one_sided_holm'] is None
-        assert entry['effect_helps_significantly'] is False
-    assert out['conditional_effects']['n_tested_follow_up'] == 0
-    assert out['conditional_effects']['n_descriptive_gate_closed'] == 4
+        assert entry["interaction_gate_open"] is False
+        assert entry["conditional_test_status"] == "descriptive_no_interaction"
+        assert entry["p_one_sided_holm"] is None
+        assert entry["effect_helps_significantly"] is False
+    assert out["conditional_effects"]["n_tested_follow_up"] == 0
+    assert out["conditional_effects"]["n_descriptive_gate_closed"] == 4
 
 
 def test_simple_effects_are_pre_registered_but_not_double_counted():
     spec = _factorial_spec()
-    cells = spec['per_channel_x_depth_softsign']['cells']
-    rows = {name: {'norm_name': 'dytcd'} for name in cells.values()}
-    hypotheses = {name: 'h' for name in rows}
+    cells = spec["per_channel_x_depth_softsign"]["cells"]
+    rows = {name: {"norm_name": "dytcd"} for name in cells.values()}
+    hypotheses = dict.fromkeys(rows, "h")
     matrix_report = {
-        'leave_one_out': {}, 'qk_axis': {},
-        'factorial': {
-            'per_channel_x_depth_softsign': {
-                'factors': spec['per_channel_x_depth_softsign']['factors'],
-                'cells': cells,
+        "leave_one_out": {}, "qk_axis": {},
+        "factorial": {
+            "per_channel_x_depth_softsign": {
+                "factors": spec["per_channel_x_depth_softsign"]["factors"],
+                "cells": cells,
             },
         },
     }
     plan = build_analysis_plan(
-        rows, hypotheses, matrix_report, list(rows), 'gpt2-124m', SEEDS)
-    by_id = {entry['id']: entry for entry in plan['contrasts']}
+        rows, hypotheses, matrix_report, list(rows), "gpt2-124m", SEEDS)
+    by_id = {entry["id"]: entry for entry in plan["contrasts"]}
     simple_ids = {effect
-                  for effect in ('per_channel@depth=off',
-                                 'per_channel@depth=on',
-                                 'depth@per_channel=off',
-                                 'depth@per_channel=on')}
+                  for effect in ("per_channel@depth=off",
+                                 "per_channel@depth=on",
+                                 "depth@per_channel=off",
+                                 "depth@per_channel=on")}
     for effect in simple_ids:
-        entry = by_id[f'factorial:per_channel_x_depth_softsign:{effect}']
-        assert entry['kind'] == 'simple_effect'
-        assert entry['counted_in_study_family'] is False
-        assert entry['tier'] == 2
-        assert entry['tier_role'] == 'conditional_follow_up'
+        entry = by_id[f"factorial:per_channel_x_depth_softsign:{effect}"]
+        assert entry["kind"] == "simple_effect"
+        assert entry["counted_in_study_family"] is False
+        assert entry["tier"] == 2
+        assert entry["tier_role"] == "conditional_follow_up"
     out = factorial_comparison(_factorial_cells(1.40), spec=spec)
-    study = study_level_correction({'factorial': out}, plan)
+    study = study_level_correction({"factorial": out}, plan)
     # Only the two main effects and the interaction form the study family;
     # the four conditional follow-ups are reported but not counted.
-    assert study['n_in_study_family'] == 3
-    assert study['n_conditional_follow_up'] == 4
-    follow_ups = [entry for entry in study['rows']
-                  if entry['id'].split(':', 2)[-1] in simple_ids]
+    assert study["n_in_study_family"] == 3
+    assert study["n_conditional_follow_up"] == 4
+    follow_ups = [entry for entry in study["rows"]
+                  if entry["id"].split(":", 2)[-1] in simple_ids]
     assert len(follow_ups) == 4
     for entry in follow_ups:
-        assert entry['tier'] == 'conditional_follow_up'
-        assert entry['confirmed_at_study_level'] is False
-        assert entry['downgraded_by_study_level'] is False
-        assert 'conditional follow-up' in entry['excluded_from_study_family']
+        assert entry["tier"] == "conditional_follow_up"
+        assert entry["confirmed_at_study_level"] is False
+        assert entry["downgraded_by_study_level"] is False
+        assert "conditional follow-up" in entry["excluded_from_study_family"]
 
 
 # ---------------------------------------------------------------------------
@@ -385,27 +394,27 @@ def test_simple_effects_are_pre_registered_but_not_double_counted():
 # ---------------------------------------------------------------------------
 def _plan_and_comparison(primary_values, secondary_value, extra_row=None):
     rows = {
-        'ln_baseline': {'norm_name': 'ln'},
-        'dytcd_full': {'norm_name': 'dytcd'},
-        'dytcd_no_perchannel': {'norm_name': 'dytcd', 'learnable_delta': False},
+        "ln_baseline": {"norm_name": "ln"},
+        "dytcd_full": {"norm_name": "dytcd"},
+        "dytcd_no_perchannel": {"norm_name": "dytcd", "learnable_delta": False},
     }
-    hypotheses = {name: f'hypothesis for {name}' for name in rows}
+    hypotheses = {name: f"hypothesis for {name}" for name in rows}
     matrix_report = {
-        'leave_one_out': {'dytcd_full': {
-            'per_channel_delta': 'dytcd_no_perchannel'}},
-        'factorial': {},
-        'qk_axis': {},
+        "leave_one_out": {"dytcd_full": {
+            "per_channel_delta": "dytcd_no_perchannel"}},
+        "factorial": {},
+        "qk_axis": {},
     }
     plan = build_analysis_plan(rows, hypotheses, matrix_report,
-                               ['ln_baseline'], 'gpt2-124m', SEEDS,
+                               ["ln_baseline"], "gpt2-124m", SEEDS,
                                alpha=0.05, margin=0.0,
                                equivalence_margin=0.02)
-    summaries = [_const('ln_baseline', 2.0),
-                 _row('dytcd_full', primary_values),
-                 _const('dytcd_no_perchannel', secondary_value)]
+    summaries = [_const("ln_baseline", 2.0),
+                 _row("dytcd_full", primary_values),
+                 _const("dytcd_no_perchannel", secondary_value)]
     if extra_row is not None:
         summaries.append(extra_row)
-    comparison = baseline_comparison(summaries, ['ln_baseline'],
+    comparison = baseline_comparison(summaries, ["ln_baseline"],
                                      equivalence_margin=0.02)
     return plan, comparison
 
@@ -413,36 +422,36 @@ def _plan_and_comparison(primary_values, secondary_value, extra_row=None):
 def test_plan_is_stable_and_tiers_the_main_proposal_as_primary():
     plan_a, _ = _plan_and_comparison({42: 1.5, 43: 1.5, 44: 1.5}, 1.6)
     plan_b, _ = _plan_and_comparison({42: 1.5, 43: 1.5, 44: 1.5}, 1.6)
-    assert plan_a['fingerprint'] == plan_b['fingerprint']
-    by_id = {contrast['id']: contrast for contrast in plan_a['contrasts']}
-    assert by_id['baseline:dytcd_full']['tier'] == 1
-    assert by_id['loo:dytcd_full:per_channel_delta']['tier'] == 1
-    assert by_id['baseline:dytcd_no_perchannel']['tier'] == 2
+    assert plan_a["fingerprint"] == plan_b["fingerprint"]
+    by_id = {contrast["id"]: contrast for contrast in plan_a["contrasts"]}
+    assert by_id["baseline:dytcd_full"]["tier"] == 1
+    assert by_id["loo:dytcd_full:per_channel_delta"]["tier"] == 1
+    assert by_id["baseline:dytcd_no_perchannel"]["tier"] == 2
 
 
 def test_plan_fingerprint_changes_with_the_scientific_margin():
-    rows = {'ln_baseline': {'norm_name': 'ln'},
-            'dytcd_full': {'norm_name': 'dytcd'}}
-    hyps = {name: 'h' for name in rows}
-    report = {'leave_one_out': {}, 'factorial': {}, 'qk_axis': {}}
-    a = build_analysis_plan(rows, hyps, report, ['ln_baseline'], 'm', SEEDS,
+    rows = {"ln_baseline": {"norm_name": "ln"},
+            "dytcd_full": {"norm_name": "dytcd"}}
+    hyps = dict.fromkeys(rows, "h")
+    report = {"leave_one_out": {}, "factorial": {}, "qk_axis": {}}
+    a = build_analysis_plan(rows, hyps, report, ["ln_baseline"], "m", SEEDS,
                             equivalence_margin=0.01)
-    b = build_analysis_plan(rows, hyps, report, ['ln_baseline'], 'm', SEEDS,
+    b = build_analysis_plan(rows, hyps, report, ["ln_baseline"], "m", SEEDS,
                             equivalence_margin=0.02)
-    assert a['fingerprint'] != b['fingerprint']
+    assert a["fingerprint"] != b["fingerprint"]
 
 
 def test_study_level_gate_opens_when_the_primary_survives():
     plan, comparison = _plan_and_comparison({42: 1.5, 43: 1.5, 44: 1.5}, 1.6)
-    study = study_level_correction({'baseline': comparison}, plan)
-    assert study['primary_gate_open'] is True
-    assert study['n_confirmed_primary'] >= 1
-    confirmed = {row['id'] for row in study['rows']
-                 if row['confirmed_at_study_level']}
-    assert 'baseline:dytcd_full' in confirmed
+    study = study_level_correction({"baseline": comparison}, plan)
+    assert study["primary_gate_open"] is True
+    assert study["n_confirmed_primary"] >= 1
+    confirmed = {row["id"] for row in study["rows"]
+                 if row["confirmed_at_study_level"]}
+    assert "baseline:dytcd_full" in confirmed
     # The secondary row is constant and far from the baseline, so once the
     # gate opens its own Holm-corrected test confirms it too.
-    assert 'baseline:dytcd_no_perchannel' in confirmed
+    assert "baseline:dytcd_no_perchannel" in confirmed
 
 
 def test_study_level_gate_closes_and_blocks_secondary_claims():
@@ -451,48 +460,48 @@ def test_study_level_gate_closes_and_blocks_secondary_claims():
     # winner; gatekeeping still refuses to promote it.
     plan, comparison = _plan_and_comparison(
         {42: 1.50, 43: 2.20, 44: 1.60}, 1.60)
-    study = study_level_correction({'baseline': comparison}, plan)
-    assert study['primary_gate_open'] is False
-    primary = [row for row in study['rows'] if row['tier'] == 'primary']
-    assert all(row['confirmed_at_study_level'] is False for row in primary)
-    secondary = [row for row in study['rows']
-                 if row['id'] == 'baseline:dytcd_no_perchannel'][0]
-    assert secondary['confirmed_at_study_level'] is False
-    assert secondary['p_study_holm'] is None
-    assert 'not tested' in secondary['gate_status']
+    study = study_level_correction({"baseline": comparison}, plan)
+    assert study["primary_gate_open"] is False
+    primary = [row for row in study["rows"] if row["tier"] == "primary"]
+    assert all(row["confirmed_at_study_level"] is False for row in primary)
+    secondary = [row for row in study["rows"]
+                 if row["id"] == "baseline:dytcd_no_perchannel"][0]
+    assert secondary["confirmed_at_study_level"] is False
+    assert secondary["p_study_holm"] is None
+    assert "not tested" in secondary["gate_status"]
 
 
 def test_unregistered_rows_cannot_become_confirmed_claims():
-    sneaky = _const('dytcd_sneaky', 1.0)
+    sneaky = _const("dytcd_sneaky", 1.0)
     plan, comparison = _plan_and_comparison(
         {42: 1.5, 43: 1.5, 44: 1.5}, 1.6, extra_row=sneaky)
-    study = study_level_correction({'baseline': comparison}, plan)
-    assert 'baseline:dytcd_sneaky' in study['unregistered_contrasts']
-    row = [entry for entry in study['rows']
-           if entry['id'] == 'baseline:dytcd_sneaky'][0]
-    assert row['tier'] == 'unregistered'
-    assert row['confirmed_at_study_level'] is False
-    assert 'pre-registered analysis plan' in row['excluded_from_study_family']
+    study = study_level_correction({"baseline": comparison}, plan)
+    assert "baseline:dytcd_sneaky" in study["unregistered_contrasts"]
+    row = [entry for entry in study["rows"]
+           if entry["id"] == "baseline:dytcd_sneaky"][0]
+    assert row["tier"] == "unregistered"
+    assert row["confirmed_at_study_level"] is False
+    assert "pre-registered analysis plan" in row["excluded_from_study_family"]
 
 
 def test_unregistered_contrasts_get_exploratory_bh_q_values():
-    plan = {'fingerprint': 'empty-plan', 'contrasts': []}
+    plan = {"fingerprint": "empty-plan", "contrasts": []}
     rows = [{
-        'name': f'row{i}', 'p_one_sided': p,
-        'beats_reference': True, 'beats_reference_significantly': True,
-        'replicated_across_seeds': True, 'excluded_from_family': None,
-        'delta_vs_reference': -0.1, 'test_basis': 'seed_means',
-        'hypothesis': 'h',
+        "name": f"row{i}", "p_one_sided": p,
+        "beats_reference": True, "beats_reference_significantly": True,
+        "replicated_across_seeds": True, "excluded_from_family": None,
+        "delta_vs_reference": -0.1, "test_basis": "seed_means",
+        "hypothesis": "h",
     } for i, p in enumerate((0.01, 0.04, 0.03))]
-    study = study_level_correction({'baseline': {'rows': rows}}, plan)
+    study = study_level_correction({"baseline": {"rows": rows}}, plan)
     expected = benjamini_hochberg_adjust([0.01, 0.04, 0.03])
-    assert [row['q_value_bh'] for row in study['rows']] == pytest.approx(
+    assert [row["q_value_bh"] for row in study["rows"]] == pytest.approx(
         expected)
-    assert study['exploratory_fdr']['n_tested'] == 3
-    assert study['exploratory_fdr']['n_discoveries'] == 3
-    assert study['exploratory_fdr']['discoveries'] == [
-        'baseline:row0', 'baseline:row1', 'baseline:row2']
-    assert all(row['tier'] == 'unregistered' for row in study['rows'])
+    assert study["exploratory_fdr"]["n_tested"] == 3
+    assert study["exploratory_fdr"]["n_discoveries"] == 3
+    assert study["exploratory_fdr"]["discoveries"] == [
+        "baseline:row0", "baseline:row1", "baseline:row2"]
+    assert all(row["tier"] == "unregistered" for row in study["rows"])
 
 
 def test_benjamini_hochberg_is_a_step_up_correction_with_invalid_slots_ignored():
@@ -501,7 +510,7 @@ def test_benjamini_hochberg_is_a_step_up_correction_with_invalid_slots_ignored()
     assert benjamini_hochberg_adjust([0.01, 0.02, 0.03, 0.04, 0.05]) == (
         pytest.approx([0.05] * 5))
     # Invalid p-values keep their None slot and do not enter the family size.
-    assert benjamini_hochberg_adjust([0.01, 1.5, '0.01', True, -0.1]) == (
+    assert benjamini_hochberg_adjust([0.01, 1.5, "0.01", True, -0.1]) == (
         pytest.approx([0.01, None, None, None, None]))
 
 
@@ -509,8 +518,8 @@ def test_unresolved_plan_contrasts_are_reported_not_silently_dropped():
     plan, comparison = _plan_and_comparison({42: 1.5, 43: 1.5, 44: 1.5}, 1.6)
     # The plan also contains the leave-one-out contrast, but no LOO report is
     # supplied here: it must show up as unresolved, not disappear.
-    study = study_level_correction({'baseline': comparison}, plan)
-    assert 'loo:dytcd_full:per_channel_delta' in study['unresolved_plan_contrasts']
+    study = study_level_correction({"baseline": comparison}, plan)
+    assert "loo:dytcd_full:per_channel_delta" in study["unresolved_plan_contrasts"]
 
 
 def test_global_correction_can_demote_a_locally_significant_claim():
@@ -519,46 +528,46 @@ def test_global_correction_can_demote_a_locally_significant_claim():
     # no primary claim survives. The gate must then close, not quietly keep
     # the family-local verdicts.
     plan = {
-        'fingerprint': 'test-plan',
-        'contrasts': [
-            {'id': f'baseline:row{i}', 'family': 'baseline',
-             'kind': 'superiority', 'tier': 1, 'tier_role': 'primary'}
+        "fingerprint": "test-plan",
+        "contrasts": [
+            {"id": f"baseline:row{i}", "family": "baseline",
+             "kind": "superiority", "tier": 1, "tier_role": "primary"}
             for i in range(3)
         ],
     }
     rows = [{
-        'name': f'row{i}',
-        'p_one_sided': 0.03,
-        'p_one_sided_holm': 0.03,
-        'beats_reference': True,
-        'beats_reference_significantly': True,
-        'replicated_across_seeds': True,
-        'excluded_from_family': None,
-        'delta_vs_reference': -0.1,
-        'test_basis': 'seed_means',
-        'hypothesis': 'h',
+        "name": f"row{i}",
+        "p_one_sided": 0.03,
+        "p_one_sided_holm": 0.03,
+        "beats_reference": True,
+        "beats_reference_significantly": True,
+        "replicated_across_seeds": True,
+        "excluded_from_family": None,
+        "delta_vs_reference": -0.1,
+        "test_basis": "seed_means",
+        "hypothesis": "h",
     } for i in range(3)]
-    study = study_level_correction({'baseline': {'rows': rows}}, plan)
-    assert study['primary_gate_open'] is False
-    assert study['n_confirmed_at_study_level'] == 0
-    assert {entry['id'] for entry in study['downgraded_by_study_level']} == {
-        f'baseline:row{i}' for i in range(3)}
+    study = study_level_correction({"baseline": {"rows": rows}}, plan)
+    assert study["primary_gate_open"] is False
+    assert study["n_confirmed_at_study_level"] == 0
+    assert {entry["id"] for entry in study["downgraded_by_study_level"]} == {
+        f"baseline:row{i}" for i in range(3)}
 
 
 def test_focused_secondary_only_run_is_not_blocked_by_a_missing_primary_family():
     # A QK-only or single-axis run has no primary tier at all. That is not a
     # failed gate - the secondary family should still be corrected and tested.
     plan, _ = _plan_and_comparison({42: 1.5, 43: 1.5, 44: 1.5}, 1.6)
-    summaries = [_const('ln_baseline', 2.0),
-                 _const('dytcd_no_perchannel', 1.6)]
-    comparison = baseline_comparison(summaries, ['ln_baseline'],
+    summaries = [_const("ln_baseline", 2.0),
+                 _const("dytcd_no_perchannel", 1.6)]
+    comparison = baseline_comparison(summaries, ["ln_baseline"],
                                      equivalence_margin=0.02)
-    study = study_level_correction({'baseline': comparison}, plan)
-    assert study['primary_gate_status'] == 'not_applicable_no_primary_tests'
-    secondary = [row for row in study['rows']
-                 if row['id'] == 'baseline:dytcd_no_perchannel'][0]
-    assert secondary['p_study_holm'] is not None
-    assert secondary['confirmed_at_study_level'] is True
+    study = study_level_correction({"baseline": comparison}, plan)
+    assert study["primary_gate_status"] == "not_applicable_no_primary_tests"
+    secondary = [row for row in study["rows"]
+                 if row["id"] == "baseline:dytcd_no_perchannel"][0]
+    assert secondary["p_study_holm"] is not None
+    assert secondary["confirmed_at_study_level"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -569,43 +578,43 @@ def test_compare_arms_reports_equivalence_and_jackknife():
 
     def aggregate(values):
         return {
-            'norm': 'test',
-            'model': 'gpt2-124m',
-            'per_seed': [{'seed': seed, 'final_val_loss': value,
-                          'final_val_step': 100}
+            "norm": "test",
+            "model": "gpt2-124m",
+            "per_seed": [{"seed": seed, "final_val_loss": value,
+                          "final_val_step": 100}
                          for seed, value in sorted(values.items())],
-            'shapes_by_seed': {str(seed): {'n_layers': 12, 'dim': 768,
-                                           'n_heads': 12}
+            "shapes_by_seed": {str(seed): {"n_layers": 12, "dim": 768,
+                                           "n_heads": 12}
                                for seed in values},
-            'data_versions_by_seed': {str(seed): {'name': 'corpus',
-                                                  'revision': 'v1'}
+            "data_versions_by_seed": {str(seed): {"name": "corpus",
+                                                  "revision": "v1"}
                                       for seed in values},
         }
 
     arms = {
-        'reference': aggregate({42: 2.0, 43: 2.0, 44: 2.0}),
-        'candidate': aggregate({42: 2.001, 43: 1.999, 44: 2.000}),
+        "reference": aggregate({42: 2.0, 43: 2.0, 44: 2.0}),
+        "candidate": aggregate({42: 2.001, 43: 1.999, 44: 2.000}),
     }
-    out = compare_arms(arms, reference='reference', equivalence_margin=0.02,
+    out = compare_arms(arms, reference="reference", equivalence_margin=0.02,
                        require_recipe=False)
-    row = out['rows'][0]
-    assert row['equivalence']['enabled'] is True
-    assert row['equivalence']['equivalent'] is True
-    assert row['equivalence']['design']['test'] == 'tost_paired_design'
-    assert row['equivalence']['design']['required_pairs_for_margin'] >= 2
+    row = out["rows"][0]
+    assert row["equivalence"]["enabled"] is True
+    assert row["equivalence"]["equivalent"] is True
+    assert row["equivalence"]["design"]["test"] == "tost_paired_design"
+    assert row["equivalence"]["design"]["required_pairs_for_margin"] >= 2
     # Small, sign-alternating differences: no stable direction to report.
-    assert row['seed_jackknife']['sign'] == 'zero'
-    assert row['seed_jackknife']['sign_stable'] is None
+    assert row["seed_jackknife"]["sign"] == "zero"
+    assert row["seed_jackknife"]["sign_stable"] is None
 
     clear = {
-        'reference': aggregate({42: 2.0, 43: 2.0, 44: 2.0}),
-        'candidate': aggregate({42: 1.5, 43: 1.52, 44: 1.49}),
+        "reference": aggregate({42: 2.0, 43: 2.0, 44: 2.0}),
+        "candidate": aggregate({42: 1.5, 43: 1.52, 44: 1.49}),
     }
-    out = compare_arms(clear, reference='reference', equivalence_margin=0.02,
+    out = compare_arms(clear, reference="reference", equivalence_margin=0.02,
                        require_recipe=False)
-    row = out['rows'][0]
-    assert row['equivalence']['equivalent'] is False
-    assert row['seed_jackknife']['sign_stable'] is True
+    row = out["rows"][0]
+    assert row["equivalence"]["equivalent"] is False
+    assert row["seed_jackknife"]["sign_stable"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -619,75 +628,75 @@ def test_paired_trend_detects_a_growing_advantage():
         44: [0.000, -0.008, -0.019, -0.028],
     }
     out = paired_trend_test(doses, deltas)
-    assert out['n_seeds'] == 3
-    assert out['n_doses'] == 4
-    assert out['mean_slope_per_dose'] < 0.0
-    assert out['p_one_sided'] < 0.05
-    assert out['certifiable'] is True
-    assert out['advantage_grows_with_dose'] is True
+    assert out["n_seeds"] == 3
+    assert out["n_doses"] == 4
+    assert out["mean_slope_per_dose"] < 0.0
+    assert out["p_one_sided"] < 0.05
+    assert out["certifiable"] is True
+    assert out["advantage_grows_with_dose"] is True
     # Every seed's slope is negative, so no single seed carries the sign.
-    assert out['seed_jackknife']['sign_stable'] is True
-    assert out['minimum_detectable_slope_95_power80'] is not None
+    assert out["seed_jackknife"]["sign_stable"] is True
+    assert out["minimum_detectable_slope_95_power80"] is not None
 
 
 def test_paired_trend_rejects_a_flat_delta_as_no_trend():
     flat = {seed: [-0.02, -0.02, -0.02, -0.02] for seed in (42, 43, 44)}
     out = paired_trend_test([1.0, 2.0, 3.0, 4.0], flat)
-    assert out['mean_slope_per_dose'] == pytest.approx(0.0)
-    assert out['advantage_grows_with_dose'] is False
-    assert out['n_seeds_with_negative_slope'] == 0
+    assert out["mean_slope_per_dose"] == pytest.approx(0.0)
+    assert out["advantage_grows_with_dose"] is False
+    assert out["n_seeds_with_negative_slope"] == 0
     # A constant advantage is not a dose-response, so a row of equally large
     # per-depth deltas must not be reported as "growing with depth".
-    assert out['seed_jackknife']['sign'] == 'zero'
+    assert out["seed_jackknife"]["sign"] == "zero"
 
 
 def test_paired_trend_treats_a_shrinking_advantage_one_sidedly():
     shrinking = {seed: [0.0, 0.01, 0.02, 0.03] for seed in (42, 43, 44)}
     out = paired_trend_test([1.0, 2.0, 3.0, 4.0], shrinking)
-    assert out['mean_slope_per_dose'] > 0.0
-    assert out['p_one_sided'] > 0.95
-    assert out['advantage_grows_with_dose'] is False
+    assert out["mean_slope_per_dose"] > 0.0
+    assert out["p_one_sided"] > 0.95
+    assert out["advantage_grows_with_dose"] is False
 
 
 def test_paired_trend_needs_replication_and_two_doses():
     one_seed = paired_trend_test([1.0, 2.0, 3.0], {42: [0.0, -0.1, -0.2]})
-    assert one_seed['mean_slope_per_dose'] < 0.0
-    assert one_seed['p_one_sided'] is None
-    assert one_seed['certifiable'] is False
-    assert 'descriptive' in one_seed['note']
+    assert one_seed["mean_slope_per_dose"] < 0.0
+    assert one_seed["p_one_sided"] is None
+    assert one_seed["certifiable"] is False
+    assert "descriptive" in one_seed["note"]
 
     one_dose = paired_trend_test([1.0], {42: [0.0], 43: [0.0]})
-    assert one_dose['n_doses'] == 1
-    assert one_dose['p_one_sided'] is None
-    assert 'two distinct doses' in one_dose['note']
+    assert one_dose["n_doses"] == 1
+    assert one_dose["p_one_sided"] is None
+    assert "two distinct doses" in one_dose["note"]
 
 
 def test_paired_trend_reports_excluded_seeds_and_bad_input():
     out = paired_trend_test([1.0, 2.0, 3.0], {
         42: [0.0, -0.01, -0.02],
         43: [0.0, -0.012, -0.021],
-        44: [0.0, float('nan'), float('nan')],  # only one finite distinct dose
+        44: [0.0, float("nan"), float("nan")],  # only one finite distinct dose
     })
-    assert out['n_seeds'] == 2
-    assert '44' in out['excluded_seeds']
-    assert out['certifiable'] is False
+    assert out["n_seeds"] == 2
+    assert "44" in out["excluded_seeds"]
+    assert out["certifiable"] is False
     with pytest.raises(ValueError):
         paired_trend_test([1.0, 2.0], {42: [0.0]})
     with pytest.raises(ValueError):
-        paired_trend_test([1.0, float('nan')], {42: [0.0, -0.1]})
+        paired_trend_test([1.0, float("nan")], {42: [0.0, -0.1]})
 
 
 def _trend_cell(values, **extra):
     items = sorted(values.items())
     mean = sum(value for _, value in items) / len(items)
     cell = {
-        'seeds': list(values),
-        'per_seed': [{'seed': seed, 'final_val_loss': value}
+        "seeds": list(values),
+        "per_seed": [{"seed": seed, "final_val_loss": value}
                      for seed, value in items],
-        'final_val_loss': mean,
-        'complete': True,
-        'n_params': 1_000_000_000,
-        'flops_per_token_forward': 1_000_000_000,
+        "final_val_loss": mean,
+        "complete": True,
+        "n_params": 1_000_000_000,
+        "flops_per_token_forward": 1_000_000_000,
     }
     cell.update(extra)
     return cell
@@ -703,26 +712,26 @@ def test_sweep_trend_is_attached_and_reads_per_seed_deltas():
     for depth, delta, noise in ((12, 0.00, 0.001), (24, 0.01, 0.001),
                                 (48, 0.02, 0.002), (96, 0.03, 0.002)):
         cells[depth] = {
-            'rmsnorm': _trend_cell(reference),
-            'dytcd': _trend_cell({
+            "rmsnorm": _trend_cell(reference),
+            "dytcd": _trend_cell({
                 42: 2.0 - delta,
                 43: 2.0 - delta + noise,
                 44: 2.0 - delta - noise,
             }),
         }
-    comparison = compare_sweep_cells(cells, 'rmsnorm')
-    for row in comparison['rows']:
-        assert set(row['per_seed_delta']) == {'42', '43', '44'}
-    block = comparison['cross_depth_trends']
-    entry = [item for item in block['trends']
-             if item['norm'] == 'dytcd'][0]
-    assert entry['depths'] == [12, 24, 48, 96]
-    assert entry['n_seeds'] == 3
-    assert entry['mean_slope_per_dose'] < 0.0
-    assert entry['advantage_grows_with_depth'] is True
+    comparison = compare_sweep_cells(cells, "rmsnorm")
+    for row in comparison["rows"]:
+        assert set(row["per_seed_delta"]) == {"42", "43", "44"}
+    block = comparison["cross_depth_trends"]
+    entry = [item for item in block["trends"]
+             if item["norm"] == "dytcd"][0]
+    assert entry["depths"] == [12, 24, 48, 96]
+    assert entry["n_seeds"] == 3
+    assert entry["mean_slope_per_dose"] < 0.0
+    assert entry["advantage_grows_with_depth"] is True
     # The trend survives dropping any single depth in this linear example.
-    assert entry['leave_one_depth_out']['sign_stable'] is True
-    assert entry['leave_one_depth_out']['influential_depths'] == []
+    assert entry["leave_one_depth_out"]["sign_stable"] is True
+    assert entry["leave_one_depth_out"]["influential_depths"] == []
 
 
 def test_sweep_trend_reports_a_single_depth_carrying_the_slope():
@@ -734,16 +743,16 @@ def test_sweep_trend_reports_a_single_depth_carrying_the_slope():
     # the negative slope is a property of the deepest cell, not a trend.
     for depth, delta in ((12, 0.00), (24, 0.00), (48, 0.00), (96, 0.10)):
         cells[depth] = {
-            'rmsnorm': _trend_cell(reference),
-            'dytcd': _trend_cell({42: 2.0 - delta, 43: 2.0 - delta,
+            "rmsnorm": _trend_cell(reference),
+            "dytcd": _trend_cell({42: 2.0 - delta, 43: 2.0 - delta,
                                   44: 2.0 - delta}),
         }
-    comparison = compare_sweep_cells(cells, 'rmsnorm')
-    entry = [item for item in comparison['cross_depth_trends']['trends']
-             if item['norm'] == 'dytcd'][0]
-    jack = entry['leave_one_depth_out']
-    assert jack['sign_stable'] is False
-    assert jack['influential_depths'] == [96]
+    comparison = compare_sweep_cells(cells, "rmsnorm")
+    entry = [item for item in comparison["cross_depth_trends"]["trends"]
+             if item["norm"] == "dytcd"][0]
+    jack = entry["leave_one_depth_out"]
+    assert jack["sign_stable"] is False
+    assert jack["influential_depths"] == [96]
 
 
 def test_sweep_trend_is_descriptive_when_a_depth_is_incomplete():
@@ -753,15 +762,15 @@ def test_sweep_trend_is_descriptive_when_a_depth_is_incomplete():
     cells = {}
     for depth, delta in ((12, 0.00), (24, 0.01), (48, 0.02), (96, 0.03)):
         cells[depth] = {
-            'rmsnorm': _trend_cell(reference),
-            'dytcd': _trend_cell({42: 2.0 - delta, 43: 2.0 - delta,
+            "rmsnorm": _trend_cell(reference),
+            "dytcd": _trend_cell({42: 2.0 - delta, 43: 2.0 - delta,
                                   44: 2.0 - delta},
                                  complete=depth != 96),
         }
-    comparison = compare_sweep_cells(cells, 'rmsnorm')
-    entry = [item for item in comparison['cross_depth_trends']['trends']
-             if item['norm'] == 'dytcd'][0]
-    assert entry['excluded_depths']
-    assert entry['certifiable'] is False
-    assert entry['advantage_grows_with_depth'] is False
-    assert 'descriptive' in entry['note']
+    comparison = compare_sweep_cells(cells, "rmsnorm")
+    entry = [item for item in comparison["cross_depth_trends"]["trends"]
+             if item["norm"] == "dytcd"][0]
+    assert entry["excluded_depths"]
+    assert entry["certifiable"] is False
+    assert entry["advantage_grows_with_depth"] is False
+    assert "descriptive" in entry["note"]

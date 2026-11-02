@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """Leakage-safe streaming data pipeline for the AdaSquash experiments.
 
 Principles enforced here
@@ -670,7 +671,7 @@ def load_hash_file(path) -> set:
         return raw
 
     out: set = set()
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             stripped = line.lstrip()
             if not stripped:
@@ -858,7 +859,7 @@ def _iter_dataset_examples(ds):
     is the non-worker-sharded iteration API, so flatten its one-example batches
     back to documents and leave the routing to `PackedStream`.
     """
-    if not hasattr(ds, 'iter') or not hasattr(ds, '_ex_iterable'):
+    if not hasattr(ds, "iter") or not hasattr(ds, "_ex_iterable"):
         yield from ds
         return
     for batch in ds.iter(batch_size=1):
@@ -984,8 +985,8 @@ class PackedStream(IterableDataset):
                     # to the documents; silently dropping/pulling tokens
                     # would change the corpus.
                     raise ValueError(
-                        f'tokenizer returned a non-matrix result for '
-                        f'{len(batch)} document(s)')
+                        f"tokenizer returned a non-matrix result for "
+                        f"{len(batch)} document(s)")
             except Exception:
                 token_lists = []
                 for text in batch:
@@ -1067,7 +1068,7 @@ class _JsonlDocumentStream(IterableDataset):
         return record
 
     def __iter__(self):
-        with open(self.path, "r", encoding="utf-8") as f:
+        with open(self.path, encoding="utf-8") as f:
             for line in f:
                 yield self._restore(json.loads(line))
 

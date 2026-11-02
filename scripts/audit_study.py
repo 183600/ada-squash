@@ -25,19 +25,19 @@ from adasquash.provenance import audit_study
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Verify a study directory against its run manifests, '
-                    'artifact fingerprints, aggregates and analysis plan')
-    parser.add_argument('study_dir', help='directory containing the study')
-    parser.add_argument('--output', default=None,
-                        help='write the JSON audit report here instead of stdout')
-    parser.add_argument('--allow-unfinished', action='store_true',
-                        help='do not fail on manifests whose status is not finished')
-    parser.add_argument('--allow-dirty', action='store_true',
-                        help='do not fail on runs from a dirty working tree')
-    parser.add_argument('--allow-commit-drift', action='store_true',
-                        help='do not fail when seed runs used different commits')
-    parser.add_argument('--allow-plan-drift', action='store_true',
-                        help='do not fail when analysis_plan.json records a post-hoc change')
+        description="Verify a study directory against its run manifests, "
+                    "artifact fingerprints, aggregates and analysis plan")
+    parser.add_argument("study_dir", help="directory containing the study")
+    parser.add_argument("--output", default=None,
+                        help="write the JSON audit report here instead of stdout")
+    parser.add_argument("--allow-unfinished", action="store_true",
+                        help="do not fail on manifests whose status is not finished")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="do not fail on runs from a dirty working tree")
+    parser.add_argument("--allow-commit-drift", action="store_true",
+                        help="do not fail when seed runs used different commits")
+    parser.add_argument("--allow-plan-drift", action="store_true",
+                        help="do not fail when analysis_plan.json records a post-hoc change")
     return parser
 
 
@@ -66,5 +66,5 @@ def main(argv=None) -> int:
     return 0 if report["ok"] else 1
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())

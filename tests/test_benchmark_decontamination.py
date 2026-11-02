@@ -45,10 +45,12 @@ from adasquash.decontamination import (
 )
 from scripts.data_pipeline import (
     DocumentCleaner,
-    canonical_document_hash as pipeline_canonical_document_hash,
     document_hash,
     load_hash_file,
     validate_data_options,
+)
+from scripts.data_pipeline import (
+    canonical_document_hash as pipeline_canonical_document_hash,
 )
 
 

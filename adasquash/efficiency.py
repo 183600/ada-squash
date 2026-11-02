@@ -27,8 +27,8 @@ from ._validation import is_boolean_scalar as _is_boolean_value
 from .metrics import student_t_ppf
 
 __all__ = [
-    "DEFAULT_MIN_LOSS_GAIN",
     "DEFAULT_MAX_COST_RATIO",
+    "DEFAULT_MIN_LOSS_GAIN",
     "analytic_flops_per_token",
     "efficiency_verdict",
     "mlp_hidden_size",
@@ -160,7 +160,7 @@ def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = 
         T = int(raw_len)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{len_name} must be an integer, got {raw_len!r}") from None
-    if T != raw_len:
+    if raw_len != T:
         raise ValueError(f"{len_name} must be an integer, got {raw_len!r}")
     if T < 0:
         raise ValueError(f"{len_name} must be >= 0, got {T}")
@@ -399,10 +399,7 @@ def efficiency_verdict(
         # "no stderr recorded" into an exactly-zero interval and let a noisy
         # benchmark certify a cost it never resolved. Reject it like the
         # boolean gain / component measurements.
-        if _is_boolean_value(cost_ratio_stderr):
-            invalid_se = repr(cost_ratio_stderr)
-            candidate_se = None
-        elif not isinstance(cost_ratio_stderr, numbers.Number):
+        if _is_boolean_value(cost_ratio_stderr) or not isinstance(cost_ratio_stderr, numbers.Number):
             invalid_se = repr(cost_ratio_stderr)
             candidate_se = None
         else:
@@ -423,9 +420,7 @@ def efficiency_verdict(
         # Decimal/Fraction/NumPy floats are real measurements too, and
         # int(2.5) would silently turn a fractional round count into 2 and
         # let it certify a t-interval.
-        if _is_boolean_value(cost_ratio_n):
-            invalid_n = repr(cost_ratio_n)
-        elif not isinstance(cost_ratio_n, numbers.Number):
+        if _is_boolean_value(cost_ratio_n) or not isinstance(cost_ratio_n, numbers.Number):
             invalid_n = repr(cost_ratio_n)
         elif isinstance(cost_ratio_n, numbers.Integral):
             # A huge Python integer is a finite integral count even though it

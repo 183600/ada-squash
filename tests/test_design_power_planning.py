@@ -24,12 +24,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from adasquash.design import (design_readiness_audit,
-                              prospective_power_plan,
-                              randomized_complete_block_schedule,
-                              schedule_balance_report,
-                              schedule_fingerprint_status,
-                              tost_power_plan)
+from adasquash.design import (
+    design_readiness_audit,
+    prospective_power_plan,
+    randomized_complete_block_schedule,
+    schedule_balance_report,
+    schedule_fingerprint_status,
+    tost_power_plan,
+)
 from scripts.ablation import build_analysis_plan
 
 
@@ -39,65 +41,65 @@ from scripts.ablation import build_analysis_plan
 def test_family_adjusted_plan_needs_more_pairs_than_the_per_test_plan():
     single = prospective_power_plan(0.10, 27, 0.05, n_tests=1)
     family = prospective_power_plan(0.10, 27, 0.05, n_tests=8)
-    assert single['family_alpha'] == pytest.approx(0.05)
-    assert family['family_alpha'] == pytest.approx(0.00625)
-    assert single['required_pairs_unadjusted'] == 27
-    assert family['required_pairs_unadjusted'] == 27
-    assert family['required_pairs_family_adjusted'] > single['required_pairs_family_adjusted']
-    assert single['adequately_powered_family_adjusted'] is True
-    assert family['adequately_powered_family_adjusted'] is False
-    assert family['shortfall_pairs'] == (
-        family['required_planned_pairs'] - family['n_pairs'])
+    assert single["family_alpha"] == pytest.approx(0.05)
+    assert family["family_alpha"] == pytest.approx(0.00625)
+    assert single["required_pairs_unadjusted"] == 27
+    assert family["required_pairs_unadjusted"] == 27
+    assert family["required_pairs_family_adjusted"] > single["required_pairs_family_adjusted"]
+    assert single["adequately_powered_family_adjusted"] is True
+    assert family["adequately_powered_family_adjusted"] is False
+    assert family["shortfall_pairs"] == (
+        family["required_planned_pairs"] - family["n_pairs"])
 
 
 def test_family_adjusted_required_n_is_the_smallest_adequate_plan():
     plan = prospective_power_plan(0.10, 48, 0.05, n_tests=8)
-    required = plan['required_pairs_family_adjusted']
+    required = plan["required_pairs_family_adjusted"]
     assert required == 48
-    assert plan['adequately_powered_after_attrition'] is True
+    assert plan["adequately_powered_after_attrition"] is True
     before = prospective_power_plan(0.10, required - 1, 0.05, n_tests=8)
-    assert before['adequately_powered_after_attrition'] is False
+    assert before["adequately_powered_after_attrition"] is False
 
 
 def test_attrition_inflates_the_planned_pairs_and_reduces_the_effective_n():
     plan = prospective_power_plan(0.10, 60, 0.05, n_tests=8,
                                   expected_attrition=0.10)
-    required = plan['required_pairs_family_adjusted']
-    assert plan['complete_pair_survival'] == pytest.approx(0.81)
-    assert plan['expected_analyzable_pairs'] == 48
-    assert plan['required_planned_pairs'] == 60
+    required = plan["required_pairs_family_adjusted"]
+    assert plan["complete_pair_survival"] == pytest.approx(0.81)
+    assert plan["expected_analyzable_pairs"] == 48
+    assert plan["required_planned_pairs"] == 60
     assert required == 48
-    assert plan['required_planned_pairs'] >= required
-    assert plan['adequately_powered_after_attrition'] is True
+    assert plan["required_planned_pairs"] >= required
+    assert plan["adequately_powered_after_attrition"] is True
     # Loss of pairs widens the resolution even though the nominal n is fixed.
-    assert (plan['minimum_detectable_delta_unadjusted']
-            <= plan['minimum_detectable_delta_family_adjusted']
-            <= plan['minimum_detectable_delta_after_attrition'])
+    assert (plan["minimum_detectable_delta_unadjusted"]
+            <= plan["minimum_detectable_delta_family_adjusted"]
+            <= plan["minimum_detectable_delta_after_attrition"])
 
 
 def test_high_attrition_can_make_a_nominally_adequate_design_underpowered():
     plan = prospective_power_plan(0.10, 48, 0.05, n_tests=8,
                                   expected_attrition=0.20)
-    assert plan['expected_analyzable_pairs'] == 30
-    assert plan['adequately_powered_family_adjusted'] is True
-    assert plan['adequately_powered_after_attrition'] is False
-    assert plan['required_planned_pairs'] == 75
-    assert plan['shortfall_pairs'] == 27
+    assert plan["expected_analyzable_pairs"] == 30
+    assert plan["adequately_powered_family_adjusted"] is True
+    assert plan["adequately_powered_after_attrition"] is False
+    assert plan["required_planned_pairs"] == 75
+    assert plan["shortfall_pairs"] == 27
 
 
-@pytest.mark.parametrize('overrides', [
-    {'paired_sd': -0.1},
-    {'paired_sd': float('nan')},
-    {'n_pairs': 1},
-    {'margin': 0.0},
-    {'margin': -0.05},
-    {'alpha': 0.0},
-    {'power': 1.0},
-    {'n_tests': 0},
-    {'n_tests': True},
-    {'expected_attrition': -0.1},
-    {'expected_attrition': 1.0},
-    {'max_pairs': 1},
+@pytest.mark.parametrize("overrides", [
+    {"paired_sd": -0.1},
+    {"paired_sd": float("nan")},
+    {"n_pairs": 1},
+    {"margin": 0.0},
+    {"margin": -0.05},
+    {"alpha": 0.0},
+    {"power": 1.0},
+    {"n_tests": 0},
+    {"n_tests": True},
+    {"expected_attrition": -0.1},
+    {"expected_attrition": 1.0},
+    {"max_pairs": 1},
 ])
 def test_planning_inputs_are_validated(overrides):
     kwargs = dict(paired_sd=0.1, n_pairs=30, margin=0.05)
@@ -111,117 +113,117 @@ def test_planning_inputs_are_validated(overrides):
 # ---------------------------------------------------------------------------
 def _schedule(n_arms, n_seeds):
     return randomized_complete_block_schedule(
-        [f'arm{i}' for i in range(n_arms)],
+        [f"arm{i}" for i in range(n_arms)],
         [str(seed) for seed in range(n_seeds)], seed=2)
 
 
 def _audit(seeds, *, n_tests, attrition, sd=0.10, margin=0.05):
-    rows = {'arm0': {}, 'arm1': {}}
-    hypotheses = {name: 'h' for name in rows}
+    rows = {"arm0": {}, "arm1": {}}
+    hypotheses = dict.fromkeys(rows, "h")
     schedule = _schedule(len(rows), len(seeds))
     return design_readiness_audit(
         seeds, rows, hypotheses, schedule=schedule,
-        expected_units=schedule['order'], margin=margin,
-        assumed_paired_sd=sd, identity_controls=[('arm0', 'arm1')],
-        schedule_arm_of=lambda unit: unit.rsplit('::rep=', 1)[0],
+        expected_units=schedule["order"], margin=margin,
+        assumed_paired_sd=sd, identity_controls=[("arm0", "arm1")],
+        schedule_arm_of=lambda unit: unit.rsplit("::rep=", 1)[0],
         n_confirmatory_tests=n_tests, expected_attrition=attrition)
 
 
 def test_tost_power_plan_uses_equivalence_power_and_attrition():
     plan = tost_power_plan(0.10, 12, equivalence_margin=0.10, n_tests=4,
                            expected_attrition=0.10)
-    assert plan['n_tests'] == 4
-    assert plan['family_alpha'] == pytest.approx(0.0125)
-    assert plan['required_pairs_family_adjusted'] > plan[
-        'required_pairs_unadjusted']
-    assert plan['required_planned_pairs'] >= plan[
-        'required_pairs_family_adjusted']
-    assert plan['expected_analyzable_pairs'] == 9
-    assert plan['schema'] == 'adasquash.tost_power.v1'
+    assert plan["n_tests"] == 4
+    assert plan["family_alpha"] == pytest.approx(0.0125)
+    assert plan["required_pairs_family_adjusted"] > plan[
+        "required_pairs_unadjusted"]
+    assert plan["required_planned_pairs"] >= plan[
+        "required_pairs_family_adjusted"]
+    assert plan["expected_analyzable_pairs"] == 9
+    assert plan["schema"] == "adasquash.tost_power.v1"
 
 
 def test_readiness_checks_equivalence_power_separately_from_superiority():
-    rows = {'arm0': {}, 'arm1': {}}
+    rows = {"arm0": {}, "arm1": {}}
     seeds = list(range(12))
     schedule = _schedule(len(rows), len(seeds))
     report = design_readiness_audit(
-        seeds, rows, {name: 'h' for name in rows}, schedule=schedule,
-        expected_units=schedule['order'], equivalence_margin=0.10,
-        assumed_paired_sd=0.10, identity_controls=[('arm0', 'arm1')],
-        schedule_arm_of=lambda unit: unit.rsplit('::rep=', 1)[0])
-    by_id = {check['id']: check for check in report['checks']}
-    assert 'power' not in by_id
-    assert by_id['equivalence_power']['status'] == 'pass'
-    assert report['planned_power'] is None
-    assert report['planned_equivalence_power']['n_tests'] == 1
+        seeds, rows, dict.fromkeys(rows, "h"), schedule=schedule,
+        expected_units=schedule["order"], equivalence_margin=0.10,
+        assumed_paired_sd=0.10, identity_controls=[("arm0", "arm1")],
+        schedule_arm_of=lambda unit: unit.rsplit("::rep=", 1)[0])
+    by_id = {check["id"]: check for check in report["checks"]}
+    assert "power" not in by_id
+    assert by_id["equivalence_power"]["status"] == "pass"
+    assert report["planned_power"] is None
+    assert report["planned_equivalence_power"]["n_tests"] == 1
 
 
 def test_readiness_plans_at_the_family_level_and_reports_the_assumptions():
     report = _audit(list(range(27)), n_tests=8, attrition=0.10)
-    by_id = {check['id']: check for check in report['checks']}
-    assert by_id['power']['status'] == 'fail'
+    by_id = {check["id"]: check for check in report["checks"]}
+    assert by_id["power"]["status"] == "fail"
     # 21 analyzable pairs still clear the three-seed replication floor; the
     # failure here is resolution, not replication.
-    assert by_id['attrition']['status'] == 'pass'
-    assert report['ready'] is False
-    plan = report['planned_power']
-    assert plan['n_tests'] == 8
-    assert plan['family_alpha'] == pytest.approx(0.00625)
-    assert plan['required_pairs_family_adjusted'] == 48
-    assert plan['expected_analyzable_pairs'] == 21
-    assert plan['required_planned_pairs'] == 60
-    assert report['n_confirmatory_tests'] == 8
-    assert report['expected_attrition'] == pytest.approx(0.10)
+    assert by_id["attrition"]["status"] == "pass"
+    assert report["ready"] is False
+    plan = report["planned_power"]
+    assert plan["n_tests"] == 8
+    assert plan["family_alpha"] == pytest.approx(0.00625)
+    assert plan["required_pairs_family_adjusted"] == 48
+    assert plan["expected_analyzable_pairs"] == 21
+    assert plan["required_planned_pairs"] == 60
+    assert report["n_confirmatory_tests"] == 8
+    assert report["expected_attrition"] == pytest.approx(0.10)
 
 
 def test_readiness_passes_a_plan_with_enough_seeds_after_attrition():
     report = _audit(list(range(60)), n_tests=8, attrition=0.10)
-    by_id = {check['id']: check for check in report['checks']}
-    assert by_id['power']['status'] == 'pass'
-    assert by_id['attrition']['status'] == 'pass'
-    assert report['ready'] is True
-    assert report['n_warn'] == 0
-    assert report['planned_power']['adequately_powered_after_attrition'] is True
+    by_id = {check["id"]: check for check in report["checks"]}
+    assert by_id["power"]["status"] == "pass"
+    assert by_id["attrition"]["status"] == "pass"
+    assert report["ready"] is True
+    assert report["n_warn"] == 0
+    assert report["planned_power"]["adequately_powered_after_attrition"] is True
 
 
 def test_readiness_rejects_invalid_attrition_and_multiplicity_inputs():
     bad_attrition = _audit(list(range(10)), n_tests=1, attrition=1.0)
     bad_tests = _audit(list(range(10)), n_tests=0, attrition=0.0)
     for report in (bad_attrition, bad_tests):
-        by_id = {check['id']: check for check in report['checks']}
-        assert report['ready'] is False
-        assert by_id['power']['status'] == 'fail'
-    assert {check['id'] for check in bad_attrition['checks']
-            if check['status'] == 'fail'} >= {'attrition'}
+        by_id = {check["id"]: check for check in report["checks"]}
+        assert report["ready"] is False
+        assert by_id["power"]["status"] == "fail"
+    assert {check["id"] for check in bad_attrition["checks"]
+            if check["status"] == "fail"} >= {"attrition"}
 
 
 # ---------------------------------------------------------------------------
 # Pre-registration
 # ---------------------------------------------------------------------------
 def test_expected_attrition_is_part_of_the_analysis_plan_fingerprint():
-    rows = {'ln_baseline': {'norm_name': 'ln'},
-            'dytcd_full': {'norm_name': 'dytcd'}}
-    hypotheses = {name: 'h' for name in rows}
-    matrix_report = {'leave_one_out': {}, 'factorial': {}, 'qk_axis': {}}
+    rows = {"ln_baseline": {"norm_name": "ln"},
+            "dytcd_full": {"norm_name": "dytcd"}}
+    hypotheses = dict.fromkeys(rows, "h")
+    matrix_report = {"leave_one_out": {}, "factorial": {}, "qk_axis": {}}
     first = build_analysis_plan(rows, hypotheses, matrix_report,
-                                ['ln_baseline'], 'gpt2-124m', [42, 43, 44],
+                                ["ln_baseline"], "gpt2-124m", [42, 43, 44],
                                 expected_attrition=0.0)
     changed = build_analysis_plan(rows, hypotheses, matrix_report,
-                                  ['ln_baseline'], 'gpt2-124m', [42, 43, 44],
+                                  ["ln_baseline"], "gpt2-124m", [42, 43, 44],
                                   expected_attrition=0.10)
-    assert first['expected_attrition'] == 0.0
-    assert changed['expected_attrition'] == pytest.approx(0.10)
-    assert first['fingerprint'] != changed['fingerprint']
+    assert first["expected_attrition"] == 0.0
+    assert changed["expected_attrition"] == pytest.approx(0.10)
+    assert first["fingerprint"] != changed["fingerprint"]
 
 
-@pytest.mark.parametrize('bad', [-0.1, 1.0, float('nan'), True])
+@pytest.mark.parametrize("bad", [-0.1, 1.0, float("nan"), True])
 def test_analysis_plan_rejects_invalid_attrition(bad):
-    rows = {'ln_baseline': {'norm_name': 'ln'},
-            'dytcd_full': {'norm_name': 'dytcd'}}
+    rows = {"ln_baseline": {"norm_name": "ln"},
+            "dytcd_full": {"norm_name": "dytcd"}}
     with pytest.raises(ValueError):
-        build_analysis_plan(rows, {name: 'h' for name in rows},
-                            {'leave_one_out': {}, 'factorial': {}, 'qk_axis': {}},
-                            ['ln_baseline'], 'gpt2-124m', [42, 43, 44],
+        build_analysis_plan(rows, dict.fromkeys(rows, "h"),
+                            {"leave_one_out": {}, "factorial": {}, "qk_axis": {}},
+                            ["ln_baseline"], "gpt2-124m", [42, 43, 44],
                             expected_attrition=bad)
 
 
@@ -230,28 +232,28 @@ def test_analysis_plan_rejects_invalid_attrition(bad):
 # ---------------------------------------------------------------------------
 def test_schedule_fingerprint_verifies_and_detects_an_edited_order():
     schedule = randomized_complete_block_schedule(
-        ['a', 'b', 'c'], ['42', '43'], seed=4)
+        ["a", "b", "c"], ["42", "43"], seed=4)
     ok = schedule_fingerprint_status(schedule)
-    assert ok['verified'] is True
-    assert ok['recomputed'] == schedule['fingerprint']
+    assert ok["verified"] is True
+    assert ok["recomputed"] == schedule["fingerprint"]
 
     edited = dict(schedule)
-    edited['order'] = list(reversed(schedule['order']))
+    edited["order"] = list(reversed(schedule["order"]))
     status = schedule_fingerprint_status(edited)
-    assert status['verified'] is False
-    assert status['recomputed'] != schedule['fingerprint']
+    assert status["verified"] is False
+    assert status["recomputed"] != schedule["fingerprint"]
 
 
 def test_balance_confirms_a_complete_block_design():
     schedule = randomized_complete_block_schedule(
-        ['a', 'b', 'c'], ['42', '43', '44'], seed=3)
+        ["a", "b", "c"], ["42", "43", "44"], seed=3)
     report = schedule_balance_report(
-        schedule, arm_of=lambda unit: unit.rsplit('::rep=', 1)[0])
-    assert report['complete_block_design'] is True
-    assert report['balanced'] is True
-    assert set(report['block_arm_counts']) == {'0', '1', '2'}
-    assert all(counts == {'a': 1, 'b': 1, 'c': 1}
-               for counts in report['block_arm_counts'].values())
+        schedule, arm_of=lambda unit: unit.rsplit("::rep=", 1)[0])
+    assert report["complete_block_design"] is True
+    assert report["balanced"] is True
+    assert set(report["block_arm_counts"]) == {"0", "1", "2"}
+    assert all(counts == {"a": 1, "b": 1, "c": 1}
+               for counts in report["block_arm_counts"].values())
 
 
 def test_balance_flags_an_rcbd_that_is_not_crossed():
@@ -259,96 +261,96 @@ def test_balance_flags_an_rcbd_that_is_not_crossed():
     # arm is missing from one block and duplicated in another. Per-arm block
     # coverage and the total run count both look balanced, so only the
     # arm x block crossing check can see this.
-    layout = [('a', 0), ('a', 0), ('b', 0),
-              ('b', 1), ('b', 1), ('c', 1),
-              ('c', 2), ('c', 2), ('a', 2)]
-    entries = [{'unit': unit, 'run_id': f'{unit}::rep={position}',
-                'replicate': str(position), 'block': block,
-                'position': position}
+    layout = [("a", 0), ("a", 0), ("b", 0),
+              ("b", 1), ("b", 1), ("c", 1),
+              ("c", 2), ("c", 2), ("a", 2)]
+    entries = [{"unit": unit, "run_id": f"{unit}::rep={position}",
+                "replicate": str(position), "block": block,
+                "position": position}
                for position, (unit, block) in enumerate(layout)]
     schedule = {
-        'schema': 'adasquash.rcbd_schedule.v1',
-        'n_units': len(entries),
-        'n_blocks': 3,
-        'block_sizes': [3, 3, 3],
-        'entries': entries,
-        'order': [entry['run_id'] for entry in entries],
-        'fingerprint': 'unused-by-balance-report',
+        "schema": "adasquash.rcbd_schedule.v1",
+        "n_units": len(entries),
+        "n_blocks": 3,
+        "block_sizes": [3, 3, 3],
+        "entries": entries,
+        "order": [entry["run_id"] for entry in entries],
+        "fingerprint": "unused-by-balance-report",
     }
     report = schedule_balance_report(
-        schedule, arm_of=lambda unit: unit.rsplit('::rep=', 1)[0])
-    assert report['complete_block_design'] is False
-    assert report['balanced'] is False
-    assert any('does not cover every arm in every block exactly once' in warning
-               for warning in report['warnings'])
+        schedule, arm_of=lambda unit: unit.rsplit("::rep=", 1)[0])
+    assert report["complete_block_design"] is False
+    assert report["balanced"] is False
+    assert any("does not cover every arm in every block exactly once" in warning
+               for warning in report["warnings"])
 
 
 def test_each_seed_runs_in_exactly_one_time_block():
-    units = [f'row{i}' for i in range(10)]
-    replicates = ['42', '43', '44']
+    units = [f"row{i}" for i in range(10)]
+    replicates = ["42", "43", "44"]
     schedule = randomized_complete_block_schedule(units, replicates, seed=7)
     report = schedule_balance_report(schedule)
-    assert report['complete_block_design'] is True
-    assert report['replicate_block_aligned'] is True
-    assert set(report['replicate_blocks']) == set(replicates)
+    assert report["complete_block_design"] is True
+    assert report["replicate_block_aligned"] is True
+    assert set(report["replicate_blocks"]) == set(replicates)
     assert all(len(blocks) == 1
-               for blocks in report['replicate_blocks'].values())
+               for blocks in report["replicate_blocks"].values())
     for unit in units:
-        assert sorted(entry['replicate'] for entry in schedule['entries']
-                      if entry['unit'] == unit) == replicates
+        assert sorted(entry["replicate"] for entry in schedule["entries"]
+                      if entry["unit"] == unit) == replicates
     for block in range(len(replicates)):
-        assert len({entry['replicate'] for entry in schedule['entries']
-                    if entry['block'] == block}) == 1
+        assert len({entry["replicate"] for entry in schedule["entries"]
+                    if entry["block"] == block}) == 1
 
 
 def test_balance_flags_a_seed_spread_over_time_blocks():
     # Every block contains every arm once and every arm receives every seed,
     # but seed 42 (and 43/44) is split across blocks. A seed-paired contrast
     # would therefore also contain a block/time difference.
-    layout = [('a', '42', 0), ('b', '43', 0), ('c', '44', 0),
-              ('a', '43', 1), ('b', '44', 1), ('c', '42', 1),
-              ('a', '44', 2), ('b', '42', 2), ('c', '43', 2)]
-    entries = [{'unit': unit, 'replicate': replicate, 'block': block,
-                'run_id': f'{unit}::rep={replicate}', 'position': position}
+    layout = [("a", "42", 0), ("b", "43", 0), ("c", "44", 0),
+              ("a", "43", 1), ("b", "44", 1), ("c", "42", 1),
+              ("a", "44", 2), ("b", "42", 2), ("c", "43", 2)]
+    entries = [{"unit": unit, "replicate": replicate, "block": block,
+                "run_id": f"{unit}::rep={replicate}", "position": position}
                for position, (unit, replicate, block) in enumerate(layout)]
     schedule = {
-        'schema': 'adasquash.rcbd_schedule.v1',
-        'n_units': len(entries),
-        'n_blocks': 3,
-        'block_sizes': [3, 3, 3],
-        'units': ['a', 'b', 'c'],
-        'replicates': ['42', '43', '44'],
-        'entries': entries,
-        'order': [entry['run_id'] for entry in entries],
+        "schema": "adasquash.rcbd_schedule.v1",
+        "n_units": len(entries),
+        "n_blocks": 3,
+        "block_sizes": [3, 3, 3],
+        "units": ["a", "b", "c"],
+        "replicates": ["42", "43", "44"],
+        "entries": entries,
+        "order": [entry["run_id"] for entry in entries],
     }
     report = schedule_balance_report(schedule)
-    assert report['complete_block_design'] is True
-    assert report['replicate_block_aligned'] is False
-    assert report['balanced'] is False
-    assert any('appear in multiple time blocks' in warning
-               for warning in report['warnings'])
+    assert report["complete_block_design"] is True
+    assert report["replicate_block_aligned"] is False
+    assert report["balanced"] is False
+    assert any("appear in multiple time blocks" in warning
+               for warning in report["warnings"])
 
-    rows = {'a': {}, 'b': {}, 'c': {}}
+    rows = {"a": {}, "b": {}, "c": {}}
     readiness = design_readiness_audit(
-        [42, 43, 44], rows, {name: 'h' for name in rows}, schedule=schedule,
-        expected_units=schedule['order'], margin=0.05,
-        identity_controls=[('a', 'b')])
-    by_id = {check['id']: check for check in readiness['checks']}
-    assert by_id['schedule_replicate_block_alignment']['status'] == 'fail'
-    assert readiness['ready'] is False
+        [42, 43, 44], rows, dict.fromkeys(rows, "h"), schedule=schedule,
+        expected_units=schedule["order"], margin=0.05,
+        identity_controls=[("a", "b")])
+    by_id = {check["id"]: check for check in readiness["checks"]}
+    assert by_id["schedule_replicate_block_alignment"]["status"] == "fail"
+    assert readiness["ready"] is False
 
 
 def test_readiness_fails_when_the_frozen_schedule_is_edited():
     schedule = randomized_complete_block_schedule(
-        ['arm0', 'arm1'], ['0', '1', '2'], seed=1)
+        ["arm0", "arm1"], ["0", "1", "2"], seed=1)
     edited = dict(schedule)
-    edited['order'] = list(reversed(schedule['order']))
-    rows = {'arm0': {}, 'arm1': {}}
+    edited["order"] = list(reversed(schedule["order"]))
+    rows = {"arm0": {}, "arm1": {}}
     report = design_readiness_audit(
-        [0, 1, 2], rows, {name: 'h' for name in rows}, schedule=edited,
-        expected_units=edited['order'], margin=0.05,
-        identity_controls=[('arm0', 'arm1')],
-        schedule_arm_of=lambda unit: unit.rsplit('::rep=', 1)[0])
-    by_id = {check['id']: check for check in report['checks']}
-    assert by_id['schedule_integrity']['status'] == 'fail'
-    assert report['ready'] is False
+        [0, 1, 2], rows, dict.fromkeys(rows, "h"), schedule=edited,
+        expected_units=edited["order"], margin=0.05,
+        identity_controls=[("arm0", "arm1")],
+        schedule_arm_of=lambda unit: unit.rsplit("::rep=", 1)[0])
+    by_id = {check["id"]: check for check in report["checks"]}
+    assert by_id["schedule_integrity"]["status"] == "fail"
+    assert report["ready"] is False

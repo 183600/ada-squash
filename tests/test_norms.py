@@ -27,20 +27,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import json
 import math
+
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 from adasquash import (
-    build_norm, NORM_REGISTRY, generalized_softsign,
-    LayerNorm, RMSNorm, DyT, DyTS, DyTP, DyTC, DyTD, DyTDI, DyTCD, DyTCDI,
-    GPTConfig, GPT, build_gpt_124m, build_llama_tiny_1b,
-    ActivationStats, LossSpikeCounter, KurtosisMeter,
+    GPT,
+    NORM_REGISTRY,
+    ActivationStats,
+    DyT,
+    DyTC,
+    DyTCD,
+    DyTCDI,
+    DyTD,
+    DyTDI,
+    DyTP,
+    DyTS,
+    GPTConfig,
+    KurtosisMeter,
+    LayerNorm,
+    LossSpikeCounter,
+    RMSNorm,
+    build_gpt_124m,
+    build_llama_tiny_1b,
+    build_norm,
     count_parameters,
+    generalized_softsign,
 )
 from adasquash.attention import apply_rope
-from adasquash.norms import QKSquash
 from adasquash.model import cross_entropy_mean
+from adasquash.norms import QKSquash
 
 
 # ---------------------------------------------------------------------------
@@ -378,8 +395,8 @@ def test_softsign_gradcheck_wrt_x_and_p(p):
 
 
 def test_swiglu_and_rmsnorm_gradcheck():
-    from adasquash.norms import _RMSNorm
     from adasquash.model import _SwiGLU
+    from adasquash.norms import _RMSNorm
 
     x = torch.randn(2, 5, 7, dtype=torch.float64).requires_grad_(True)
     w = torch.randn(7, dtype=torch.float64).requires_grad_(True)
@@ -806,8 +823,10 @@ def test_w8a8_quantizes_every_gemm_activation_including_the_hidden():
     """The SwiGLU hidden (`silu(w1 x) * (w3 x)`) is fed to `w2` from inside
     `_SwiGLU`, so leaving it fp32 makes the W8A8 measurement a partial one."""
     import torch.nn.functional as F
+
     from scripts.check_w8a8_ppl import (
-        quantize_activation_per_token, wrap_model_w8a8,
+        quantize_activation_per_token,
+        wrap_model_w8a8,
     )
 
     torch.manual_seed(0)
@@ -856,9 +875,12 @@ def test_w8a8_quantizes_the_head_on_the_fused_loss_path():
     `forward` silently measures that GEMM unquantized.
     """
     import copy
+
     from adasquash.model import fused_cross_entropy_mean
     from scripts.check_w8a8_ppl import (
-        compute_ce_sum, quantize_weight_per_channel, wrap_model_w8a8,
+        compute_ce_sum,
+        quantize_weight_per_channel,
+        wrap_model_w8a8,
     )
 
     torch.manual_seed(0)
@@ -947,6 +969,7 @@ def test_fp8_quantizer_preserves_input_dtype():
 def test_fp8_wrapper_quantizes_weights_not_just_activations():
     """An fp8 GEMM is fp8 x fp8; quantizing only the activation is A8-only."""
     import torch.nn.functional as F
+
     from scripts.check_fp8_stability import fp8_forward, to_fp8_e4m3
 
     torch.manual_seed(0)
@@ -962,9 +985,8 @@ def test_fp8_wrapper_quantizes_weights_not_just_activations():
 
     F.linear = spy
     try:
-        with torch.no_grad():
-            with fp8_forward(model, to_fp8_e4m3):
-                model(torch.randint(0, 128, (1, 16)))
+        with torch.no_grad(), fp8_forward(model, to_fp8_e4m3):
+            model(torch.randint(0, 128, (1, 16)))
     finally:
         F.linear = orig
     assert seen, "no GEMM observed"
@@ -1033,9 +1055,8 @@ def test_fp8_forward_simulation_perturbs_logits_and_restores():
     x = torch.randint(0, 256, (1, 8))
     with torch.no_grad():
         ref = model(x)[0]
-    with fp8_forward(model, to_fp8_e4m3):
-        with torch.no_grad():
-            got = model(x)[0]
+    with fp8_forward(model, to_fp8_e4m3), torch.no_grad():
+        got = model(x)[0]
     assert not torch.allclose(ref, got, atol=1e-8)
     # The context manager must restore the original forwards.
     with torch.no_grad():
@@ -1046,7 +1067,7 @@ def test_fp8_forward_simulation_perturbs_logits_and_restores():
 def test_fp8_quantizer_respects_format_range():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from scripts.check_fp8_stability import to_fp8_e4m3, to_fp8_e5m2, fp8_min_normal
+    from scripts.check_fp8_stability import fp8_min_normal, to_fp8_e4m3, to_fp8_e5m2
 
     x = torch.tensor([1e6, -1e6, 0.0, 1e-8, 1.0, -3.25])
     q = to_fp8_e4m3(x)
@@ -1209,8 +1230,7 @@ def test_ablation_matrix_contrasts_are_single_variable():
     """
     import dataclasses
     root = Path(__file__).resolve().parent.parent
-    from scripts.ablation import (check_factorial, effective_config_key,
-                                  load_ablations_from_config)
+    from scripts.ablation import check_factorial, effective_config_key, load_ablations_from_config
 
     rows = load_ablations_from_config(str(root / "configs" / "ablation-matrix.yaml"))
 
@@ -1364,7 +1384,7 @@ def test_activation_stats_hook_the_new_norms():
 def test_yaml_config_overrides_parser_defaults():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
+    from scripts.train_gpt2 import _TRAIN_CONFIG_ALIASES, apply_config_to_parser
 
     root = Path(__file__).resolve().parent.parent
     p = argparse.ArgumentParser()
@@ -1388,7 +1408,7 @@ def test_yaml_config_overrides_parser_defaults():
 def test_explicit_cli_flags_beat_the_config():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
+    from scripts.train_gpt2 import _TRAIN_CONFIG_ALIASES, apply_config_to_parser
 
     root = Path(__file__).resolve().parent.parent
     p = argparse.ArgumentParser()

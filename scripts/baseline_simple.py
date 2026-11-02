@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """Tuned simplest-baseline ladder and Bayes-limit calibration for the synthetic ablation corpus.
 
 Why this script exists
@@ -67,17 +68,25 @@ import math
 import numbers
 import sys
 from pathlib import Path
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
+
 from adasquash.jsonio import save_json_atomic
-from adasquash.metrics import (holm_adjust, mean_std_stderr, paired_t_one_sided,
-                               student_t_ppf)
-from adasquash.repro import collect_run_metadata, file_fingerprint, finish_metadata, save_run_manifest, set_all_seeds
+from adasquash.metrics import holm_adjust, mean_std_stderr, paired_t_one_sided, student_t_ppf
+from adasquash.repro import (
+    collect_run_metadata,
+    file_fingerprint,
+    finish_metadata,
+    save_run_manifest,
+    set_all_seeds,
+)
 from adasquash.utils import markov_batch
+
 DEFAULT_SEEDS = (42, 43, 44)
 DEFAULT_KS = (1e-06, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0)
-SIMPLE_PREDICTORS = ('unigram', 'bigram', 'trigram')
+SIMPLE_PREDICTORS = ("unigram", "bigram", "trigram")
 # Mirrors the spike probability hardcoded in `adasquash.utils.markov_batch`
 # (`torch.rand(...) < 0.03`). The corpus is the data; this constant only
 # enters the closed-form memoryless floor.
@@ -120,7 +129,7 @@ def memoryless_bayes_floor_nats(n_states: int, max_jump: int, spike_prob: float=
         floor = (1.0 - float(spike_prob)) * floor + float(spike_prob) * math.log(int(n_states))
     return floor
 
-def build_remap(vocab_size: int, support, device='cpu') -> torch.Tensor:
+def build_remap(vocab_size: int, support, device="cpu") -> torch.Tensor:
     """Map corpus ids to compact indices; index `len(support)` is "unseen".
 
     Built on `device` so it can index the (possibly CUDA) corpus batches.
@@ -133,7 +142,7 @@ def build_remap(vocab_size: int, support, device='cpu') -> torch.Tensor:
 def generate_batches(seed: int, n_batches: int, args, device: str):
     """The ablation runner's stream: same generator seed, corpus and batch shape."""
     if not _is_seed_id(seed):
-        raise ValueError(f'stream seed must be an integer, got {seed!r}')
+        raise ValueError(f"stream seed must be an integer, got {seed!r}")
     seed = int(seed)
     rng = torch.Generator(device=device).manual_seed(seed)
     outlier_id = int(args.vocab_size) - 1 if args.outlier_channel else None
@@ -165,9 +174,9 @@ def flatten_split(batches, remap: torch.Tensor, unknown: int, ignore_index: int=
         x_raw.append(x[mask])
         y_raw.append(y[mask])
     if not xs or not any(t.numel() for t in xs):
-        raise ValueError('corpus stream produced no supervision tokens')
-    return {'x': torch.cat(xs), 'x2': torch.cat(x2s), 'y': torch.cat(ys),
-            'x_raw': torch.cat(x_raw), 'y_raw': torch.cat(y_raw)}
+        raise ValueError("corpus stream produced no supervision tokens")
+    return {"x": torch.cat(xs), "x2": torch.cat(x2s), "y": torch.cat(ys),
+            "x_raw": torch.cat(x_raw), "y_raw": torch.cat(y_raw)}
 
 def collect_counts(split: dict, n_symbols: int, with_trigram: bool=True) -> dict:
     """Full-order count tables over the compact alphabet.
@@ -175,8 +184,8 @@ def collect_counts(split: dict, n_symbols: int, with_trigram: bool=True) -> dict
     The corpus uses at most `n_states + 1` distinct ids, so the dense bigram
     and trigram tables are indexed by the compact remap.
     """
-    uni = torch.bincount(split['y'], minlength=n_symbols).to(torch.float64)
-    bi = torch.bincount(split['x'] * n_symbols + split['y'],
+    uni = torch.bincount(split["y"], minlength=n_symbols).to(torch.float64)
+    bi = torch.bincount(split["x"] * n_symbols + split["y"],
                         minlength=n_symbols * n_symbols).to(torch.float64).view(n_symbols, n_symbols)
     tri = None
     if with_trigram and n_symbols ** 3 <= 1 << 27:
@@ -184,26 +193,26 @@ def collect_counts(split: dict, n_symbols: int, with_trigram: bool=True) -> dict
         # the unseen bucket so the trigram must fall back to the bigram
         # there. Counting those artificial contexts would make `seen2` true
         # and defeat the documented fallback.
-        real_context = split['x2'].ne(n_symbols - 1)
-        idx = ((split['x2'] * n_symbols + split['x']) * n_symbols + split['y'])[real_context]
+        real_context = split["x2"].ne(n_symbols - 1)
+        idx = ((split["x2"] * n_symbols + split["x"]) * n_symbols + split["y"])[real_context]
         tri = torch.bincount(idx, minlength=n_symbols ** 3).to(torch.float64).view(n_symbols, n_symbols, n_symbols)
     else:
         with_trigram = False
-    return {'uni': uni, 'bi': bi, 'tri': tri, 'with_trigram': with_trigram}
+    return {"uni": uni, "bi": bi, "tri": tri, "with_trigram": with_trigram}
 
 def unigram_probs(counts: dict, n_symbols: int, k: float) -> torch.Tensor:
-    return (counts['uni'] + k) / (counts['uni'].sum() + k * n_symbols)
+    return (counts["uni"] + k) / (counts["uni"].sum() + k * n_symbols)
 
 def ce_unigram(counts: dict, split: dict, n_symbols: int, k: float) -> float:
-    return float(-unigram_probs(counts, n_symbols, k)[split['y']].log().mean())
+    return float(-unigram_probs(counts, n_symbols, k)[split["y"]].log().mean())
 
 def ce_bigram(counts: dict, split: dict, n_symbols: int, k: float) -> float:
     """Add-k bigram P(y|x), backing off to the unigram when x was unseen."""
     p_uni = unigram_probs(counts, n_symbols, k)
-    bi = counts['bi']
+    bi = counts["bi"]
     ctx = bi.sum(-1, keepdim=True)
     p_cond = (bi + k) / (ctx + k * n_symbols)
-    x, y = (split['x'], split['y'])
+    x, y = (split["x"], split["y"])
     seen = ctx.squeeze(-1)[x] > 0
     p = torch.where(seen, p_cond[x, y], p_uni[y])
     return float(-p.log().mean())
@@ -211,18 +220,18 @@ def ce_bigram(counts: dict, split: dict, n_symbols: int, k: float) -> float:
 def ce_trigram(counts: dict, split: dict, n_symbols: int, k: float) -> float:
     """Add-k trigram P(y|x2,x), backing off to the bigram then the unigram."""
     p_uni = unigram_probs(counts, n_symbols, k)
-    bi = counts['bi']
+    bi = counts["bi"]
     ctx1 = bi.sum(-1, keepdim=True)
     p_bi = (bi + k) / (ctx1 + k * n_symbols)
-    x, y = (split['x'], split['y'])
+    x, y = (split["x"], split["y"])
     seen1 = ctx1.squeeze(-1)[x] > 0
     p = torch.where(seen1, p_bi[x, y], p_uni[y])
-    tri = counts['tri']
+    tri = counts["tri"]
     if tri is None:
         return float(-p.log().mean())
     ctx2 = tri.sum(-1, keepdim=True)
     p_tri = (tri + k) / (ctx2 + k * n_symbols)
-    x2 = split['x2']
+    x2 = split["x2"]
     seen2 = ctx2.squeeze(-1)[x2, x] > 0
     p = torch.where(seen2, p_tri[x2, x, y], p)
     return float(-p.log().mean())
@@ -234,7 +243,7 @@ def walk_rule_stats(split: dict, n_states: int, max_jump: int, outlier_id) -> di
     non-outlier `x`): a nonzero count means the stream is not the process the
     closed-form floor describes, and the calibration must not be trusted.
     """
-    x_raw, y_raw = (split['x_raw'], split['y_raw'])
+    x_raw, y_raw = (split["x_raw"], split["y_raw"])
     if outlier_id is None:
         is_outlier = torch.zeros_like(x_raw, dtype=torch.bool)
     else:
@@ -246,9 +255,9 @@ def walk_rule_stats(split: dict, n_states: int, max_jump: int, outlier_id) -> di
                     torch.full_like(jump_p[step], 1.0 / int(n_states)),
                     jump_p[step])
     mismatches = int((~is_outlier & (jump_p[step] == 0)).sum())
-    return {'ce_nats': float(-p.log().mean()),
-            'rule_target_mismatches': mismatches,
-            'outlier_input_fraction': float(is_outlier.to(torch.float64).mean())}
+    return {"ce_nats": float(-p.log().mean()),
+            "rule_target_mismatches": mismatches,
+            "outlier_input_fraction": float(is_outlier.to(torch.float64).mean())}
 
 def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id,
                     ignore_index: int = -100) -> dict:
@@ -267,7 +276,7 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id,
     n_states = int(n_states)
     batches = list(batches)
     if not batches:
-        raise ValueError('hmm filter received no batches')
+        raise ValueError("hmm filter received no batches")
     # The filter lives on the batch device: indexing with `rows`/`x`/`y`
     # (which come from the caller's batches) must not mix CPU and CUDA tensors.
     device = batches[0][0].device
@@ -319,8 +328,8 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id,
                 # observed rows were overwritten with the delta.
             belief, pred = pred, belief
     if n_tokens == 0:
-        raise ValueError('hmm filter received no tokens (empty batches or seq_len < 2)')
-    return {'ce_nats': float(ce_sum_t) / n_tokens, 'n_tokens': n_tokens}
+        raise ValueError("hmm filter received no tokens (empty batches or seq_len < 2)")
+    return {"ce_nats": float(ce_sum_t) / n_tokens, "n_tokens": n_tokens}
 
 def tune_smoothing(ce_fn, ks) -> dict:
     """Select the add-k smoothing constant on a held-out tuning stream.
@@ -332,22 +341,22 @@ def tune_smoothing(ce_fn, ks) -> dict:
     grid = []
     for k in ks:
         ce = float(ce_fn(float(k)))
-        grid.append({'k': float(k), 'tuning_ce_nats': ce if math.isfinite(ce) else None,
-                     '_ce': ce})
-    finite = [row for row in grid if math.isfinite(row['_ce'])]
+        grid.append({"k": float(k), "tuning_ce_nats": ce if math.isfinite(ce) else None,
+                     "_ce": ce})
+    finite = [row for row in grid if math.isfinite(row["_ce"])]
     if not finite:
-        return {'grid': [{key: val for key, val in row.items() if key != '_ce'} for row in grid],
-                'best_k': None, 'best_tuning_ce_nats': None, 'grid_limited': None}
-    best = min(finite, key=lambda row: row['_ce'])
+        return {"grid": [{key: val for key, val in row.items() if key != "_ce"} for row in grid],
+                "best_k": None, "best_tuning_ce_nats": None, "grid_limited": None}
+    best = min(finite, key=lambda row: row["_ce"])
     position = grid.index(best)
-    return {'best_k': best['k'], 'best_tuning_ce_nats': best['_ce'],
-            'grid_limited': position == 0 or position == len(grid) - 1,
-            'grid': [{key: val for key, val in row.items() if key != '_ce'} for row in grid]}
+    return {"best_k": best["k"], "best_tuning_ce_nats": best["_ce"],
+            "grid_limited": position == 0 or position == len(grid) - 1,
+            "grid": [{key: val for key, val in row.items() if key != "_ce"} for row in grid]}
 
 def evaluate_seed(seed: int, args, device: str) -> dict:
     """Fit, tune and evaluate the whole predictor ladder for one seed."""
     if not _is_seed_id(seed):
-        raise ValueError(f'seed must be an integer, got {seed!r}')
+        raise ValueError(f"seed must be an integer, got {seed!r}")
     seed = int(seed)
     outlier_id = args.vocab_size - 1 if args.outlier_channel else None
     support = build_support(args.n_states, outlier_id)
@@ -358,25 +367,25 @@ def evaluate_seed(seed: int, args, device: str) -> dict:
     val_batches = list(generate_batches(seed + 1, args.val_batches, args, device))
     val = flatten_split(val_batches, remap, len(support))
     counts = collect_counts(train, n_symbols, with_trigram=not args.no_trigram)
-    record = {'seed': seed, 'n_train_tokens': int(train['y'].numel()),
-              'n_tune_tokens': int(tune['y'].numel()), 'n_val_tokens': int(val['y'].numel()),
-              'predictors': {}, 'tuning': {},
-              'walk_rule': walk_rule_stats(val, args.n_states, args.max_jump, outlier_id)}
-    record['predictors']['uniform_vocab'] = math.log(args.vocab_size)
-    record['predictors']['uniform_targets'] = math.log(args.n_states)
-    for name, ce_fn in (('unigram', ce_unigram), ('bigram', ce_bigram), ('trigram', ce_trigram)):
-        if name == 'trigram' and not counts['with_trigram']:
+    record = {"seed": seed, "n_train_tokens": int(train["y"].numel()),
+              "n_tune_tokens": int(tune["y"].numel()), "n_val_tokens": int(val["y"].numel()),
+              "predictors": {}, "tuning": {},
+              "walk_rule": walk_rule_stats(val, args.n_states, args.max_jump, outlier_id)}
+    record["predictors"]["uniform_vocab"] = math.log(args.vocab_size)
+    record["predictors"]["uniform_targets"] = math.log(args.n_states)
+    for name, ce_fn in (("unigram", ce_unigram), ("bigram", ce_bigram), ("trigram", ce_trigram)):
+        if name == "trigram" and not counts["with_trigram"]:
             # Report it as skipped rather than falling back to the bigram under
             # a "trigram" label, which would overstate what was evaluated.
-            record['predictors'][name] = None
+            record["predictors"][name] = None
             continue
         tuning = tune_smoothing(lambda k, fn=ce_fn: fn(counts, tune, n_symbols, k), args.ks)
-        record['tuning'][name] = tuning
-        record['predictors'][name] = (None if tuning['best_k'] is None
-                                      else float(ce_fn(counts, val, n_symbols, tuning['best_k'])))
-    record['predictors']['walk_rule'] = record['walk_rule']['ce_nats']
-    record['predictors']['hmm_bayes'] = hmm_bayes_stats(val_batches, args.n_states,
-                                                       args.max_jump, outlier_id)['ce_nats']
+        record["tuning"][name] = tuning
+        record["predictors"][name] = (None if tuning["best_k"] is None
+                                      else float(ce_fn(counts, val, n_symbols, tuning["best_k"])))
+    record["predictors"]["walk_rule"] = record["walk_rule"]["ce_nats"]
+    record["predictors"]["hmm_bayes"] = hmm_bayes_stats(val_batches, args.n_states,
+                                                       args.max_jump, outlier_id)["ce_nats"]
     return record
 
 def _perplexity(mean_nats: float) -> float:
@@ -390,14 +399,14 @@ def _perplexity(mean_nats: float) -> float:
 def aggregate_records(records: list, names) -> dict:
     out = {}
     for name in names:
-        values = [r['predictors'].get(name) for r in records
-                  if isinstance(r.get('predictors'), dict)
-                  and isinstance(r['predictors'].get(name), (int, float))]
+        values = [r["predictors"].get(name) for r in records
+                  if isinstance(r.get("predictors"), dict)
+                  and isinstance(r["predictors"].get(name), (int, float))]
         stats = mean_std_stderr(values)
         out[name] = None if stats is None else {
-            'mean_ce_nats': stats['mean'], 'std_ce_nats': stats['std'],
-            'stderr_ce_nats': stats['stderr'], 'n_seeds': stats['n'],
-            'perplexity': _perplexity(stats['mean']),
+            "mean_ce_nats": stats["mean"], "std_ce_nats": stats["std"],
+            "stderr_ce_nats": stats["stderr"], "n_seeds": stats["n"],
+            "perplexity": _perplexity(stats["mean"]),
         }
     return out
 
@@ -406,33 +415,33 @@ def best_count_model(aggregate: dict) -> dict | None:
     candidates = [(name, aggregate[name]) for name in SIMPLE_PREDICTORS if aggregate.get(name)]
     if not candidates:
         return None
-    name, stats = min(candidates, key=lambda item: item[1]['mean_ce_nats'])
-    return {'predictor': name, **stats}
+    name, stats = min(candidates, key=lambda item: item[1]["mean_ce_nats"])
+    return {"predictor": name, **stats}
 
 def build_calibration(aggregate: dict, memoryless_floor: float, tuned: dict | None, records: list) -> dict:
     """Consistency checks between the observed streams and the two limits."""
-    rule = aggregate.get('walk_rule')
-    full = aggregate.get('hmm_bayes')
-    rule_delta = None if not rule else rule['mean_ce_nats'] - memoryless_floor
-    rule_tolerance = None if not rule else max(0.02, 4.0 * rule['stderr_ce_nats'])
-    full_delta = None if not full else full['mean_ce_nats'] - memoryless_floor
+    rule = aggregate.get("walk_rule")
+    full = aggregate.get("hmm_bayes")
+    rule_delta = None if not rule else rule["mean_ce_nats"] - memoryless_floor
+    rule_tolerance = None if not rule else max(0.02, 4.0 * rule["stderr_ce_nats"])
+    full_delta = None if not full else full["mean_ce_nats"] - memoryless_floor
     return {
-        'memoryless_floor_nats': memoryless_floor,
-        'rule_minus_memoryless_nats': rule_delta,
-        'rule_memoryless_tolerance_nats': rule_tolerance,
-        'rule_matches_memoryless_floor': None if rule_delta is None else abs(rule_delta) <= rule_tolerance,
-        'full_context_minus_memoryless_nats': full_delta,
-        'full_context_below_memoryless_floor': None if full_delta is None else full_delta <= (rule_tolerance or 0.02),
-        'best_count_model_minus_full_context_nats': (None if not tuned or not full
-                                                     else tuned['mean_ce_nats'] - full['mean_ce_nats']),
-        'rule_target_mismatches_total': sum(r['walk_rule']['rule_target_mismatches'] for r in records),
-        'outlier_input_fraction': (sum(r['walk_rule']['outlier_input_fraction'] for r in records) / len(records)
+        "memoryless_floor_nats": memoryless_floor,
+        "rule_minus_memoryless_nats": rule_delta,
+        "rule_memoryless_tolerance_nats": rule_tolerance,
+        "rule_matches_memoryless_floor": None if rule_delta is None else abs(rule_delta) <= rule_tolerance,
+        "full_context_minus_memoryless_nats": full_delta,
+        "full_context_below_memoryless_floor": None if full_delta is None else full_delta <= (rule_tolerance or 0.02),
+        "best_count_model_minus_full_context_nats": (None if not tuned or not full
+                                                     else tuned["mean_ce_nats"] - full["mean_ce_nats"]),
+        "rule_target_mismatches_total": sum(r["walk_rule"]["rule_target_mismatches"] for r in records),
+        "outlier_input_fraction": (sum(r["walk_rule"]["outlier_input_fraction"] for r in records) / len(records)
                                    if records else None),
-        'reading': ('walk_rule must match the closed-form memoryless floor (corpus model check); the HMM '
-                    'filter is the exact causal full-context ceiling and must sit at or below that floor '
-                    '(any positive gap is Monte-Carlo noise on finite streams); transformers read the full '
-                    'prefix, so hmm_bayes - not the memoryless floor - is the ceiling their excess is '
-                    'measured against'),
+        "reading": ("walk_rule must match the closed-form memoryless floor (corpus model check); the HMM "
+                    "filter is the exact causal full-context ceiling and must sit at or below that floor "
+                    "(any positive gap is Monte-Carlo noise on finite streams); transformers read the full "
+                    "prefix, so hmm_bayes - not the memoryless floor - is the ceiling their excess is "
+                    "measured against"),
     }
 
 def load_ablation_rows(path) -> list:
@@ -465,26 +474,26 @@ def _row_seed_losses(row: dict, duplicates: set | None = None) -> dict:
     duplicate silently decide the paired test.
     """
     out = {}
-    per_seed = row.get('per_seed')
+    per_seed = row.get("per_seed")
     if isinstance(per_seed, list):
         for item in per_seed:
             if not isinstance(item, dict):
                 continue
-            seed = item.get('seed')
+            seed = item.get("seed")
             # A boolean/fractional/string seed is not an independent
             # replication id; int(True)/int("42") would silently pair this
             # row with a different ablation run.
-            if not _is_seed_id(seed) or not _finite_number(item.get('val_loss')):
+            if not _is_seed_id(seed) or not _finite_number(item.get("val_loss")):
                 continue
             if seed in out:
                 if duplicates is not None:
                     duplicates.add(seed)
                 continue
-            out[seed] = float(item['val_loss'])
+            out[seed] = float(item["val_loss"])
         return out
-    seed = row.get('seed')
-    if _is_seed_id(seed) and _finite_number(row.get('val_loss')):
-        out[seed] = float(row['val_loss'])
+    seed = row.get("seed")
+    if _is_seed_id(seed) and _finite_number(row.get("val_loss")):
+        out[seed] = float(row["val_loss"])
     return out
 
 
@@ -495,10 +504,10 @@ def _count_seed_ce(records: list, predictor: str,
     for record in records or []:
         if not isinstance(record, dict):
             continue
-        seed = record.get('seed')
+        seed = record.get("seed")
         if not _is_seed_id(seed):
             continue
-        value = (record.get('predictors') or {}).get(predictor)
+        value = (record.get("predictors") or {}).get(predictor)
         if not _finite_number(value):
             continue
         if seed in out:
@@ -510,21 +519,21 @@ def _count_seed_ce(records: list, predictor: str,
 
 
 def _mde_from_test(test: dict | None, alpha: float = 0.05, power: float = 0.8):
-    if (test is None or not test.get('df')
-            or not _finite_number(test.get('ci_low'))
-            or not _finite_number(test.get('ci_high'))):
+    if (test is None or not test.get("df")
+            or not _finite_number(test.get("ci_low"))
+            or not _finite_number(test.get("ci_high"))):
         return None
-    half = (test['ci_high'] - test['ci_low']) / 2.0
-    critical = student_t_ppf(1.0 - alpha / 2.0, float(test['df']))
+    half = (test["ci_high"] - test["ci_low"]) / 2.0
+    critical = student_t_ppf(1.0 - alpha / 2.0, float(test["df"]))
     if critical <= 0.0:
         return None
     stderr = half / critical
-    return ((student_t_ppf(1.0 - alpha, float(test['df']))
-             + student_t_ppf(power, float(test['df']))) * stderr)
+    return ((student_t_ppf(1.0 - alpha, float(test["df"]))
+             + student_t_ppf(power, float(test["df"]))) * stderr)
 
 
 def _row_run_identity(row: dict, parent_of: dict) -> str:
-    name = row.get('name')
+    name = row.get("name")
     seen = set()
     while isinstance(name, str) and name not in seen:
         seen.add(name)
@@ -532,61 +541,61 @@ def _row_run_identity(row: dict, parent_of: dict) -> str:
         if not isinstance(parent, str):
             return name
         name = parent
-    return row.get('name')
+    return row.get("name")
 
 # The synthetic corpus and validation stream have to match the count model's
 # for its CE to be a paired baseline. These are the fields the ablation runner
 # records in each row's `controls` block; missing/unknown values never count
 # as a match.
-_CALIBRATION_MODEL_VOCAB = {'gpt2-124m': 50304, 'gpt2-350m': 50304,
-                            'llama-1b': 32000}
+_CALIBRATION_MODEL_VOCAB = {"gpt2-124m": 50304, "gpt2-350m": 50304,
+                            "llama-1b": 32000}
 _CALIBRATION_PROTOCOL_KEYS = (
-    'generator', 'n_states', 'max_jump', 'vocab_size', 'batch_size', 'seq_len',
-    'outlier_id', 'val_seed_offset', 'val_batches',
+    "generator", "n_states", "max_jump", "vocab_size", "batch_size", "seq_len",
+    "outlier_id", "val_seed_offset", "val_batches",
 )
 
 def _calibration_protocol(args, outlier_id) -> dict:
     """The held-out corpus protocol this calibration run actually uses."""
     return {
-        'generator': 'markov_batch',
+        "generator": "markov_batch",
         # `ablation.run_one` calls `markov_batch` with its defaults; a
         # non-default calibration corpus is a different experiment.
-        'n_states': int(args.n_states),
-        'max_jump': int(args.max_jump),
-        'vocab_size': int(args.vocab_size),
-        'batch_size': int(args.batch_size),
-        'seq_len': int(args.seq_len),
-        'outlier_id': outlier_id,
-        'val_seed_offset': 1,
-        'val_batches': int(args.val_batches),
+        "n_states": int(args.n_states),
+        "max_jump": int(args.max_jump),
+        "vocab_size": int(args.vocab_size),
+        "batch_size": int(args.batch_size),
+        "seq_len": int(args.seq_len),
+        "outlier_id": outlier_id,
+        "val_seed_offset": 1,
+        "val_batches": int(args.val_batches),
     }
 
 def _row_calibration_protocol(row: dict) -> dict | None:
     """The corpus protocol recorded by one ablation row, or None when unknown."""
-    controls = row.get('controls')
+    controls = row.get("controls")
     if not isinstance(controls, dict):
         return None
-    data = controls.get('data')
+    data = controls.get("data")
     if not isinstance(data, dict):
         return None
-    generator = data.get('generator')
+    generator = data.get("generator")
     # `markov_batch` defaults used by the ablation runner. n_states/max_jump
     # are not separately recorded, so only a recorded markov_batch generator
     # can establish them.
-    known_defaults = generator == 'markov_batch'
+    known_defaults = generator == "markov_batch"
     return {
-        'generator': generator,
-        'n_states': 64 if known_defaults else None,
-        'max_jump': 3 if known_defaults else None,
-        'vocab_size': _CALIBRATION_MODEL_VOCAB.get(row.get('model')),
-        'batch_size': data.get('batch_size'),
-        'seq_len': data.get('seq_len'),
+        "generator": generator,
+        "n_states": 64 if known_defaults else None,
+        "max_jump": 3 if known_defaults else None,
+        "vocab_size": _CALIBRATION_MODEL_VOCAB.get(row.get("model")),
+        "batch_size": data.get("batch_size"),
+        "seq_len": data.get("seq_len"),
         # An absent key is unknown, while an explicitly recorded `null` means
         # the outlier channel was off. Both used to `.get()` to None, so an
         # unverified row matched a no-outlier calibration run.
-        'outlier_id': (data['outlier_id'] if 'outlier_id' in data else '<missing>'),
-        'val_seed_offset': data.get('val_seed_offset'),
-        'val_batches': data.get('val_batches'),
+        "outlier_id": (data["outlier_id"] if "outlier_id" in data else "<missing>"),
+        "val_seed_offset": data.get("val_seed_offset"),
+        "val_batches": data.get("val_batches"),
     }
 
 def _same_protocol_value(actual, expected) -> bool:
@@ -637,99 +646,99 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
     stale row's CE is not paired with this calibration's count-model CE.
     """
     out = []
-    parent_of = {row.get('name'): row.get('reused_from') for row in rows
-                 if isinstance(row, dict) and isinstance(row.get('name'), str)
-                 and isinstance(row.get('reused_from'), str)}
+    parent_of = {row.get("name"): row.get("reused_from") for row in rows
+                 if isinstance(row, dict) and isinstance(row.get("name"), str)
+                 and isinstance(row.get("reused_from"), str)}
     for row in rows:
         if not isinstance(row, dict):
             continue
-        val_loss = row.get('val_loss')
+        val_loss = row.get("val_loss")
         valid_loss = _finite_number(val_loss)
         identity = _row_run_identity(row, parent_of)
-        entry = {'name': row.get('name'),
-                 'val_loss': float(val_loss) if valid_loss else None,
-                 'n_seeds': row.get('n_seeds'),
-                 'run_identity': identity,
-                 'excluded_from_family': None}
+        entry = {"name": row.get("name"),
+                 "val_loss": float(val_loss) if valid_loss else None,
+                 "n_seeds": row.get("n_seeds"),
+                 "run_identity": identity,
+                 "excluded_from_family": None}
         if val_loss is not None and not valid_loss:
             # NaN/Inf and bools are not measurements. Keeping the raw value in
             # `val_loss` made a bool loss compute a finite excess and even
             # "beat" the tuned count model.
-            entry['invalid_val_loss'] = repr(val_loss)
+            entry["invalid_val_loss"] = repr(val_loss)
         if protocol is not None:
             mismatches = _calibration_protocol_mismatches(
                 _row_calibration_protocol(row), protocol)
-            entry['protocol_matches'] = not mismatches
-            entry['protocol_mismatches'] = mismatches
-            entry['recorded_protocol'] = _row_calibration_protocol(row)
+            entry["protocol_matches"] = not mismatches
+            entry["protocol_mismatches"] = mismatches
+            entry["recorded_protocol"] = _row_calibration_protocol(row)
             if mismatches:
-                entry['excluded_from_family'] = (
-                    'trained/validated under a different corpus protocol than this '
+                entry["excluded_from_family"] = (
+                    "trained/validated under a different corpus protocol than this "
                     f"calibration: {', '.join(mismatches)}")
         if valid_loss:
-            entry['excess_over_bayes_floor_nats'] = val_loss - memoryless_floor
+            entry["excess_over_bayes_floor_nats"] = val_loss - memoryless_floor
             if ceiling is not None:
-                entry['excess_over_bayes_ceiling_nats'] = val_loss - ceiling
+                entry["excess_over_bayes_ceiling_nats"] = val_loss - ceiling
             if tuned_ce is not None:
-                entry['excess_over_tuned_simple_nats'] = val_loss - tuned_ce
-                entry['beats_tuned_simple_baseline'] = bool(val_loss < tuned_ce)
+                entry["excess_over_tuned_simple_nats"] = val_loss - tuned_ce
+                entry["beats_tuned_simple_baseline"] = bool(val_loss < tuned_ce)
             if log_vocab is not None and ceiling is not None and log_vocab > ceiling:
-                entry['signal_captured_fraction'] = (log_vocab - val_loss) / (log_vocab - ceiling)
+                entry["signal_captured_fraction"] = (log_vocab - val_loss) / (log_vocab - ceiling)
         row_duplicates: set = set()
         per_seed_val_loss = _row_seed_losses(row, row_duplicates)
         entry.update({
-            'beats_tuned_simple_significantly': False,
-            'per_seed_val_loss': per_seed_val_loss,
-            'duplicate_seed_ids': sorted(row_duplicates),
-            'n_paired_seeds': 0,
-            'p_one_sided_tuned_simple': None,
-            'p_one_sided_tuned_simple_holm': None,
-            'delta_seed_mean_tuned_simple': None,
-            'delta_ci_95_tuned_simple': None,
-            'minimum_detectable_delta_tuned_simple': None,
-            'simple_baseline_test_basis': None,
+            "beats_tuned_simple_significantly": False,
+            "per_seed_val_loss": per_seed_val_loss,
+            "duplicate_seed_ids": sorted(row_duplicates),
+            "n_paired_seeds": 0,
+            "p_one_sided_tuned_simple": None,
+            "p_one_sided_tuned_simple_holm": None,
+            "delta_seed_mean_tuned_simple": None,
+            "delta_ci_95_tuned_simple": None,
+            "minimum_detectable_delta_tuned_simple": None,
+            "simple_baseline_test_basis": None,
         })
         seed_duplicates: set = set()
         seed_ce = (_count_seed_ce(records, tuned_predictor, seed_duplicates)
                    if tuned_predictor else {})
-        common = sorted(set(entry['per_seed_val_loss']) & set(seed_ce))
-        entry['n_paired_seeds'] = len(common)
+        common = sorted(set(entry["per_seed_val_loss"]) & set(seed_ce))
+        entry["n_paired_seeds"] = len(common)
         if len(common) >= 2:
-            row_vals = [entry['per_seed_val_loss'][seed] for seed in common]
+            row_vals = [entry["per_seed_val_loss"][seed] for seed in common]
             ref_vals = [seed_ce[seed] for seed in common]
             test = paired_t_one_sided(row_vals, ref_vals, alpha=alpha)
             entry.update({
-                'p_one_sided_tuned_simple': test['p_one_sided'],
-                'delta_seed_mean_tuned_simple': test['mean_delta'],
-                'delta_ci_95_tuned_simple': [test['ci_low'], test['ci_high']],
-                'minimum_detectable_delta_tuned_simple': _mde_from_test(test, alpha=alpha),
-                'simple_baseline_test_basis': 'seed_means',
-                'replicated_across_seeds': len(common) >= 3,
+                "p_one_sided_tuned_simple": test["p_one_sided"],
+                "delta_seed_mean_tuned_simple": test["mean_delta"],
+                "delta_ci_95_tuned_simple": [test["ci_low"], test["ci_high"]],
+                "minimum_detectable_delta_tuned_simple": _mde_from_test(test, alpha=alpha),
+                "simple_baseline_test_basis": "seed_means",
+                "replicated_across_seeds": len(common) >= 3,
             })
             if len(common) < 3:
-                entry['simple_baseline_test_basis'] = (
-                    f'descriptive only: {len(common)} shared seeds, fewer than the '
-                    'required 3')
+                entry["simple_baseline_test_basis"] = (
+                    f"descriptive only: {len(common)} shared seeds, fewer than the "
+                    "required 3")
         elif len(common) == 1:
-            entry['simple_baseline_test_basis'] = (
-                'descriptive only: one shared seed, so a paired count-model test '
-                'cannot separate an arm effect from run-to-run noise')
+            entry["simple_baseline_test_basis"] = (
+                "descriptive only: one shared seed, so a paired count-model test "
+                "cannot separate an arm effect from run-to-run noise")
         elif tuned_predictor:
-            entry['simple_baseline_test_basis'] = 'no_shared_seeds'
+            entry["simple_baseline_test_basis"] = "no_shared_seeds"
         duplicate_ids = row_duplicates | seed_duplicates
         if duplicate_ids:
             # Repeated seed ids are one run, not extra replication; the paired
             # test above is not independent evidence and must not enter the
             # Holm family (or set the significant flag).
-            entry['duplicate_seed_ids'] = sorted(duplicate_ids)
-            entry['replicated_across_seeds'] = False
-            entry['simple_baseline_test_basis'] = (
-                'duplicate seed record(s) '
-                f'{sorted(duplicate_ids)}: the same run cannot be counted twice')
-            if entry.get('excluded_from_family') is None:
-                entry['excluded_from_family'] = (
-                    'duplicate seed record(s) '
-                    f'{sorted(duplicate_ids)}: not independent evidence')
+            entry["duplicate_seed_ids"] = sorted(duplicate_ids)
+            entry["replicated_across_seeds"] = False
+            entry["simple_baseline_test_basis"] = (
+                "duplicate seed record(s) "
+                f"{sorted(duplicate_ids)}: the same run cannot be counted twice")
+            if entry.get("excluded_from_family") is None:
+                entry["excluded_from_family"] = (
+                    "duplicate seed record(s) "
+                    f"{sorted(duplicate_ids)}: not independent evidence")
         out.append(entry)
     # Alias rows (`reused_from`) are the same underlying run under a second
     # name. Choose the canonical row by evidence quality, not by summary
@@ -738,95 +747,95 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
     # Holm family.
     by_identity: dict[str, list] = {}
     for entry in out:
-        by_identity.setdefault(entry['run_identity'], []).append(entry)
+        by_identity.setdefault(entry["run_identity"], []).append(entry)
     for aliases in by_identity.values():
         if len(aliases) < 2:
             continue
         canonical = min(
             aliases,
             key=lambda entry: (
-                0 if _finite_number(entry.get('val_loss')) else 1,
-                0 if entry.get('protocol_matches', True) else 1,
-                0 if entry.get('replicated_across_seeds') else 1,
-                -int(entry.get('n_seeds') or 0),
-                0 if entry.get('p_one_sided_tuned_simple') is not None else 1,
-                -int(entry.get('n_paired_seeds') or 0),
-                str(entry.get('name')),
+                0 if _finite_number(entry.get("val_loss")) else 1,
+                0 if entry.get("protocol_matches", True) else 1,
+                0 if entry.get("replicated_across_seeds") else 1,
+                -int(entry.get("n_seeds") or 0),
+                0 if entry.get("p_one_sided_tuned_simple") is not None else 1,
+                -int(entry.get("n_paired_seeds") or 0),
+                str(entry.get("name")),
             ),
         )
         for entry in aliases:
             if entry is not canonical:
-                entry['excluded_from_family'] = (
+                entry["excluded_from_family"] = (
                     f"duplicate run of {canonical.get('name')} "
-                    '(reused summary, not independent evidence)')
-    family = [entry for entry in out if entry.get('replicated_across_seeds')
-              and entry.get('p_one_sided_tuned_simple') is not None
-              and entry.get('excluded_from_family') is None]
-    adjusted = holm_adjust([entry['p_one_sided_tuned_simple'] for entry in family])
+                    "(reused summary, not independent evidence)")
+    family = [entry for entry in out if entry.get("replicated_across_seeds")
+              and entry.get("p_one_sided_tuned_simple") is not None
+              and entry.get("excluded_from_family") is None]
+    adjusted = holm_adjust([entry["p_one_sided_tuned_simple"] for entry in family])
     for entry, p_holm in zip(family, adjusted):
-        entry['p_one_sided_tuned_simple_holm'] = p_holm
+        entry["p_one_sided_tuned_simple_holm"] = p_holm
         # The certifying test is paired on the shared seeds, so its direction
         # comes from that paired delta, not the all-seed point estimate.
-        paired_delta = entry.get('delta_seed_mean_tuned_simple')
-        entry['beats_tuned_simple_significantly'] = bool(
+        paired_delta = entry.get("delta_seed_mean_tuned_simple")
+        entry["beats_tuned_simple_significantly"] = bool(
             paired_delta is not None and paired_delta < 0.0
             and p_holm is not None and p_holm < alpha)
     return out
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--n-states', type=int, default=64, help='state count of the Markov walk')
-    p.add_argument('--max-jump', type=int, default=3, help='jump support {0..max_jump-1} of the walk')
-    p.add_argument('--vocab-size', type=int, default=50304, help='token vocabulary of the ablation model; the outlier id is vocab_size - 1')
-    p.add_argument('--no-outlier-channel', dest='outlier_channel', action='store_false', help='disable the 3%% spike to vocab_size - 1 (the ablation default keeps it on)')
-    p.add_argument('--no-trigram', dest='no_trigram', action='store_true', help='skip the trigram row (only useful when the alphabet is too large for the dense count table)')
-    p.add_argument('--batch-size', type=int, default=8)
-    p.add_argument('--seq-len', type=int, default=512)
-    p.add_argument('--train-batches', type=int, default=200, help='batches fitted, drawn from the ablation training generator (seed s)')
-    p.add_argument('--tune-batches', type=int, default=32, help='batches for the add-k selection, drawn from a separate generator (seed s + 2)')
-    p.add_argument('--val-batches', type=int, default=20, help="batches scored, drawn from the ablation's held-out generator (seed s + 1)")
-    p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='one independent fit/tune/eval per seed; the report is Mean +/- Std across seeds')
-    p.add_argument('--ks', nargs='+', type=float, default=list(DEFAULT_KS), help='add-k smoothing grid, selected on the tuning stream')
-    p.add_argument('--hypothesis', default=('The tuned count baselines approach the memoryless Bayes floor of the synthetic corpus, the exact HMM filter is strictly below it and bounds what the ablation transformers can achieve, so every ablation row can be read as a fraction of the learnable signal rather than only against the other transformer rows.'), help='pre-registered claim this calibration supports; recorded in the report manifest')
-    p.add_argument('--ablation-summaries', default=None, help='ablation all_summaries.json to annotate with the limits; defaults to the sibling of --output')
-    p.add_argument('--output', default='runs/ablation/simple_baselines.json')
+    p.add_argument("--n-states", type=int, default=64, help="state count of the Markov walk")
+    p.add_argument("--max-jump", type=int, default=3, help="jump support {0..max_jump-1} of the walk")
+    p.add_argument("--vocab-size", type=int, default=50304, help="token vocabulary of the ablation model; the outlier id is vocab_size - 1")
+    p.add_argument("--no-outlier-channel", dest="outlier_channel", action="store_false", help="disable the 3%% spike to vocab_size - 1 (the ablation default keeps it on)")
+    p.add_argument("--no-trigram", dest="no_trigram", action="store_true", help="skip the trigram row (only useful when the alphabet is too large for the dense count table)")
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--seq-len", type=int, default=512)
+    p.add_argument("--train-batches", type=int, default=200, help="batches fitted, drawn from the ablation training generator (seed s)")
+    p.add_argument("--tune-batches", type=int, default=32, help="batches for the add-k selection, drawn from a separate generator (seed s + 2)")
+    p.add_argument("--val-batches", type=int, default=20, help="batches scored, drawn from the ablation's held-out generator (seed s + 1)")
+    p.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS), help="one independent fit/tune/eval per seed; the report is Mean +/- Std across seeds")
+    p.add_argument("--ks", nargs="+", type=float, default=list(DEFAULT_KS), help="add-k smoothing grid, selected on the tuning stream")
+    p.add_argument("--hypothesis", default=("The tuned count baselines approach the memoryless Bayes floor of the synthetic corpus, the exact HMM filter is strictly below it and bounds what the ablation transformers can achieve, so every ablation row can be read as a fraction of the learnable signal rather than only against the other transformer rows."), help="pre-registered claim this calibration supports; recorded in the report manifest")
+    p.add_argument("--ablation-summaries", default=None, help="ablation all_summaries.json to annotate with the limits; defaults to the sibling of --output")
+    p.add_argument("--output", default="runs/ablation/simple_baselines.json")
     args = p.parse_args()
     raw_seeds = list(args.seeds)
     if not raw_seeds:
-        p.error('--seeds must not be empty')
+        p.error("--seeds must not be empty")
     args.seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(args.seeds) != len(raw_seeds):
-        print(f'[baseline][warn] duplicate seeds removed: {raw_seeds} -> {args.seeds} '
-              '(a repeated seed reruns the identical fit, not an independent sample)')
-    for flag, value in (('--batch-size', args.batch_size),
-                        ('--seq-len', args.seq_len),
-                        ('--train-batches', args.train_batches),
-                        ('--tune-batches', args.tune_batches),
-                        ('--val-batches', args.val_batches)):
+        print(f"[baseline][warn] duplicate seeds removed: {raw_seeds} -> {args.seeds} "
+              "(a repeated seed reruns the identical fit, not an independent sample)")
+    for flag, value in (("--batch-size", args.batch_size),
+                        ("--seq-len", args.seq_len),
+                        ("--train-batches", args.train_batches),
+                        ("--tune-batches", args.tune_batches),
+                        ("--val-batches", args.val_batches)):
         if value < 1:
-            p.error(f'{flag} {value} must be >= 1')
+            p.error(f"{flag} {value} must be >= 1")
     if args.seq_len < 2:
         # A one-token sequence has no next-token target: the synthetic
         # generator labels every position ignore_index, so no baseline/HMM
         # statistic or supervised loss can be computed.
-        p.error(f'--seq-len {args.seq_len} must be >= 2 for next-token '
-                'supervision')
+        p.error(f"--seq-len {args.seq_len} must be >= 2 for next-token "
+                "supervision")
     if args.n_states < 1:
-        p.error(f'--n-states {args.n_states} must be >= 1')
+        p.error(f"--n-states {args.n_states} must be >= 1")
     if args.max_jump < 1:
-        p.error(f'--max-jump {args.max_jump} must be >= 1')
+        p.error(f"--max-jump {args.max_jump} must be >= 1")
     if args.vocab_size < 1:
-        p.error(f'--vocab-size {args.vocab_size} must be >= 1')
+        p.error(f"--vocab-size {args.vocab_size} must be >= 1")
     if args.n_states > args.vocab_size:
-        p.error(f'--n-states {args.n_states} cannot exceed --vocab-size {args.vocab_size}')
+        p.error(f"--n-states {args.n_states} cannot exceed --vocab-size {args.vocab_size}")
     if args.outlier_channel and args.n_states >= args.vocab_size:
-        p.error(f'--n-states {args.n_states} must be smaller than --vocab-size {args.vocab_size} '
-                'when the outlier channel is enabled (the outlier id is vocab_size - 1)')
+        p.error(f"--n-states {args.n_states} must be smaller than --vocab-size {args.vocab_size} "
+                "when the outlier channel is enabled (the outlier id is vocab_size - 1)")
     if not args.ks:
-        p.error('--ks must not be empty')
+        p.error("--ks must not be empty")
     if any((not math.isfinite(k)) or k <= 0.0 for k in args.ks):
-        p.error('--ks entries must be finite and > 0')
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        p.error("--ks entries must be finite and > 0")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     set_all_seeds(args.seeds[0])
     outlier_id = args.vocab_size - 1 if args.outlier_channel else None
     memoryless_floor = memoryless_bayes_floor_nats(args.n_states, args.max_jump,
@@ -841,20 +850,20 @@ def main():
     for seed in args.seeds:
         record = evaluate_seed(seed, args, device)
         records.append(record)
-        preds = record['predictors']
-        tuned = {name: record['tuning'][name]['best_k'] for name in record['tuning']}
-        trigram = ('skipped' if preds.get('trigram') is None
+        preds = record["predictors"]
+        tuned = {name: record["tuning"][name]["best_k"] for name in record["tuning"]}
+        trigram = ("skipped" if preds.get("trigram") is None
                    else f"{preds['trigram']:.4f}")
         print(f"[baseline] seed {seed}: uniform_vocab={preds['uniform_vocab']:.4f} "
               f"uniform_targets={preds['uniform_targets']:.4f} "
               f"unigram={preds['unigram']:.4f} bigram={preds['bigram']:.4f} "
               f"trigram={trigram} walk_rule={preds['walk_rule']:.4f} "
               f"hmm_bayes={preds['hmm_bayes']:.4f} (ks: {tuned})")
-    aggregate = aggregate_records(records, ('uniform_vocab', 'uniform_targets', *SIMPLE_PREDICTORS,
-                                            'walk_rule', 'hmm_bayes'))
+    aggregate = aggregate_records(records, ("uniform_vocab", "uniform_targets", *SIMPLE_PREDICTORS,
+                                            "walk_rule", "hmm_bayes"))
     tuned_baseline = best_count_model(aggregate)
     calibration = build_calibration(aggregate, memoryless_floor, tuned_baseline, records)
-    full_context = aggregate.get('hmm_bayes')
+    full_context = aggregate.get("hmm_bayes")
     if tuned_baseline:
         print(f"[baseline] tuned simple baseline: {tuned_baseline['predictor']} "
               f"{tuned_baseline['mean_ce_nats']:.4f} +/- {tuned_baseline['std_ce_nats']:.4f} nats")
@@ -866,71 +875,71 @@ def main():
           f"{calibration['rule_minus_memoryless_nats']:+.4f} nats "
           f"(tol {calibration['rule_memoryless_tolerance_nats']:.4f}) -> "
           f"rule_matches_memoryless_floor={calibration['rule_matches_memoryless_floor']}")
-    if not calibration['rule_matches_memoryless_floor'] or calibration['full_context_below_memoryless_floor'] is False:
-        print('[baseline] WARNING: the corpus does not behave like the assumed process; do not '
-              'calibrate against these limits until the discrepancy is explained')
-    ceiling = None if not full_context else full_context['mean_ce_nats']
-    summaries_path = Path(args.ablation_summaries) if args.ablation_summaries else Path(args.output).with_name('all_summaries.json')
+    if not calibration["rule_matches_memoryless_floor"] or calibration["full_context_below_memoryless_floor"] is False:
+        print("[baseline] WARNING: the corpus does not behave like the assumed process; do not "
+              "calibrate against these limits until the discrepancy is explained")
+    ceiling = None if not full_context else full_context["mean_ce_nats"]
+    summaries_path = Path(args.ablation_summaries) if args.ablation_summaries else Path(args.output).with_name("all_summaries.json")
     ablation_rows = calibrate_ablation_rows(
         load_ablation_rows(summaries_path), memoryless_floor, ceiling,
-        None if not tuned_baseline else tuned_baseline['mean_ce_nats'],
+        None if not tuned_baseline else tuned_baseline["mean_ce_nats"],
         math.log(args.vocab_size),
-        tuned_predictor=None if not tuned_baseline else tuned_baseline['predictor'],
+        tuned_predictor=None if not tuned_baseline else tuned_baseline["predictor"],
         records=records,
         protocol=_calibration_protocol(args, outlier_id))
     if ablation_rows:
-        above = sum(1 for row in ablation_rows if row.get('beats_tuned_simple_baseline'))
-        certified = sum(1 for row in ablation_rows if row.get('beats_tuned_simple_significantly'))
-        mismatched = sum(1 for row in ablation_rows if row.get('protocol_matches') is False)
+        above = sum(1 for row in ablation_rows if row.get("beats_tuned_simple_baseline"))
+        certified = sum(1 for row in ablation_rows if row.get("beats_tuned_simple_significantly"))
+        mismatched = sum(1 for row in ablation_rows if row.get("protocol_matches") is False)
         print(f"[baseline] ablation rows from {summaries_path}: {above}/{len(ablation_rows)} beat the tuned "
               f"count model on the point estimate, {certified}/{len(ablation_rows)} significantly "
               f"(paired t, Holm, >=3 shared seeds); {mismatched} row(s) were excluded as "
               f"trained/validated under a different corpus protocol; every row is annotated "
               f"with excess_over_bayes_floor_nats and excess_over_bayes_ceiling_nats")
     report = {
-        'hypothesis': args.hypothesis,
-        'protocol': {
-            'corpus': 'markov_batch', 'n_states': args.n_states, 'max_jump': args.max_jump,
-            'outlier_channel': bool(args.outlier_channel), 'outlier_id': outlier_id,
-            'spike_prob': MARKOV_SPIKE_PROB if args.outlier_channel else 0.0,
-            'vocab_size': args.vocab_size, 'batch_size': args.batch_size, 'seq_len': args.seq_len,
-            'train_batches': args.train_batches, 'tune_batches': args.tune_batches,
-            'val_batches': args.val_batches, 'seeds': list(args.seeds), 'ks': list(args.ks),
-            'evaluation_metric': 'mean cross-entropy in nats over unmasked next-token targets',
-            'fit_stream': "torch.Generator seed s - the same training stream scripts/ablation.py optimizes on",
-            'tuning_stream': 'torch.Generator seed s + 2 - separate from every reported evaluation',
-            'eval_stream': "torch.Generator seed s + 1 - the same held-out stream scripts/ablation.py scores on",
+        "hypothesis": args.hypothesis,
+        "protocol": {
+            "corpus": "markov_batch", "n_states": args.n_states, "max_jump": args.max_jump,
+            "outlier_channel": bool(args.outlier_channel), "outlier_id": outlier_id,
+            "spike_prob": MARKOV_SPIKE_PROB if args.outlier_channel else 0.0,
+            "vocab_size": args.vocab_size, "batch_size": args.batch_size, "seq_len": args.seq_len,
+            "train_batches": args.train_batches, "tune_batches": args.tune_batches,
+            "val_batches": args.val_batches, "seeds": list(args.seeds), "ks": list(args.ks),
+            "evaluation_metric": "mean cross-entropy in nats over unmasked next-token targets",
+            "fit_stream": "torch.Generator seed s - the same training stream scripts/ablation.py optimizes on",
+            "tuning_stream": "torch.Generator seed s + 2 - separate from every reported evaluation",
+            "eval_stream": "torch.Generator seed s + 1 - the same held-out stream scripts/ablation.py scores on",
         },
-        'bayes_limits': {
-            'memoryless_nats': memoryless_floor,
-            'memoryless_perplexity': math.exp(memoryless_floor),
-            'memoryless_formula': ('H(wrapped jump)' if not args.outlier_channel else
-                                   '(1 - spike_prob) * H(wrapped jump) + spike_prob * ln(n_states)'),
-            'without_outlier_nats': memoryless_bayes_floor_nats(args.n_states, args.max_jump, 0.0),
-            'full_context_nats': ceiling,
-            'full_context_stderr_nats': None if not full_context else full_context['stderr_ce_nats'],
-            'full_context_definition': ('exact forward filtering of the observation-hidden Markov walk; the '
-                                        'minimum achievable mean causal CE for any model that reads the observed '
-                                        'prefix (the ablation transformers included)'),
-            'context_gain_nats': None if ceiling is None else memoryless_floor - ceiling,
+        "bayes_limits": {
+            "memoryless_nats": memoryless_floor,
+            "memoryless_perplexity": math.exp(memoryless_floor),
+            "memoryless_formula": ("H(wrapped jump)" if not args.outlier_channel else
+                                   "(1 - spike_prob) * H(wrapped jump) + spike_prob * ln(n_states)"),
+            "without_outlier_nats": memoryless_bayes_floor_nats(args.n_states, args.max_jump, 0.0),
+            "full_context_nats": ceiling,
+            "full_context_stderr_nats": None if not full_context else full_context["stderr_ce_nats"],
+            "full_context_definition": ("exact forward filtering of the observation-hidden Markov walk; the "
+                                        "minimum achievable mean causal CE for any model that reads the observed "
+                                        "prefix (the ablation transformers included)"),
+            "context_gain_nats": None if ceiling is None else memoryless_floor - ceiling,
         },
-        'predictors': aggregate,
-        'tuned_count_baseline': tuned_baseline,
-        'calibration': calibration,
-        'per_seed': records,
-        'ablation_calibration': {'summaries': str(summaries_path), 'rows': ablation_rows},
+        "predictors": aggregate,
+        "tuned_count_baseline": tuned_baseline,
+        "calibration": calibration,
+        "per_seed": records,
+        "ablation_calibration": {"summaries": str(summaries_path), "rows": ablation_rows},
     }
     out_path = Path(args.output)
     save_json_atomic(out_path, report)
-    manifest = collect_run_metadata(seed=args.seeds[0], extra={'hypothesis': args.hypothesis,
-                                                               'seeds': list(args.seeds)})
-    manifest['hyperparameters'] = vars(args)
-    manifest['report_file'] = str(out_path)
-    manifest['bayes_limits'] = report['bayes_limits']
-    manifest['tuned_count_baseline'] = tuned_baseline
-    manifest = finish_metadata(manifest, artifacts={'report': file_fingerprint(out_path)})
-    save_run_manifest(out_path.with_name('simple_baselines_manifest.json'), manifest)
-    print(f'[done] saved to {out_path}')
+    manifest = collect_run_metadata(seed=args.seeds[0], extra={"hypothesis": args.hypothesis,
+                                                               "seeds": list(args.seeds)})
+    manifest["hyperparameters"] = vars(args)
+    manifest["report_file"] = str(out_path)
+    manifest["bayes_limits"] = report["bayes_limits"]
+    manifest["tuned_count_baseline"] = tuned_baseline
+    manifest = finish_metadata(manifest, artifacts={"report": file_fingerprint(out_path)})
+    save_run_manifest(out_path.with_name("simple_baselines_manifest.json"), manifest)
+    print(f"[done] saved to {out_path}")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

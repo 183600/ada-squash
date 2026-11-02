@@ -30,21 +30,31 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from adasquash.repro import compare_train_streams
-from scripts.audit_data import (_collect_split, eval_batch_capacity,
-                                evaluation_reuse_status, packed_window_count,
-                                split_token_budget,
-                                minhash_signature, near_duplicate_leakage,
-                                near_duplicate_ledger_additions,
-                                near_duplicate_record,
-                                near_duplicate_scan_bound,
-                                near_duplicate_train_budget,
-                                near_duplicate_train_ledger_hashes,
-                                token_shingles, train_wrap_status,
-                                within_split_near_duplicates)
-from scripts.data_pipeline import (canonical_document_hash,
-                                   configure_data_options, document_hash,
-                                   get_data_options, split_document_boundaries,
-                                   validate_data_options)
+from scripts.audit_data import (
+    _collect_split,
+    eval_batch_capacity,
+    evaluation_reuse_status,
+    minhash_signature,
+    near_duplicate_leakage,
+    near_duplicate_ledger_additions,
+    near_duplicate_record,
+    near_duplicate_scan_bound,
+    near_duplicate_train_budget,
+    near_duplicate_train_ledger_hashes,
+    packed_window_count,
+    split_token_budget,
+    token_shingles,
+    train_wrap_status,
+    within_split_near_duplicates,
+)
+from scripts.data_pipeline import (
+    canonical_document_hash,
+    configure_data_options,
+    document_hash,
+    get_data_options,
+    split_document_boundaries,
+    validate_data_options,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -621,6 +631,7 @@ def test_train_stream_fingerprint_is_order_and_shape_sensitive():
 
 def test_train_stream_fingerprint_includes_the_target_tokens():
     import torch
+
     from adasquash.repro import TrainStreamFingerprint
 
     x = torch.tensor([[1, 2], [3, 4]])
@@ -685,63 +696,63 @@ def test_train_stream_lookup_accepts_json_string_seed_keys():
 
 
 def test_compare_arms_reports_a_train_stream_mismatch_without_certifying():
-    from scripts.compare_arms import compare_arms
-
     import torch
+
+    from scripts.compare_arms import compare_arms
 
     matching = _stream_record(torch.tensor([[1, 2], [3, 4]]))
     different = _stream_record(torch.tensor([[9, 9], [9, 9]]))
 
     def aggregate(values, stream):
         return {
-            'model': 'gpt2-124m',
-            'per_seed': [{'seed': seed, 'final_val_loss': value,
-                          'final_val_step': 100}
+            "model": "gpt2-124m",
+            "per_seed": [{"seed": seed, "final_val_loss": value,
+                          "final_val_step": 100}
                          for seed, value in sorted(values.items())],
-            'shapes_by_seed': {str(seed): {'n_layers': 12, 'dim': 768,
-                                           'n_heads': 12}
+            "shapes_by_seed": {str(seed): {"n_layers": 12, "dim": 768,
+                                           "n_heads": 12}
                                for seed in values},
-            'data_versions_by_seed': {str(seed): {'name': 'corpus',
-                                                  'revision': 'v1'}
+            "data_versions_by_seed": {str(seed): {"name": "corpus",
+                                                  "revision": "v1"}
                                       for seed in values},
-            'train_stream_by_seed': {seed: stream for seed in values},
+            "train_stream_by_seed": dict.fromkeys(values, stream),
         }
 
     values = {42: 2.0, 43: 2.0, 44: 2.0}
     clean = {
-        'reference': aggregate(values, matching),
-        'candidate': aggregate({42: 1.5, 43: 1.52, 44: 1.49}, matching),
+        "reference": aggregate(values, matching),
+        "candidate": aggregate({42: 1.5, 43: 1.52, 44: 1.49}, matching),
     }
-    out = compare_arms(clean, reference='reference', require_recipe=False)
-    row = out['rows'][0]
-    assert not any('train stream' in problem.lower()
-                   for problem in row['protocol_problems'])
-    assert row['train_stream_identity']['checked'] is True
+    out = compare_arms(clean, reference="reference", require_recipe=False)
+    row = out["rows"][0]
+    assert not any("train stream" in problem.lower()
+                   for problem in row["protocol_problems"])
+    assert row["train_stream_identity"]["checked"] is True
 
     dirty = {
-        'reference': aggregate(values, matching),
-        'candidate': aggregate({42: 1.5, 43: 1.52, 44: 1.49}, different),
+        "reference": aggregate(values, matching),
+        "candidate": aggregate({42: 1.5, 43: 1.52, 44: 1.49}, different),
     }
-    out = compare_arms(dirty, reference='reference', require_recipe=False)
-    row = out['rows'][0]
-    assert any('train stream differs' in problem
-               for problem in row['protocol_problems'])
-    assert row['certifiable'] is False
+    out = compare_arms(dirty, reference="reference", require_recipe=False)
+    row = out["rows"][0]
+    assert any("train stream differs" in problem
+               for problem in row["protocol_problems"])
+    assert row["certifiable"] is False
 
     # A legacy aggregate without a stream record is unknown, not equal. It is
     # tolerated by default but fails closed when the comparison is required to
     # prove data identity.
     legacy = {
-        'reference': {**aggregate(values, matching),
-                      'train_stream_by_seed': {}},
-        'candidate': {**aggregate({42: 1.5, 43: 1.52, 44: 1.49}, matching),
-                      'train_stream_by_seed': {}},
+        "reference": {**aggregate(values, matching),
+                      "train_stream_by_seed": {}},
+        "candidate": {**aggregate({42: 1.5, 43: 1.52, 44: 1.49}, matching),
+                      "train_stream_by_seed": {}},
     }
-    out = compare_arms(legacy, reference='reference', require_recipe=False,
+    out = compare_arms(legacy, reference="reference", require_recipe=False,
                        require_train_stream_identity=True)
-    row = out['rows'][0]
-    assert any('identity was not established' in problem
-               for problem in row['protocol_problems'])
+    row = out["rows"][0]
+    assert any("identity was not established" in problem
+               for problem in row["protocol_problems"])
 
 
 # ---------------------------------------------------------------------------
@@ -1022,8 +1033,9 @@ def test_load_document_stream_opens_the_requested_upstream_split(monkeypatch):
 
 
 def test_open_validation_split_uses_the_whole_named_external_split(monkeypatch):
-    import scripts.train_gpt2 as tg
     from types import SimpleNamespace
+
+    import scripts.train_gpt2 as tg
 
     captured = {}
 
@@ -1077,8 +1089,9 @@ def test_materialized_cache_supports_a_full_split_starting_at_zero(tmp_path, mon
 
 
 def test_open_data_split_does_not_leak_the_training_dataset_revision(monkeypatch):
-    import scripts.train_gpt2 as tg
     from types import SimpleNamespace
+
+    import scripts.train_gpt2 as tg
 
     captured = {}
     monkeypatch.setattr(tg, "configure_data_options",

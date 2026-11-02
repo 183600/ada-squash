@@ -13,8 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import wilson_interval
-from scripts.audit_validation import (_is_boolean_scalar, _strict_bool_option,
-                                      _strict_int_option)
+from scripts.audit_validation import _is_boolean_scalar, _strict_bool_option, _strict_int_option
 
 # ---------------------------------------------------------------------------
 # Near-duplicate contamination
@@ -82,8 +81,8 @@ def token_shingles(ids, shingle_size: int = 8) -> set:
     if any(not isinstance(token, numbers.Integral)
            or isinstance(token, bool) for token in raw_tokens):
         raise ValueError(
-            'token_shingles expects exact integer token ids; a float/string/bool '
-            'would be silently truncated')
+            "token_shingles expects exact integer token ids; a float/string/bool "
+            "would be silently truncated")
     tokens = [int(token) + 1 for token in raw_tokens]
     n = len(tokens)
     if n == 0:
@@ -183,10 +182,10 @@ def _has_shingle_sketch(record: dict) -> bool:
     """
     if not isinstance(record, dict):
         return False
-    n = record.get('n_shingles')
+    n = record.get("n_shingles")
     if isinstance(n, int) and not isinstance(n, bool):
         return n > 0
-    signature = record.get('signature')
+    signature = record.get("signature")
     if not signature:
         return False
     try:
@@ -847,9 +846,7 @@ def near_duplicate_ledger_additions(report: dict) -> dict:
             continue
         earlier = pair.get("earlier_split")
         later = pair.get("later_split")
-        if later == "validation" and earlier == "train":
-            role = "train"
-        elif later == "test" and earlier == "train":
+        if (later == "validation" and earlier == "train") or (later == "test" and earlier == "train"):
             role = "train"
         elif later == "test" and earlier == "validation":
             role = "validation"

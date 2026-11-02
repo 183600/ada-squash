@@ -1,35 +1,49 @@
 from __future__ import annotations
+
 import argparse
 import json
 import math
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
+
 from adasquash.jsonio import save_json_atomic
-from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, holm_adjust, mean_std_stderr,
-                               paired_t_one_sided, scale_replication_summary)
-from adasquash.model import (MLP, build_gpt_124m, build_gpt_350m,
-                             build_llama_tiny_1b)
-from adasquash.repro import (TRAINING_RECIPE_KEYS, collect_run_metadata, file_fingerprint,
-                             finish_metadata, save_run_manifest, set_all_seeds,
-                             training_recipe_mismatches)
+from adasquash.metrics import (
+    MIN_SEEDS_FOR_SIGNIFICANCE,
+    holm_adjust,
+    mean_std_stderr,
+    paired_t_one_sided,
+    scale_replication_summary,
+)
+from adasquash.model import MLP, build_gpt_124m, build_gpt_350m, build_llama_tiny_1b
 from adasquash.norms import LayerNorm, RMSNorm, _SquashedAffine
+from adasquash.repro import (
+    TRAINING_RECIPE_KEYS,
+    collect_run_metadata,
+    file_fingerprint,
+    finish_metadata,
+    save_run_manifest,
+    set_all_seeds,
+    training_recipe_mismatches,
+)
 from adasquash.utils import KurtosisMeter, markov_batch
 from scripts.data_pipeline import _is_pinned_revision
+
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
 # The FP8 probe must not certify a mechanism from one architecture. These are
 # the builder targets accepted by --models (random-init mode); each produces a
 # distinct shape label in comparison.json's scale_replication block.
 _FP8_MODEL_BUILDERS = {
-    'gpt2-124m': build_gpt_124m,
-    'gpt2-350m': build_gpt_350m,
-    'llama-1b': build_llama_tiny_1b,
+    "gpt2-124m": build_gpt_124m,
+    "gpt2-350m": build_gpt_350m,
+    "llama-1b": build_llama_tiny_1b,
 }
 # One probe draw is one sample: these per-norm quantities are aggregated as
 # Mean +/- Std over the `--seeds` replications, with the per-seed records kept
@@ -53,11 +67,11 @@ _FP8_MODEL_BUILDERS = {
 #   independent draws (df = 1) are descriptive only, like two training seeds.
 # The comparison is saved next to the results as `comparison.json`.
 _FP8_SEED_METRIC_KEYS = (
-    'max_abs_pre_norm', 'max_abs_post_norm', 'mean_excess_kurtosis_pre_norm',
-    'mean_overflow_rate_e4m3', 'max_overflow_rate_e4m3',
-    'mean_underflow_rate_e4m3', 'mean_subnormal_rate_e4m3',
-    'mean_quantized_zero_rate_e4m3', 'mean_rel_quant_err_e4m3',
-    'logit_rel_divergence',
+    "max_abs_pre_norm", "max_abs_post_norm", "mean_excess_kurtosis_pre_norm",
+    "mean_overflow_rate_e4m3", "max_overflow_rate_e4m3",
+    "mean_underflow_rate_e4m3", "mean_subnormal_rate_e4m3",
+    "mean_quantized_zero_rate_e4m3", "mean_rel_quant_err_e4m3",
+    "logit_rel_divergence",
 )
 
 def fp8_min_normal(exp_bits: int) -> float:
@@ -77,13 +91,13 @@ def to_fp8_e5m2(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
 to_fp8_e4m3.max_val = 448.0
 to_fp8_e4m3.min_normal = fp8_min_normal(4)
 to_fp8_e4m3.min_subnormal = fp8_min_subnormal(4, 3)
-to_fp8_e4m3.scaling = 'none'
+to_fp8_e4m3.scaling = "none"
 to_fp8_e5m2.max_val = 57344.0
 to_fp8_e5m2.min_normal = fp8_min_normal(5)
 to_fp8_e5m2.min_subnormal = fp8_min_subnormal(5, 2)
-to_fp8_e5m2.scaling = 'none'
+to_fp8_e5m2.scaling = "none"
 
-def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
+def make_fp8_quant(fmt: str="e4m3", scaling: str="none"):
     """Return a quantizer with the requested format and scaling recipe.
 
     ``scaling='none'`` is the raw-value worst case: values beyond the format
@@ -94,15 +108,15 @@ def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
     explicit prevents a clipped stress-test number from being quoted as a
     training-stability prediction.
     """
-    if fmt == 'e5m2':
+    if fmt == "e5m2":
         base, maxv = (to_fp8_e5m2, 57344.0)
-    elif fmt == 'e4m3':
+    elif fmt == "e4m3":
         base, maxv = (to_fp8_e4m3, 448.0)
     else:
         raise ValueError(f"unknown fp8 format {fmt!r} (e4m3 | e5m2)")
-    if scaling == 'none':
+    if scaling == "none":
         return base
-    if scaling != 'dynamic-tensor':
+    if scaling != "dynamic-tensor":
         raise ValueError(f"unknown scaling {scaling!r} (none | dynamic-tensor)")
 
     def q(x: torch.Tensor, inplace: bool=False) -> torch.Tensor:
@@ -122,9 +136,9 @@ def make_fp8_quant(fmt: str='e4m3', scaling: str='none'):
     # rates describe a quantization recipe that was not applied.
     q.scaling = scaling
     q.max_val = maxv
-    q.min_normal = fp8_min_normal(4 if fmt == 'e4m3' else 5)
-    q.min_subnormal = fp8_min_subnormal(4 if fmt == 'e4m3' else 5,
-                                        3 if fmt == 'e4m3' else 2)
+    q.min_normal = fp8_min_normal(4 if fmt == "e4m3" else 5)
+    q.min_subnormal = fp8_min_subnormal(4 if fmt == "e4m3" else 5,
+                                        3 if fmt == "e4m3" else 2)
     return q
 
 # Reusable frexp scratch keyed by (shape, device).
@@ -240,11 +254,11 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
     quant_errors = []
     ranges = []
     quant = quant or to_fp8_e4m3
-    quant_max = float(getattr(quant, 'max_val', FP8_E4M3_MAX))
-    quant_min = float(getattr(quant, 'min_normal', fp8_min_normal(4)))
+    quant_max = float(getattr(quant, "max_val", FP8_E4M3_MAX))
+    quant_min = float(getattr(quant, "min_normal", fp8_min_normal(4)))
     quant_min_subnormal = float(getattr(
-        quant, 'min_subnormal', fp8_min_subnormal(4, 3)))
-    quant_dynamic = getattr(quant, 'scaling', None) == 'dynamic-tensor'
+        quant, "min_subnormal", fp8_min_subnormal(4, 3)))
+    quant_dynamic = getattr(quant, "scaling", None) == "dynamic-tensor"
 
     def _zero_scalar(device) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float64, device=device)
@@ -338,9 +352,8 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
         if isinstance(m, (LayerNorm, RMSNorm, _SquashedAffine)):
             handles.append(m.register_forward_hook(make_stat_hook()))
     block_handles = [blk.register_forward_hook(make_block_hook(i)) for i, blk in enumerate(model.blocks)]
-    with fp8_forward(model, quant):
-        with torch.no_grad():
-            logits_fp8, _ = model(x)
+    with fp8_forward(model, quant), torch.no_grad():
+        logits_fp8, _ = model(x)
     for h in block_handles:
         h.remove()
     for h in handles:
@@ -351,8 +364,8 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
             (max_abs_in, max_abs_out, mean_abs_out, overflow, underflow,
              subnormal, quantized_zero, err, kurtosis_in) = vals
             denom = mean_abs_out + 1e-06
-            ranges.append({'module': cls_name, 'max_abs_in': max_abs_in, 'max_abs_out': max_abs_out, 'kurtosis_in': kurtosis_in})
-            quant_errors.append({'module': cls_name, 'max_abs': max_abs_out, 'overflow_rate': overflow, 'underflow_rate': underflow, 'subnormal_rate': subnormal, 'quantized_zero_rate': quantized_zero, 'rel_err': err / denom})
+            ranges.append({"module": cls_name, "max_abs_in": max_abs_in, "max_abs_out": max_abs_out, "kurtosis_in": kurtosis_in})
+            quant_errors.append({"module": cls_name, "max_abs": max_abs_out, "overflow_rate": overflow, "underflow_rate": underflow, "subnormal_rate": subnormal, "quantized_zero_rate": quantized_zero, "rel_err": err / denom})
     bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags) if not ok), None)
@@ -360,7 +373,7 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
                            if v > quant_max), None)
     # Compare against the fp32 logits row-block by row-block.
     max_abs_fp32 = torch.maximum(logits_fp32.max(), -logits_fp32.min()).cpu()
-    logits_fp32_cpu = logits_fp32.detach().to('cpu')
+    logits_fp32_cpu = logits_fp32.detach().to("cpu")
     del logits_fp32
     rows = logits_fp8.shape[0]
     row_bytes = max(1, int(logits_fp8[0].numel())) * 4
@@ -373,7 +386,7 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
         if not bool(torch.isfinite(blk).all()):
             finite = False
             break
-        diff = (blk.to('cpu') - logits_fp32_cpu[b0:b1]).abs().max()
+        diff = (blk.to("cpu") - logits_fp32_cpu[b0:b1]).abs().max()
         max_diff = diff if max_diff is None else torch.maximum(max_diff, diff)
     del logits_fp32_cpu
     if finite:
@@ -381,20 +394,20 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
         rel = float(max_diff / max_abs_fp32.clamp(min=1e-12))
         logit_nan = False
     else:
-        rel = float('inf')
+        rel = float("inf")
         logit_nan = True
     if not quant_errors:
-        return {'norm': norm_name, 'n_layers': int(getattr(model.cfg, 'n_layers', 0)), 'n_norm_hooks': 0, 'max_abs_pre_norm': 0.0, 'max_abs_post_norm': 0.0, 'mean_excess_kurtosis_pre_norm': 0.0, 'mean_overflow_rate_e4m3': 0.0, 'max_overflow_rate_e4m3': 0.0, 'mean_underflow_rate_e4m3': 0.0, 'mean_subnormal_rate_e4m3': 0.0, 'mean_quantized_zero_rate_e4m3': 0.0, 'mean_rel_quant_err_e4m3': 0.0, 'logit_rel_divergence': rel, 'logit_nan_under_fp8': logit_nan, 'first_nonfinite_layer': first_bad_idx, 'first_overflow_layer': first_over_idx}
-    mean_overflow = sum((e['overflow_rate'] for e in quant_errors)) / len(quant_errors)
-    max_overflow = max((e['overflow_rate'] for e in quant_errors))
-    mean_underflow = sum((e['underflow_rate'] for e in quant_errors)) / len(quant_errors)
-    mean_subnormal = sum((e['subnormal_rate'] for e in quant_errors)) / len(quant_errors)
-    mean_quantized_zero = sum((e['quantized_zero_rate'] for e in quant_errors)) / len(quant_errors)
-    mean_rel_err = sum((e['rel_err'] for e in quant_errors)) / len(quant_errors)
-    max_max = max((e['max_abs'] for e in quant_errors))
-    max_in = max((r['max_abs_in'] for r in ranges)) if ranges else 0.0
-    mean_kurt = sum((r['kurtosis_in'] for r in ranges)) / len(ranges) if ranges else 0.0
-    return {'norm': norm_name, 'n_layers': int(getattr(model.cfg, 'n_layers', 0)), 'n_norm_hooks': len(quant_errors), 'max_abs_pre_norm': max_in, 'max_abs_post_norm': max_max, 'mean_excess_kurtosis_pre_norm': mean_kurt, 'mean_overflow_rate_e4m3': mean_overflow, 'max_overflow_rate_e4m3': max_overflow, 'mean_underflow_rate_e4m3': mean_underflow, 'mean_subnormal_rate_e4m3': mean_subnormal, 'mean_quantized_zero_rate_e4m3': mean_quantized_zero, 'mean_rel_quant_err_e4m3': mean_rel_err, 'logit_rel_divergence': rel, 'logit_nan_under_fp8': logit_nan, 'first_nonfinite_layer': first_bad_idx, 'first_overflow_layer': first_over_idx}
+        return {"norm": norm_name, "n_layers": int(getattr(model.cfg, "n_layers", 0)), "n_norm_hooks": 0, "max_abs_pre_norm": 0.0, "max_abs_post_norm": 0.0, "mean_excess_kurtosis_pre_norm": 0.0, "mean_overflow_rate_e4m3": 0.0, "max_overflow_rate_e4m3": 0.0, "mean_underflow_rate_e4m3": 0.0, "mean_subnormal_rate_e4m3": 0.0, "mean_quantized_zero_rate_e4m3": 0.0, "mean_rel_quant_err_e4m3": 0.0, "logit_rel_divergence": rel, "logit_nan_under_fp8": logit_nan, "first_nonfinite_layer": first_bad_idx, "first_overflow_layer": first_over_idx}
+    mean_overflow = sum(e["overflow_rate"] for e in quant_errors) / len(quant_errors)
+    max_overflow = max(e["overflow_rate"] for e in quant_errors)
+    mean_underflow = sum(e["underflow_rate"] for e in quant_errors) / len(quant_errors)
+    mean_subnormal = sum(e["subnormal_rate"] for e in quant_errors) / len(quant_errors)
+    mean_quantized_zero = sum(e["quantized_zero_rate"] for e in quant_errors) / len(quant_errors)
+    mean_rel_err = sum(e["rel_err"] for e in quant_errors) / len(quant_errors)
+    max_max = max(e["max_abs"] for e in quant_errors)
+    max_in = max(r["max_abs_in"] for r in ranges) if ranges else 0.0
+    mean_kurt = sum(r["kurtosis_in"] for r in ranges) / len(ranges) if ranges else 0.0
+    return {"norm": norm_name, "n_layers": int(getattr(model.cfg, "n_layers", 0)), "n_norm_hooks": len(quant_errors), "max_abs_pre_norm": max_in, "max_abs_post_norm": max_max, "mean_excess_kurtosis_pre_norm": mean_kurt, "mean_overflow_rate_e4m3": mean_overflow, "max_overflow_rate_e4m3": max_overflow, "mean_underflow_rate_e4m3": mean_underflow, "mean_subnormal_rate_e4m3": mean_subnormal, "mean_quantized_zero_rate_e4m3": mean_quantized_zero, "mean_rel_quant_err_e4m3": mean_rel_err, "logit_rel_divergence": rel, "logit_nan_under_fp8": logit_nan, "first_nonfinite_layer": first_bad_idx, "first_overflow_layer": first_over_idx}
 
 def _excess_kurtosis(x: torch.Tensor):
     with torch.no_grad():
@@ -422,12 +435,12 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
     reported with `_any` / `_earliest` semantics.
     """
     if not per_seed:
-        raise ValueError('aggregate_fp8_seed_rows needs at least one seed record')
-    agg = {k: v for k, v in per_seed[0].items() if not k.startswith('__')}
-    agg.pop('seed', None)
-    agg['norm'] = norm_name
-    agg['seeds'] = [r.get('seed') for r in per_seed]
-    agg['n_seeds'] = len(per_seed)
+        raise ValueError("aggregate_fp8_seed_rows needs at least one seed record")
+    agg = {k: v for k, v in per_seed[0].items() if not k.startswith("__")}
+    agg.pop("seed", None)
+    agg["norm"] = norm_name
+    agg["seeds"] = [r.get("seed") for r in per_seed]
+    agg["n_seeds"] = len(per_seed)
     for key in _FP8_SEED_METRIC_KEYS:
         # Keep the numeric draws (including non-finite ones) for the census;
         # `mean_std_stderr` filters non-finite values itself. Filtering them
@@ -443,30 +456,30 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
             # leaving the first seed's NaN in the aggregate. A probe that
             # overflowed is a numerical failure to triage, not a result.
             agg[key] = None
-            agg[key + '_std'] = None
-            agg[key + '_n_finite'] = 0
-            agg[key + '_n_nonfinite'] = len(raw)
+            agg[key + "_std"] = None
+            agg[key + "_n_finite"] = 0
+            agg[key + "_n_nonfinite"] = len(raw)
             if raw:
-                agg.setdefault('nonfinite_metric_counts', {})[key] = len(raw)
+                agg.setdefault("nonfinite_metric_counts", {})[key] = len(raw)
             continue
-        agg[key] = stats['mean']
-        agg[key + '_std'] = stats['std'] if stats['n'] >= 2 else None
-        agg[key + '_n_finite'] = stats['n']
-        agg[key + '_n_nonfinite'] = stats['n_nonfinite']
-        if stats['n_nonfinite']:
-            agg.setdefault('nonfinite_metric_counts', {})[key] = stats['n_nonfinite']
-    nonfinite = [r['first_nonfinite_layer'] for r in per_seed
-                 if isinstance(r.get('first_nonfinite_layer'), int)
-                 and not isinstance(r.get('first_nonfinite_layer'), bool)]
-    overflowing = [r['first_overflow_layer'] for r in per_seed
-                   if isinstance(r.get('first_overflow_layer'), int)
-                   and not isinstance(r.get('first_overflow_layer'), bool)]
-    agg['first_nonfinite_layer'] = min(nonfinite) if nonfinite else None
-    agg['first_nonfinite_layer_earliest'] = agg['first_nonfinite_layer']
-    agg['first_overflow_layer'] = min(overflowing) if overflowing else None
-    agg['first_overflow_layer_earliest'] = agg['first_overflow_layer']
-    agg['logit_nan_under_fp8'] = any(bool(r.get('logit_nan_under_fp8')) for r in per_seed)
-    agg['per_seed'] = per_seed
+        agg[key] = stats["mean"]
+        agg[key + "_std"] = stats["std"] if stats["n"] >= 2 else None
+        agg[key + "_n_finite"] = stats["n"]
+        agg[key + "_n_nonfinite"] = stats["n_nonfinite"]
+        if stats["n_nonfinite"]:
+            agg.setdefault("nonfinite_metric_counts", {})[key] = stats["n_nonfinite"]
+    nonfinite = [r["first_nonfinite_layer"] for r in per_seed
+                 if isinstance(r.get("first_nonfinite_layer"), int)
+                 and not isinstance(r.get("first_nonfinite_layer"), bool)]
+    overflowing = [r["first_overflow_layer"] for r in per_seed
+                   if isinstance(r.get("first_overflow_layer"), int)
+                   and not isinstance(r.get("first_overflow_layer"), bool)]
+    agg["first_nonfinite_layer"] = min(nonfinite) if nonfinite else None
+    agg["first_nonfinite_layer_earliest"] = agg["first_nonfinite_layer"]
+    agg["first_overflow_layer"] = min(overflowing) if overflowing else None
+    agg["first_overflow_layer_earliest"] = agg["first_overflow_layer"]
+    agg["logit_nan_under_fp8"] = any(bool(r.get("logit_nan_under_fp8")) for r in per_seed)
+    agg["per_seed"] = per_seed
     return agg
 
 # The seed-varying metrics on which "norm A is more FP8-stable than norm B" is
@@ -474,8 +487,8 @@ def aggregate_fp8_seed_rows(norm_name: str, per_seed: list) -> dict:
 # `first_overflow_layer` / `first_nonfinite_layer` are event counts, not
 # continuous per-seed quantities, so they are reported with `_any` /
 # `_earliest` semantics instead of being averaged or tested.
-FP8_COMPARISON_METRICS = ('logit_rel_divergence', 'mean_overflow_rate_e4m3',
-                          'mean_underflow_rate_e4m3')
+FP8_COMPARISON_METRICS = ("logit_rel_divergence", "mean_overflow_rate_e4m3",
+                          "mean_underflow_rate_e4m3")
 
 def _finite_metric(value) -> bool:
     """Whether a probe metric may enter a paired test.
@@ -512,13 +525,13 @@ def _seed_id(value):
     return None
 
 def _seed_metric_values(agg: dict, key: str) -> list:
-    return [float(r[key]) for r in agg.get('per_seed', [])
+    return [float(r[key]) for r in agg.get("per_seed", [])
             if _finite_metric(r.get(key))]
 
 def _train_seed_metric_values(agg: dict, key: str) -> dict:
     """Per-training-seed mean of `key` (averaged over that seed's checkpoints)."""
     out = {}
-    for train_seed, metrics in (agg.get('per_train_seed') or {}).items():
+    for train_seed, metrics in (agg.get("per_train_seed") or {}).items():
         seed = _seed_id(train_seed)
         value = metrics.get(key) if isinstance(metrics, dict) else None
         if seed is not None and _finite_metric(value):
@@ -535,21 +548,21 @@ def _shared_seed_samples(agg_a: dict, agg_b: dict, key: str) -> tuple[list, list
     usable pair and is excluded rather than poisoning the paired t statistic.
     A malformed seed field is unknown and is skipped, never coerced.
     """
-    a_by_seed = {_seed_id(r.get('seed')): r.get(key)
-                 for r in agg_a.get('per_seed', [])
-                 if _seed_id(r.get('seed')) is not None}
-    b_by_seed = {_seed_id(r.get('seed')): r.get(key)
-                 for r in agg_b.get('per_seed', [])
-                 if _seed_id(r.get('seed')) is not None}
+    a_by_seed = {_seed_id(r.get("seed")): r.get(key)
+                 for r in agg_a.get("per_seed", [])
+                 if _seed_id(r.get("seed")) is not None}
+    b_by_seed = {_seed_id(r.get("seed")): r.get(key)
+                 for r in agg_b.get("per_seed", [])
+                 if _seed_id(r.get("seed")) is not None}
     shared = sorted(s for s in set(a_by_seed) & set(b_by_seed)
                     if _finite_metric(a_by_seed[s])
                     and _finite_metric(b_by_seed[s]))
     return shared, [float(a_by_seed[s]) for s in shared], [float(b_by_seed[s]) for s in shared]
 
 _TREATMENT_KEYS = (
-    'norm', 'qk_norm', 'qk_alpha_init', 'alpha_0', 'k_init', 'alpha_init',
-    'p_init', 'learnable_p', 'learnable_k', 'learnable_delta', 'beta',
-    'use_layerscale', 'layerscale_init', 'alpha_jitter',
+    "norm", "qk_norm", "qk_alpha_init", "alpha_0", "k_init", "alpha_init",
+    "p_init", "learnable_p", "learnable_k", "learnable_delta", "beta",
+    "use_layerscale", "layerscale_init", "alpha_jitter",
 )
 
 
@@ -564,7 +577,7 @@ def _treatment_record(ckpt_args, model) -> dict:
     a single norm.
     """
     args = ckpt_args if isinstance(ckpt_args, dict) else {}
-    cfg = getattr(model, 'cfg', None)
+    cfg = getattr(model, "cfg", None)
 
     def recorded(name, cfg_name=None, default=None):
         if name in args:
@@ -579,20 +592,20 @@ def _treatment_record(ckpt_args, model) -> dict:
         return getattr(cfg, cfg_name, default)
 
     return {
-        'norm': recorded('norm', 'norm_name'),
-        'qk_norm': recorded('qk_norm'),
-        'qk_alpha_init': recorded('qk_alpha_init'),
-        'alpha_0': recorded('alpha_0'),
-        'k_init': recorded('k_init'),
-        'alpha_init': recorded('alpha_init'),
-        'p_init': recorded('p_init'),
-        'learnable_p': negated('no_learnable_p', 'learnable_p', True),
-        'learnable_k': negated('no_learnable_k', 'learnable_k', True),
-        'learnable_delta': negated('no_learnable_delta', 'learnable_delta', True),
-        'beta': recorded('beta', default=True),
-        'use_layerscale': negated('no_layerscale', 'use_layerscale', True),
-        'layerscale_init': recorded('layerscale_init'),
-        'alpha_jitter': recorded('alpha_jitter'),
+        "norm": recorded("norm", "norm_name"),
+        "qk_norm": recorded("qk_norm"),
+        "qk_alpha_init": recorded("qk_alpha_init"),
+        "alpha_0": recorded("alpha_0"),
+        "k_init": recorded("k_init"),
+        "alpha_init": recorded("alpha_init"),
+        "p_init": recorded("p_init"),
+        "learnable_p": negated("no_learnable_p", "learnable_p", True),
+        "learnable_k": negated("no_learnable_k", "learnable_k", True),
+        "learnable_delta": negated("no_learnable_delta", "learnable_delta", True),
+        "beta": recorded("beta", default=True),
+        "use_layerscale": negated("no_layerscale", "use_layerscale", True),
+        "layerscale_init": recorded("layerscale_init"),
+        "alpha_jitter": recorded("alpha_jitter"),
     }
 
 
@@ -613,7 +626,7 @@ def _protocol_record(ckpt_args: dict, model) -> dict:
         # Keep absent keys absent: `training_recipe_mismatches` treats a
         # missing key as unknown, but materializing it as None made two
         # unrecorded recipes compare equal.
-        'hyperparameters': {key: ckpt_args[key]
+        "hyperparameters": {key: ckpt_args[key]
                             for key in TRAINING_RECIPE_KEYS
                             if key in ckpt_args},
         # The requested dataset/tokenizer revision may be None/branch while
@@ -621,25 +634,25 @@ def _protocol_record(ckpt_args: dict, model) -> dict:
         # probe is built from its own resolved revision, so the protocol guard
         # must compare these too: otherwise probes from different corpora are
         # paired as if they were identical.
-        'resolved_revisions': {
-            'dataset_revision_resolved': ckpt_args.get('dataset_revision_resolved'),
-            'tokenizer_revision_resolved': ckpt_args.get('tokenizer_revision_resolved'),
+        "resolved_revisions": {
+            "dataset_revision_resolved": ckpt_args.get("dataset_revision_resolved"),
+            "tokenizer_revision_resolved": ckpt_args.get("tokenizer_revision_resolved"),
         },
-        'shape': {'model': ckpt_args.get('model'),
-                  'n_layers': int(getattr(model.cfg, 'n_layers', 0)),
-                  'dim': int(getattr(model.cfg, 'dim', 0)),
-                  'n_heads': int(getattr(model.cfg, 'n_heads', 0))},
-        'checkpoint': {'step': ckpt_args.get('_checkpoint_step')},
+        "shape": {"model": ckpt_args.get("model"),
+                  "n_layers": int(getattr(model.cfg, "n_layers", 0)),
+                  "dim": int(getattr(model.cfg, "dim", 0)),
+                  "n_heads": int(getattr(model.cfg, "n_heads", 0))},
+        "checkpoint": {"step": ckpt_args.get("_checkpoint_step")},
     }
 
 def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
     """Differences in the training recipe or model shape of two checkpoints."""
     if not isinstance(a, dict) or not isinstance(b, dict):
-        return {'protocol': ['<missing>', '<missing>']}
-    out = training_recipe_mismatches(a.get('hyperparameters'), b.get('hyperparameters'))
-    revisions_a = a.get('resolved_revisions') or {}
-    revisions_b = b.get('resolved_revisions') or {}
-    for key in ('dataset_revision_resolved', 'tokenizer_revision_resolved'):
+        return {"protocol": ["<missing>", "<missing>"]}
+    out = training_recipe_mismatches(a.get("hyperparameters"), b.get("hyperparameters"))
+    revisions_a = a.get("resolved_revisions") or {}
+    revisions_b = b.get("resolved_revisions") or {}
+    for key in ("dataset_revision_resolved", "tokenizer_revision_resolved"):
         value_a = revisions_a.get(key, a.get(key))
         value_b = revisions_b.get(key, b.get(key))
         # Equal is not provenance: two runs on the mutable default branch can
@@ -649,13 +662,13 @@ def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
         if (not _is_pinned_revision(value_a)
                 or not _is_pinned_revision(value_b)
                 or value_a != value_b):
-            out[f'data.{key}'] = [value_a, value_b]
-    shape_a = a.get('shape') or {}
-    shape_b = b.get('shape') or {}
-    for key in ('model', 'n_layers', 'dim', 'n_heads'):
+            out[f"data.{key}"] = [value_a, value_b]
+    shape_a = a.get("shape") or {}
+    shape_b = b.get("shape") or {}
+    for key in ("model", "n_layers", "dim", "n_heads"):
         value_a = shape_a.get(key)
         value_b = shape_b.get(key)
-        if key == 'model':
+        if key == "model":
             valid_a = isinstance(value_a, str) and bool(value_a.strip())
             valid_b = isinstance(value_b, str) and bool(value_b.strip())
         else:
@@ -666,15 +679,15 @@ def _protocol_pair_mismatches(a: dict, b: dict) -> dict:
         # Unknown is not equal: two arms that both omit a shape field have
         # not proven that they share an architecture.
         if not valid_a or not valid_b or value_a != value_b:
-            out[f'shape.{key}'] = [value_a, value_b]
-    step_a = (a.get('checkpoint') or {}).get('step')
-    step_b = (b.get('checkpoint') or {}).get('step')
+            out[f"shape.{key}"] = [value_a, value_b]
+    step_a = (a.get("checkpoint") or {}).get("step")
+    step_b = (b.get("checkpoint") or {}).get("step")
     valid_step_a = (isinstance(step_a, int) and not isinstance(step_a, bool)
                     and step_a >= 0)
     valid_step_b = (isinstance(step_b, int) and not isinstance(step_b, bool)
                     and step_b >= 0)
     if not valid_step_a or not valid_step_b or step_a != step_b:
-        out['checkpoint.step'] = [step_a, step_b]
+        out["checkpoint.step"] = [step_a, step_b]
     return out
 
 def _result_scale(result: dict, index: int) -> str:
@@ -687,16 +700,16 @@ def _result_scale(result: dict, index: int) -> str:
     fixtures) share the single `unknown` scale rather than inventing one
     scale per row.
     """
-    protocol = result.get('protocol') if isinstance(result, dict) else None
-    shape = protocol.get('shape') if isinstance(protocol, dict) else None
-    shape = shape or (result.get('shape') if isinstance(result, dict) else None)
+    protocol = result.get("protocol") if isinstance(result, dict) else None
+    shape = protocol.get("shape") if isinstance(protocol, dict) else None
+    shape = shape or (result.get("shape") if isinstance(result, dict) else None)
     if isinstance(shape, dict) and shape:
         return json.dumps(shape, sort_keys=True)
-    model = result.get('model') if isinstance(result, dict) else None
-    n_layers = result.get('n_layers') if isinstance(result, dict) else None
+    model = result.get("model") if isinstance(result, dict) else None
+    n_layers = result.get("n_layers") if isinstance(result, dict) else None
     if model is not None or n_layers is not None:
         return f"{model or 'model'}:L{n_layers}"
-    return 'unknown'
+    return "unknown"
 
 def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alpha: float=0.05,
                       trained: bool=False) -> dict:
@@ -729,12 +742,12 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
       shared draws; two (df = 1) are descriptive. The standing caveat is that
       a random init says nothing about trained weights.
     """
-    labels = [str(r.get('label') or r.get('norm') or r.get('ckpt') or f'run{i}') for i, r in enumerate(results)]
+    labels = [str(r.get("label") or r.get("norm") or r.get("ckpt") or f"run{i}") for i, r in enumerate(results)]
     # The cross-scale contrast identity is the norm pair, not the display
     # label: in multi-model mode the label carries an `@model` suffix, which
     # made the "same" test at two scales look like two different contrasts and
     # silently disabled the replication report.
-    norm_ids = [str(r.get('norm') or str(labels[i]).split('@', 1)[0])
+    norm_ids = [str(r.get("norm") or str(labels[i]).split("@", 1)[0])
                 for i, r in enumerate(results)]
     tests = []
     for metric in metrics:
@@ -746,123 +759,123 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                 shared, av, bv = _shared_seed_samples(results[i], results[j], metric)
                 a_scale = _result_scale(results[i], i)
                 b_scale = _result_scale(results[j], j)
-                t = {'a': labels[i], 'b': labels[j], 'metric': metric,
-                     'a_norm': norm_ids[i], 'b_norm': norm_ids[j],
-                     'a_scale': a_scale, 'b_scale': b_scale,
-                     'same_scale': a_scale == b_scale,
-                     'direction': f'negative mean_delta means A has lower {metric} (more FP8-stable)',
-                     'a_train_seeds': sorted(a_train), 'b_train_seeds': sorted(b_train)}
+                t = {"a": labels[i], "b": labels[j], "metric": metric,
+                     "a_norm": norm_ids[i], "b_norm": norm_ids[j],
+                     "a_scale": a_scale, "b_scale": b_scale,
+                     "same_scale": a_scale == b_scale,
+                     "direction": f"negative mean_delta means A has lower {metric} (more FP8-stable)",
+                     "a_train_seeds": sorted(a_train), "b_train_seeds": sorted(b_train)}
                 if a_scale != b_scale:
                     # A cross-scale pair confounds the norm with width/depth;
                     # record the number but never certify it as a norm effect.
-                    t.update({'basis': 'cross_scale', 'certifiable': False,
-                              'significant': False, 'p_one_sided': None,
-                              'mean_delta': ((sum(av) - sum(bv)) / len(shared)
+                    t.update({"basis": "cross_scale", "certifiable": False,
+                              "significant": False, "p_one_sided": None,
+                              "mean_delta": ((sum(av) - sum(bv)) / len(shared)
                                              if shared else None),
-                              'n_shared_seeds': len(shared),
-                              'shared_seeds': shared,
-                              'reason': ('the two arms are different model shapes; a '
-                                         'cross-scale delta is not a same-scale norm effect '
-                                         '(run both norms at each scale and use the '
-                                         'scale_replication block)')})
+                              "n_shared_seeds": len(shared),
+                              "shared_seeds": shared,
+                              "reason": ("the two arms are different model shapes; a "
+                                         "cross-scale delta is not a same-scale norm effect "
+                                         "(run both norms at each scale and use the "
+                                         "scale_replication block)")})
                     tests.append(t)
                     continue
                 if trained:
-                    arm_problems = [f'{labels[idx]} mixes training recipes across its checkpoints'
+                    arm_problems = [f"{labels[idx]} mixes training recipes across its checkpoints"
                                     for idx, arm in ((i, results[i]), (j, results[j]))
-                                    if arm.get('protocol_consistent') is False]
+                                    if arm.get("protocol_consistent") is False]
                     if arm_problems:
-                        t.update({'basis': 'protocol_mismatch', 'certifiable': False,
-                                  'mean_delta': None, 'p_one_sided': None,
-                                  'n_shared_train_seeds': len(shared_train),
-                                  'shared_train_seeds': shared_train,
-                                  'reason': '; '.join(arm_problems)})
+                        t.update({"basis": "protocol_mismatch", "certifiable": False,
+                                  "mean_delta": None, "p_one_sided": None,
+                                  "n_shared_train_seeds": len(shared_train),
+                                  "shared_train_seeds": shared_train,
+                                  "reason": "; ".join(arm_problems)})
                         tests.append(t)
                         continue
                     protocol_mismatches = _protocol_pair_mismatches(
-                        results[i].get('protocol'), results[j].get('protocol'))
+                        results[i].get("protocol"), results[j].get("protocol"))
                     if protocol_mismatches:
-                        t.update({'basis': 'protocol_mismatch', 'certifiable': False,
-                                  'mean_delta': None, 'p_one_sided': None,
-                                  'n_shared_train_seeds': len(shared_train),
-                                  'shared_train_seeds': shared_train,
-                                  'protocol_mismatches': protocol_mismatches,
-                                  'reason': ('training recipe/model shape differs between norms, '
-                                             'so the delta is not attributable to the norm: '
+                        t.update({"basis": "protocol_mismatch", "certifiable": False,
+                                  "mean_delta": None, "p_one_sided": None,
+                                  "n_shared_train_seeds": len(shared_train),
+                                  "shared_train_seeds": shared_train,
+                                  "protocol_mismatches": protocol_mismatches,
+                                  "reason": ("training recipe/model shape differs between norms, "
+                                             "so the delta is not attributable to the norm: "
                                              + json.dumps(protocol_mismatches, sort_keys=True))})
                         tests.append(t)
                         continue
                 if trained and len(shared_train) >= 2:
-                    t['basis'] = 'train_seed_means'
-                    t['certifiable'] = len(shared_train) >= MIN_SEEDS_FOR_SIGNIFICANCE
-                    t['n_shared_train_seeds'] = len(shared_train)
-                    t['shared_train_seeds'] = shared_train
-                    t['n_shared_seeds'] = len(shared)
-                    t['shared_seeds'] = shared
+                    t["basis"] = "train_seed_means"
+                    t["certifiable"] = len(shared_train) >= MIN_SEEDS_FOR_SIGNIFICANCE
+                    t["n_shared_train_seeds"] = len(shared_train)
+                    t["shared_train_seeds"] = shared_train
+                    t["n_shared_seeds"] = len(shared)
+                    t["shared_seeds"] = shared
                     t.update(paired_t_one_sided([a_train[s] for s in shared_train],
                                                 [b_train[s] for s in shared_train], alpha=alpha))
                 else:
-                    t['basis'] = ('probe_paired_single_train_run' if trained
-                                  else 'independent_random_inits')
+                    t["basis"] = ("probe_paired_single_train_run" if trained
+                                  else "independent_random_inits")
                     # In random-init mode each seed is an independent (init,
                     # probe) draw, so it is a legitimate run-to-run unit - but
                     # only once there are at least three of them. Two draws
                     # give df=1 and must stay descriptive, exactly like two
                     # shared training seeds.
-                    t['certifiable'] = (not trained) and len(shared) >= MIN_SEEDS_FOR_SIGNIFICANCE
-                    t['n_shared_train_seeds'] = len(shared_train)
-                    t['shared_train_seeds'] = shared_train
-                    t['n_shared_seeds'] = len(shared)
-                    t['shared_seeds'] = shared
+                    t["certifiable"] = (not trained) and len(shared) >= MIN_SEEDS_FOR_SIGNIFICANCE
+                    t["n_shared_train_seeds"] = len(shared_train)
+                    t["shared_train_seeds"] = shared_train
+                    t["n_shared_seeds"] = len(shared)
+                    t["shared_seeds"] = shared
                     if len(shared) < 2:
-                        t['mean_delta'] = (sum(av) - sum(bv)) / len(shared) if shared else None
-                        t['p_one_sided'] = None
-                        t['reason'] = 'need >= 2 shared samples to pair a test'
+                        t["mean_delta"] = (sum(av) - sum(bv)) / len(shared) if shared else None
+                        t["p_one_sided"] = None
+                        t["reason"] = "need >= 2 shared samples to pair a test"
                     else:
                         t.update(paired_t_one_sided(av, bv, alpha=alpha))
                     if not trained and len(shared) < MIN_SEEDS_FOR_SIGNIFICANCE:
-                        t['reason'] = '; '.join(filter(None, (
-                            t.get('reason'),
-                            f'only {len(shared)} shared probe draw(s): fewer than the required '
-                            f'{MIN_SEEDS_FOR_SIGNIFICANCE} independent (init, probe) draws, so '
-                            'the test is descriptive only')))
+                        t["reason"] = "; ".join(filter(None, (
+                            t.get("reason"),
+                            f"only {len(shared)} shared probe draw(s): fewer than the required "
+                            f"{MIN_SEEDS_FOR_SIGNIFICANCE} independent (init, probe) draws, so "
+                            "the test is descriptive only")))
                     if trained:
                         # Append, never replace: with too few shared probe
                         # samples *and* one training run per arm, both reasons
                         # apply to this pair.
-                        t['reason'] = '; '.join(filter(None, (
-                            t.get('reason'),
-                            f'only {len(shared_train)} shared training seed(s): fewer than the '
-                            'required 3 cannot certify the norm against run-to-run noise, so the '
-                            'test is descriptive only; provide >= 3 checkpoints (comma-separated in '
-                            '--ckpt) with distinct training seeds per norm to certify')))
+                        t["reason"] = "; ".join(filter(None, (
+                            t.get("reason"),
+                            f"only {len(shared_train)} shared training seed(s): fewer than the "
+                            "required 3 cannot certify the norm against run-to-run noise, so the "
+                            "test is descriptive only; provide >= 3 checkpoints (comma-separated in "
+                            "--ckpt) with distinct training seeds per norm to certify")))
                 tests.append(t)
-    for t, p_adj in zip(tests, holm_adjust([t.get('p_one_sided') for t in tests])):
-        t['p_holm'] = p_adj
-        t['significant'] = bool(t.get('certifiable') and p_adj is not None and p_adj < alpha)
+    for t, p_adj in zip(tests, holm_adjust([t.get("p_one_sided") for t in tests])):
+        t["p_holm"] = p_adj
+        t["significant"] = bool(t.get("certifiable") and p_adj is not None and p_adj < alpha)
     scale_obs = []
     for t in tests:
-        if t.get('same_scale') and t.get('mean_delta') is not None:
+        if t.get("same_scale") and t.get("mean_delta") is not None:
             # A Holm p-value can be explicitly None for a row excluded from
             # its family; `dict.get(key, fallback)` only falls back on a
             # missing key, so choose the raw p explicitly.
-            p_holm = t.get('p_holm')
-            scale_obs.append({'scale': t.get('a_scale'), 'metric': t.get('metric'),
-                              'contrast': f"{t.get('a_norm')} vs {t.get('b_norm')}",
-                              'delta': t.get('mean_delta'),
-                              'certified': t.get('significant') is True,
-                              'p_one_sided': (p_holm if p_holm is not None
-                                              else t.get('p_one_sided')),
-                              'n_seeds': (t.get('n_shared_train_seeds')
-                                          if t.get('basis') == 'train_seed_means'
-                                          else t.get('n_shared_seeds')),
+            p_holm = t.get("p_holm")
+            scale_obs.append({"scale": t.get("a_scale"), "metric": t.get("metric"),
+                              "contrast": f"{t.get('a_norm')} vs {t.get('b_norm')}",
+                              "delta": t.get("mean_delta"),
+                              "certified": t.get("significant") is True,
+                              "p_one_sided": (p_holm if p_holm is not None
+                                              else t.get("p_one_sided")),
+                              "n_seeds": (t.get("n_shared_train_seeds")
+                                          if t.get("basis") == "train_seed_means"
+                                          else t.get("n_shared_seeds")),
                               # Width of the same paired test, forwarded so
                               # the multi-scale report can pool effects by
                               # inverse variance instead of voting on signs.
-                              'ci_low': t.get('ci_low'),
-                              'ci_high': t.get('ci_high'),
-                              'df': t.get('df'),
-                              'ci_level': t.get('ci_level')})
+                              "ci_low": t.get("ci_low"),
+                              "ci_high": t.get("ci_high"),
+                              "df": t.get("df"),
+                              "ci_level": t.get("ci_level")})
     scale_replication = scale_replication_summary(scale_obs, alpha=alpha)
     ranking = {}
     for metric in metrics:
@@ -872,103 +885,103 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
             stats = mean_std_stderr(vals)
             train_vals = list(_train_seed_metric_values(r, metric).values())
             train_stats = mean_std_stderr(train_vals)
-            rows.append({'norm': label, 'n_seeds': len(vals),
-                         'n_train_seeds': len(train_vals),
-                         'mean': stats['mean'] if stats else None,
-                         'std': stats['std'] if stats and stats['n'] >= 2 else None,
-                         'mean_across_train_seeds': train_stats['mean'] if train_stats else None,
-                         'std_across_train_seeds': (train_stats['std']
-                                                    if train_stats and train_stats['n'] >= 2 else None)})
-        rows.sort(key=lambda row: (row['mean'] is None, row['mean']))
+            rows.append({"norm": label, "n_seeds": len(vals),
+                         "n_train_seeds": len(train_vals),
+                         "mean": stats["mean"] if stats else None,
+                         "std": stats["std"] if stats and stats["n"] >= 2 else None,
+                         "mean_across_train_seeds": train_stats["mean"] if train_stats else None,
+                         "std_across_train_seeds": (train_stats["std"]
+                                                    if train_stats and train_stats["n"] >= 2 else None)})
+        rows.sort(key=lambda row: (row["mean"] is None, row["mean"]))
         ranking[metric] = rows
-    return {'metrics': list(metrics), 'alpha': alpha, 'trained': trained,
-            'pairing': ('probe draws are paired across norms by probe seed and (when available) by training seed; '
-                        'certification requires >= 3 shared training seeds per arm and otherwise stays descriptive'),
-            'scale_replication': scale_replication,
-            'ranking': ranking, 'tests': tests}
+    return {"metrics": list(metrics), "alpha": alpha, "trained": trained,
+            "pairing": ("probe draws are paired across norms by probe seed and (when available) by training seed; "
+                        "certification requires >= 3 shared training seeds per arm and otherwise stays descriptive"),
+            "scale_replication": scale_replication,
+            "ranking": ranking, "tests": tests}
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--norms', nargs='+', default=['ln', 'rmsnorm', 'dyt', 'dytc', 'dytd', 'dytcd'])
-    p.add_argument('--models', nargs='+', default=['gpt2-124m'],
+    p.add_argument("--norms", nargs="+", default=["ln", "rmsnorm", "dyt", "dytc", "dytd", "dytcd"])
+    p.add_argument("--models", nargs="+", default=["gpt2-124m"],
                    choices=sorted(_FP8_MODEL_BUILDERS),
-                   help='random-init architectures to probe (one run per model; each norm is '
-                        'measured at every model and comparison.json records whether a '
-                        'cross-norm direction replicated across scales). Not used with --ckpt, '
-                        'where the checkpoint defines the scale.')
-    p.add_argument('--probe', default='markov', choices=['markov', 'random'], help="probe corpus. 'random' is uniform token ids: it has no next-token structure, so the activation magnitudes below describe embedding noise rather than a trained model's activations (kept only for parity)")
-    p.add_argument('--scaling', default='none', choices=['none', 'dynamic-tensor'],
+                   help="random-init architectures to probe (one run per model; each norm is "
+                        "measured at every model and comparison.json records whether a "
+                        "cross-norm direction replicated across scales). Not used with --ckpt, "
+                        "where the checkpoint defines the scale.")
+    p.add_argument("--probe", default="markov", choices=["markov", "random"], help="probe corpus. 'random' is uniform token ids: it has no next-token structure, so the activation magnitudes below describe embedding noise rather than a trained model's activations (kept only for parity)")
+    p.add_argument("--scaling", default="none", choices=["none", "dynamic-tensor"],
                    help="quantization scaling. 'none' (default) is the raw-value worst case: "
                         "values beyond the format range clip, a stress test of range pressure, "
                         "NOT a prediction of real FP8 training. 'dynamic-tensor' rescales each "
                         "tensor to the full range first, like real FP8 recipes; compare against "
                         "that run before drawing a training-stability conclusion.")
-    p.add_argument('--ckpt', nargs='+', default=None, help='one entry per --norms entry; a plain checkpoint path probes the trained weights instead of a fresh random init. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-norm certification then pairs training seeds, so >= 3 shared training seeds across the compared norms are required for comparison.json to certify a winner')
-    p.add_argument('--n-states', type=int, default=64, help="state count of the synthetic 'markov' probe")
-    p.add_argument('--batch-size', type=int, default=2)
-    p.add_argument('--seq-len', type=int, default=512)
-    p.add_argument('--seed', type=int, default=None, help='deprecated single-seed shorthand; overrides --seeds when given')
-    p.add_argument('--seeds', nargs='+', type=int, default=list(DEFAULT_SEEDS), help='each norm is probed once per seed (fresh probe, and fresh init in random-init mode) and reported as Mean +/- Std across seeds; >= 3 recommended so one probe draw cannot decide a comparison')
-    p.add_argument('--alpha', type=float, default=0.05, help='significance level of the paired cross-norm tests in comparison.json (Holm-adjusted over metrics x pairs)')
-    p.add_argument('--output', default='runs/fp8_check/results.json')
-    p.add_argument('--hypothesis', default=None, help='the scientific hypothesis this check tests (e.g. "DyT-CD limits fp8 activation blowup versus RMSNorm at matched init"); recorded in the run manifest so the result can be audited against the claim it was meant to support')
+    p.add_argument("--ckpt", nargs="+", default=None, help="one entry per --norms entry; a plain checkpoint path probes the trained weights instead of a fresh random init. An entry may be a comma-separated list of checkpoints (ideally distinct training seeds of the same arm), which are all probed and averaged per probe seed; cross-norm certification then pairs training seeds, so >= 3 shared training seeds across the compared norms are required for comparison.json to certify a winner")
+    p.add_argument("--n-states", type=int, default=64, help="state count of the synthetic 'markov' probe")
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--seq-len", type=int, default=512)
+    p.add_argument("--seed", type=int, default=None, help="deprecated single-seed shorthand; overrides --seeds when given")
+    p.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS), help="each norm is probed once per seed (fresh probe, and fresh init in random-init mode) and reported as Mean +/- Std across seeds; >= 3 recommended so one probe draw cannot decide a comparison")
+    p.add_argument("--alpha", type=float, default=0.05, help="significance level of the paired cross-norm tests in comparison.json (Holm-adjusted over metrics x pairs)")
+    p.add_argument("--output", default="runs/fp8_check/results.json")
+    p.add_argument("--hypothesis", default=None, help='the scientific hypothesis this check tests (e.g. "DyT-CD limits fp8 activation blowup versus RMSNorm at matched init"); recorded in the run manifest so the result can be audited against the claim it was meant to support')
     args = p.parse_args()
     if not args.norms:
-        p.error('--norms must not be empty')
+        p.error("--norms must not be empty")
     if len(set(args.norms)) != len(args.norms):
-        p.error(f'--norms contains duplicates: {args.norms}; a repeated norm is the same '
-                'row and would add duplicate tests to the Holm family')
+        p.error(f"--norms contains duplicates: {args.norms}; a repeated norm is the same "
+                "row and would add duplicate tests to the Holm family")
     if args.ckpt and len(args.ckpt) != len(args.norms):
-        p.error(f'--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}')
+        p.error(f"--ckpt expects {len(args.norms)} paths (one per --norms), got {len(args.ckpt)}")
     if args.ckpt and len(args.models) > 1:
-        p.error('--models is for random-init probing; with --ckpt the checkpoint defines the '
-                'model shape, so pass at most the default --models value')
-    for flag, value in (('--batch-size', args.batch_size), ('--seq-len', args.seq_len)):
+        p.error("--models is for random-init probing; with --ckpt the checkpoint defines the "
+                "model shape, so pass at most the default --models value")
+    for flag, value in (("--batch-size", args.batch_size), ("--seq-len", args.seq_len)):
         if value < 1:
-            p.error(f'{flag} {value} must be >= 1')
+            p.error(f"{flag} {value} must be >= 1")
     if args.n_states < 2:
-        p.error(f'--n-states {args.n_states} must be >= 2: a one-state probe has a '
-                'deterministic successor and measures no next-token structure')
+        p.error(f"--n-states {args.n_states} must be >= 2: a one-state probe has a "
+                "deterministic successor and measures no next-token structure")
     if not math.isfinite(args.alpha) or not 0.0 < args.alpha < 1.0:
-        p.error(f'--alpha {args.alpha} must be finite and strictly between 0 and 1')
+        p.error(f"--alpha {args.alpha} must be finite and strictly between 0 and 1")
     raw_seeds = [args.seed] if args.seed is not None else list(args.seeds)
     if not raw_seeds:
-        p.error('--seeds must not be empty')
+        p.error("--seeds must not be empty")
     seeds = list(dict.fromkeys(int(s) for s in raw_seeds))
     if len(seeds) != len(raw_seeds):
-        print(f'[fp8][warn] duplicate seeds removed: {raw_seeds} -> {seeds} '
-              f'(a repeated seed reruns the identical probe, not an independent sample)')
+        print(f"[fp8][warn] duplicate seeds removed: {raw_seeds} -> {seeds} "
+              f"(a repeated seed reruns the identical probe, not an independent sample)")
     if len(seeds) < 3:
-        print(f'[fp8][warn] {len(seeds)} seed(s): one probe draw is one sample; use >= 3 independent probes before treating a metric difference as real')
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"[fp8][warn] {len(seeds)} seed(s): one probe draw is one sample; use >= 3 independent probes before treating a metric difference as real")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     set_all_seeds(seeds[0])
-    fp8_quant = make_fp8_quant('e4m3', args.scaling)
+    fp8_quant = make_fp8_quant("e4m3", args.scaling)
     print(f"[fp8] scope: FORWARD-ONLY simulation (no FP8 gradients or optimizer states) "
           f"with scaling={args.scaling!r}; scaling='none' is a range stress test, not a "
           "real FP8-training prediction", file=sys.stderr)
 
     def make_probe(rng, cfg):
-        if args.probe == 'random':
+        if args.probe == "random":
             return torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), generator=rng, device=device)
         if args.n_states > int(cfg.vocab_size):
             raise SystemExit(
-                f'[fp8] --n-states {args.n_states} exceeds the model vocabulary '
-                f'({int(cfg.vocab_size)}); markov_batch would emit out-of-range token ids')
+                f"[fp8] --n-states {args.n_states} exceeds the model vocabulary "
+                f"({int(cfg.vocab_size)}); markov_batch would emit out-of-range token ids")
         x, _ = markov_batch(rng, cfg.ignore_index, args.batch_size, args.seq_len, device, n_states=args.n_states)
         return x
     ckpt_groups = None
     if args.ckpt:
-        ckpt_groups = [[path for path in str(entry).split(',') if path] for entry in args.ckpt]
+        ckpt_groups = [[path for path in str(entry).split(",") if path] for entry in args.ckpt]
         if any(not group for group in ckpt_groups):
-            p.error('--ckpt entries must not be empty')
+            p.error("--ckpt entries must not be empty")
         for group in ckpt_groups:
             if len(set(group)) != len(group):
-                p.error(f'--ckpt arm {group} repeats a checkpoint; a repeated path is the '
-                        'same trained run and would be weighted twice instead of adding evidence')
+                p.error(f"--ckpt arm {group} repeats a checkpoint; a repeated path is the "
+                        "same trained run and would be weighted twice instead of adding evidence")
         normalized_groups = [tuple(sorted(group)) for group in ckpt_groups]
         if len(set(normalized_groups)) != len(normalized_groups):
-            p.error('--ckpt contains the same checkpoint set for two norms; the same weights '
-                    'cannot support a cross-norm difference')
+            p.error("--ckpt contains the same checkpoint set for two norms; the same weights "
+                    "cannot support a cross-norm difference")
         # A partially shared checkpoint set is also a self-comparison on the
         # shared runs: their paired deltas are exactly zero, which shrinks the
         # variance estimate and contaminates the cross-norm contrast. Compare
@@ -979,10 +992,10 @@ def main():
                 key = str(Path(path).resolve())
                 previous = seen_paths.get(key)
                 if previous is not None:
-                    where = ('within one norm' if previous == group_index
-                             else f'in norms {previous + 1} and {group_index + 1}')
-                    p.error(f'--ckpt checkpoint {path} appears more than once ({where}); '
-                            'each training run may contribute to exactly one norm')
+                    where = ("within one norm" if previous == group_index
+                             else f"in norms {previous + 1} and {group_index + 1}")
+                    p.error(f"--ckpt checkpoint {path} appears more than once ({where}); "
+                            "each training run may contribute to exactly one norm")
                 seen_paths[key] = group_index
     results = []
     # Random-init mode can sweep several architectures in one invocation;
@@ -994,11 +1007,11 @@ def main():
         i = args.norms.index(norm)
         # A multi-model arm gets a unique label so the comparison cannot
         # silently pair the same norm name across two architectures.
-        label = f'{norm}@{model_name}' if multi_model else norm
+        label = f"{norm}@{model_name}" if multi_model else norm
         arm_model = model_name
         arm_cfg = None
         if not args.ckpt:
-            print(f'[fp8] WARNING: {label} probed at a fresh random init. layerscale_init=1e-5 leaves the residual stream at the embedding table, so every norm reports the same pre-norm statistics and this row says nothing about the layer. Pass --ckpt <path> (one per --norms entry) to measure trained weights.', file=sys.stderr)
+            print(f"[fp8] WARNING: {label} probed at a fresh random init. layerscale_init=1e-5 leaves the residual stream at the embedding table, so every norm reports the same pre-norm statistics and this row says nothing about the layer. Pass --ckpt <path> (one per --norms entry) to measure trained weights.", file=sys.stderr)
         else:
             from scripts.eval_downstream import load_ckpt
         per_ckpt = []
@@ -1007,10 +1020,10 @@ def main():
             ckpt_model = None
             if ckpt_path is not None:
                 ckpt_model, ckpt_args = load_ckpt(ckpt_path, device=device)
-                raw_seed = (ckpt_args or {}).get('seed')
+                raw_seed = (ckpt_args or {}).get("seed")
                 train_seed = _seed_id(raw_seed)
-                arm_model = (ckpt_args or {}).get('model')
-                arm_cfg = getattr(ckpt_model, 'cfg', None)
+                arm_model = (ckpt_args or {}).get("model")
+                arm_cfg = getattr(ckpt_model, "cfg", None)
             per_seed_ckpt = []
             for seed in seeds:
                 set_all_seeds(seed)
@@ -1025,66 +1038,66 @@ def main():
                 model.eval()
                 x = make_probe(rng, model.cfg)
                 r = measure_fp8_divergence(model, x, norm, quant=fp8_quant)
-                r['scaling'] = args.scaling
-                r['forward_only'] = True
-                r['seed'] = seed
+                r["scaling"] = args.scaling
+                r["forward_only"] = True
+                r["seed"] = seed
                 per_seed_ckpt.append(r)
-            per_ckpt.append({'ckpt': ckpt_path, 'train_seed': train_seed,
-                             'protocol': _protocol_record(ckpt_args, ckpt_model)
+            per_ckpt.append({"ckpt": ckpt_path, "train_seed": train_seed,
+                             "protocol": _protocol_record(ckpt_args, ckpt_model)
                              if ckpt_model is not None else None,
-                             'treatment': _treatment_record(ckpt_args, ckpt_model)
+                             "treatment": _treatment_record(ckpt_args, ckpt_model)
                              if ckpt_model is not None else None,
-                             'per_seed': per_seed_ckpt})
+                             "per_seed": per_seed_ckpt})
         # A comma-separated group is one arm only when every checkpoint in it
         # is the same treatment; otherwise its per-seed means mix norms before
         # the cross-norm comparison ever starts.
         treatment_mismatches = _treatment_mismatches(
-            c.get('treatment') for c in per_ckpt)
+            c.get("treatment") for c in per_ckpt)
         if treatment_mismatches:
             p.error(
-                f'--ckpt group {label!r} mixes treatment values '
-                f'{json.dumps(treatment_mismatches, sort_keys=True)}; one '
-                'checkpoint group must contain a single normalization treatment')
+                f"--ckpt group {label!r} mixes treatment values "
+                f"{json.dumps(treatment_mismatches, sort_keys=True)}; one "
+                "checkpoint group must contain a single normalization treatment")
         # A multi-checkpoint norm is one treatment only if its checkpoints
         # share the training recipe and model shape; keep any disagreement
         # visible instead of averaging it into the arm.
-        base_protocol = next((c.get('protocol') for c in per_ckpt
-                              if c.get('protocol') is not None), None)
+        base_protocol = next((c.get("protocol") for c in per_ckpt
+                              if c.get("protocol") is not None), None)
         arm_protocol_mismatches = []
         for c in per_ckpt:
-            if c.get('protocol') is None or c.get('protocol') is base_protocol:
+            if c.get("protocol") is None or c.get("protocol") is base_protocol:
                 # Comparing the base checkpoint with itself is not a
                 # disagreement: a single arm with an old/incomplete protocol
                 # must not be marked inconsistent (the same reason the
                 # w8a8 path loops over the remaining checkpoints).
                 continue
-            mismatches = _protocol_pair_mismatches(base_protocol, c.get('protocol'))
+            mismatches = _protocol_pair_mismatches(base_protocol, c.get("protocol"))
             if mismatches:
-                arm_protocol_mismatches.append({'ckpt': c.get('ckpt'),
-                                                'mismatches': mismatches})
+                arm_protocol_mismatches.append({"ckpt": c.get("ckpt"),
+                                                "mismatches": mismatches})
         # Norm-level probe records: each probe seed keeps one row whose metrics
         # are the mean over this norm's checkpoints (probe seed is the shared
         # draw; checkpoints are replicates of the arm).
         per_seed = []
         for j, seed in enumerate(seeds):
-            record = {k: v for k, v in per_ckpt[0]['per_seed'][j].items() if not k.startswith('__')}
+            record = {k: v for k, v in per_ckpt[0]["per_seed"][j].items() if not k.startswith("__")}
             for key in _FP8_SEED_METRIC_KEYS:
-                vals = [c['per_seed'][j][key] for c in per_ckpt
-                        if _finite_metric(c['per_seed'][j].get(key))]
+                vals = [c["per_seed"][j][key] for c in per_ckpt
+                        if _finite_metric(c["per_seed"][j].get(key))]
                 if vals:
                     record[key] = sum(vals) / len(vals)
-            flags = [c['per_seed'][j] for c in per_ckpt]
-            nonfinite = [f['first_nonfinite_layer'] for f in flags
-                         if isinstance(f.get('first_nonfinite_layer'), int)
-                         and not isinstance(f.get('first_nonfinite_layer'), bool)]
-            overflowing = [f['first_overflow_layer'] for f in flags
-                           if isinstance(f.get('first_overflow_layer'), int)
-                           and not isinstance(f.get('first_overflow_layer'), bool)]
-            record['first_nonfinite_layer'] = min(nonfinite) if nonfinite else None
-            record['first_overflow_layer'] = min(overflowing) if overflowing else None
-            record['logit_nan_under_fp8'] = any(bool(f.get('logit_nan_under_fp8')) for f in flags)
-            record['seed'] = seed
-            record['n_checkpoints'] = len(per_ckpt)
+            flags = [c["per_seed"][j] for c in per_ckpt]
+            nonfinite = [f["first_nonfinite_layer"] for f in flags
+                         if isinstance(f.get("first_nonfinite_layer"), int)
+                         and not isinstance(f.get("first_nonfinite_layer"), bool)]
+            overflowing = [f["first_overflow_layer"] for f in flags
+                           if isinstance(f.get("first_overflow_layer"), int)
+                           and not isinstance(f.get("first_overflow_layer"), bool)]
+            record["first_nonfinite_layer"] = min(nonfinite) if nonfinite else None
+            record["first_overflow_layer"] = min(overflowing) if overflowing else None
+            record["logit_nan_under_fp8"] = any(bool(f.get("logit_nan_under_fp8")) for f in flags)
+            record["seed"] = seed
+            record["n_checkpoints"] = len(per_ckpt)
             per_seed.append(record)
         r = aggregate_fp8_seed_rows(norm, per_seed)
         # The probe-seed row uses the mean over finite checkpoint values, so a
@@ -1092,7 +1105,7 @@ def main():
         # Re-attach the count of non-finite checkpoint draws per metric.
         arm_nonfinite = {}
         for c in per_ckpt:
-            for rec in c.get('per_seed') or []:
+            for rec in c.get("per_seed") or []:
                 for key in _FP8_SEED_METRIC_KEYS:
                     value = rec.get(key)
                     if (isinstance(value, (int, float))
@@ -1100,76 +1113,76 @@ def main():
                             and not _finite_metric(value)):
                         arm_nonfinite[key] = arm_nonfinite.get(key, 0) + 1
         if arm_nonfinite:
-            counts = dict(r.get('nonfinite_metric_counts') or {})
+            counts = dict(r.get("nonfinite_metric_counts") or {})
             for key, count in arm_nonfinite.items():
-                r[key + '_n_nonfinite'] = max(
-                    int(r.get(key + '_n_nonfinite') or 0), count)
+                r[key + "_n_nonfinite"] = max(
+                    int(r.get(key + "_n_nonfinite") or 0), count)
                 counts[key] = max(int(counts.get(key) or 0), count)
-            r['nonfinite_metric_counts'] = counts
-        train_seeds = sorted({c['train_seed'] for c in per_ckpt if c['train_seed'] is not None})
-        r['train_seeds'] = train_seeds
-        r['n_train_seeds'] = len(train_seeds)
-        r['label'] = label
-        r['model'] = arm_model
+            r["nonfinite_metric_counts"] = counts
+        train_seeds = sorted({c["train_seed"] for c in per_ckpt if c["train_seed"] is not None})
+        r["train_seeds"] = train_seeds
+        r["n_train_seeds"] = len(train_seeds)
+        r["label"] = label
+        r["model"] = arm_model
         if arm_cfg is not None:
-            r['shape'] = {'n_layers': int(arm_cfg.n_layers),
-                          'dim': int(arm_cfg.dim),
-                          'n_heads': int(arm_cfg.n_heads)}
+            r["shape"] = {"n_layers": int(arm_cfg.n_layers),
+                          "dim": int(arm_cfg.dim),
+                          "n_heads": int(arm_cfg.n_heads)}
         if args.ckpt:
-            r['protocol'] = base_protocol
-            r['protocol_consistent'] = not arm_protocol_mismatches
-            r['protocol_mismatches'] = arm_protocol_mismatches
+            r["protocol"] = base_protocol
+            r["protocol_consistent"] = not arm_protocol_mismatches
+            r["protocol_mismatches"] = arm_protocol_mismatches
         per_train_seed = {}
         for c in per_ckpt:
-            if c['train_seed'] is None:
+            if c["train_seed"] is None:
                 continue
-            bucket = per_train_seed.setdefault(c['train_seed'], {key: [] for key in _FP8_SEED_METRIC_KEYS})
-            for rec in c['per_seed']:
+            bucket = per_train_seed.setdefault(c["train_seed"], {key: [] for key in _FP8_SEED_METRIC_KEYS})
+            for rec in c["per_seed"]:
                 for key in _FP8_SEED_METRIC_KEYS:
                     value = rec.get(key)
                     if _finite_metric(value):
                         bucket[key].append(float(value))
-        r['per_train_seed'] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
+        r["per_train_seed"] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
                                for ts, bucket in per_train_seed.items()}
         if arm_protocol_mismatches:
-            print(f'[fp8][warn] {norm}: checkpoints disagree on the training recipe/model '
-                  f'shape; cross-norm tests for this arm are descriptive only: '
-                  f'{json.dumps(arm_protocol_mismatches, sort_keys=True)}', file=sys.stderr)
+            print(f"[fp8][warn] {norm}: checkpoints disagree on the training recipe/model "
+                  f"shape; cross-norm tests for this arm are descriptive only: "
+                  f"{json.dumps(arm_protocol_mismatches, sort_keys=True)}", file=sys.stderr)
         if ckpt_groups:
-            r['ckpt'] = list(ckpt_groups[i])
-            r['ckpts'] = list(ckpt_groups[i])
+            r["ckpt"] = list(ckpt_groups[i])
+            r["ckpts"] = list(ckpt_groups[i])
             if ckpt_groups[i] != [None] and len(train_seeds) < MIN_SEEDS_FOR_SIGNIFICANCE:
-                print(f'[fp8][warn] {norm}: {len(ckpt_groups[i])} checkpoint(s) but {len(train_seeds)} distinct '
-                      'training seed(s); cross-norm certification needs >= 3 independent training runs per arm '
-                      '(pass comma-separated checkpoints with distinct training seeds)', file=sys.stderr)
-        print(f'[fp8] {norm}: {r}')
+                print(f"[fp8][warn] {norm}: {len(ckpt_groups[i])} checkpoint(s) but {len(train_seeds)} distinct "
+                      "training seed(s); cross-norm certification needs >= 3 independent training runs per arm "
+                      "(pass comma-separated checkpoints with distinct training seeds)", file=sys.stderr)
+        print(f"[fp8] {norm}: {r}")
         results.append(r)
     out_path = Path(args.output)
     save_json_atomic(out_path, results)
     comparison = compare_fp8_norms(results, alpha=args.alpha, trained=bool(args.ckpt))
-    comparison_path = out_path.with_name('comparison.json')
+    comparison_path = out_path.with_name("comparison.json")
     save_json_atomic(comparison_path, comparison)
-    scale = comparison.get('scale_replication') or {}
-    if scale.get('single_scale_only'):
+    scale = comparison.get("scale_replication") or {}
+    if scale.get("single_scale_only"):
         print(f"[fp8][scale] WARNING: this comparison covers {scale.get('n_scales', 0)} "
               f"model scale(s) ({scale.get('scales')}); a direction that is certified at one "
-              'scale is a scope-limited result, not a multi-scale mechanism claim. Rerun with '
-              '--models at another width/depth (or add checkpoints from another scale) and '
-              'combine the per-scale comparison files.')
-    elif scale.get('multi_scale_certified_metrics'):
+              "scale is a scope-limited result, not a multi-scale mechanism claim. Rerun with "
+              "--models at another width/depth (or add checkpoints from another scale) and "
+              "combine the per-scale comparison files.")
+    elif scale.get("multi_scale_certified_metrics"):
         print(f"[fp8][scale] replicated across scales: "
               f"{scale.get('multi_scale_certified_metrics')} over {scale.get('scales')}")
     else:
         print(f"[fp8][scale] scales={scale.get('scales')} "
               f"replicated_metrics={scale.get('replicated_metrics')} "
               f"(no metric certified at >= 2 scales yet)")
-    for t in comparison['tests']:
-        if t.get('p_one_sided') is None:
+    for t in comparison["tests"]:
+        if t.get("p_one_sided") is None:
             print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: {t['reason']}")
             continue
-        verdict = 'A more stable' if t['significant'] and t['mean_delta'] < 0 else ('B more stable' if t['significant'] else 'inside the noise')
-        if not t.get('certifiable'):
-            if t.get('basis') == 'independent_random_inits':
+        verdict = "A more stable" if t["significant"] and t["mean_delta"] < 0 else ("B more stable" if t["significant"] else "inside the noise")
+        if not t.get("certifiable"):
+            if t.get("basis") == "independent_random_inits":
                 verdict = (f'descriptive only ({t.get("n_shared_seeds", 0)} shared '
                            'probe/init draw(s); >= 3 required)')
             else:
@@ -1177,20 +1190,20 @@ def main():
                            'training seed(s); >= 3 required)')
         print(f"[fp8][compare] {t['a']} vs {t['b']} on {t['metric']}: delta={t['mean_delta']:+.4g}, 95% CI [{t['ci_low']:+.4g}, {t['ci_high']:+.4g}], Holm p={t['p_holm']:.4f} (n={t['n_shared_seeds']}, basis={t['basis']}) -> {verdict}")
     manifest = collect_run_metadata(seed=seeds[0])
-    manifest['hyperparameters'] = vars(args)
-    manifest['seeds'] = seeds
+    manifest["hyperparameters"] = vars(args)
+    manifest["seeds"] = seeds
     if args.hypothesis:
-        manifest['hypothesis'] = args.hypothesis
-        print(f'[hypothesis] {args.hypothesis}')
+        manifest["hypothesis"] = args.hypothesis
+        print(f"[hypothesis] {args.hypothesis}")
     else:
         print('[hypothesis] none stated: pass --hypothesis "..." so this check is auditable as a test of a claim, not a sweep')
-    manifest['results_file'] = str(out_path)
-    manifest['comparison_file'] = str(comparison_path)
+    manifest["results_file"] = str(out_path)
+    manifest["comparison_file"] = str(comparison_path)
     manifest = finish_metadata(manifest, artifacts={
-        'results': file_fingerprint(out_path),
-        'comparison': file_fingerprint(comparison_path),
+        "results": file_fingerprint(out_path),
+        "comparison": file_fingerprint(comparison_path),
     })
-    save_run_manifest(out_path.with_name('run_manifest.json'), manifest)
-    print(f'[done] saved to {out_path}')
-if __name__ == '__main__':
+    save_run_manifest(out_path.with_name("run_manifest.json"), manifest)
+    print(f"[done] saved to {out_path}")
+if __name__ == "__main__":
     main()

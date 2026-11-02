@@ -17,4 +17,4 @@ def is_boolean_scalar(value) -> bool:
     if isinstance(value, bool):
         return True
     cls = type(value)
-    return cls.__module__ == 'numpy' and cls.__name__ in ('bool_', 'bool')
+    return cls.__module__ == "numpy" and cls.__name__ in ("bool_", "bool")

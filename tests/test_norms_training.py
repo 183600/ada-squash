@@ -27,20 +27,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import json
 import math
+
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 from adasquash import (
-    build_norm, NORM_REGISTRY, generalized_softsign,
-    LayerNorm, RMSNorm, DyT, DyTS, DyTP, DyTC, DyTD, DyTDI, DyTCD, DyTCDI,
-    GPTConfig, GPT, build_gpt_124m, build_llama_tiny_1b,
-    ActivationStats, LossSpikeCounter, KurtosisMeter,
+    GPT,
+    NORM_REGISTRY,
+    ActivationStats,
+    DyT,
+    DyTC,
+    DyTCD,
+    DyTCDI,
+    DyTD,
+    DyTDI,
+    DyTP,
+    DyTS,
+    GPTConfig,
+    KurtosisMeter,
+    LayerNorm,
+    LossSpikeCounter,
+    RMSNorm,
+    build_gpt_124m,
+    build_llama_tiny_1b,
+    build_norm,
     count_parameters,
+    generalized_softsign,
 )
 from adasquash.attention import apply_rope
-from adasquash.norms import QKSquash
 from adasquash.model import cross_entropy_mean
+from adasquash.norms import QKSquash
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +370,9 @@ def test_depth_sweep_base_shape_follows_the_selected_model():
     rescaled from (768, 12) and built at 124M's shape.
     """
     from scripts.train_llama_depth_sweep import (
-        _BASE_SHAPE, base_shape_for_model, shape_for_depth,
+        _BASE_SHAPE,
+        base_shape_for_model,
+        shape_for_depth,
     )
 
     assert base_shape_for_model("llama-1b") == _BASE_SHAPE == (2048, 16)
@@ -373,8 +392,10 @@ def test_lr_schedule_has_no_dead_first_step():
     """`LambdaLR` evaluates step 0 at construction, so the first update
     would otherwise run at lr == 0 and warmup end one step late."""
     import argparse as _argparse
-    from scripts.train_gpt2 import build_lr_lambda
+
     from torch.optim.lr_scheduler import LambdaLR
+
+    from scripts.train_gpt2 import build_lr_lambda
 
     args = _argparse.Namespace(max_steps=100, warmup=10, min_lr_ratio=0.1)
     opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=6e-4)
@@ -394,6 +415,7 @@ def test_lr_schedule_has_no_dead_first_step():
 
 def test_resume_restores_the_schedule_defining_flags():
     import argparse as _argparse
+
     from scripts.train_gpt2 import restore_schedule_args
 
     ckpt_args = dict(max_steps=10000, warmup=500, min_lr_ratio=0.1, lr=6e-4,
@@ -417,6 +439,7 @@ def test_resume_keeps_an_explicitly_typed_schedule_flag():
     old step count. A flag left at its default is still restored, because
     that one would otherwise silently reshape the cosine curve."""
     import argparse as _argparse
+
     from scripts.train_gpt2 import restore_schedule_args
 
     ckpt_args = dict(max_steps=10000, warmup=500, min_lr_ratio=0.1, lr=6e-4,
@@ -444,9 +467,12 @@ def test_config_seeded_flags_are_defaults_not_explicit_overrides(tmp_path):
     would be allowed to silently reshape the curve of the run it resumes -
     exactly what the restore exists to prevent."""
     import argparse as _argparse
+
     from scripts.train_gpt2 import (
-        apply_config_to_parser, restore_schedule_args, _SCHEDULE_ARGS,
+        _SCHEDULE_ARGS,
         _TRAIN_CONFIG_ALIASES,
+        apply_config_to_parser,
+        restore_schedule_args,
     )
 
     cfg_path = tmp_path / "run.yaml"
@@ -743,7 +769,8 @@ def test_needle_decode_overhead_matches_the_secret_length():
     """The contexts the call sites allow for the decode are derived from
     the same tokenization the scoring loop uses."""
     from scripts.eval_downstream import (
-        needle_decode_overhead, needle_target_ids,
+        needle_decode_overhead,
+        needle_target_ids,
     )
 
     tok = _CharTokenizer()
@@ -768,7 +795,7 @@ def test_beta_config_key_is_not_inverted(tmp_path):
     that asked for beta train without it - and a `beta: false` config train
     with it - in both the trainer and the depth-sweep launcher.
     """
-    from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
+    from scripts.train_gpt2 import _TRAIN_CONFIG_ALIASES, apply_config_to_parser
     from scripts.train_llama_depth_sweep import _SWEEP_CONFIG_ALIASES
 
     for aliases in (_TRAIN_CONFIG_ALIASES, _SWEEP_CONFIG_ALIASES):
@@ -847,9 +874,8 @@ def test_forward_smoke():
 def test_fp8_reports_zero_quantization_separately_from_small_values():
     """underflow (|x| < min-normal), subnormal share and quantized-to-zero
     share are three different numbers; the old metric collapsed them."""
-    from scripts.check_fp8_stability import (
-        measure_fp8_divergence, fp8_min_normal)
     from adasquash.model import build_gpt_124m
+    from scripts.check_fp8_stability import fp8_min_normal, measure_fp8_divergence
 
     m = build_gpt_124m(norm_name="dytcd")
     m.reset_parameters(3)
@@ -875,7 +901,7 @@ def test_fp8_dynamic_tensor_scaling_removes_clipping():
     """scaling='dynamic-tensor' rescales by amax before quantizing, so a
     tensor beyond +-448 no longer clips - the contrast that scopes the
     no-scaling run as a stress test rather than a prediction."""
-    from scripts.check_fp8_stability import make_fp8_quant, FP8_E4M3_MAX
+    from scripts.check_fp8_stability import FP8_E4M3_MAX, make_fp8_quant
 
     x = torch.randn(1000) * 1000.0
     none_q = make_fp8_quant("e4m3", "none")
@@ -898,8 +924,9 @@ def test_w8a8_dataset_probe_defaults_to_a_held_out_split():
     default split stays 'train' (training behaviour unchanged), while the
     probe builder's default is a held-out split."""
     import inspect
-    from scripts.train_gpt2 import build_dataloader
+
     from scripts.check_w8a8_ppl import make_dataset_probe
+    from scripts.train_gpt2 import build_dataloader
 
     assert inspect.signature(build_dataloader).parameters["split"].default == "train"
     assert inspect.signature(make_dataset_probe).parameters["split"].default == "test"
@@ -1015,7 +1042,7 @@ def test_lm_harness_reports_missing_dependency():
     (not a bare ImportError or a NotImplementedError stub)."""
     from scripts.eval_downstream import evaluate_lm_harness
     try:
-        import lm_eval  # noqa: F401
+        import lm_eval
         pytest.skip("lm_eval installed; the error path cannot be exercised")
     except ImportError:
         pass
@@ -1113,7 +1140,7 @@ def test_unknown_config_keys_are_fatal_in_strict_mode(tmp_path):
     so the run fails before spending compute on a protocol the author did not
     specify.
     """
-    from scripts.train_gpt2 import apply_config_to_parser, _TRAIN_CONFIG_ALIASES
+    from scripts.train_gpt2 import _TRAIN_CONFIG_ALIASES, apply_config_to_parser
 
     cfg = tmp_path / "typo.yaml"
     cfg.write_text("norm: dyt\nleraning_rate: 0.1\n", encoding="utf-8")

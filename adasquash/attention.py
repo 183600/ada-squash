@@ -1,12 +1,16 @@
 from __future__ import annotations
+
 import math
 from collections import OrderedDict
 from typing import Optional
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.nn.utils import skip_init
+
 from .norms import QKSquash, _RMSNorm
+
 _TRIL_MASK_CACHE: OrderedDict = OrderedDict()
 _ROPE_TABLE_CACHE: OrderedDict = OrderedDict()
 _LOGIT_SCRATCH_CACHE: OrderedDict = OrderedDict()
@@ -46,8 +50,8 @@ def _skip_init(module_cls, *args, **kwargs):
     is kept on the ambient default device.
     """
     device = torch.get_default_device()
-    if device.type == 'meta':
-        with torch.device('meta'):
+    if device.type == "meta":
+        with torch.device("meta"):
             return module_cls(*args, **kwargs)
     return skip_init(module_cls, *args, **kwargs, device=device)
 
@@ -68,7 +72,7 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, dim: int, n_heads: int, qk_norm: Optional[str]=None, alpha_init: float=1.0, dropout: float=0.0, skip_init: bool=False):
         super().__init__()
-        assert dim % n_heads == 0, 'dim must be divisible by n_heads'
+        assert dim % n_heads == 0, "dim must be divisible by n_heads"
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         self.dim = dim
@@ -85,12 +89,12 @@ class CausalSelfAttention(nn.Module):
             self.k_squash = None
             self.q_rms = None
             self.k_rms = None
-        elif qk_norm == 'qknorm':
+        elif qk_norm == "qknorm":
             self.q_squash = None
             self.k_squash = None
             self.q_rms = RMSNormHead(self.head_dim)
             self.k_rms = RMSNormHead(self.head_dim)
-        elif qk_norm == 'dytqk':
+        elif qk_norm == "dytqk":
             self.q_squash = QKSquash(alpha_q_init=alpha_init, alpha_k_init=alpha_init)
             self.k_squash = self.q_squash
             self.q_rms = None
@@ -181,7 +185,7 @@ class CausalSelfAttention(nn.Module):
         rows = min(T, self._LOGITS_BLOCK_ROWS, budget_rows)
         n_valid = B * H * (T * (T + 1) // 2)
         if n_valid == 0:
-            return {'logit_abs_mean': 0.0, 'logit_abs_max': 0.0, 'logit_std': 0.0}
+            return {"logit_abs_mean": 0.0, "logit_abs_max": 0.0, "logit_std": 0.0}
         acc_abs = torch.zeros((), dtype=torch.float64, device=device)
         acc_x = torch.zeros((), dtype=torch.float64, device=device)
         acc_sq = torch.zeros((), dtype=torch.float64, device=device)
@@ -234,8 +238,8 @@ class CausalSelfAttention(nn.Module):
         elif var >= 0.0:
             logit_std = math.sqrt(var)
         else:
-            logit_std = float('nan')
-        return {'logit_abs_mean': mean_abs, 'logit_abs_max': peak_v, 'logit_std': logit_std}
+            logit_std = float("nan")
+        return {"logit_abs_mean": mean_abs, "logit_abs_max": peak_v, "logit_std": logit_std}
 
     def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
@@ -460,4 +464,4 @@ def _apply_rope_(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos:
 def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
     cos, sin = _resolve_rope_tables(freqs_cis, cos, sin, q.dtype)
     return _ApplyRoPE.apply(q, k, cos, sin)
-__all__ = ['CausalSelfAttention', 'RMSNormHead']
+__all__ = ["CausalSelfAttention", "RMSNormHead"]

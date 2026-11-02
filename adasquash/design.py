@@ -95,31 +95,39 @@ import json
 import math
 import numbers
 import random
+from collections.abc import Iterable, Mapping, Sequence
 from fractions import Fraction
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Optional
 
-from .metrics import (MIN_SEEDS_FOR_SIGNIFICANCE, chi2_sf,
-                      mean_std_stderr, paired_design_summary,
-                      paired_required_n, paired_t_one_sided,
-                      tost_design_summary, tost_paired, tost_required_n)
+from .metrics import (
+    MIN_SEEDS_FOR_SIGNIFICANCE,
+    chi2_sf,
+    mean_std_stderr,
+    paired_design_summary,
+    paired_required_n,
+    paired_t_one_sided,
+    tost_design_summary,
+    tost_paired,
+    tost_required_n,
+)
 
 __all__ = [
-    'block_randomized_schedule',
-    'randomized_complete_block_schedule',
-    'schedule_balance_report',
-    'schedule_fingerprint_status',
-    'order_drift_report',
-    'default_exclusion_policy',
-    'normalize_exclusion_policy',
-    'exclusion_policy_fingerprint',
-    'classify_run_exclusions',
-    'run_exclusion_audit',
-    'design_readiness_audit',
-    'prospective_power_plan',
-    'tost_power_plan',
-    'paired_sd_calibration',
-    'paired_sd_evidence_audit',
-    'simulate_paired_design',
+    "block_randomized_schedule",
+    "classify_run_exclusions",
+    "default_exclusion_policy",
+    "design_readiness_audit",
+    "exclusion_policy_fingerprint",
+    "normalize_exclusion_policy",
+    "order_drift_report",
+    "paired_sd_calibration",
+    "paired_sd_evidence_audit",
+    "prospective_power_plan",
+    "randomized_complete_block_schedule",
+    "run_exclusion_audit",
+    "schedule_balance_report",
+    "schedule_fingerprint_status",
+    "simulate_paired_design",
+    "tost_power_plan",
 ]
 
 
@@ -127,13 +135,13 @@ def _validate_seed(seed) -> int:
     # Accept integral NumPy scalars too: they are exact integer seeds, while
     # a float (even an integral one) is not a seed identity.
     if isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
-        raise ValueError(f'schedule seed must be an integer, got {seed!r}')
+        raise ValueError(f"schedule seed must be an integer, got {seed!r}")
     return int(seed)
 
 
 def _validate_unit(unit) -> str:
     if not isinstance(unit, str) or not unit.strip():
-        raise ValueError(f'run id must be a non-empty string, got {unit!r}')
+        raise ValueError(f"run id must be a non-empty string, got {unit!r}")
     return unit
 
 
@@ -209,19 +217,19 @@ def block_randomized_schedule(units: Iterable[str], block_size: Optional[int] = 
     """
     seed = _validate_seed(seed)
     if isinstance(units, (str, bytes)):
-        raise ValueError('units must be an iterable of run ids, not a single string')
+        raise ValueError("units must be an iterable of run ids, not a single string")
     ids = [_validate_unit(unit) for unit in units]
     if not ids:
-        raise ValueError('a run schedule needs at least one run id')
+        raise ValueError("a run schedule needs at least one run id")
     if len(set(ids)) != len(ids):
         duplicates = sorted({unit for unit in ids if ids.count(unit) > 1})
-        raise ValueError(f'run ids must be unique; duplicated: {duplicates}')
+        raise ValueError(f"run ids must be unique; duplicated: {duplicates}")
     n = len(ids)
     if block_size is None:
         block_size = n if n <= 8 else max(1, math.ceil(math.sqrt(n)))
     if (isinstance(block_size, bool) or not isinstance(block_size, numbers.Integral)
             or block_size < 1):
-        raise ValueError(f'block_size must be a positive integer, got {block_size!r}')
+        raise ValueError(f"block_size must be a positive integer, got {block_size!r}")
     block_size = int(block_size)
 
     order: list[str] = []
@@ -231,31 +239,31 @@ def block_randomized_schedule(units: Iterable[str], block_size: Optional[int] = 
         chunk = ids[start:start + block_size]
         block_sizes.append(len(chunk))
         digest_key = lambda unit: (
-            hashlib.sha256(f'{seed}\x1f{block_index}\x1f{unit}'.encode('utf-8')).hexdigest(),
+            hashlib.sha256(f"{seed}\x1f{block_index}\x1f{unit}".encode()).hexdigest(),
             unit,
         )
         for unit in sorted(chunk, key=digest_key):
-            entries.append({'unit': unit, 'block': block_index,
-                            'position': len(order)})
+            entries.append({"unit": unit, "block": block_index,
+                            "position": len(order)})
             order.append(unit)
 
-    payload = {'seed': seed, 'block_size': block_size, 'order': order}
+    payload = {"seed": seed, "block_size": block_size, "order": order}
     fingerprint = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {
-        'schema': 'adasquash.run_schedule.v1',
-        'seed': seed,
-        'block_size': block_size,
-        'n_units': n,
-        'n_blocks': len(block_sizes),
-        'block_sizes': block_sizes,
-        'order': order,
-        'entries': entries,
-        'positions': {unit: position for position, unit in enumerate(order)},
-        'fingerprint': fingerprint,
-        'protocol': ('within-block order is a keyed SHA-256 sort; the same seed and '
-                     'run-id set reproduce the same schedule on every host'),
+        "schema": "adasquash.run_schedule.v1",
+        "seed": seed,
+        "block_size": block_size,
+        "n_units": n,
+        "n_blocks": len(block_sizes),
+        "block_sizes": block_sizes,
+        "order": order,
+        "entries": entries,
+        "positions": {unit: position for position, unit in enumerate(order)},
+        "fingerprint": fingerprint,
+        "protocol": ("within-block order is a keyed SHA-256 sort; the same seed and "
+                     "run-id set reproduce the same schedule on every host"),
     }
 
 
@@ -284,74 +292,74 @@ def randomized_complete_block_schedule(units: Iterable[str], replicates: Iterabl
     """
     seed = _validate_seed(seed)
     if isinstance(units, (str, bytes)) or isinstance(replicates, (str, bytes)):
-        raise ValueError('units and replicates must be iterables, not single strings')
+        raise ValueError("units and replicates must be iterables, not single strings")
     unit_ids = [_validate_unit(unit) for unit in units]
     replicate_ids = [str(rep) for rep in replicates]
     if any(not rep.strip() for rep in replicate_ids):
-        raise ValueError('replicate ids must be non-empty')
+        raise ValueError("replicate ids must be non-empty")
     if not unit_ids:
-        raise ValueError('a block schedule needs at least one unit')
+        raise ValueError("a block schedule needs at least one unit")
     if not replicate_ids:
-        raise ValueError('a block schedule needs at least one replicate')
+        raise ValueError("a block schedule needs at least one replicate")
     if len(set(unit_ids)) != len(unit_ids):
-        raise ValueError('unit ids must be unique')
+        raise ValueError("unit ids must be unique")
     if len(set(replicate_ids)) != len(replicate_ids):
-        raise ValueError('replicate ids must be unique')
+        raise ValueError("replicate ids must be unique")
 
     def _hash(*parts) -> str:
-        return hashlib.sha256('\x1f'.join(str(part) for part in parts).encode('utf-8')).hexdigest()
+        return hashlib.sha256("\x1f".join(str(part) for part in parts).encode("utf-8")).hexdigest()
 
     block_replicates = sorted(
-        replicate_ids, key=lambda rep: (_hash(seed, 'base', rep), rep))
+        replicate_ids, key=lambda rep: (_hash(seed, "base", rep), rep))
     entries: list[dict] = []
     order: list[str] = []
     for block_index, replicate in enumerate(block_replicates):
         for unit in sorted(unit_ids,
                            key=lambda unit, block=block_index: (
-                               _hash(seed, 'block', block, unit), unit)):
-            run_id = f'{unit}::rep={replicate}'
-            entries.append({'unit': unit, 'replicate': replicate,
-                            'run_id': run_id, 'block': block_index,
-                            'position': len(order)})
+                               _hash(seed, "block", block, unit), unit)):
+            run_id = f"{unit}::rep={replicate}"
+            entries.append({"unit": unit, "replicate": replicate,
+                            "run_id": run_id, "block": block_index,
+                            "position": len(order)})
             order.append(run_id)
-    run_ids = [entry['run_id'] for entry in entries]
+    run_ids = [entry["run_id"] for entry in entries]
     if len(set(run_ids)) != len(run_ids):
-        raise ValueError('internal error: a unit x replicate run was assigned twice')
+        raise ValueError("internal error: a unit x replicate run was assigned twice")
     expected = {(unit, rep) for unit in unit_ids for rep in replicate_ids}
-    realized = {(entry['unit'], entry['replicate']) for entry in entries}
+    realized = {(entry["unit"], entry["replicate"]) for entry in entries}
     if realized != expected:
-        raise ValueError('internal error: the block design does not cover every '
-                         'unit x replicate pair exactly once')
+        raise ValueError("internal error: the block design does not cover every "
+                         "unit x replicate pair exactly once")
     replicate_blocks: dict[str, set[int]] = {}
     for entry in entries:
-        replicate_blocks.setdefault(entry['replicate'], set()).add(entry['block'])
+        replicate_blocks.setdefault(entry["replicate"], set()).add(entry["block"])
     if any(len(blocks) != 1 for blocks in replicate_blocks.values()):
-        raise ValueError('internal error: a replicate/seed is spread over '
-                         'several time blocks, so seed-paired contrasts would '
-                         'not be within-block')
-    payload = {'seed': seed, 'units': unit_ids, 'replicates': replicate_ids,
-               'order': order}
+        raise ValueError("internal error: a replicate/seed is spread over "
+                         "several time blocks, so seed-paired contrasts would "
+                         "not be within-block")
+    payload = {"seed": seed, "units": unit_ids, "replicates": replicate_ids,
+               "order": order}
     fingerprint = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {
-        'schema': 'adasquash.rcbd_schedule.v1',
-        'seed': seed,
-        'n_units': len(order),
-        'n_treatments': len(unit_ids),
-        'n_blocks': len(replicate_ids),
-        'block_sizes': [len(unit_ids)] * len(replicate_ids),
-        'units': unit_ids,
-        'replicates': replicate_ids,
-        'order': order,
-        'entries': entries,
-        'positions': {run_id: position for position, run_id in enumerate(order)},
-        'fingerprint': fingerprint,
-        'protocol': ('randomized complete block design: one time block per '
-                     'replicate/seed, every treatment runs once in every block, '
-                     'the seed-to-block assignment and the within-block order '
-                     'are keyed SHA-256 sorts, so a seed-paired contrast is '
-                     'always within-block'),
+        "schema": "adasquash.rcbd_schedule.v1",
+        "seed": seed,
+        "n_units": len(order),
+        "n_treatments": len(unit_ids),
+        "n_blocks": len(replicate_ids),
+        "block_sizes": [len(unit_ids)] * len(replicate_ids),
+        "units": unit_ids,
+        "replicates": replicate_ids,
+        "order": order,
+        "entries": entries,
+        "positions": {run_id: position for position, run_id in enumerate(order)},
+        "fingerprint": fingerprint,
+        "protocol": ("randomized complete block design: one time block per "
+                     "replicate/seed, every treatment runs once in every block, "
+                     "the seed-to-block assignment and the within-block order "
+                     "are keyed SHA-256 sorts, so a seed-paired contrast is "
+                     "always within-block"),
     }
 
 
@@ -370,58 +378,58 @@ def schedule_fingerprint_status(schedule: dict) -> dict:
     :func:`design_readiness_audit`; an unverifiable record is a warning.
     """
     if not isinstance(schedule, dict):
-        raise ValueError('schedule must be a mapping')
-    schema = schedule.get('schema')
-    expected = schedule.get('fingerprint')
+        raise ValueError("schedule must be a mapping")
+    schema = schedule.get("schema")
+    expected = schedule.get("fingerprint")
     if not isinstance(expected, str) or not expected:
         return {
-            'schema': schema,
-            'fingerprint': expected,
-            'recomputed': None,
-            'verified': None,
-            'reason': 'schedule has no stored fingerprint to verify',
+            "schema": schema,
+            "fingerprint": expected,
+            "recomputed": None,
+            "verified": None,
+            "reason": "schedule has no stored fingerprint to verify",
         }
-    if schema == 'adasquash.run_schedule.v1':
+    if schema == "adasquash.run_schedule.v1":
         payload = {
-            'seed': schedule.get('seed'),
-            'block_size': schedule.get('block_size'),
-            'order': schedule.get('order'),
+            "seed": schedule.get("seed"),
+            "block_size": schedule.get("block_size"),
+            "order": schedule.get("order"),
         }
-    elif schema == 'adasquash.rcbd_schedule.v1':
+    elif schema == "adasquash.rcbd_schedule.v1":
         payload = {
-            'seed': schedule.get('seed'),
-            'units': schedule.get('units'),
-            'replicates': schedule.get('replicates'),
-            'order': schedule.get('order'),
+            "seed": schedule.get("seed"),
+            "units": schedule.get("units"),
+            "replicates": schedule.get("replicates"),
+            "order": schedule.get("order"),
         }
     else:
         return {
-            'schema': schema,
-            'fingerprint': expected,
-            'recomputed': None,
-            'verified': None,
-            'reason': f'unrecognized schedule schema {schema!r}',
+            "schema": schema,
+            "fingerprint": expected,
+            "recomputed": None,
+            "verified": None,
+            "reason": f"unrecognized schedule schema {schema!r}",
         }
     try:
         recomputed = hashlib.sha256(
             json.dumps(payload, sort_keys=True,
-                       separators=(',', ':')).encode('utf-8')).hexdigest()
+                       separators=(",", ":")).encode("utf-8")).hexdigest()
     except (TypeError, ValueError):
         return {
-            'schema': schema,
-            'fingerprint': expected,
-            'recomputed': None,
-            'verified': None,
-            'reason': 'schedule fields are not JSON-serializable',
+            "schema": schema,
+            "fingerprint": expected,
+            "recomputed": None,
+            "verified": None,
+            "reason": "schedule fields are not JSON-serializable",
         }
     verified = recomputed == expected
     return {
-        'schema': schema,
-        'fingerprint': expected,
-        'recomputed': recomputed,
-        'verified': verified,
-        'reason': ('fingerprint matches the recorded schedule' if verified else
-                   'fingerprint does not match the recorded schedule fields'),
+        "schema": schema,
+        "fingerprint": expected,
+        "recomputed": recomputed,
+        "verified": verified,
+        "reason": ("fingerprint matches the recorded schedule" if verified else
+                   "fingerprint does not match the recorded schedule fields"),
     }
 
 
@@ -432,7 +440,7 @@ def _arm_resolver(arm_of):
         return arm_of
     if isinstance(arm_of, Mapping):
         return lambda unit: arm_of.get(unit, unit)
-    raise ValueError('arm_of must be None, a mapping or a callable')
+    raise ValueError("arm_of must be None, a mapping or a callable")
 
 
 def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
@@ -445,32 +453,32 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     large grid, or missing/duplicate positions).  :func:`order_drift_report`
     tests whether the realized positions actually correlate with outcomes.
     """
-    if not isinstance(schedule, dict) or not isinstance(schedule.get('entries'), list):
-        raise ValueError('schedule must be the dict returned by block_randomized_schedule')
+    if not isinstance(schedule, dict) or not isinstance(schedule.get("entries"), list):
+        raise ValueError("schedule must be the dict returned by block_randomized_schedule")
     resolve = _arm_resolver(arm_of)
     # An RCBD run id is `unit::rep=<replicate>`; its treatment/arm is the
     # `unit` field, not the replicated run id. Without an explicit resolver,
     # grouping by run id would give every arm one block and falsely reject a
     # perfectly crossed design. `run_id` is still the identity used for the
     # realized-order/duplicate checks below.
-    rcbd = schedule.get('schema') == 'adasquash.rcbd_schedule.v1'
+    rcbd = schedule.get("schema") == "adasquash.rcbd_schedule.v1"
 
     def _arm_of(entry: dict):
         if arm_of is None and rcbd:
-            return entry.get('unit', entry.get('run_id'))
+            return entry.get("unit", entry.get("run_id"))
         if rcbd and isinstance(arm_of, Mapping):
             # An RCBD's treatment key is `unit`, not the replicated run id.
             # Honour a mapping keyed by that natural identifier; fall back to
             # the run id for callers that map the full run ids.
-            unit = entry.get('unit')
+            unit = entry.get("unit")
             if unit in arm_of:
                 return arm_of[unit]
-        return resolve(entry.get('run_id', entry.get('unit')))
+        return resolve(entry.get("run_id", entry.get("unit")))
 
-    entries = schedule['entries']
+    entries = schedule["entries"]
     structural: list[str] = []
-    if len(entries) != schedule.get('n_units'):
-        structural.append('entry count does not match n_units')
+    if len(entries) != schedule.get("n_units"):
+        structural.append("entry count does not match n_units")
     # Positions are the structural contract of the schedule. A malformed
     # record must produce a warning instead of a KeyError/TypeError: this
     # report is the pre-flight check that is supposed to expose a broken
@@ -481,7 +489,7 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         if not isinstance(entry, dict):
             positions_valid = False
             continue
-        position = entry.get('position')
+        position = entry.get("position")
         if (isinstance(position, bool)
                 or not isinstance(position, numbers.Integral)
                 or position < 0):
@@ -489,49 +497,49 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         else:
             positions.append(int(position))
     if not positions_valid:
-        structural.append('positions are not a contiguous 0..n-1 range '
-                          '(missing or non-integer position)')
+        structural.append("positions are not a contiguous 0..n-1 range "
+                          "(missing or non-integer position)")
     elif sorted(positions) != list(range(len(entries))):
-        structural.append('positions are not a contiguous 0..n-1 range')
+        structural.append("positions are not a contiguous 0..n-1 range")
     units = []
     units_valid = True
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             units_valid = False
-            units.append(('invalid-entry', index))
+            units.append(("invalid-entry", index))
             continue
-        unit = entry.get('run_id', entry.get('unit'))
+        unit = entry.get("run_id", entry.get("unit"))
         if not isinstance(unit, str) or not unit.strip():
             # A non-string run id cannot be compared/paired by the later
             # reports. It must produce a warning, not an unhashable-type crash
             # from the duplicate check.
             units_valid = False
-            units.append(('invalid-unit', index, repr(unit)))
+            units.append(("invalid-unit", index, repr(unit)))
         else:
-            units.append(('unit', unit))
+            units.append(("unit", unit))
     if not units_valid:
-        structural.append('run ids are missing or not non-empty strings')
+        structural.append("run ids are missing or not non-empty strings")
     if len(set(units)) != len(units):
-        structural.append('duplicate run ids in the realized order')
-    raw_order = schedule.get('order')
+        structural.append("duplicate run ids in the realized order")
+    raw_order = schedule.get("order")
     if raw_order is not None and not isinstance(raw_order, list):
-        structural.append('recorded order is not a list of run ids')
+        structural.append("recorded order is not a list of run ids")
     elif isinstance(raw_order, list) and len(raw_order) != len(entries):
         # A truncated/extended frozen order cannot be compared position by
         # position. Silence here would certify a schedule whose recorded
         # allocation and realized entries disagree in size.
         structural.append(
-            f'recorded order has {len(raw_order)} run id(s) but there are '
-            f'{len(entries)} entries; the frozen schedule and the run records '
-            'describe different allocations')
+            f"recorded order has {len(raw_order)} run id(s) but there are "
+            f"{len(entries)} entries; the frozen schedule and the run records "
+            "describe different allocations")
     elif positions_valid and isinstance(raw_order, list):
-        by_position = sorted(entries, key=lambda entry: entry['position'])
-        realized_order = [entry.get('run_id', entry.get('unit'))
+        by_position = sorted(entries, key=lambda entry: entry["position"])
+        realized_order = [entry.get("run_id", entry.get("unit"))
                           for entry in by_position]
         if realized_order != raw_order:
             structural.append(
-                'entries do not follow the recorded order; the frozen schedule '
-                'and the run records describe different allocations')
+                "entries do not follow the recorded order; the frozen schedule "
+                "and the run records describe different allocations")
 
     per_arm: dict[str, dict] = {}
     blocks_valid = True
@@ -540,56 +548,56 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
             continue
         arm = str(_arm_of(entry))
         bucket = per_arm.setdefault(arm, {
-            'count': 0, 'positions': [], 'blocks': set(), 'early': 0, 'late': 0,
+            "count": 0, "positions": [], "blocks": set(), "early": 0, "late": 0,
         })
-        bucket['count'] += 1
-        position = entry.get('position')
+        bucket["count"] += 1
+        position = entry.get("position")
         if (not isinstance(position, bool)
                 and isinstance(position, numbers.Integral)
                 and position >= 0):
-            bucket['positions'].append(int(position))
-        block = entry.get('block')
+            bucket["positions"].append(int(position))
+        block = entry.get("block")
         if (isinstance(block, bool)
                 or not isinstance(block, numbers.Integral) or block < 0):
             blocks_valid = False
         else:
-            bucket['blocks'].add(int(block))
+            bucket["blocks"].add(int(block))
     if not blocks_valid:
-        structural.append('one or more entries have a missing or non-integer block')
+        structural.append("one or more entries have a missing or non-integer block")
     n = len(entries)
     overall_mean = (n - 1) / 2.0 if n else None
     extreme_counts: dict[str, int] = {}
     for arm, bucket in per_arm.items():
-        bucket['mean_position'] = (
-            sum(bucket['positions']) / len(bucket['positions'])
-            if bucket['positions'] else None)
-        bucket['position_span'] = (max(bucket['positions']) - min(bucket['positions'])
-                                   if bucket['positions'] else None)
-        bucket['blocks'] = sorted(bucket['blocks'])
-        bucket['n_blocks'] = len(bucket['blocks'])
+        bucket["mean_position"] = (
+            sum(bucket["positions"]) / len(bucket["positions"])
+            if bucket["positions"] else None)
+        bucket["position_span"] = (max(bucket["positions"]) - min(bucket["positions"])
+                                   if bucket["positions"] else None)
+        bucket["blocks"] = sorted(bucket["blocks"])
+        bucket["n_blocks"] = len(bucket["blocks"])
         if n:
-            bucket['early'] = sum(1 for p in bucket['positions'] if p < n / 3.0)
-            bucket['late'] = sum(1 for p in bucket['positions'] if p >= 2.0 * n / 3.0)
-        if bucket['count'] >= 2 and bucket['n_blocks'] <= 1:
+            bucket["early"] = sum(1 for p in bucket["positions"] if p < n / 3.0)
+            bucket["late"] = sum(1 for p in bucket["positions"] if p >= 2.0 * n / 3.0)
+        if bucket["count"] >= 2 and bucket["n_blocks"] <= 1:
             structural.append(
                 f"arm {arm!r} appears in only one time block "
                 f"({bucket['count']} run(s)); its position is confounded with "
                 f"any block-level drift")
-        if bucket['count'] >= 2 and n and bucket['mean_position'] is not None:
-            dev = abs(bucket['mean_position'] - overall_mean) / max(1.0, n - 1)
+        if bucket["count"] >= 2 and n and bucket["mean_position"] is not None:
+            dev = abs(bucket["mean_position"] - overall_mean) / max(1.0, n - 1)
             if dev >= 1.0 / 3.0:
-                extreme_counts[arm] = bucket['count']
-    if schedule.get('n_blocks') == 1 and n > 8:
-        structural.append('a single block was used for a large grid; '
-                          'blocking cannot spread a monotone drift')
+                extreme_counts[arm] = bucket["count"]
+    if schedule.get("n_blocks") == 1 and n > 8:
+        structural.append("a single block was used for a large grid; "
+                          "blocking cannot spread a monotone drift")
     # A complete randomized block design is a stronger contract than "every
     # arm appears in several blocks": within *each* block every arm must
     # appear exactly once. The check only applies when the schedule looks
     # like an RCBD (each arm has one run per block), so a generic blocked
     # order with unequal arm counts is not misclassified.
-    is_rcbd = schedule.get('schema') == 'adasquash.rcbd_schedule.v1'
+    is_rcbd = schedule.get("schema") == "adasquash.rcbd_schedule.v1"
     has_replicates = is_rcbd or any(
-        isinstance(entry, dict) and entry.get('replicate') is not None
+        isinstance(entry, dict) and entry.get("replicate") is not None
         for entry in entries)
     block_arm_counts: dict[int, dict[str, int]] = {}
     block_replicate_counts: dict[int, dict[str, int]] = {}
@@ -598,7 +606,7 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        block = entry.get('block')
+        block = entry.get("block")
         if (isinstance(block, bool)
                 or not isinstance(block, numbers.Integral) or block < 0):
             continue
@@ -608,14 +616,14 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         counts[arm] = counts.get(arm, 0) + 1
         if not has_replicates:
             continue
-        replicate = entry.get('replicate')
+        replicate = entry.get("replicate")
         if not isinstance(replicate, str) or not replicate.strip():
             replicate_entries_valid = False
             continue
         realized_replicates.add(replicate)
         rep_counts = block_replicate_counts.setdefault(block, {})
         rep_counts[replicate] = rep_counts.get(replicate, 0) + 1
-    declared_blocks = schedule.get('n_blocks')
+    declared_blocks = schedule.get("n_blocks")
     declared_blocks_valid = (
         isinstance(declared_blocks, numbers.Integral)
         and not isinstance(declared_blocks, bool)
@@ -628,10 +636,10 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         if not replicate_entries_valid:
             block_replicate_counts = {}
             structural.append(
-                'one or more entries have a missing or non-empty string '
-                'replicate id; seed-by-block alignment cannot be checked')
+                "one or more entries have a missing or non-empty string "
+                "replicate id; seed-by-block alignment cannot be checked")
         else:
-            raw_replicates = schedule.get('replicates')
+            raw_replicates = schedule.get("replicates")
             declared_replicates = {
                 str(rep) for rep in raw_replicates
                 if str(rep).strip()
@@ -641,7 +649,7 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
             if replicate_ids and blocks:
                 complete_counts = {}
                 for block in blocks:
-                    counts = {rep: 0 for rep in replicate_ids}
+                    counts = dict.fromkeys(replicate_ids, 0)
                     for rep, value in block_replicate_counts[block].items():
                         counts[rep] = value
                     complete_counts[block] = counts
@@ -660,15 +668,15 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
                          if len(rep_blocks) > 1}
                 if split:
                     structural.append(
-                        f'replicate/seed(s) {sorted(split)} appear in multiple '
-                        f'time blocks ({split}); a seed-paired arm contrast then '
-                        f'also contains a block/time difference, so block drift '
-                        f'does not cancel')
+                        f"replicate/seed(s) {sorted(split)} appear in multiple "
+                        f"time blocks ({split}); a seed-paired arm contrast then "
+                        f"also contains a block/time difference, so block drift "
+                        f"does not cancel")
             else:
                 block_replicate_counts = {}
     declared_missing = []
     declared_extra = []
-    raw_units = schedule.get('units')
+    raw_units = schedule.get("units")
     if is_rcbd and isinstance(raw_units, list) and raw_units:
         # The frozen design declares every treatment; entries that retain only
         # a subset are not a complete block design even when the retained
@@ -676,19 +684,19 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         # (possibly remapped) arm labels, so this check also works with an
         # explicit `arm_of` mapping.
         declared = {str(unit) for unit in raw_units}
-        realized = {str(entry.get('unit')) for entry in entries
-                    if isinstance(entry, dict) and entry.get('unit') is not None}
+        realized = {str(entry.get("unit")) for entry in entries
+                    if isinstance(entry, dict) and entry.get("unit") is not None}
         declared_missing = sorted(declared - realized)
         declared_extra = sorted(realized - declared)
         if declared_missing or declared_extra:
             structural.append(
-                'the realized schedule does not cover the declared RCBD '
-                f'treatment(s): missing {declared_missing}, extra {declared_extra}')
+                "the realized schedule does not cover the declared RCBD "
+                f"treatment(s): missing {declared_missing}, extra {declared_extra}")
     looks_complete = is_rcbd or (
         declared_blocks_valid and bool(per_arm)
         and sorted(block_arm_counts) == list(range(declared_blocks))
-        and all(bucket['count'] == declared_blocks
-                and bucket['n_blocks'] == declared_blocks
+        and all(bucket["count"] == declared_blocks
+                and bucket["n_blocks"] == declared_blocks
                 for bucket in per_arm.values()))
     complete_block_design = None
     if looks_complete:
@@ -696,15 +704,15 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
         coverage_ok = (
             block_index_valid
             and sorted(block_arm_counts) == list(range(declared_blocks))
-            and all(bucket['count'] == declared_blocks
-                    and bucket['n_blocks'] == declared_blocks
+            and all(bucket["count"] == declared_blocks
+                    and bucket["n_blocks"] == declared_blocks
                     for bucket in per_arm.values()))
         if not coverage_ok:
             complete_block_design = False
             structural.append(
-                'the declared randomized complete block design does not cover '
-                'every arm in every block exactly once (missing/extra block or '
-                'arm x block cell)')
+                "the declared randomized complete block design does not cover "
+                "every arm in every block exactly once (missing/extra block or "
+                "arm x block cell)")
         else:
             complete_block_design = True
             for block, counts in sorted(block_arm_counts.items()):
@@ -712,33 +720,33 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
                         or any(value != 1 for value in counts.values())):
                     complete_block_design = False
                     structural.append(
-                        f'block {block} does not contain every arm exactly once '
-                        f'({counts}); the schedule is not a randomized complete '
-                        f'block design')
+                        f"block {block} does not contain every arm exactly once "
+                        f"({counts}); the schedule is not a randomized complete "
+                        f"block design")
     if complete_block_design and (declared_missing or declared_extra):
         complete_block_design = False
     return {
-        'schema': 'adasquash.schedule_balance.v1',
-        'schedule_fingerprint': schedule.get('fingerprint'),
-        'n_units': n,
-        'n_blocks': declared_blocks,
-        'block_sizes': schedule.get('block_sizes'),
-        'overall_mean_position': overall_mean,
-        'per_arm': per_arm,
-        'block_arm_counts': {str(block): counts
+        "schema": "adasquash.schedule_balance.v1",
+        "schedule_fingerprint": schedule.get("fingerprint"),
+        "n_units": n,
+        "n_blocks": declared_blocks,
+        "block_sizes": schedule.get("block_sizes"),
+        "overall_mean_position": overall_mean,
+        "per_arm": per_arm,
+        "block_arm_counts": {str(block): counts
                              for block, counts in sorted(block_arm_counts.items())},
-        'block_replicate_counts': {str(block): counts
+        "block_replicate_counts": {str(block): counts
                                    for block, counts in sorted(
                                        block_replicate_counts.items())},
-        'replicate_blocks': replicate_blocks,
-        'replicate_block_aligned': replicate_block_aligned,
-        'complete_block_design': complete_block_design,
-        'arms_with_extreme_mean_position': sorted(extreme_counts),
-        'balanced': not structural,
-        'warnings': structural,
-        'note': ('balance is descriptive; use order_drift_report to test whether '
-                 'the realized run order predicts the outcome after removing '
-                 'arm means'),
+        "replicate_blocks": replicate_blocks,
+        "replicate_block_aligned": replicate_block_aligned,
+        "complete_block_design": complete_block_design,
+        "arms_with_extreme_mean_position": sorted(extreme_counts),
+        "balanced": not structural,
+        "warnings": structural,
+        "note": ("balance is descriptive; use order_drift_report to test whether "
+                 "the realized run order predicts the outcome after removing "
+                 "arm means"),
     }
 
 
@@ -829,81 +837,81 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
     if (isinstance(permutations, bool)
             or not isinstance(permutations, numbers.Integral)
             or permutations < 1):
-        raise ValueError(f'permutations must be a positive integer, got {permutations!r}')
+        raise ValueError(f"permutations must be a positive integer, got {permutations!r}")
     permutations = int(permutations)
     alpha_value = _finite_float(alpha)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
-        raise ValueError(f'alpha must be strictly between 0 and 1, got {alpha!r}')
+        raise ValueError(f"alpha must be strictly between 0 and 1, got {alpha!r}")
     seed = _validate_seed(seed)
     if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes)):
-        raise ValueError('observations must be a sequence of dict records')
+        raise ValueError("observations must be a sequence of dict records")
 
-    excluded = {'malformed': 0, 'non_finite': 0, 'duplicate_position': 0,
-                'singleton_arm': 0}
+    excluded = {"malformed": 0, "non_finite": 0, "duplicate_position": 0,
+                "singleton_arm": 0}
     valid: list[dict] = []
     seen: set[tuple] = set()
     for record in observations:
         if not isinstance(record, dict):
-            excluded['malformed'] += 1
+            excluded["malformed"] += 1
             continue
-        arm = record.get('arm')
-        position = record.get('position')
-        value = record.get('value')
+        arm = record.get("arm")
+        position = record.get("position")
+        value = record.get("value")
         if (not isinstance(arm, str) or not arm
                 or isinstance(position, bool) or not isinstance(position, numbers.Real)
                 or not isinstance(value, numbers.Real) or isinstance(value, bool)):
-            excluded['malformed'] += 1
+            excluded["malformed"] += 1
             continue
         position_value = _finite_float(position)
         value_value = _finite_float(value)
         if position_value is None or value_value is None:
-            excluded['non_finite'] += 1
+            excluded["non_finite"] += 1
             continue
         key = (arm, position_value)
         if key in seen:
-            excluded['duplicate_position'] += 1
+            excluded["duplicate_position"] += 1
             continue
         seen.add(key)
-        valid.append({'unit': record.get('unit'), 'arm': arm,
-                      'position': position_value, 'value': value_value})
+        valid.append({"unit": record.get("unit"), "arm": arm,
+                      "position": position_value, "value": value_value})
 
     groups: dict[str, list[dict]] = {}
     for record in valid:
-        groups.setdefault(record['arm'], []).append(record)
+        groups.setdefault(record["arm"], []).append(record)
     usable = {arm: records for arm, records in groups.items() if len(records) >= 2}
-    excluded['singleton_arm'] = sum(len(records) for arm, records in groups.items()
+    excluded["singleton_arm"] = sum(len(records) for arm, records in groups.items()
                                     if len(records) < 2)
     flat = [record for arm in sorted(usable) for record in usable[arm]]
-    distinct_positions = {record['position'] for record in flat}
+    distinct_positions = {record["position"] for record in flat}
     base = {
-        'schema': 'adasquash.order_drift.v1',
-        'n_observations': len(flat),
-        'n_arms': len(usable),
-        'n_distinct_positions': len(distinct_positions),
-        'excluded': excluded,
-        'permutations': permutations,
-        'alpha': float(alpha),
-        'spearman_rho': None,
-        'p_two_sided': None,
-        'drift_detected': None,
-        'status': 'insufficient_data',
+        "schema": "adasquash.order_drift.v1",
+        "n_observations": len(flat),
+        "n_arms": len(usable),
+        "n_distinct_positions": len(distinct_positions),
+        "excluded": excluded,
+        "permutations": permutations,
+        "alpha": float(alpha),
+        "spearman_rho": None,
+        "p_two_sided": None,
+        "drift_detected": None,
+        "status": "insufficient_data",
     }
     if len(flat) < 6 or len(distinct_positions) < 2:
-        base['note'] = ('at least six observations from arms with >= 2 runs and two '
-                        'distinct positions are needed to test order drift')
+        base["note"] = ("at least six observations from arms with >= 2 runs and two "
+                        "distinct positions are needed to test order drift")
         return base
 
     residual_scale = None
     ordinary_ok = True
     try:
         for arm, records in usable.items():
-            mean = sum(record['value'] for record in records) / len(records)
+            mean = sum(record["value"] for record in records) / len(records)
             if not math.isfinite(mean):
                 ordinary_ok = False
                 break
             for record in records:
-                record['residual'] = record['value'] - mean
-                if not math.isfinite(record['residual']):
+                record["residual"] = record["value"] - mean
+                if not math.isfinite(record["residual"]):
                     ordinary_ok = False
                     break
             if not ordinary_ok:
@@ -916,28 +924,28 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
         # defined. Center in units of the largest observed magnitude; a
         # common positive scale preserves every rank, so the ordinary path
         # above (and its exact tie behaviour) remains unchanged.
-        residual_scale = max(abs(record['value']) for record in flat)
+        residual_scale = max(abs(record["value"]) for record in flat)
         if residual_scale == 0.0:
             for record in flat:
-                record['residual'] = 0.0
+                record["residual"] = 0.0
         else:
             for arm, records in usable.items():
-                scaled = [record['value'] / residual_scale for record in records]
+                scaled = [record["value"] / residual_scale for record in records]
                 mean_scaled = math.fsum(scaled) / len(scaled)
                 for record in records:
-                    record['residual'] = (
-                        record['value'] / residual_scale - mean_scaled)
-    x = [record['position'] for record in flat]
-    y = [record['residual'] for record in flat]
+                    record["residual"] = (
+                        record["value"] / residual_scale - mean_scaled)
+    x = [record["position"] for record in flat]
+    y = [record["residual"] for record in flat]
     rho = _spearman(x, y)
     if rho is None:
-        base['note'] = 'every within-arm residual is identical; no rank correlation is defined'
+        base["note"] = "every within-arm residual is identical; no rank correlation is defined"
         return base
 
     rng = random.Random(seed)
-    arm_positions = {arm: [record['position'] for record in records]
+    arm_positions = {arm: [record["position"] for record in records]
                      for arm, records in usable.items()}
-    residuals = [record['residual'] for record in flat]
+    residuals = [record["residual"] for record in flat]
     rho_samples: list[float] = []
     for _ in range(permutations):
         shuffled_positions: list[float] = []
@@ -960,42 +968,42 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
     per_arm = []
     for arm in sorted(usable):
         records = usable[arm]
-        positions = [record['position'] for record in records]
+        positions = [record["position"] for record in records]
         per_arm.append({
-            'arm': arm,
-            'count': len(records),
-            'mean_position': sum(positions) / len(positions),
-            'position_span': max(positions) - min(positions),
-            'mean_residual': (
-                math.fsum(record['residual'] for record in records)
+            "arm": arm,
+            "count": len(records),
+            "mean_position": sum(positions) / len(positions),
+            "position_span": max(positions) - min(positions),
+            "mean_residual": (
+                math.fsum(record["residual"] for record in records)
                 / len(records)
                 * (1.0 if residual_scale is None else residual_scale)),
         })
     base.update({
-        'status': 'tested',
-        'spearman_rho': rho,
-        'p_two_sided': p_two_sided,
-        'p_one_sided_decline': p_one_sided_decline,
-        'drift_detected': bool(p_two_sided < float(alpha) and rho != 0.0),
-        'direction': ('later_runs_worse' if rho > 0 else
-                      'later_runs_better' if rho < 0 else 'flat'),
-        'n_permutations_defined': len(rho_samples),
-        'per_arm': per_arm,
-        'note': ('a significant within-arm rank correlation means execution order '
-                 'is confounded with the outcome; re-run the affected arms in a '
-                 'fresh randomized block rather than interpreting the arm delta'),
+        "status": "tested",
+        "spearman_rho": rho,
+        "p_two_sided": p_two_sided,
+        "p_one_sided_decline": p_one_sided_decline,
+        "drift_detected": bool(p_two_sided < float(alpha) and rho != 0.0),
+        "direction": ("later_runs_worse" if rho > 0 else
+                      "later_runs_better" if rho < 0 else "flat"),
+        "n_permutations_defined": len(rho_samples),
+        "per_arm": per_arm,
+        "note": ("a significant within-arm rank correlation means execution order "
+                 "is confounded with the outcome; re-run the affected arms in a "
+                 "fresh randomized block rather than interpreting the arm delta"),
     })
     return base
 
 
-EXCLUSION_POLICY_SCHEMA = 'adasquash.exclusion_policy.v1'
-_EXCLUSION_ACTIONS = ('exclude', 'sensitivity')
+EXCLUSION_POLICY_SCHEMA = "adasquash.exclusion_policy.v1"
+_EXCLUSION_ACTIONS = ("exclude", "sensitivity")
 # A confirmatory design may not discard a run because its outcome is
 # inconvenient. These are the only failure modes the default policy treats as
 # exclusions; all of them are observable before/independently of the arm
 # contrast.
-_REQUIRED_EXCLUSION_RULES = ('missing_run', 'protocol_mismatch', 'non_finite_loss')
-_DIVERGED_CLASSIFICATIONS = ('diverging', 'diverged', 'nonfinite_loss')
+_REQUIRED_EXCLUSION_RULES = ("missing_run", "protocol_mismatch", "non_finite_loss")
+_DIVERGED_CLASSIFICATIONS = ("diverging", "diverged", "nonfinite_loss")
 
 
 def default_exclusion_policy() -> dict:
@@ -1011,31 +1019,31 @@ def default_exclusion_policy() -> dict:
     is exactly the garden of forking paths this policy is meant to stop.
     """
     return {
-        'schema': EXCLUSION_POLICY_SCHEMA,
-        'version': 1,
-        'rules': [
-            {'id': 'missing_run', 'action': 'exclude', 'outcome_blind': True,
-             'description': ('planned run has no readable summary, checkpoint or '
-                             'finished manifest')},
-            {'id': 'protocol_mismatch', 'action': 'exclude', 'outcome_blind': True,
-             'description': ('recorded model/data/optimizer recipe or pinned '
-                             'provenance differs from the registered protocol')},
-            {'id': 'non_finite_loss', 'action': 'exclude', 'outcome_blind': True,
-             'description': ('held-out loss is NaN/Inf, so no finite paired '
-                             'contrast can be computed')},
-            {'id': 'diverged_curve', 'action': 'sensitivity', 'outcome_blind': False,
-             'description': ('the training curve is already diverging; the run is '
-                             'retained in the primary analysis and reported as a '
-                             'sensitivity check instead of being dropped')},
+        "schema": EXCLUSION_POLICY_SCHEMA,
+        "version": 1,
+        "rules": [
+            {"id": "missing_run", "action": "exclude", "outcome_blind": True,
+             "description": ("planned run has no readable summary, checkpoint or "
+                             "finished manifest")},
+            {"id": "protocol_mismatch", "action": "exclude", "outcome_blind": True,
+             "description": ("recorded model/data/optimizer recipe or pinned "
+                             "provenance differs from the registered protocol")},
+            {"id": "non_finite_loss", "action": "exclude", "outcome_blind": True,
+             "description": ("held-out loss is NaN/Inf, so no finite paired "
+                             "contrast can be computed")},
+            {"id": "diverged_curve", "action": "sensitivity", "outcome_blind": False,
+             "description": ("the training curve is already diverging; the run is "
+                             "retained in the primary analysis and reported as a "
+                             "sensitivity check instead of being dropped")},
         ],
-        'forbidden_exclusion_criteria': [
-            'val_loss_outlier', 'best_of_seeds', 'drop_worst_arm',
-            'post_hoc_loss_threshold',
+        "forbidden_exclusion_criteria": [
+            "val_loss_outlier", "best_of_seeds", "drop_worst_arm",
+            "post_hoc_loss_threshold",
         ],
-        'protocol': (
-            'exclusions are fixed before outcomes are inspected; only missing '
-            'runs, protocol/provenance mismatches and non-finite losses may be '
-            'excluded, and every excluded or flagged run is counted per arm'),
+        "protocol": (
+            "exclusions are fixed before outcomes are inspected; only missing "
+            "runs, protocol/provenance mismatches and non-finite losses may be "
+            "excluded, and every excluded or flagged run is counted per arm"),
     }
 
 
@@ -1052,92 +1060,92 @@ def normalize_exclusion_policy(policy: Optional[Mapping] = None) -> dict:
     if policy is None:
         policy = default_exclusion_policy()
     if not isinstance(policy, Mapping):
-        raise ValueError(f'exclusion policy must be a mapping, got {type(policy).__name__}')
-    if policy.get('schema') != EXCLUSION_POLICY_SCHEMA:
+        raise ValueError(f"exclusion policy must be a mapping, got {type(policy).__name__}")
+    if policy.get("schema") != EXCLUSION_POLICY_SCHEMA:
         raise ValueError(
             f"exclusion policy schema must be {EXCLUSION_POLICY_SCHEMA!r}, "
             f"got {policy.get('schema')!r}")
-    version = policy.get('version', 1)
+    version = policy.get("version", 1)
     if (isinstance(version, bool)
             or not isinstance(version, numbers.Integral) or version < 1):
-        raise ValueError(f'exclusion policy version must be a positive integer, got {version!r}')
-    raw_rules = policy.get('rules')
+        raise ValueError(f"exclusion policy version must be a positive integer, got {version!r}")
+    raw_rules = policy.get("rules")
     if (not isinstance(raw_rules, Sequence) or isinstance(raw_rules, (str, bytes))
             or not raw_rules):
-        raise ValueError('exclusion policy needs a non-empty list of rules')
+        raise ValueError("exclusion policy needs a non-empty list of rules")
     rules: list[dict] = []
     seen: set[str] = set()
     for raw in raw_rules:
         if not isinstance(raw, Mapping):
-            raise ValueError(f'exclusion rule must be a mapping, got {type(raw).__name__}')
-        rule_id = raw.get('id')
+            raise ValueError(f"exclusion rule must be a mapping, got {type(raw).__name__}")
+        rule_id = raw.get("id")
         if not isinstance(rule_id, str) or not rule_id.strip():
-            raise ValueError(f'exclusion rule id must be a non-empty string, got {rule_id!r}')
+            raise ValueError(f"exclusion rule id must be a non-empty string, got {rule_id!r}")
         if rule_id in seen:
-            raise ValueError(f'duplicate exclusion rule id {rule_id!r}')
+            raise ValueError(f"duplicate exclusion rule id {rule_id!r}")
         seen.add(rule_id)
-        action = raw.get('action')
+        action = raw.get("action")
         if action not in _EXCLUSION_ACTIONS:
             raise ValueError(
-                f'exclusion rule {rule_id!r} action must be one of '
-                f'{_EXCLUSION_ACTIONS}, got {action!r}')
-        blind = raw.get('outcome_blind')
+                f"exclusion rule {rule_id!r} action must be one of "
+                f"{_EXCLUSION_ACTIONS}, got {action!r}")
+        blind = raw.get("outcome_blind")
         if not isinstance(blind, bool):
             raise ValueError(
-                f'exclusion rule {rule_id!r} must declare outcome_blind true/false')
-        if action == 'exclude' and not blind:
+                f"exclusion rule {rule_id!r} must declare outcome_blind true/false")
+        if action == "exclude" and not blind:
             raise ValueError(
-                f'exclusion rule {rule_id!r} is outcome-dependent; an exclude '
-                f'rule must be outcome_blind, otherwise a bad result can be '
-                f'dropped after it is seen')
-        rule = {'id': rule_id, 'action': action, 'outcome_blind': blind}
-        description = raw.get('description')
+                f"exclusion rule {rule_id!r} is outcome-dependent; an exclude "
+                f"rule must be outcome_blind, otherwise a bad result can be "
+                f"dropped after it is seen")
+        rule = {"id": rule_id, "action": action, "outcome_blind": blind}
+        description = raw.get("description")
         if description is not None:
             if not isinstance(description, str) or not description.strip():
                 raise ValueError(
-                    f'exclusion rule {rule_id!r} description must be a non-empty string')
-            rule['description'] = description
+                    f"exclusion rule {rule_id!r} description must be a non-empty string")
+            rule["description"] = description
         rules.append(rule)
     missing = [rule_id for rule_id in _REQUIRED_EXCLUSION_RULES if rule_id not in seen]
     if missing:
         raise ValueError(
-            f'exclusion policy is missing mandatory protocol rule(s): {missing}; '
-            f'a run may not disappear without a recorded reason')
+            f"exclusion policy is missing mandatory protocol rule(s): {missing}; "
+            f"a run may not disappear without a recorded reason")
     # Keeping the rule id while changing its action to `sensitivity` would
     # silently stop treating a missing/non-finite run as attrition, so the
     # mandatory rules must remain `exclude` rules.
-    downgraded = [rule['id'] for rule in rules
-                  if rule['id'] in _REQUIRED_EXCLUSION_RULES
-                  and rule['action'] != 'exclude']
+    downgraded = [rule["id"] for rule in rules
+                  if rule["id"] in _REQUIRED_EXCLUSION_RULES
+                  and rule["action"] != "exclude"]
     if downgraded:
         raise ValueError(
             f'mandatory protocol rule(s) {downgraded} must keep action="exclude"; '
             f'a missing, mismatched or non-finite run may not be retained as a '
             f'sensitivity case')
-    forbidden = policy.get('forbidden_exclusion_criteria', [])
+    forbidden = policy.get("forbidden_exclusion_criteria", [])
     if (not isinstance(forbidden, Sequence) or isinstance(forbidden, (str, bytes))):
-        raise ValueError('forbidden_exclusion_criteria must be a sequence of strings')
+        raise ValueError("forbidden_exclusion_criteria must be a sequence of strings")
     if any(not isinstance(item, str) or not item.strip() for item in forbidden):
         raise ValueError(
-            'forbidden_exclusion_criteria must contain non-empty strings, got '
-            f'{[item for item in forbidden if not isinstance(item, str) or not item.strip()]!r}')
+            "forbidden_exclusion_criteria must contain non-empty strings, got "
+            f"{[item for item in forbidden if not isinstance(item, str) or not item.strip()]!r}")
     forbidden = list(forbidden)
     used_forbidden = sorted(seen.intersection(forbidden))
     if used_forbidden:
         raise ValueError(
-            f'exclusion rule id(s) {used_forbidden} are listed as forbidden '
-            f'outcome-based criteria; a policy cannot both forbid and use them')
-    protocol = policy.get('protocol')
+            f"exclusion rule id(s) {used_forbidden} are listed as forbidden "
+            f"outcome-based criteria; a policy cannot both forbid and use them")
+    protocol = policy.get("protocol")
     if protocol is not None and not isinstance(protocol, str):
-        raise ValueError('exclusion policy protocol must be a string')
+        raise ValueError("exclusion policy protocol must be a string")
     return {
-        'schema': EXCLUSION_POLICY_SCHEMA,
-        'version': int(version),
-        'rules': sorted(rules, key=lambda rule: rule['id']),
-        'forbidden_exclusion_criteria': sorted(set(forbidden)),
-        'protocol': protocol or (
-            'only pre-specified, outcome-blind protocol failures may be excluded; '
-            'the per-arm attrition is audited after the run'),
+        "schema": EXCLUSION_POLICY_SCHEMA,
+        "version": int(version),
+        "rules": sorted(rules, key=lambda rule: rule["id"]),
+        "forbidden_exclusion_criteria": sorted(set(forbidden)),
+        "protocol": protocol or (
+            "only pre-specified, outcome-blind protocol failures may be excluded; "
+            "the per-arm attrition is audited after the run"),
     }
 
 
@@ -1145,7 +1153,7 @@ def exclusion_policy_fingerprint(policy: Optional[Mapping] = None) -> str:
     """Stable SHA-256 of the canonical exclusion policy."""
     canonical = normalize_exclusion_policy(policy)
     return hashlib.sha256(
-        json.dumps(canonical, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 
@@ -1169,38 +1177,38 @@ def classify_run_exclusions(runs: Sequence[Mapping],
     classified as an exclusion.
     """
     canonical = normalize_exclusion_policy(policy)
-    rule_action = {rule['id']: rule['action'] for rule in canonical['rules']}
+    rule_action = {rule["id"]: rule["action"] for rule in canonical["rules"]}
     if isinstance(runs, (str, bytes)) or not isinstance(runs, Sequence):
-        raise ValueError('runs must be a sequence of run records')
+        raise ValueError("runs must be a sequence of run records")
     classified: list[dict] = []
     for index, run in enumerate(runs):
         if not isinstance(run, Mapping):
-            raise ValueError(f'run record {index} must be a mapping, '
-                             f'got {type(run).__name__}')
-        run_id = run.get('run_id')
-        arm = run.get('arm')
+            raise ValueError(f"run record {index} must be a mapping, "
+                             f"got {type(run).__name__}")
+        run_id = run.get("run_id")
+        arm = run.get("arm")
         if not isinstance(run_id, str) or not run_id.strip():
-            raise ValueError(f'run record {index} needs a non-empty string run_id')
+            raise ValueError(f"run record {index} needs a non-empty string run_id")
         if not isinstance(arm, str) or not arm.strip():
-            raise ValueError(f'run record {index} ({run_id!r}) needs a non-empty arm')
-        present = run.get('present', True)
+            raise ValueError(f"run record {index} ({run_id!r}) needs a non-empty arm")
+        present = run.get("present", True)
         if not isinstance(present, bool):
-            raise ValueError(f'run record {run_id!r} present must be a boolean, '
-                             f'got {present!r}')
-        mismatch = run.get('protocol_mismatch', False)
+            raise ValueError(f"run record {run_id!r} present must be a boolean, "
+                             f"got {present!r}")
+        mismatch = run.get("protocol_mismatch", False)
         if not isinstance(mismatch, bool):
             raise ValueError(
-                f'run record {run_id!r} protocol_mismatch must be a boolean, '
-                f'got {mismatch!r}')
+                f"run record {run_id!r} protocol_mismatch must be a boolean, "
+                f"got {mismatch!r}")
         facts: list[str] = []
         if not present:
-            facts.append('missing_run')
+            facts.append("missing_run")
         if mismatch:
-            facts.append('protocol_mismatch')
-        loss = run.get('val_loss')
+            facts.append("protocol_mismatch")
+        loss = run.get("val_loss")
         if present:
             if loss is None:
-                facts.append('missing_run')
+                facts.append("missing_run")
             else:
                 try:
                     finite = (not isinstance(loss, bool)
@@ -1214,29 +1222,29 @@ def classify_run_exclusions(runs: Sequence[Mapping],
                 if not finite:
                     # A bool, a string or a NaN/Inf all mean the same thing for
                     # the paired contrast: there is no finite loss to analyse.
-                    facts.append('non_finite_loss')
-        curve = run.get('curve_classification')
+                    facts.append("non_finite_loss")
+        curve = run.get("curve_classification")
         if isinstance(curve, str) and curve in _DIVERGED_CLASSIFICATIONS:
-            facts.append('diverged_curve')
+            facts.append("diverged_curve")
         facts = list(dict.fromkeys(facts))
         unknown = [fact for fact in facts if fact not in rule_action]
         actions = [rule_action[fact] for fact in facts if fact in rule_action]
-        if 'exclude' in actions:
-            status = 'excluded'
-        elif 'sensitivity' in actions:
-            status = 'sensitivity'
+        if "exclude" in actions:
+            status = "excluded"
+        elif "sensitivity" in actions:
+            status = "sensitivity"
         else:
-            status = 'analyzed'
+            status = "analyzed"
         classified.append({
-            'run_id': run_id,
-            'arm': arm,
-            'seed': run.get('seed'),
-            'val_loss': loss if present else None,
-            'curve_classification': curve,
-            'reasons': facts,
-            'unknown_reasons': unknown,
-            'actions': actions,
-            'status': status,
+            "run_id": run_id,
+            "arm": arm,
+            "seed": run.get("seed"),
+            "val_loss": loss if present else None,
+            "curve_classification": curve,
+            "reasons": facts,
+            "unknown_reasons": unknown,
+            "actions": actions,
+            "status": status,
         })
     return classified
 
@@ -1257,7 +1265,7 @@ def run_exclusion_audit(runs: Sequence[Mapping],
     """
     if (isinstance(min_seeds, bool)
             or not isinstance(min_seeds, numbers.Integral) or min_seeds < 1):
-        raise ValueError(f'min_seeds must be a positive integer, got {min_seeds!r}')
+        raise ValueError(f"min_seeds must be a positive integer, got {min_seeds!r}")
     min_seeds = int(min_seeds)
     canonical = normalize_exclusion_policy(policy)
     fingerprint = exclusion_policy_fingerprint(canonical)
@@ -1266,7 +1274,7 @@ def run_exclusion_audit(runs: Sequence[Mapping],
     warnings: list[str] = []
     attrition_balanced = True
     if not classified:
-        violations.append('no planned runs were supplied to the attrition audit')
+        violations.append("no planned runs were supplied to the attrition audit")
 
     seen_ids: set[str] = set()
     duplicate_ids: list[str] = []
@@ -1274,17 +1282,17 @@ def run_exclusion_audit(runs: Sequence[Mapping],
     duplicate_seeds: list[str] = []
     invalid_seed_ids: list[str] = []
     by_reason: dict[str, int] = {}
-    by_status: dict[str, int] = {'analyzed': 0, 'sensitivity': 0, 'excluded': 0}
+    by_status: dict[str, int] = {"analyzed": 0, "sensitivity": 0, "excluded": 0}
     per_arm: dict[str, dict] = {}
     excluded_runs: list[dict] = []
     sensitivity_runs: list[dict] = []
     unknown_reasons: set[str] = set()
     for record in classified:
-        run_id = record['run_id']
+        run_id = record["run_id"]
         if run_id in seen_ids:
             duplicate_ids.append(run_id)
         seen_ids.add(run_id)
-        seed = record.get('seed')
+        seed = record.get("seed")
         # A boolean/float/string is not an independent replication id. It
         # must not inflate the per-arm seed count just because it can be
         # stringified; treat it as a structural failure instead. Accept
@@ -1298,39 +1306,39 @@ def run_exclusion_audit(runs: Sequence[Mapping],
             invalid_seed_ids.append(f'{record["arm"]}::seed={seed!r}')
         if seed is not None and valid_seed:
             seed = int(seed)
-            key = (record['arm'], str(seed))
+            key = (record["arm"], str(seed))
             if key in seen_seed_keys:
                 duplicate_seeds.append(f'{record["arm"]}::seed={seed}')
             seen_seed_keys.add(key)
-        status = record['status']
+        status = record["status"]
         by_status[status] += 1
-        for reason in record['reasons']:
+        for reason in record["reasons"]:
             by_reason[reason] = by_reason.get(reason, 0) + 1
-        unknown_reasons.update(record['unknown_reasons'])
-        bucket = per_arm.setdefault(record['arm'], {
-            'planned': 0, 'analyzed': 0, 'clean': 0, 'sensitivity': 0,
-            'excluded': 0, 'seeds': set(),
+        unknown_reasons.update(record["unknown_reasons"])
+        bucket = per_arm.setdefault(record["arm"], {
+            "planned": 0, "analyzed": 0, "clean": 0, "sensitivity": 0,
+            "excluded": 0, "seeds": set(),
         })
-        bucket['planned'] += 1
-        if status != 'excluded':
-            bucket['analyzed'] += 1
+        bucket["planned"] += 1
+        if status != "excluded":
+            bucket["analyzed"] += 1
             if valid_seed and seed is not None:
-                bucket['seeds'].add(str(seed))
-        if status == 'analyzed':
-            bucket['clean'] += 1
-        elif status == 'sensitivity':
-            bucket['sensitivity'] += 1
+                bucket["seeds"].add(str(seed))
+        if status == "analyzed":
+            bucket["clean"] += 1
+        elif status == "sensitivity":
+            bucket["sensitivity"] += 1
             sensitivity_runs.append(record)
         else:
-            bucket['excluded'] += 1
+            bucket["excluded"] += 1
             excluded_runs.append(record)
 
     for arm, bucket in sorted(per_arm.items()):
-        bucket['seeds'] = sorted(bucket['seeds'])
-        bucket['n_seeds_analyzed'] = len(bucket['seeds'])
-        bucket['excluded_fraction'] = (
-            bucket['excluded'] / bucket['planned'] if bucket['planned'] else 0.0)
-        if bucket['n_seeds_analyzed'] < min_seeds:
+        bucket["seeds"] = sorted(bucket["seeds"])
+        bucket["n_seeds_analyzed"] = len(bucket["seeds"])
+        bucket["excluded_fraction"] = (
+            bucket["excluded"] / bucket["planned"] if bucket["planned"] else 0.0)
+        if bucket["n_seeds_analyzed"] < min_seeds:
             violations.append(
                 f'arm {arm!r}: {bucket["n_seeds_analyzed"]} analyzable seed(s) '
                 f'after pre-specified exclusions, below the certification '
@@ -1339,56 +1347,56 @@ def run_exclusion_audit(runs: Sequence[Mapping],
         # Per-arm seed counts are not enough: the paired contrast uses the
         # seeds shared by every arm. Arms with disjoint seed sets can each look
         # replicated while contributing zero analyzable pairs.
-        seed_sets = [set(bucket['seeds']) for bucket in per_arm.values()]
+        seed_sets = [set(bucket["seeds"]) for bucket in per_arm.values()]
         shared_seeds = set.intersection(*seed_sets) if seed_sets else set()
         if not shared_seeds:
             violations.append(
-                'no seed is shared by every analyzed arm; the planned paired '
-                'contrast has zero analyzable pairs (per-arm seed counts alone '
-                'do not establish a paired replication)')
+                "no seed is shared by every analyzed arm; the planned paired "
+                "contrast has zero analyzable pairs (per-arm seed counts alone "
+                "do not establish a paired replication)")
     if duplicate_ids:
-        violations.append(f'duplicate run id(s): {sorted(set(duplicate_ids))}')
+        violations.append(f"duplicate run id(s): {sorted(set(duplicate_ids))}")
     if duplicate_seeds:
-        violations.append(f'duplicate seed(s) within an arm: {sorted(set(duplicate_seeds))}')
+        violations.append(f"duplicate seed(s) within an arm: {sorted(set(duplicate_seeds))}")
     if invalid_seed_ids:
         violations.append(
-            'invalid seed id(s) (seed must be an integer): '
-            f'{sorted(set(invalid_seed_ids))}')
+            "invalid seed id(s) (seed must be an integer): "
+            f"{sorted(set(invalid_seed_ids))}")
     if unknown_reasons:
         warnings.append(
-            'run fact(s) with no policy rule, treated as no exclusion: '
-            f'{sorted(unknown_reasons)}')
-    if by_status['excluded'] and len(per_arm) > 1:
-        fractions = [bucket['excluded_fraction'] for bucket in per_arm.values()]
+            "run fact(s) with no policy rule, treated as no exclusion: "
+            f"{sorted(unknown_reasons)}")
+    if by_status["excluded"] and len(per_arm) > 1:
+        fractions = [bucket["excluded_fraction"] for bucket in per_arm.values()]
         if max(fractions) - min(fractions) >= 0.5:
             attrition_balanced = False
             warnings.append(
-                'differential attrition across arms (excluded fraction range '
-                f'{min(fractions):.2f}-{max(fractions):.2f}); compare the per-arm '
-                'counts before reading a pooled mean')
+                "differential attrition across arms (excluded fraction range "
+                f"{min(fractions):.2f}-{max(fractions):.2f}); compare the per-arm "
+                "counts before reading a pooled mean")
     return {
-        'schema': 'adasquash.exclusion_audit.v1',
-        'policy_fingerprint': fingerprint,
-        'policy': canonical,
-        'min_seeds': min_seeds,
-        'n_planned': len(classified),
-        'n_analyzed': by_status['analyzed'] + by_status['sensitivity'],
-        'n_clean': by_status['analyzed'],
-        'n_sensitivity': by_status['sensitivity'],
-        'n_excluded': by_status['excluded'],
-        'by_status': by_status,
-        'by_reason': by_reason,
-        'per_arm': per_arm,
-        'excluded_runs': excluded_runs,
-        'sensitivity_runs': sensitivity_runs,
-        'violations': violations,
-        'warnings': warnings,
-        'ready': not violations,
-        'attrition_balanced': attrition_balanced,
-        'protocol': (
-            'every planned run is either retained, flagged for a sensitivity '
-            'check, or excluded for a pre-specified outcome-blind protocol '
-            'failure; an arm below the replication minimum cannot be certified'),
+        "schema": "adasquash.exclusion_audit.v1",
+        "policy_fingerprint": fingerprint,
+        "policy": canonical,
+        "min_seeds": min_seeds,
+        "n_planned": len(classified),
+        "n_analyzed": by_status["analyzed"] + by_status["sensitivity"],
+        "n_clean": by_status["analyzed"],
+        "n_sensitivity": by_status["sensitivity"],
+        "n_excluded": by_status["excluded"],
+        "by_status": by_status,
+        "by_reason": by_reason,
+        "per_arm": per_arm,
+        "excluded_runs": excluded_runs,
+        "sensitivity_runs": sensitivity_runs,
+        "violations": violations,
+        "warnings": warnings,
+        "ready": not violations,
+        "attrition_balanced": attrition_balanced,
+        "protocol": (
+            "every planned run is either retained, flagged for a sensitivity "
+            "check, or excluded for a pre-specified outcome-blind protocol "
+            "failure; an arm below the replication minimum cannot be certified"),
     }
 
 
@@ -1424,44 +1432,44 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
     """
     sd = _finite_float(paired_sd)
     if sd is None or sd < 0.0:
-        raise ValueError(f'paired_sd must be a finite number >= 0, got {paired_sd!r}')
+        raise ValueError(f"paired_sd must be a finite number >= 0, got {paired_sd!r}")
     if (isinstance(n_pairs, bool)
             or not isinstance(n_pairs, numbers.Integral) or n_pairs < 2):
-        raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
+        raise ValueError(f"n_pairs must be an integer >= 2, got {n_pairs!r}")
     n_pairs = int(n_pairs)
     margin_value = _finite_float(margin)
     if margin_value is None or margin_value <= 0.0:
-        raise ValueError(f'margin must be a finite number > 0, got {margin!r}')
+        raise ValueError(f"margin must be a finite number > 0, got {margin!r}")
     alpha_value = _finite_float(alpha)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
-        raise ValueError(f'alpha must be strictly between 0 and 1, got {alpha!r}')
+        raise ValueError(f"alpha must be strictly between 0 and 1, got {alpha!r}")
     power_value = _finite_float(power)
     if power_value is None or not 0.0 < power_value < 1.0:
-        raise ValueError(f'power must be strictly between 0 and 1, got {power!r}')
+        raise ValueError(f"power must be strictly between 0 and 1, got {power!r}")
     if (isinstance(n_tests, bool)
             or not isinstance(n_tests, numbers.Integral) or n_tests < 1):
-        raise ValueError(f'n_tests must be a positive integer, got {n_tests!r}')
+        raise ValueError(f"n_tests must be a positive integer, got {n_tests!r}")
     n_tests = int(n_tests)
     attrition = _finite_float(expected_attrition)
     if attrition is None or not 0.0 <= attrition < 1.0:
         raise ValueError(
-            f'expected_attrition must be a probability in [0, 1), got '
-            f'{expected_attrition!r}')
+            f"expected_attrition must be a probability in [0, 1), got "
+            f"{expected_attrition!r}")
     if (isinstance(max_pairs, bool)
             or not isinstance(max_pairs, numbers.Integral) or max_pairs < 2):
-        raise ValueError(f'max_pairs must be an integer >= 2, got {max_pairs!r}')
+        raise ValueError(f"max_pairs must be an integer >= 2, got {max_pairs!r}")
     max_pairs = int(max_pairs)
 
     try:
         family_alpha = alpha_value / n_tests
     except OverflowError:
         raise ValueError(
-            f'n_tests={n_tests!r} is too large: alpha / n_tests exceeds the '
-            f'float range') from None
+            f"n_tests={n_tests!r} is too large: alpha / n_tests exceeds the "
+            f"float range") from None
     if family_alpha == 0.0:
         raise ValueError(
-            f'n_tests={n_tests!r} is too large: alpha / n_tests underflows to '
-            f'zero')
+            f"n_tests={n_tests!r} is too large: alpha / n_tests underflows to "
+            f"zero")
     required_unadjusted = paired_required_n(
         sd, margin_value, alpha=alpha_value, power=power_value, max_n=max_pairs)
     required_adjusted = paired_required_n(
@@ -1490,47 +1498,47 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
         None if required_adjusted is None else
         bool(expected_pairs >= 2 and expected_pairs >= required_adjusted))
     if required_adjusted is None:
-        note = ('the pre-specified margin is not detectable within max_pairs at '
-                'the family-level alpha even before attrition; increase the '
-                'budget or reconsider the margin')
+        note = ("the pre-specified margin is not detectable within max_pairs at "
+                "the family-level alpha even before attrition; increase the "
+                "budget or reconsider the margin")
     elif required_planned is None:
-        note = ('the attrition assumption leaves no positive complete-pair '
-                'survival, so a finite planned pair count does not exist')
+        note = ("the attrition assumption leaves no positive complete-pair "
+                "survival, so a finite planned pair count does not exist")
     elif adequate_after_attrition:
-        note = ('the planned seed count still covers the family-adjusted '
-                'requirement after the expected attrition')
+        note = ("the planned seed count still covers the family-adjusted "
+                "requirement after the expected attrition")
     else:
-        note = ('underpowered after multiplicity and attrition: plan '
-                f'{required_planned} seed pair(s), not {n_pairs}')
+        note = ("underpowered after multiplicity and attrition: plan "
+                f"{required_planned} seed pair(s), not {n_pairs}")
     return {
-        'schema': 'adasquash.prospective_power.v1',
-        'paired_sd': sd,
-        'n_pairs': n_pairs,
-        'margin': margin_value,
-        'alpha': alpha_value,
-        'power_target': power_value,
-        'n_tests': n_tests,
-        'multiplicity_method': 'bonferroni',
-        'family_alpha': family_alpha,
-        'expected_attrition': attrition,
-        'complete_pair_survival': pair_survival,
-        'expected_analyzable_pairs': expected_pairs,
-        'required_pairs_unadjusted': required_unadjusted,
-        'required_pairs_family_adjusted': required_adjusted,
-        'required_planned_pairs': required_planned,
-        'shortfall_pairs': (None if required_planned is None
+        "schema": "adasquash.prospective_power.v1",
+        "paired_sd": sd,
+        "n_pairs": n_pairs,
+        "margin": margin_value,
+        "alpha": alpha_value,
+        "power_target": power_value,
+        "n_tests": n_tests,
+        "multiplicity_method": "bonferroni",
+        "family_alpha": family_alpha,
+        "expected_attrition": attrition,
+        "complete_pair_survival": pair_survival,
+        "expected_analyzable_pairs": expected_pairs,
+        "required_pairs_unadjusted": required_unadjusted,
+        "required_pairs_family_adjusted": required_adjusted,
+        "required_planned_pairs": required_planned,
+        "shortfall_pairs": (None if required_planned is None
                             else max(0, required_planned - n_pairs)),
-        'minimum_detectable_delta_unadjusted': planned_unadjusted[
-            'minimum_detectable_delta'],
-        'minimum_detectable_delta_family_adjusted': planned_summary[
-            'minimum_detectable_delta'],
-        'minimum_detectable_delta_after_attrition': (
-            effective_summary['minimum_detectable_delta']
+        "minimum_detectable_delta_unadjusted": planned_unadjusted[
+            "minimum_detectable_delta"],
+        "minimum_detectable_delta_family_adjusted": planned_summary[
+            "minimum_detectable_delta"],
+        "minimum_detectable_delta_after_attrition": (
+            effective_summary["minimum_detectable_delta"]
             if effective_summary else None),
-        'adequately_powered_unadjusted': adequate_unadjusted,
-        'adequately_powered_family_adjusted': adequate_adjusted,
-        'adequately_powered_after_attrition': adequate_after_attrition,
-        'note': note,
+        "adequately_powered_unadjusted": adequate_unadjusted,
+        "adequately_powered_family_adjusted": adequate_adjusted,
+        "adequately_powered_after_attrition": adequate_after_attrition,
+        "note": note,
     }
 
 
@@ -1556,51 +1564,51 @@ def tost_power_plan(paired_sd: float, n_pairs: int,
     sd = _finite_float(paired_sd)
     if sd is None or sd < 0.0:
         raise ValueError(
-            f'paired_sd must be a finite number >= 0, got {paired_sd!r}')
+            f"paired_sd must be a finite number >= 0, got {paired_sd!r}")
     if (isinstance(n_pairs, bool)
             or not isinstance(n_pairs, numbers.Integral) or n_pairs < 2):
-        raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
+        raise ValueError(f"n_pairs must be an integer >= 2, got {n_pairs!r}")
     n_pairs = int(n_pairs)
     margin_value = _finite_float(equivalence_margin)
     if margin_value is None or margin_value <= 0.0:
         raise ValueError(
-            f'equivalence_margin must be a finite number > 0, got '
-            f'{equivalence_margin!r}')
+            f"equivalence_margin must be a finite number > 0, got "
+            f"{equivalence_margin!r}")
     alpha_value = _finite_float(alpha)
     if alpha_value is None or not 0.0 < alpha_value < 0.5:
         raise ValueError(
-            f'alpha must be strictly between 0 and 0.5 for a TOST, got '
-            f'{alpha!r}')
+            f"alpha must be strictly between 0 and 0.5 for a TOST, got "
+            f"{alpha!r}")
     power_value = _finite_float(power)
     if power_value is None or not 0.0 < power_value < 1.0:
         raise ValueError(
-            f'power must be strictly between 0 and 1, got {power!r}')
+            f"power must be strictly between 0 and 1, got {power!r}")
     if (isinstance(n_tests, bool)
             or not isinstance(n_tests, numbers.Integral) or n_tests < 1):
         raise ValueError(
-            f'n_tests must be a positive integer, got {n_tests!r}')
+            f"n_tests must be a positive integer, got {n_tests!r}")
     n_tests = int(n_tests)
     attrition = _finite_float(expected_attrition)
     if attrition is None or not 0.0 <= attrition < 1.0:
         raise ValueError(
-            f'expected_attrition must be a probability in [0, 1), got '
-            f'{expected_attrition!r}')
+            f"expected_attrition must be a probability in [0, 1), got "
+            f"{expected_attrition!r}")
     if (isinstance(max_pairs, bool)
             or not isinstance(max_pairs, numbers.Integral) or max_pairs < 2):
         raise ValueError(
-            f'max_pairs must be an integer >= 2, got {max_pairs!r}')
+            f"max_pairs must be an integer >= 2, got {max_pairs!r}")
     max_pairs = int(max_pairs)
 
     try:
         family_alpha = alpha_value / n_tests
     except OverflowError:
         raise ValueError(
-            f'n_tests={n_tests!r} is too large: alpha / n_tests exceeds the '
-            f'float range') from None
+            f"n_tests={n_tests!r} is too large: alpha / n_tests exceeds the "
+            f"float range") from None
     if family_alpha == 0.0:
         raise ValueError(
-            f'n_tests={n_tests!r} is too large: alpha / n_tests underflows to '
-            f'zero')
+            f"n_tests={n_tests!r} is too large: alpha / n_tests underflows to "
+            f"zero")
     required_unadjusted = tost_required_n(
         sd, margin_value, alpha=alpha_value, power=power_value,
         max_n=max_pairs)
@@ -1630,56 +1638,56 @@ def tost_power_plan(paired_sd: float, n_pairs: int,
         None if required_adjusted is None else
         bool(expected_pairs >= 2 and expected_pairs >= required_adjusted))
     if required_adjusted is None:
-        note = ('the equivalence margin is not reachable within max_pairs at '
-                'the family-level alpha even before attrition; increase the '
-                'budget or reconsider the margin')
+        note = ("the equivalence margin is not reachable within max_pairs at "
+                "the family-level alpha even before attrition; increase the "
+                "budget or reconsider the margin")
     elif required_planned is None:
-        note = ('the attrition assumption leaves no positive complete-pair '
-                'survival, so a finite planned pair count does not exist')
+        note = ("the attrition assumption leaves no positive complete-pair "
+                "survival, so a finite planned pair count does not exist")
     elif adequate_after_attrition:
-        note = ('the planned seed count still covers the family-adjusted '
-                'TOST requirement after the expected attrition')
+        note = ("the planned seed count still covers the family-adjusted "
+                "TOST requirement after the expected attrition")
     else:
-        note = ('underpowered for equivalence after multiplicity and '
-                f'attrition: plan {required_planned} seed pair(s), not '
-                f'{n_pairs}')
+        note = ("underpowered for equivalence after multiplicity and "
+                f"attrition: plan {required_planned} seed pair(s), not "
+                f"{n_pairs}")
     return {
-        'schema': 'adasquash.tost_power.v1',
-        'paired_sd': sd,
-        'n_pairs': n_pairs,
-        'equivalence_margin': margin_value,
-        'alpha': alpha_value,
-        'power_target': power_value,
-        'n_tests': n_tests,
-        'multiplicity_method': 'bonferroni',
-        'family_alpha': family_alpha,
-        'expected_attrition': attrition,
-        'complete_pair_survival': pair_survival,
-        'expected_analyzable_pairs': expected_pairs,
-        'required_pairs_unadjusted': required_unadjusted,
-        'required_pairs_family_adjusted': required_adjusted,
-        'required_planned_pairs': required_planned,
-        'shortfall_pairs': (None if required_planned is None
+        "schema": "adasquash.tost_power.v1",
+        "paired_sd": sd,
+        "n_pairs": n_pairs,
+        "equivalence_margin": margin_value,
+        "alpha": alpha_value,
+        "power_target": power_value,
+        "n_tests": n_tests,
+        "multiplicity_method": "bonferroni",
+        "family_alpha": family_alpha,
+        "expected_attrition": attrition,
+        "complete_pair_survival": pair_survival,
+        "expected_analyzable_pairs": expected_pairs,
+        "required_pairs_unadjusted": required_unadjusted,
+        "required_pairs_family_adjusted": required_adjusted,
+        "required_planned_pairs": required_planned,
+        "shortfall_pairs": (None if required_planned is None
                             else max(0, required_planned - n_pairs)),
-        'approximate_power_unadjusted': planned_unadjusted[
-            'approximate_power_at_n'],
-        'approximate_power_family_adjusted': planned_summary[
-            'approximate_power_at_n'],
-        'approximate_power_after_attrition': (
-            effective_summary['approximate_power_at_n']
+        "approximate_power_unadjusted": planned_unadjusted[
+            "approximate_power_at_n"],
+        "approximate_power_family_adjusted": planned_summary[
+            "approximate_power_at_n"],
+        "approximate_power_after_attrition": (
+            effective_summary["approximate_power_at_n"]
             if effective_summary else None),
-        'minimum_detectable_equivalence_margin_unadjusted':
-            planned_unadjusted['minimum_detectable_equivalence_margin'],
-        'minimum_detectable_equivalence_margin_family_adjusted':
-            planned_summary['minimum_detectable_equivalence_margin'],
-        'adequately_powered_unadjusted': adequate_unadjusted,
-        'adequately_powered_family_adjusted': adequate_adjusted,
-        'adequately_powered_after_attrition': adequate_after_attrition,
-        'note': note,
+        "minimum_detectable_equivalence_margin_unadjusted":
+            planned_unadjusted["minimum_detectable_equivalence_margin"],
+        "minimum_detectable_equivalence_margin_family_adjusted":
+            planned_summary["minimum_detectable_equivalence_margin"],
+        "adequately_powered_unadjusted": adequate_unadjusted,
+        "adequately_powered_family_adjusted": adequate_adjusted,
+        "adequately_powered_after_attrition": adequate_after_attrition,
+        "note": note,
     }
 
 
-PAIRED_SD_CALIBRATION_SCHEMA = 'adasquash.paired_sd_calibration.v1'
+PAIRED_SD_CALIBRATION_SCHEMA = "adasquash.paired_sd_calibration.v1"
 
 
 def _median(values: Sequence[float]) -> float:
@@ -1702,10 +1710,10 @@ def _chi2_lower_quantile(probability: float, df: float) -> float:
     """
     if not 0.0 < probability < 1.0:
         raise ValueError(
-            f'chi-square probability must be strictly between 0 and 1, got '
-            f'{probability!r}')
+            f"chi-square probability must be strictly between 0 and 1, got "
+            f"{probability!r}")
     if not math.isfinite(df) or df <= 0.0:
-        raise ValueError(f'chi-square df must be positive and finite, got {df!r}')
+        raise ValueError(f"chi-square df must be positive and finite, got {df!r}")
     target_tail = 1.0 - probability
     lo = 0.0
     hi = max(1.0, df)
@@ -1715,10 +1723,10 @@ def _chi2_lower_quantile(probability: float, df: float) -> float:
         hi *= 2.0
         if not math.isfinite(hi):
             raise ValueError(
-                'chi-square quantile overflowed; the confidence level is too '
-                'close to 1 for the available precision')
+                "chi-square quantile overflowed; the confidence level is too "
+                "close to 1 for the available precision")
     else:
-        raise ValueError('chi-square quantile did not converge')
+        raise ValueError("chi-square quantile did not converge")
     for _ in range(400):
         mid = (lo + hi) / 2.0
         if mid == lo or mid == hi:
@@ -1732,7 +1740,7 @@ def _chi2_lower_quantile(probability: float, df: float) -> float:
 
 def _paired_sd_fingerprint(payload: Mapping) -> str:
     return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 
@@ -1770,94 +1778,94 @@ def paired_sd_calibration(differences, *,
     choose the scientifically important margin after seeing it.
     """
     if isinstance(differences, (str, bytes, bytearray)) or isinstance(differences, Mapping):
-        raise ValueError('differences must be an iterable of paired differences')
+        raise ValueError("differences must be an iterable of paired differences")
     try:
         raw_items = list(differences)
     except TypeError:
         raise ValueError(
-            'differences must be an iterable of paired differences') from None
+            "differences must be an iterable of paired differences") from None
     confidence_value = _finite_float(confidence)
     if confidence_value is None or not 0.5 < confidence_value < 1.0:
         raise ValueError(
-            f'confidence must be strictly between 0.5 and 1, got {confidence!r}')
+            f"confidence must be strictly between 0.5 and 1, got {confidence!r}")
     if (isinstance(min_pairs, bool)
             or not isinstance(min_pairs, numbers.Integral) or min_pairs < 2):
-        raise ValueError(f'min_pairs must be an integer >= 2, got {min_pairs!r}')
+        raise ValueError(f"min_pairs must be an integer >= 2, got {min_pairs!r}")
     min_pairs = int(min_pairs)
 
     seed_list = None
     if pilot_seeds is not None:
         if isinstance(pilot_seeds, (str, bytes)):
-            raise ValueError('pilot_seeds must be an iterable of integer seeds')
+            raise ValueError("pilot_seeds must be an iterable of integer seeds")
         seed_list = [_validate_seed(seed) for seed in pilot_seeds]
     confirmatory = None
     if confirmatory_seeds is not None:
         if isinstance(confirmatory_seeds, (str, bytes)):
             raise ValueError(
-                'confirmatory_seeds must be an iterable of integer seeds')
+                "confirmatory_seeds must be an iterable of integer seeds")
         confirmatory = [_validate_seed(seed) for seed in confirmatory_seeds]
         if len(set(confirmatory)) != len(confirmatory):
-            raise ValueError('confirmatory_seeds must be unique')
+            raise ValueError("confirmatory_seeds must be unique")
 
     values: list[float] = []
     seeds: list[Optional[int]] = []
     for index, item in enumerate(raw_items):
         item_seed = None
         if isinstance(item, Mapping):
-            if 'difference' in item:
-                raw_value = item.get('difference')
-            elif 'delta' in item:
-                raw_value = item.get('delta')
+            if "difference" in item:
+                raw_value = item.get("difference")
+            elif "delta" in item:
+                raw_value = item.get("delta")
             else:
                 raise ValueError(
                     f'difference record {index} needs a "difference" (or '
                     f'"delta") field')
-            item_seed = item.get('seed')
+            item_seed = item.get("seed")
         else:
             raw_value = item
         value = _finite_float(raw_value)
         if value is None:
             raise ValueError(
-                f'paired difference {index} must be a finite real number, got '
-                f'{raw_value!r}')
+                f"paired difference {index} must be a finite real number, got "
+                f"{raw_value!r}")
         if item_seed is not None:
             item_seed = _validate_seed(item_seed)
         if seed_list is not None:
             if index >= len(seed_list):
                 raise ValueError(
-                    'pilot_seeds must have one entry per paired difference')
+                    "pilot_seeds must have one entry per paired difference")
             if item_seed is not None and item_seed != seed_list[index]:
                 raise ValueError(
-                    f'difference record {index} carries seed {item_seed}, but '
-                    f'pilot_seeds[{index}] is {seed_list[index]}')
+                    f"difference record {index} carries seed {item_seed}, but "
+                    f"pilot_seeds[{index}] is {seed_list[index]}")
             item_seed = seed_list[index]
         values.append(float(value))
         seeds.append(item_seed)
     if seed_list is not None and len(seed_list) != len(values):
         raise ValueError(
-            f'pilot_seeds has {len(seed_list)} entries for {len(values)} '
-            f'paired difference(s)')
+            f"pilot_seeds has {len(seed_list)} entries for {len(values)} "
+            f"paired difference(s)")
     if len(values) < min_pairs:
         raise ValueError(
-            f'a paired-SD calibration needs at least {min_pairs} finite pair(s), '
-            f'got {len(values)}')
+            f"a paired-SD calibration needs at least {min_pairs} finite pair(s), "
+            f"got {len(values)}")
     present_seeds = [seed for seed in seeds if seed is not None]
     if len(set(present_seeds)) != len(present_seeds):
         duplicates = sorted({seed for seed in present_seeds
                              if present_seeds.count(seed) > 1})
         raise ValueError(
-            f'pilot seeds must identify independent runs; duplicated: {duplicates}')
+            f"pilot seeds must identify independent runs; duplicated: {duplicates}")
     if present_seeds and len(present_seeds) != len(values):
         raise ValueError(
-            'either every pilot difference must carry its seed or none may; '
-            'a partial seed table cannot prove seed-level independence')
+            "either every pilot difference must carry its seed or none may; "
+            "a partial seed table cannot prove seed-level independence")
 
     stats = mean_std_stderr(values)
     if stats is None:
-        raise ValueError('the pilot differences have no finite statistics')
-    n = int(stats['n'])
-    mean = float(stats['mean'])
-    sd = float(stats['std'])
+        raise ValueError("the pilot differences have no finite statistics")
+    n = int(stats["n"])
+    mean = float(stats["mean"])
+    sd = float(stats["std"])
     df = n - 1
     if sd == 0.0:
         upper = 0.0
@@ -1880,15 +1888,15 @@ def paired_sd_calibration(differences, *,
         # upper bound is also zero. Planning at zero would make every sample
         # size look sufficient, so the calibration refuses to recommend it.
         recommended = None
-        recommended_basis = 'zero_variance_pilot_not_usable'
+        recommended_basis = "zero_variance_pilot_not_usable"
     elif upper is None:
         # A finite point estimate is still a better fallback than refusing to
         # produce any planning value, but the report says the bound overflowed.
         recommended = sd if math.isfinite(sd) else None
-        recommended_basis = 'point_estimate_after_bound_overflow'
+        recommended_basis = "point_estimate_after_bound_overflow"
     else:
         recommended = upper
-        recommended_basis = 'one_sided_upper_confidence_bound'
+        recommended_basis = "one_sided_upper_confidence_bound"
 
     pilot_seed_list = present_seeds if present_seeds else []
     overlap = None
@@ -1897,41 +1905,41 @@ def paired_sd_calibration(differences, *,
         overlap = sorted(set(pilot_seed_list).intersection(confirmatory))
         disjoint = not overlap
     payload = {
-        'differences': values,
-        'pilot_seeds': pilot_seed_list,
-        'confirmatory_seeds': confirmatory,
-        'confidence': confidence_value,
-        'min_pairs': min_pairs,
-        'n_pairs': n,
-        'mean_delta': mean,
-        'paired_sd': sd,
-        'recommended_paired_sd': recommended,
+        "differences": values,
+        "pilot_seeds": pilot_seed_list,
+        "confirmatory_seeds": confirmatory,
+        "confidence": confidence_value,
+        "min_pairs": min_pairs,
+        "n_pairs": n,
+        "mean_delta": mean,
+        "paired_sd": sd,
+        "recommended_paired_sd": recommended,
     }
     fingerprint = _paired_sd_fingerprint(payload)
     return {
-        'schema': PAIRED_SD_CALIBRATION_SCHEMA,
-        'fingerprint': fingerprint,
-        'source': 'pilot',
-        'differences': values,
-        'pilot_seeds': pilot_seed_list,
-        'confirmatory_seeds': confirmatory,
-        'n_pairs': n,
-        'min_pairs': min_pairs,
-        'df': df,
-        'mean_delta': mean,
-        'paired_sd': sd,
-        'robust_paired_sd': robust_sd,
-        'confidence': confidence_value,
-        'sd_upper_confidence_bound': upper,
-        'recommended_paired_sd': recommended,
-        'recommended_basis': recommended_basis,
-        'zero_variance': bool(sd == 0.0),
-        'seed_overlap': overlap,
-        'seeds_disjoint': disjoint,
-        'note': (
-            'plan at the upper confidence bound, not the pilot point estimate; '
-            'the pilot mean is descriptive and must not be used to choose the '
-            'smallest effect of interest after seeing it'),
+        "schema": PAIRED_SD_CALIBRATION_SCHEMA,
+        "fingerprint": fingerprint,
+        "source": "pilot",
+        "differences": values,
+        "pilot_seeds": pilot_seed_list,
+        "confirmatory_seeds": confirmatory,
+        "n_pairs": n,
+        "min_pairs": min_pairs,
+        "df": df,
+        "mean_delta": mean,
+        "paired_sd": sd,
+        "robust_paired_sd": robust_sd,
+        "confidence": confidence_value,
+        "sd_upper_confidence_bound": upper,
+        "recommended_paired_sd": recommended,
+        "recommended_basis": recommended_basis,
+        "zero_variance": bool(sd == 0.0),
+        "seed_overlap": overlap,
+        "seeds_disjoint": disjoint,
+        "note": (
+            "plan at the upper confidence bound, not the pilot point estimate; "
+            "the pilot mean is descriptive and must not be used to choose the "
+            "smallest effect of interest after seeing it"),
     }
 
 
@@ -1958,160 +1966,160 @@ def paired_sd_evidence_audit(evidence: Mapping,
     """
     if not isinstance(evidence, Mapping):
         raise ValueError(
-            f'paired-SD evidence must be a mapping, got '
-            f'{type(evidence).__name__}')
-    if evidence.get('schema') != PAIRED_SD_CALIBRATION_SCHEMA:
+            f"paired-SD evidence must be a mapping, got "
+            f"{type(evidence).__name__}")
+    if evidence.get("schema") != PAIRED_SD_CALIBRATION_SCHEMA:
         raise ValueError(
             f'paired-SD evidence schema must be '
             f'{PAIRED_SD_CALIBRATION_SCHEMA!r}, got {evidence.get("schema")!r}')
     tolerance_value = _finite_float(tolerance)
     if tolerance_value is None or not 0.0 <= tolerance_value < 1.0:
         raise ValueError(
-            f'tolerance must be a finite probability in [0, 1), got '
-            f'{tolerance!r}')
+            f"tolerance must be a finite probability in [0, 1), got "
+            f"{tolerance!r}")
     if (isinstance(min_pilot_pairs, bool)
             or not isinstance(min_pilot_pairs, numbers.Integral)
             or min_pilot_pairs < 2):
         raise ValueError(
-            f'min_pilot_pairs must be an integer >= 2, got '
-            f'{min_pilot_pairs!r}')
+            f"min_pilot_pairs must be an integer >= 2, got "
+            f"{min_pilot_pairs!r}")
     min_pilot_pairs = int(min_pilot_pairs)
 
-    stored_fingerprint = evidence.get('fingerprint')
+    stored_fingerprint = evidence.get("fingerprint")
     try:
         recomputed = paired_sd_calibration(
-            evidence.get('differences'),
-            pilot_seeds=evidence.get('pilot_seeds'),
-            confirmatory_seeds=evidence.get('confirmatory_seeds'),
-            confidence=evidence.get('confidence'),
-            min_pairs=evidence.get('min_pairs'))
+            evidence.get("differences"),
+            pilot_seeds=evidence.get("pilot_seeds"),
+            confirmatory_seeds=evidence.get("confirmatory_seeds"),
+            confidence=evidence.get("confidence"),
+            min_pairs=evidence.get("min_pairs"))
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f'paired-SD evidence is not a valid calibration record: {exc}') from None
+            f"paired-SD evidence is not a valid calibration record: {exc}") from None
     fingerprint_verified = (
         isinstance(stored_fingerprint, str)
-        and stored_fingerprint == recomputed['fingerprint'])
+        and stored_fingerprint == recomputed["fingerprint"])
     checks: list[dict] = []
 
     def add(check_id: str, status: str, detail: str) -> None:
-        checks.append({'id': check_id, 'status': status, 'detail': detail})
+        checks.append({"id": check_id, "status": status, "detail": detail})
 
     if fingerprint_verified:
-        add('fingerprint', 'pass',
-            'stored fingerprint matches the recorded pilot differences')
+        add("fingerprint", "pass",
+            "stored fingerprint matches the recorded pilot differences")
     else:
-        add('fingerprint', 'fail',
-            'stored fingerprint is missing or does not match the recorded '
-            'pilot differences; the calibration was edited after it was frozen')
+        add("fingerprint", "fail",
+            "stored fingerprint is missing or does not match the recorded "
+            "pilot differences; the calibration was edited after it was frozen")
 
-    n_pairs = int(recomputed['n_pairs'])
+    n_pairs = int(recomputed["n_pairs"])
     if n_pairs < min_pilot_pairs:
-        add('pilot_replication', 'warn',
-            f'{n_pairs} pilot pair(s) is a very small variance pilot; the '
-            f'upper bound is wide and the design should not be read as '
-            f'precisely powered (recommended >= {min_pilot_pairs})')
+        add("pilot_replication", "warn",
+            f"{n_pairs} pilot pair(s) is a very small variance pilot; the "
+            f"upper bound is wide and the design should not be read as "
+            f"precisely powered (recommended >= {min_pilot_pairs})")
     else:
-        add('pilot_replication', 'pass',
-            f'{n_pairs} pilot pair(s) supply the variance calibration')
+        add("pilot_replication", "pass",
+            f"{n_pairs} pilot pair(s) supply the variance calibration")
 
     confirm = None
     if confirmatory_seeds is not None:
         if isinstance(confirmatory_seeds, (str, bytes)):
             raise ValueError(
-                'confirmatory_seeds must be an iterable of integer seeds')
+                "confirmatory_seeds must be an iterable of integer seeds")
         confirm = [_validate_seed(seed) for seed in confirmatory_seeds]
         if len(set(confirm)) != len(confirm):
-            raise ValueError('confirmatory_seeds must be unique')
-    stored_confirm = recomputed.get('confirmatory_seeds')
-    overlap = recomputed.get('seed_overlap')
-    disjoint = recomputed.get('seeds_disjoint')
-    pilot_seeds = recomputed.get('pilot_seeds') or []
+            raise ValueError("confirmatory_seeds must be unique")
+    stored_confirm = recomputed.get("confirmatory_seeds")
+    overlap = recomputed.get("seed_overlap")
+    disjoint = recomputed.get("seeds_disjoint")
+    pilot_seeds = recomputed.get("pilot_seeds") or []
     if confirm is not None and pilot_seeds:
         overlap = sorted(set(pilot_seeds).intersection(confirm))
         disjoint = not overlap
     if not pilot_seeds:
-        add('seed_disjointness', 'warn',
-            'the pilot differences carry no seed provenance, so independence '
-            'from the confirmatory seeds cannot be verified')
+        add("seed_disjointness", "warn",
+            "the pilot differences carry no seed provenance, so independence "
+            "from the confirmatory seeds cannot be verified")
     elif disjoint is None:
-        add('seed_disjointness', 'warn',
-            'confirmatory seeds were not supplied, so pilot/confirmatory seed '
-            'overlap cannot be checked')
+        add("seed_disjointness", "warn",
+            "confirmatory seeds were not supplied, so pilot/confirmatory seed "
+            "overlap cannot be checked")
     elif disjoint:
-        add('seed_disjointness', 'pass',
-            f'pilot seeds {pilot_seeds} are disjoint from the confirmatory '
-            f'seeds {confirm if confirm is not None else stored_confirm}')
+        add("seed_disjointness", "pass",
+            f"pilot seeds {pilot_seeds} are disjoint from the confirmatory "
+            f"seeds {confirm if confirm is not None else stored_confirm}")
     else:
-        add('seed_disjointness', 'fail',
-            f'pilot seed(s) {overlap} are reused in the confirmatory design; '
-            f'this is not independent replication and lets a pilot outcome '
-            f'enter the confirmatory analysis')
+        add("seed_disjointness", "fail",
+            f"pilot seed(s) {overlap} are reused in the confirmatory design; "
+            f"this is not independent replication and lets a pilot outcome "
+            f"enter the confirmatory analysis")
 
-    recommended = recomputed.get('recommended_paired_sd')
-    if recomputed.get('zero_variance'):
-        add('variance_estimate', 'warn',
-            'the pilot paired differences have exactly zero variance; a zero '
-            'planning SD is not credible from a small pilot and makes any '
-            'sample size look sufficient')
+    recommended = recomputed.get("recommended_paired_sd")
+    if recomputed.get("zero_variance"):
+        add("variance_estimate", "warn",
+            "the pilot paired differences have exactly zero variance; a zero "
+            "planning SD is not credible from a small pilot and makes any "
+            "sample size look sufficient")
     if assumed_paired_sd is None:
         if recommended is None:
-            add('planning_sd', 'fail',
-                'no planning SD was supplied and the pilot calibration has no '
-                'finite upper confidence bound')
+            add("planning_sd", "fail",
+                "no planning SD was supplied and the pilot calibration has no "
+                "finite upper confidence bound")
         else:
-            add('planning_sd', 'warn',
-                f'no planning SD was supplied; the pilot recommends '
-                f'{recommended:g}, but the design audit did not use it')
+            add("planning_sd", "warn",
+                f"no planning SD was supplied; the pilot recommends "
+                f"{recommended:g}, but the design audit did not use it")
     else:
         assumed = _finite_float(assumed_paired_sd)
         if assumed is None or assumed < 0.0:
-            add('planning_sd', 'fail',
-                f'assumed paired SD must be a finite number >= 0, got '
-                f'{assumed_paired_sd!r}')
+            add("planning_sd", "fail",
+                f"assumed paired SD must be a finite number >= 0, got "
+                f"{assumed_paired_sd!r}")
         elif recommended is None or not math.isfinite(float(recommended)):
-            add('planning_sd', 'fail',
-                'the pilot calibration has no finite planning SD to compare '
-                'against')
+            add("planning_sd", "fail",
+                "the pilot calibration has no finite planning SD to compare "
+                "against")
         else:
             lower = float(recommended) * (1.0 - tolerance_value)
             upper = float(recommended) * (1.0 + tolerance_value)
             if assumed < lower:
-                add('planning_sd', 'fail',
-                    f'assumed paired SD={assumed:g} is below the pilot upper '
-                    f'confidence bound {float(recommended):g} (tolerance '
-                    f'{tolerance_value:.0%}); the planned power is optimistic')
+                add("planning_sd", "fail",
+                    f"assumed paired SD={assumed:g} is below the pilot upper "
+                    f"confidence bound {float(recommended):g} (tolerance "
+                    f"{tolerance_value:.0%}); the planned power is optimistic")
             elif assumed > upper:
-                add('planning_sd', 'pass',
-                    f'assumed paired SD={assumed:g} is above the pilot upper '
-                    f'confidence bound {float(recommended):g}; the plan is '
-                    f'conservative')
+                add("planning_sd", "pass",
+                    f"assumed paired SD={assumed:g} is above the pilot upper "
+                    f"confidence bound {float(recommended):g}; the plan is "
+                    f"conservative")
             else:
-                add('planning_sd', 'pass',
-                    f'assumed paired SD={assumed:g} matches the pilot upper '
-                    f'confidence bound {float(recommended):g} within '
-                    f'{tolerance_value:.0%}')
+                add("planning_sd", "pass",
+                    f"assumed paired SD={assumed:g} matches the pilot upper "
+                    f"confidence bound {float(recommended):g} within "
+                    f"{tolerance_value:.0%}")
 
-    n_fail = sum(1 for check in checks if check['status'] == 'fail')
-    n_warn = sum(1 for check in checks if check['status'] == 'warn')
-    status = 'fail' if n_fail else ('warn' if n_warn else 'pass')
+    n_fail = sum(1 for check in checks if check["status"] == "fail")
+    n_warn = sum(1 for check in checks if check["status"] == "warn")
+    status = "fail" if n_fail else ("warn" if n_warn else "pass")
     return {
-        'schema': 'adasquash.paired_sd_evidence_audit.v1',
-        'status': status,
-        'checks': checks,
-        'n_fail': n_fail,
-        'n_warn': n_warn,
-        'evidence_fingerprint': recomputed['fingerprint'],
-        'stored_fingerprint': stored_fingerprint,
-        'fingerprint_verified': fingerprint_verified,
-        'n_pilot_pairs': n_pairs,
-        'paired_sd': recomputed['paired_sd'],
-        'recommended_paired_sd': recommended,
-        'assumed_paired_sd': assumed_paired_sd,
-        'seed_overlap': overlap,
-        'seeds_disjoint': disjoint,
-        'note': (
-            'a confirmatory plan should use the pilot upper confidence bound; '
-            'the point estimate is reported for comparison only'),
+        "schema": "adasquash.paired_sd_evidence_audit.v1",
+        "status": status,
+        "checks": checks,
+        "n_fail": n_fail,
+        "n_warn": n_warn,
+        "evidence_fingerprint": recomputed["fingerprint"],
+        "stored_fingerprint": stored_fingerprint,
+        "fingerprint_verified": fingerprint_verified,
+        "n_pilot_pairs": n_pairs,
+        "paired_sd": recomputed["paired_sd"],
+        "recommended_paired_sd": recommended,
+        "assumed_paired_sd": assumed_paired_sd,
+        "seed_overlap": overlap,
+        "seeds_disjoint": disjoint,
+        "note": (
+            "a confirmatory plan should use the pilot upper confidence bound; "
+            "the point estimate is reported for comparison only"),
     }
 
 
@@ -2164,7 +2172,7 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     effective_paired_sd = assumed_paired_sd
 
     def add(check_id: str, status: str, detail: str) -> None:
-        checks.append({'id': check_id, 'status': status, 'detail': detail})
+        checks.append({"id": check_id, "status": status, "detail": detail})
 
     # `seeds or []` asks a NumPy array for its truth value, which raises
     # "truth value is ambiguous" before any check can run. A None default is
@@ -2176,9 +2184,9 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     if not min_seeds_valid:
         # A floor of 0 (or a bool) would switch off both the replication check
         # and the attrition floor; the audit must not certify such a design.
-        add('replication', 'fail',
-            f'invalid min_seeds {min_seeds!r}: must be a positive integer; '
-            f'using {MIN_SEEDS_FOR_SIGNIFICANCE}')
+        add("replication", "fail",
+            f"invalid min_seeds {min_seeds!r}: must be a positive integer; "
+            f"using {MIN_SEEDS_FOR_SIGNIFICANCE}")
         min_seeds = MIN_SEEDS_FOR_SIGNIFICANCE
     else:
         min_seeds = int(min_seeds)
@@ -2196,10 +2204,10 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             len(seeds) < min_seeds
             or len(integral_seeds) != len(seeds)
             or n_pairs != len(seeds)):
-        add('replication', 'fail',
-            f'{len(seeds)} seed(s) {seeds}: need >= {min_seeds} distinct integer seeds')
+        add("replication", "fail",
+            f"{len(seeds)} seed(s) {seeds}: need >= {min_seeds} distinct integer seeds")
     elif min_seeds_valid:
-        add('replication', 'pass', f'{len(seeds)} distinct seeds: {seeds}')
+        add("replication", "pass", f"{len(seeds)} distinct seeds: {seeds}")
 
     # The planning variance is a design assumption, so it needs provenance too.
     # A pilot point estimate is optimistic and cannot be checked after the
@@ -2208,19 +2216,19 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                             if len(integral_seeds) == len(seeds) else None)
     if paired_sd_evidence is None:
         if require_variance_evidence:
-            add('variance_evidence', 'fail',
-                'no paired-SD calibration was supplied; the planning variance '
-                'has no pilot provenance and --require-variance-evidence is set')
+            add("variance_evidence", "fail",
+                "no paired-SD calibration was supplied; the planning variance "
+                "has no pilot provenance and --require-variance-evidence is set")
     else:
         try:
             adoption = paired_sd_evidence_audit(
                 paired_sd_evidence, None, confirm_for_evidence)
         except ValueError as exc:
-            add('variance_evidence', 'fail',
-                f'invalid paired-SD calibration: {exc}')
+            add("variance_evidence", "fail",
+                f"invalid paired-SD calibration: {exc}")
         else:
             if effective_paired_sd is None:
-                recommended = adoption.get('recommended_paired_sd')
+                recommended = adoption.get("recommended_paired_sd")
                 if (recommended is not None
                         and isinstance(recommended, numbers.Real)
                         and not isinstance(recommended, bool)
@@ -2231,25 +2239,25 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                     paired_sd_evidence, effective_paired_sd,
                     confirm_for_evidence)
             except ValueError as exc:
-                add('variance_evidence', 'fail',
-                    f'invalid paired-SD calibration: {exc}')
+                add("variance_evidence", "fail",
+                    f"invalid paired-SD calibration: {exc}")
             else:
-                status = paired_sd_evidence_report['status']
-                detail = '; '.join(
+                status = paired_sd_evidence_report["status"]
+                detail = "; ".join(
                     f'{check["id"]}: {check["detail"]}'
-                    for check in paired_sd_evidence_report['checks']
-                    if check['status'] != 'pass')
+                    for check in paired_sd_evidence_report["checks"]
+                    if check["status"] != "pass")
                 if not detail:
-                    detail = ('pilot calibration and planning SD agree, and '
-                              'pilot seeds are disjoint from the confirmatory '
-                              'design')
-                add('variance_evidence', status, detail)
+                    detail = ("pilot calibration and planning SD agree, and "
+                              "pilot seeds are disjoint from the confirmatory "
+                              "design")
+                add("variance_evidence", status, detail)
 
-    missing = sorted(name for name in names if not str(hypotheses.get(name) or '').strip())
+    missing = sorted(name for name in names if not str(hypotheses.get(name) or "").strip())
     if missing:
-        add('hypotheses', 'fail', f'rows without a stated hypothesis: {missing}')
+        add("hypotheses", "fail", f"rows without a stated hypothesis: {missing}")
     else:
-        add('hypotheses', 'pass', f'all {len(names)} rows state a hypothesis')
+        add("hypotheses", "pass", f"all {len(names)} rows state a hypothesis")
 
     # `margin or 0.0` silently turned malformed falsy values (False, "",
     # []) into the legitimate "no margin specified" case. Only an actual
@@ -2258,21 +2266,21 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     equivalence_value = (0.0 if equivalence_margin is None
                          else _finite_float(equivalence_margin))
     if margin_value is None or equivalence_value is None:
-        margin = equivalence_margin = float('nan')
+        margin = equivalence_margin = float("nan")
     else:
         margin, equivalence_margin = margin_value, equivalence_value
     if not math.isfinite(margin) or margin < 0.0:
-        add('effect_size', 'fail', f'invalid superiority margin {margin!r}')
+        add("effect_size", "fail", f"invalid superiority margin {margin!r}")
     elif not math.isfinite(equivalence_margin) or equivalence_margin < 0.0:
-        add('effect_size', 'fail', f'invalid equivalence margin {equivalence_margin!r}')
+        add("effect_size", "fail", f"invalid equivalence margin {equivalence_margin!r}")
     elif margin <= 0.0 and equivalence_margin <= 0.0:
-        add('effect_size', 'warn',
-            'no positive smallest effect of interest (--baseline-margin or '
-            '--equivalence-margin); the study can rank arms but cannot claim '
-            'practical significance or equivalence')
+        add("effect_size", "warn",
+            "no positive smallest effect of interest (--baseline-margin or "
+            "--equivalence-margin); the study can rank arms but cannot claim "
+            "practical significance or equivalence")
     else:
-        add('effect_size', 'pass',
-            f'superiority margin={margin}, equivalence margin={equivalence_margin}')
+        add("effect_size", "pass",
+            f"superiority margin={margin}, equivalence margin={equivalence_margin}")
 
     alpha_value = _finite_float(alpha)
     target_power_value = _finite_float(target_power)
@@ -2282,40 +2290,40 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     if n_tests_valid:
         n_confirmatory_tests = int(n_confirmatory_tests)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
-        add('power', 'fail', f'invalid alpha {alpha!r}')
+        add("power", "fail", f"invalid alpha {alpha!r}")
     elif equivalence_margin > 0.0 and alpha_value >= 0.5:
-        add('power', 'fail',
-            f'alpha={alpha_value:g} cannot support the requested TOST '
-            'equivalence test: its confidence interval 1 - 2*alpha would be '
-            'non-positive, so alpha must be < 0.5')
+        add("power", "fail",
+            f"alpha={alpha_value:g} cannot support the requested TOST "
+            "equivalence test: its confidence interval 1 - 2*alpha would be "
+            "non-positive, so alpha must be < 0.5")
     elif target_power_value is None or not 0.0 < target_power_value < 1.0:
-        add('power', 'fail', f'invalid target power {target_power!r}')
+        add("power", "fail", f"invalid target power {target_power!r}")
     elif not n_tests_valid:
-        add('power', 'fail',
-            f'invalid n_confirmatory_tests {n_confirmatory_tests!r}: must be a '
-            'positive integer')
+        add("power", "fail",
+            f"invalid n_confirmatory_tests {n_confirmatory_tests!r}: must be a "
+            "positive integer")
     elif effective_paired_sd is None:
-        add('power', 'warn',
-            'no assumed paired SD supplied; planned power for the smallest effect '
-            'cannot be checked before the run (the comparison report still '
-            'reports the observed MDE afterwards)')
+        add("power", "warn",
+            "no assumed paired SD supplied; planned power for the smallest effect "
+            "cannot be checked before the run (the comparison report still "
+            "reports the observed MDE afterwards)")
     else:
         sd = _finite_float(effective_paired_sd)
         target = margin
         if sd is None or sd < 0.0:
-            add('power', 'fail', f'invalid assumed paired SD {effective_paired_sd!r}')
+            add("power", "fail", f"invalid assumed paired SD {effective_paired_sd!r}")
         elif target <= 0.0:
             if equivalence_margin <= 0.0:
-                add('power', 'warn',
-                    'a paired SD was supplied but no positive margin defines the '
-                    'effect to power for')
+                add("power", "warn",
+                    "a paired SD was supplied but no positive margin defines the "
+                    "effect to power for")
         elif n_pairs < 2:
             # A paired design needs at least two distinct observations before
             # its power can be estimated. Reporting a crash here would turn a
             # failed pre-flight check into an unusable audit.
-            add('power', 'fail',
-                f'{n_pairs} distinct seed(s): at least 2 paired observations are '
-                f'needed to estimate power for margin={target:g}')
+            add("power", "fail",
+                f"{n_pairs} distinct seed(s): at least 2 paired observations are "
+                f"needed to estimate power for margin={target:g}")
         else:
             try:
                 plan = prospective_power_plan(
@@ -2324,21 +2332,21 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                     n_tests=n_confirmatory_tests,
                     expected_attrition=expected_attrition)
             except ValueError as exc:
-                add('power', 'fail', f'invalid power-planning input: {exc}')
+                add("power", "fail", f"invalid power-planning input: {exc}")
             else:
                 planned_power = plan
                 family_note = (
                     f'{plan["n_tests"]} test(s) at family alpha '
-                    f'{plan["family_alpha"]:.4g}' if plan['n_tests'] > 1 else
-                    'one test at alpha')
-                if plan['adequately_powered_after_attrition'] is True:
-                    add('power', 'pass',
+                    f'{plan["family_alpha"]:.4g}' if plan["n_tests"] > 1 else
+                    "one test at alpha")
+                if plan["adequately_powered_after_attrition"] is True:
+                    add("power", "pass",
                         f'{n_pairs} pairs at paired SD={sd:g} reach the '
                         f'{target:g} target ({family_note}); '
                         f'{plan["required_planned_pairs"]} planned pairs needed '
                         f'after {plan["expected_attrition"]:.0%} attrition')
-                elif plan['adequately_powered_after_attrition'] is False:
-                    add('power', 'fail',
+                elif plan["adequately_powered_after_attrition"] is False:
+                    add("power", "fail",
                         f'{n_pairs} pairs at paired SD={sd:g} are underpowered for '
                         f'margin={target:g} ({family_note}): '
                         f'{plan["required_pairs_family_adjusted"]} analyzable pairs '
@@ -2346,7 +2354,7 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                         f'{plan["required_planned_pairs"]} pairs after '
                         f'{plan["expected_attrition"]:.0%} attrition')
                 else:
-                    add('power', 'warn',
+                    add("power", "warn",
                         f'margin={target:g} is not reachable within the search cap '
                         f'at paired SD={sd:g} and family alpha '
                         f'{plan["family_alpha"]:.4g}')
@@ -2354,13 +2362,13 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     if equivalence_margin > 0.0 and effective_paired_sd is not None:
         eq_sd = _finite_float(effective_paired_sd)
         if eq_sd is None or eq_sd < 0.0:
-            add('equivalence_power', 'fail',
-                f'invalid assumed paired SD {effective_paired_sd!r}')
+            add("equivalence_power", "fail",
+                f"invalid assumed paired SD {effective_paired_sd!r}")
         elif n_pairs < 2:
-            add('equivalence_power', 'fail',
-                f'{n_pairs} distinct seed(s): at least 2 paired observations '
-                f'are needed to plan a TOST at margin='
-                f'{equivalence_margin:g}')
+            add("equivalence_power", "fail",
+                f"{n_pairs} distinct seed(s): at least 2 paired observations "
+                f"are needed to plan a TOST at margin="
+                f"{equivalence_margin:g}")
         else:
             try:
                 eq_plan = tost_power_plan(
@@ -2369,24 +2377,24 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                     n_tests=n_confirmatory_tests,
                     expected_attrition=expected_attrition)
             except ValueError as exc:
-                add('equivalence_power', 'fail',
-                    f'invalid equivalence power-planning input: {exc}')
+                add("equivalence_power", "fail",
+                    f"invalid equivalence power-planning input: {exc}")
             else:
                 planned_equivalence_power = eq_plan
                 family_note = (
                     f'{eq_plan["n_tests"]} test(s) at family alpha '
                     f'{eq_plan["family_alpha"]:.4g}'
-                    if eq_plan['n_tests'] > 1 else 'one test at alpha')
-                if eq_plan['adequately_powered_after_attrition'] is True:
-                    add('equivalence_power', 'pass',
+                    if eq_plan["n_tests"] > 1 else "one test at alpha")
+                if eq_plan["adequately_powered_after_attrition"] is True:
+                    add("equivalence_power", "pass",
                         f'{n_pairs} pairs at paired SD={eq_sd:g} reach the '
                         f'{target_power:g} TOST target for margin='
                         f'{equivalence_margin:g} ({family_note}); '
                         f'{eq_plan["required_planned_pairs"]} planned pairs '
                         f'needed after {eq_plan["expected_attrition"]:.0%} '
                         f'attrition')
-                elif eq_plan['adequately_powered_after_attrition'] is False:
-                    add('equivalence_power', 'fail',
+                elif eq_plan["adequately_powered_after_attrition"] is False:
+                    add("equivalence_power", "fail",
                         f'{n_pairs} pairs at paired SD={eq_sd:g} are '
                         f'underpowered for TOST equivalence at margin='
                         f'{equivalence_margin:g} ({family_note}): '
@@ -2395,7 +2403,7 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                         f'{eq_plan["required_planned_pairs"]} pairs after '
                         f'{eq_plan["expected_attrition"]:.0%} attrition')
                 else:
-                    add('equivalence_power', 'warn',
+                    add("equivalence_power", "warn",
                         f'equivalence margin={equivalence_margin:g} is not '
                         f'reachable within the search cap at paired SD='
                         f'{eq_sd:g} and family alpha '
@@ -2403,85 +2411,85 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
 
     attrition_value = _finite_float(expected_attrition)
     if attrition_value is None or not 0.0 <= attrition_value < 1.0:
-        add('attrition', 'fail',
-            f'invalid expected attrition {expected_attrition!r}: must be a '
-            f'probability in [0, 1)')
+        add("attrition", "fail",
+            f"invalid expected attrition {expected_attrition!r}: must be a "
+            f"probability in [0, 1)")
     else:
         expected_pairs = int(math.floor(
             n_pairs * (1.0 - attrition_value) ** 2 + 1e-12))
         if expected_pairs < min_seeds:
-            add('attrition', 'fail',
-                f'{expected_pairs} complete pair(s) are expected to survive '
-                f'{attrition_value:.0%} run attrition, below the replication '
-                f'minimum of {min_seeds}; plan more seeds or lower the '
-                f'attrition assumption')
+            add("attrition", "fail",
+                f"{expected_pairs} complete pair(s) are expected to survive "
+                f"{attrition_value:.0%} run attrition, below the replication "
+                f"minimum of {min_seeds}; plan more seeds or lower the "
+                f"attrition assumption")
         else:
-            add('attrition', 'pass',
-                f'{expected_pairs} of {n_pairs} planned pair(s) expected to '
-                f'survive {attrition_value:.0%} run attrition')
+            add("attrition", "pass",
+                f"{expected_pairs} of {n_pairs} planned pair(s) expected to "
+                f"survive {attrition_value:.0%} run attrition")
 
     if schedule is None:
-        add('schedule', 'warn',
-            'no randomized run schedule: execution order may be confounded with '
-            'the arm and with time drift')
+        add("schedule", "warn",
+            "no randomized run schedule: execution order may be confounded with "
+            "the arm and with time drift")
     else:
         try:
             integrity = schedule_fingerprint_status(schedule)
         except ValueError as exc:
-            add('schedule_integrity', 'fail',
-                f'malformed run schedule: {exc}')
+            add("schedule_integrity", "fail",
+                f"malformed run schedule: {exc}")
         else:
-            if integrity['verified'] is True:
-                add('schedule_integrity', 'pass',
-                    'schedule fingerprint matches the recorded order')
-            elif integrity['verified'] is False:
-                add('schedule_integrity', 'fail',
-                    'schedule fingerprint does not match the recorded order; '
-                    'the pre-registered allocation was edited after freezing')
+            if integrity["verified"] is True:
+                add("schedule_integrity", "pass",
+                    "schedule fingerprint matches the recorded order")
+            elif integrity["verified"] is False:
+                add("schedule_integrity", "fail",
+                    "schedule fingerprint does not match the recorded order; "
+                    "the pre-registered allocation was edited after freezing")
             else:
-                add('schedule_integrity', 'warn',
+                add("schedule_integrity", "warn",
                     f'schedule cannot be verified: {integrity["reason"]}')
         try:
             balance = schedule_balance_report(schedule, arm_of=schedule_arm_of)
         except ValueError as exc:
-            add('schedule', 'fail', f'malformed run schedule: {exc}')
+            add("schedule", "fail", f"malformed run schedule: {exc}")
         else:
-            alignment = balance.get('replicate_block_aligned')
+            alignment = balance.get("replicate_block_aligned")
             if alignment is True:
-                add('schedule_replicate_block_alignment', 'pass',
-                    'every replicate/seed stays inside one time block, so '
-                    'seed-paired arm contrasts are within-block')
+                add("schedule_replicate_block_alignment", "pass",
+                    "every replicate/seed stays inside one time block, so "
+                    "seed-paired arm contrasts are within-block")
             elif alignment is False:
                 split = {rep: blocks for rep, blocks in
-                         (balance.get('replicate_blocks') or {}).items()
+                         (balance.get("replicate_blocks") or {}).items()
                          if len(blocks) != 1}
-                add('schedule_replicate_block_alignment', 'fail',
-                    f'replicate/seed(s) {sorted(split)} are not bound to one '
-                    f'time block ({split}); seed-paired arm contrasts then '
-                    f'also contain a block/time difference, so regenerate the '
-                    f'frozen schedule with one block per seed')
-            raw_order = schedule.get('order')
+                add("schedule_replicate_block_alignment", "fail",
+                    f"replicate/seed(s) {sorted(split)} are not bound to one "
+                    f"time block ({split}); seed-paired arm contrasts then "
+                    f"also contain a block/time difference, so regenerate the "
+                    f"frozen schedule with one block per seed")
+            raw_order = schedule.get("order")
             if not isinstance(raw_order, list):
-                add('schedule', 'fail',
-                    'malformed run schedule: order is not a list of run ids')
+                add("schedule", "fail",
+                    "malformed run schedule: order is not a list of run ids")
             elif expected_units is not None:
                 expected = {str(unit) for unit in expected_units}
                 realized = {str(unit) for unit in raw_order}
                 if expected != realized:
-                    add('schedule', 'fail',
-                        f'schedule does not cover the planned runs: missing '
-                        f'{sorted(expected - realized)}, extra {sorted(realized - expected)}')
-                elif balance['warnings']:
-                    add('schedule', 'warn', '; '.join(balance['warnings']))
+                    add("schedule", "fail",
+                        f"schedule does not cover the planned runs: missing "
+                        f"{sorted(expected - realized)}, extra {sorted(realized - expected)}")
+                elif balance["warnings"]:
+                    add("schedule", "warn", "; ".join(balance["warnings"]))
                 else:
-                    add('schedule', 'pass',
+                    add("schedule", "pass",
                         f'{schedule.get("n_units")} run(s) in '
                         f'{schedule.get("n_blocks")} block(s), fingerprint '
                         f'{str(schedule.get("fingerprint"))[:12]}')
-            elif balance['warnings']:
-                add('schedule', 'warn', '; '.join(balance['warnings']))
+            elif balance["warnings"]:
+                add("schedule", "warn", "; ".join(balance["warnings"]))
             else:
-                add('schedule', 'pass',
+                add("schedule", "pass",
                     f'{schedule.get("n_units")} run(s) in '
                     f'{schedule.get("n_blocks")} block(s)')
 
@@ -2507,23 +2515,23 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                 continue
             pairs.append(tuple(pair))
     if malformed_controls:
-        add('controls', 'fail',
-            f'control pair(s) must be two-element lists/tuples of row names: '
-            f'{malformed_controls!r}')
+        add("controls", "fail",
+            f"control pair(s) must be two-element lists/tuples of row names: "
+            f"{malformed_controls!r}")
     elif not pairs:
-        add('controls', 'warn',
-            'no identity/negative-control pair declared: the analysis has no '
-            'known-null contrast to check its own calibration')
+        add("controls", "warn",
+            "no identity/negative-control pair declared: the analysis has no "
+            "known-null contrast to check its own calibration")
     else:
         missing_pairs = [pair for pair in pairs
                          if len(pair) != 2 or any(str(name) not in names for name in pair)]
         if missing_pairs:
-            add('controls', 'fail',
-                f'control pair(s) reference absent rows: {missing_pairs}')
+            add("controls", "fail",
+                f"control pair(s) reference absent rows: {missing_pairs}")
         else:
-            add('controls', 'pass',
-                f'{len(pairs)} identity/negative-control pair(s) present: '
-                f'{[list(pair) for pair in pairs]}')
+            add("controls", "pass",
+                f"{len(pairs)} identity/negative-control pair(s) present: "
+                f"{[list(pair) for pair in pairs]}")
 
     canonical_policy = None
     policy_fingerprint = None
@@ -2531,31 +2539,31 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         canonical_policy = normalize_exclusion_policy(exclusion_policy)
         policy_fingerprint = exclusion_policy_fingerprint(canonical_policy)
     except ValueError as exc:
-        add('exclusions', 'fail', f'invalid exclusion policy: {exc}')
+        add("exclusions", "fail", f"invalid exclusion policy: {exc}")
     else:
-        rules = {rule['id']: rule for rule in canonical_policy['rules']}
-        add('exclusions', 'pass',
-            f'pre-specified attrition policy with {len(rules)} rule(s), '
-            f'fingerprint {policy_fingerprint[:12]}')
+        rules = {rule["id"]: rule for rule in canonical_policy["rules"]}
+        add("exclusions", "pass",
+            f"pre-specified attrition policy with {len(rules)} rule(s), "
+            f"fingerprint {policy_fingerprint[:12]}")
 
-    n_fail = sum(1 for check in checks if check['status'] == 'fail')
-    n_warn = sum(1 for check in checks if check['status'] == 'warn')
+    n_fail = sum(1 for check in checks if check["status"] == "fail")
+    n_warn = sum(1 for check in checks if check["status"] == "warn")
     return {
-        'schema': 'adasquash.design_readiness.v1',
-        'ready': n_fail == 0,
-        'n_fail': n_fail,
-        'n_warn': n_warn,
-        'checks': checks,
-        'planned_power': planned_power,
-        'planned_equivalence_power': planned_equivalence_power,
-        'n_confirmatory_tests': n_confirmatory_tests,
-        'expected_attrition': expected_attrition,
-        'assumed_paired_sd': effective_paired_sd,
-        'paired_sd_evidence_audit': paired_sd_evidence_report,
-        'exclusion_policy': canonical_policy,
-        'exclusion_policy_fingerprint': policy_fingerprint,
-        'note': ('failures block a confirmatory launch; warnings are recorded so a '
-                 'reader can see which design decisions were left open'),
+        "schema": "adasquash.design_readiness.v1",
+        "ready": n_fail == 0,
+        "n_fail": n_fail,
+        "n_warn": n_warn,
+        "checks": checks,
+        "planned_power": planned_power,
+        "planned_equivalence_power": planned_equivalence_power,
+        "n_confirmatory_tests": n_confirmatory_tests,
+        "expected_attrition": expected_attrition,
+        "assumed_paired_sd": effective_paired_sd,
+        "paired_sd_evidence_audit": paired_sd_evidence_report,
+        "exclusion_policy": canonical_policy,
+        "exclusion_policy_fingerprint": policy_fingerprint,
+        "note": ("failures block a confirmatory launch; warnings are recorded so a "
+                 "reader can see which design decisions were left open"),
     }
 
 
@@ -2586,31 +2594,31 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
     """
     if (isinstance(n_pairs, bool)
             or not isinstance(n_pairs, numbers.Integral) or n_pairs < 2):
-        raise ValueError(f'n_pairs must be an integer >= 2, got {n_pairs!r}')
+        raise ValueError(f"n_pairs must be an integer >= 2, got {n_pairs!r}")
     n_pairs = int(n_pairs)
     if (isinstance(reps, bool)
             or not isinstance(reps, numbers.Integral) or reps < 100):
-        raise ValueError(f'reps must be an integer >= 100, got {reps!r}')
+        raise ValueError(f"reps must be an integer >= 100, got {reps!r}")
     reps = int(reps)
     effect_value = _finite_float(effect)
     paired_sd_value = _finite_float(paired_sd)
     if effect_value is None:
-        raise ValueError(f'effect must be a finite number, got {effect!r}')
+        raise ValueError(f"effect must be a finite number, got {effect!r}")
     if paired_sd_value is None:
-        raise ValueError(f'paired_sd must be a finite number, got {paired_sd!r}')
+        raise ValueError(f"paired_sd must be a finite number, got {paired_sd!r}")
     if paired_sd_value < 0.0:
-        raise ValueError(f'paired_sd must be >= 0, got {paired_sd!r}')
+        raise ValueError(f"paired_sd must be >= 0, got {paired_sd!r}")
     alpha_value = _finite_float(alpha)
     if alpha_value is None or not 0.0 < alpha_value < 1.0:
-        raise ValueError(f'alpha must be strictly between 0 and 1, got {alpha!r}')
+        raise ValueError(f"alpha must be strictly between 0 and 1, got {alpha!r}")
     equivalence_value = _finite_float(equivalence_margin)
     if equivalence_value is None or equivalence_value < 0.0:
-        raise ValueError(f'equivalence_margin must be a finite number >= 0, '
-                         f'got {equivalence_margin!r}')
+        raise ValueError(f"equivalence_margin must be a finite number >= 0, "
+                         f"got {equivalence_margin!r}")
     if equivalence_value > 0.0 and alpha_value >= 0.5:
-        raise ValueError(f'a positive equivalence_margin requires alpha < 0.5 so '
-                         f'the TOST confidence interval 1 - 2*alpha is positive, '
-                         f'got alpha={alpha!r}')
+        raise ValueError(f"a positive equivalence_margin requires alpha < 0.5 so "
+                         f"the TOST confidence interval 1 - 2*alpha is positive, "
+                         f"got alpha={alpha!r}")
     seed = _validate_seed(seed)
 
     rng = random.Random(seed)
@@ -2632,7 +2640,7 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
         means.append(sum(deltas) / n_pairs)
         test = paired_t_one_sided(deltas, [0.0] * n_pairs, margin=0.0,
                                   alpha=alpha_value)
-        p_value = test.get('p_one_sided')
+        p_value = test.get("p_one_sided")
         if p_value is None or not math.isfinite(float(p_value)):
             undefined += 1
         elif float(p_value) < alpha_value:
@@ -2640,7 +2648,7 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
         if equivalence_value > 0.0:
             equiv = tost_paired(deltas, [0.0] * n_pairs,
                                 margin=test_margin, alpha=alpha_value)
-            if equiv.get('equivalent') is True:
+            if equiv.get("equivalent") is True:
                 equivalence += 1
     mean_scaled = sum(means) / len(means)
     mean_estimate = mean_scaled * scale
@@ -2669,29 +2677,29 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
                  if scaled_run else mean_estimate - effect_value)
     detection_rate = detection / reps
     return {
-        'schema': 'adasquash.design_simulation.v1',
-        'n_pairs': n_pairs,
-        'effect': float(effect),
-        'paired_sd': float(paired_sd),
-        'reps': reps,
-        'alpha': float(alpha),
-        'equivalence_margin': (float(equivalence_margin)
+        "schema": "adasquash.design_simulation.v1",
+        "n_pairs": n_pairs,
+        "effect": float(effect),
+        "paired_sd": float(paired_sd),
+        "reps": reps,
+        "alpha": float(alpha),
+        "equivalence_margin": (float(equivalence_margin)
                                if float(equivalence_margin) > 0.0 else None),
-        'empirical_detection_rate': detection_rate,
-        'empirical_type_i_error': (detection_rate if float(effect) == 0.0 else None),
-        'empirical_power': (detection_rate if float(effect) < 0.0 else None),
-        'empirical_equivalence_rate': (equivalence / reps
+        "empirical_detection_rate": detection_rate,
+        "empirical_type_i_error": (detection_rate if float(effect) == 0.0 else None),
+        "empirical_power": (detection_rate if float(effect) < 0.0 else None),
+        "empirical_equivalence_rate": (equivalence / reps
                                        if float(equivalence_margin) > 0.0 else None),
-        'wrong_direction_rate': (sum(1 for value in means if value > 0.0) / reps
+        "wrong_direction_rate": (sum(1 for value in means if value > 0.0) / reps
                                  if float(effect) <= 0.0 else None),
-        'mean_estimate': mean_estimate,
-        'mean_bias': mean_bias,
-        'estimate_sd': estimate_sd,
-        'monte_carlo_se_detection_rate': math.sqrt(
+        "mean_estimate": mean_estimate,
+        "mean_bias": mean_bias,
+        "estimate_sd": estimate_sd,
+        "monte_carlo_se_detection_rate": math.sqrt(
             max(0.0, detection_rate * (1.0 - detection_rate)) / reps),
-        'undefined_p_rate': undefined / reps,
-        'note': ('a well-calibrated superiority pipeline has '
-                 'empirical_type_i_error <= alpha (within Monte-Carlo error); '
-                 'power below the target means the planned seed count cannot '
-                 'detect the stated effect'),
+        "undefined_p_rate": undefined / reps,
+        "note": ("a well-calibrated superiority pipeline has "
+                 "empirical_type_i_error <= alpha (within Monte-Carlo error); "
+                 "power below the target means the planned seed count cannot "
+                 "detect the stated effect"),
     }

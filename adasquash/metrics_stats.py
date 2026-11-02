@@ -3,8 +3,9 @@ from __future__ import annotations
 import functools
 import math
 import numbers
+from collections.abc import Sequence
 from statistics import NormalDist
-from typing import Optional, Sequence
+from typing import Optional
 
 from ._validation import is_boolean_scalar as _is_boolean_value
 
@@ -719,8 +720,7 @@ def _chi2_sf_large_df(x: float, df: float) -> float:
         w_squared = 2.0 * a * series
     else:
         w_squared = 2.0 * (half - a - a * math.log1p(s))
-    if w_squared < 0.0:
-        w_squared = 0.0
+    w_squared = max(w_squared, 0.0)
     if math.isinf(w_squared):
         return 0.0 if s > 0.0 else 1.0
     w = math.copysign(math.sqrt(w_squared), s)

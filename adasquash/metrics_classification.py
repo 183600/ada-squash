@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence
+from collections.abc import Sequence
+from typing import Optional
 
-from .metrics_stats import (_EXTREME_IMBALANCE,
-                               _binary_labels, _is_boolean_value, _strict_int)
+from .metrics_stats import _EXTREME_IMBALANCE, _binary_labels, _is_boolean_value, _strict_int
+
 
 def _weighted_mean(values: Sequence[float], weights: Sequence[int],
                   total: int) -> float:

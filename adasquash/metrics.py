@@ -74,9 +74,11 @@ import functools
 import math
 import numbers
 import random
-from typing import Optional, Sequence
+from collections.abc import Sequence
+from typing import Optional
 
 __all__ = [
+    "MIN_SEEDS_FOR_SIGNIFICANCE",
     "average_precision",
     "benjamini_hochberg_adjust",
     "binary_auc_report",
@@ -86,13 +88,13 @@ __all__ = [
     "imbalance_report",
     "leave_one_out_jackknife",
     "macro_weighted_f1",
-    "MIN_SEEDS_FOR_SIGNIFICANCE",
+    "max_p_combination",
     "mcnemar_test",
     "mean_ci",
     "mean_prediction_interval",
     "mean_std_stderr",
     "meta_analysis",
-    "max_p_combination",
+    "ndcg_at_k",
     "paired_design_summary",
     "paired_randomization_test",
     "paired_required_n",
@@ -100,6 +102,7 @@ __all__ = [
     "paired_trend_test",
     "paired_z_one_sided",
     "ratio_effect_report",
+    "recall_at_k",
     "roc_auc",
     "scale_replication_summary",
     "student_t_cdf",
@@ -112,15 +115,41 @@ __all__ = [
     "welch_t_one_sided",
     "welch_z_one_sided",
     "wilson_interval",
-    "recall_at_k",
-    "ndcg_at_k",
 ]
 
 
-from .metrics_stats import (MIN_SEEDS_FOR_SIGNIFICANCE,
+from .metrics_classification import (
+    _average_precision_from_groups,
+    _roc_auc_from_groups,
+    _tie_groups_ascending,
+    average_precision,
+    binary_auc_report,
+    f1_from_counts,
+    imbalance_report,
+    macro_weighted_f1,
+    ndcg_at_k,
+    recall_at_k,
+    roc_auc,
+)
+from .metrics_meta import (
+    _META_EFFECT_KEYS,
+    _META_STDERR_KEYS,
+    _meta_influence,
+    _meta_study,
+    _ols_slope_and_r2,
+    _pool_meta_studies,
+    meta_analysis,
+    paired_randomization_test,
+    paired_trend_test,
+    scale_replication_summary,
+    welch_t_one_sided,
+    welch_z_one_sided,
+)
+from .metrics_stats import (
     _EXTREME_IMBALANCE,
     _RANDOMIZATION_EXACT_MAX,
     _Z_95,
+    MIN_SEEDS_FOR_SIGNIFICANCE,
     _as_real,
     _betacf,
     _binary_labels,
@@ -155,29 +184,4 @@ from .metrics_stats import (MIN_SEEDS_FOR_SIGNIFICANCE,
     tost_required_n,
     two_sided_p_from_t,
     wilson_interval,
-)
-from .metrics_meta import (_META_EFFECT_KEYS,
-    _META_STDERR_KEYS,
-    _meta_influence,
-    _meta_study,
-    _ols_slope_and_r2,
-    _pool_meta_studies,
-    meta_analysis,
-    paired_randomization_test,
-    paired_trend_test,
-    scale_replication_summary,
-    welch_t_one_sided,
-    welch_z_one_sided,
-)
-from .metrics_classification import (_average_precision_from_groups,
-    _roc_auc_from_groups,
-    _tie_groups_ascending,
-    average_precision,
-    binary_auc_report,
-    f1_from_counts,
-    imbalance_report,
-    macro_weighted_f1,
-    ndcg_at_k,
-    recall_at_k,
-    roc_auc,
 )

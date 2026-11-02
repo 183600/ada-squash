@@ -5,14 +5,19 @@ import numbers
 from pathlib import Path
 
 from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
-from adasquash.metrics import (MIN_SEEDS_FOR_SIGNIFICANCE,
-                               leave_one_out_jackknife,
-                               mean_prediction_interval, mean_std_stderr,
-                               paired_design_summary,
-                               paired_randomization_test,
-                               paired_t_one_sided, student_t_ppf,
-                               tost_design_summary, tost_paired,
-                               welch_t_one_sided)
+from adasquash.metrics import (
+    MIN_SEEDS_FOR_SIGNIFICANCE,
+    leave_one_out_jackknife,
+    mean_prediction_interval,
+    mean_std_stderr,
+    paired_design_summary,
+    paired_randomization_test,
+    paired_t_one_sided,
+    student_t_ppf,
+    tost_design_summary,
+    tost_paired,
+    welch_t_one_sided,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,15 +57,15 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
     Both are descriptive: they never change `beats_*_significantly`.
     """
     out = {
-        'n_seeds_favoring': None,
-        'n_seeds_tied': None,
-        'n_seeds_against': None,
-        'per_seed_delta': None,
-        'paired_delta_std': None,
-        'minimum_detectable_delta_95_power80': None,
-        'design_power': None,
-        'delta_prediction_interval_95': None,
-        'delta_same_direction_probability': None,
+        "n_seeds_favoring": None,
+        "n_seeds_tied": None,
+        "n_seeds_against": None,
+        "per_seed_delta": None,
+        "paired_delta_std": None,
+        "minimum_detectable_delta_95_power80": None,
+        "design_power": None,
+        "delta_prediction_interval_95": None,
+        "delta_same_direction_probability": None,
     }
     common = list(common_seeds or [])
     if len(common) >= 2:
@@ -72,26 +77,26 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
             values = list(deltas.values())
             stats = mean_std_stderr(values)
             out.update({
-                'n_seeds_favoring': sum(v < 0.0 for v in values),
-                'n_seeds_tied': sum(v == 0.0 for v in values),
-                'n_seeds_against': sum(v > 0.0 for v in values),
-                'per_seed_delta': {str(seed): value for seed, value in deltas.items()},
-                'paired_delta_std': None if stats is None else stats['std'],
+                "n_seeds_favoring": sum(v < 0.0 for v in values),
+                "n_seeds_tied": sum(v == 0.0 for v in values),
+                "n_seeds_against": sum(v > 0.0 for v in values),
+                "per_seed_delta": {str(seed): value for seed, value in deltas.items()},
+                "paired_delta_std": None if stats is None else stats["std"],
             })
             replication = mean_prediction_interval(values, alpha=alpha)
             if replication is not None:
-                out['delta_prediction_interval_95'] = [
-                    replication['prediction_low'],
-                    replication['prediction_high']]
-                out['delta_same_direction_probability'] = (
-                    replication['same_direction_probability'])
-    if (test is not None and test.get('df') and len(common) >= 2):
+                out["delta_prediction_interval_95"] = [
+                    replication["prediction_low"],
+                    replication["prediction_high"]]
+                out["delta_same_direction_probability"] = (
+                    replication["same_direction_probability"])
+    if (test is not None and test.get("df") and len(common) >= 2):
         row_seeds = _seed_means(row)
         ref_seeds = _seed_means(reference)
         deltas = [float(row_seeds[seed] - ref_seeds[seed])
                   for seed in common if seed in row_seeds and seed in ref_seeds]
         stats = mean_std_stderr(deltas)
-        if stats is not None and stats['stderr'] is not None:
+        if stats is not None and stats["stderr"] is not None:
             # Use the paired-delta stderr directly. Inverting the CI would
             # require the test to have been run at this `alpha`; `_paired_row_test`
             # uses its own default, so the inferred stderr would be wrong
@@ -100,11 +105,11 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
             # clear both the practical margin and the sampling noise. Report
             # margin + t*stderr; omitting the margin understates the smallest
             # detectable effect whenever --baseline-margin is non-zero.
-            out['minimum_detectable_delta_95_power80'] = (
+            out["minimum_detectable_delta_95_power80"] = (
                 float(margin)
-                + (student_t_ppf(1.0 - alpha, float(test['df']))
-                   + student_t_ppf(power, float(test['df'])))
-                * stats['stderr']
+                + (student_t_ppf(1.0 - alpha, float(test["df"]))
+                   + student_t_ppf(power, float(test["df"])))
+                * stats["stderr"]
             )
             # Prospective sample-size check against the pre-specified margin.
             # It uses the observed paired SD (the best available planning
@@ -112,8 +117,8 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
             # null result can be read as underpowered rather than as evidence
             # of no effect. With margin=0 the block explicitly says no target
             # was registered instead of inventing one post hoc.
-            out['design_power'] = paired_design_summary(
-                stats['std'], int(test['n']), margin=margin,
+            out["design_power"] = paired_design_summary(
+                stats["std"], int(test["n"]), margin=margin,
                 alpha=alpha, power=power)
     return out
 
@@ -172,8 +177,8 @@ def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
         if (alpha_number is not None and math.isfinite(alpha_number)
                 and alpha_number >= 0.5):
             raise ValueError(
-                'a positive equivalence_margin requires alpha < 0.5 so the TOST '
-                f'confidence interval 1 - 2*alpha is positive, got alpha={alpha!r}')
+                "a positive equivalence_margin requires alpha < 0.5 so the TOST "
+                f"confidence interval 1 - 2*alpha is positive, got alpha={alpha!r}")
     values = [float(deltas[seed]) for seed in deltas]
     labels = [str(seed) for seed in deltas]
     jackknife = leave_one_out_jackknife(values, labels=labels)
@@ -208,28 +213,28 @@ def _robustness_for_deltas(deltas: dict, alpha: float = 0.05,
 def _robustness_note(entry: dict) -> str:
     """Compact human-readable suffix for the robustness/equivalence blocks."""
     parts = []
-    jackknife = entry.get('seed_jackknife')
-    if isinstance(jackknife, dict) and jackknife.get('meaningful'):
-        if jackknife.get('sign_stable') is False:
+    jackknife = entry.get("seed_jackknife")
+    if isinstance(jackknife, dict) and jackknife.get("meaningful"):
+        if jackknife.get("sign_stable") is False:
             parts.append(f" [SEED-SENSITIVE: dropping "
                          f"{jackknife.get('influential_labels')} flips the sign]")
-        elif jackknife.get('sign_stable') is True:
-            parts.append(' [seed-robust sign]')
-    equivalence = entry.get('equivalence')
-    if isinstance(equivalence, dict) and equivalence.get('enabled'):
-        margin = equivalence.get('margin')
-        if equivalence.get('equivalent'):
-            parts.append(f' [EQUIVALENT within {margin:g}]')
+        elif jackknife.get("sign_stable") is True:
+            parts.append(" [seed-robust sign]")
+    equivalence = entry.get("equivalence")
+    if isinstance(equivalence, dict) and equivalence.get("enabled"):
+        margin = equivalence.get("margin")
+        if equivalence.get("equivalent"):
+            parts.append(f" [EQUIVALENT within {margin:g}]")
         else:
-            parts.append(f' [NOT equivalent within {margin:g}]')
-    randomization = entry.get('randomization_test')
-    if isinstance(randomization, dict) and randomization.get('can_reach_alpha') is False:
-        floor = randomization.get('minimum_attainable_p_one_sided')
+            parts.append(f" [NOT equivalent within {margin:g}]")
+    randomization = entry.get("randomization_test")
+    if isinstance(randomization, dict) and randomization.get("can_reach_alpha") is False:
+        floor = randomization.get("minimum_attainable_p_one_sided")
         if floor is not None:
-            parts.append(f' [distribution-free p floor {floor:.3g} at '
+            parts.append(f" [distribution-free p floor {floor:.3g} at "
                          f"n={randomization.get('n')}: sign-flip test cannot "
-                         'reject without the t model]')
-    return ''.join(parts)
+                         "reject without the t model]")
+    return "".join(parts)
 
 
 def _is_integer_scalar(value) -> bool:
@@ -268,14 +273,14 @@ def _seed_means(row) -> dict:
     still identifies its seed, so it can pair with the same seed inside an
     aggregate.
     """
-    per = row.get('per_seed')
+    per = row.get("per_seed")
     out = {}
     seen: set[int] = set()
     if isinstance(per, list):
         for item in per:
             if not isinstance(item, dict):
                 return {}
-            seed = item.get('seed')
+            seed = item.get("seed")
             if not _is_seed_id(seed):
                 # Unknown/malformed seed identity makes the whole row
                 # unpairable: dropping just this entry would silently pair a
@@ -290,11 +295,11 @@ def _seed_means(row) -> dict:
                 # non-finite first record that never enters `out`.
                 return {}
             seen.add(seed)
-            if _finite_metric(item.get('val_loss')):
-                out[seed] = float(item['val_loss'])
+            if _finite_metric(item.get("val_loss")):
+                out[seed] = float(item["val_loss"])
         return out
-    seeds = row.get('seeds') if isinstance(row.get('seeds'), list) else []
-    seeds = [s for s in seeds if s is not None] or ([row['seed']] if row.get('seed') is not None else [])
+    seeds = row.get("seeds") if isinstance(row.get("seeds"), list) else []
+    seeds = [s for s in seeds if s is not None] or ([row["seed"]] if row.get("seed") is not None else [])
     # A single-run summary names exactly one seed, so its pooled val_loss is
     # that seed's mean. A multi-seed row without per_seed losses has no
     # per-seed observations: copying the pooled mean to every seed would
@@ -304,8 +309,8 @@ def _seed_means(row) -> dict:
     unique_seeds = list(dict.fromkeys(int(s) for s in seeds))
     if len(unique_seeds) != len(seeds):
         return {}
-    if len(unique_seeds) == 1 and _finite_metric(row.get('val_loss')):
-        out[unique_seeds[0]] = float(row['val_loss'])
+    if len(unique_seeds) == 1 and _finite_metric(row.get("val_loss")):
+        out[unique_seeds[0]] = float(row["val_loss"])
     return out
 
 def _batches_of_seed(row, seed):
@@ -324,13 +329,13 @@ def _batches_of_seed(row, seed):
         finite = [value for value in values if _finite_metric(value)]
         dropped = len(values) - len(finite)
         if dropped and isinstance(row, dict):
-            ledger = row.setdefault('val_losses_excluded_by_seed', {})
+            ledger = row.setdefault("val_losses_excluded_by_seed", {})
             if isinstance(ledger, dict):
                 key = str(seed)
                 ledger[key] = int(ledger.get(key, 0)) + dropped
         return finite
 
-    by_seed = row.get('val_losses_by_seed')
+    by_seed = row.get("val_losses_by_seed")
     if isinstance(by_seed, dict):
         # Accept both JSON's string keys and in-memory integer seed keys.
         for key in (str(seed), seed):
@@ -343,19 +348,19 @@ def _batches_of_seed(row, seed):
     # or a declared multi-seed row must never be zipped as if it were seed
     # `seed` alone. Batch k of another seed would otherwise be paired with
     # batch k of this one.
-    per_seed = row.get('per_seed')
+    per_seed = row.get("per_seed")
     if isinstance(per_seed, list) and len(per_seed) != 1:
         return None
-    declared_seeds = row.get('seeds')
+    declared_seeds = row.get("seeds")
     if isinstance(declared_seeds, list) and len(declared_seeds) > 1:
         return None
-    declared_n = row.get('n_seeds')
+    declared_n = row.get("n_seeds")
     if (isinstance(declared_n, (int, float)) and not isinstance(declared_n, bool)
             and float(declared_n) > 1.0):
         return None
     means = _seed_means(row)
-    if len(means) == 1 and seed in means and isinstance(row.get('val_losses'), list):
-        return _finite_batches(row['val_losses'])
+    if len(means) == 1 and seed in means and isinstance(row.get("val_losses"), list):
+        return _finite_batches(row["val_losses"])
     return None
 
 def _row_n_seeds(row) -> int:
@@ -374,10 +379,10 @@ def _row_n_seeds(row) -> int:
     # If the row *has* per-seed/seed data but none of it is pairable (a
     # duplicate seed, malformed id, or no finite loss), the declared count
     # cannot turn it into replication; report 0 rather than trusting it.
-    if (isinstance(row.get('per_seed'), list)
-            or isinstance(row.get('seeds'), list)):
+    if (isinstance(row.get("per_seed"), list)
+            or isinstance(row.get("seeds"), list)):
         return 0
-    declared = row.get('n_seeds')
+    declared = row.get("n_seeds")
     if _is_integer_scalar(declared) and declared >= 0:
         return int(declared)
     return 1
@@ -390,9 +395,9 @@ def _row_std(row):
     generic `val_loss_std` when an older/cached aggregate only wrote that
     name, so the delta-vs-seed-noise scale check is not silently disabled.
     """
-    if _row_n_seeds(row) >= 2 and row.get('val_loss_seed_std') is not None:
-        return row.get('val_loss_seed_std')
-    return row.get('val_loss_std')
+    if _row_n_seeds(row) >= 2 and row.get("val_loss_seed_std") is not None:
+        return row.get("val_loss_seed_std")
+    return row.get("val_loss_std")
 
 def _paired_row_test(row: dict, reference: dict, margin: float=0.0,
                      alpha: float=0.05):
@@ -421,7 +426,7 @@ def _paired_row_test(row: dict, reference: dict, margin: float=0.0,
         test = paired_t_one_sided([row_seeds[s] for s in common],
                                   [ref_seeds[s] for s in common], margin=margin,
                                   alpha=alpha)
-        return test, 'seed_means', common
+        return test, "seed_means", common
     if len(common) == 1:
         seed = common[0]
         row_batches = _batches_of_seed(row, seed)
@@ -431,17 +436,17 @@ def _paired_row_test(row: dict, reference: dict, margin: float=0.0,
             if len(row_batches) == len(ref_batches):
                 test = paired_t_one_sided(row_batches, ref_batches, margin=margin,
                                           alpha=alpha)
-                return test, f'val_batches_single_seed{seed}', common
+                return test, f"val_batches_single_seed{seed}", common
             test = welch_t_one_sided(row_batches, ref_batches, margin=margin,
                                      alpha=alpha)
-            return test, f'val_batches_single_seed{seed}_unpaired', common
-        return (None, f'single_seed_batches_insufficient{seed}', common)
-    basis = 'no_shared_seeds' if (row_seeds and ref_seeds) else 'insufficient_seeds'
+            return test, f"val_batches_single_seed{seed}_unpaired", common
+        return (None, f"single_seed_batches_insufficient{seed}", common)
+    basis = "no_shared_seeds" if (row_seeds and ref_seeds) else "insufficient_seeds"
     return None, basis, common
 
 def _basis_counted_in_family(basis, n_shared: int=0) -> bool:
     """Only a >= 3-seed paired test is admissible to the Holm family."""
-    return basis == 'seed_means' and n_shared >= MIN_SEEDS_FOR_SIGNIFICANCE
+    return basis == "seed_means" and n_shared >= MIN_SEEDS_FOR_SIGNIFICANCE
 
 def _run_identity(row: dict, parent_of: dict) -> str:
     """Name of the run a row ultimately reuses, following `reused_from` chains.
@@ -450,7 +455,7 @@ def _run_identity(row: dict, parent_of: dict) -> str:
     single hop would misread C and B as two independent runs; resolving to the
     root keeps "aliases are counted once" true for chains too.
     """
-    name = row.get('name')
+    name = row.get("name")
     seen = set()
     while isinstance(name, str) and name not in seen:
         seen.add(name)
@@ -458,4 +463,4 @@ def _run_identity(row: dict, parent_of: dict) -> str:
         if not isinstance(parent, str):
             return name
         name = parent
-    return row.get('name')
+    return row.get("name")

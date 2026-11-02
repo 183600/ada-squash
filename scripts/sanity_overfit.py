@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """Fail-fast overfit sanity check: can the model memorize one small batch?
 
 Run this before any full-scale training. It freezes one small batch (a few
@@ -72,7 +73,7 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from adasquash import GPT, GPTConfig, NORM_REGISTRY, markov_batch
+from adasquash import GPT, NORM_REGISTRY, GPTConfig, markov_batch
 from adasquash.metrics import binary_auc_report, f1_from_counts
 from adasquash.repro import collect_run_metadata, finish_metadata, save_run_manifest, set_all_seeds
 

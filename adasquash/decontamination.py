@@ -408,11 +408,11 @@ def find_ngram_matches(tokens, index: NgramIndex) -> dict:
     # runs: two matching windows separated by a single non-matching window can
     # still overlap in their token span, and summing runs would then report a
     # coverage above 1.0.
-    runs = {name: 0 for name in index.benchmarks}
+    runs = dict.fromkeys(index.benchmarks, 0)
     active = set()
-    covered = {name: 0 for name in index.benchmarks}
-    covered_end = {name: None for name in index.benchmarks}
-    longest_run = {name: 0 for name in index.benchmarks}
+    covered = dict.fromkeys(index.benchmarks, 0)
+    covered_end = dict.fromkeys(index.benchmarks)
+    longest_run = dict.fromkeys(index.benchmarks, 0)
     global_run = 0
     global_longest_run = 0
     global_covered = 0
