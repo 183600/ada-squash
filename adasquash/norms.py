@@ -1,14 +1,42 @@
+"""Statistic-free adaptive squashing normalization layers.
+
+Three families live here:
+
+* the statistic-based baselines (``LayerNorm``, ``RMSNorm``);
+* the generalized-softsign family - ``DyT`` / ``DyT-S`` / ``DyT-P`` /
+  ``DyT-C`` and the depth-conditioned ``DyT-D`` / ``DyT-CD`` variants;
+* the attention-logit squash ``QKSquash``.
+
+Every squash is a hand-written ``torch.autograd.Function``: the forward is
+closed-form and the backward recomputes the intermediates it needs. The
+layers are reached through :func:`build_norm` and :data:`NORM_REGISTRY`;
+:func:`generalized_softsign` is the public entry point of the core math.
+
+The numerical-stability floors (``_MIN_P``, ``_MIN_ALPHA``) and the
+reciprocal-on-``max(|x|, 1)`` formulation of the softsign core are fixed
+design decisions - see ``docs/design_notes.md``.
+"""
 from __future__ import annotations
 import math
 from typing import Optional
 import torch
 import torch.nn as nn
+
+# Registry of the norm families, keyed by the ``norm_name`` values the
+# configs and scripts pass around (``build_norm`` resolves them).
 NORM_REGISTRY: dict[str, type] = {}
+
+# Floors of the generalized-softsign exponent and of the depth-conditioned
+# per-channel alpha. Both are fixed design decisions (D2).
 _MIN_ALPHA = 1e-4
 _MIN_P = 1e-3
+
 _LOG2E = math.log2(math.e)
 _LN2 = math.log(2.0)
+
+# ``log(finfo(dtype).tiny)`` per dtype; the value only depends on the dtype.
 _TINY_LOG_CACHE: dict = {}
+
 
 def _log_tiny(dtype: torch.dtype) -> float:
     """``log(finfo(dtype).tiny)`` per dtype: the softsign p-gradient floor.
@@ -22,6 +50,7 @@ def _log_tiny(dtype: torch.dtype) -> float:
         _TINY_LOG_CACHE[dtype] = v
     return v
 
+
 def _as_scalar_exponent(p):
     """``p`` as a Python float when it is a one-element CPU tensor.
 
@@ -31,11 +60,13 @@ def _as_scalar_exponent(p):
         return float(p)
     return p
 
+
 def _as_scalar_exponent_inplace(g: torch.Tensor, p) -> torch.Tensor:
     """``g ** (p + 1)`` written in place."""
     if isinstance(p, torch.Tensor):
         return g.log2_().mul_(p + 1).exp2_()
     return g.pow_(p + 1)
+
 
 def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
     """Whether the compensating `±1` multiply has to run.
@@ -48,7 +79,9 @@ def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
         return True
     return bool(torch.signbit(scale).any())
 
+
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
+    """Sum over every axis except the last one."""
     if t.ndim <= 1:
         return t.clone()
     return t.sum(dim=tuple(range(t.ndim - 1)))
@@ -127,12 +160,16 @@ def register_norm(name: str):
 def _softsign_core(xs: torch.Tensor, p, scale=None):
     """Compute the shared intermediates for softsign forward/backward.
 
-    Returns ``(t, lo, r, u, p)`` where:
-      t  = |xs| or |xs * scale|
-      lo = clamp(t, max=1) = min(t, 1)
-      r  = 1 / clamp(t, min=1) = 1 / max(t, 1)
-      u  = lo * r in [0, 1]
-      p  = the scalar-exponent form of ``p``
+    Returns ``(lo, r, u, p)`` where:
+
+    * ``lo`` = ``clamp(t, max=1)`` = ``min(t, 1)``;
+    * ``r``  = ``1 / clamp(t, min=1)`` = ``1 / max(t, 1)``;
+    * ``u``  = ``lo * r`` in ``[0, 1]``;
+    * ``p``  = the scalar-exponent form of ``p``;
+
+    with ``t = |xs|`` or ``t = |xs * scale|``. The reciprocal is taken on
+    ``max(t, 1)`` and never on ``t`` itself: a zero magnitude would make
+    ``1/0`` infinite and the derivative of the unselected branch ``NaN``.
     """
     p = _as_scalar_exponent(p)
     if scale is None:
@@ -142,54 +179,71 @@ def _softsign_core(xs: torch.Tensor, p, scale=None):
     lo = t.clamp(max=1.0)
     r = t.clamp_(min=1.0).reciprocal_()
     u = lo.mul(r)
-    return t, lo, r, u, p
+    return lo, r, u, p
 
 
-def _compute_s_from_u(u: torch.Tensor, p) -> torch.Tensor:
-    """Compute s = (u^p + 1)^(-1/p) from u, handling tensor and scalar p."""
+def _compute_s_and_a(u: torch.Tensor, p, need_a: bool):
+    """``s = (u^p + 1)^(-1/p)`` and, on demand, ``a = clamp(p * ln u)``.
+
+    ``a`` is the intermediate of the exponent gradient, so it is only needed
+    when the exponent itself is differentiable. The tensor and the plain
+    float representation of ``p`` follow different op sequences (and a
+    different aliasing of ``u``), which is why both branches are spelled out.
+    """
     if isinstance(p, torch.Tensor):
-        neg_log2e_p = -_LOG2E / p.to(torch.promote_types(u.dtype, p.dtype))
-        return u.log2_().mul_(p).exp2_().log1p_().mul_(neg_log2e_p).exp2_()
-    return u.pow_(p).add_(1.0).pow_(-1.0 / p)
+        q = u.log2_().mul_(p)
+        a = None
+        if need_a:
+            a = q.mul(_LN2).clamp_(min=p * _log_tiny(q.dtype))
+        s = q.exp2_().log1p_().mul_(-_LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))).exp2_()
+        return s, a
+    if need_a:
+        # ``torch.pow`` leaves ``u`` intact: the exponent gradient needs its
+        # pre-power value.
+        s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
+        a = u.log2_().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
+        return s, a
+    s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
+    return s, None
 
 
 def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False) -> torch.Tensor:
-    t, lo, r, u, p = _softsign_core(xs, p, scale)
-    s = _compute_s_from_u(u, p)
+    """``phi_p(xs * scale)`` (or ``phi_p(xs)`` without a scale).
+
+    ``scale_nonneg`` tells the caller that the scale is known to be
+    non-negative, which makes the compensating ``±1`` multiply unnecessary.
+    """
+    lo, _r, u, p = _softsign_core(xs, p, scale)
+    s, _a = _compute_s_and_a(u, p, False)
     out = s.mul_(lo).copysign_(xs)
     if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
         out.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     return out
 
 
-def _softsign_backward_pieces(xs: torch.Tensor, p, need_u: bool, need_phi: bool=True, need_g: bool=True, scale=None, scale_nonneg: bool=False):
-    t, lo, r, u, p = _softsign_core(xs, p, scale)
-    a = None
-    if need_u:
-        # `lo` only feeds `phi`; when that output is not requested it is not
-        # needed separately.
-        if isinstance(p, torch.Tensor):
-            q = u.log2_().mul_(p)
-            a = q.mul(_LN2).clamp_(min=p * _log_tiny(q.dtype))
-            s = q.exp2_().log1p_().mul_(-_LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))).exp2_()
-        else:
-            s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
-            a = u.log2_().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
-    else:
-        s = u
-        if isinstance(p, torch.Tensor):
-            s.log2_().mul_(p).exp2_().log1p_().mul_(-_LOG2E / p.to(torch.promote_types(s.dtype, p.dtype))).exp2_()
-        else:
-            s.pow_(p).add_(1.0).pow_(-1.0 / p)
+def _softsign_backward_pieces(xs: torch.Tensor, p, need_p_grad: bool, need_phi: bool=True, need_x_grad: bool=True, scale=None, scale_nonneg: bool=False):
+    """The pieces the softsign backward needs, recomputed from ``xs``.
+
+    Returns ``(g, phi, a)``:
+
+    * ``g``   = the cotangent factor of the squashed output (``None`` when
+      the input gradient is not requested);
+    * ``phi`` = the squashed output itself, needed for the exponent and the
+      affine gradients;
+    * ``a``   = the clamped ``p * ln u`` intermediate of the exponent
+      gradient (``None`` when the exponent gradient is not requested).
+    """
+    lo, r, u, p = _softsign_core(xs, p, scale)
+    s, a = _compute_s_and_a(u, p, need_p_grad)
     phi = None
     if need_phi:
-        if need_g:
+        if need_x_grad:
             phi = lo.mul_(s).copysign_(xs)
         else:
             phi = s.mul_(lo).copysign_(xs)
         if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
             phi.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
-    if not need_g:
+    if not need_x_grad:
         return (None, phi, a)
     return (r.mul_(s), phi, a)
 
@@ -227,12 +281,99 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
         red = red.to(p.dtype)
     return red.reshape(p.shape)
 
+def _floor_exponent(p):
+    """The generalized-softsign exponent with the D2 floor applied.
+
+    Returns ``(p_effective, p_raw, p_is_tensor)``. A tensor exponent keeps
+    its unclamped value in ``p_raw`` so the gradient can see the clamp
+    boundary; a frozen exponent is a plain float and is floored directly -
+    ``p = 0`` would divide by zero and ``p < 0`` would make ``|x|^p`` blow
+    up at zero. The floor applies to both representations.
+    """
+    if isinstance(p, torch.Tensor):
+        return p.clamp(min=_MIN_P), p, True
+    return max(float(p), _MIN_P), None, False
+
+
+def _prepare_exponent(ctx, p):
+    """Floor the exponent and record its state on the context.
+
+    Returns ``(p_effective, p_raw)``. The raw (unclamped) exponent is
+    returned rather than saved here: every kernel places it among its own
+    saved tensors, and the position differs from kernel to kernel.
+    """
+    p_effective, p_raw, p_is_tensor = _floor_exponent(p)
+    ctx.p_is_tensor = p_is_tensor
+    ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
+    if not p_is_tensor:
+        ctx.p_value = float(p_effective)
+    return p_effective, p_raw
+
+
+def _save_exponent(ctx, p, saved: list):
+    """Floor the exponent, record its state and append the raw exponent.
+
+    This is the common case: the raw exponent is the last saved tensor.
+    """
+    p_effective, p_raw = _prepare_exponent(ctx, p)
+    if p_raw is not None:
+        saved.append(p_raw)
+    return p_effective
+
+
+def _restore_exponent(ctx, saved, index: int):
+    """``(p, p_raw)`` of the exponent, restored from the saved tensors."""
+    if ctx.p_is_tensor:
+        p_raw = saved[index]
+        return p_raw.clamp(min=_MIN_P), p_raw
+    return ctx.p_value, None
+
+
+def _apply_affine(phi: torch.Tensor, gamma: torch.Tensor, beta) -> torch.Tensor:
+    """``gamma * phi (+ beta)`` written in place."""
+    if beta is not None:
+        return phi.mul_(gamma).add_(beta)
+    return phi.mul_(gamma)
+
+
+def _tanh_squash_forward(x: torch.Tensor, alpha, gamma: torch.Tensor, beta) -> torch.Tensor:
+    """``gamma * tanh(alpha * x) (+ beta)`` as one fused step."""
+    return _apply_affine(x.mul(alpha).tanh_(), gamma, beta)
+
+
+def _tanh_squash_backward(x: torch.Tensor, alpha, gamma: torch.Tensor,
+                          grad_out: torch.Tensor, need_gamma: bool):
+    """The backward core shared by the ``tanh(alpha * x)`` squashes.
+
+    Returns ``(w, grad_gamma)`` where ``w`` is the cotangent of the
+    squashed output, already scaled by ``gamma``. The caller reduces ``w``
+    against ``x`` for the ``alpha`` gradient - a full dot product for a
+    scalar ``alpha``, a per-channel product for a vector one - and then
+    scales ``w`` by ``alpha`` for the input gradient.
+    """
+    phi = x.mul(alpha).tanh_()
+    w = phi * grad_out
+    grad_gamma = _sum_leading_dims(w) if need_gamma else None
+    w.mul_(phi)
+    del phi
+    torch.sub(grad_out, w, out=w)
+    w.mul_(gamma)
+    return w, grad_gamma
+
+
 def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
+    """Instantiate the norm registered under ``name``."""
     if name not in NORM_REGISTRY:
         raise KeyError(f"Unknown norm '{name}'. Registered: {list(NORM_REGISTRY)}")
     return NORM_REGISTRY[name](dim, **kwargs)
 
+
 class _SquashedAffine(nn.Module):
+    """Marker base class of the squashing norms.
+
+    ``ActivationStats`` uses it to recognise the family, so every member
+    exposes a learnable ``gamma`` and an optional ``beta``.
+    """
     pass
 
 def _init_depth_schedule(module, layer_idx, num_layers, alpha_0, k_init,
@@ -248,26 +389,16 @@ def _init_depth_schedule(module, layer_idx, num_layers, alpha_0, k_init,
     module.k_min = k_min
 
 class _GeneralizedSoftsign(torch.autograd.Function):
+    """``phi_p(x) = x / (1 + |x|^p)^(1/p)`` as one autograd node.
+
+    The forward is the closed form; the backward recomputes the
+    intermediates it needs from ``x`` and the exponent.
+    """
 
     @staticmethod
     def forward(ctx, x, p):
-        p_is_tensor = isinstance(p, torch.Tensor)
-        if p_is_tensor:
-            p_raw = p
-            p = p.clamp(min=_MIN_P)
-        else:
-            # Frozen p (`learnable_p=False`) is stored as a Python float, so
-            # the tensor-only clamp above would let p <= 0 reach the closed
-            # form: p=0 divides by zero and p<0 makes |x|^p explode at zero.
-            # D2's floor applies to every representation of the exponent.
-            p = max(float(p), _MIN_P)
-        ctx.p_is_tensor = p_is_tensor
-        ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
         saved = [x]
-        if p_is_tensor:
-            saved.append(p_raw)
-        else:
-            ctx.p_value = float(p)
+        p = _save_exponent(ctx, p, saved)
         ctx.save_for_backward(*saved)
         return _softsign_forward(x, p)
 
@@ -275,11 +406,7 @@ class _GeneralizedSoftsign(torch.autograd.Function):
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
         x = saved[0]
-        if ctx.p_is_tensor:
-            p_raw = saved[1]
-            p = p_raw.clamp(min=_MIN_P)
-        else:
-            p = ctx.p_value
+        p, p_raw = _restore_exponent(ctx, saved, 1)
         grad_x = grad_p = None
         need_x = ctx.needs_input_grad[0]
         need_p = ctx.needs_input_grad[1] and ctx.need_p_grad
@@ -291,7 +418,13 @@ class _GeneralizedSoftsign(torch.autograd.Function):
             grad_p = _softsign_p_grad(phi.mul_(grad_out), a, p, p_raw)
         return (grad_x, grad_p)
 
+
 def generalized_softsign(x: torch.Tensor, p) -> torch.Tensor:
+    """The generalized softsign ``x / (1 + |x|^p)^(1/p)``.
+
+    This is the public entry point of the core math; every norm of the
+    family routes through it (directly or through the fused kernel).
+    """
     return _GeneralizedSoftsign.apply(x, p)
 
 @register_norm("ln")
@@ -372,6 +505,11 @@ class _RMSNorm(torch.autograd.Function):
 
 @register_norm("dytc")
 class DyTC(_SquashedAffine):
+    """Per-channel generalized softsign: ``gamma * phi_p(alpha_c * x) (+ beta)``.
+
+    ``alpha`` is a learnable vector (one entry per channel); ``p`` is a
+    learnable scalar exponent unless ``learnable_p=False`` freezes it.
+    """
 
     def __init__(self, dim: int, alpha_init: float=0.5, p_init: float=2.0, learnable_p: bool=True, beta: bool=True, alpha_jitter: float=0.05):
         super().__init__()
@@ -386,29 +524,19 @@ class DyTC(_SquashedAffine):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _DyTCForward.apply(x, self.alpha, self.p, self.gamma, self.beta)
 
+
 class _DyTCForward(torch.autograd.Function):
+    """The per-channel generalized-softsign norm as one autograd node.
+
+    The forward is the closed form; the backward recomputes the
+    intermediates it needs from ``x``.
+    """
 
     @staticmethod
     def forward(ctx, x, alpha, p, gamma, beta):
-        p_is_tensor = isinstance(p, torch.Tensor)
-        if p_is_tensor:
-            p_raw = p
-            p = p.clamp(min=_MIN_P)
-        else:
-            # Frozen p is a Python float; apply the same D2 floor as tensor p.
-            p = max(float(p), _MIN_P)
-        phi = _softsign_forward(x, p, alpha)
-        if beta is not None:
-            out = phi.mul_(gamma).add_(beta)
-        else:
-            out = phi.mul_(gamma)
-        ctx.p_is_tensor = p_is_tensor
-        ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
         saved = [x, alpha, gamma, beta]
-        if p_is_tensor:
-            saved.append(p_raw)
-        else:
-            ctx.p_value = float(p)
+        p = _save_exponent(ctx, p, saved)
+        out = _apply_affine(_softsign_forward(x, p, alpha), gamma, beta)
         ctx.save_for_backward(*saved)
         return out
 
@@ -416,12 +544,7 @@ class _DyTCForward(torch.autograd.Function):
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
         x, alpha, gamma, beta = saved[:4]
-        p_is_tensor = ctx.p_is_tensor
-        p_raw = saved[4] if p_is_tensor else None
-        if p_is_tensor:
-            p = p_raw.clamp(min=_MIN_P)
-        else:
-            p = ctx.p_value
+        p, p_raw = _restore_exponent(ctx, saved, 4)
         need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
         need_gamma_grad = ctx.needs_input_grad[3]
@@ -478,16 +601,18 @@ class DyTD(_SquashedAffine):
         return _DyTDForward.apply(x, self.alpha_0, self._k_effective(), self.gamma, self.beta, self._depth_ratio)
 
 class _DyTDForward(torch.autograd.Function):
+    """The depth-conditioned tanh norm as one autograd node.
+
+    The schedule ``alpha_l = alpha_0 * exp(-k * l / L)`` is evaluated once
+    in the forward and the backward chains the schedule gradients through
+    the closed-form ``tanh`` derivative.
+    """
 
     @staticmethod
     def forward(ctx, x, alpha_0, k, gamma, beta, depth_ratio):
         exp_kdr = torch.exp(k.mul(-depth_ratio))
         a = alpha_0 * exp_kdr
-        phi = x.mul(a).tanh_()
-        if beta is not None:
-            out = phi.mul_(gamma).add_(beta)
-        else:
-            out = phi.mul_(gamma)
+        out = _tanh_squash_forward(x, a, gamma, beta)
         ctx.save_for_backward(x, alpha_0, k, gamma, beta, exp_kdr.detach())
         ctx.depth_ratio = depth_ratio
         return out
@@ -497,15 +622,7 @@ class _DyTDForward(torch.autograd.Function):
         x, alpha_0, k, gamma, beta, exp_kdr = ctx.saved_tensors
         depth_ratio = ctx.depth_ratio
         a = alpha_0 * exp_kdr
-        phi = x.mul(a).tanh_()
-        w = phi * grad_out
-        grad_gamma = None
-        if ctx.needs_input_grad[3]:
-            grad_gamma = _sum_leading_dims(w)
-        w.mul_(phi)
-        del phi
-        torch.sub(grad_out, w, out=w)
-        w.mul_(gamma)
+        w, grad_gamma = _tanh_squash_backward(x, a, gamma, grad_out, ctx.needs_input_grad[3])
         need_schedule = ctx.needs_input_grad[1] or ctx.needs_input_grad[2]
         grad_a = _dot_all(w, x) if need_schedule else None
         w.mul_(a)
@@ -552,6 +669,7 @@ class DyTDTanh(nn.Module):
 
 @register_norm("dyt")
 class DyT(_SquashedAffine):
+    """The original DyT: ``gamma * tanh(alpha * x) (+ beta)`` with a scalar alpha."""
 
     def __init__(self, dim: int, alpha_init: float=0.6, beta: bool=True):
         super().__init__()
@@ -562,30 +680,23 @@ class DyT(_SquashedAffine):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _DyTForward.apply(x, self.alpha, self.gamma, self.beta)
 
+
 class _DyTForward(torch.autograd.Function):
+    """The scalar-alpha tanh norm as one autograd node.
+
+    The backward recomputes the squashed output from ``x`` and ``alpha``.
+    """
 
     @staticmethod
     def forward(ctx, x, alpha, gamma, beta):
-        phi = x.mul(alpha).tanh_()
-        if beta is not None:
-            out = phi.mul_(gamma).add_(beta)
-        else:
-            out = phi.mul_(gamma)
+        out = _tanh_squash_forward(x, alpha, gamma, beta)
         ctx.save_for_backward(x, alpha, gamma, beta)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         x, alpha, gamma, beta = ctx.saved_tensors
-        phi = x.mul(alpha).tanh_()
-        w = phi * grad_out
-        grad_gamma = None
-        if ctx.needs_input_grad[2]:
-            grad_gamma = _sum_leading_dims(w)
-        w.mul_(phi)
-        del phi
-        torch.sub(grad_out, w, out=w)
-        w.mul_(gamma)
+        w, grad_gamma = _tanh_squash_backward(x, alpha, gamma, grad_out, ctx.needs_input_grad[2])
         grad_alpha = _dot_all(w, x) if ctx.needs_input_grad[1] else None
         w.mul_(alpha)
         grad_x = w
@@ -630,32 +741,23 @@ class DyTCD(_SquashedAffine):
         return _DyTCDForward.apply(x, self.alpha_0, self._k_effective(), self.delta, self.p, self.gamma, self.beta, self._depth_ratio)
 
 class _DyTCDForward(torch.autograd.Function):
+    """The main proposal (per-channel x depth-conditioned softsign) as one
+    autograd node.
+
+    The per-channel alpha is ``alpha_c = alpha_0 * exp(-k*l/L) * (1 + delta)``
+    floored at ``_MIN_ALPHA``; the exponent ``p`` is floored at ``_MIN_P``.
+    """
 
     @staticmethod
     def forward(ctx, x, alpha_0, k, delta, p, gamma, beta, depth_ratio):
-        p_is_tensor = isinstance(p, torch.Tensor)
-        if p_is_tensor:
-            p_raw = p
-            p = p.clamp(min=_MIN_P)
-        else:
-            # A frozen exponent buffer can still be a plain float on external
-            # call paths; keep the D2 floor for both representations.
-            p = max(float(p), _MIN_P)
+        p, p_raw = _prepare_exponent(ctx, p)
         exp_kdr = torch.exp(k.mul(-depth_ratio))
         scale = alpha_0 * exp_kdr
         alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=_MIN_ALPHA)
-        phi = _softsign_forward(x, p, alpha_c, scale_nonneg=True)
-        if beta is not None:
-            out = phi.mul_(gamma).add_(beta)
-        else:
-            out = phi.mul_(gamma)
-        ctx.p_is_tensor = p_is_tensor
-        ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
+        out = _apply_affine(_softsign_forward(x, p, alpha_c, scale_nonneg=True), gamma, beta)
         saved = [x, alpha_0, k, delta, gamma, beta, alpha_c, exp_kdr.detach()]
-        if p_is_tensor:
+        if p_raw is not None:
             saved.append(p_raw)
-        else:
-            ctx.p_value = float(p)
         ctx.save_for_backward(*saved)
         ctx.depth_ratio = depth_ratio
         return out
@@ -666,12 +768,7 @@ class _DyTCDForward(torch.autograd.Function):
         x, alpha_0, k, delta, gamma, beta, alpha_c = saved[:7]
         exp_kdr = saved[7]
         depth_ratio = ctx.depth_ratio
-        p_is_tensor = ctx.p_is_tensor
-        p_raw = saved[8] if p_is_tensor else None
-        if p_is_tensor:
-            p = p_raw.clamp(min=_MIN_P)
-        else:
-            p = ctx.p_value
+        p, p_raw = _restore_exponent(ctx, saved, 8)
         need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or ctx.needs_input_grad[2] or ctx.needs_input_grad[3]
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[4]
         need_gamma_grad = ctx.needs_input_grad[5]
@@ -782,25 +879,9 @@ class _DyTSForward(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, alpha, p, gamma, beta):
-        p_is_tensor = isinstance(p, torch.Tensor)
-        if p_is_tensor:
-            p_raw = p
-            p = p.clamp(min=_MIN_P)
-        else:
-            # Frozen p is a Python float; apply the same D2 floor as tensor p.
-            p = max(float(p), _MIN_P)
-        phi = _softsign_forward(x, p, alpha)
-        if beta is not None:
-            out = phi.mul_(gamma).add_(beta)
-        else:
-            out = phi.mul_(gamma)
-        ctx.p_is_tensor = p_is_tensor
-        ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
         saved = [x, alpha, gamma, beta]
-        if p_is_tensor:
-            saved.append(p_raw)
-        else:
-            ctx.p_value = float(p)
+        p = _save_exponent(ctx, p, saved)
+        out = _apply_affine(_softsign_forward(x, p, alpha), gamma, beta)
         ctx.save_for_backward(*saved)
         return out
 
@@ -808,12 +889,7 @@ class _DyTSForward(torch.autograd.Function):
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
         x, alpha, gamma, beta = saved[:4]
-        p_is_tensor = ctx.p_is_tensor
-        p_raw = saved[4] if p_is_tensor else None
-        if p_is_tensor:
-            p = p_raw.clamp(min=_MIN_P)
-        else:
-            p = ctx.p_value
+        p, p_raw = _restore_exponent(ctx, saved, 4)
         need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
         need_gamma_grad = ctx.needs_input_grad[3]
@@ -822,7 +898,7 @@ class _DyTSForward(torch.autograd.Function):
         a = None
         if need_softsign or need_phi:
             g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha)
-        p_val = p if p_is_tensor else float(p)
+        p_val = p
         grad_p = grad_gamma = None
         if need_phi:
             grad_phi = phi.mul_(grad_out)
@@ -833,6 +909,10 @@ class _DyTSForward(torch.autograd.Function):
             del phi, a, grad_phi
         grad_x = grad_alpha = None
         if need_softsign:
+            # The ``log2``/``exp2`` form is used for both representations of
+            # ``p`` here (unlike the per-channel kernel, which switches to
+            # ``pow`` for a frozen exponent): the two spellings round
+            # differently, so each kernel keeps its own sequence.
             grad_x_scaled = g.log2_().mul_(p_val + 1).exp2_()
             grad_x_scaled.mul_(grad_out).mul_(gamma)
             if ctx.needs_input_grad[1]:
@@ -871,27 +951,15 @@ class _DyTPForward(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, alpha, gamma, beta):
-        phi = x.mul(alpha).tanh_()
-        if beta is not None:
-            out = phi.mul_(gamma).add_(beta)
-        else:
-            out = phi.mul_(gamma)
+        out = _tanh_squash_forward(x, alpha, gamma, beta)
         ctx.save_for_backward(x, alpha, gamma, beta)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         x, alpha, gamma, beta = ctx.saved_tensors
-        phi = x.mul(alpha).tanh_()
-        w = phi * grad_out
-        grad_gamma = None
-        if ctx.needs_input_grad[2]:
-            grad_gamma = _sum_leading_dims(w)
-        w.mul_(phi)
-        torch.sub(grad_out, w, out=w)
-        w.mul_(gamma)
+        w, grad_gamma = _tanh_squash_backward(x, alpha, gamma, grad_out, ctx.needs_input_grad[2])
         grad_alpha = _reduce_products(w, x) if ctx.needs_input_grad[1] else None
-        del phi
         grad_x = w.mul_(alpha) if ctx.needs_input_grad[0] else None
         grad_beta = None
         if beta is not None and ctx.needs_input_grad[3]:
