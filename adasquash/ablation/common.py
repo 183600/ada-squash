@@ -116,10 +116,15 @@ def _paired_effect_summary(row: dict, reference: dict, common_seeds, test: dict 
             # value) but the *scientific* margin, not the observed delta, so a
             # null result can be read as underpowered rather than as evidence
             # of no effect. With margin=0 the block explicitly says no target
-            # was registered instead of inventing one post hoc.
+            # margin was registered instead of inventing one post hoc; the
+            # `adequately_powered_for_margin` field will be None in that case.
             out["design_power"] = paired_design_summary(
                 stats["std"], int(test["n"]), margin=margin,
                 alpha=alpha, power=power)
+            if margin == 0.0:
+                out["design_power"]["note"] = (
+                    "margin=0 means no target effect size was registered; "
+                    "adequately_powered_for_margin is therefore None")
     return out
 
 

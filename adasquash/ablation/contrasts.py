@@ -1270,6 +1270,16 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                     entry["interaction_direction"] = "antagonism"
                 else:
                     entry["interaction_direction"] = "additive_or_within_margin"
+                # Report the interaction magnitude relative to the main effect
+                # scales for context: a small interaction relative to main effects
+                # may be practically negligible even if statistically significant.
+                main_effects = entry.get("arm_effects", {})
+                if main_effects:
+                    arm_delta_vals = list(main_effects.values())
+                    if arm_delta_vals and arm_delta_vals[0].get("mean_delta") is not None:
+                        main_mean = abs(arm_delta_vals[0]["mean_delta"])
+                        if main_mean > 0:
+                            entry["interaction_vs_main_ratio"] = abs(delta) / main_mean
             effect_row = {"per_seed": [{"seed": int(seed), "val_loss": value}
                                        for seed, value in effect["per_seed_values"].items()]}
             zero_row = {"per_seed": [{"seed": int(seed), "val_loss": 0.0}
@@ -1410,10 +1420,13 @@ def print_factorial_comparison(comparison: dict | None) -> None:
         if entry.get("kind") == "interaction":
             p2 = entry.get("p_two_sided")
             p2_holm = entry.get("p_two_sided_holm")
+            ratio = entry.get("interaction_vs_main_ratio")
+            ratio_str = "" if ratio is None else f" vs_main_ratio={ratio:.2f} "
             interaction = (f" interaction={entry.get('interaction_direction')} "
                            f"p(two-sided)={'n/a' if p2 is None else f'{p2:.3g}'} "
                            f"p2(holm)={'n/a' if p2_holm is None else f'{p2_holm:.3g}'} "
-                           f"differs={entry.get('interaction_differs_significantly')}")
+                           f"differs={entry.get('interaction_differs_significantly')}"
+                           f" {ratio_str}")
         print(f"[factorial] {entry['design']} {entry['kind']} {entry['effect']}: "
               f"delta={entry['delta_seed_mean']:+.4f} {ci_str}"
               f"seeds_favoring={entry['n_seeds_favoring']}/{entry['n_seeds']} "
