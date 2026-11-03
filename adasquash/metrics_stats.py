@@ -1684,7 +1684,7 @@ def tost_design_summary(std: float, n: int, margin: float,
 
 def leave_one_out_jackknife(
     values: Sequence[float], labels: Optional[Sequence] = None
-) -> dict:
+) -> dict | None:
     """How dependent is a sample mean on any single observation?
 
     With three seeds, one lucky or broken run can carry a delta. Dropping
