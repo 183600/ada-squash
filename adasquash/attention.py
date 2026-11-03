@@ -277,7 +277,7 @@ class CausalSelfAttention(nn.Module):
             logit_std = float("nan")
         return {"logit_abs_mean": mean_abs, "logit_abs_max": peak_v, "logit_std": logit_std}
 
-def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
+    def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
         """Cache‑lookup for rotary position embeddings keyed by ``(ptr, shape, device, dtype)``.
 
         The D6 cache key is the source pointer so that in-place buffer updates
