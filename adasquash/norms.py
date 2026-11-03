@@ -952,7 +952,7 @@ class _DyTSForward(torch.autograd.Function):
         a = None
         if need_softsign or need_phi:
             g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha)
-        p_val = p
+        p_val = _as_scalar_exponent(p)
         grad_p = grad_gamma = None
         if need_phi:
             grad_phi = phi.mul_(grad_out)
