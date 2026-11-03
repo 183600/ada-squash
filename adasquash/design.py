@@ -2519,9 +2519,13 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
             f"control pair(s) must be two-element lists/tuples of row names: "
             f"{malformed_controls!r}")
     elif not pairs:
-        add("controls", "warn",
-            "no identity/negative-control pair declared: the analysis has no "
-            "known-null contrast to check its own calibration")
+        if equivalence_margin > 0.0:
+            add("controls", "fail",
+                "no identity/negative-control pair declared: equivalence testing requires a known-null contrast to check calibration")
+        else:
+            add("controls", "warn",
+                "no identity/negative-control pair declared: the analysis has no "
+                "known-null contrast to check its own calibration")
     else:
         missing_pairs = [pair for pair in pairs
                          if len(pair) != 2 or any(str(name) not in names for name in pair)]
