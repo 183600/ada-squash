@@ -1106,11 +1106,27 @@ def paired_t_one_sided(
     half = -student_t_ppf(alpha / 2.0, df) * se
     ci_low = (mean_test - half) * ci_scale
     ci_high = (mean_test + half) * ci_scale
+    # Standardized effect size over the paired differences: scale-invariant,
+    # comparable across loss scales, and the quantity a reader needs to judge
+    # practical significance at 2-4 seeds. Both arms share the same scale, so
+    # mean/std is unchanged by the optional rescaling above.
+    dz = None
+    hedges_g = None
+    if std > 0.0 and n >= 2:
+        dz = mean / std
+        if not math.isfinite(dz):
+            dz = None
+        else:
+            hedges_g = dz * _hedges_correction(df)
+            if not math.isfinite(hedges_g):
+                hedges_g = None
     out = {
         "mean_delta": mean,
         "t": t,
         "df": df,
         "p_one_sided": student_t_cdf(t, df),
+        "cohens_dz": dz,
+        "hedges_g": hedges_g,
         "ci_low": ci_low,
         "ci_high": ci_high,
         "ci_level": 1.0 - alpha,
@@ -1124,6 +1140,91 @@ def paired_t_one_sided(
     if note is not None:
         out["note"] = note
     return out
+
+
+def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    """Standardized mean difference for paired samples (Cohen's dz).
+
+    The paired design compares two arms on the same seeds/batches, so the
+    natural standardization is the standard deviation of the *paired
+    differences*, not the pooled standard deviation of each arm.
+    ``dz = mean(a - b) / sd(a - b)``. A value of 0.2/0.5/0.8 is the usual
+    small/medium/large reference, but the pairing makes dz sensitive to how
+    strongly the two arms track each other: high within-pair correlation
+    shrinks the difference SD and inflates dz even when the raw gap is tiny,
+    so always read it beside the raw mean delta and its confidence interval.
+
+    Returns ``None`` when there are fewer than two finite paired
+    observations or the paired difference SD is zero (in which case the
+    effect is exactly the sign of the mean delta and cannot be standardized).
+    """
+    a_vals = _real_values(a, "a")
+    b_vals = _real_values(b, "b")
+    if len(a_vals) != len(b_vals):
+        raise ValueError(
+            f"paired effect size needs equal lengths, got {len(a_vals)} vs "
+            f"{len(b_vals)}")
+    pairs, excluded = _finite_paired_observations(a_vals, b_vals)
+    if len(pairs) < 2:
+        return None
+    diffs = [left - right for left, right in pairs]
+    n = len(diffs)
+    mean_diff = sum(diffs) / n
+    variance = sum((value - mean_diff) ** 2 for value in diffs) / (n - 1)
+    if variance <= 0.0:
+        return None
+    sd_diff = math.sqrt(variance)
+    dz = mean_diff / sd_diff
+    if not math.isfinite(dz):
+        return None
+    return dz
+
+
+def _hedges_correction(df: float) -> float:
+    """Hedges' small-sample bias correction ``J(df)``.
+
+    Exact form: ``J = Gamma(df/2) / (sqrt(df/2) * Gamma((df-1)/2))``,
+    evaluated through ``math.lgamma`` so it stays finite for large df. For
+    very large df the first-order expansion ``1 - 3/(4*df - 1)`` agrees to
+    within reporting precision and is cheaper, so use it there to avoid the
+    lgamma overhead. The correction is < 1 and tends to 1 as df grows, so
+    Hedges' g is a slightly conservative version of Cohen's d at small n.
+    """
+    if df <= 1.0:
+        return 1.0
+    if df > _T_NORMAL_APPROX_DF:
+        return 1.0 - 3.0 / (4.0 * df - 1.0)
+    try:
+        log_j = (
+            math.lgamma(df / 2.0)
+            - 0.5 * math.log(df / 2.0)
+            - math.lgamma((df - 1.0) / 2.0))
+        j = math.exp(log_j)
+    except OverflowError:
+        j = 1.0 - 3.0 / (4.0 * df - 1.0)
+    if not math.isfinite(j) or j <= 0.0:
+        j = 1.0 - 3.0 / (4.0 * df - 1.0)
+    return min(1.0, max(0.0, j))
+
+
+def hedges_g_paired(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    """Small-sample bias-corrected paired effect size (Hedges' g for pairs).
+
+    ``g = dz * J(n - 1)`` where ``dz`` is Cohen's dz over the paired
+    differences and ``J`` is Hedges' correction. At n = 3 seeds the
+    correction is about 0.78, so the uncorrected dz would overstate the
+    effect by roughly a quarter; this is exactly the regime this repo's
+    confirmatory comparisons live in. Returns ``None`` under the same
+    conditions as :func:`cohens_dz`.
+    """
+    dz = cohens_dz(a, b)
+    if dz is None:
+        return None
+    a_vals = _real_values(a, "a")
+    b_vals = _real_values(b, "b")
+    pairs, _ = _finite_paired_observations(a_vals, b_vals)
+    df = float(len(pairs) - 1)
+    return dz * _hedges_correction(df)
 
 
 def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[float]:

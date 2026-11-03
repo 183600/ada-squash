@@ -28,7 +28,10 @@ if str(ROOT) not in sys.path:
 
 from adasquash.metrics import (
     benjamini_hochberg_adjust,
+    cohens_dz,
+    hedges_g_paired,
     leave_one_out_jackknife,
+    paired_t_one_sided,
     paired_trend_test,
     tost_design_summary,
     tost_paired,
@@ -44,6 +47,8 @@ from scripts.ablation import (
 )
 
 SEEDS = [42, 43, 44]
+_HEDGES_J3_LOW = 0.70
+_HEDGES_J3_HIGH = 0.75
 
 
 def _row(name, values, **extra):
@@ -774,3 +779,90 @@ def test_sweep_trend_is_descriptive_when_a_depth_is_incomplete():
     assert entry["certifiable"] is False
     assert entry["advantage_grows_with_depth"] is False
     assert "descriptive" in entry["note"]
+
+
+# ---------------------------------------------------------------------------
+# Paired effect sizes (Cohen's dz / Hedges' g)
+# ---------------------------------------------------------------------------
+def test_cohens_dz_basic():
+    a = [1.0, 2.0, 3.0]
+    b = [0.0, 1.0, 2.0]
+    # Constant difference 1.0 over SD 0.0 -> dz undefined (zero variance).
+    assert cohens_dz(a, b) is None
+
+
+def test_cohens_dz_value():
+    a = [2.0, 4.0, 6.0, 8.0]
+    b = [1.0, 2.0, 3.0, 4.0]
+    diffs = [1.0, 2.0, 3.0, 4.0]
+    mean_diff = 2.5
+    sd_diff = (sum((d - mean_diff) ** 2 for d in diffs) / 3.0) ** 0.5
+    expected = mean_diff / sd_diff
+    assert cohens_dz(a, b) == pytest.approx(expected, rel=1e-6)
+
+
+def test_hedges_g_is_shrunken_dz():
+    a = [2.0, 4.0, 6.0, 8.0]
+    b = [1.0, 2.0, 3.0, 4.0]
+    dz = cohens_dz(a, b)
+    assert dz is not None and dz > 0.0
+    g = hedges_g_paired(a, b)
+    assert g is not None
+    # Hedges' correction J(df=3) is about 0.72, so g < dz (conservative at
+    # small n). The first-order approximation 1 - 3/(4*df - 1) is close but
+    # not exact; bound the ratio instead of pinning it.
+    ratio = g / dz
+    assert 0.0 < ratio < 1.0
+    assert _HEDGES_J3_LOW < ratio < _HEDGES_J3_HIGH
+
+
+def test_cohens_dz_scale_invariant():
+    a = [2.0, 4.0, 6.0, 8.0]
+    b = [1.0, 2.0, 3.0, 4.0]
+    scale = 100.0
+    assert cohens_dz(a, b) == pytest.approx(
+        cohens_dz([x * scale for x in a], [x * scale for x in b]), rel=1e-6)
+    assert hedges_g_paired(a, b) == pytest.approx(
+        hedges_g_paired([x * scale for x in a],
+                        [x * scale for x in b]), rel=1e-6)
+
+
+def test_cohens_dz_sign_tracks_mean_delta():
+    a = [5.0, 5.0, 5.0]
+    b = [1.0, 2.0, 3.0]
+    dz = cohens_dz(a, b)
+    assert dz is not None and dz > 0.0
+    dz_neg = cohens_dz(b, a)
+    assert dz_neg is not None and dz_neg < 0.0
+    assert dz_neg == pytest.approx(-dz, rel=1e-6)
+
+
+def test_cohens_dz_insufficient_data():
+    assert cohens_dz([1.0], [2.0]) is None
+    assert cohens_dz([], []) is None
+    assert hedges_g_paired([1.0], [2.0]) is None
+    assert hedges_g_paired([], []) is None
+
+
+def test_cohens_dz_unequal_lengths_rejected():
+    with pytest.raises(ValueError):
+        cohens_dz([1.0, 2.0], [1.0])
+    with pytest.raises(ValueError):
+        hedges_g_paired([1.0, 2.0], [1.0])
+
+
+def test_paired_t_reports_effect_sizes():
+    a = [2.0, 4.0, 6.0, 8.0]
+    b = [1.0, 2.0, 3.0, 4.0]
+    out = paired_t_one_sided(a, b, margin=0.0)
+    assert out["cohens_dz"] is not None
+    assert out["hedges_g"] is not None
+    assert 0.0 < out["hedges_g"] < out["cohens_dz"]
+
+
+def test_paired_t_effect_sizes_none_when_undefined():
+    a = [1.0, 1.0, 1.0]
+    b = [1.0, 1.0, 1.0]
+    out = paired_t_one_sided(a, b, margin=0.0)
+    assert out["cohens_dz"] is None
+    assert out["hedges_g"] is None
