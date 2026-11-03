@@ -219,7 +219,7 @@ def _compute_s_and_a(u: torch.Tensor, p, need_a: bool):
     ``p`` because the exponent gradient depends on the pre-power value of ``u``.
     """
     if isinstance(p, torch.Tensor):
-        q = u.log2_().mul_(p)
+        q = u.log2().mul_(p)
         a = None
         if need_a:
             a = q.mul(_LN2).clamp_(min=p * _log_tiny(q.dtype))
@@ -229,7 +229,7 @@ def _compute_s_and_a(u: torch.Tensor, p, need_a: bool):
         # ``torch.pow`` leaves ``u`` intact: the exponent gradient needs its
         # pre-power value.
         s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
-        a = u.log2_().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
+        a = u.log2().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
         return s, a
     s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     return s, None
@@ -266,14 +266,14 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_p_grad: bool, need_phi: 
     phi = None
     if need_phi:
         if need_x_grad:
-            phi = lo.mul_(s).copysign_(xs)
+            phi = (lo * s).copysign_(xs)
         else:
-            phi = s.mul_(lo).copysign_(xs)
+            phi = (s * lo).copysign_(xs)
         if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
             phi.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     if not need_x_grad:
         return (None, phi, a)
-    return (r.mul_(s), phi, a)
+    return (r * s, phi, a)
 
 def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p_raw: torch.Tensor, gamma: Optional[torch.Tensor]=None) -> torch.Tensor:
     """Gradient of the generalized softsign exponent ``p`` from the output cotangent.
