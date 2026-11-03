@@ -693,7 +693,7 @@ class _DyTDForward(torch.autograd.Function):
         return (grad_x, grad_alpha_0, grad_k, grad_gamma, grad_beta, None)
 
 @register_norm("dytd_tanh")
-class DyTDTanh(nn.Module):
+class DyTDTanh(_SquashedAffine):
     """Ablation-only comparator: DyT-D with `tanh` (plain autograd).
 
     Same depth schedule as `DyTD` (`alpha_l = alpha_0 * exp(-k * l/L)`),
@@ -867,7 +867,7 @@ class _DyTCDForward(torch.autograd.Function):
         return (grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None)
 
 @register_norm("dytcd_tanh")
-class DyTCDTanh(nn.Module):
+class DyTCDTanh(_SquashedAffine):
     """Ablation-only comparator: DyT-CD with `tanh` instead of the softsign family.
 
     Same per-channel x depth alpha as `DyTCD` (`alpha_c,l = alpha_0 *
