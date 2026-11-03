@@ -72,7 +72,8 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, dim: int, n_heads: int, qk_norm: Optional[str]=None, alpha_init: float=1.0, dropout: float=0.0, skip_init: bool=False):
         super().__init__()
-        assert dim % n_heads == 0, "dim must be divisible by n_heads"
+        if dim % n_heads != 0:
+             raise ValueError("dim must be divisible by n_heads")
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         self.dim = dim
