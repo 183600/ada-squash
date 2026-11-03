@@ -54,9 +54,9 @@ def _log_tiny(dtype: torch.dtype) -> float:
 
 
 def _as_scalar_exponent(p):
-    """``p`` as a Python float when it is a one-element CPU tensor.
+    """Return ``p`` as a Python float when it is a one-element CPU tensor.
 
-    Other tensors (including every CUDA tensor) are returned unchanged.
+    CUDA and multi-element tensors are returned unchanged.
     """
     if isinstance(p, torch.Tensor) and p.device.type == "cpu" and p.numel() == 1:
         return float(p)
@@ -64,18 +64,22 @@ def _as_scalar_exponent(p):
 
 
 def _as_scalar_exponent_inplace(g: torch.Tensor, p) -> torch.Tensor:
-    """``g ** (p + 1)`` written in place."""
+    """Compute ``g ** (p + 1)`` in-place.
+
+    The tensor ``g`` is modified in-place and returned for convenience.
+    ``p`` is treated as a scalar exponent (floored if a tensor).
+    """
     if isinstance(p, torch.Tensor):
         return g.log2_().mul_(p + 1).exp2_()
     return g.pow_(p + 1)
 
 
 def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
-    """Whether the compensating `±1` multiply has to run.
+    """Whether the compensating ``±1`` multiply is needed.
 
-    Multiplying by `+1.0` is exact, so when no `scale` entry is negative the
-    correction is a no-op; non-CPU tensors keep the multiply unconditionally.
-    `signbit` (rather than `< 0`) is what makes `-0.0` count as negative.
+    Multiplying by ``+1.0`` is exact, so when no ``scale`` entry is negative
+    the correction is a no-op.  Non-CPU tensors keep the multiply unconditionally.
+    ``signbit`` (rather than ``< 0``) treats ``-0.0`` as negative.
     """
     if scale.device.type != "cpu":
         return True
@@ -83,17 +87,20 @@ def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
 
 
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
-    """Sum over every axis except the last one."""
+    """Sum over all dimensions except the last one.
+
+    For 1-D inputs a clone is returned to preserve the tensor.
+    """
     if t.ndim <= 1:
         return t.clone()
     return t.sum(dim=tuple(range(t.ndim - 1)))
 _REDUCE_CHUNK_ELEMS = 1 << 22
 
 def _chunked_product_sum(a2: torch.Tensor, b2: torch.Tensor, step: int, acc_dtype: torch.dtype) -> torch.Tensor:
-    """Row-chunked sum of products accumulated in ``acc_dtype``.
+    """Row-chunked sum of products ``a * b`` accumulated in ``acc_dtype``.
 
-    Both inputs are 2-D; each chunk is a row block, so the temporary block
-    never covers the whole leading dimension at once.
+    Both inputs are 2-D; each chunk is a row block so the temporary block
+    never covers the entire leading dimension at once.
     """
     total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a2.device)
     for start in range(0, a2.shape[0], step):
@@ -102,6 +109,12 @@ def _chunked_product_sum(a2: torch.Tensor, b2: torch.Tensor, step: int, acc_dtyp
     return total
 
 def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Element-wise product of ``a`` and ``b``, with contour reduction.
+
+    For 1-D tensors returns ``a * b`` directly.  For 2-D contiguous tensors
+    with total size <= ``_REDUCE_CHUNK_ELEMS`` a single ``sum(dim=0)`` is used.
+    Larger or non-contiguous tensors take chunked or per-row reduction paths.
+    """
     if a.ndim <= 1:
         return a * b
     if a.shape[-1] == 0:
@@ -134,7 +147,8 @@ def _effective_decay_rate(k, k_min):
     """Depth-decay rate, optionally floored at ``k_min``.
 
     ``None`` keeps the historical unconstrained rate; a tensor rate is
-    clamped without leaving autograd.
+    clamped ``.clamp(min=k_min)`` without leaving autograd.
+    A plain float is floored with ``max(float(k), float(k_min))``.
     """
     if k_min is None:
         return k
@@ -143,10 +157,19 @@ def _effective_decay_rate(k, k_min):
     return max(float(k), float(k_min))
 
 def _depth_alpha(alpha_0, k, depth_ratio: float) -> torch.Tensor:
-    """``alpha_0 * exp(-k * depth_ratio)`` for the depth-conditioned norms."""
+    """Compute ``alpha_0 * exp(-k * depth_ratio)`` for depth-conditioned norms.
+
+    The decay factor ``exp(-k * depth_ratio)`` attenuates the initial alpha
+    ``alpha_0`` across layers; ``depth_ratio = layer_idx / num_layers``.
+    """
     return alpha_0 * torch.exp(-k * depth_ratio)
 
 def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Dot product of two tensors, flattening leading dimensions.
+
+    If both tensors are contiguous the optimized ``torch.dot`` path is used;
+    otherwise a element-wise product sum falls back.
+    """
     if a.is_contiguous() and b.is_contiguous():
         return torch.dot(a.reshape(-1), b.reshape(-1))
     return (a * b).sum()
@@ -160,7 +183,7 @@ def register_norm(name: str):
     return _decorator
 
 def _softsign_core(xs: torch.Tensor, p, scale=None):
-    """Compute the shared intermediates for softsign forward/backward.
+    """Compute the shared intermediates for generalized softsign forward/backward.
 
     Returns ``(lo, r, u, p)`` where:
 
@@ -169,9 +192,12 @@ def _softsign_core(xs: torch.Tensor, p, scale=None):
     * ``u``  = ``lo * r`` in ``[0, 1]``;
     * ``p``  = the scalar-exponent form of ``p``;
 
-    with ``t = |xs|`` or ``t = |xs * scale|``. The reciprocal is taken on
+    with ``t = |xs|`` or ``t = |xs * scale|``.  The reciprocal is taken on
     ``max(t, 1)`` and never on ``t`` itself: a zero magnitude would make
     ``1/0`` infinite and the derivative of the unselected branch ``NaN``.
+
+    The two-step clamp-then-reciprocal design (rather than a single ``1/(1+|t|^p)``)
+    guarantees numerical stability when ``t`` contains zeros or very small values.
     """
     p = _as_scalar_exponent(p)
     if scale is None:
@@ -185,12 +211,12 @@ def _softsign_core(xs: torch.Tensor, p, scale=None):
 
 
 def _compute_s_and_a(u: torch.Tensor, p, need_a: bool):
-    """``s = (u^p + 1)^(-1/p)`` and, on demand, ``a = clamp(p * ln u)``.
+    """Compute ``s = (u^p + 1)^(-1/p)`` and optionally ``a = p * ln u``.
 
-    ``a`` is the intermediate of the exponent gradient, so it is only needed
-    when the exponent itself is differentiable. The tensor and the plain
-    float representation of ``p`` follow different op sequences (and a
-    different aliasing of ``u``), which is why both branches are spelled out.
+    The forward value ``s`` is the core of the generalized softsign inversion.
+    The intermediate ``a`` is the clamped ``p * ln u`` needed when the exponent
+    ``p`` is differentiable; its numerical path differs between tensor and scalar
+    ``p`` because the exponent gradient depends on the pre-power value of ``u``.
     """
     if isinstance(p, torch.Tensor):
         q = u.log2_().mul_(p)
@@ -250,15 +276,17 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_p_grad: bool, need_phi: 
     return (r.mul_(s), phi, a)
 
 def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p_raw: torch.Tensor, gamma: Optional[torch.Tensor]=None) -> torch.Tensor:
-    """Gradient w.r.t. ``p`` from the cotangent of the squashed output.
+    """Gradient of the generalized softsign exponent ``p`` from the output cotangent.
 
-    ``a`` is the clamped ``p * ln(u)`` from ``_softsign_backward_pieces``; it is
-    overwritten with the ``a * sigmoid(a)`` factor and consumed by the end of
-    the call.
+    ``a`` is the clamped ``p * ln(u)`` intermediate; it is overwritten in-place
+    with ``a * sigmoid(a)`` before the final reduction.
+
+    The gradient is averaged over ``p`` via ``1/(p * p)`` and then masked by
+    ``p_raw > _MIN_P`` to enforce the D2 exponent floor.
     """
     if p.numel() != 1 or p_raw.numel() != 1:
         raise ValueError(
-            "the generalized-softsign exponent must be a scalar (one element), "
+            "the generalized-softsign exponent must be a scalar (one-element), "
             f"got p.shape={tuple(p.shape)}")
     p_scalar = p.reshape(())
     p_raw_scalar = p_raw.reshape(())
@@ -284,13 +312,14 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
     return red.reshape(p.shape)
 
 def _floor_exponent(p):
-    """The generalized-softsign exponent with the D2 floor applied.
+    """Apply the D2 exponent floor and return both effective and raw forms.
 
-    Returns ``(p_effective, p_raw, p_is_tensor)``. A tensor exponent keeps
-    its unclamped value in ``p_raw`` so the gradient can see the clamp
-    boundary; a frozen exponent is a plain float and is floored directly -
-    ``p = 0`` would divide by zero and ``p < 0`` would make ``|x|^p`` blow
-    up at zero. The floor applies to both representations.
+    The effective exponent ``p_effective`` is floored at ``_MIN_P = 1e-3``.
+    When ``p`` is a tensor its unclamped value is kept in ``p_raw`` so the
+    gradient can observe the clamp boundary; a frozen (plain-float) exponent
+    is floored directly.
+
+    Returns ``(p_effective, p_raw, p_is_tensor)``.
     """
     if isinstance(p, torch.Tensor):
         return p.clamp(min=_MIN_P), p, True
@@ -298,11 +327,11 @@ def _floor_exponent(p):
 
 
 def _prepare_exponent(ctx, p):
-    """Floor the exponent and record its state on the context.
+    """Floor the exponent and record its state for the autograd context.
 
-    Returns ``(p_effective, p_raw)``. The raw (unclamped) exponent is
-    returned rather than saved here: every kernel places it among its own
-    saved tensors, and the position differs from kernel to kernel.
+    Returns ``(p_effective, p_raw)``.  The raw (unclamped) exponent is returned
+    rather than saved in the context because every kernel places it among its
+    own saved tensors at different positions.
     """
     p_effective, p_raw, p_is_tensor = _floor_exponent(p)
     ctx.p_is_tensor = p_is_tensor
@@ -313,9 +342,10 @@ def _prepare_exponent(ctx, p):
 
 
 def _save_exponent(ctx, p, saved: list):
-    """Floor the exponent, record its state and append the raw exponent.
+    """Floor the exponent, record its context state, and append the raw exponent.
 
-    This is the common case: the raw exponent is the last saved tensor.
+    The raw (unclamped) exponent tensor is appended to ``saved`` so that
+    each kernel can restore it at its own saved-tensor index.
     """
     p_effective, p_raw = _prepare_exponent(ctx, p)
     if p_raw is not None:
@@ -324,7 +354,11 @@ def _save_exponent(ctx, p, saved: list):
 
 
 def _restore_exponent(ctx, saved, index: int):
-    """``(p, p_raw)`` of the exponent, restored from the saved tensors."""
+    """Restore ``(p, p_raw)`` of the exponent from the saved tensors.
+
+    The saved tensor at ``index`` contains the raw (unclamped) exponent;
+    the effective value is either the clamped tensor or the stored float.
+    """
     if ctx.p_is_tensor:
         p_raw = saved[index]
         return p_raw.clamp(min=_MIN_P), p_raw
@@ -332,33 +366,48 @@ def _restore_exponent(ctx, saved, index: int):
 
 
 def _apply_affine(phi: torch.Tensor, gamma: torch.Tensor, beta) -> torch.Tensor:
-    """``gamma * phi (+ beta)`` written in place."""
+    """Apply ``gamma * phi (+ beta)`` in-place.
+
+    If ``beta`` is provided the result is ``gamma * phi + beta``; otherwise
+    ``gamma * phi``.
+    """
     if beta is not None:
         return phi.mul_(gamma).add_(beta)
     return phi.mul_(gamma)
 
 
 def _grad_beta(beta, grad_out, need_beta: bool):
-    """Return summed gradient for ``beta`` if required, else ``None``."""
+    """Return the summed gradient for ``beta`` if required, else ``None``."""
     if beta is not None and need_beta:
         return _sum_leading_dims(grad_out)
     return None
 
 
 def _tanh_squash_forward(x: torch.Tensor, alpha, gamma: torch.Tensor, beta) -> torch.Tensor:
-    """``gamma * tanh(alpha * x) (+ beta)`` as one fused step."""
+    """``gamma * tanh(alpha * x) (+ beta)`` as one fused step.
+
+    The forward applies ``alpha * x``, then ``tanh`` in-place, then scales
+    by ``gamma`` and optionally adds ``beta``, all within a single autograd
+    node so intermediates are recomputed in the backward.
+    """
     return _apply_affine(x.mul(alpha).tanh_(), gamma, beta)
 
 
 def _tanh_squash_backward(x: torch.Tensor, alpha, gamma: torch.Tensor,
                           grad_out: torch.Tensor, need_gamma: bool):
-    """The backward core shared by the ``tanh(alpha * x)`` squashes.
+    """Backward core for ``tanh(alpha * x)`` squash: cotangent scaled by ``gamma``.
 
-    Returns ``(w, grad_gamma)`` where ``w`` is the cotangent of the
-    squashed output, already scaled by ``gamma``. The caller reduces ``w``
-    against ``x`` for the ``alpha`` gradient - a full dot product for a
-    scalar ``alpha``, a per-channel product for a vector one - and then
-    scales ``w`` by ``alpha`` for the input gradient.
+    The forward is ``alpha * x`` then ``tanh``; the backward reuses the saved
+    ``phi = tanh(alpha * x)`` to compute:
+
+    - ``w = gamma * grad_out * phi``  (cotangent of the squashed output)
+    - ``grad_gamma = sum(w)`` if the gamma gradient is requested
+    - ``grad_alpha`` is obtained by reducing ``w * x`` (scalar or per-channel)
+    - The input gradient is ``w`` (already scaled by ``alpha`` after the mul below)
+
+    Here the cotangent ``w`` is first multiplied by ``phi`` (the tanh
+    derivative), then ``grad_out`` is subtracted in-place and ``gamma`` is
+    applied.
     """
     phi = x.mul(alpha).tanh_()
     w = phi * grad_out
@@ -371,7 +420,11 @@ def _tanh_squash_backward(x: torch.Tensor, alpha, gamma: torch.Tensor,
 
 
 def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
-    """Instantiate the norm registered under ``name``."""
+    """Instantiate the norm registered under ``name``.
+
+    The norm class is looked up in :data:`NORM_REGISTRY` and constructed
+    with ``dim`` and any additional keyword arguments.
+    """
     if name not in NORM_REGISTRY:
         raise KeyError(f"Unknown norm '{name}'. Registered: {list(NORM_REGISTRY)}")
     return NORM_REGISTRY[name](dim, **kwargs)

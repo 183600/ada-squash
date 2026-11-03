@@ -4,13 +4,13 @@
 
 > Adaptive Squashing without Statistics for Ultra-Deep and Low-Precision Transformers
 
-This repository is the experimental codebase for the DyT++ proposal: a
-family of *statistic-free* normalization layers that generalize
+This repository is the experimental codebase for the DyT++ proposal: a family of
+*statistic-free* normalization layers that generalize
 Dynamic Tanh (DyT, Zhu et al. 2025) along three orthogonal axes:
 
 | Variant | Axis | What it adds | Targets |
 |--------|------|---------------|---------|
-| **DyT-S**  | activation family         | scalar α + generalized softsign (the {scalar × softsign} factorial cell) | saturation profile vs tanh |
+| **DyT-S**  | activation family         | scalar α + generalized softsign (the {scalar × softsign} cell) | saturation profile vs tanh |
 | **DyT-P**  | per-channel (tanh)        | per-channel α under tanh (the {per-channel × tanh} cell) | isolates the per-channel axis from the family swap |
 | **DyT-C**  | per-channel + softsign    | per-channel α + generalized softsign | outlier-heavy channels (LLaMA "super-active" dims) |
 | **DyT-D**  | depth-conditioned         | depth-decaying α + LayerScale residual | the "curse of depth" in Pre-LN Transformers |
@@ -24,10 +24,10 @@ versus vector normalization — which better handles outlier channels and
 attention expressivity at a matched effective logit scale?* Both approaches
 bound logits identically; see the DyT-QK section.
 
-The `norm_name` values used by configs and scripts are `ln`, `rmsnorm`,
-`dyt`, `dyts`, `dytp`, `dytc`, `dytd`, `dytcd`, and their controlled
-ablation variants. QK squashing is selected separately through
-`qk_norm: dytqk`.
+The ``norm_name`` values used by configs and scripts are ``ln``, ``rmsnorm``,
+``dyt``, ``dyts``, ``dytp``, ``dytc``, ``dytd``, ``dytcd``, and their
+controlled ablation variants. QK squashing is selected separately through
+``qk_norm: dytqk``.
 
 ## Contents
 

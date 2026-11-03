@@ -22,8 +22,8 @@ _ROPE_HALF_SCRATCH_MAX_ENTRIES = 4
 def _rope_half_scratch(x_lo: torch.Tensor) -> torch.Tensor:
     """Shared half-width buffer for the rotary rotation.
 
-    Keyed by (shape, dtype, device) like the other aux caches (never by
-    `id()`); an inference-mode buffer is rebuilt for a grad-mode caller.
+    Keyed by ``(shape, dtype, device)`` like the other aux caches (never by
+    ``id()``); an inference-mode buffer is rebuilt for a grad-mode caller.
     """
     key = (tuple(x_lo.shape), x_lo.dtype, x_lo.device)
     buf = _ROPE_HALF_SCRATCH_CACHE.get(key)
@@ -56,11 +56,11 @@ def _skip_init(module_cls, *args, **kwargs):
     return skip_init(module_cls, *args, **kwargs, device=device)
 
 def _make_linear(in_features: int, out_features: int, bias: bool, skip: bool) -> nn.Linear:
-    """``nn.Linear`` whose constructor's kaiming pass can be skipped.
+    """``nn.Linear`` whose constructor's kaiming initialization can be skipped.
 
-    ``GPT.__init__`` re-initializes every Linear through ``_init_weights``
+    ``GPT.__init__`` re-initialises every Linear through ``_init_weights``
     right after construction, so the constructor's draw is overwritten; when
-    the caller says so, build the module with uninitialized storage instead
+    the caller says so, build the module with uninitialised storage instead
     (``skip_init``) and let that pass be the only initialization. Standalone
     construction (tests, helper modules) keeps the default initialization.
     """
@@ -103,6 +103,16 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(f"Unknown qk_norm='{qk_norm}'")
 
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor]=None, return_stats: bool=False):
+        """Forward pass of the causal self-attention.
+
+        The path follows D1: the main attention uses ``F.scaled_dot_product_attention``
+        with causal masking.  QK-norm (``qknorm`` / ``dytqk``) is applied before
+        RoPE if configured.  Logit statistics are collected in a no-grad sidebar.
+
+        Returns:
+            ``(out, stats)`` where ``out`` is the projected attention output and
+            ``stats`` is a dict of logit metrics (empty when ``return_stats=False``).
+        """
         B, T, C = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.head_dim)
         if freqs_cis is None or self.q_squash is not None or self.q_rms is not None:
@@ -138,6 +148,12 @@ class CausalSelfAttention(nn.Module):
         return (out, stats)
 
     def _tril_mask(self, T: int, device) -> torch.Tensor:
+        """Cache-aware causal mask of shape ``(T, T)``.
+
+        The mask is keyed by ``(T, device)`` and stored in ``_TRIL_MASK_CACHE``.
+        The lower-triangular boolean mask ensures only causal (past) tokens
+        attend to each other.
+        """
         key = (T, device)
         cache = self._tril_cache
         if cache is not None and cache[0] == key:
@@ -159,6 +175,12 @@ class CausalSelfAttention(nn.Module):
     _LOGITS_BLOCK_ROWS = 128
 
     def _logit_scratch(self, B: int, H: int, R: int, T: int, dtype: torch.dtype, device) -> torch.Tensor:
+        """Reusable scratch buffer for the logit statistics sweep.
+
+        The buffer is keyed by ``(B, H, R, T, dtype, device)`` and holds
+        intermediate matmul results row-by-row so the full leading dimension
+        is never materialised at once.
+        """
         key = (B, H, R, T, dtype, device)
         buf = _LOGIT_SCRATCH_CACHE.get(key)
         if buf is not None and buf.is_inference() and (not torch.is_inference_mode_enabled()):
@@ -175,6 +197,15 @@ class CausalSelfAttention(nn.Module):
         return buf
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
+        """Compute per-batch logit statistics over the causal triangle.
+
+        Accumulates ``sum(x)``, ``sum(|x|)``, ``max(|x|)`` and ``var(x)``
+        in the masked lower triangle.  Statistics are returned in a dict with
+        keys ``logit_abs_mean``, ``logit_abs_max``, ``logit_std``.
+
+        The scale factor ``scale = 1 / sqrt(head_dim)`` is applied to all
+        accumulated values so the numbers reflect true logit magnitudes.
+        """
         B, H = (q.shape[0], q.shape[1])
         reduce_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
         # A row block can hold the matmul output and its reduce-dtype copy.
@@ -198,20 +229,20 @@ class CausalSelfAttention(nn.Module):
         buf = self._logit_scratch(B, H, min(rows, T), T, q.dtype, q.device)
         # Reductions run on a matching-precision image of the block.
         work = buf if reduce_dtype == q.dtype else self._logit_scratch(B, H, min(rows, T), T, reduce_dtype, device)
-        # Scaled statistics: `s*sum(x)`, `s*sum|x|`, `s*max|x|`, `s^2*sum(x^2)`,
+        # Scaled statistics: ``s*sum(x)``, ``s*sum|x|``, ``s*max|x|``, ``s^2*sum(x^2)``,
         # accumulated in float64.
         scale_sq = scale * scale
         block = None
         for start in range(0, T, rows):
             end = min(start + rows, T)
-            # Only keys up to `end` are causal for this row block; later
-            # columns would be masked to zero. The kept values are unchanged
+            # Only keys up to ``end`` are causal for this row block; later
+            # columns would be masked to zero.  The kept values are unchanged
             # (each column is the same reduction over D).
             block = torch.matmul(q[:, :, start:end], k_t[..., :end],
                                  out=buf[:B * H * (end - start) * end].view(B, H, end - start, end))
-            # Only the square [start:end) part of the row block can be causally
+            # Only the square ``[start:end)`` part of the row block can be causally
             # masked: every earlier column is below the diagonal for all rows
-            # of this block. The kept logits are unchanged.
+            # of this block.  The kept logits are unchanged.
             block[:, :, :, start:end].masked_fill_(drop[start:end, start:end], 0.0)
             if work is buf:
                 blockf = block
@@ -241,18 +272,24 @@ class CausalSelfAttention(nn.Module):
             logit_std = float("nan")
         return {"logit_abs_mean": mean_abs, "logit_abs_max": peak_v, "logit_std": logit_std}
 
-    def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
+def _rope_tables(self, freqs_cis: torch.Tensor, dtype: torch.dtype):
+        """Cache‑lookup for rotary position embeddings keyed by ``(ptr, shape, device, dtype)``.
+
+        The D6 cache key is the source pointer so that in-place buffer updates
+        invalidate the cache.  Both the expansion and per-dtype cast paths go
+        through this function.
+        """
         key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
         cache = self._rope_cache
         entry = cache[1] if cache is not None and cache[0] == key else None
         if entry is not None and entry[4] != freqs_cis._version:
             # The caller updated the same buffer in place (a context-extension
-            # or reset is a normal operation). The key D6 fixes is intentionally
-            # unchanged; the stored table's source version is what proves the
-            # cached cos/sin still match its content.
+            # or reset is a normal operation).  The key D6 fix is intentionally
+            # unchanged; the stored table's source version proves the cached
+            # cos/sin still match its content.
             entry = None
         if entry is not None and entry[1].is_inference() and (not torch.is_inference_mode_enabled()):
-            # A table built under `inference_mode` cannot be saved for
+            # A table built under ``inference_mode`` cannot be saved for
             # backward; a later grad-mode forward through this module has to
             # get normal tables.
             entry = None
@@ -272,17 +309,17 @@ class RMSNormHead(nn.Module):
         return _RMSNorm.apply(x, self.weight, self.eps)
 
 def _rope_table_entry(freqs_cis: torch.Tensor):
-    """``(key, entry)`` for ``freqs_cis`` from the shared table cache.
+    """``(key, entry)`` lookup for rotary position embedding tables.
 
-    The key is the ``(data_ptr, shape, device, dtype)`` tuple D6 fixes; the
-    entry keeps a strong reference to ``freqs_cis`` so the storage pointer can
-    never be recycled into a key collision while the entry is cached. Both the
-    attention modules and the standalone `apply_rope` go through here.
+    The key is ``(data_ptr, shape, device, dtype)`` D6-fixed: the entry keeps
+    a strong reference to ``freqs_cis`` so the storage pointer can never be
+    recycled into a key collision while the entry is cached.  Both the attention
+    modules and the standalone ``apply_rope`` go through this function.
     """
     key = (freqs_cis.data_ptr(), freqs_cis.shape, freqs_cis.device, freqs_cis.dtype)
     entry = _ROPE_TABLE_CACHE.get(key)
     if entry is not None and entry[4] != freqs_cis._version:
-        # An in-place update of the same buffer (e.g. `freqs_cis.copy_(new)`)
+        # An in-place update of the same buffer (e.g. ``freqs_cis.copy_(new)``)
         # must invalidate the cached cos/sin even though the D6 storage-pointer
         # key is unchanged.
         entry = None
@@ -303,7 +340,11 @@ def _rope_table_entry(freqs_cis: torch.Tensor):
     return (key, entry)
 
 def _rope_pair_for_dtype(entry, dtype: torch.dtype):
-    """``(cos, sin)`` of an entry in ``dtype``; the cast pair is cached too."""
+    """Return ``(cos, sin)`` in the requested ``dtype`` from a cached entry.
+
+    The entry stores cos/sin at the base dtype; other dtypes are cast from
+    the base.  A per-dtype sub-cache avoids redundant casts.
+    """
     tables = entry[3]
     got = tables.get(dtype)
     if got is not None and got[0].is_inference() and (not torch.is_inference_mode_enabled()):
@@ -317,6 +358,11 @@ def _rope_pair_for_dtype(entry, dtype: torch.dtype):
     return got
 
 def _rope_halves(cos: torch.Tensor, sin: torch.Tensor, half: int):
+    """Split ``(cos, sin)`` into half-width ``(lo, hi)`` pairs.
+
+    If the table already has singleton leading axes matching ``half`` they are
+    returned directly; otherwise the last dimension is split at ``half``.
+    """
     if cos.shape[-1] == half:
         return (cos, cos, sin, sin)
     return (cos[..., :half], cos[..., half:], sin[..., :half], sin[..., half:])
@@ -325,11 +371,8 @@ def _rope_table_like(table: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """Align a cached table's singleton leading axes with ``x``.
 
     The shared table cache stores ``(1, 1, T, D)`` so it broadcasts over the
-    usual ``(B, H, T, D)`` Q/K. ``apply_rope`` also accepts plain ``(T, D)``
-    and ``(B, T, D)`` tensors; against those, the extra singleton axes would
-    prepend dimensions and make the ``out=`` write fail (or resize it). Only
-    leading axes that are exactly one are squeezed, so the batched path is
-    unchanged.
+    usual ``(B, H, T, D)`` Q/K.  Leading axes of size exactly 1 are squeezed
+    so the batched path is unchanged.
     """
     if table.ndim > x.ndim and all(size == 1 for size in table.shape[:-2]):
         return table.reshape(table.shape[-2:])
@@ -337,14 +380,11 @@ def _rope_table_like(table: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 
 
 def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: torch.Tensor, hi_s: torch.Tensor, transpose: bool=False, out: Optional[torch.Tensor]=None):
-    """(x_lo*lo_c - x_hi*lo_s, x_hi*hi_c + x_lo*hi_s) written into ``out``.
+    """Apply the rotary rotation ``x_lo * lo_c - x_hi * lo_s`` (and ``x_hi * hi_c + x_lo * hi_s``).
 
-    The step order is the same op sequence as the plain-autograd composition,
-    so the values are bit-identical. ``transpose`` applies the transposed
-    (inverse) rotation ``[[lo_c, hi_s], [-lo_s, hi_c]]``, which is what a
-    cotangent of this orthogonal map has to be rotated by: the ``lo`` row
-    picks up ``hi_s`` and the ``hi`` row picks up ``-lo_s`` (a no-op on the
-    half-width split, where both sin halves are the same tensor).
+    The step order is the same as the plain-autograd composition so values are
+    bit-identical.  ``transpose`` applies the inverse rotation
+    ``[[lo_c, hi_s], [-lo_s, hi_c]]``, used for cotangent backpropagation.
     """
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
@@ -367,7 +407,7 @@ def _rope_into(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: to
     return out
 
 def _rope_inplace_(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor, lo_s: torch.Tensor, hi_s: torch.Tensor):
-    """Apply the ``_rope_into`` rotation to ``x`` itself.
+    """Apply the rotary rotation to ``x`` in-place.
 
     The ``lo`` row is updated first (reading the original ``hi`` row) and a
     half-width clone carries the original ``lo`` row into the ``hi`` update.
@@ -462,6 +502,11 @@ def _apply_rope_(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos:
     return (_ApplyRoPEOne.apply(q, cos, sin), _ApplyRoPEOne.apply(k, cos, sin))
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor, cos: Optional[torch.Tensor]=None, sin: Optional[torch.Tensor]=None):
+    """Apply rotary position embedding to Q and K.
+
+    Uses the shared cache (D6 key ``(data_ptr, shape, device, dtype)``) for
+    the cos/sin tables, then applies the orthogonal rotation via ``_ApplyRoPE``.
+    """
     cos, sin = _resolve_rope_tables(freqs_cis, cos, sin, q.dtype)
     return _ApplyRoPE.apply(q, k, cos, sin)
 __all__ = ["CausalSelfAttention", "RMSNormHead"]

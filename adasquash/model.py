@@ -58,6 +58,10 @@ _CE_SCRATCH_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 _CE_SCRATCH_MAX_ENTRIES = 2
 
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
+    """Chunk size for cross-entropy computation, keyed by vocabulary size.
+
+    The chunk size is capped so the scratch buffer fits within ``_CROSSENTROPY_CHUNK_BYTES``.
+    """
     if vocab_size not in _CROSS_ENTROPY_CHUNK_ROWS_CACHE:
         row_bytes = max(1, vocab_size) * 4
         _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
@@ -81,10 +85,10 @@ def _fused_linear_chunk_rows(chunk_rows: int, vocab: int, dt: torch.dtype, acc: 
     return min(chunk_rows, _FUSED_LINEAR_CHUNK_ROWS_CACHE[key])
 
 def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tensor:
-    """Reusable ``(rows, vocab)`` logit scratch for the chunked losses.
+    """Reusable scratch buffer for chunked cross-entropy.
 
-    The buffers are private to the forward/backward sweeps (never returned,
-    never saved for backward) and keyed by shape, dtype and device.
+    The buffer is keyed by ``(rows, vocab, dtype, device)`` and is private
+    to the forward/backward sweeps; it is never returned or saved for backward.
     """
     key = (rows, vocab, dtype, device)
     buf = _CE_SCRATCH_CACHE.get(key)
@@ -100,7 +104,7 @@ def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tens
     return buf
 
 def clear_ce_scratch_cache() -> None:
-    """Release the cached CE scratch buffers (model switch / run end)."""
+    """Release the cached CE scratch buffers when switching models / ending a run."""
     _CE_SCRATCH_CACHE.clear()
 
 # Autocast weight casts for the custom kernels, keyed by identity + version.
@@ -121,6 +125,7 @@ def clear_cast_weight_cache() -> None:
     _CAST_WEIGHT_CACHE_BYTES = 0
 
 def _cast_entry_bytes(entry: tuple) -> int:
+    """Byte size of a cached weight cast entry."""
     cast = entry[1]
     return cast.numel() * cast.element_size()
 
@@ -187,21 +192,33 @@ def build_norm_kwargs(cfg: GPTConfig, layer_idx: int=0, is_final_norm: bool=Fals
     return kwargs
 
 def _valid_target_mask(targets: torch.Tensor, ignore_index: int) -> torch.Tensor:
-    """Rows that contribute to the loss, without unsigned-integer wraparound.
+    """Mask of target rows that contribute to the loss.
 
     Cross-entropy accepts Byte targets, but comparing a uint8 tensor with a
-    negative ignore index promotes through the unsigned dtype (`-100` becomes
-    ``156``), so a real token 156 would be silently dropped from the loss
-    denominator and its gradient. Compare an int64 image instead.
+    negative ignore index promotes through unsigned dtype (`-100` becomes
+    ``156``), so a real token 156 would be silently dropped.  Cast to int64 first.
     """
     if targets.dtype == torch.uint8:
         targets = targets.to(torch.int64)
     return targets.ne(ignore_index)
 
 class _ChunkedCrossEntropy(torch.autograd.Function):
+    """Chunked cross-entropy forward/backward via NLL loss.
+
+    The leading dimension is sliced into row blocks of ``chunk_rows`` so the
+    scratch buffer stays within ``_CROSSENTROPY_CHUNK_BYTES``.  Both forward
+    and backward preserve the ``ignore_index`` masking and return ``None``
+    gradients for the ignore index and chunk size.
+    """
 
     @staticmethod
     def forward(ctx, logits, targets, ignore_index, chunk_rows):
+        """Chunked cross-entropy forward.
+
+        Slices the leading logit dimension into blocks of ``chunk_rows``,
+        applies ``log_softmax`` and ``nll_loss`` per block, and averages
+        by the number of valid (non-ignored) targets.
+        """
         total = None
         n = targets.numel()
         buf_rows = min(chunk_rows, n)
@@ -225,6 +242,12 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        """Chunked cross-entropy backward.
+
+        Computes the gradient of the loss w.r.t. the logits using the softmax
+        and the saved targets/ignore_index/chunk_rows/count.  Returns
+        ``(grad_logits, None, None, None)``.
+        """
         logits, targets = ctx.saved_tensors
         grad_logits = torch.empty_like(logits)
         grad_scale = (grad_out / ctx.count.clamp(min=1)).to(logits.dtype)
@@ -277,9 +300,19 @@ def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index
     return _ChunkedCrossEntropy.apply(logits, targets, int(ignore_index), int(chunk_rows))
 
 def _loss_acc_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Promote accumulator dtype at least to float32.
+
+    BFloat16 and Float16 accumulations are promoted to float32 for numerical
+    stability; other dtypes pass through.
+    """
     return torch.promote_types(dtype, torch.float32)
 
 def _autocast_dtype(device_type: str, *dtypes: torch.dtype) -> torch.dtype:
+    """Return the autocast dtype if enabled, otherwise fall back to the first dtype.
+
+    If automatic mixed precision is active the configured dtype is returned;
+    otherwise the first (or promoted) dtype is returned.
+    """
     try:
         if torch.is_autocast_enabled(device_type):
             return torch.get_autocast_dtype(device_type)
@@ -292,9 +325,23 @@ def _autocast_dtype(device_type: str, *dtypes: torch.dtype) -> torch.dtype:
     return fallback
 
 class _FusedLinearCrossEntropy(torch.autograd.Function):
+    """Fused linear + cross-entropy forward/backward.
+
+    Performs ``log_softmax`` via a GEMM in the selected accumulator dtype,
+    then ``nll_loss`` with ``ignore_index``.  The backward computes the
+    gradient w.r.t. the hidden state and the weight.  Both forward and backward
+    respect per-row masking from ``ignore_index``.
+    """
 
     @staticmethod
     def forward(ctx, hidden, weight, targets, ignore_index, chunk_rows):
+        """Fused linear-cross-entropy forward.
+
+        The logits are computed as ``hidden @ weight`` in an autocast dtype,
+        then ``log_softmax`` and ``nll_loss`` are applied in row blocks of
+        ``chunk_rows``.  The accumulated loss is averaged by the number of
+        valid (non-ignored) targets.
+        """
         dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
         w = _cast_weight_cached(weight, dt)
         acc = _loss_acc_dtype(dt)
@@ -337,6 +384,13 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        """Fused linear-cross-entropy backward.
+
+        Computes gradients of the loss w.r.t. the hidden state and the weight.
+        The hidden gradient is a GEMM with the weight; the weight gradient is a
+        GEMM with the transposed probs.  Both respect the ``ignore_index`` mask
+        and dtype handling through the cached ``compute_dtype`` / ``in_dtypes``.
+        """
         h, w, targets = ctx.saved_tensors
         dt = ctx.compute_dtype
         acc = _loss_acc_dtype(dt)
@@ -450,6 +504,22 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         return (grad_h, grad_w, None, None, None)
 
 def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, ignore_index: int=-100, chunk_rows: Optional[int]=None) -> torch.Tensor:
+    """Fused linear + cross-entropy mean loss.
+
+    Takes the fast path via ``F.cross_entropy`` when the whole block fits in
+    ``_CROSS_ENTROPY_FAST_PATH_BYTES``; otherwise uses the chunked ``_FusedLinearCrossEntropy``
+    autograd node for memory-efficient computation.
+
+    Args:
+        hidden: ``(N, D)`` tensor of hidden states.
+        weight: ``(V, D)`` weight tensor of the lm_head.
+        targets: 1-D int64 tensor of token labels.
+        ignore_index: Target value that is ignored when computing the loss.
+        chunk_rows: Number of rows per chunk; defaults to ``_cross_entropy_chunk_rows``.
+
+    Returns:
+        Scalar mean loss (zero for empty batches when all targets are ignored).
+    """
     n = targets.numel()
     if hidden.numel() != n * hidden.size(-1):
         raise ValueError(
@@ -457,17 +527,10 @@ def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets
             f"{hidden.size(-1)} features")
     if hidden.dim() != 2 or hidden.size(0) != n:
         hidden = hidden.reshape(n, -1)
-    # `F.cross_entropy`/`nll_loss` expect a 1-D target whose length matches
-    # the flattened rows. The logits-path wrapper flattens leading dims, and
-    # the fused path must do the same: `hidden` is reshaped above, but a 2-D
-    # target left as-is made the chunked nll_loss reject the batch even though
-    # the same call is valid through `cross_entropy_mean`.
     if targets.dim() != 1:
         targets = targets.reshape(-1)
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(weight.size(0))
-    # The plain pair is taken only when the whole block fits in a single
-    # chunk; an explicit small `chunk_rows` still selects the fused node.
     fast_rows = max(1, _CROSS_ENTROPY_FAST_PATH_BYTES // max(1, weight.size(0) * hidden.element_size()))
     if n <= min(fast_rows, chunk_rows):
         dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
@@ -486,14 +549,32 @@ def fused_cross_entropy_mean(hidden: torch.Tensor, weight: torch.Tensor, targets
     return _FusedLinearCrossEntropy.apply(hidden, weight, targets, int(ignore_index), int(chunk_rows))
 
 class _LayerScaleResidual(torch.autograd.Function):
+    """LayerScale residual connection: ``x + scale * residual``.
+
+    The forward is a single ``addcmul``; the backward routes the scale gradient
+    through a product with the residual and the residual gradient through the
+    scale factor.
+    """
 
     @staticmethod
     def forward(ctx, x, residual, scale):
+        """LayerScale forward: ``x + scale * residual``.
+
+        Saves ``residual`` and ``scale`` for the backward; the operation is
+        ``torch.addcmul(x, residual, scale)`` which is ``x + scale * residual``.
+        """
         ctx.save_for_backward(residual, scale)
         return torch.addcmul(x, residual, scale)
 
     @staticmethod
     def backward(ctx, grad_out):
+        """LayerScale backward.
+
+        Returns ``(grad_out, grad_residual, grad_scale)`` where:
+
+        - ``grad_residual = grad_out * scale`` (scale the incoming cotangent)
+        - ``grad_scale = sum(grad_out * residual)`` (dot product for the scale factor)
+        """
         residual, scale = ctx.saved_tensors
         grad_scale = (_reduce_products(grad_out, residual)
                       if ctx.needs_input_grad[2] else None)
@@ -503,6 +584,11 @@ class _LayerScaleResidual(torch.autograd.Function):
 class Block(nn.Module):
 
     def __init__(self, cfg: GPTConfig, layer_idx: int, skip_init: bool=False):
+        """Transformer block with norm-attn-mlp wiring.
+
+        The block applies ``norm1 -> attn -> residual/ls -> norm2 -> mlp -> residual/ls``.
+        LayerScale is applied if ``cfg.use_layerscale`` is ``True``.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         norm_kwargs = build_norm_kwargs(cfg, layer_idx, is_final_norm=False)
@@ -521,6 +607,18 @@ class Block(nn.Module):
         return x + branch_out
 
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor]=None, return_stats: bool=False):
+        """Block forward: ``norm1 -> attn -> residual/ls -> norm2 -> mlp -> residual/ls``.
+
+        Args:
+            x: input activation ``(B, T, D)``.
+            freqs_cis: rotary position embedding frequencies (or ``None``).
+            return_stats: if ``True``, also return attention logit statistics.
+
+        Returns:
+            ``(x, logit_stats)`` where ``x`` is the post-MLP output and
+            ``logit_stats`` is the attention stats dict (empty when
+            ``return_stats=False``).
+        """
         h = self.norm1(x)
         attn_out, logit_stats = self.attn(h, freqs_cis=freqs_cis, return_stats=return_stats)
         x = self._residual(x, attn_out, self.ls1 if self.use_layerscale else None)
@@ -530,9 +628,20 @@ class Block(nn.Module):
         return (x, logit_stats)
 
 class _SwiGLU(torch.autograd.Function):
+    """SwiGLU activation: ``F.silu(x @ W1) * (x @ W3)`` then ``(x @ W2)``.
+
+    The forward does ``silu(x @ W1) .* (x @ W3)`` followed by ``(silu(...) .* (x @ W3)) @ W2``.
+    The backward computes per-tensor gradients for all three weight matrices and
+    the input gradient.  Cast dtypes are handled through the autocast cache.
+    """
 
     @staticmethod
     def forward(ctx, x, w1, w2, w3):
+        """SwiGLU forward.
+
+        Computes ``silu(x @ W1) .* (x @ W3)`` then ``(... ) @ W2``, with
+        optional autocast dtypes and per-leading-axis caching.
+        """
         lead = x.shape[:-1]
         in_dtypes = (x.dtype, w1.dtype, w2.dtype, w3.dtype)
         dt = _autocast_dtype(x.device.type, x.dtype, w1.dtype, w2.dtype, w3.dtype)
@@ -558,6 +667,12 @@ class _SwiGLU(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        """SwiGLU backward.
+
+        Computes gradients of ``silu(x @ W1) .* (x @ W3) @ W2`` w.r.t. all
+        weights and the input.  The gradient flows through the silu activation
+        and the element-wise multiply, with per-tensor GEMM for each weight.
+        """
         x, w1, w2, w3 = ctx.saved_tensors
         dt = ctx.compute_dtype
         if x.dtype != dt:
@@ -619,6 +734,12 @@ class _SwiGLU(torch.autograd.Function):
 class MLP(nn.Module):
 
     def __init__(self, dim: int, hidden: int, dropout: float=0.0, skip_init: bool=False):
+        """MLP with SwiGLU activation.
+
+        The hidden dimension is ``2/3`` of the requested size, rounded down to
+        a multiple of 8 (the ``+ 7 & ~7`` pattern).  Three linear projections
+        ``w1``, ``w2``, ``w3`` feed the SwiGLU module.
+        """
         super().__init__()
         hidden = int(hidden * 2 / 3)
         hidden = hidden + 7 & ~7
@@ -628,6 +749,10 @@ class MLP(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """MLP forward with SwiGLU.
+
+        Computes ``_SwiGLU.apply(x, w1, w2, w3)`` and optional dropout.
+        """
         y = _SwiGLU.apply(x, self.w1.weight, self.w2.weight, self.w3.weight)
         if self.drop.p > 0.0:
             y = self.drop(y)
@@ -636,6 +761,14 @@ class MLP(nn.Module):
 class GPT(nn.Module):
 
     def __init__(self, cfg: GPTConfig, init: bool=True):
+        """GPT decoder model.
+
+        Args:
+            cfg: ``GPTConfig`` with all model hyperparameters.
+            init: if ``True``, apply ``_init_weights`` to all modules after
+                construction.  Set ``init=False`` for callers that will immediately
+                re-init or load a checkpoint.
+        """
         super().__init__()
         self.cfg = cfg
         # The constructor's own kaiming / normal passes are always overwritten
@@ -687,15 +820,12 @@ class GPT(nn.Module):
             self._pos_ids = None
 
     def _apply(self, fn, recurse: bool=True):
-        """Move/cast the module while keeping the RoPE table complex.
+        """Move/cast the module while preserving the RoPE complex table.
 
-        `nn.Module.to(dtype)` applies the conversion to every buffer, which
-        turns the complex `freqs_cis` into a real tensor and discards its
-        imaginary part; the next rotary forward then fails at `.imag`. A
-        complex RoPE table is an auxiliary constant, not a model parameter, so
-        hide it from the generic pass and rebuild it from its real/imaginary
-        parts in the destination dtype/device. Non-RoPE models have no such
-        buffer and take the normal path unchanged.
+        ``nn.Module.to(dtype)`` would convert the complex ``freqs_cis`` into a
+        real tensor, discarding the imaginary part.  This method hides ``freqs_cis``
+        from the generic pass, applies the conversion to its real/imaginary parts
+        separately, and re-registers the complex buffer in the destination dtype.
         """
         freqs = self._buffers.pop("freqs_cis", None)
         result = super()._apply(fn, recurse)
@@ -703,9 +833,6 @@ class GPT(nn.Module):
             real = fn(freqs.real)
             imag = fn(freqs.imag)
             if real.dtype in (torch.bfloat16, torch.float16):
-                # torch.complex has no bfloat16/complex32 support on every
-                # backend; the per-call RoPE cast to the activation dtype
-                # still happens in attention._rope_pair_for_dtype.
                 real = real.float()
                 imag = imag.float()
             self.register_buffer("freqs_cis", torch.complex(real, imag),
@@ -713,6 +840,12 @@ class GPT(nn.Module):
         return result
 
     def _init_weights(self, m: nn.Module):
+        """Initialize weights for ``nn.Linear`` and ``nn.Embedding``.
+
+        Linear weights are drawn from ``Normal(0.0, 0.02)`` and biases zeroed.
+        Embedding weights follow the same scheme.  The lm_head weight tie is
+        respected (returns early if ``m.weight is self.tok_emb.weight``).
+        """
         if isinstance(m, nn.Linear):
             if m.weight is self.tok_emb.weight:
                 # lm_head shares the input embedding's storage (tied): `apply`
@@ -726,6 +859,12 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def reset_parameters(self, seed: Optional[int]=None):
+        """Reset model parameters with an optional seed.
+
+        If ``seed`` is provided the CUDA RNG is seeded so that the same seed
+        always produces the same weights (important for reproducibility across
+        runs).  After seeding, the standard ``_init_weights`` pass is applied.
+        """
         if seed is not None:
             # Parameters are usually allocated on the accelerator (callers build
             # inside `torch.device('cuda')`), so `nn.init.normal_` draws from the
@@ -739,6 +878,21 @@ class GPT(nn.Module):
         return self
 
     def forward(self, input_ids: torch.Tensor, targets: Optional[torch.Tensor]=None, return_stats: bool=False, last_position_only: bool=False, return_logits: bool=True, return_hidden: bool=False):
+        """GPT forward pass.
+
+        Args:
+            input_ids: token indices ``(B, T)``.
+            targets: optional label tensor for loss computation.
+            return_stats: if ``True``, also return per-block logit statistics.
+            last_position_only: if ``True`` only the last position's logits/loss are returned.
+            return_logits: if ``True`` return the logits tensor.
+            return_hidden: if ``True`` return the pre-``norm_f`` block output.
+
+        Returns:
+            ``(logits, loss, all_logit_stats)`` depending on the flags.
+            ``all_logit_stats`` is a list of dicts (one per block) when
+            ``return_stats=True``, otherwise ``None``.
+        """
         B, T = input_ids.shape
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
@@ -764,7 +918,7 @@ class GPT(nn.Module):
         if last_position_only:
             x = x[:, -1:]
         if return_hidden:
-            # Pre-`norm_f` block output; `norm_f` and `lm_head` are
+            # Pre-``norm_f`` block output; ``norm_f`` and ``lm_head`` are
             # per-position, so callers can project position chunks.
             if return_stats:
                 return (x, None, all_logit_stats)
@@ -794,16 +948,27 @@ class GPT(nn.Module):
         return (logits, loss, all_logit_stats)
 
     def forward_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Final block output (pre-`norm_f`) for chunked logits projection."""
+        """Final block output (pre-``norm_f``) for chunked logits projection."""
         out = self.forward(input_ids, targets=None, return_hidden=True)
         return out[0]
 
     def last_position_logits(self, input_ids: torch.Tensor, return_stats: bool=False) -> torch.Tensor:
+        """Last-position logits (or stats) for the given input.
+
+        Args:
+            input_ids: token indices ``(B, T)``.
+            return_stats: if ``True`` also return attention logit statistics.
+
+        Returns:
+            Logits for the last position ``(B, V)``, or ``(logits, loss, stats)``
+            when ``return_stats=True``.
+        """
         out = self.forward(input_ids, targets=None, return_stats=return_stats, last_position_only=True)
         return out[0][:, -1]
 
     @torch.no_grad()
     def num_params(self, trainable_only: bool=False) -> int:
+        """Return the total number of parameters (optionally trainable only)."""
         s = 0
         for p in self.parameters():
             if trainable_only and (not p.requires_grad):
@@ -813,6 +978,11 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def norm_param_count(self) -> dict:
+        """Return parameter counts for norm modules.
+
+        Counts parameters whose name is ``norm_f`` or ends with ``.norm1`` /
+        ``.norm2``, grouped by module class name.
+        """
         out = {}
         for name, m in self.named_modules():
             if name == "norm_f" or name.endswith((".norm1", ".norm2")):
@@ -823,14 +993,35 @@ class GPT(nn.Module):
         return out
 
 def build_gpt_124m(norm_name: str="dytcd", init: bool=True, **over) -> GPT:
+    """Build a GPT-124M model.
+
+    Args:
+        norm_name: which normalization family to use (see ``NORM_REGISTRY``).
+        init: if ``True``, apply weight initialization.
+        **over: extra ``GPTConfig`` overrides.
+    """
     cfg = GPTConfig(vocab_size=50304, dim=768, n_layers=12, n_heads=12, max_seq_len=1024, mlp_ratio=4.0, norm_name=norm_name, **over)
     return GPT(cfg, init=init)
 
 def build_gpt_350m(norm_name: str="dytcd", init: bool=True, **over) -> GPT:
+    """Build a GPT-350M model.
+
+    Args:
+        norm_name: which normalization family to use (see ``NORM_REGISTRY``).
+        init: if ``True``, apply weight initialization.
+        **over: extra ``GPTConfig`` overrides.
+    """
     cfg = GPTConfig(vocab_size=50304, dim=1024, n_layers=24, n_heads=16, max_seq_len=1024, mlp_ratio=4.0, norm_name=norm_name, **over)
     return GPT(cfg, init=init)
 
 def build_llama_tiny_1b(norm_name: str="dytcd", init: bool=True, **over) -> GPT:
+    """Build a tiny LLaMA-1B model.
+
+    Args:
+        norm_name: which normalization family to use (see ``NORM_REGISTRY``).
+        init: if ``True``, apply weight initialization.
+        **over: extra ``GPTConfig`` overrides.
+    """
     over.setdefault("tie_word_embeddings", False)
     over.setdefault("rotary", True)
     cfg = GPTConfig(vocab_size=32000, dim=2048, n_layers=24, n_heads=16, max_seq_len=2048, mlp_ratio=8.0 / 3.0, norm_name=norm_name, **over)
