@@ -158,7 +158,11 @@ class CausalSelfAttention(nn.Module):
         key = (T, device)
         cache = self._tril_cache
         if cache is not None and cache[0] == key:
-            return cache[1]
+            mask = cache[1]
+            if mask.is_inference() and (not torch.is_inference_mode_enabled()):
+                mask = None
+            else:
+                return mask
         mask = _TRIL_MASK_CACHE.get(key)
         if mask is None:
             ij = torch.arange(T, device=device)
