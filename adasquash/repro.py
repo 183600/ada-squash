@@ -1223,6 +1223,114 @@ def _self_test_deterministic_algorithms_optin() -> bool:
     return ok
 
 
+def order_drift_report(reference: dict, other: dict) -> dict:
+    """Report whether batch order within each arm could predict outcomes.
+
+    In a paired-design comparison, two arms must consume the same token windows
+    in the same order.  This report checks the training-stream prefixes of both
+    arms: if the prefix fingerprints differ, the early batches (the most influential
+    for early-stopping checks and learning-rate warmup) were not seen in the same
+    order, which is a protocol violation for a paired design.
+
+    Missing stream records are *unknown*, not equal: an old manifest that never
+    recorded the stream cannot prove the order, so the report returns
+    ``comparable`` = False with reason ``'stream not recorded'``.
+
+    Returns a dict with keys:
+      recorded   -- bool, whether fingerprints were present to compare
+      comparable -- bool, True only when both arms have compatible prefix
+                     fingerprints and the full stream order is agreed
+      identical  -- bool, True when the prefix fingerprints exactly match
+      scope      -- str, either ``'full_run'`` or ``'shared_prefix'`` or None
+      problems   -- list of human-readable issues
+      reason     -- str, description of why the comparison succeeded or failed
+    """
+    if not isinstance(reference, dict) or not isinstance(other, dict):
+        return {
+            "recorded": False,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "problems": [],
+            "reason": "inputs must be dicts",
+        }
+    problems: list[str] = []
+    # ------------------------------------------------------------------
+    #Collect training-stream records from the manifests (they live under
+    # the "train_stream_fingerprint" key that scripts should embed when they
+    # call TrainStreamFingerprint.record()).
+    # ------------------------------------------------------------------
+    ref_stream = reference.get("train_stream_fingerprint")
+    oth_stream = other.get("train_stream_fingerprint")
+    if ref_stream is None or oth_stream is None:
+        return {
+            "recorded": False,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "problems": ["at least one manifest has no train_stream_fingerprint"],
+            "reason": "training stream fingerprints not recorded on one or both sides",
+        }
+    # ------------------------------------------------------------------
+    #Compare prefix fingerprints (first 64 batches)
+    # ------------------------------------------------------------------
+    ref_prefix_fp = ref_stream.get("prefix_fingerprint")
+    oth_prefix_fp = oth_stream.get("prefix_fingerprint")
+    ref_prefix_batches = ref_stream.get("prefix_batches", 0)
+    oth_prefix_batches = oth_stream.get("prefix_batches", 0)
+    ref_full_fp = ref_stream.get("stream_fingerprint")
+    oth_full_fp = oth_stream.get("stream_fingerprint")
+    ref_batches = ref_stream.get("batches", 0)
+    oth_batches = oth_stream.get("batches", 0)
+
+    # prefix length must not exceed what was consumed
+    if ref_prefix_batches > ref_batches or oth_prefix_batches > oth_batches:
+        problems.append(
+            "training stream prefix_batches exceeds the number of batches consumed; "
+            "the record is malformed")
+    # prefix sizes must also match for a valid comparison
+    if ref_prefix_batches != oth_prefix_batches:
+        problems.append(
+            f"training stream prefix_batches differs: reference {ref_prefix_batches} vs other {oth_prefix_batches}")
+
+    prefix_match = ref_prefix_fp == oth_prefix_fp
+    full_match = (
+        ref_full_fp is not None
+        and oth_full_fp is not None
+        and ref_full_fp == oth_full_fp
+    )
+
+    if not prefix_match:
+        problems.append(
+            f"prefix fingerprints differ: reference {ref_prefix_fp[:16]}... vs other {oth_prefix_fp[:16]}..."
+        )
+
+    # ------------------------------------------------------------------
+    #Determine comparable / identical
+    # ------------------------------------------------------------------
+    comparable = prefix_match and full_match and not problems
+    identical = prefix_match and full_match and (ref_batches == oth_batches)
+
+    scope = None
+    if identical and ref_batches > 0 and oth_batches > 0 and ref_batches == oth_batches:
+        scope = "full_run"
+    elif prefix_match:
+        scope = "shared_prefix"
+
+    return {
+        "recorded": True,
+        "comparable": comparable,
+        "identical": identical,
+        "scope": scope,
+        "problems": problems,
+        "reason": (
+            None if comparable else
+            "batch order drift detected between the two arms; "
+            "paired-design assumptions are violated"
+        ),
+    }
+
+
 def _self_test_execution_identity() -> bool:
     """A mismatched/dirty/unknown identity must never verify as comparable."""
     def manifest(**environment_overrides):
@@ -1342,13 +1450,14 @@ __all__ = [
     "file_fingerprint",
     "finish_metadata",
     "git_revision",
+    "order_drift_report",
     "save_json_atomic",
     "save_run_manifest",
     "seed_worker",
-    "validate_run_manifest",
     "self_test",
     "set_all_seeds",
     "training_recipe_mismatches",
+    "validate_run_manifest",
 ]
 
 if __name__ == "__main__":

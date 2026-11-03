@@ -247,3 +247,70 @@ def test_execution_identity_is_not_replaced_by_recipe_equality():
     assert training_recipe_mismatches(recipe, recipe) == {}
     assert execution_identity_mismatches(
         _manifest(), _manifest(commit="changed"))["comparable"] is False
+
+
+def test_order_drift_report_basic():
+    from adasquash.repro import order_drift_report
+
+    # Both manifests with identical stream fingerprints
+    stream = {
+        "version": 1,
+        "start_step": 0,
+        "prefix_batches_target": 64,
+        "prefix_batches": 30,
+        "prefix_tokens": 1920,
+        "batches": 50,
+        "tokens": 3200,
+        "prefix_fingerprint": "a" * 32,
+        "stream_fingerprint": "b" * 32,
+    }
+    ref = {"train_stream_fingerprint": stream}
+    other = {"train_stream_fingerprint": stream}
+    report = order_drift_report(ref, other)
+    assert report["comparable"] is True
+    assert report["identical"] is True
+    assert report["scope"] == "full_run"
+
+    # Different prefix fingerprints
+    other2 = {"train_stream_fingerprint": dict(stream, prefix_fingerprint="c" * 32)}
+    report = order_drift_report(ref, other2)
+    assert report["comparable"] is False
+    assert report["identical"] is False
+
+    # Missing stream
+    ref_no_stream = {}
+    report = order_drift_report(ref_no_stream, other)
+    assert report["comparable"] is False
+    assert "at least one manifest has no train_stream_fingerprint" in " ".join(report["problems"])
+
+
+def test_order_drift_report_different_batches():
+    from adasquash.repro import order_drift_report
+
+    stream_a = {
+        "version": 1,
+        "start_step": 0,
+        "prefix_batches_target": 64,
+        "prefix_batches": 30,
+        "prefix_tokens": 1920,
+        "batches": 50,
+        "tokens": 3200,
+        "prefix_fingerprint": "a" * 32,
+        "stream_fingerprint": "b" * 32,
+    }
+    stream_b = {
+        "version": 1,
+        "start_step": 0,
+        "prefix_batches_target": 64,
+        "prefix_batches": 40,  # different prefix size
+        "prefix_tokens": 2560,
+        "batches": 60,
+        "tokens": 3840,
+        "prefix_fingerprint": "a" * 32,
+        "stream_fingerprint": "b" * 32,
+    }
+    ref = {"train_stream_fingerprint": stream_a}
+    other = {"train_stream_fingerprint": stream_b}
+    report = order_drift_report(ref, other)
+    assert report["comparable"] is False
+    assert any("prefix_batches differs" in p for p in report["problems"])
