@@ -366,14 +366,14 @@ def _restore_exponent(ctx, saved, index: int):
 
 
 def _apply_affine(phi: torch.Tensor, gamma: torch.Tensor, beta) -> torch.Tensor:
-    """Apply ``gamma * phi (+ beta)`` in-place.
+    """Apply ``gamma * phi (+ beta)`` without in-place mutation.
 
     If ``beta`` is provided the result is ``gamma * phi + beta``; otherwise
     ``gamma * phi``.
     """
     if beta is not None:
-        return phi.mul_(gamma).add_(beta)
-    return phi.mul_(gamma)
+        return phi.mul(gamma).add_(beta)
+    return phi.mul(gamma)
 
 
 def _grad_beta(beta, grad_out, need_beta: bool):
@@ -386,10 +386,10 @@ def _grad_beta(beta, grad_out, need_beta: bool):
 def _tanh_squash_forward(x: torch.Tensor, alpha, gamma: torch.Tensor, beta) -> torch.Tensor:
     """Apply ``gamma * tanh(alpha * x) (+ beta)`` as a fused operation.
 
-    The forward applies ``alpha * x``, then ``tanh`` in-place, then scales
+    The forward applies ``alpha * x``, then ``tanh``, then scales
     by ``gamma`` and optionally adds ``beta`` within a single autograd node.
     """
-    return _apply_affine(x.mul(alpha).tanh_(), gamma, beta)
+    return _apply_affine(x.mul(alpha).tanh(), gamma, beta)
 
 
 def _tanh_squash_backward(x: torch.Tensor, alpha, gamma: torch.Tensor,
@@ -403,13 +403,12 @@ def _tanh_squash_backward(x: torch.Tensor, alpha, gamma: torch.Tensor,
     - Input gradient: ``w * alpha``
 
     """
-    phi = x.mul(alpha).tanh_()
+    phi = x.mul(alpha).tanh()
     w = phi * grad_out
     grad_gamma = _sum_leading_dims(w) if need_gamma else None
-    w.mul_(phi)
-    del phi
-    torch.sub(grad_out, w, out=w)
-    w.mul_(gamma)
+    w = w * phi
+    w = grad_out - w
+    w = w * gamma
     return w, grad_gamma
 
 
@@ -802,7 +801,7 @@ class _DyTCDForward(torch.autograd.Function):
         p, p_raw = _prepare_exponent(ctx, p)
         exp_kdr = torch.exp(k.mul(-depth_ratio))
         scale = alpha_0 * exp_kdr
-        alpha_c = torch.addcmul(scale, scale, delta).clamp_(min=_MIN_ALPHA)
+        alpha_c = torch.addcmul(scale, scale, delta).clamp(min=_MIN_ALPHA)
         out = _apply_affine(_softsign_forward(x, p, alpha_c, scale_nonneg=True), gamma, beta)
         saved = [x, alpha_0, k, delta, gamma, beta, alpha_c, exp_kdr.detach()]
         if p_raw is not None:
@@ -1049,20 +1048,18 @@ class _QKSquashTanh(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, alpha_q, alpha_k):
-        qo = q.mul(alpha_q)
-        qo.tanh_()
-        ko = k.mul(alpha_k)
-        ko.tanh_()
+        qo = q.mul(alpha_q).tanh()
+        ko = k.mul(alpha_k).tanh()
         ctx.save_for_backward(q, k, alpha_q, alpha_k)
         return (qo, ko)
 
     @staticmethod
     def _side(g, x, alpha, need_x, need_alpha):
-        xo = x.mul(alpha)
-        xo.tanh_()
+        xo = x.mul(alpha).tanh()
         gx = torch.ops.aten.tanh_backward(g, xo)
         grad_alpha = _reduce_products(gx, x) if need_alpha else None
-        return (gx.mul_(alpha) if need_x else None), grad_alpha
+        gx = gx * alpha if need_x else None
+        return gx, grad_alpha
 
     @staticmethod
     def backward(ctx, grad_qo, grad_ko):
