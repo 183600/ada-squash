@@ -115,7 +115,7 @@ def mlp_hidden_size(dim: int, mlp_ratio: float) -> int:
     except OverflowError:
         base = math.floor(Fraction(dim) * Fraction.from_float(mlp_ratio))
         hidden = (2 * base) // 3
-    return hidden + 7 & ~7
+    return (hidden + 7) & ~7
 
 
 def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = None) -> dict:
