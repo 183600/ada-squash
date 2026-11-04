@@ -754,7 +754,7 @@ class MLP(nn.Module):
         """
         super().__init__()
         hidden = int(hidden * 2 / 3)
-        hidden = hidden + 7 & ~7
+        hidden = (hidden + 7) & ~7
         self.w1 = _make_linear(dim, hidden, False, skip_init)
         self.w2 = _make_linear(hidden, dim, False, skip_init)
         self.w3 = _make_linear(dim, hidden, False, skip_init)
