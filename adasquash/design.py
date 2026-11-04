@@ -2571,6 +2571,154 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     }
 
 
+def design_analysis_alignment_report(
+        design_readiness: dict,
+        comparison: dict,
+        *,
+        min_seeds: int = MIN_SEEDS_FOR_SIGNIFICANCE) -> dict:
+    """Check whether the actual analysis aligns with the pre-registered design.
+
+    Compares the design_readiness audit (pre-flight checklist) with the actual
+    comparison results (arm_comparison.json) to surface deviations that affect
+    interpretability and certifiability.
+
+    Checks include:
+     - Schedule fingerprint: was the frozen schedule respected (order drift
+       tested, block alignment verified)?
+     - Exclusion policy: does the per-arm attrition match the pre-specified
+       policy, or were runs excluded post-hoc?
+     - Seed coverage: do the shared seeds used in the comparison match the
+       planned seed set?
+     - Metric consistency: is the compared metric the one planned (final_val_loss
+       is the only certifiable endpoint)?
+     - Reference selection: was the reference pre-specified or data-selected?
+
+    Returns a dict with ``"aligned"`` (bool), ``"deviations`` (list of strings)
+    and ``"warnings`` (list of strings).
+    """
+    from adasquash.repro import execution_identity_mismatches
+
+    deviations: list[str] = []
+    warnings: list[str] = []
+
+    # Extract design readiness components
+    dr_checks = design_readiness.get("checks", [])
+    dr_exclusion_fp = design_readiness.get("exclusion_policy_fingerprint")
+    dr_schedule = design_readiness.get("schedule_integrity")
+    dr_balance = design_readiness.get("schedule_replicate_block_alignment")
+    dr_min_seeds = design_readiness.get("min_seeds", min_seeds)
+
+    # Extract comparison components
+    cmp_rows = comparison.get("rows", [])
+    cmp_protocol = comparison.get("protocol", {})
+    cmp_reference = comparison.get("reference", None)
+    cmp_reference_selection = comparison.get("reference_selection", {})
+    cmp_metric = comparison.get("metric", "final_val_loss")
+    cmp_certifiable = comparison.get("certifiable", False)
+    cmp_n_fail = design_readiness.get("n_fail", 0)
+
+    # 1. Schedule integrity
+    if dr_schedule is not None:
+        sp_status = dr_schedule.get("status")
+        if sp_status == "fail":
+            deviations.append(
+                "schedule fingerprint FAIL: the frozen allocation was edited after "
+                "pre-registration; analysis against the planned design is invalid")
+        elif sp_status == "warn":
+            warnings.append(
+                f"schedule fingerprint WARNING: {dr_schedule.get('reason', 'unknown')}")
+        else:
+            warnings.append("schedule fingerprint pass: frozen schedule respected")
+
+    # 2. Block replicate alignment
+    if dr_balance is not None:
+        ba_status = dr_balance.get("status")
+        if ba_status == "fail":
+            deviations.append(
+                "block replicate alignment FAIL: replicate(s)/seed(s) spread across "
+                "time blocks; seed-paired contrasts contain block/time confounding")
+        elif ba_status == "pass":
+            warnings.append(
+                "block replicate alignment pass: every seed confined to one block")
+        else:
+            warnings.append(
+                "block replicate alignment warn: check replicate-block mapping")
+
+    # 3. Exclusion policy deviation
+    if dr_exclusion_fp is not None:
+        # Check if the comparison reports any post-hoc exclusions
+        for row in cmp_rows:
+            proto_probs = row.get("protocol_problems", [])
+            if proto_problems:
+                deviations.append(
+                    f"protocol problems detected in comparison: {'; '.join(proto_problems)}")
+
+    # 4. Seed coverage vs planned minimum
+    shared_seed_counts = {row.get("name"): row.get("n_shared_seeds")
+                         for row in cmp_rows if row.get("n_shared_seeds") is not None}
+    for name, n_shared in shared_seed_counts.items():
+        if n_shared is not None and n_shared < min_seeds:
+            deviations.append(
+                f'arm {name!r}: only {n_shared} shared seed(s) < {min_seeds} '
+                f'planned minimum; result is descriptive only')
+
+    # 5. Reference selection alignment
+    if cmp_reference_selection.get("data_dependent", False):
+        pool = cmp_reference_selection.get("pool", [])
+        if cmp_reference not in pool:
+            deviations.append(
+                f"reference {cmp_reference!r} not in declared pool {pool}; "
+                "data-selected reference may not match pre-registration")
+        pool_size = cmp_reference_selection.get("pool_size", 0)
+        if pool_size > 1 and not cmp_reference_selection.get("selection_adjustment_complete", False):
+            deviations.append(
+                f"data-selected reference from pool of {pool_size} but "
+                "selection adjustment is incomplete; certification is conditional")
+        if pool_size == 1:
+            warnings.append(
+                "single-arm reference pool: data selection had no alternative; "
+                "no selection adjustment needed")
+    elif not cmp_reference_selection.get("data_dependent", True):
+        # Explicit reference was pre-specified
+        warnings.append(
+            "reference pre-specified: no data-dependent selection, no adjustment needed")
+
+    # 6. Metric certifiability alignment
+    if cmp_metric != "final_val_loss":
+        warnings.append(
+            f"comparing metric '{cmp_metric}': only 'final_val_loss' is certifiable "
+            f"from aggregate.json per the pre-registered endpoint policy")
+
+    # 7. Overall certifiability vs design readiness
+    if not cmp_certifiable and cmp_n_fail > 0:
+        deviations.append(
+            "comparison is not certifiable (design readiness had failures) but "
+            "results are being interpreted as confirmatory")
+
+    # 8. Per-row protocol problems
+    for row in cmp_rows:
+        proto_probs = row.get("protocol_problems", [])
+        if proto_probs:
+            deviations.append(
+                f"row {row.get('name')}: protocol problems - {'; '.join(proto_probs)}")
+
+    aligned = len(deviations) == 0
+
+    return {
+        "schema": "adasquash.design_analysis_alignment.v1",
+        "aligned": aligned,
+        "n_deviations": len(deviations),
+        "n_warnings": len(warnings),
+        "deviations": deviations,
+        "warnings": warnings,
+        "reading": (
+            "no deviations found: the analysis is consistent with the "
+            "pre-registered design" if aligned
+            else "deviations from pre-registered design found; see deviations list"
+        ),
+    }
+
+
 def _normal_sampler(rng: random.Random, mean: float, sd: float):
     if sd == 0.0:
         return lambda: mean

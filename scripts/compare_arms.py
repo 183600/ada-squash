@@ -1033,9 +1033,20 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                     "tested completely, so the reported comparison is conditional on "
                     "the reference selection")
             elif len(common) < MIN_SEEDS_FOR_SIGNIFICANCE:
-                entry["certification_basis"] = (
-                    f"descriptive only: {len(common)} shared seed(s), fewer than "
-                    f"{MIN_SEEDS_FOR_SIGNIFICANCE}; batch/step noise is not run-to-run noise")
+                if len(common) == 1:
+                    entry["certification_basis"] = (
+                        "descriptive only: 1 shared seed; no paired test is possible, "
+                        "only a batch-level descriptive note is available")
+                elif len(common) == 2:
+                    entry["certification_basis"] = (
+                        f"descriptive only: {len(common)} shared seed(s); "
+                        f"paired t-test has df=1 and is anti-conservative at α=0.05 "
+                        f"(critical t≈6.31). Batch/step noise is not run-to-run noise; "
+                        f">= {MIN_SEEDS_FOR_SIGNIFICANCE} seeds needed for certifiability")
+                else:
+                    entry["certification_basis"] = (
+                        f"descriptive only: {len(common)} shared seed(s), fewer than "
+                        f"{MIN_SEEDS_FOR_SIGNIFICANCE}; batch/step noise is not run-to-run noise")
             elif cand["issues"] or ref["issues"]:
                 entry["certification_basis"] = (
                     "descriptive only: incomplete/invalid seed coverage - "
@@ -1043,11 +1054,9 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
         else:
             entry["test_basis"] = "insufficient_shared_seeds"
             entry["certification_basis"] = (
-                ("descriptive only: " + metric_policy["reason"]
-                 + "; required evidence: " + metric_policy["required_evidence"])
-                if not metric_policy["certifiable_from_aggregate"] else
-                (f"{len(common)} shared seed(s); a paired test needs at least 2, "
-                 f"and only >= {MIN_SEEDS_FOR_SIGNIFICANCE} can certify"))
+                "descriptive only: no shared seeds between the two arms; "
+                "without shared training seeds there is no paired contrast to compute. "
+                "Compare on a common data batch or seed set instead.")
         if common:
             deltas = [cand["values"][seed] - ref["values"][seed]
                       for seed in common]
@@ -1141,10 +1150,12 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
             "p_family_basis": ("p_inferential (= selection-adjusted p)"
                                if reference_data_dependent else
                                "p_one_sided (= raw paired test)"),
-            "reading": ("a data-selected reference makes the reported comparison "
-                        "conditional on which arm looked best; the max-p "
-                        "intersection-union requires the candidate to beat "
-                        "every pool member, not just the winner"),
+"reading": ("a data-selected reference makes the reported comparison "
+                 "conditional on which arm looked best; the max-p "
+                 "intersection-union requires the candidate to beat "
+                 "every pool member, not just the winner. "
+                 "If the candidate does not beat every pool member, "
+                 "the result is not certified even if it beats the selected reference."),
         },
         "multiple_comparison": (
             f"Holm-Bonferroni over the {len(family)} candidate arm(s) tested "
@@ -1185,7 +1196,9 @@ def print_comparison(comparison: dict) -> None:
     if selection.get("data_dependent") and selection.get("pool_size", 0) > 1:
         print(f"[arms] WARNING: reference {ref!r} was selected from "
               f"{selection.get('pool')} after seeing the losses; the "
-              f"selection-adjusted p is reported alongside the raw one")
+              f"selection-adjusted p (max-p intersection-union) is reported "
+              f"alongside the raw one; the candidate must beat every pool "
+              f"member for certification, not just the selected reference")
     for entry in comparison["rows"]:
         identity = entry.get("execution_identity") or {}
         if identity.get("problems") or (

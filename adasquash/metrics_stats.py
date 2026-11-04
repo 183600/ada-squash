@@ -423,6 +423,20 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
     defined but ``meaningful`` is False because one seed's spread cannot
     support a replication claim. A zero-variance sample reduces to a
     degenerate interval and a deterministic same-direction probability.
+
+    Interpretation rules of thumb:
+     - ``meaningful`` is True only when ``n >= 3``: with 2 seeds the "spread"
+       is just the difference between those two runs, not a distribution to
+       predict a third run from.
+     - When ``meaningful`` is False, the PI is effectively a CI (n=2) or
+       degenerate (n=1); do not use it to claim "the next run will...".
+     - ``same_direction_probability`` near 0.5 means the sign is essentially
+       unpredictable given the current data; near 0 or 1 the sign is reliable.
+     - The PI is *necessarily wider* than the CI (by factor sqrt(1+1/n)),
+       so a narrow CI does not imply a narrow PI.
+     - A claim of "replication" or "generalization" should be read against
+       the PI, not the CI: even if the CI excludes zero, the PI may still
+       include zero, meaning a future replication could reverse sign.
     """
     alpha = _validate_alpha(alpha)
     stats = mean_std_stderr(values)
