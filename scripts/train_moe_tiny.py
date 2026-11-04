@@ -80,7 +80,7 @@ class MoELayer(nn.Module):
         self.top_k = top_k
         self.router = nn.Linear(dim, n_experts, bias=False)
         hidden = int(hidden * 2 / 3)
-        hidden = hidden + 7 & ~7
+        hidden = (hidden + 7) & ~7
         self.experts_w1 = nn.Parameter(torch.empty(n_experts, dim, hidden))
         self.experts_w2 = nn.Parameter(torch.empty(n_experts, hidden, dim))
         self.experts_w3 = nn.Parameter(torch.empty(n_experts, dim, hidden))
