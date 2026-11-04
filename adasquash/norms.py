@@ -885,7 +885,7 @@ class DyTCDTanh(_SquashedAffine):
     @property
     def alpha_per_channel(self) -> torch.Tensor:
         scale = _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
-        return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
+        return torch.addcmul(scale, scale, self.delta).clamp(min=_MIN_ALPHA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi = torch.tanh(self.alpha_per_channel * x)
