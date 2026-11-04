@@ -339,6 +339,10 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
                 if _finite_metric(p.get("tokens_per_second"))]
     tps_stats = mean_std_stderr(tps_vals)
 
+    tokens_vals = [int(p["tokens_processed"]) for p in per_seed if _is_integer_scalar(p.get("tokens_processed"))]
+    tokens_stats = mean_std_stderr(tokens_vals) if len(tokens_vals) >= 2 else None
+    tokens_cv = (tokens_stats["std"] / tokens_stats["mean"]) if tokens_stats and tokens_stats["mean"] else None
+
     # Attrition is part of the row, not an implicit side effect of filtering
     # non-finite values out of the mean. The policy is fixed before training
     # and every seed is classified against it; a diverged-but-finite seed is
@@ -423,11 +427,15 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
                          if _finite_metric(p.get("elapsed_s"))),
         # Measured cost of the arm, carried next to the loss delta.
         "tokens_processed": sum(int(p["tokens_processed"]) for p in per_seed
-                                if _is_integer_scalar(p.get("tokens_processed"))),
+                                 if _is_integer_scalar(p.get("tokens_processed"))),
+        "tokens_processed_per_seed_mean": tokens_stats["mean"] if tokens_stats else None,
+        "tokens_processed_per_seed_std": tokens_stats["std"] if tokens_stats else None,
+        "tokens_processed_cv": tokens_cv,
         "tokens_per_second": None if tps_stats is None else tps_stats["mean"],
         "tokens_per_second_seed_std": (tps_stats["std"] if tps_stats and len(tps_vals) >= 2 else None),
         "peak_device_memory_mb": _mean_of("peak_device_memory_mb"),
         "cost_basis": "tokens_per_second / peak_device_memory_mb are measured this run; memory is null on CPU",
+        "compute_budget_consistent": (tokens_cv is None) or (tokens_cv <= 0.01),
         # Curve regimes across the row's seeds: a seed whose run was still
         # underfit/stalled or already overfitting/diverging makes its
         # val_loss a statement about that regime as much as about the norm,
