@@ -80,7 +80,7 @@ def test_build_norm_returns_correct_type():
 # ---------------------------------------------------------------------------
 # Shape / dtype preservation
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dyts", "dytp", "dytc", "dytd", "dytdi", "dytcd", "dytcdi"])
+@pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dyts", "dytp", "dytc", "dytd", "dytdi", "dytd_tanh", "dytcd", "dytcdi", "dytcd_tanh"])
 def test_norm_preserves_shape_and_dtype(name):
     for dtype in (torch.float32, torch.bfloat16):
         norm = build_norm(name, 64).to(dtype)
@@ -90,7 +90,7 @@ def test_norm_preserves_shape_and_dtype(name):
         assert y.dtype == x.dtype
 
 
-@pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dyts", "dytp", "dytc", "dytd", "dytdi", "dytcd", "dytcdi"])
+@pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dyts", "dytp", "dytc", "dytd", "dytdi", "dytd_tanh", "dytcd", "dytcdi", "dytcd_tanh"])
 def test_norm_gradient_flows(name):
     norm = build_norm(name, 64)
     x = torch.randn(2, 16, 64, requires_grad=True)
