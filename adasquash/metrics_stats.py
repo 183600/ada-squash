@@ -784,6 +784,55 @@ def chi2_sf(x: float, df: float) -> float:
     return min(1.0, max(0.0, _gamma_q_cf(a, half)))
 
 
+def chi2_ppf(p: float, df: float) -> float:
+    """Inverse chi-square CDF: the x with P(X <= x) = p.
+
+    The heterogeneity intervals of a pooled analysis are built from
+    chi-square quantiles of Cochran's Q, so the inverse tail is needed
+    wherever the tau^2 interval is reported. `chi2_sf` is strictly decreasing
+    in x, which makes a bisection on it monotone and exact for the small
+    degrees of freedom a handful of studies produce (k - 1 d.o.f.). Closed-form
+    approximations such as Wilson-Hilferty are visibly off in that range, and
+    the repository deliberately has no scipy dependency.
+
+    `p` outside (0, 1) is an error: `p = 0` maps to the boundary 0 and
+    `p = 1` to infinity, and a caller that means "the whole line" should say
+    so explicitly rather than receive a finite quantile.
+
+    Args:
+        p: target probability in (0, 1).
+        df: degrees of freedom, > 0.
+
+    Returns:
+        The chi-square quantile at `p`.
+    """
+    p_value = _as_real(p)
+    if p_value is None or not math.isfinite(p_value):
+        raise ValueError("chi2_ppf needs a finite probability")
+    if p_value <= 0.0 or p_value >= 1.0:
+        raise ValueError(f"chi2_ppf needs 0 < p < 1, got {p!r}")
+    df_value = _as_real(df)
+    if df_value is None or not math.isfinite(df_value) or df_value <= 0.0:
+        raise ValueError("chi2_ppf needs df > 0")
+    df = df_value
+    target_survival = 1.0 - p_value
+    lo = 0.0
+    hi = df + 10.0 * math.sqrt(2.0 * df) + 10.0
+    while chi2_sf(hi, df) > target_survival:
+        hi *= 2.0
+        if math.isinf(hi):
+            return math.inf
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if mid == lo or mid == hi:
+            break
+        if chi2_sf(mid, df) > target_survival:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
 def student_t_cdf(t: float, df: float) -> float:
     """P(T <= t) for Student's t with `df` degrees of freedom.
 
@@ -1904,5 +1953,169 @@ def leave_one_out_jackknife(
                  "descriptive robustness check; dropping one observation is "
                  "not an independent replication and never certifies a result"),
     }
+
+
+def normal_ppf(p: float) -> float:
+    """Standard-normal quantile: the z with P(Z <= z) = p.
+
+    Needed wherever a normal quantile enters a formula that has no
+    closed-form inverse in this dependency-free repository (the p-uniform
+    likelihood, for instance). The value comes from `statistics.NormalDist`,
+    which is part of the standard library, so no extra dependency is added.
+
+    Args:
+        p: target probability in (0, 1).
+
+    Returns:
+        The standard-normal quantile at `p`.
+    """
+    p_value = _as_real(p)
+    if p_value is None or not math.isfinite(p_value) or not 0.0 < p_value < 1.0:
+        raise ValueError(f"normal_ppf needs 0 < p < 1, got {p!r}")
+    return NormalDist().inv_cdf(p_value)
+
+
+def kendall_tau(x: Sequence[float], y: Sequence[float]) -> dict:
+    """Kendall's rank correlation between two samples.
+
+    The funnel-plot diagnostics of a publication-bias audit are rank based:
+    they ask whether the effect size moves with the precision of the study
+    regardless of how the effects are distributed. Kendall's tau is the
+    standard choice for that question and, unlike a Pearson correlation, it
+    is not driven by a single outlying study.
+
+    Both tau-a (which ignores ties and divides by the number of pairs) and
+    tau-b (which corrects for tied ranks in either variable) are reported.
+    The exact null distribution of tau-a is available through
+    `kendall_tau_exact_p`; tau-b needs a tie-corrected approximation, so the
+    caller should read `ties_x`/`ties_y` before choosing a reference
+    distribution.
+
+    Args:
+        x: first sample of real observations.
+        y: second sample, the same length as `x`.
+
+    Returns:
+        A dict with the pair counts, `tau_a`, `tau_b` (None when the tie
+        correction is undefined) and the number of tied pairs.
+    """
+    xs = _real_values(x, "x")
+    ys = _real_values(y, "y")
+    if len(xs) != len(ys):
+        raise ValueError(
+            f"kendall_tau needs two samples of equal length, got {len(xs)} "
+            f"and {len(ys)}")
+    n = len(xs)
+    if n < 2:
+        return {
+            "n": n,
+            "concordant": 0,
+            "discordant": 0,
+            "ties_x": 0,
+            "ties_y": 0,
+            "n_pairs": 0,
+            "tau_a": None,
+            "tau_b": None,
+            "note": "a rank correlation needs at least two observations",
+        }
+    concordant = 0
+    discordant = 0
+    ties_x = 0
+    ties_y = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = xs[i] - xs[j]
+            dy = ys[i] - ys[j]
+            if dx == 0.0:
+                ties_x += 1
+                if dy == 0.0:
+                    ties_y += 1
+            elif dy == 0.0:
+                ties_y += 1
+            elif dx * dy > 0.0:
+                concordant += 1
+            else:
+                discordant += 1
+    n_pairs = n * (n - 1) // 2
+    tau_a = (concordant - discordant) / n_pairs
+    denominator = math.sqrt((n_pairs - ties_x) * (n_pairs - ties_y))
+    tau_b = ((concordant - discordant) / denominator
+             if denominator > 0.0 else None)
+    return {
+        "n": n,
+        "concordant": concordant,
+        "discordant": discordant,
+        "ties_x": ties_x,
+        "ties_y": ties_y,
+        "n_pairs": n_pairs,
+        "tau_a": tau_a,
+        "tau_b": tau_b,
+        "note": None,
+    }
+
+
+def _inversion_count_distribution(n: int) -> list[int]:
+    """Counts of permutations of `n` items by their number of inversions.
+
+    Inserting the k-th item into a permutation of k-1 items adds any number
+    of inversions from 0 to k-1, so the distribution is the product of the
+    polynomials ``1 + x + ... + x^(k-1)``. The dynamic program below builds
+    that product one factor at a time and keeps the counts exact (they are
+    integers, not floats), which is what makes the Kendall null distribution
+    exact rather than a normal approximation.
+    """
+    counts = [1]
+    for k in range(1, n + 1):
+        updated = [0] * (len(counts) + k - 1)
+        for index, count in enumerate(counts):
+            for added in range(k):
+                updated[index + added] += count
+        counts = updated
+    return counts
+
+
+def kendall_tau_exact_p(tau_a: float, n: int) -> Optional[float]:
+    """Exact two-sided null p-value of Kendall's tau-a.
+
+    Under the null of independence the ranks are a uniformly random
+    permutation, so the number of discordant pairs follows the Mahonian
+    (inversion-count) distribution. Enumerating that distribution gives the
+    exact two-sided p-value for any observed tau-a, with no normality
+    assumption and no asymptotic approximation. For the handful of studies a
+    publication-bias audit sees, the normal approximation to Kendall's tau is
+    noticeably anti-conservative, so the exact distribution is the reference
+    used here.
+
+    The two-sided p-value is the probability of a discordant-pair count at
+    least as extreme as the observed one in either direction. When the two
+    tails overlap (an observed tau of zero, for instance) the overlap is
+    subtracted so the result never exceeds one.
+
+    Args:
+        tau_a: the observed Kendall tau-a, in [-1, 1].
+        n: number of paired observations.
+
+    Returns:
+        The exact two-sided p-value, or None when `n` is too large for the
+        exact enumeration (the caller then uses an approximation).
+    """
+    n_value = _strict_int(n, "n", minimum=2)
+    if n_value > _RANDOMIZATION_EXACT_MAX:
+        return None
+    value = _as_real(tau_a)
+    if value is None or not math.isfinite(value):
+        raise ValueError("kendall_tau_exact_p needs a finite tau")
+    n_pairs = n_value * (n_value - 1) // 2
+    magnitude = min(1.0, abs(value))
+    low_count = math.floor((1.0 - magnitude) * n_pairs / 2.0 + 1e-9)
+    high_count = math.ceil((1.0 + magnitude) * n_pairs / 2.0 - 1e-9)
+    counts = _inversion_count_distribution(n_value)
+    total = sum(counts)
+    lower = sum(counts[:low_count + 1])
+    upper = sum(counts[high_count:])
+    overlap = (sum(counts[high_count:low_count + 1])
+               if high_count <= low_count else 0)
+    p_value = (lower + upper - overlap) / total
+    return min(1.0, max(0.0, p_value))
 
 
