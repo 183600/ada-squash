@@ -35,11 +35,11 @@ from typing import Any, Optional
 __all__ = [
     "Preregistration",
     "PreregistrationRegistry",
-    "create_preregistration",
-    "commit_preregistration_git",
     "commit_preregistration_file",
-    "verify_preregistration",
+    "commit_preregistration_git",
+    "create_preregistration",
     "timestamp_now",
+    "verify_preregistration",
 ]
 
 
@@ -83,7 +83,7 @@ class Preregistration:
         }, sort_keys=True, separators=(",", ":"))
 
     @classmethod
-    def from_json(cls, data: str) -> "Preregistration":
+    def from_json(cls, data: str) -> Preregistration:
         obj = json.loads(data)
         return cls(
             version=obj.get("version", 1),

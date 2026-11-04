@@ -7,22 +7,22 @@
 本仓库是 DyT++ 提案的实验代码库：一族*免统计*归一化层，沿三条正交轴推广
 Dynamic Tanh（DyT, Zhu et al. 2025）：
 
-| 变体 | 轴 | 新增内容 | 针对问题 |
-|--------|------|---------------|---------|
-| **DyT-S**  | 激活族 | 标量 α + 广义 softsign（{标量 × softsign} 因子格） | 饱和剖面 vs tanh |
-| **DyT-P**  | 逐通道（tanh） | tanh 下的逐通道 α（{逐通道 × tanh} 因子格） | 把逐通道轴与激活族互换解耦 |
-| **DyT-C**  | 逐通道 + softsign | 逐通道 alpha + 广义 softsign | 离群值集中通道（LLaMA "super-active" 维度） |
-| **DyT-D**  | 深度条件 | 深度衰减 alpha + LayerScale 残差门 | Pre-LN Transformer 的"深度诅咒" |
-| **DyT-CD** | 两者结合（主提案） | DyT-C + DyT-D | 超深模型、MoE、FP8 |
-| **DyT-QK** | 注意力 logits（变体 C） | Q/K 点积前的标量压缩 | 长上下文 logit 爆炸 |
+| 变体 | 轴 | `norm_name` | 新增内容 | 针对问题 |
+|--------|------|-------------|---------------|---------|
+| **DyT**   | 基线 | `dyt` | 标量 α + tanh | 原版 Dynamic Tanh |
+| **DyT-S**  | 激活族 | `dyts` | 标量 α + 广义 softsign（{标量 × softsign} 因子格） | 饱和剖面 vs tanh |
+| **DyT-P**  | 逐通道（tanh） | `dytp` | tanh 下的逐通道 α（{逐通道 × tanh} 因子格） | 把逐通道轴与激活族互换解耦 |
+| **DyT-C**  | 逐通道 + softsign | `dytc` | 逐通道 alpha + 广义 softsign | 离群值集中通道（LLaMA "super-active" 维度） |
+| **DyT-D**  | 深度条件 | `dytd` | 深度衰减 alpha + LayerScale 残差门 | Pre-LN Transformer 的"深度诅咒" |
+| **DyT-CD** | 两者结合（主提案） | `dytcd` | DyT-C + DyT-D | 超深模型、MoE、FP8 |
+| **DyT-QK** | 注意力 logits（变体 C） | `dytqk` | Q/K 点积前的标量压缩 | 长上下文 logit 爆炸 |
 
-核心假设是免统计的逐元素自适应压缩可以在仅增加 **<0.1% 参数** 的前提下替代基于统计的归一化。
+核心假设：免统计的逐元素自适应压缩可在仅增加 **<0.1% 参数** 的前提下替代基于统计的归一化。
 对 QK 变体，更精确的表述是：*逐元素饱和 vs 向量归一化——在对齐有效 logit 尺度时，谁更抗离群通道、谁更有注意力表达力？*
 两者给出的 logit 上界相同，详见 DyT-QK 一节。
 
-配置与脚本中的 `norm_name` 取值为 `ln`、`rmsnorm`、`dyt`、`dyts`、
-`dytp`、`dytc`、`dytd`、`dytcd` 以及对应的消融变体；QK 压缩通过
-`qk_norm: dytqk` 单独选择。
+基线：`ln`、`rmsnorm`。消融对照：`dytdi`、`dytcdi`（仅深度初始化）、
+`dytd_tanh`/`dytcd_tanh`（tanh 替代 softsign）。QK 压缩通过 `qk_norm: dytqk` 选择。
 
 ## 目录
 

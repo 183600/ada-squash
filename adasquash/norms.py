@@ -3,10 +3,10 @@
 This module implements the DyT++ normalization family:
 
 * **Statistic-based baselines**: ``LayerNorm``, ``RMSNorm``
-* **Generalized-softsign family**: scalar/per-channel α with softsign
-  - ``DyT`` / ``DyT-S`` (scalar α)
-  - ``DyT-P`` (per-channel α under tanh)
-  - ``DyT-C`` (per-channel α with generalized softsign)
+* **Generalized-softsign family**: scalar/per-channel alpha with softsign
+  - ``DyT`` / ``DyT-S`` (scalar alpha)
+  - ``DyT-P`` (per-channel alpha under tanh)
+  - ``DyT-C`` (per-channel alpha with generalized softsign)
   - ``DyT-D`` / ``DyT-CD`` (depth-conditioned variants)
 * **Attention logit squashing**: ``QKSquash``
 
@@ -209,10 +209,7 @@ def _softsign_core(xs: torch.Tensor, p, scale=None):
     guarantees numerical stability when ``t`` contains zeros or very small values.
     """
     p = _as_scalar_exponent(p)
-    if scale is None:
-        t = xs.abs()
-    else:
-        t = xs.mul(scale).abs_()
+    t = xs.abs() if scale is None else xs.mul(scale).abs_()
     lo = t.clamp(max=1.0)
     r = t.clamp_(min=1.0).reciprocal_()
     u = lo.mul(r)
@@ -274,10 +271,7 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_p_grad: bool, need_phi: 
     s, a = _compute_s_and_a(u, p, need_p_grad)
     phi = None
     if need_phi:
-        if need_x_grad:
-            phi = (lo * s).copysign_(xs)
-        else:
-            phi = (s * lo).copysign_(xs)
+        phi = (lo * s).copysign_(xs) if need_x_grad else (s * lo).copysign_(xs)
         if scale is not None and (not scale_nonneg) and _scale_needs_sign_fix(scale):
             phi.mul_(torch.where(torch.signbit(scale), -1.0, 1.0))
     if not need_x_grad:
@@ -306,10 +300,7 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
     sig.neg_().log1p_().neg_()
     k = sig.sub_(a)
     acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
-    if acc is None:
-        red = _dot_all(grad_phi, k)
-    else:
-        red = (grad_phi * k).sum(dtype=acc)
+    red = _dot_all(grad_phi, k) if acc is None else (grad_phi * k).sum(dtype=acc)
     # Out-of-place with a 0-dim p: an in-place division by a one-element p
     # would try to write a [1] broadcast back into the 0-dim reduction. For a
     # one-element tensor the scalar reduction is still the correct value; it
@@ -550,10 +541,7 @@ class _RMSNorm(torch.autograd.Function):
                 u.mul_(weight)
             else:
                 u = u * weight
-            if m.dtype == rstd.dtype:
-                corr = m.mul_(rstd).mul_(rstd)
-            else:
-                corr = m * rstd * rstd
+            corr = m.mul_(rstd).mul_(rstd) if m.dtype == rstd.dtype else m * rstd * rstd
             out_dtype = torch.promote_types(u.dtype, torch.promote_types(x.dtype, corr.dtype))
             if out_dtype == u.dtype:
                 u.addcmul_(x, corr, value=-1)
@@ -686,7 +674,7 @@ class _DyTDForward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        x, alpha_0, k, gamma, beta, exp_kdr = ctx.saved_tensors
+        x, alpha_0, _k, gamma, beta, exp_kdr = ctx.saved_tensors
         depth_ratio = ctx.depth_ratio
         a = alpha_0 * exp_kdr
         w, grad_gamma = _tanh_squash_backward(x, a, gamma, grad_out, ctx.needs_input_grad[3])
@@ -769,7 +757,7 @@ class _DyTForward(torch.autograd.Function):
 
 @register_norm("dytcd")
 class DyTCD(_SquashedAffine):
-    """Main proposal: per-channel α scaled by depth-conditioned schedule, softsign activation.
+    """Main proposal: per-channel alpha scaled by depth-conditioned schedule, softsign activation.
 
     ``alpha_c = alpha_0 * exp(-k * l / L) * (1 + delta)``, floored at ``_MIN_ALPHA``.
     Uses generalized softsign with learnable ``p``, floored at ``_MIN_P``.
@@ -826,7 +814,7 @@ class _DyTCDForward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         saved = ctx.saved_tensors
-        x, alpha_0, k, delta, gamma, beta, alpha_c = saved[:7]
+        x, alpha_0, _k, delta, gamma, beta, alpha_c = saved[:7]
         exp_kdr = saved[7]
         depth_ratio = ctx.depth_ratio
         p, p_raw = _restore_exponent(ctx, saved, 8)
@@ -875,7 +863,7 @@ class _DyTCDForward(torch.autograd.Function):
 class DyTCDTanh(_SquashedAffine):
     """Ablation control: DyT-CD with tanh instead of softsign (plain autograd).
 
-    Same per-channel α by depth schedule as ``DyTCD``, same ``gamma``/``beta``,
+    Same per-channel alpha by depth schedule as ``DyTCD``, same ``gamma``/``beta``,
     same LayerScale residual. The only difference is the activation function.
     Like ``LayerNorm``, this is a plain-autograd control, not part of the research
     core, so gradients use PyTorch's autograd.
@@ -1020,7 +1008,7 @@ class _DyTPForward(torch.autograd.Function):
 
 @register_norm("dytdi")
 class DyTDI(DyT):
-    """Depth-init control for DyT-D: DyT with α initialized at the depth schedule.
+    """Depth-init control for DyT-D: DyT with alpha initialized at the depth schedule.
 
     The scalar alpha starts at ``alpha_0 * exp(-k * l / L)`` and is then
     learned freely with no reparameterization. Against ``DyTD``, this isolates
@@ -1036,7 +1024,7 @@ class DyTDI(DyT):
 
 @register_norm("dytcdi")
 class DyTCDI(DyTC):
-    """Depth-init control for DyT-CD: DyT-C with α initialized at the depth schedule.
+    """Depth-init control for DyT-CD: DyT-C with alpha initialized at the depth schedule.
 
     The per-channel alpha starts at ``alpha_0 * exp(-k * l / L)`` (delta=0)
     and is then learned freely. Against ``DyTCD``, this isolates the

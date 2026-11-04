@@ -7,27 +7,22 @@
 This repository implements DyT++: a family of **statistic-free** normalization
 layers that generalize Dynamic Tanh (DyT, Zhu et al. 2025) along three orthogonal axes.
 
-| Variant   | Axis              | What it adds                                            | Targets                                              |
-|-----------|-------------------|--------------------------------------------------------|------------------------------------------------------|
-| **DyT-S** | activation family | scalar α + generalized softsign                       | saturation profile vs tanh                         |
-| **DyT-P** | per-channel (tanh)| per-channel α under tanh                               | isolates the per-channel axis from the family swap  |
-| **DyT-C** | per-channel + softsign | per-channel α + generalized softsign                  | outlier-heavy channels (LLaMA "super-active" dims)   |
-| **DyT-D** | depth-conditioned | depth-decaying α + LayerScale residual                 | Pre-LN "curse of depth" in Transformers              |
-| **DyT-CD**| both (main)       | DyT-C + DyT-D                                          | ultra-deep, MoE, FP8                                 |
-| **DyT-QK**| attention logits  | scalar squashing of Q/K before dot product             | long-context logit explosion                       |
+| Variant   | Axis              | `norm_name` | What it adds                                            | Targets                                              |
+|-----------|-------------------|-------------|--------------------------------------------------------|------------------------------------------------------|
+| **DyT**   | baseline (tanh)   | `dyt`       | scalar α + tanh                                        | original Dynamic Tanh                                |
+| **DyT-S** | activation family | `dyts`      | scalar α + generalized softsign                        | saturation profile vs tanh                           |
+| **DyT-P** | per-channel (tanh)| `dytp`      | per-channel α under tanh                               | isolates per-channel axis from family swap           |
+| **DyT-C** | per-channel + softsign | `dytc`   | per-channel α + generalized softsign                   | outlier-heavy channels (LLaMA "super-active" dims)   |
+| **DyT-D** | depth-conditioned | `dytd`      | depth-decaying α + LayerScale residual                 | Pre-LN "curse of depth" in Transformers              |
+| **DyT-CD**| both (main)       | `dytcd`     | DyT-C + DyT-D                                          | ultra-deep, MoE, FP8                                 |
+| **DyT-QK**| attention logits  | `dytqk`     | scalar squashing of Q/K before dot product             | long-context logit explosion                         |
 
 **Core hypothesis**: statistic-free, element-wise adaptive squashing can replace
 statistic-based normalization with **<0.1% additional parameters**.
 
-The `norm_name` values used by configs and scripts are `ln`, `rmsnorm`,
-`dyt`, `dyts`, `dytp`, `dytc`, `dytd`, `dytdi`, `dytcd`, `dytcdi`, and
-`dytd_tanh`/`dytcd_tanh` (ablation controls). QK squashing is selected via
+Baseline norms: `ln`, `rmsnorm`. Ablation controls: `dytdi`, `dytcdi` (depth-init only),
+`dytd_tanh`/`dytcd_tanh` (tanh instead of softsign). QK squashing is selected via
 `qk_norm: dytqk`.
-
-The ``norm_name`` values used by configs and scripts are ``ln``, ``rmsnorm``,
-``dyt``, ``dyts``, ``dytp``, ``dytc``, ``dytd``, ``dytcd``, and their
-controlled ablation variants. QK squashing is selected separately through
-``qk_norm: dytqk``.
 
 ## Contents
 

@@ -35,13 +35,13 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 __all__ = [
-    "BlindingKey",
     "BlindedAnalysis",
+    "BlindingKey",
     "blind_arms",
-    "unblind_report",
     "create_blinding_key",
-    "verify_blinding_integrity",
     "time_locked_key",
+    "unblind_report",
+    "verify_blinding_integrity",
 ]
 
 
@@ -76,7 +76,7 @@ class BlindingKey:
         }, sort_keys=True, separators=(",", ":"))
 
     @classmethod
-    def from_json(cls, data: str) -> "BlindingKey":
+    def from_json(cls, data: str) -> BlindingKey:
         obj = json.loads(data)
         return cls(
             version=obj.get("version", 1),
@@ -255,7 +255,7 @@ class BlindedAnalysis:
         self._analysis_fingerprint: Optional[str] = None
         self._audit_log: list[dict] = []
 
-    def __enter__(self) -> "BlindedAnalysis":
+    def __enter__(self) -> BlindedAnalysis:
         # Verify key integrity on entry
         verification = verify_blinding_integrity(self.key, self.passphrase)
         if not verification["all_checks_pass"]:

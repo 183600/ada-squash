@@ -2611,7 +2611,7 @@ def design_analysis_alignment_report(
     # Extract comparison components
     cmp_rows = comparison.get("rows", [])
     cmp_protocol = comparison.get("protocol", {})
-    cmp_reference = comparison.get("reference", None)
+    cmp_reference = comparison.get("reference")
     cmp_reference_selection = comparison.get("reference_selection", {})
     cmp_metric = comparison.get("metric", "final_val_loss")
     cmp_certifiable = comparison.get("certifiable", False)
@@ -2659,8 +2659,8 @@ def design_analysis_alignment_report(
     for name, n_shared in shared_seed_counts.items():
         if n_shared is not None and n_shared < min_seeds:
             deviations.append(
-                f'arm {name!r}: only {n_shared} shared seed(s) < {min_seeds} '
-                f'planned minimum; result is descriptive only')
+                f"arm {name!r}: only {n_shared} shared seed(s) < {min_seeds} "
+                f"planned minimum; result is descriptive only")
 
     # 5. Reference selection alignment
     if cmp_reference_selection.get("data_dependent", False):

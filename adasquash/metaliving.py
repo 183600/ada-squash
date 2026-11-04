@@ -19,16 +19,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from .metrics_meta import meta_analysis, _pool_meta_studies
+from .metrics_meta import _pool_meta_studies, meta_analysis
 
 __all__ = [
     "CumulativeMetaAnalysis",
+    "LivingMetaAnalysis",
     "StudyEffect",
-    "run_cumulative_meta_analysis",
-    "meta_regression",
     "grade_assessment",
     "living_meta_analysis",
-    "LivingMetaAnalysis",
+    "meta_regression",
+    "run_cumulative_meta_analysis",
 ]
 
 

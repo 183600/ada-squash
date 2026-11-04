@@ -31,16 +31,16 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 __all__ = [
-    "LossFunction",
-    "TypeITypeIILoss",
-    "EstimationLoss",
-    "DecisionRule",
-    "ThresholdDecisionRule",
     "BayesDecisionRule",
-    "expected_loss",
-    "value_of_information",
     "DecisionAnalysis",
+    "DecisionRule",
+    "EstimationLoss",
+    "LossFunction",
+    "ThresholdDecisionRule",
+    "TypeITypeIILoss",
+    "expected_loss",
     "run_decision_analysis",
+    "value_of_information",
 ]
 
 
@@ -87,19 +87,17 @@ class TypeITypeIILoss(LossFunction):
         if decision == "adopt":
             if truth == "better":
                 return 0.0
-            elif truth == "equivalent":
+            if truth == "equivalent":
                 return self.type_i_cost * 0.5  # Partial cost for equivalent
-            else:  # worse
-                return self.type_i_cost
-        elif decision == "reject":
+            # worse
+            return self.type_i_cost
+        if decision == "reject":
             if truth == "better":
                 return self.type_ii_cost
-            else:
-                return 0.0
-        elif decision == "continue":
+            return 0.0
+        if decision == "continue":
             return self.continue_cost
-        else:
-            raise ValueError(f"Unknown decision: {decision}")
+        raise ValueError(f"Unknown decision: {decision}")
 
     def describe(self) -> str:
         return (f"Type I/II Loss: Type I={self.type_i_cost}, Type II={self.type_ii_cost}, "
@@ -121,12 +119,11 @@ class EstimationLoss(LossFunction):
             est = float(decision)
             true_val = float(truth)
         except (ValueError, TypeError):
-            return float('inf')
+            return float("inf")
 
         if self.loss_type == "squared":
             return (est - true_val) ** 2
-        else:
-            return abs(est - true_val)
+        return abs(est - true_val)
 
     def describe(self) -> str:
         return f"Estimation Loss: {self.loss_type} error"
@@ -167,10 +164,9 @@ class ThresholdDecisionRule(DecisionRule):
             if self.require_both and equiv is not None:
                 return "adopt" if not equiv else "continue"
             return "adopt"
-        elif self.equivalence_margin > 0 and equiv is True:
+        if self.equivalence_margin > 0 and equiv is True:
             return "reject"  # Equivalent to reference, no need to adopt
-        else:
-            return "continue"
+        return "continue"
 
     def describe(self) -> str:
         return (f"Threshold Rule: alpha={self.alpha}, "

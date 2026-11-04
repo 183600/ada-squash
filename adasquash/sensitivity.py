@@ -48,19 +48,19 @@ from .design import (
 )
 from .metrics import (
     MIN_SEEDS_FOR_SIGNIFICANCE,
+    paired_randomization_test,
     paired_t_one_sided,
     tost_paired,
     welch_t_one_sided,
-    paired_randomization_test,
 )
 
 __all__ = [
     "SensitivityReport",
-    "exclusion_policy_sensitivity",
-    "attrition_sensitivity",
-    "effect_size_sensitivity",
     "analysis_pipeline_sensitivity",
+    "attrition_sensitivity",
     "combine_sensitivity_reports",
+    "effect_size_sensitivity",
+    "exclusion_policy_sensitivity",
 ]
 
 
@@ -136,8 +136,8 @@ def _compare_significance(baseline: dict, alternative: dict, alpha: float = 0.05
     base_p = baseline.get("p_one_sided", baseline.get("p_value", 1.0))
     alt_p = alternative.get("p_one_sided", alternative.get("p_value", 1.0))
 
-    base_eq = baseline.get("equivalent", None)
-    alt_eq = alternative.get("equivalent", None)
+    base_eq = baseline.get("equivalent")
+    alt_eq = alternative.get("equivalent")
 
     changed = base_sig != alt_sig or base_eq != alt_eq
     details = {

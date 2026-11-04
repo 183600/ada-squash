@@ -24,11 +24,11 @@ from typing import Any, Optional
 __all__ = [
     "AssumptionCheck",
     "AssumptionReport",
-    "check_normality",
-    "check_variance_homogeneity",
     "check_independence",
+    "check_normality",
     "check_outlier_influence",
     "check_sample_size_adequacy",
+    "check_variance_homogeneity",
     "run_full_assumption_diagnostics",
 ]
 
@@ -151,7 +151,7 @@ def _approx_normal_ppf(p: float) -> float:
     """Approximate inverse normal CDF (probit function)."""
     # Abramowitz & Stegun approximation
     if p <= 0 or p >= 1:
-        return float('inf') if p >= 1 else float('-inf')
+        return float("inf") if p >= 1 else float("-inf")
     # Symmetric
     if p > 0.5:
         return -_approx_normal_ppf(1 - p)
@@ -333,12 +333,12 @@ def check_variance_homogeneity(
 
     ms_between = ss_between / df_between
     ms_within = ss_within / df_within
-    F = ms_between / ms_within if ms_within > 0 else float('inf')
+    F = ms_between / ms_within if ms_within > 0 else float("inf")
 
     # Approximate p-value from F-distribution
     # Using the fact that F ~ Beta(df1/2, df2/2) transformed
     # Simple approximation
-    if F == float('inf'):
+    if float("inf") == F:
         p = 0.0
     else:
         # Approximate using chi-squared approximation

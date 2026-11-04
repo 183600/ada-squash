@@ -27,26 +27,26 @@ from typing import Any, Optional
 
 from .design import simulate_paired_design
 from .metrics import (
+    benjamini_hochberg_adjust,
+    holm_adjust,
+    leave_one_out_jackknife,
     paired_t_one_sided,
     tost_paired,
-    holm_adjust,
-    benjamini_hochberg_adjust,
-    leave_one_out_jackknife,
 )
 from .sequential import group_sequential_plan, sequential_paired_audit
 
 __all__ = [
-    "CalibrationScenario",
-    "CalibrationResult",
     "CalibrationReport",
-    "run_calibration_suite",
+    "CalibrationResult",
+    "CalibrationScenario",
     "calibrate_coverage",
-    "calibrate_type_i_under_violations",
-    "calibrate_power_under_heterogeneity",
     "calibrate_equivalence",
-    "calibrate_sequential_monitoring",
     "calibrate_factorial_interaction",
     "calibrate_multiple_testing",
+    "calibrate_power_under_heterogeneity",
+    "calibrate_sequential_monitoring",
+    "calibrate_type_i_under_violations",
+    "run_calibration_suite",
 ]
 
 

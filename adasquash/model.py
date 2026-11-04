@@ -145,9 +145,8 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
         return w
     key = (w.data_ptr(), w._version, dt, w.device)
     entry = _CAST_WEIGHT_CACHE.get(key)
-    if entry is not None and entry[0] is w and entry[1].shape == w.shape:
-        if not (entry[1].is_inference() and (not torch.is_inference_mode_enabled())):
-            return entry[1]
+    if entry is not None and entry[0] is w and entry[1].shape == w.shape and not (entry[1].is_inference() and (not torch.is_inference_mode_enabled())):
+        return entry[1]
         # An inference-mode cast cannot be saved for backward; a grad-mode
         # forward has to rebuild it (the key and the values are unchanged).
     nbytes = w.numel() * (torch.finfo(dt).bits // 8)
@@ -168,14 +167,14 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     return got
 
 # All statistic-free squashing norms (share the ``beta`` affine switch).
-# Factorial cells: {scalar, per-channel} alpha × {tanh, softsign}, plus
+# Factorial cells: {scalar, per-channel} alpha x {tanh, softsign}, plus
 # depth-conditioned variants and their depth-*init* controls.
 _DYT_FAMILY = ("dyt", "dyts", "dytp", "dytc", "dytd", "dytd_tanh",
                "dytdi", "dytcd", "dytcd_tanh", "dytcdi")
 # Norms whose alpha follows (alpha_0, k) at construction time.
 _DEPTH_REPARAM = ("dytd", "dytd_tanh", "dytcd", "dytcd_tanh")
 # Depth-family norms that accept (layer_idx, num_layers, alpha_0, k_init).
-_DEPTH_FAMILY = _DEPTH_REPARAM + ("dytdi", "dytcdi")
+_DEPTH_FAMILY = (*_DEPTH_REPARAM, "dytdi", "dytcdi")
 # Norms parameterized by the generalized-softsign exponent p.
 _SOFTSIGN_P = ("dyts", "dytc", "dytcd", "dytcdi")
 
@@ -190,8 +189,8 @@ def build_norm_kwargs(cfg: GPTConfig, layer_idx: int = 0,
     if cfg.norm_name in _DEPTH_FAMILY:
         if is_final_norm:
             layer_idx = cfg.n_layers
-        kwargs = dict(layer_idx=layer_idx, num_layers=cfg.n_layers,
-                      alpha_0=cfg.alpha_0, k_init=cfg.k_init)
+        kwargs = {"layer_idx": layer_idx, "num_layers": cfg.n_layers,
+                  "alpha_0": cfg.alpha_0, "k_init": cfg.k_init}
         if cfg.norm_name in _DEPTH_REPARAM:
             kwargs.update(learnable_k=cfg.learnable_k, k_min=cfg.k_min)
     if cfg.norm_name in ("dytcd", "dytcd_tanh"):
@@ -906,7 +905,7 @@ class GPT(nn.Module):
             ``all_logit_stats`` is a list of dicts (one per block) when
             ``return_stats=True``, otherwise ``None``.
         """
-        B, T = input_ids.shape
+        _B, T = input_ids.shape
         x = self.tok_emb(input_ids)
         if self.pos_emb is not None:
             pe = self.pos_emb.weight[:T]

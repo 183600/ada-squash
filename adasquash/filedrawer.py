@@ -25,17 +25,17 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 __all__ = [
+    "FileDrawerReport",
     "StudyRecord",
     "StudyRegistry",
-    "FileDrawerReport",
-    "funnel_plot_asymmetry",
-    "eggers_test",
     "beggs_test",
-    "trim_and_fill",
+    "eggers_test",
+    "funnel_plot_asymmetry",
+    "get_study_registry",
     "p_curve_analysis",
     "p_uniform_analysis",
     "register_study",
-    "get_study_registry",
+    "trim_and_fill",
 ]
 
 
@@ -102,7 +102,7 @@ class StudyRecord:
         }, sort_keys=True, separators=(",", ":"))
 
     @classmethod
-    def from_json(cls, data: str) -> "StudyRecord":
+    def from_json(cls, data: str) -> StudyRecord:
         obj = json.loads(data)
         return cls(
             schema=obj.get("schema", "adasquash.study_record.v1"),
