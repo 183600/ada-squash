@@ -11,16 +11,26 @@ from torch import nn
 from .attention import CausalSelfAttention, _make_linear, _skip_init
 from .norms import DyTCD, DyTCDTanh, DyTD, DyTDTanh, _reduce_products, build_norm
 
+# =============================================================================
+# Configuration
+# =============================================================================
 
 @dataclass
 class LayerConfig:
+    """Configuration for a single transformer block."""
     norm: str = "dytcd"
     qk_norm: Optional[str] = None
     use_layerscale: bool = True
     layerscale_init: float = 1e-05
 
+
 @dataclass
 class GPTConfig:
+    """GPT model configuration.
+
+    Hyperparameters for the transformer decoder, including norm choices,
+    depth schedule, and training defaults.
+    """
     vocab_size: int = 50304
     dim: int = 768
     n_layers: int = 12
@@ -158,9 +168,10 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     return got
 
 # All statistic-free squashing norms (share the ``beta`` affine switch).
-# The factorial cells: {scalar, per-channel} alpha x {tanh, softsign}, plus
-# the depth-conditioned family and its depth-*init* controls.
-_DYT_FAMILY = ("dyt", "dyts", "dytp", "dytc", "dytd", "dytd_tanh", "dytdi", "dytcd", "dytcd_tanh", "dytcdi")
+# Factorial cells: {scalar, per-channel} alpha × {tanh, softsign}, plus
+# depth-conditioned variants and their depth-*init* controls.
+_DYT_FAMILY = ("dyt", "dyts", "dytp", "dytc", "dytd", "dytd_tanh",
+               "dytdi", "dytcd", "dytcd_tanh", "dytcdi")
 # Norms whose alpha follows (alpha_0, k) at construction time.
 _DEPTH_REPARAM = ("dytd", "dytd_tanh", "dytcd", "dytcd_tanh")
 # Depth-family norms that accept (layer_idx, num_layers, alpha_0, k_init).
@@ -168,16 +179,20 @@ _DEPTH_FAMILY = _DEPTH_REPARAM + ("dytdi", "dytcdi")
 # Norms parameterized by the generalized-softsign exponent p.
 _SOFTSIGN_P = ("dyts", "dytc", "dytcd", "dytcdi")
 
-def build_norm_kwargs(cfg: GPTConfig, layer_idx: int=0, is_final_norm: bool=False) -> dict:
+def build_norm_kwargs(cfg: GPTConfig, layer_idx: int = 0,
+                      is_final_norm: bool = False) -> dict:
+    """Build norm-specific kwargs from GPTConfig.
+
+    Dispatches config values to the appropriate norm constructor arguments.
+    """
     kwargs: dict = {}
     is_dyt_family = cfg.norm_name in _DYT_FAMILY
     if cfg.norm_name in _DEPTH_FAMILY:
         if is_final_norm:
             layer_idx = cfg.n_layers
-        kwargs = dict(layer_idx=layer_idx, num_layers=cfg.n_layers, alpha_0=cfg.alpha_0, k_init=cfg.k_init)
+        kwargs = dict(layer_idx=layer_idx, num_layers=cfg.n_layers,
+                      alpha_0=cfg.alpha_0, k_init=cfg.k_init)
         if cfg.norm_name in _DEPTH_REPARAM:
-            # Only the reparameterized variants own a (learnable) k; the
-            # depth-init controls consume (alpha_0, k_init) purely at init.
             kwargs.update(learnable_k=cfg.learnable_k, k_min=cfg.k_min)
     if cfg.norm_name in ("dytcd", "dytcd_tanh"):
         kwargs.update(learnable_delta=cfg.learnable_delta)
@@ -187,7 +202,7 @@ def build_norm_kwargs(cfg: GPTConfig, layer_idx: int=0, is_final_norm: bool=Fals
         kwargs.update(alpha_init=cfg.alpha_init, alpha_jitter=cfg.alpha_jitter)
     if cfg.norm_name in ("dyt", "dyts"):
         kwargs.update(alpha_init=cfg.alpha_init)
-    if is_dyt_family and hasattr(cfg, "beta") and (cfg.beta is not None):
+    if is_dyt_family and cfg.beta is not None:
         kwargs.update(beta=cfg.beta)
     return kwargs
 
@@ -195,8 +210,8 @@ def _valid_target_mask(targets: torch.Tensor, ignore_index: int) -> torch.Tensor
     """Mask of target rows that contribute to the loss.
 
     Cross-entropy accepts Byte targets, but comparing a uint8 tensor with a
-    negative ignore index promotes through unsigned dtype (`-100` becomes
-    ``156``), so a real token 156 would be silently dropped.  Cast to int64 first.
+    negative ignore index promotes through unsigned dtype (``-100`` becomes
+    ``156``), so a real token 156 would be silently dropped. Cast to int64 first.
     """
     if targets.dtype == torch.uint8:
         targets = targets.to(torch.int64)
@@ -205,19 +220,18 @@ def _valid_target_mask(targets: torch.Tensor, ignore_index: int) -> torch.Tensor
 class _ChunkedCrossEntropy(torch.autograd.Function):
     """Chunked cross-entropy forward/backward via NLL loss.
 
-    The leading dimension is sliced into row blocks of ``chunk_rows`` so the
-    scratch buffer stays within ``_CROSSENTROPY_CHUNK_BYTES``.  Both forward
-    and backward preserve the ``ignore_index`` masking and return ``None``
-    gradients for the ignore index and chunk size.
+    Slices the leading dimension into row blocks to keep the scratch buffer
+    within ``_CROSSENTROPY_CHUNK_BYTES``. Both forward and backward preserve
+    ``ignore_index`` masking and return ``None`` gradients for ignored rows.
     """
 
     @staticmethod
     def forward(ctx, logits, targets, ignore_index, chunk_rows):
         """Chunked cross-entropy forward.
 
-        Slices the leading logit dimension into blocks of ``chunk_rows``,
-        applies ``log_softmax`` and ``nll_loss`` per block, and averages
-        by the number of valid (non-ignored) targets.
+        Splits the logit dimension into blocks of ``chunk_rows``, applies
+        ``log_softmax`` and ``nll_loss`` per block, and averages by valid
+        target count.
         """
         total = None
         n = targets.numel()
@@ -236,27 +250,20 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
         ctx.count = count
-        # An all-masked batch has no defined mean, but returning NaN would
-        # poison a training step whose backward is already a zero gradient.
         return total / count.clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
         """Chunked cross-entropy backward.
 
-        Computes the gradient of the loss w.r.t. the logits using the softmax
-        and the saved targets/ignore_index/chunk_rows/count.  Returns
-        ``(grad_logits, None, None, None)``.
+        Computes the gradient of the loss w.r.t. the logits using softmax
+        and the saved targets/ignore_index/chunk_rows/count.
         """
         logits, targets = ctx.saved_tensors
         grad_logits = torch.empty_like(logits)
         grad_scale = (grad_out / ctx.count.clamp(min=1)).to(logits.dtype)
         chunk_rows = ctx.chunk_rows
-        # The row mask and the scatter source depend only on the targets.
         valid = _valid_target_mask(targets, ctx.ignore_index)
-        # `scatter_add_` requires an int64 index. Cross-entropy accepts uint8
-        # (Byte) targets as class ids, so cast the index copy, not the saved
-        # target used by the mask.
         gold = targets.to(torch.long).masked_fill(~valid, 0).unsqueeze(-1)
         keep = valid.unsqueeze(-1).to(logits.dtype)
         neg_keep = keep.neg()
@@ -270,19 +277,27 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             probs.scatter_add_(-1, gold[start:end], neg_keep[start:end])
         return (grad_logits, None, None, None)
 
-def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int=-100, chunk_rows: Optional[int]=None) -> torch.Tensor:
-    # `F.cross_entropy` accepts logits of shape (..., V) with matching target
-    # shape (...,). The chunked node slices the leading dimension, so flatten
-    # the leading dims first; otherwise a valid 3-D call is sliced on dim 0
-    # but its targets are not, and nll_loss sees mismatched shapes.
+def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor,
+                       ignore_index: int = -100,
+                       chunk_rows: Optional[int] = None) -> torch.Tensor:
+    """Chunked cross-entropy mean loss.
+
+    Uses ``_ChunkedCrossEntropy`` when the whole block exceeds
+    ``_CROSS_ENTROPY_FAST_PATH_BYTES``; otherwise uses ``F.cross_entropy``.
+
+    Args:
+        logits: logits of shape ``(..., V)``.
+        targets: target labels matching logits shape ``(...,)``.
+        ignore_index: value to ignore in loss computation.
+        chunk_rows: number of rows per chunk; defaults to auto-computed.
+
+    Returns:
+        Scalar mean loss (zero for empty batches when all targets ignored).
+    """
     if logits.dim() > 2:
         logits = logits.reshape(-1, logits.size(-1))
         targets = targets.reshape(-1)
     elif logits.dim() == 1:
-        # `F.cross_entropy` accepts a single (V,) logit vector with a scalar
-        # target. The chunked node slices the leading dimension and passes the
-        # target slice to `nll_loss`, so normalize that documented form to one
-        # explicit row instead of slicing a 0-dim target (IndexError).
         logits = logits.unsqueeze(0)
         targets = targets.reshape(-1)
     if targets.dim() != 1:
@@ -294,8 +309,6 @@ def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor, ignore_index
     if chunk_rows is None:
         chunk_rows = _cross_entropy_chunk_rows(logits.size(-1))
     if logits.size(0) == 0:
-        # An empty block has no tokens to average, but a NaN loss would still
-        # poison an otherwise valid training step.
         return logits.sum() * 0.0
     return _ChunkedCrossEntropy.apply(logits, targets, int(ignore_index), int(chunk_rows))
 

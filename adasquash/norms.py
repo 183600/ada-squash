@@ -1,20 +1,23 @@
 """Statistic-free adaptive squashing normalization layers.
 
-Three families live here:
+This module implements the DyT++ normalization family:
 
-* the statistic-based baselines (``LayerNorm``, ``RMSNorm``);
-* the generalized-softsign family - ``DyT`` / ``DyT-S`` / ``DyT-P`` /
-  ``DyT-C`` and the depth-conditioned ``DyT-D`` / ``DyT-CD`` variants;
-* the attention-logit squash ``QKSquash``.
+* **Statistic-based baselines**: ``LayerNorm``, ``RMSNorm``
+* **Generalized-softsign family**: scalar/per-channel α with softsign
+  - ``DyT`` / ``DyT-S`` (scalar α)
+  - ``DyT-P`` (per-channel α under tanh)
+  - ``DyT-C`` (per-channel α with generalized softsign)
+  - ``DyT-D`` / ``DyT-CD`` (depth-conditioned variants)
+* **Attention logit squashing**: ``QKSquash``
 
-Every squash is a hand-written ``torch.autograd.Function``: the forward is
-closed-form and the backward recomputes the intermediates it needs. The
-layers are reached through :func:`build_norm` and :data:`NORM_REGISTRY`;
-:func:`generalized_softsign` is the public entry point of the core math.
+All operations are hand-written ``torch.autograd.Function`` subclasses:
+the forward pass uses closed-form expressions; the backward recomputes
+needed intermediates. Access via :func:`build_norm`, :data:`NORM_REGISTRY`,
+and :func:`generalized_softsign`.
 
-The numerical-stability floors (``_MIN_P``, ``_MIN_ALPHA``) and the
-reciprocal-on-``max(|x|, 1)`` formulation of the softsign core are fixed
-design decisions - see ``docs/design_notes.md``.
+Numerical stability floors (``_MIN_P``, ``_MIN_ALPHA``) and the
+``reciprocal-on-max(|x|, 1)`` softsign formulation are fixed design decisions.
+See ``docs/design_notes.md`` (D2, D3).
 """
 from __future__ import annotations
 
@@ -111,21 +114,29 @@ def _chunked_product_sum(a2: torch.Tensor, b2: torch.Tensor, step: int, acc_dtyp
 def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Element-wise product of ``a`` and ``b``, with contour reduction.
 
-    For 1-D tensors returns ``a * b`` directly.  For 2-D contiguous tensors
-    with total size <= ``_REDUCE_CHUNK_ELEMS`` a single ``sum(dim=0)`` is used.
-    Larger or non-contiguous tensors take chunked or per-row reduction paths.
+    Returns ``sum(a * b, dim=0..n-1)`` for ``n``-D input tensors.
+    For 1-D tensors returns ``a * b`` directly. For larger inputs, uses
+    chunked computation to stay within memory bounds.
     """
     if a.ndim <= 1:
         return a * b
     if a.shape[-1] == 0:
         return a.new_zeros(a.shape[-1])
-    if a.ndim == 2 and a.is_contiguous() and b.is_contiguous() and a.numel() <= _REDUCE_CHUNK_ELEMS:
-        # Larger shapes take the chunked branches below.
+    return _chunked_reduce_product(a, b, _REDUCE_CHUNK_ELEMS)
+
+
+def _chunked_reduce_product(a: torch.Tensor, b: torch.Tensor, chunk_elems: int) -> torch.Tensor:
+    """Chunked product-sum reduction for memory-efficient accumulation.
+
+    Handles contiguous and non-contiguous inputs, using float32 accumulation
+    for bfloat16/float16 inputs to avoid overflow in the reduction.
+    """
+    if a.ndim == 2 and a.is_contiguous() and b.is_contiguous() and a.numel() <= chunk_elems:
         acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
         return (a * b).sum(dim=0, dtype=acc).to(a.dtype)
     if a.is_contiguous() and b.is_contiguous():
         rows = a.numel() // a.shape[-1]
-        step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
+        step = max(1, chunk_elems // max(1, a.shape[-1]))
         if rows <= step:
             return _sum_leading_dims(a * b)
         acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
@@ -133,15 +144,13 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if total.dtype != a.dtype:
             total = total.to(a.dtype)
         return total
-    if a.numel() > _REDUCE_CHUNK_ELEMS:
-        rows = a.numel() // a.shape[-1]
-        step = max(1, _REDUCE_CHUNK_ELEMS // max(1, a.shape[-1]))
-        acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
-        total = _chunked_product_sum(a.reshape(rows, -1), b.reshape(rows, -1), step, acc_dtype)
-        if total.dtype != a.dtype:
-            total = total.to(a.dtype)
-        return total
-    return _sum_leading_dims(a * b)
+    rows = a.numel() // a.shape[-1]
+    step = max(1, chunk_elems // max(1, a.shape[-1]))
+    acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
+    total = _chunked_product_sum(a.reshape(rows, -1), b.reshape(rows, -1), step, acc_dtype)
+    if total.dtype != a.dtype:
+        total = total.to(a.dtype)
+    return total
 
 def _effective_decay_rate(k, k_min):
     """Depth-decay rate, optionally floored at ``k_min``.
@@ -384,30 +393,24 @@ def _grad_beta(beta, grad_out, need_beta: bool):
 
 
 def _tanh_squash_forward(x: torch.Tensor, alpha, gamma: torch.Tensor, beta) -> torch.Tensor:
-    """``gamma * tanh(alpha * x) (+ beta)`` as one fused step.
+    """Apply ``gamma * tanh(alpha * x) (+ beta)`` as a fused operation.
 
     The forward applies ``alpha * x``, then ``tanh`` in-place, then scales
-    by ``gamma`` and optionally adds ``beta``, all within a single autograd
-    node so intermediates are recomputed in the backward.
+    by ``gamma`` and optionally adds ``beta`` within a single autograd node.
     """
     return _apply_affine(x.mul(alpha).tanh_(), gamma, beta)
 
 
 def _tanh_squash_backward(x: torch.Tensor, alpha, gamma: torch.Tensor,
                           grad_out: torch.Tensor, need_gamma: bool):
-    """Backward core for ``tanh(alpha * x)`` squash: cotangent scaled by ``gamma``.
+    """Backward pass for ``tanh(alpha * x)`` squash.
 
-    The forward is ``alpha * x`` then ``tanh``; the backward reuses the saved
-    ``phi = tanh(alpha * x)`` to compute:
+    Uses the forward's ``phi = tanh(alpha * x)`` to compute:
+    - ``w = phi * grad_out`` (cotangent of squashed output)
+    - ``grad_gamma = sum(w)`` if requested
+    - ``grad_alpha`` from ``w * x`` (scalar or per-channel reduction)
+    - Input gradient: ``w * alpha``
 
-    - ``w = gamma * grad_out * phi``  (cotangent of the squashed output)
-    - ``grad_gamma = sum(w)`` if the gamma gradient is requested
-    - ``grad_alpha`` is obtained by reducing ``w * x`` (scalar or per-channel)
-    - The input gradient is ``w`` (already scaled by ``alpha`` after the mul below)
-
-    Here the cotangent ``w`` is first multiplied by ``phi`` (the tanh
-    derivative), then ``grad_out`` is subtracted in-place and ``gamma`` is
-    applied.
     """
     phi = x.mul(alpha).tanh_()
     w = phi * grad_out
@@ -573,7 +576,9 @@ class DyTC(_SquashedAffine):
     learnable scalar exponent unless ``learnable_p=False`` freezes it.
     """
 
-    def __init__(self, dim: int, alpha_init: float=0.5, p_init: float=2.0, learnable_p: bool=True, beta: bool=True, alpha_jitter: float=0.05):
+    def __init__(self, dim: int, alpha_init: float = 0.5, p_init: float = 2.0,
+                 learnable_p: bool = True, beta: bool = True,
+                 alpha_jitter: float = 0.05):
         super().__init__()
         alpha = torch.full((dim,), float(alpha_init))
         if alpha_jitter > 0:
@@ -637,14 +642,16 @@ class _DyTCForward(torch.autograd.Function):
 
 @register_norm("dytd")
 class DyTD(_SquashedAffine):
+    """Depth-conditioned tanh norm: ``gamma * tanh(alpha_l * x) (+ beta)``.
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, k_min: Optional[float]=0.0):
+    The depth schedule ``alpha_l = alpha_0 * exp(-k * l / L)`` is evaluated
+    per layer, allowing deeper layers to start with smaller squash factors.
+    """
+
+    def __init__(self, dim: int, layer_idx: int = 0, num_layers: int = 12,
+                 alpha_0: float = 0.9, k_init: float = 1.0, learnable_k: bool = True,
+                 beta: bool = True, k_min: Optional[float] = 0.0):
         super().__init__()
-        # Depth-decay rate floor. ``None`` restores the old unconstrained
-        # behaviour (k may go negative and alpha_l then *grows* with depth);
-        # the default 0.0 keeps the schedule non-increasing in depth, so the
-        # "depth-conditioned" claim holds not only at init but for every
-        # point the optimizer visits.
         _init_depth_schedule(self, layer_idx, num_layers, alpha_0, k_init,
                              learnable_k, k_min)
         self.gamma = nn.Parameter(torch.ones(dim))
@@ -694,18 +701,19 @@ class _DyTDForward(torch.autograd.Function):
 
 @register_norm("dytd_tanh")
 class DyTDTanh(_SquashedAffine):
-    """Ablation-only comparator: DyT-D with `tanh` (plain autograd).
+    """Ablation control: DyT-D with plain autograd tanh (not fused kernel).
 
-    Same depth schedule as `DyTD` (`alpha_l = alpha_0 * exp(-k * l/L)`),
-    same `gamma`/`beta`, same LayerScale residual (it lives in `Block`):
-    the only change is using plain autograd `tanh` instead of the fused
-    `_DyTDForward` kernel. This is a control for the factorial design,
-    not part of the research core.
+    Same depth schedule as ``DyTD`` (``alpha_l = alpha_0 * exp(-k * l/L)``),
+    same ``gamma``/``beta``, same LayerScale residual. The only difference is
+    using plain autograd ``tanh`` instead of the fused ``_DyTDForward`` kernel.
 
-    Frozen `k` is supported via `learnable_k=False` (registers a buffer).
+    This is a factorial design control, not part of the research core.
+    Frozen ``k`` via ``learnable_k=False`` registers a buffer.
     """
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, k_min: Optional[float]=0.0):
+    def __init__(self, dim: int, layer_idx: int = 0, num_layers: int = 12,
+                 alpha_0: float = 0.9, k_init: float = 1.0, learnable_k: bool = True,
+                 beta: bool = True, k_min: Optional[float] = 0.0):
         super().__init__()
         _init_depth_schedule(self, layer_idx, num_layers, alpha_0, k_init,
                              learnable_k, k_min)
@@ -721,15 +729,13 @@ class DyTDTanh(_SquashedAffine):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi = torch.tanh(self.alpha_l * x)
-        if self.beta is not None:
-            return phi * self.gamma + self.beta
-        return phi * self.gamma
+        return phi * self.gamma if self.beta is None else phi * self.gamma + self.beta
 
 @register_norm("dyt")
 class DyT(_SquashedAffine):
-    """The original DyT: ``gamma * tanh(alpha * x) (+ beta)`` with a scalar alpha."""
+    """Original DyT: ``gamma * tanh(alpha * x) (+ beta)`` with scalar alpha."""
 
-    def __init__(self, dim: int, alpha_init: float=0.6, beta: bool=True):
+    def __init__(self, dim: int, alpha_init: float = 0.6, beta: bool = True):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
         self.gamma = nn.Parameter(torch.ones(dim))
@@ -740,9 +746,9 @@ class DyT(_SquashedAffine):
 
 
 class _DyTForward(torch.autograd.Function):
-    """The scalar-alpha tanh norm as one autograd node.
+    """Scalar-alpha tanh norm as an autograd node.
 
-    The backward recomputes the squashed output from ``x`` and ``alpha``.
+    Backward recomputes the squashed output from ``x`` and ``alpha``.
     """
 
     @staticmethod
@@ -763,25 +769,22 @@ class _DyTForward(torch.autograd.Function):
 
 @register_norm("dytcd")
 class DyTCD(_SquashedAffine):
+    """Main proposal: per-channel α scaled by depth-conditioned schedule, softsign activation.
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, p_init: float=2.0, learnable_p: bool=True, beta: bool=True, learnable_delta: bool=True, k_min: Optional[float]=0.0):
+    ``alpha_c = alpha_0 * exp(-k * l / L) * (1 + delta)``, floored at ``_MIN_ALPHA``.
+    Uses generalized softsign with learnable ``p``, floored at ``_MIN_P``.
+    """
+
+    def __init__(self, dim: int, layer_idx: int = 0, num_layers: int = 12,
+                 alpha_0: float = 0.9, k_init: float = 1.0, learnable_k: bool = True,
+                 p_init: float = 2.0, learnable_p: bool = True, beta: bool = True,
+                 learnable_delta: bool = True, k_min: Optional[float] = 0.0):
         super().__init__()
         _init_depth_schedule(self, layer_idx, num_layers, alpha_0, k_init,
                              learnable_k, k_min)
-        if learnable_delta:
-            self.delta = nn.Parameter(torch.zeros(dim))
-        else:
-            # Per-channel axis off for the controlled ablation: `delta` is a
-            # zero buffer rather than a parameter, so `alpha_c == alpha_l`
-            # exactly. The kernel is untouched - it only sees `delta.requires_
-            # grad == False` and returns no gradient for it - which keeps the
-            # depth schedule, the softsign activation and LayerScale identical
-            # to the full model. (Frozen `k` / `p` already use this pattern.)
-            self.register_buffer("delta", torch.zeros(dim))
-        if learnable_p:
-            self.p = nn.Parameter(torch.tensor(float(p_init)))
-        else:
-            self.register_buffer("p", torch.tensor(float(p_init)))
+        self.delta = nn.Parameter(torch.zeros(dim)) if learnable_delta else nn.Parameter(
+            torch.zeros(dim), requires_grad=False)
+        self.p = nn.Parameter(torch.tensor(float(p_init))) if learnable_p else float(p_init)
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
@@ -794,7 +797,9 @@ class DyTCD(_SquashedAffine):
         return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _DyTCDForward.apply(x, self.alpha_0, self._k_effective(), self.delta, self.p, self.gamma, self.beta, self._depth_ratio)
+        return _DyTCDForward.apply(x, self.alpha_0, self._k_effective(),
+                                   self.delta, self.p, self.gamma,
+                                   self.beta, self._depth_ratio)
 
 class _DyTCDForward(torch.autograd.Function):
     """The main proposal (per-channel x depth-conditioned softsign) as one
@@ -868,29 +873,22 @@ class _DyTCDForward(torch.autograd.Function):
 
 @register_norm("dytcd_tanh")
 class DyTCDTanh(_SquashedAffine):
-    """Ablation-only comparator: DyT-CD with `tanh` instead of the softsign family.
+    """Ablation control: DyT-CD with tanh instead of softsign (plain autograd).
 
-    Same per-channel x depth alpha as `DyTCD` (`alpha_c,l = alpha_0 *
-    exp(-k*l/L) * (1 + delta)`, clamped at `_MIN_ALPHA`), same `gamma`/`beta`,
-    same LayerScale residual (it lives in `Block`): the only change is the
-    squash. This is what makes the activation family (generalized softsign vs
-    tanh) a leave-one-out axis of the main proposal - the `dytd_full`
-    reference cannot isolate it because it also removes the per-channel
-    factor.
-
-    `tanh` primitives are only used here; the fused-kernel family above stays
-    untouched. Like `LayerNorm`, this comparator is plain autograd (it is a
-    control, not part of the research core), so its gradients are torch's own.
+    Same per-channel α by depth schedule as ``DyTCD``, same ``gamma``/``beta``,
+    same LayerScale residual. The only difference is the activation function.
+    Like ``LayerNorm``, this is a plain-autograd control, not part of the research
+    core, so gradients use PyTorch's autograd.
     """
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, learnable_k: bool=True, beta: bool=True, learnable_delta: bool=True, k_min: Optional[float]=0.0):
+    def __init__(self, dim: int, layer_idx: int = 0, num_layers: int = 12,
+                 alpha_0: float = 0.9, k_init: float = 1.0, learnable_k: bool = True,
+                 beta: bool = True, learnable_delta: bool = True, k_min: Optional[float] = 0.0):
         super().__init__()
         _init_depth_schedule(self, layer_idx, num_layers, alpha_0, k_init,
                              learnable_k, k_min)
-        if learnable_delta:
-            self.delta = nn.Parameter(torch.zeros(dim))
-        else:
-            self.register_buffer("delta", torch.zeros(dim))
+        self.delta = nn.Parameter(torch.zeros(dim)) if learnable_delta else nn.Parameter(
+            torch.zeros(dim), requires_grad=False)
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
@@ -904,20 +902,18 @@ class DyTCDTanh(_SquashedAffine):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi = torch.tanh(self.alpha_per_channel * x)
-        if self.beta is not None:
-            return phi * self.gamma + self.beta
-        return phi * self.gamma
+        return phi * self.gamma if self.beta is None else phi * self.gamma + self.beta
 @register_norm("dyts")
 class DyTS(_SquashedAffine):
-    """Scalar-alpha generalized softsign: the missing cell of the
-    {scalar, per-channel} x {tanh, softsign} factorial.
+    """Scalar-alpha generalized softsign, completing the factorial design.
 
-    Identical to DyTC except alpha is a single scalar, so ``dyt -> dyts``
-    isolates the activation family and ``dyts -> dytc`` isolates the
-    per-channel axis (single-variable contrasts the old matrix mixed).
+    Identical to ``DyTC`` except alpha is a scalar. This isolates the
+    activation family (tanh vs softsign) from the per-channel axis for
+    single-variable contrasts in the ablation matrix.
     """
 
-    def __init__(self, dim: int, alpha_init: float=0.5, p_init: float=2.0, learnable_p: bool=True, beta: bool=True):
+    def __init__(self, dim: int, alpha_init: float = 0.5, p_init: float = 2.0,
+                 learnable_p: bool = True, beta: bool = True):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
         self.p = nn.Parameter(torch.tensor(float(p_init))) if learnable_p else float(p_init)
@@ -927,9 +923,13 @@ class DyTS(_SquashedAffine):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _DyTSForward.apply(x, self.alpha, self.p, self.gamma, self.beta)
 
+
 class _DyTSForward(torch.autograd.Function):
-    """DyTS forward: same math as _DyTCForward but with a scalar alpha, so
-    the alpha gradient is a full reduction (_dot_all) instead of per-channel."""
+    """Scalar-alpha generalized softsign kernel.
+
+    Uses ``log2/exp2`` form for both frozen and learnable ``p`` since scalar
+    exponent representations round differently.
+    """
 
     @staticmethod
     def forward(ctx, x, alpha, p, gamma, beta):
@@ -978,14 +978,13 @@ class _DyTSForward(torch.autograd.Function):
 
 @register_norm("dytp")
 class DyTP(_SquashedAffine):
-    """Per-channel-alpha tanh: the other missing cell of the
-    {scalar, per-channel} x {tanh, softsign} factorial.
+    """Per-channel-alpha tanh, completing the factorial design.
 
-    Identical to DyT except alpha is a per-channel vector, so ``dyt -> dytp``
-    isolates the per-channel axis under the *tanh* family.
+    Identical to ``DyT`` except alpha is per-channel. This isolates the
+    per-channel axis under the tanh activation family.
     """
 
-    def __init__(self, dim: int, alpha_init: float=0.5, beta: bool=True, alpha_jitter: float=0.0):
+    def __init__(self, dim: int, alpha_init: float = 0.5, beta: bool = True, alpha_jitter: float = 0.0):
         super().__init__()
         alpha = torch.full((dim,), float(alpha_init))
         if alpha_jitter > 0:
@@ -997,9 +996,12 @@ class DyTP(_SquashedAffine):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _DyTPForward.apply(x, self.alpha, self.gamma, self.beta)
 
+
 class _DyTPForward(torch.autograd.Function):
-    """DyTP forward: same math as _DyTForward but with a per-channel alpha,
-    so the alpha gradient is a per-channel reduction (_reduce_products)."""
+    """Per-channel-alpha tanh kernel.
+
+    The alpha gradient is computed via per-channel reduction.
+    """
 
     @staticmethod
     def forward(ctx, x, alpha, gamma, beta):
@@ -1018,42 +1020,43 @@ class _DyTPForward(torch.autograd.Function):
 
 @register_norm("dytdi")
 class DyTDI(DyT):
-    """Depth-*init* control for DyT-D: a plain DyT whose scalar alpha is
-    *initialized* at the DyT-D schedule value alpha_0 * exp(-k l / L) and
-    then learned freely, with no (alpha_0, k) reparameterization.
+    """Depth-init control for DyT-D: DyT with α initialized at the depth schedule.
 
-    Against ``dytd`` this isolates "depth prior at init + plain
-    parameterization" from "depth-decay reparameterization": if dytd wins
-    only via a better-conditioned init, dytdi matches it.
+    The scalar alpha starts at ``alpha_0 * exp(-k * l / L)`` and is then
+    learned freely with no reparameterization. Against ``DyTD``, this isolates
+    the depth-decay reparameterization from the initialization prior.
     """
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, beta: bool=True):
+    def __init__(self, dim: int, layer_idx: int = 0, num_layers: int = 12,
+                 alpha_0: float = 0.9, k_init: float = 1.0, beta: bool = True):
         ratio = float(layer_idx) / float(max(1, num_layers))
-        super().__init__(dim, alpha_init=float(alpha_0) * math.exp(-float(k_init) * ratio), beta=beta)
+        super().__init__(dim, alpha_init=float(alpha_0) * math.exp(-float(k_init) * ratio),
+                         beta=beta)
+
 
 @register_norm("dytcdi")
 class DyTCDI(DyTC):
-    """Depth-*init* control for DyT-CD: DyT-C (per-channel alpha, generalized
-    softsign, learnable p) whose per-channel alpha is *initialized* at the
-    DyT-CD schedule value alpha_0 * exp(-k l / L) (delta = 0) and then
-    learned freely.
+    """Depth-init control for DyT-CD: DyT-C with α initialized at the depth schedule.
 
-    Against ``dytcd`` this isolates the depth-decay reparameterization from
-    the depth prior at init, activation family and per-channel axis held
-    fixed.
+    The per-channel alpha starts at ``alpha_0 * exp(-k * l / L)`` (delta=0)
+    and is then learned freely. Against ``DyTCD``, this isolates the
+    depth-decay reparameterization from the initialization prior, with
+    activation family and per-channel axis held fixed.
     """
 
-    def __init__(self, dim: int, layer_idx: int=0, num_layers: int=12, alpha_0: float=0.9, k_init: float=1.0, p_init: float=2.0, learnable_p: bool=True, beta: bool=True):
+    def __init__(self, dim: int, layer_idx: int = 0, num_layers: int = 12,
+                 alpha_0: float = 0.9, k_init: float = 1.0, p_init: float = 2.0,
+                 learnable_p: bool = True, beta: bool = True):
         ratio = float(layer_idx) / float(max(1, num_layers))
-        super().__init__(dim, alpha_init=float(alpha_0) * math.exp(-float(k_init) * ratio), p_init=p_init, learnable_p=learnable_p, beta=beta, alpha_jitter=0.0)
+        super().__init__(dim, alpha_init=float(alpha_0) * math.exp(-float(k_init) * ratio),
+                         p_init=p_init, learnable_p=learnable_p, beta=beta, alpha_jitter=0.0)
 
 class _QKSquashTanh(torch.autograd.Function):
-    """tanh(alpha * Q) and tanh(alpha * K) as one autograd node.
+    """Apply ``tanh(alpha * Q)`` and ``tanh(alpha * K)`` as a fused kernel.
 
-    Same closed form as ``torch.tanh(q * alpha_q)`` (D4): the backward
-    re-derives the squashed output from the raw Q/K, so the node returns both
-    the per-tensor values and the alpha_q / alpha_k gradients while keeping
-    the public tanh semantics.
+    The forward uses closed-form ``tanh``; backward recomputes the squashed
+    output and gradients. This implements design decision D4: tanh bounds
+    elements to [-1, 1], capping logits independently of input magnitude.
     """
 
     @staticmethod
@@ -1087,13 +1090,22 @@ class _QKSquashTanh(torch.autograd.Function):
                 grad_ko, k, alpha_k, need_k, need_ak)
         return (grad_q, grad_k, grad_alpha_q, grad_alpha_k)
 
-class QKSquash(nn.Module):
 
-    def __init__(self, alpha_q_init: float=1.0, alpha_k_init: float=1.0):
+class QKSquash(nn.Module):
+    """Q/K logit squashing layer with learnable per-tensor alphas.
+
+    Implements D4: applies ``tanh(alpha * x)`` to keep logits bounded.
+    """
+
+    def __init__(self, alpha_q_init: float = 1.0, alpha_k_init: float = 1.0):
         super().__init__()
         self.alpha_q = nn.Parameter(torch.tensor(float(alpha_q_init)))
         self.alpha_k = nn.Parameter(torch.tensor(float(alpha_k_init)))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
         return _QKSquashTanh.apply(q, k, self.alpha_q, self.alpha_k)
-__all__ = ["NORM_REGISTRY", "DyT", "DyTC", "DyTCD", "DyTCDI", "DyTCDTanh", "DyTD", "DyTDI", "DyTDTanh", "DyTP", "DyTS", "LayerNorm", "QKSquash", "RMSNorm", "build_norm", "generalized_softsign", "register_norm"]
+
+
+__all__ = ["NORM_REGISTRY", "DyT", "DyTC", "DyTCD", "DyTCDI", "DyTCDTanh",
+           "DyTD", "DyTDI", "DyTDTanh", "DyTP", "DyTS", "LayerNorm", "QKSquash",
+           "RMSNorm", "build_norm", "generalized_softsign", "register_norm"]

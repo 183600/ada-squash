@@ -4,25 +4,25 @@
 
 > Adaptive Squashing without Statistics for Ultra-Deep and Low-Precision Transformers
 
-This repository is the experimental codebase for the DyT++ proposal: a family of
-*statistic-free* normalization layers that generalize
-Dynamic Tanh (DyT, Zhu et al. 2025) along three orthogonal axes:
+This repository implements DyT++: a family of **statistic-free** normalization
+layers that generalize Dynamic Tanh (DyT, Zhu et al. 2025) along three orthogonal axes.
 
-| Variant | Axis | What it adds | Targets |
-|--------|------|---------------|---------|
-| **DyT-S**  | activation family         | scalar α + generalized softsign (the {scalar × softsign} cell) | saturation profile vs tanh |
-| **DyT-P**  | per-channel (tanh)        | per-channel α under tanh (the {per-channel × tanh} cell) | isolates the per-channel axis from the family swap |
-| **DyT-C**  | per-channel + softsign    | per-channel α + generalized softsign | outlier-heavy channels (LLaMA "super-active" dims) |
-| **DyT-D**  | depth-conditioned         | depth-decaying α + LayerScale residual | the "curse of depth" in Pre-LN Transformers |
-| **DyT-CD** | both (the main proposal)  | DyT-C + DyT-D combined                     | ultra-deep, MoE, FP8 |
-| **DyT-QK** | attention logits (Variant C) | scalar squashing of Q/K before dot product | long-context logit explosion |
+| Variant   | Axis              | What it adds                                            | Targets                                              |
+|-----------|-------------------|--------------------------------------------------------|------------------------------------------------------|
+| **DyT-S** | activation family | scalar α + generalized softsign                       | saturation profile vs tanh                         |
+| **DyT-P** | per-channel (tanh)| per-channel α under tanh                               | isolates the per-channel axis from the family swap  |
+| **DyT-C** | per-channel + softsign | per-channel α + generalized softsign                  | outlier-heavy channels (LLaMA "super-active" dims)   |
+| **DyT-D** | depth-conditioned | depth-decaying α + LayerScale residual                 | Pre-LN "curse of depth" in Transformers              |
+| **DyT-CD**| both (main)       | DyT-C + DyT-D                                          | ultra-deep, MoE, FP8                                 |
+| **DyT-QK**| attention logits  | scalar squashing of Q/K before dot product             | long-context logit explosion                       |
 
-The core hypothesis is that statistic-free, element-wise adaptive squashing
-can replace statistic-based normalization with **<0.1% additional parameters**.
-For the QK variant the more precise formulation is: *element-wise saturation
-versus vector normalization — which better handles outlier channels and
-attention expressivity at a matched effective logit scale?* Both approaches
-bound logits identically; see the DyT-QK section.
+**Core hypothesis**: statistic-free, element-wise adaptive squashing can replace
+statistic-based normalization with **<0.1% additional parameters**.
+
+The `norm_name` values used by configs and scripts are `ln`, `rmsnorm`,
+`dyt`, `dyts`, `dytp`, `dytc`, `dytd`, `dytdi`, `dytcd`, `dytcdi`, and
+`dytd_tanh`/`dytcd_tanh` (ablation controls). QK squashing is selected via
+`qk_norm: dytqk`.
 
 The ``norm_name`` values used by configs and scripts are ``ln``, ``rmsnorm``,
 ``dyt``, ``dyts``, ``dytp``, ``dytc``, ``dytd``, ``dytcd``, and their
@@ -47,30 +47,30 @@ controlled ablation variants. QK squashing is selected separately through
 ```
 ada-squash/
 ├── adasquash/        # importable package
-│   ├── norms.py        # LayerNorm, RMSNorm, DyT(-S/-P/-C/-D/-CD/-DI), QKSquash
-│   ├── attention.py    # CausalSelfAttention with optional QK-squashing and RoPE
-│   ├── model.py        # GPT-style decoder, fused losses, configurable depth
-│   ├── utils.py        # ActivationStats, KurtosisMeter, LossSpikeCounter, ...
-│   ├── diagnostics.py  # train/val curve diagnosis and NaN/Inf triage
-│   ├── efficiency.py   # parameter/FLOP accounting and efficiency verdicts
-│   ├── repro.py        # seeds, run manifests, execution identity
-│   ├── design.py       # run schedules, exclusion policy, prospective power
-│   ├── decontamination.py  # benchmark n-gram scans and contamination bounds
-│   ├── metrics*.py     # hypothesis tests, meta-analysis, classification metrics
-│   └── ablation/       # matrix, runner, contrasts, analysis and CLI
+│   ├── norms.py          # LayerNorm, RMSNorm, DyT variants, QKSquash
+│   ├── attention.py      # SDPA baseline + QK-squashing + RoPE (D1, D4, D6)
+│   ├── model.py          # GPT, fused losses, SwiGLU (D3)
+│   ├── utils.py          # ActivationStats, KurtosisMeter, LossSpikeCounter
+│   ├── diagnostics.py    # train/val curve diagnosis, NaN/Inf triage
+│   ├── efficiency.py   # parameter/FLOP accounting
+│   ├── repro.py          # seeds, run manifests, execution identity
+│   ├── design.py         # run schedules, exclusion policy, power plans
+│   ├── decontamination.py # benchmark n-gram scans
+│   ├── metrics*.py       # hypothesis tests, meta-analysis
+│   └── ablation/         # matrix, runner, contrasts, analysis
 ├── scripts/           # CLI entrypoints
-│   ├── train_gpt2.py             # Phase 1 driver (GPT-2 124M, FineWeb-Edu, held-out val)
-│   ├── train_llama_depth_sweep.py# Phase 2 depth sweep (12/24/48/96, incl. the dytdi control)
-│   ├── eval_downstream.py       # lm-eval harness (custom LM wrapper), needle
-│   ├── ablation.py              # single-variable ablation matrix runner, multi-seed
-│   ├── train_moe_tiny.py        # Phase 3a: tiny MoE expert-variance study
-│   ├── check_fp8_stability.py   # Phase 3b: simulated FP8 overflow / underflow (scoped)
-│   ├── check_w8a8_ppl.py       # Phase 3c: post-training W8A8 PPL drop (held-out)
-│   └── run_needle.py            # Phase 3d: needle-in-a-haystack sweep (per-position)
-├── tests/             # full pytest suite: kernels, methods, design, decontamination
-├── configs/           # YAML configs (see configs/)
-├── docs/design_notes.md  # fixed design decisions D1-D6 and quality gate
-├── ci_gate.py         # syntax + design-pin + full-pytest gate
+│   ├── train_gpt2.py             # Phase 1 driver
+│   ├── train_llama_depth_sweep.py # Phase 2 depth sweep
+│   ├── eval_downstream.py        # lm-eval harness
+│   ├── ablation.py                 # ablation matrix runner
+│   ├── train_moe_tiny.py           # Phase 3a: MoE study
+│   ├── check_fp8_stability.py      # Phase 3b: FP8 stability
+│   ├── check_w8a8_ppl.py           # Phase 3c: W8A8 PPL drop
+│   └── run_needle.py               # Phase 3d: needle sweep
+├── tests/             # full pytest suite
+├── configs/           # YAML configurations
+├── docs/design_notes.md
+├── ci_gate.py
 ├── requirements.txt
 └── README.md
 ```
@@ -106,17 +106,17 @@ authoritative check.
 
 ### Design gate
 
-The fixed design decisions are listed in
-[`docs/design_notes.md`](docs/design_notes.md). Before trusting a change to
-the kernels or the model, run the same gate used by CI:
+The fixed design decisions D1-D6 are documented in
+[`docs/design_notes.md`](docs/design_notes.md). Before modifying kernels
+or the model, run the same gate used by CI:
 
 ```bash
 python3 ci_gate.py
 ```
 
-It parses every Python file, checks the `【固定】` design pins D1–D6 against
-the source, and then runs the full `tests/` suite. `--syntax-only` runs just
-the parser layer.
+It parses every Python file, verifies the 【固定】 design pins D1-D6 against
+the source, then runs the full `tests/` suite. `--syntax-only` runs just the
+parser layer.
 
 ### Use the package directly
 
