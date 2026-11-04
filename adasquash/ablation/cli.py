@@ -7,8 +7,10 @@ import os
 import sys
 from pathlib import Path
 
+from adasquash.costing import plan_runs_from_matrix, study_budget_plan
 from adasquash.design import (
     design_readiness_audit,
+    factorial_power_plan,
     normalize_exclusion_policy,
     paired_sd_evidence_audit,
     randomized_complete_block_schedule,
@@ -128,6 +130,13 @@ def build_arg_parser(argv=None):
     p.add_argument("--paired-sd-evidence", default=None, help="pilot calibration JSON from scripts/calibrate_paired_sd.py; when --assumed-paired-sd is omitted the conservative upper confidence bound is used, the calibration fingerprint is frozen in analysis_plan.json, and pilot/confirmatory seed overlap fails the readiness audit")
     p.add_argument("--require-variance-evidence", action="store_true", help="fail before training unless --paired-sd-evidence supplies a pilot-based planning SD (the planning variance otherwise has no provenance)")
     p.add_argument("--expected-attrition", type=float, default=0.0, help="pre-run expected fraction of planned runs lost to pre-specified protocol failures; a complete pair needs both arms, so the readiness audit plans for n*(1-attrition)^2 analyzable pairs and freezes this assumption in analysis_plan.json")
+    p.add_argument("--interaction-margin", type=float, default=0.0, help="smallest interaction (deviation from additivity) the factorial designs must be able to detect, on the interaction scale; an interaction is a different contrast than an arm-vs-arm comparison, so it is planned separately and frozen in analysis_plan.json")
+    p.add_argument("--interaction-equivalence-margin", type=float, default=0.0, help="bound inside which an interaction is declared zero (the 'the axes are orthogonal' claim); planned with the TOST power calculation, because a non-significant interaction test cannot certify orthogonality")
+    p.add_argument("--target-power", type=float, default=0.8, help="target power of the planned confirmatory contrasts; used by the readiness audit and by the interaction and budget plans")
+    p.add_argument("--primary-arms", nargs="+", default=None, help="rows that carry the primary claim; the budget plan keeps them when the compute budget forces a trade-off between breadth and replication (default: every selected row)")
+    p.add_argument("--compute-budget-hours", type=float, default=None, help="wall-clock budget available for the study; the pre-flight cost plan reports whether the matrix fits and which allocation (breadth vs replication) still fits")
+    p.add_argument("--throughput-tokens-per-second", type=float, default=None, help="measured throughput of the target device, used to convert the planned token count into wall-clock hours; without it the cost plan reports tokens only and cannot check the budget")
+    p.add_argument("--require-compute-budget", action="store_true", help="fail before training when the planned matrix does not fit --compute-budget-hours, or when the cost cannot be estimated at all")
     p.add_argument("--sequential-looks", type=int, default=0, help="freeze a group-sequential monitoring plan with this many interim looks over the planned seeds (0 = off); looking after every run and stopping when p < alpha is optional stopping, so the look counts and spending function are part of analysis_plan.json")
     p.add_argument("--sequential-spending", choices=("obrien-fleming", "pocock"), default="obrien-fleming", help="alpha-spending function for --sequential-looks (O Brien-Fleming spends little early; Pocock is closer to equal per look)")
     p.add_argument("--require-design-ready", action="store_true", help="fail before training when the design-readiness audit has a structural failure (missing replication/hypothesis, incomplete schedule, absent control pair, or underpowered for the stated margin)")
@@ -309,6 +318,109 @@ def main():
         paired_sd_evidence=paired_sd_evidence,
         sequential_looks=args.sequential_looks,
         sequential_spending=args.sequential_spending)
+    # Prospective power is planned over the *primary* confirmatory tier, not
+    # every secondary sweep: the hierarchical gatekeeping test only pays the
+    # family-wise price on the contrasts that carry the main claim. A focused
+    # run with no primary contrast is planned as a single test.
+    n_confirmatory_tests = max(
+        1, sum(1 for entry in analysis_plan["contrasts"]
+               if entry.get("tier") == 1))
+    interaction_geometries = []
+    if matrix_report.get("factorial"):
+        interaction_geometries.append(2)
+    if matrix_report.get("three_way_factorial"):
+        interaction_geometries.append(3)
+    interaction_plans: dict[int, dict] = {}
+    if args.interaction_margin > 0.0 or args.interaction_equivalence_margin > 0.0:
+        if args.assumed_paired_sd is None:
+            print("[design] WARNING: no planning SD is available (pass "
+                  "--assumed-paired-sd or --paired-sd-evidence), so the "
+                  "interaction claims cannot be powered before the run")
+        else:
+            for geometry in (interaction_geometries or [2]):
+                try:
+                    interaction_plans[geometry] = factorial_power_plan(
+                        float(args.assumed_paired_sd), len(seeds),
+                        n_factors=geometry, term_size=2,
+                        margin=float(args.interaction_margin),
+                        alpha=float(args.alpha), power=float(args.target_power),
+                        n_tests=n_confirmatory_tests,
+                        expected_attrition=float(args.expected_attrition),
+                        equivalence_margin=float(args.interaction_equivalence_margin))
+                except ValueError as exc:
+                    p.error(f"the interaction claims cannot be planned: {exc}")
+    interaction_power_payload = None
+    if interaction_plans:
+        def _interaction_required(plan: dict) -> int:
+            required = []
+            for key in ("superiority", "equivalence"):
+                block = plan.get(key) or {}
+                value = block.get("required_planned_pairs")
+                if isinstance(value, int):
+                    required.append(value)
+            return max(required) if required else 0
+
+        worst_geometry = max(
+            interaction_plans.items(),
+            key=lambda item: _interaction_required(item[1]))[0]
+        interaction_power_payload = {
+            "geometries": {str(key): value
+                           for key, value in sorted(interaction_plans.items())},
+            "worst_geometry": worst_geometry,
+            "required_planned_pairs": _interaction_required(
+                interaction_plans[worst_geometry]),
+            "note": ("an interaction is a different contrast than an arm-vs-arm "
+                     "comparison; the plan is sized on the interaction scale"),
+        }
+    compute_budget_payload = None
+    compute_budget_report = None
+    if args.compute_budget_hours is not None:
+        tokens_per_run = (int(args.max_steps) * int(args.batch_size)
+                          * int(args.seq_len))
+        primary_arms = list(args.primary_arms) if args.primary_arms else list(canonical_rows)
+        unknown_primary = sorted(set(primary_arms) - set(canonical_rows))
+        if unknown_primary:
+            p.error(f"--primary-arms names row(s) that are not part of this "
+                    f"matrix: {unknown_primary}")
+        budget_runs = plan_runs_from_matrix(
+            canonical_rows, len(seeds), tokens_per_run,
+            primary_arms=primary_arms,
+            tokens_per_second=args.throughput_tokens_per_second)
+        compute_budget_report = study_budget_plan(
+            budget_runs, budget_hours=args.compute_budget_hours,
+            min_seeds=MIN_SEEDS_FOR_SIGNIFICANCE,
+            paired_sd=args.assumed_paired_sd, margin=args.baseline_margin,
+            alpha=args.alpha, power=args.target_power,
+            n_tests=n_confirmatory_tests,
+            expected_attrition=args.expected_attrition)
+        recommended = compute_budget_report["recommended"]
+        compute_budget_payload = {
+            "budget_hours": float(args.compute_budget_hours),
+            "tokens_per_run": tokens_per_run,
+            "planned_seeds": {arm: len(seeds) for arm in canonical_rows},
+            "recommended_allocation": {
+                "name": recommended["name"],
+                "arms": recommended["arms"],
+                "seeds": recommended["seeds"],
+            },
+            "fits_budget": compute_budget_report["fits_budget"],
+            "note": ("the measured throughput is recorded in "
+                     "compute_budget.json and kept out of the "
+                     "pre-registration fingerprint, so a re-measurement does "
+                     "not look like a changed experiment"),
+        }
+    if interaction_power_payload is not None or compute_budget_payload is not None:
+        analysis_plan = build_analysis_plan(
+            ablations, hypotheses, matrix_report, args.baselines, args.model,
+            seeds, alpha=args.alpha, margin=args.baseline_margin,
+            equivalence_margin=args.equivalence_margin,
+            run_schedule=run_schedule, exclusion_policy=exclusion_policy,
+            expected_attrition=args.expected_attrition,
+            paired_sd_evidence=paired_sd_evidence,
+            sequential_looks=args.sequential_looks,
+            sequential_spending=args.sequential_spending,
+            interaction_power=interaction_power_payload,
+            compute_budget=compute_budget_payload)
     matrix_report["analysis_plan"] = analysis_plan
     print(f"[plan] {analysis_plan['n_contrasts']} pre-registered confirmatory contrast(s) "
           f"(fingerprint {analysis_plan['fingerprint'][:12]}); every test outside this "
@@ -353,27 +465,30 @@ def main():
     expected_schedule_units = (
         [f"{name}::rep={seed}" for name in canonical_rows for seed in seeds]
         if run_schedule is not None else None)
-    # Prospective power is planned over the *primary* confirmatory tier, not
-    # every secondary sweep: the hierarchical gatekeeping test only pays the
-    # family-wise price on the contrasts that carry the main claim. A focused
-    # run with no primary contrast is planned as a single test.
-    n_confirmatory_tests = max(
-        1, sum(1 for entry in analysis_plan["contrasts"]
-               if entry.get("tier") == 1))
+    # The audit re-checks the same pre-flight contract before the runs start:
+    # replication, hypotheses, the pre-specified margins, the planned power,
+    # the schedule, the controls and the exclusion policy.
     design_readiness = design_readiness_audit(
         seeds, ablations, hypotheses, schedule=run_schedule,
         expected_units=expected_schedule_units,
         schedule_arm_of=schedule_arm_of, margin=args.baseline_margin,
         equivalence_margin=args.equivalence_margin,
         assumed_paired_sd=args.assumed_paired_sd, alpha=args.alpha,
+        target_power=float(args.target_power),
         identity_controls=control_pairs, exclusion_policy=exclusion_policy,
         n_confirmatory_tests=n_confirmatory_tests,
         expected_attrition=args.expected_attrition,
         paired_sd_evidence=paired_sd_evidence,
-        require_variance_evidence=args.require_variance_evidence)
+        require_variance_evidence=args.require_variance_evidence,
+        interaction_margin=args.interaction_margin,
+        interaction_equivalence_margin=args.interaction_equivalence_margin,
+        n_factors=(interaction_power_payload or {}).get("worst_geometry", 2),
+        declares_interaction_claims=bool(interaction_geometries))
     if run_schedule is not None:
         design_readiness["schedule_balance"] = schedule_balance_report(
             run_schedule, arm_of=schedule_arm_of)
+    if interaction_power_payload is not None:
+        design_readiness["interaction_power_plan"] = interaction_power_payload
     if (args.assumed_paired_sd is not None and args.baseline_margin > 0.0
             and len(seeds) >= 2):
         # Calibrate the actual paired-test code against the pre-run assumption:
@@ -394,6 +509,31 @@ def main():
             design_readiness["simulated_power_check"]["expected_attrition"] = (
                 args.expected_attrition)
     save_json_atomic(base / "design_readiness.json", design_readiness)
+    if compute_budget_report is not None:
+        save_json_atomic(base / "compute_budget.json", compute_budget_report)
+        for check in compute_budget_report["checks"]:
+            if check["status"] != "pass":
+                print(f"[budget] {check['status'].upper()}: {check['id']}: "
+                      f"{check['detail']}")
+        recommended = compute_budget_report["recommended"]
+        print(f"[budget] planned cost {compute_budget_report['total_hours']} h "
+              f"of {compute_budget_report['budget_hours']} h budget; "
+              f"recommended allocation '{recommended['name']}'")
+        if args.require_compute_budget:
+            if compute_budget_report["total_hours"] is None:
+                raise SystemExit(
+                    "[budget] ERROR: --require-compute-budget is set but the "
+                    "cost cannot be estimated: pass "
+                    "--throughput-tokens-per-second with the measured "
+                    "throughput of the target device")
+            if compute_budget_report["recommended"]["fits_budget"] is not True:
+                raise SystemExit(
+                    "[budget] ERROR: --require-compute-budget is set but the "
+                    "planned matrix does not fit the budget: "
+                    f"{compute_budget_report['planned']['total_hours']:.4g} h "
+                    f"planned vs {compute_budget_report['budget_hours']:.4g} h "
+                    f"available; even the smallest allocation needs "
+                    f"{compute_budget_report['recommended']['total_hours']:.4g} h")
     for check in design_readiness["checks"]:
         if check["status"] != "pass":
             print(f"[design] {check['status'].upper()}: {check['id']}: {check['detail']}")

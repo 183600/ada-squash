@@ -56,6 +56,13 @@ This module supplies the reusable, pure-Python pieces:
     The equivalence counterpart. A superiority power formula evaluated at the
     equivalence margin answers the wrong question, so TOST claims get their
     own family-level and attrition-inflated sample-size plan.
+``factorial_contrast_sd`` / ``factorial_power_plan``
+    The planning counterpart of the factorial designs. An interaction is a
+    different contrast with a different noise level than an arm-vs-arm
+    comparison, so the seed count that powers the main claim does not power
+    the orthogonality/synergy claims. The helper converts the pilot's paired
+    SD into the SD of the factorial term itself and plans it with the same
+    family-level and attrition corrections.
 ``paired_sd_calibration``
     Turns pilot runs into a *provenance-carrying* planning variance. A pilot
     point estimate is itself uncertain, so the helper reports the sample and
@@ -117,6 +124,8 @@ __all__ = [
     "default_exclusion_policy",
     "design_readiness_audit",
     "exclusion_policy_fingerprint",
+    "factorial_contrast_sd",
+    "factorial_power_plan",
     "normalize_exclusion_policy",
     "order_drift_report",
     "paired_sd_calibration",
@@ -1687,6 +1696,160 @@ def tost_power_plan(paired_sd: float, n_pairs: int,
     }
 
 
+def factorial_contrast_sd(simple_paired_sd: float, n_factors: int,
+                          term_size: int) -> float:
+    """Per-seed SD of a factorial term, derived from a simple paired SD.
+
+    A factorial design replaces one arm-vs-arm contrast with several
+    simultaneous ones, and every extra term makes the *contrast itself*
+    noisier. Planning the seed count of a factorial study with the SD of a
+    simple paired difference therefore understates the required replication
+    for the interaction claims and overstates it for a pooled main effect.
+
+    Derivation (the same contrast construction the analysis code uses). Let
+    the cells of a ``2**k`` factorial share the seed, let ``sigma`` be the
+    across-seed SD of one cell's metric and ``rho`` the correlation between
+    two cells of the same seed. A simple paired contrast between two cells
+    has SD ``sigma * sqrt(2 * (1 - rho))``. An orthogonal sum-to-zero term
+    over ``t`` of the ``k`` factors carries the coefficients ``+-2**-(k-t)``
+    on the ``2**k`` cells, so its per-seed variance is
+    ``sigma**2 * (1 - rho) * 2**(2*t - k)`` and its SD is the simple paired
+    SD times ``2**(t - k/2 - 1/2)``:
+
+    ==========  ==================  ==========================
+    design      term                SD multiplier
+    ==========  ==================  ==========================
+    2x2         main effect         ``1 / sqrt(2)``
+    2x2         interaction         ``sqrt(2)``
+    2x2x2       main effect         ``1 / 2``
+    2x2x2       two-way interaction ``1``
+    2x2x2       three-way           ``2``
+    ==========  ==================  ==========================
+
+    The multipliers cancel the unknown ``sigma`` and ``rho``, which is why
+    the pilot's plain paired SD is enough to plan a factorial study.
+    """
+    sd = _finite_float(simple_paired_sd)
+    if sd is None or sd < 0.0:
+        raise ValueError(
+            f"simple_paired_sd must be a finite number >= 0, got {simple_paired_sd!r}")
+    if (isinstance(n_factors, bool)
+            or not isinstance(n_factors, numbers.Integral) or n_factors < 1):
+        raise ValueError(f"n_factors must be a positive integer, got {n_factors!r}")
+    n_factors = int(n_factors)
+    if (isinstance(term_size, bool)
+            or not isinstance(term_size, numbers.Integral) or term_size < 1):
+        raise ValueError(f"term_size must be a positive integer, got {term_size!r}")
+    term_size = int(term_size)
+    if term_size > n_factors:
+        raise ValueError(
+            f"term_size {term_size} exceeds n_factors {n_factors}: a term "
+            f"cannot involve more factors than the design has")
+    multiplier = 2.0 ** (term_size - n_factors / 2.0 - 0.5)
+    return sd * multiplier
+
+
+def factorial_power_plan(simple_paired_sd: float, n_pairs: int, *,
+                         n_factors: int = 2, term_size: int = 2,
+                         margin: float = 0.0, alpha: float = 0.05,
+                         power: float = 0.8, n_tests: int = 1,
+                         expected_attrition: float = 0.0,
+                         max_pairs: int = 100000,
+                         equivalence_margin: float = 0.0) -> dict:
+    """Prospective power plan for a factorial term (main effect or interaction).
+
+    The repo's central proposition is that the per-channel, depth and
+    activation axes are *orthogonal* and *synergistic*; those are interaction
+    claims, and an interaction claim is a different test with a different
+    noise level than the arm-vs-arm comparison the rest of the design is
+    powered for. This helper plans the seed count of such a claim with the
+    same machinery as :func:`prospective_power_plan` (Bonferroni family level
+    over the pre-registered confirmatory tests, expected run attrition,
+    minimum detectable effect) after converting the planning SD into the
+    term's own contrast SD with :func:`factorial_contrast_sd`.
+
+    ``margin`` is the smallest interaction of scientific interest: the
+    deviation from perfect additivity that the study must be able to see. It
+    is the *interaction* scale, so it is not comparable with the baseline
+    margin of a simple contrast. ``equivalence_margin`` is the bound inside
+    which the interaction is declared zero - the "the axes are orthogonal"
+    claim - and is planned with the TOST power calculation, because a
+    non-significant interaction test cannot certify orthogonality.
+
+    The returned plan reports both readings side by side, so a study cannot
+    quietly claim orthogonality with a design that was only powered to detect
+    large deviations.
+    """
+    sd = _finite_float(simple_paired_sd)
+    if sd is None or sd < 0.0:
+        raise ValueError(
+            f"simple_paired_sd must be a finite number >= 0, got {simple_paired_sd!r}")
+    if (isinstance(n_pairs, bool)
+            or not isinstance(n_pairs, numbers.Integral) or n_pairs < 2):
+        raise ValueError(f"n_pairs must be an integer >= 2, got {n_pairs!r}")
+    n_pairs = int(n_pairs)
+    contrast_sd = factorial_contrast_sd(sd, n_factors, term_size)
+    margin_value = 0.0 if margin is None else _finite_float(margin)
+    if margin_value is None or margin_value < 0.0:
+        raise ValueError(f"margin must be a finite number >= 0, got {margin!r}")
+    equivalence_value = (0.0 if equivalence_margin is None
+                         else _finite_float(equivalence_margin))
+    if equivalence_value is None or equivalence_value < 0.0:
+        raise ValueError(
+            f"equivalence_margin must be a finite number >= 0, got "
+            f"{equivalence_margin!r}")
+
+    superiority = None
+    if margin_value is not None and margin_value > 0.0:
+        superiority = prospective_power_plan(
+            contrast_sd, n_pairs, margin_value, alpha=alpha, power=power,
+            n_tests=n_tests, expected_attrition=expected_attrition,
+            max_pairs=max_pairs)
+    equivalence = None
+    if equivalence_value > 0.0:
+        equivalence = tost_power_plan(
+            contrast_sd, n_pairs, equivalence_value, alpha=alpha, power=power,
+            n_tests=n_tests, expected_attrition=expected_attrition,
+            max_pairs=max_pairs)
+
+    multiplier = (contrast_sd / sd) if sd > 0.0 else None
+    if superiority is not None and equivalence is not None:
+        note = ("the design is planned for a superiority claim on the "
+                "interaction and for the equivalence (orthogonality) claim at "
+                "the same time; both readings must be satisfied")
+    elif superiority is not None:
+        note = ("the design is planned for a superiority claim on the "
+                "interaction only; an equivalence (orthogonality) claim needs "
+                "its own equivalence_margin")
+    elif equivalence is not None:
+        note = ("the design is planned for the equivalence (orthogonality) "
+                "claim only; a superiority claim on the interaction needs its "
+                "own margin")
+    else:
+        note = ("no interaction margin and no equivalence margin were given: "
+                "the interaction claims of this study are descriptive only")
+    return {
+        "schema": "adasquash.factorial_power.v1",
+        "simple_paired_sd": sd,
+        "n_pairs": n_pairs,
+        "n_factors": int(n_factors),
+        "term_size": int(term_size),
+        "contrast_sd": contrast_sd,
+        "contrast_sd_multiplier": multiplier,
+        "margin": margin_value if margin_value and margin_value > 0.0 else None,
+        "equivalence_margin": (equivalence_value
+                               if equivalence_value and equivalence_value > 0.0
+                               else None),
+        "alpha": float(alpha),
+        "power_target": float(power),
+        "n_tests": int(n_tests),
+        "expected_attrition": float(expected_attrition),
+        "superiority": superiority,
+        "equivalence": equivalence,
+        "note": note,
+    }
+
+
 PAIRED_SD_CALIBRATION_SCHEMA = "adasquash.paired_sd_calibration.v1"
 
 
@@ -2139,7 +2302,12 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                            n_confirmatory_tests: int = 1,
                            expected_attrition: float = 0.0,
                            paired_sd_evidence: Optional[Mapping] = None,
-                           require_variance_evidence: bool = False) -> dict:
+                           require_variance_evidence: bool = False,
+                           interaction_margin: float = 0.0,
+                           interaction_equivalence_margin: float = 0.0,
+                           n_factors: int = 2,
+                           interaction_term_size: int = 2,
+                           declares_interaction_claims: bool = False) -> dict:
     """Pre-flight design checklist, written before any run starts.
 
     Failures are structural and should stop a confirmatory launch; warnings are
@@ -2163,6 +2331,18 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
     below that bound, and fails on pilot/confirmatory seed overlap. Set
     ``require_variance_evidence`` to make a missing calibration a structural
     failure instead of leaving the planning variance unproven.
+
+    A factorial study makes *interaction* claims ("the axes are orthogonal",
+    "the combination is synergistic"), and an interaction is a different
+    contrast with a different noise level than the arm-vs-arm comparison the
+    rest of the audit is powered for. ``interaction_margin`` (the smallest
+    interaction of interest) and ``interaction_equivalence_margin`` (the
+    bound inside which the interaction is declared zero) therefore add their
+    own power checks, planned on the interaction scale with
+    :func:`factorial_power_plan`. ``declares_interaction_claims`` marks a
+    study that contains factorial designs, so a matrix that can produce
+    interaction claims but never states an interaction margin is recorded as
+    an unplanned claim instead of silently producing descriptive numbers.
     """
     names = list(rows.keys()) if isinstance(rows, Mapping) else list(rows)
     checks: list[dict] = []
@@ -2409,6 +2589,116 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
                         f'{eq_sd:g} and family alpha '
                         f'{eq_plan["family_alpha"]:.4g}')
 
+    interaction_value = _finite_float(interaction_margin)
+    interaction_equivalence_value = _finite_float(interaction_equivalence_margin)
+    if interaction_value is None or interaction_value < 0.0:
+        add("interaction_effect_size", "fail",
+            f"invalid interaction margin {interaction_margin!r}")
+        interaction_value = 0.0
+    if interaction_equivalence_value is None or interaction_equivalence_value < 0.0:
+        add("interaction_effect_size", "fail",
+            f"invalid interaction equivalence margin {interaction_equivalence_margin!r}")
+        interaction_equivalence_value = 0.0
+    factors_valid = (isinstance(n_factors, numbers.Integral)
+                     and not isinstance(n_factors, bool) and n_factors >= 1)
+    term_valid = (isinstance(interaction_term_size, numbers.Integral)
+                  and not isinstance(interaction_term_size, bool)
+                  and 1 <= interaction_term_size <= max(1, int(n_factors or 1)))
+    if not factors_valid or not term_valid:
+        add("interaction_design", "fail",
+            f"invalid factorial geometry: n_factors={n_factors!r}, "
+            f"interaction_term_size={interaction_term_size!r} (the term may "
+            f"not involve more factors than the design has)")
+        n_factors = 2
+        interaction_term_size = 2
+    if (declares_interaction_claims and interaction_value <= 0.0
+            and interaction_equivalence_value <= 0.0):
+        add("interaction_effect_size", "warn",
+            "the study contains factorial designs but pre-specifies no "
+            "interaction margin: the orthogonality and synergy claims will "
+            "be descriptive and cannot be certified")
+    elif interaction_value > 0.0 or interaction_equivalence_value > 0.0:
+        add("interaction_effect_size", "pass",
+            f"interaction margin={interaction_value}, interaction equivalence "
+            f"margin={interaction_equivalence_value} on a "
+            f"2**{n_factors} design")
+
+    planned_interaction_power = None
+    if interaction_value > 0.0 or interaction_equivalence_value > 0.0:
+        if alpha_value is None or target_power_value is None or not n_tests_valid:
+            add("interaction_power", "fail",
+                "the interaction claims cannot be planned because alpha, the "
+                "target power or the family size is invalid")
+        elif effective_paired_sd is None:
+            add("interaction_power", "warn",
+                "no assumed paired SD supplied: the planned power for the "
+                "interaction claims cannot be checked before the run")
+        else:
+            interaction_sd = _finite_float(effective_paired_sd)
+            if interaction_sd is None or interaction_sd < 0.0:
+                add("interaction_power", "fail",
+                    f"invalid assumed paired SD {effective_paired_sd!r}")
+            elif n_pairs < 2:
+                add("interaction_power", "fail",
+                    f"{n_pairs} distinct seed(s): at least 2 paired observations "
+                    f"are needed to plan an interaction contrast")
+            else:
+                try:
+                    planned_interaction_power = factorial_power_plan(
+                        interaction_sd, n_pairs, n_factors=int(n_factors),
+                        term_size=int(interaction_term_size),
+                        margin=float(interaction_value),
+                        alpha=float(alpha_value),
+                        power=float(target_power_value),
+                        n_tests=int(n_confirmatory_tests),
+                        expected_attrition=float(expected_attrition),
+                        equivalence_margin=float(interaction_equivalence_value))
+                except (ValueError, TypeError) as exc:
+                    add("interaction_power", "fail",
+                        f"invalid interaction power-planning input: {exc}")
+                else:
+                    superiority = planned_interaction_power.get("superiority")
+                    if superiority is not None:
+                        if superiority["adequately_powered_after_attrition"] is True:
+                            add("interaction_power", "pass",
+                                f"{n_pairs} pairs reach the target for an "
+                                f"interaction of {interaction_value:g} at "
+                                f"contrast SD={planned_interaction_power['contrast_sd']:g} "
+                                f"({superiority['required_planned_pairs']} planned "
+                                f"pairs needed after "
+                                f"{superiority['expected_attrition']:.0%} attrition)")
+                        elif superiority["adequately_powered_after_attrition"] is False:
+                            add("interaction_power", "fail",
+                                f"{n_pairs} pairs are underpowered for an "
+                                f"interaction of {interaction_value:g} at contrast "
+                                f"SD={planned_interaction_power['contrast_sd']:g}: "
+                                f"{superiority['required_pairs_family_adjusted']} "
+                                f"analyzable pairs are required, so plan "
+                                f"{superiority['required_planned_pairs']} pairs")
+                        else:
+                            add("interaction_power", "warn",
+                                f"an interaction of {interaction_value:g} is not "
+                                f"reachable within the search cap at contrast "
+                                f"SD={planned_interaction_power['contrast_sd']:g}")
+                    equivalence = planned_interaction_power.get("equivalence")
+                    if equivalence is not None:
+                        if equivalence["adequately_powered_after_attrition"] is True:
+                            add("interaction_equivalence_power", "pass",
+                                f"{n_pairs} pairs reach the target for declaring "
+                                f"the interaction equivalent to zero within "
+                                f"{interaction_equivalence_value:g}")
+                        elif equivalence["adequately_powered_after_attrition"] is False:
+                            add("interaction_equivalence_power", "fail",
+                                f"{n_pairs} pairs cannot certify orthogonality "
+                                f"within {interaction_equivalence_value:g}: "
+                                f"{equivalence['required_pairs_family_adjusted']} "
+                                f"analyzable pairs are required, so plan "
+                                f"{equivalence['required_planned_pairs']} pairs")
+                        else:
+                            add("interaction_equivalence_power", "warn",
+                                f"the orthogonality bound {interaction_equivalence_value:g} "
+                                f"is not reachable within the search cap")
+
     attrition_value = _finite_float(expected_attrition)
     if attrition_value is None or not 0.0 <= attrition_value < 1.0:
         add("attrition", "fail",
@@ -2560,6 +2850,7 @@ def design_readiness_audit(seeds: Sequence[int], rows: Iterable[str],
         "checks": checks,
         "planned_power": planned_power,
         "planned_equivalence_power": planned_equivalence_power,
+        "planned_interaction_power": planned_interaction_power,
         "n_confirmatory_tests": n_confirmatory_tests,
         "expected_attrition": expected_attrition,
         "assumed_paired_sd": effective_paired_sd,

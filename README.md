@@ -367,6 +367,34 @@ non-significant superiority result. Factorial interactions are reported
 two-sided, so an antagonistic interaction is not mistaken for a failed
 synergy claim.
 
+**The interaction claims are planned separately.** "The three axes are
+orthogonal" and "the combination is synergistic" are *interaction*
+contrasts, and an interaction is noisier than an arm-vs-arm difference: in a
+2x2 design the interaction carries twice the variance of a simple paired
+contrast, and in a 2x2x2 design the three-way term carries four times.
+Power for the main claim therefore does not imply power for the
+orthogonality claim. `--interaction-margin <delta>` states the smallest
+deviation from additivity the study must be able to see, and
+`--interaction-equivalence-margin <delta>` states the bound inside which
+the interaction is declared zero; both are sized at the family alpha, with
+the expected attrition, and are frozen into the `analysis_plan.json`
+fingerprint. A matrix that contains factorial designs but pre-specifies no
+interaction margin is recorded as making descriptive interaction claims
+only.
+
+**The compute budget is part of the design too.** With
+`--compute-budget-hours <h>` and `--throughput-tokens-per-second <tps>`
+(the measured throughput of the target device) the runner reports, before
+the first run, what every arm costs, whether the whole matrix fits, and
+what has to be traded away when it does not: breadth (an arm is a
+hypothesis) or replication (a seed is the resolution of the remaining
+hypotheses). `compute_budget.json` records every candidate allocation
+together with the prospective power of the primary claim, and
+`--require-compute-budget` makes an over-budget design fail closed. The
+recommended allocation is frozen into `analysis_plan.json`; the measured
+throughput is kept out of the fingerprint, so re-measuring it does not look
+like a changed experiment.
+
 ## Method reference
 
 ### Original DyT (baseline)

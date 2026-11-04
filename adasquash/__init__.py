@@ -32,6 +32,12 @@ from .calibration import (
     calibrate_type_i_under_violations,
     run_calibration_suite,
 )
+from .costing import (
+    STUDY_BUDGET_SCHEMA,
+    estimate_run_cost,
+    plan_runs_from_matrix,
+    study_budget_plan,
+)
 from .data_audit_log import (
     DATA_AUDIT_LOG_SCHEMA,
     DataAuditEntry,
@@ -78,6 +84,8 @@ from .design import (
     default_exclusion_policy,
     design_readiness_audit,
     exclusion_policy_fingerprint,
+    factorial_contrast_sd,
+    factorial_power_plan,
     normalize_exclusion_policy,
     order_drift_report,
     paired_sd_calibration,
@@ -211,6 +219,7 @@ __all__ = [
     # Normalization family and public math entry points.
     "NORM_REGISTRY",
     "RUN_MANIFEST_SCHEMA",
+    "STUDY_BUDGET_SCHEMA",
     # Instrumentation.
     "ActivationStats",
     # Assumption diagnostics.
@@ -322,10 +331,13 @@ __all__ = [
     "efficiency_verdict",
     "eggers_test",
     "environment_info",
+    "estimate_run_cost",
     "exclusion_policy_fingerprint",
     "exclusion_policy_sensitivity",
     "execution_identity_mismatches",
     "expected_loss",
+    "factorial_contrast_sd",
+    "factorial_power_plan",
     "find_ngram_matches",
     "fine_grained_shift_report",
     "flag_sensitive_statistics",
@@ -347,6 +359,7 @@ __all__ = [
     "paired_sd_evidence_audit",
     "parameter_breakdown",
     "parameter_sweep",
+    "plan_runs_from_matrix",
     "prospective_power_plan",
     "randomized_complete_block_schedule",
     "register_study",
@@ -366,6 +379,7 @@ __all__ = [
     "set_all_seeds",
     "simulate_paired_design",
     "split_position_robustness",
+    "study_budget_plan",
     "tensor_finite_report",
     "time_locked_key",
     "timestamp_now",

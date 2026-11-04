@@ -42,9 +42,18 @@ ANALYSIS_PLAN_FINGERPRINT_FIELDS = (
     "baseline_pool", "expected_attrition", "exclusion_policy",
     "exclusion_policy_fingerprint", "row_configs", "matrix_cells",
     "run_schedule", "contrasts", "paired_sd_evidence",
-    "sequential_monitoring",
+    "sequential_monitoring", "interaction_power", "compute_budget",
 )
-_ANALYSIS_PLAN_REQUIRED_FIELDS = ANALYSIS_PLAN_FINGERPRINT_FIELDS[:-2]
+# The optional blocks are hashed when they are present, so a plan written by
+# an older producer still verifies, but a study that planned its interaction
+# claims or its compute allocation cannot silently change them afterwards.
+_ANALYSIS_PLAN_OPTIONAL_FIELDS = (
+    "paired_sd_evidence", "sequential_monitoring", "interaction_power",
+    "compute_budget",
+)
+_ANALYSIS_PLAN_REQUIRED_FIELDS = tuple(
+    field for field in ANALYSIS_PLAN_FINGERPRINT_FIELDS
+    if field not in _ANALYSIS_PLAN_OPTIONAL_FIELDS)
 
 
 def analysis_plan_fingerprint(plan: dict) -> str:
@@ -78,7 +87,9 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
                         expected_attrition: float=0.0,
                         paired_sd_evidence: dict | None=None,
                         sequential_looks: int=0,
-                        sequential_spending: str="obrien-fleming") -> dict:
+                        sequential_spending: str="obrien-fleming",
+                        interaction_power: dict | None=None,
+                        compute_budget: dict | None=None) -> dict:
     """Freeze the confirmatory contrast registry *before* any training starts.
 
     A comparison experiment is only confirmatory if the set of tests is fixed
@@ -102,6 +113,14 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
     counts, family alpha and spending function are part of this fingerprint
     whenever monitoring is requested. The default of zero looks adds no key
     and leaves existing pre-registration fingerprints unchanged.
+    The interaction power plan is frozen in the same payload when supplied:
+    the orthogonality and synergy claims of a factorial study are a different
+    contrast with a different noise level than the arm-vs-arm comparison, so
+    the margin and the seed count that power them are design assumptions, not
+    re-analysis choices. The compute-budget plan is frozen for the same
+    reason: the allocation of a fixed budget between breadth (how many arms)
+    and replication (how many seeds per arm) decides which hypotheses the
+    study can answer at all.
     The exclusion policy is normalized and hashed into the same fingerprint:
     a rerun that quietly changes which runs may be dropped is a changed
     experiment, not a re-analysis. The expected run-attrition assumption used
@@ -417,6 +436,18 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"paired_sd_evidence must be JSON-serializable: {exc}") from None
+    for key, payload in (("interaction_power", interaction_power),
+                         ("compute_budget", compute_budget)):
+        if payload is None:
+            continue
+        if not isinstance(payload, Mapping):
+            raise ValueError(
+                f"{key} must be a mapping, got {type(payload).__name__}")
+        try:
+            json.dumps(payload, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{key} must be JSON-serializable: {exc}") from None
     payload = {
         "model": model_name,
         "seeds": normalized_seeds,
@@ -448,6 +479,10 @@ def build_analysis_plan(rows: dict, hypotheses: dict, matrix_report: dict,
         payload["paired_sd_evidence"] = paired_sd_evidence
     if sequential_plan is not None:
         payload["sequential_monitoring"] = sequential_plan
+    if interaction_power is not None:
+        payload["interaction_power"] = interaction_power
+    if compute_budget is not None:
+        payload["compute_budget"] = compute_budget
     fingerprint = analysis_plan_fingerprint(payload)
     return {
         "schema": "adasquash.analysis_plan.v1",

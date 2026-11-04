@@ -322,6 +322,23 @@ python scripts/ablation.py --config configs/ablation-matrix.yaml --seeds 42 43 4
 的 TOST 等价性检验——“两个设置相同”因此是一个有检验的结论，而不是“优越性
 检验不显著”。析因交互项按双侧报告，避免把拮抗交互误读成“协同不显著”。
 
+**交互项也要先做功效规划。** 交互（“三轴正交”“组合有协同”）是与
+arm-vs-arm 不同的对比，其噪声水平更高：2×2 的交互项方差是单对对比的 2 倍，
+2×2×2 的三阶交互是 4 倍。因此主结论有功效，不代表正交性/协同性结论有功效。
+`--interaction-margin <delta>` 给出“最小值得检出的交互偏离”，
+`--interaction-equivalence-margin <delta>` 给出“判定交互为零（正交）的界”；
+两者都按族 alpha、预期流失折算后规划所需 seed 对，并写进
+`analysis_plan.json` 的指纹。若矩阵含析因设计却未给出交互 margin，
+`design_readiness.json` 会记录一条“交互结论只是描述性的”警告。
+
+**算力预算也是设计的一部分。** `--compute-budget-hours <h>` 配合
+`--throughput-tokens-per-second <tps>`（目标设备的实测吞吐）在训练前给出
+每个 arm 的成本、整份矩阵是否装得下，以及装不下时该牺牲什么：
+“少几个 arm”（少一个假设）还是“少几个 seed”（少一份分辨率）。
+`compute_budget.json` 记录各候选分配及其主结论的事前功效；
+`--require-compute-budget` 可让超预算直接失败。矩阵的推荐分配被冻结进
+`analysis_plan.json`（实测吞吐不进指纹，因此重新测量不会被当成“换了实验”）。
+
 ## 方法速查
 
 ### 原版 DyT（基线）
