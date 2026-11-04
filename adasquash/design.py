@@ -2648,7 +2648,7 @@ def design_analysis_alignment_report(
     if dr_exclusion_fp is not None:
         # Check if the comparison reports any post-hoc exclusions
         for row in cmp_rows:
-            proto_probs = row.get("protocol_problems", [])
+            proto_problems = row.get("protocol_problems", [])
             if proto_problems:
                 deviations.append(
                     f"protocol problems detected in comparison: {'; '.join(proto_problems)}")
