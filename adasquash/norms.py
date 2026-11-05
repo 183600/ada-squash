@@ -27,28 +27,18 @@ from typing import Optional
 import torch
 from torch import nn
 
-# Registry of the norm families, keyed by the ``norm_name`` values the
-# configs and scripts pass around (``build_norm`` resolves them).
 NORM_REGISTRY: dict[str, type] = {}
 
-# Floors of the generalized-softsign exponent and of the depth-conditioned
-# per-channel alpha. Both are fixed design decisions (D2).
 _MIN_ALPHA = 1e-4
 _MIN_P = 1e-3
 
 _LOG2E = math.log2(math.e)
 _LN2 = math.log(2.0)
 
-# ``log(finfo(dtype).tiny)`` per dtype; the value only depends on the dtype.
 _TINY_LOG_CACHE: dict = {}
 
 
 def _log_tiny(dtype: torch.dtype) -> float:
-    """``log(finfo(dtype).tiny)`` per dtype: the softsign p-gradient floor.
-
-    The constant only depends on the dtype; the cache keyed by dtype returns
-    the same value every time.
-    """
     v = _TINY_LOG_CACHE.get(dtype)
     if v is None:
         v = math.log(torch.finfo(dtype).tiny)
@@ -57,71 +47,41 @@ def _log_tiny(dtype: torch.dtype) -> float:
 
 
 def _as_scalar_exponent(p):
-    """Return ``p`` as a Python float when it is a one-element CPU tensor.
-
-    CUDA and multi-element tensors are returned unchanged.
-    """
     if isinstance(p, torch.Tensor) and p.device.type == "cpu" and p.numel() == 1:
         return float(p)
     return p
 
 
 def _as_scalar_exponent_inplace(g: torch.Tensor, p) -> torch.Tensor:
-    """Compute ``g ** (p + 1)`` in-place.
-
-    The tensor ``g`` is modified in-place and returned for convenience.
-    ``p`` is treated as a scalar exponent (floored if a tensor).
-    """
     if isinstance(p, torch.Tensor):
         return g.log2_().mul_(p + 1).exp2_()
     return g.pow_(p + 1)
 
 
 def _scale_needs_sign_fix(scale: torch.Tensor) -> bool:
-    """Whether the compensating ``±1`` multiply is needed.
-
-    Multiplying by ``+1.0`` is exact, so when no ``scale`` entry is negative
-    the correction is a no-op.  Non-CPU tensors keep the multiply unconditionally.
-    ``signbit`` (rather than ``< 0``) treats ``-0.0`` as negative.
-    """
     if scale.device.type != "cpu":
         return True
     return bool(torch.signbit(scale).any())
 
 
 def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
-    """Sum over all dimensions except the last one.
-
-    For 1-D inputs a clone is returned to preserve the tensor.
-    """
     if t.ndim <= 1:
         return t.clone()
     return t.sum(dim=tuple(range(t.ndim - 1)))
 
 
-# Row-block element budget of the chunked product-sum reduction.
 _REDUCE_CHUNK_ELEMS = 1 << 22
 
 
 def _chunked_product_sum(a2: torch.Tensor, b2: torch.Tensor, step: int, acc_dtype: torch.dtype) -> torch.Tensor:
-    """Row-chunked sum of products ``a * b`` accumulated in ``acc_dtype``.
-
-    Both inputs are 2-D; each chunk is a row block so the temporary block
-    never covers the entire leading dimension at once.
-    """
     total = torch.zeros(a2.shape[1], dtype=acc_dtype, device=a2.device)
     for start in range(0, a2.shape[0], step):
         part = (a2[start:start + step] * b2[start:start + step]).sum(dim=0, dtype=acc_dtype)
         total.add_(part)
     return total
 
-def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Element-wise product of ``a`` and ``b``, with contour reduction.
 
-    Returns ``sum(a * b, dim=0..n-1)`` for ``n``-D input tensors.
-    For 1-D tensors returns ``a * b`` directly. For larger inputs, uses
-    chunked computation to stay within memory bounds.
-    """
+def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.ndim <= 1:
         return a * b
     if a.shape[-1] == 0:
@@ -130,11 +90,6 @@ def _reduce_products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def _chunked_reduce_product(a: torch.Tensor, b: torch.Tensor, chunk_elems: int) -> torch.Tensor:
-    """Chunked product-sum reduction for memory-efficient accumulation.
-
-    Handles contiguous and non-contiguous inputs, using float32 accumulation
-    for bfloat16/float16 inputs to avoid overflow in the reduction.
-    """
     contiguous = a.is_contiguous() and b.is_contiguous()
     if a.ndim == 2 and contiguous and a.numel() <= chunk_elems:
         acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
@@ -144,8 +99,6 @@ def _chunked_reduce_product(a: torch.Tensor, b: torch.Tensor, chunk_elems: int) 
     if contiguous and rows <= step:
         return _sum_leading_dims(a * b)
     acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
-    # ``view`` keeps the contiguous path zero-copy; non-contiguous inputs
-    # flatten through ``reshape`` (same values and row order).
     a2 = a.view(rows, -1) if contiguous else a.reshape(rows, -1)
     b2 = b.view(rows, -1) if contiguous else b.reshape(rows, -1)
     total = _chunked_product_sum(a2, b2, step, acc_dtype)
@@ -155,32 +108,18 @@ def _chunked_reduce_product(a: torch.Tensor, b: torch.Tensor, chunk_elems: int) 
 
 
 def _effective_decay_rate(k, k_min):
-    """Depth-decay rate, optionally floored at ``k_min``.
-
-    ``None`` keeps the historical unconstrained rate; a tensor rate is
-    clamped ``.clamp(min=k_min)`` without leaving autograd.
-    A plain float is floored with ``max(float(k), float(k_min))``.
-    """
     if k_min is None:
         return k
     if isinstance(k, torch.Tensor):
         return k.clamp(min=k_min)
     return max(float(k), float(k_min))
 
-def _depth_alpha(alpha_0, k, depth_ratio: float) -> torch.Tensor:
-    """Compute ``alpha_0 * exp(-k * depth_ratio)`` for depth-conditioned norms.
 
-    The decay factor ``exp(-k * depth_ratio)`` attenuates the initial alpha
-    ``alpha_0`` across layers; ``depth_ratio = layer_idx / num_layers``.
-    """
+def _depth_alpha(alpha_0, k, depth_ratio: float) -> torch.Tensor:
     return alpha_0 * torch.exp(-k * depth_ratio)
 
-def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Dot product of two tensors, flattening leading dimensions.
 
-    If both tensors are contiguous the optimized ``torch.dot`` path is used;
-    otherwise a element-wise product sum falls back.
-    """
+def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.is_contiguous() and b.is_contiguous():
         return torch.dot(a.reshape(-1), b.reshape(-1))
     return (a * b).sum()
@@ -193,23 +132,8 @@ def register_norm(name: str):
         return cls
     return _decorator
 
+
 def _softsign_core(xs: torch.Tensor, p, scale=None):
-    """Compute the shared intermediates for generalized softsign forward/backward.
-
-    Returns ``(lo, r, u, p)`` where:
-
-    * ``lo`` = ``clamp(t, max=1)`` = ``min(t, 1)``;
-    * ``r``  = ``1 / clamp(t, min=1)`` = ``1 / max(t, 1)``;
-    * ``u``  = ``lo * r`` in ``[0, 1]``;
-    * ``p``  = the scalar-exponent form of ``p``;
-
-    with ``t = |xs|`` or ``t = |xs * scale|``.  The reciprocal is taken on
-    ``max(t, 1)`` and never on ``t`` itself: a zero magnitude would make
-    ``1/0`` infinite and the derivative of the unselected branch ``NaN``.
-
-    The two-step clamp-then-reciprocal design (rather than a single ``1/(1+|t|^p)``)
-    guarantees numerical stability when ``t`` contains zeros or very small values.
-    """
     p = _as_scalar_exponent(p)
     t = xs.abs() if scale is None else xs.mul(scale).abs_()
     lo = t.clamp(max=1.0)
@@ -219,13 +143,6 @@ def _softsign_core(xs: torch.Tensor, p, scale=None):
 
 
 def _compute_s_and_a(u: torch.Tensor, p, need_a: bool):
-    """Compute ``s = (u^p + 1)^(-1/p)`` and optionally ``a = p * ln u``.
-
-    The forward value ``s`` is the core of the generalized softsign inversion.
-    The intermediate ``a`` is the clamped ``p * ln u`` needed when the exponent
-    ``p`` is differentiable; its numerical path differs between tensor and scalar
-    ``p`` because the exponent gradient depends on the pre-power value of ``u``.
-    """
     if isinstance(p, torch.Tensor):
         q = u.log2().mul_(p)
         a = None
@@ -234,8 +151,6 @@ def _compute_s_and_a(u: torch.Tensor, p, need_a: bool):
         s = q.exp2_().log1p_().mul_(-_LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))).exp2_()
         return s, a
     if need_a:
-        # ``torch.pow`` leaves ``u`` intact: the exponent gradient needs its
-        # pre-power value.
         s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
         a = u.log2().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
         return s, a
@@ -244,11 +159,6 @@ def _compute_s_and_a(u: torch.Tensor, p, need_a: bool):
 
 
 def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False) -> torch.Tensor:
-    """``phi_p(xs * scale)`` (or ``phi_p(xs)`` without a scale).
-
-    ``scale_nonneg`` tells the caller that the scale is known to be
-    non-negative, which makes the compensating ``±1`` multiply unnecessary.
-    """
     lo, _r, u, p = _softsign_core(xs, p, scale)
     s, _a = _compute_s_and_a(u, p, False)
     out = s.mul_(lo).copysign_(xs)
@@ -258,17 +168,6 @@ def _softsign_forward(xs: torch.Tensor, p, scale=None, scale_nonneg: bool=False)
 
 
 def _softsign_backward_pieces(xs: torch.Tensor, p, need_p_grad: bool, need_phi: bool=True, need_x_grad: bool=True, scale=None, scale_nonneg: bool=False):
-    """The pieces the softsign backward needs, recomputed from ``xs``.
-
-    Returns ``(g, phi, a)``:
-
-    * ``g``   = the cotangent factor of the squashed output (``None`` when
-      the input gradient is not requested);
-    * ``phi`` = the squashed output itself, needed for the exponent and the
-      affine gradients;
-    * ``a``   = the clamped ``p * ln u`` intermediate of the exponent
-      gradient (``None`` when the exponent gradient is not requested).
-    """
     lo, r, u, p = _softsign_core(xs, p, scale)
     s, a = _compute_s_and_a(u, p, need_p_grad)
     phi = None
@@ -280,15 +179,8 @@ def _softsign_backward_pieces(xs: torch.Tensor, p, need_p_grad: bool, need_phi: 
         return (None, phi, a)
     return (r * s, phi, a)
 
+
 def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p_raw: torch.Tensor, gamma: Optional[torch.Tensor]=None) -> torch.Tensor:
-    """Gradient of the generalized softsign exponent ``p`` from the output cotangent.
-
-    ``a`` is the clamped ``p * ln(u)`` intermediate; it is overwritten in-place
-    with ``a * sigmoid(a)`` before the final reduction.
-
-    The gradient is averaged over ``p`` via ``1/(p * p)`` and then masked by
-    ``p_raw > _MIN_P`` to enforce the D2 exponent floor.
-    """
     if p.numel() != 1 or p_raw.numel() != 1:
         raise ValueError(
             "the generalized-softsign exponent must be a scalar (one-element), "
@@ -303,10 +195,6 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
     k = sig.sub_(a)
     acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
     red = _dot_all(grad_phi, k) if acc is None else (grad_phi * k).sum(dtype=acc)
-    # Out-of-place with a 0-dim p: an in-place division by a one-element p
-    # would try to write a [1] broadcast back into the 0-dim reduction. For a
-    # one-element tensor the scalar reduction is still the correct value; it
-    # is reshaped to p's shape only for autograd's returned gradient.
     red = red / (p_scalar * p_scalar)
     red = red * (p_raw_scalar > _MIN_P)
     if red.dtype != p.dtype:
@@ -318,18 +206,6 @@ def _softsign_affine_grads(x: torch.Tensor, p, p_raw, grad_out: torch.Tensor,
                            gamma: torch.Tensor, scale, need_softsign: bool,
                            need_p_grad: bool, need_gamma_grad: bool,
                            scale_nonneg: bool = False):
-    """Shared recomputation + phi-chained gradients of the affine softsign kernels.
-
-    The per-channel (``_DyTCForward``), scalar-alpha (``_DyTSForward``) and
-    depth-conditioned (``_DyTCDForward``) kernels share this backward block:
-    the softsign pieces are recomputed from ``x``, and the exponent and
-    ``gamma`` cotangents chain through the squashed output ``phi`` when either
-    is requested. ``scale`` is the alpha entering the softsign (per-channel or
-    scalar); ``scale_nonneg`` marks a scale known to be non-negative (DyT-CD).
-
-    Returns ``(g, grad_p, grad_gamma)``; ``g`` is the input-side cotangent
-    factor and is ``None`` unless ``need_softsign``.
-    """
     g = phi = a = None
     need_phi = need_p_grad or need_gamma_grad
     if need_softsign or need_phi:
@@ -347,27 +223,12 @@ def _softsign_affine_grads(x: torch.Tensor, p, p_raw, grad_out: torch.Tensor,
 
 
 def _floor_exponent(p):
-    """Apply the D2 exponent floor and return both effective and raw forms.
-
-    The effective exponent ``p_effective`` is floored at ``_MIN_P = 1e-3``.
-    When ``p`` is a tensor its unclamped value is kept in ``p_raw`` so the
-    gradient can observe the clamp boundary; a frozen (plain-float) exponent
-    is floored directly.
-
-    Returns ``(p_effective, p_raw, p_is_tensor)``.
-    """
     if isinstance(p, torch.Tensor):
         return p.clamp(min=_MIN_P), p, True
     return max(float(p), _MIN_P), None, False
 
 
 def _prepare_exponent(ctx, p):
-    """Floor the exponent and record its state for the autograd context.
-
-    Returns ``(p_effective, p_raw)``.  The raw (unclamped) exponent is returned
-    rather than saved in the context because every kernel places it among its
-    own saved tensors at different positions.
-    """
     p_effective, p_raw, p_is_tensor = _floor_exponent(p)
     ctx.p_is_tensor = p_is_tensor
     ctx.need_p_grad = p_is_tensor and p_raw.requires_grad
@@ -377,11 +238,6 @@ def _prepare_exponent(ctx, p):
 
 
 def _save_exponent(ctx, p, saved: list):
-    """Floor the exponent, record its context state, and append the raw exponent.
-
-    The raw (unclamped) exponent tensor is appended to ``saved`` so that
-    each kernel can restore it at its own saved-tensor index.
-    """
     p_effective, p_raw = _prepare_exponent(ctx, p)
     if p_raw is not None:
         saved.append(p_raw)
@@ -389,11 +245,6 @@ def _save_exponent(ctx, p, saved: list):
 
 
 def _restore_exponent(ctx, saved, index: int):
-    """Restore ``(p, p_raw)`` of the exponent from the saved tensors.
-
-    The saved tensor at ``index`` contains the raw (unclamped) exponent;
-    the effective value is either the clamped tensor or the stored float.
-    """
     if ctx.p_is_tensor:
         p_raw = saved[index]
         return p_raw.clamp(min=_MIN_P), p_raw
@@ -401,43 +252,23 @@ def _restore_exponent(ctx, saved, index: int):
 
 
 def _apply_affine(phi: torch.Tensor, gamma: torch.Tensor, beta) -> torch.Tensor:
-    """Apply ``gamma * phi (+ beta)`` without in-place mutation.
-
-    If ``beta`` is provided the result is ``gamma * phi + beta``; otherwise
-    ``gamma * phi``.
-    """
     if beta is not None:
         return phi.mul(gamma).add_(beta)
     return phi.mul(gamma)
 
 
 def _grad_beta(beta, grad_out, need_beta: bool):
-    """Return the summed gradient for ``beta`` if required, else ``None``."""
     if beta is not None and need_beta:
         return _sum_leading_dims(grad_out)
     return None
 
 
 def _tanh_squash_forward(x: torch.Tensor, alpha, gamma: torch.Tensor, beta) -> torch.Tensor:
-    """Apply ``gamma * tanh(alpha * x) (+ beta)`` as a fused operation.
-
-    The forward applies ``alpha * x``, then ``tanh``, then scales
-    by ``gamma`` and optionally adds ``beta`` within a single autograd node.
-    """
     return _apply_affine(x.mul(alpha).tanh(), gamma, beta)
 
 
 def _tanh_squash_backward(x: torch.Tensor, alpha, gamma: torch.Tensor,
                           grad_out: torch.Tensor, need_gamma: bool):
-    """Backward pass for ``tanh(alpha * x)`` squash.
-
-    Uses the forward's ``phi = tanh(alpha * x)`` to compute:
-    - ``w = phi * grad_out`` (cotangent of squashed output)
-    - ``grad_gamma = sum(w)`` if requested
-    - ``grad_alpha`` from ``w * x`` (scalar or per-channel reduction)
-    - Input gradient: ``w * alpha``
-
-    """
     phi = x.mul(alpha).tanh()
     w = phi * grad_out
     grad_gamma = _sum_leading_dims(w) if need_gamma else None
@@ -448,11 +279,6 @@ def _tanh_squash_backward(x: torch.Tensor, alpha, gamma: torch.Tensor,
 
 
 def build_norm(name: str, dim: int, **kwargs) -> nn.Module:
-    """Instantiate the norm registered under ``name``.
-
-    The norm class is looked up in :data:`NORM_REGISTRY` and constructed
-    with ``dim`` and any additional keyword arguments.
-    """
     if name not in NORM_REGISTRY:
         raise KeyError(f"Unknown norm '{name}'. Registered: {list(NORM_REGISTRY)}")
     return NORM_REGISTRY[name](dim, **kwargs)

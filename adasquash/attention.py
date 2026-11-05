@@ -12,12 +12,10 @@ from torch.nn.utils import skip_init
 from ._caching import _inference_stale, _lru_scratch_buffer
 from .norms import QKSquash, _RMSNorm
 
-# Cache configurations
 _CACHE_MAX_ENTRIES = 8
 _LOGIT_SCRATCH_MAX_ENTRIES = 2
 _ROPE_HALF_SCRATCH_MAX_ENTRIES = 4
 
-# Cache instances (D1, D6: SDPA baseline, storage-pointer keyed)
 _TRIL_MASK_CACHE: OrderedDict = OrderedDict()
 _ROPE_TABLE_CACHE: OrderedDict = OrderedDict()
 _LOGIT_SCRATCH_CACHE: OrderedDict = OrderedDict()
@@ -25,11 +23,6 @@ _ROPE_HALF_SCRATCH_CACHE: OrderedDict = OrderedDict()
 
 
 def _rope_half_scratch(x_lo: torch.Tensor) -> torch.Tensor:
-    """Shared half-width rotation buffer for RoPE.
-
-    Keyed by ``(shape, dtype, device)`` per D6. An inference-mode buffer
-    is rebuilt for grad-mode callers.
-    """
     key = (tuple(x_lo.shape), x_lo.dtype, x_lo.device)
     return _lru_scratch_buffer(_ROPE_HALF_SCRATCH_CACHE,
                                _ROPE_HALF_SCRATCH_MAX_ENTRIES, key,
@@ -37,16 +30,10 @@ def _rope_half_scratch(x_lo: torch.Tensor) -> torch.Tensor:
 
 
 def clear_logit_scratch_cache() -> None:
-    """Release the cached logit scratch buffers when a stats window ends."""
     _LOGIT_SCRATCH_CACHE.clear()
 
 
 def _skip_init(module_cls, *args, **kwargs):
-    """``skip_init`` that honors the ambient default device.
-
-    ``scripts/ablation.py`` builds models under ``torch.device('meta')`` to
-    read config only, so modules stay on the ambient default device.
-    """
     device = torch.get_default_device()
     if device.type == "meta":
         with torch.device("meta"):
@@ -55,12 +42,6 @@ def _skip_init(module_cls, *args, **kwargs):
 
 
 def _make_linear(in_features: int, out_features: int, bias: bool, skip: bool) -> nn.Linear:
-    """``nn.Linear`` with optional skip of constructor initialization.
-
-    ``GPT.__init__`` re-initializes all Linear via ``_init_weights`` after
-    construction, so constructor draws are overwritten; when skip is True,
-    build with uninitialised storage via ``skip_init``.
-    """
     if skip:
         return _skip_init(nn.Linear, in_features, out_features, bias=bias)
     return nn.Linear(in_features, out_features, bias=bias)

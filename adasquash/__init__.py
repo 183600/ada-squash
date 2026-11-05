@@ -209,31 +209,26 @@ from .utils import (
 __version__ = "0.1.0"
 
 __all__ = [
-    # Data-processing audit and sensitivity.
     "DATA_AUDIT_LOG_SCHEMA",
-    # Benchmark decontamination.
     "DEFAULT_NGRAM_SIZE",
     "EXECUTION_IDENTITY_KEYS",
     "GPT",
+    "GPTConfig",
+    "LayerConfig",
     "NAN_TRIAGE_ORDER",
-    # Normalization family and public math entry points.
     "NORM_REGISTRY",
     "RUN_MANIFEST_SCHEMA",
     "STUDY_BUDGET_SCHEMA",
-    # Instrumentation.
+    "QKSquash",
     "ActivationStats",
-    # Assumption diagnostics.
     "AssumptionCheck",
     "AssumptionReport",
     "BayesDecisionRule",
-    # Analyst blinding.
     "BlindedAnalysis",
     "BlindingKey",
     "CalibrationReport",
     "CalibrationResult",
-    # Simulation-based calibration.
     "CalibrationScenario",
-    # Model and attention.
     "CausalSelfAttention",
     "CumulativeMetaAnalysis",
     "DataAuditEntry",
@@ -252,27 +247,21 @@ __all__ = [
     "DyTS",
     "EstimationLoss",
     "FileDrawerReport",
-    "GPTConfig",
     "GradeAssessment",
     "KurtosisMeter",
-    "LayerConfig",
     "LayerNorm",
     "LivingMetaAnalysis",
-    # Decision-theoretic framework.
     "LossFunction",
     "LossSpikeCounter",
     "MaxAbsMeter",
+    "MLP",
     "NgramIndex",
-    # Pre-registration.
     "Preregistration",
     "PreregistrationRegistry",
     "RMSNorm",
     "SensitivityCheck",
-    # Sensitivity analysis.
     "SensitivityReport",
-    # Cross-study cumulative meta-analysis.
     "StudyEffect",
-    # Publication bias / file-drawer tracking.
     "StudyRecord",
     "StudyRegistry",
     "ThresholdDecisionRule",
@@ -287,7 +276,6 @@ __all__ = [
     "audit_step",
     "beggs_test",
     "blind_arms",
-    # Experimental design.
     "block_randomized_schedule",
     "build_gpt_124m",
     "build_gpt_350m",
@@ -323,11 +311,10 @@ __all__ = [
     "default_exclusion_policy",
     "design_readiness_audit",
     "deterministic_algorithms_context",
-    # Diagnostics and efficiency accounting.
     "diagnose_train_val_curve",
     "document_length_buckets",
     "document_length_tvd",
-    "effect_size_sensitivity",
+    "effectiveness_verdict",
     "efficiency_verdict",
     "eggers_test",
     "environment_info",
@@ -375,7 +362,6 @@ __all__ = [
     "seed_worker",
     "sequential_monitor",
     "sequential_paired_audit",
-    # Reproducibility.
     "set_all_seeds",
     "simulate_paired_design",
     "split_position_robustness",

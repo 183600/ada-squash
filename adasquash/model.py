@@ -64,15 +64,10 @@ _CROSSENTROPY_CHUNK_BYTES = 1 << 27
 _CROSS_ENTROPY_FAST_PATH_BYTES = 1 << 23
 _CROSS_ENTROPY_CHUNK_ROWS_CACHE: dict[int, int] = {}
 _CE_SCRATCH_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
-# At most one shape pair is live at a time: the fp32 accumulator plus (under
-# autocast) its low-precision cast twin.
 _CE_SCRATCH_MAX_ENTRIES = 2
 
-def _cross_entropy_chunk_rows(vocab_size: int) -> int:
-    """Chunk size for cross-entropy computation, keyed by vocabulary size.
 
-    The chunk size is capped so the scratch buffer fits within ``_CROSSENTROPY_CHUNK_BYTES``.
-    """
+def _cross_entropy_chunk_rows(vocab_size: int) -> int:
     if vocab_size not in _CROSS_ENTROPY_CHUNK_ROWS_CACHE:
         row_bytes = max(1, vocab_size) * 4
         _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
@@ -80,12 +75,8 @@ def _cross_entropy_chunk_rows(vocab_size: int) -> int:
 
 _FUSED_LINEAR_CHUNK_ROWS_CACHE: dict[tuple, int] = {}
 
-def _fused_linear_chunk_rows(chunk_rows: int, vocab: int, dt: torch.dtype, acc: torch.dtype) -> int:
-    """Cap a fused-CE chunk at the row-block size.
 
-    The fused loss can hold the low-precision logits plus their accumulator
-    image at the same time, so the chunk accounts for both.
-    """
+def _fused_linear_chunk_rows(chunk_rows: int, vocab: int, dt: torch.dtype, acc: torch.dtype) -> int:
     key = (vocab, dt, acc)
     if key not in _FUSED_LINEAR_CHUNK_ROWS_CACHE:
         element_bytes = torch.finfo(acc).bits // 8
@@ -95,60 +86,44 @@ def _fused_linear_chunk_rows(chunk_rows: int, vocab: int, dt: torch.dtype, acc: 
         _FUSED_LINEAR_CHUNK_ROWS_CACHE[key] = cap
     return min(chunk_rows, _FUSED_LINEAR_CHUNK_ROWS_CACHE[key])
 
-def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tensor:
-    """Reusable scratch buffer for chunked cross-entropy.
 
-    The buffer is keyed by ``(rows, vocab, dtype, device)`` and is private
-    to the forward/backward sweeps; it is never returned or saved for backward.
-    """
+def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tensor:
     key = (rows, vocab, dtype, device)
     return _lru_scratch_buffer(_CE_SCRATCH_CACHE, _CE_SCRATCH_MAX_ENTRIES,
                                key, (rows, vocab), dtype, device)
 
+
 def clear_ce_scratch_cache() -> None:
-    """Release the cached CE scratch buffers when switching models / ending a run."""
     _CE_SCRATCH_CACHE.clear()
 
-# Autocast weight casts for the custom kernels, keyed by identity + version.
-# `_version` bumps on every in-place update, so an optimizer step can never
-# leave a stale cast behind. Each entry keeps a strong reference to its
-# source weight (the guard the RoPE table cache uses): the storage address
-# in the key can then never be recycled by a *different* model's parameter,
-# and the identity check rejects a same-address / same-version collision
-# outright.
 _CAST_WEIGHT_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _CAST_WEIGHT_CACHE_BYTES = 0
 _CAST_WEIGHT_CACHE_MAX_BYTES = 1 << 28
 
+
 def clear_cast_weight_cache() -> None:
-    """Release the cached autocast weight casts (model switch / run end)."""
     global _CAST_WEIGHT_CACHE_BYTES
     _CAST_WEIGHT_CACHE.clear()
     _CAST_WEIGHT_CACHE_BYTES = 0
 
+
 def _cast_entry_bytes(entry: tuple) -> int:
-    """Byte size of a cached weight cast entry."""
     cast = entry[1]
     return cast.numel() * cast.element_size()
+
 
 def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     global _CAST_WEIGHT_CACHE_BYTES
     if w.dtype == dt:
         return w
     key = (w.data_ptr(), w._version, dt, w.device)
-    # An inference-mode cast cannot be saved for backward; a grad-mode
-    # forward has to rebuild it (the key and the values are unchanged).
     entry = _CAST_WEIGHT_CACHE.get(key)
     if entry is not None and entry[0] is w and entry[1].shape == w.shape and not _inference_stale(entry[1]):
         return entry[1]
     nbytes = w.numel() * (torch.finfo(dt).bits // 8)
     if nbytes > _CAST_WEIGHT_CACHE_MAX_BYTES:
-        # A single cast larger than the cache capacity (e.g. the 1B CE
-        # weight) is used directly instead of being cached.
         return w.to(dt)
     if entry is not None:
-        # Stale same-key entry (collided identity or an inference cast):
-        # the replacement gives back the bytes it shadows.
         _CAST_WEIGHT_CACHE_BYTES -= _cast_entry_bytes(entry)
     if _CAST_WEIGHT_CACHE_BYTES + nbytes > _CAST_WEIGHT_CACHE_MAX_BYTES:
         _CAST_WEIGHT_CACHE.clear()
@@ -158,16 +133,11 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     _CAST_WEIGHT_CACHE_BYTES += nbytes
     return got
 
-# All statistic-free squashing norms (share the ``beta`` affine switch).
-# Factorial cells: {scalar, per-channel} alpha x {tanh, softsign}, plus
-# depth-conditioned variants and their depth-*init* controls.
+
 _DYT_FAMILY = ("dyt", "dyts", "dytp", "dytc", "dytd", "dytd_tanh",
                "dytdi", "dytcd", "dytcd_tanh", "dytcdi")
-# Norms whose alpha follows (alpha_0, k) at construction time.
 _DEPTH_REPARAM = ("dytd", "dytd_tanh", "dytcd", "dytcd_tanh")
-# Depth-family norms that accept (layer_idx, num_layers, alpha_0, k_init).
 _DEPTH_FAMILY = (*_DEPTH_REPARAM, "dytdi", "dytcdi")
-# Norms parameterized by the generalized-softsign exponent p.
 _SOFTSIGN_P = ("dyts", "dytc", "dytcd", "dytcdi")
 
 def build_norm_kwargs(cfg: GPTConfig, layer_idx: int = 0,
