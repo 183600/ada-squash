@@ -675,7 +675,7 @@ class _DyTCForward(torch.autograd.Function):
                 grad_alpha = _reduce_products(grad_x_scaled, x)
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha)
-        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[4])
+        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[3])
         return (grad_x, grad_alpha, grad_p, grad_gamma, grad_beta)
 
 @register_norm("dytd")
@@ -881,7 +881,7 @@ class _DyTCDForward(torch.autograd.Function):
                             grad_k = -grad_scale * scale * depth_ratio
             if ctx.needs_input_grad[0]:
                 grad_x = grad_x_scaled.mul_(alpha_c)
-        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[6])
+        grad_beta = _grad_beta(beta, grad_out, ctx.needs_input_grad[5])
         return (grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None)
 
 @register_norm("dytcd_tanh")
