@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils import skip_init
 
+from ._caching import _inference_stale, _lru_scratch_buffer
 from .norms import QKSquash, _RMSNorm
 
 # Cache configurations
@@ -30,17 +31,9 @@ def _rope_half_scratch(x_lo: torch.Tensor) -> torch.Tensor:
     is rebuilt for grad-mode callers.
     """
     key = (tuple(x_lo.shape), x_lo.dtype, x_lo.device)
-    buf = _ROPE_HALF_SCRATCH_CACHE.get(key)
-    if buf is not None and buf.is_inference() and (not torch.is_inference_mode_enabled()):
-        buf = None
-    if buf is None:
-        buf = torch.empty(x_lo.shape, dtype=x_lo.dtype, device=x_lo.device)
-        if len(_ROPE_HALF_SCRATCH_CACHE) >= _ROPE_HALF_SCRATCH_MAX_ENTRIES:
-            _ROPE_HALF_SCRATCH_CACHE.popitem(last=False)
-        _ROPE_HALF_SCRATCH_CACHE[key] = buf
-    else:
-        _ROPE_HALF_SCRATCH_CACHE.move_to_end(key)
-    return buf
+    return _lru_scratch_buffer(_ROPE_HALF_SCRATCH_CACHE,
+                               _ROPE_HALF_SCRATCH_MAX_ENTRIES, key,
+                               x_lo.shape, x_lo.dtype, x_lo.device)
 
 
 def clear_logit_scratch_cache() -> None:
@@ -161,12 +154,8 @@ class CausalSelfAttention(nn.Module):
         """
         key = (T, device)
         cache = self._tril_cache
-        if cache is not None and cache[0] == key:
-            mask = cache[1]
-            if mask.is_inference() and (not torch.is_inference_mode_enabled()):
-                mask = None
-            else:
-                return mask
+        if cache is not None and cache[0] == key and not _inference_stale(cache[1]):
+            return cache[1]
         mask = _TRIL_MASK_CACHE.get(key)
         if mask is None:
             ij = torch.arange(T, device=device)
@@ -191,19 +180,10 @@ class CausalSelfAttention(nn.Module):
         is never materialised at once.
         """
         key = (B, H, R, T, dtype, device)
-        buf = _LOGIT_SCRATCH_CACHE.get(key)
-        if buf is not None and buf.is_inference() and (not torch.is_inference_mode_enabled()):
-            buf = None
-        if buf is None:
-            # Flat scratch for the whole sweep; each row block views a
-            # contiguous prefix of the shape it needs.
-            buf = torch.empty(B * H * R * T, dtype=dtype, device=device)
-            if len(_LOGIT_SCRATCH_CACHE) >= _LOGIT_SCRATCH_MAX_ENTRIES:
-                _LOGIT_SCRATCH_CACHE.popitem(last=False)
-            _LOGIT_SCRATCH_CACHE[key] = buf
-        else:
-            _LOGIT_SCRATCH_CACHE.move_to_end(key)
-        return buf
+        # Flat scratch for the whole sweep; each row block views a
+        # contiguous prefix of the shape it needs.
+        return _lru_scratch_buffer(_LOGIT_SCRATCH_CACHE, _LOGIT_SCRATCH_MAX_ENTRIES,
+                                   key, (B * H * R * T,), dtype, device)
 
     def _logit_stats(self, q: torch.Tensor, k: torch.Tensor, scale: float, T: int, device) -> dict:
         """Compute per-batch logit statistics over the causal triangle.
@@ -297,7 +277,7 @@ class CausalSelfAttention(nn.Module):
             # unchanged; the stored table's source version proves the cached
             # cos/sin still match its content.
             entry = None
-        if entry is not None and entry[1].is_inference() and (not torch.is_inference_mode_enabled()):
+        if entry is not None and _inference_stale(entry[1]):
             # A table built under ``inference_mode`` cannot be saved for
             # backward; a later grad-mode forward through this module has to
             # get normal tables.
@@ -336,7 +316,7 @@ def _rope_table_entry(freqs_cis: torch.Tensor):
         # must invalidate the cached cos/sin even though the D6 storage-pointer
         # key is unchanged.
         entry = None
-    if entry is not None and entry[1].is_inference() and (not torch.is_inference_mode_enabled()):
+    if entry is not None and _inference_stale(entry[1]):
         # Inference-mode tables are immutable constants: they cannot be saved
         # for backward, so grad-mode callers need a normal rebuild (the key
         # and the values are unchanged).
@@ -360,7 +340,7 @@ def _rope_pair_for_dtype(entry, dtype: torch.dtype):
     """
     tables = entry[3]
     got = tables.get(dtype)
-    if got is not None and got[0].is_inference() and (not torch.is_inference_mode_enabled()):
+    if _inference_stale(got[0] if got is not None else None):
         got = None
     if got is None:
         cos, sin = (entry[1], entry[2])

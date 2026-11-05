@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ._caching import _inference_stale, _lru_scratch_buffer
 from .attention import CausalSelfAttention, _make_linear, _skip_init
 from .norms import DyTCD, DyTCDTanh, DyTD, DyTDTanh, _reduce_products, build_norm
 
@@ -101,17 +102,8 @@ def _ce_scratch(rows: int, vocab: int, dtype: torch.dtype, device) -> torch.Tens
     to the forward/backward sweeps; it is never returned or saved for backward.
     """
     key = (rows, vocab, dtype, device)
-    buf = _CE_SCRATCH_CACHE.get(key)
-    if buf is not None and buf.is_inference() and (not torch.is_inference_mode_enabled()):
-        buf = None
-    if buf is None:
-        buf = torch.empty(rows, vocab, dtype=dtype, device=device)
-        if len(_CE_SCRATCH_CACHE) >= _CE_SCRATCH_MAX_ENTRIES:
-            _CE_SCRATCH_CACHE.popitem(last=False)
-        _CE_SCRATCH_CACHE[key] = buf
-    else:
-        _CE_SCRATCH_CACHE.move_to_end(key)
-    return buf
+    return _lru_scratch_buffer(_CE_SCRATCH_CACHE, _CE_SCRATCH_MAX_ENTRIES,
+                               key, (rows, vocab), dtype, device)
 
 def clear_ce_scratch_cache() -> None:
     """Release the cached CE scratch buffers when switching models / ending a run."""
@@ -144,11 +136,11 @@ def _cast_weight_cached(w: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     if w.dtype == dt:
         return w
     key = (w.data_ptr(), w._version, dt, w.device)
+    # An inference-mode cast cannot be saved for backward; a grad-mode
+    # forward has to rebuild it (the key and the values are unchanged).
     entry = _CAST_WEIGHT_CACHE.get(key)
-    if entry is not None and entry[0] is w and entry[1].shape == w.shape and not (entry[1].is_inference() and (not torch.is_inference_mode_enabled())):
+    if entry is not None and entry[0] is w and entry[1].shape == w.shape and not _inference_stale(entry[1]):
         return entry[1]
-        # An inference-mode cast cannot be saved for backward; a grad-mode
-        # forward has to rebuild it (the key and the values are unchanged).
     nbytes = w.numel() * (torch.finfo(dt).bits // 8)
     if nbytes > _CAST_WEIGHT_CACHE_MAX_BYTES:
         # A single cast larger than the cache capacity (e.g. the 1B CE
@@ -408,7 +400,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         acc = _loss_acc_dtype(dt)
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
-        _, weight_dtype = ctx.in_dtypes
+        weight_dtype = ctx.in_dtypes[1]
         chunk_rows = ctx.chunk_rows
         grad_h = torch.empty_like(h) if need_h else None
         grad_h_tmp = None
@@ -425,7 +417,6 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         grad_w_tmp = None
         grad_w = None
         if need_w:
-            weight_dtype = ctx.in_dtypes[1]
             low_precision = weight_dtype in (torch.bfloat16, torch.float16)
             grad_w_dtype = weight_dtype if low_precision else acc
             grad_w = torch.empty_like(w, dtype=grad_w_dtype)

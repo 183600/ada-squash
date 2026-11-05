@@ -3,11 +3,12 @@ from __future__ import annotations
 import math
 import numbers
 from collections import OrderedDict, defaultdict, deque
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 from torch import nn
 
+from ._caching import _inference_stale
 from ._validation import is_boolean_scalar as _is_boolean_scalar
 
 
@@ -50,8 +51,7 @@ class MaxAbsMeter:
                 # A peak tensor created under torch.inference_mode() cannot be
                 # updated in place once the meter is used outside it. Cloning
                 # drops the inference flag while keeping the running maximum.
-                if (self._peak is not None and self._peak.is_inference()
-                        and not torch.is_inference_mode_enabled()):
+                if _inference_stale(self._peak):
                     self._peak = self._peak.clone()
                 if self._peak is None:
                     self._peak = v.clone()
@@ -75,8 +75,7 @@ def _kurtosis_workspace_get_or_create(key: tuple, n: int, dtype: torch.dtype, de
     # A workspace allocated under torch.inference_mode() becomes an inference
     # tensor; reusing it as an `out=` target outside that mode raises. It is
     # only scratch, so drop it and allocate a normal buffer instead.
-    stale_inference = (buf is not None and buf.is_inference()
-                       and not torch.is_inference_mode_enabled())
+    stale_inference = _inference_stale(buf)
     if buf is None or buf.numel() < n or stale_inference:
         buf = torch.empty(n, dtype=dtype, device=device)
         if len(_KURTOSIS_WORKSPACES) >= _KURTOSIS_WORKSPACES_MAX_ENTRIES:

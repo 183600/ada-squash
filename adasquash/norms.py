@@ -97,7 +97,11 @@ def _sum_leading_dims(t: torch.Tensor) -> torch.Tensor:
     if t.ndim <= 1:
         return t.clone()
     return t.sum(dim=tuple(range(t.ndim - 1)))
+
+
+# Row-block element budget of the chunked product-sum reduction.
 _REDUCE_CHUNK_ELEMS = 1 << 22
+
 
 def _chunked_product_sum(a2: torch.Tensor, b2: torch.Tensor, step: int, acc_dtype: torch.dtype) -> torch.Tensor:
     """Row-chunked sum of products ``a * b`` accumulated in ``acc_dtype``.
@@ -131,26 +135,24 @@ def _chunked_reduce_product(a: torch.Tensor, b: torch.Tensor, chunk_elems: int) 
     Handles contiguous and non-contiguous inputs, using float32 accumulation
     for bfloat16/float16 inputs to avoid overflow in the reduction.
     """
-    if a.ndim == 2 and a.is_contiguous() and b.is_contiguous() and a.numel() <= chunk_elems:
+    contiguous = a.is_contiguous() and b.is_contiguous()
+    if a.ndim == 2 and contiguous and a.numel() <= chunk_elems:
         acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
         return (a * b).sum(dim=0, dtype=acc).to(a.dtype)
-    if a.is_contiguous() and b.is_contiguous():
-        rows = a.numel() // a.shape[-1]
-        step = max(1, chunk_elems // max(1, a.shape[-1]))
-        if rows <= step:
-            return _sum_leading_dims(a * b)
-        acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
-        total = _chunked_product_sum(a.view(rows, -1), b.view(rows, -1), step, acc_dtype)
-        if total.dtype != a.dtype:
-            total = total.to(a.dtype)
-        return total
     rows = a.numel() // a.shape[-1]
     step = max(1, chunk_elems // max(1, a.shape[-1]))
+    if contiguous and rows <= step:
+        return _sum_leading_dims(a * b)
     acc_dtype = torch.promote_types(a.dtype, torch.float32) if a.dtype in (torch.bfloat16, torch.float16) else a.dtype
-    total = _chunked_product_sum(a.reshape(rows, -1), b.reshape(rows, -1), step, acc_dtype)
+    # ``view`` keeps the contiguous path zero-copy; non-contiguous inputs
+    # flatten through ``reshape`` (same values and row order).
+    a2 = a.view(rows, -1) if contiguous else a.reshape(rows, -1)
+    b2 = b.view(rows, -1) if contiguous else b.reshape(rows, -1)
+    total = _chunked_product_sum(a2, b2, step, acc_dtype)
     if total.dtype != a.dtype:
         total = total.to(a.dtype)
     return total
+
 
 def _effective_decay_rate(k, k_min):
     """Depth-decay rate, optionally floored at ``k_min``.
@@ -183,8 +185,8 @@ def _dot_all(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.dot(a.reshape(-1), b.reshape(-1))
     return (a * b).sum()
 
-def register_norm(name: str):
 
+def register_norm(name: str):
     def _decorator(cls):
         NORM_REGISTRY[name] = cls
         cls._norm_name = name
@@ -311,6 +313,39 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
         red = red.to(p.dtype)
     return red.reshape(p.shape)
 
+
+def _softsign_affine_grads(x: torch.Tensor, p, p_raw, grad_out: torch.Tensor,
+                           gamma: torch.Tensor, scale, need_softsign: bool,
+                           need_p_grad: bool, need_gamma_grad: bool,
+                           scale_nonneg: bool = False):
+    """Shared recomputation + phi-chained gradients of the affine softsign kernels.
+
+    The per-channel (``_DyTCForward``), scalar-alpha (``_DyTSForward``) and
+    depth-conditioned (``_DyTCDForward``) kernels share this backward block:
+    the softsign pieces are recomputed from ``x``, and the exponent and
+    ``gamma`` cotangents chain through the squashed output ``phi`` when either
+    is requested. ``scale`` is the alpha entering the softsign (per-channel or
+    scalar); ``scale_nonneg`` marks a scale known to be non-negative (DyT-CD).
+
+    Returns ``(g, grad_p, grad_gamma)``; ``g`` is the input-side cotangent
+    factor and is ``None`` unless ``need_softsign``.
+    """
+    g = phi = a = None
+    need_phi = need_p_grad or need_gamma_grad
+    if need_softsign or need_phi:
+        g, phi, a = _softsign_backward_pieces(
+            x, p, need_p_grad, need_phi, need_softsign, scale, scale_nonneg)
+    grad_p = grad_gamma = None
+    if need_phi:
+        grad_phi = phi.mul_(grad_out)
+        if need_gamma_grad:
+            grad_gamma = _sum_leading_dims(grad_phi)
+        if need_p_grad:
+            grad_p = _softsign_p_grad(grad_phi, a, p, p_raw, gamma)
+        del phi, a, grad_phi
+    return g, grad_p, grad_gamma
+
+
 def _floor_exponent(p):
     """Apply the D2 exponent floor and return both effective and raw forms.
 
@@ -431,8 +466,14 @@ class _SquashedAffine(nn.Module):
     """
     pass
 
+
 def _init_depth_schedule(module, layer_idx, num_layers, alpha_0, k_init,
                          learnable_k, k_min):
+    """Set the depth-schedule attributes shared by the depth-conditioned norms.
+
+    ``k`` becomes an ``nn.Parameter`` when ``learnable_k`` is set and a
+    registered (non-persistent) buffer otherwise.
+    """
     module.layer_idx = layer_idx
     module.num_layers = max(1, num_layers)
     module._depth_ratio = float(layer_idx) / float(module.num_layers)
@@ -442,6 +483,26 @@ def _init_depth_schedule(module, layer_idx, num_layers, alpha_0, k_init,
     else:
         module.register_buffer("k", torch.tensor(float(k_init)))
     module.k_min = k_min
+
+
+class _DepthScheduledNorm(_SquashedAffine):
+    """Shared depth-schedule accessors of the depth-conditioned norms.
+
+    Concrete subclasses receive their schedule attributes from
+    :func:`_init_depth_schedule` and evaluate the depth law
+    ``alpha_l = alpha_0 * exp(-k * depth_ratio)`` through these accessors,
+    with ``depth_ratio = layer_idx / num_layers``.
+    """
+
+    def _k_effective(self):
+        """The decay rate ``k`` floored at ``k_min`` (``None`` keeps it raw)."""
+        return _effective_decay_rate(self.k, self.k_min)
+
+    @property
+    def alpha_l(self) -> torch.Tensor:
+        """Scalar depth-schedule alpha evaluated at this module's depth."""
+        return _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
+
 
 class _GeneralizedSoftsign(torch.autograd.Function):
     """``phi_p(x) = x / (1 + |x|^p)^(1/p)`` as one autograd node.
@@ -602,20 +663,10 @@ class _DyTCForward(torch.autograd.Function):
         need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
         need_gamma_grad = ctx.needs_input_grad[3]
-        need_phi = need_p_grad or need_gamma_grad
-        phi = None
-        a = None
-        if need_softsign or need_phi:
-            g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha)
+        g, grad_p, grad_gamma = _softsign_affine_grads(
+            x, p, p_raw, grad_out, gamma, alpha,
+            need_softsign, need_p_grad, need_gamma_grad)
         p_val = _as_scalar_exponent(p)
-        grad_p = grad_gamma = None
-        if need_phi:
-            grad_phi = phi.mul_(grad_out)
-            if need_gamma_grad:
-                grad_gamma = _sum_leading_dims(grad_phi)
-            if need_p_grad:
-                grad_p = _softsign_p_grad(grad_phi, a, p, p_raw, gamma)
-            del phi, a, grad_phi
         grad_x = grad_alpha = None
         if need_softsign:
             grad_x_scaled = _as_scalar_exponent_inplace(g, p_val)
@@ -628,7 +679,7 @@ class _DyTCForward(torch.autograd.Function):
         return (grad_x, grad_alpha, grad_p, grad_gamma, grad_beta)
 
 @register_norm("dytd")
-class DyTD(_SquashedAffine):
+class DyTD(_DepthScheduledNorm):
     """Depth-conditioned tanh norm: ``gamma * tanh(alpha_l * x) (+ beta)``.
 
     The depth schedule ``alpha_l = alpha_0 * exp(-k * l / L)`` is evaluated
@@ -643,13 +694,6 @@ class DyTD(_SquashedAffine):
                              learnable_k, k_min)
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
-
-    def _k_effective(self):
-        return _effective_decay_rate(self.k, self.k_min)
-
-    @property
-    def alpha_l(self) -> torch.Tensor:
-        return _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _DyTDForward.apply(x, self.alpha_0, self._k_effective(), self.gamma, self.beta, self._depth_ratio)
@@ -687,7 +731,7 @@ class _DyTDForward(torch.autograd.Function):
         return (grad_x, grad_alpha_0, grad_k, grad_gamma, grad_beta, None)
 
 @register_norm("dytd_tanh")
-class DyTDTanh(_SquashedAffine):
+class DyTDTanh(_DepthScheduledNorm):
     """Ablation control: DyT-D with plain autograd tanh (not fused kernel).
 
     Same depth schedule as ``DyTD`` (``alpha_l = alpha_0 * exp(-k * l/L)``),
@@ -706,13 +750,6 @@ class DyTDTanh(_SquashedAffine):
                              learnable_k, k_min)
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
-
-    def _k_effective(self):
-        return _effective_decay_rate(self.k, self.k_min)
-
-    @property
-    def alpha_l(self) -> torch.Tensor:
-        return _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi = torch.tanh(self.alpha_l * x)
@@ -755,7 +792,7 @@ class _DyTForward(torch.autograd.Function):
         return (grad_x, grad_alpha, grad_gamma, grad_beta)
 
 @register_norm("dytcd")
-class DyTCD(_SquashedAffine):
+class DyTCD(_DepthScheduledNorm):
     """Main proposal: per-channel alpha scaled by depth-conditioned schedule, softsign activation.
 
     ``alpha_c = alpha_0 * exp(-k * l / L) * (1 + delta)``, floored at ``_MIN_ALPHA``.
@@ -775,11 +812,9 @@ class DyTCD(_SquashedAffine):
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
-    def _k_effective(self):
-        return _effective_decay_rate(self.k, self.k_min)
-
     @property
     def alpha_per_channel(self) -> torch.Tensor:
+        """Per-channel alpha: the depth-schedule scale modulated by ``delta``."""
         scale = _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
         return torch.addcmul(scale, scale, self.delta).clamp_(min=_MIN_ALPHA)
 
@@ -817,23 +852,14 @@ class _DyTCDForward(torch.autograd.Function):
         exp_kdr = saved[7]
         depth_ratio = ctx.depth_ratio
         p, p_raw = _restore_exponent(ctx, saved, 8)
-        need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or ctx.needs_input_grad[2] or ctx.needs_input_grad[3]
+        need_softsign = (ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+                         or ctx.needs_input_grad[2] or ctx.needs_input_grad[3])
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[4]
         need_gamma_grad = ctx.needs_input_grad[5]
-        need_phi = need_p_grad or need_gamma_grad
-        phi = None
-        a = None
-        if need_softsign or need_phi:
-            g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha_c, scale_nonneg=True)
+        g, grad_p, grad_gamma = _softsign_affine_grads(
+            x, p, p_raw, grad_out, gamma, alpha_c,
+            need_softsign, need_p_grad, need_gamma_grad, scale_nonneg=True)
         p_val = _as_scalar_exponent(p)
-        grad_p = grad_gamma = None
-        if need_phi:
-            grad_phi = phi.mul_(grad_out)
-            if need_gamma_grad:
-                grad_gamma = _sum_leading_dims(grad_phi)
-            if need_p_grad:
-                grad_p = _softsign_p_grad(grad_phi, a, p, p_raw, gamma)
-            del phi, a, grad_phi
         grad_x = grad_alpha_0 = grad_k = grad_delta = None
         if need_softsign:
             grad_x_scaled = _as_scalar_exponent_inplace(g, p_val)
@@ -859,7 +885,7 @@ class _DyTCDForward(torch.autograd.Function):
         return (grad_x, grad_alpha_0, grad_k, grad_delta, grad_p, grad_gamma, grad_beta, None)
 
 @register_norm("dytcd_tanh")
-class DyTCDTanh(_SquashedAffine):
+class DyTCDTanh(_DepthScheduledNorm):
     """Ablation control: DyT-CD with tanh instead of softsign (plain autograd).
 
     Same per-channel alpha by depth schedule as ``DyTCD``, same ``gamma``/``beta``,
@@ -879,17 +905,17 @@ class DyTCDTanh(_SquashedAffine):
         self.gamma = nn.Parameter(torch.ones(dim))
         self.beta = nn.Parameter(torch.zeros(dim)) if beta else None
 
-    def _k_effective(self):
-        return _effective_decay_rate(self.k, self.k_min)
-
     @property
     def alpha_per_channel(self) -> torch.Tensor:
+        """Per-channel alpha: the depth-schedule scale modulated by ``delta``."""
         scale = _depth_alpha(self.alpha_0, self._k_effective(), self._depth_ratio)
         return torch.addcmul(scale, scale, self.delta).clamp(min=_MIN_ALPHA)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi = torch.tanh(self.alpha_per_channel * x)
         return phi * self.gamma if self.beta is None else phi * self.gamma + self.beta
+
+
 @register_norm("dyts")
 class DyTS(_SquashedAffine):
     """Scalar-alpha generalized softsign, completing the factorial design.
@@ -934,20 +960,10 @@ class _DyTSForward(torch.autograd.Function):
         need_softsign = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
         need_p_grad = ctx.need_p_grad and ctx.needs_input_grad[2]
         need_gamma_grad = ctx.needs_input_grad[3]
-        need_phi = need_p_grad or need_gamma_grad
-        phi = None
-        a = None
-        if need_softsign or need_phi:
-            g, phi, a = _softsign_backward_pieces(x, p, need_p_grad, need_phi, need_softsign, alpha)
+        g, grad_p, grad_gamma = _softsign_affine_grads(
+            x, p, p_raw, grad_out, gamma, alpha,
+            need_softsign, need_p_grad, need_gamma_grad)
         p_val = _as_scalar_exponent(p)
-        grad_p = grad_gamma = None
-        if need_phi:
-            grad_phi = phi.mul_(grad_out)
-            if need_gamma_grad:
-                grad_gamma = _sum_leading_dims(grad_phi)
-            if need_p_grad:
-                grad_p = _softsign_p_grad(grad_phi, a, p, p_raw, gamma)
-            del phi, a, grad_phi
         grad_x = grad_alpha = None
         if need_softsign:
             # The ``log2``/``exp2`` form is used for both representations of
@@ -1037,6 +1053,7 @@ class DyTCDI(DyTC):
         ratio = float(layer_idx) / float(max(1, num_layers))
         super().__init__(dim, alpha_init=float(alpha_0) * math.exp(-float(k_init) * ratio),
                          p_init=p_init, learnable_p=learnable_p, beta=beta, alpha_jitter=0.0)
+
 
 class _QKSquashTanh(torch.autograd.Function):
     """Apply ``tanh(alpha * Q)`` and ``tanh(alpha * K)`` as a fused kernel.
