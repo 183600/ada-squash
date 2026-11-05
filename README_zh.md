@@ -82,31 +82,38 @@ pip install lm-eval
 
 ### 健全性测试
 
-运行全量套件：
+运行完整测试套件：
 
 ```bash
 python -m pytest tests/ -q
 ```
 
-覆盖形状/dtype 保持、softsign 有界性、深度调度单调性、QK 压缩 logit
-上界、checkpoint 往返、指标实现，以及——由于本仓库每个归一化层都是手写
-autograd kernel——把每个 kernel 与普通 autograd 的独立重组逐参数对拍，
-且从*随机化*参数集出发，避免在 `gamma=1, beta=0` 初始化下对拍流于形式。
+测试包括：
+- 形状和数据类型保持
+- Softsign 输出在 [-1, 1] 有界
+- 深度调度单调性
+- QK 压缩 logits 上界
+- Checkpoint 保存/加载往返
+- 指标实现正确性
+
+由于每个归一化层都是手写 autograd kernel，测试套件还包括对每个 kernel
+的 per-parameter 梯度与独立 autograd 重构的对拍，使用随机化参数集，
+避免在 `gamma=1, beta=0` 初始化时流于形式。
 
 编辑某个 kernel 时，可用 `python3 -m pytest tests/test_norms.py -q`
 获得更快的聚焦反馈；下方的完整 `python3 ci_gate.py` 仍是最终判定。
 
 ### 设计门禁
 
-固定设计决策见 [`docs/design_notes.md`](docs/design_notes.md)。改动
+固定设计决策见 [`docs/design_notes.md`](docs/design_notes.md)。在修改
 kernel 或模型后，运行与 CI 相同的门禁：
 
 ```bash
 python3 ci_gate.py
 ```
 
-它会解析全部 Python 文件、按源码检查 `【固定】` 设计项 D1–D6，然后运行
-完整的 `tests/` 套件。`--syntax-only` 只运行解析层。
+它会解析全部 Python 文件、按源码检查 `【固定】` 设计项 D1–D6，
+然后运行完整的 `tests/` 套件。`--syntax-only` 只运行解析层。
 
 ### 直接使用包
 
@@ -114,15 +121,15 @@ python3 ci_gate.py
 import torch
 from adasquash import GPT, GPTConfig, build_norm, generalized_softsign
 
-# 实例化单个归一化层。
+# 实例化归一化层。
 norm = build_norm("dytcd", dim=128)
 x = torch.randn(2, 8, 128)
-print(norm(x).shape)                    # torch.Size([2, 8, 128])
+print(norm(x).shape)  # torch.Size([2, 8, 128])
 
 # 广义 softsign 的公共入口（p=2 为平滑默认值）。
 print(generalized_softsign(torch.randn(4), 2.0))
 
-# 与实验使用相同 Block 与归一化接线的小型解码器。
+# 使用相同 Block 与归一化接线的最小解码器。
 cfg = GPTConfig(vocab_size=256, dim=128, n_layers=2, n_heads=4, max_seq_len=16)
 model = GPT(cfg)
 tokens = torch.randint(0, cfg.vocab_size, (2, 16))
@@ -180,19 +187,22 @@ python scripts/train_gpt2.py \
 ```
 
 用 `--resume <ckpt>.pt` 恢复中断的训练：模型、优化器、调度器、步数计数、
-**随机数状态**（torch / CUDA / python，dropout 像未中断一样继续）与
+**随机数状态**（torch / CUDA / python，dropout 持续以未中断方式进行）和
 **数据位置**（已消费的流式批数）全部恢复。默认会把 dataloader 快进跳过
 已消费的批——流式顺序相同，因此续跑看到*新鲜*数据而非重放语料开头；
 传 `--resume-skip-data` 可跳过快进（更快，但会重放训练数据——只有在
-不跨断点比较 PPL/验证曲线时才可接受）。定义调度的 flag
-（`--max-steps`、`--warmup`、`--min-lr-ratio`、`--lr`、`--weight-decay`、
-`--beta1` / `--beta2`、`--grad-clip`）也会从 checkpoint 读回——否则余弦
+不跨断点比较 PPL/验证曲线时才可接受）。
+
+调度定义 flag（`--max-steps`、`--warmup`、`--min-lr-ratio`、`--lr`、`--weight-decay`、
+`--beta1`/`--beta2`、`--grad-clip`）也会从 checkpoint 读回；否则余弦
 曲线会在训练中途被悄悄改变，因为 `load_state_dict` 只保留
-`last_epoch`。命令行里保持默认值的项被静默替换；显式输入的项被保留并
+`last_epoch`。命令行里保持默认值的项目被静默替换；显式输入的项目被保留并
 报告，这正是延长训练的方式（`--resume <ckpt> --max-steps <更大值>` 续跑
-余弦尾段而非截断）。loss-spike 计数器及其 EMA 基线也在 checkpoint 里，
-`n_loss_spikes` 跨断点继续累计而非清零。早于随机数/数据位置记录功能的
-checkpoint 会在恢复时明确说明这一点，而不是假装是精确续跑。
+余弦尾段而非截断）。
+
+loss-spike 计数器及其 EMA 基线也在 checkpoint 里，`n_loss_spikes` 跨断点
+继续累计而非清零。早于随机数/数据位置记录功能的 checkpoint 会在恢复时
+明确说明这一点，而不是假装是精确续跑。
 
 `<output-dir>/` 下的日志输出：
 - `train.jsonl`     - 逐步 loss / lr / 独立验证集 val_loss

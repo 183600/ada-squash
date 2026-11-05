@@ -75,12 +75,12 @@ from adasquash.metrics import (
     tost_design_summary,
     tost_paired,
 )
-from adasquash.results_analysis import enhance_comparison_report
 from adasquash.repro import (
     compare_train_streams,
     execution_identity_mismatches,
     training_recipe_mismatches,
 )
+from adasquash.results_analysis import enhance_comparison_report
 
 _LOSS_METRICS = ("final_val_loss", "best_val_loss", "test_loss")
 
@@ -1382,7 +1382,7 @@ def main(argv=None) -> None:
 
     if args.advanced_analysis:
         enhanced_output = output.with_suffix(".enhanced.json")
-        print(f"[arms] running advanced robustness analyses...")
+        print("[arms] running advanced robustness analyses...")
         try:
             enhance_comparison_report(str(output), str(enhanced_output))
             print(f"[arms] wrote enhanced report {enhanced_output}")

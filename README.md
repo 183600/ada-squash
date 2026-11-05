@@ -76,24 +76,30 @@ ada-squash/
 
 ```bash
 pip install -r requirements.txt
-# (optional) for downstream eval:
+# (optional) for downstream evaluation:
 pip install lm-eval
 ```
 
 ### Sanity tests
 
-Run the complete suite:
+Run the complete test suite:
 
 ```bash
 python -m pytest tests/ -q
 ```
 
-These cover shape/dtype preservation, softsign boundedness, depth schedule
-monotonicity, QK-squashing logit bounds, checkpoint round-trip, the metrics
-implementation, and — since every norm here is a hand-written autograd kernel
-— a per-parameter comparison of each kernel against an independent
-recomposition in plain autograd, run from a *randomized* parameter set so the
-check is not vacuous at the `gamma=1, beta=0` initialization.
+Tests cover:
+- Shape and dtype preservation
+- Softsign boundedness in [-1, 1]
+- Depth schedule monotonicity
+- QK-squashing logit bounds
+- Checkpoint save/load round-trip
+- Metrics implementation correctness
+
+Since every normalization layer is a hand-written autograd kernel,
+the test suite includes per-parameter gradient verification against an
+independent autograd recomposition, run from a *randomized* parameter set
+so the check is not vacuous at the `gamma=1, beta=0` initialization.
 
 While editing a kernel, `python3 -m pytest tests/test_norms.py -q` gives a
 focused feedback loop; the full `python3 ci_gate.py` run below remains the
@@ -119,15 +125,15 @@ parser layer.
 import torch
 from adasquash import GPT, GPTConfig, build_norm, generalized_softsign
 
-# Instantiate a single normalization layer.
+# Instantiate a normalization layer.
 norm = build_norm("dytcd", dim=128)
 x = torch.randn(2, 8, 128)
-print(norm(x).shape)                    # torch.Size([2, 8, 128])
+print(norm(x).shape)  # torch.Size([2, 8, 128])
 
-# Public entry point for the generalized softsign (p=2 is the smooth default).
+# Public entry point for the generalized softsign (p=2 is smooth default).
 print(generalized_softsign(torch.randn(4), 2.0))
 
-# Minimal decoder using the same block and norm wiring as the experiments.
+# Minimal decoder with the same block and norm wiring as experiments.
 cfg = GPTConfig(vocab_size=256, dim=128, n_layers=2, n_heads=4, max_seq_len=16)
 model = GPT(cfg)
 tokens = torch.randint(0, cfg.vocab_size, (2, 16))
@@ -186,25 +192,27 @@ python scripts/train_gpt2.py \
 
 Resume an interrupted run with `--resume <ckpt>.pt`; the model, optimizer,
 scheduler, step counter, **RNG states** (torch / CUDA / python, so dropout
-continues as if uninterrupted) and **data position** (number of stream
+continues as if uninterrupted), and **data position** (number of stream
 batches already consumed) are all restored. By default the dataloader is
 fast-forwarded past the consumed batches — same streaming order, so the
 resumed run trains on *fresh* data instead of replaying the beginning of
 the corpus; pass `--resume-skip-data` to skip the fast-forward (faster, but
 the run replays training data — only acceptable when you do not compare
-PPL/val curves across the resume). The schedule-defining flags
-(`--max-steps`, `--warmup`, `--min-lr-ratio`, `--lr`, `--weight-decay`,
-`--beta1` / `--beta2`, `--grad-clip`) are read back from the checkpoint as
-well -
-without them the cosine curve would be silently reshaped mid-run, since
-only `last_epoch` survives `load_state_dict`. Any that the command line
-leaves at its default are replaced silently; one you typed explicitly is
-kept and reported, which is how a finished run is extended
+PPL/val curves across the resume).
+
+Schedule-defining flags (`--max-steps`, `--warmup`, `--min-lr-ratio`,
+`--lr`, `--weight-decay`, `--beta1` / `--beta2`, `--grad-clip`) are read back
+from the checkpoint; without them the cosine curve would be silently reshaped
+mid-run, since only `last_epoch` survives `load_state_dict`. Any that the
+command line leaves at its default are replaced silently; one you typed
+explicitly is kept and reported, which is how a finished run is extended
 (`--resume <ckpt> --max-steps <larger>` continues the cosine tail instead
-of truncating it). The loss-spike counter and its EMA baseline are part of
-the checkpoint, so `n_loss_spikes` keeps counting across a resume rather
-than restarting. Checkpoints written before RNG/data-position tracking
-say so loudly on resume instead of pretending to be exact continuations.
+of truncating it).
+
+The loss-spike counter and its EMA baseline are part of the checkpoint, so
+`n_loss_spikes` keeps counting across a resume rather than restarting.
+Checkpoints written before RNG/data-position tracking announce this on
+resume instead of pretending to be exact continuations.
 
 Logged outputs in `<output-dir>/`:
 - `train.jsonl`     - per-step loss / lr / held-out val_loss

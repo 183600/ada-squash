@@ -23,10 +23,18 @@ def canonical_json_dumps(value, *, indent: int | None = None,
                          allow_nan: bool = True) -> str:
     """Serialize ``value`` deterministically.
 
-    ``allow_nan`` defaults to True to match Python's ``json.dump`` and keep
-    existing diagnostic reports writable.  Fingerprint callers should pass
-    ``allow_nan=False`` so a non-finite value cannot silently produce a
-    non-standard JSON document.
+    Key ordering and separators are fixed to produce byte-identical output
+    for equivalent Python values, enabling meaningful fingerprints and
+    diff-based provenance checks.
+
+    Args:
+        value: The Python object to serialize (must be JSON-serializable).
+        indent: Indentation level for pretty-printing; ``None`` for compact.
+        sort_keys: Whether to sort dictionary keys lexicographically.
+        allow_nan: Whether to allow NaN/Inf values (``json.dumps`` default is True).
+
+    Returns:
+        A JSON string with canonical formatting.
     """
     separators = (",", ":") if indent is None else None
     return json.dumps(

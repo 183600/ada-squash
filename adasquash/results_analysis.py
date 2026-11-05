@@ -18,6 +18,7 @@ robustness checks*, not replacements for the pre-specified paired t-test.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -38,21 +39,20 @@ from .metrics_stats import (
     student_t_ppf,
 )
 
-
 __all__ = [
-    "wilcoxon_signed_rank",
-    "trimmed_mean_ci",
-    "bootstrap_ci",
-    "bayesian_paired_analysis",
-    "influence_diagnostics",
     "assumption_checks",
-    "replication_probability",
+    "bayesian_paired_analysis",
+    "bland_altman_data",
+    "bootstrap_ci",
     "composite_endpoint",
+    "forest_plot_data",
+    "influence_diagnostics",
     "mediation_analysis",
     "post_hoc_sensitivity_curve",
-    "forest_plot_data",
-    "bland_altman_data",
     "qq_plot_data",
+    "replication_probability",
+    "trimmed_mean_ci",
+    "wilcoxon_signed_rank",
 ]
 
 
@@ -199,7 +199,7 @@ def wilcoxon_signed_rank(
         # Enumerate all 2^n sign assignments
         from functools import lru_cache
 
-        @lru_cache(maxsize=None)
+        @functools.cache
         def count_wplus_leq(target: int, idx: int = 0) -> int:
             """Count sign assignments where sum of positive ranks <= target."""
             if idx == n_eff:
@@ -373,22 +373,21 @@ def bootstrap_ci(
         diffs = [x - y for x, y in zip(pa, pb)]
         if statistic == "mean_diff":
             return sum(diffs) / len(diffs)
-        elif statistic == "median_diff":
+        if statistic == "median_diff":
             s = sorted(diffs)
             m = len(s)
             return s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2.0
-        elif statistic == "trimmed_mean_diff":
+        if statistic == "trimmed_mean_diff":
             k = int(math.floor(len(diffs) * 0.2))
             td = sorted(diffs)[k:len(diffs) - k]
             return sum(td) / len(td) if td else 0.0
-        elif statistic == "ratio":
+        if statistic == "ratio":
             ma = sum(pa) / len(pa)
             mb = sum(pb) / len(pb)
             return ma / mb if mb != 0 else float("inf")
-        elif statistic == "ppl_ratio":
+        if statistic == "ppl_ratio":
             return math.exp(sum(diffs) / len(diffs))
-        else:
-            raise ValueError(f"unknown statistic {statistic!r}")
+        raise ValueError(f"unknown statistic {statistic!r}")
 
     orig_a = [x for x, _ in pairs]
     orig_b = [y for _, y in pairs]
@@ -578,14 +577,13 @@ def bayesian_paired_analysis(
         p_rope = cdf_high - cdf_low
         p_worse = 1.0 - cdf_high  # P(delta > rope_high)
         p_better = cdf_low  # P(delta < rope_low)
+    # Degenerate posterior at sample_mean
+    elif sample_mean < rope[0]:
+        p_better, p_rope, p_worse = 1.0, 0.0, 0.0
+    elif sample_mean > rope[1]:
+        p_better, p_rope, p_worse = 0.0, 0.0, 1.0
     else:
-        # Degenerate posterior at sample_mean
-        if sample_mean < rope[0]:
-            p_better, p_rope, p_worse = 1.0, 0.0, 0.0
-        elif sample_mean > rope[1]:
-            p_better, p_rope, p_worse = 0.0, 0.0, 1.0
-        else:
-            p_better, p_rope, p_worse = 0.0, 1.0, 0.0
+        p_better, p_rope, p_worse = 0.0, 1.0, 0.0
 
     # Bayes factor BF_10 (H1: delta < 0 vs H0: delta = 0)
     # Using Savage-Dickey density ratio: BF_01 = prior(0) / posterior(0)
@@ -1451,7 +1449,6 @@ def enhance_comparison_report(comparison_json_path: str, output_path: Optional[s
 
     Writes enhanced report to output_path (or comparison_json_path + ".enhanced.json").
     """
-    import json
     from pathlib import Path
 
     path = Path(comparison_json_path)
