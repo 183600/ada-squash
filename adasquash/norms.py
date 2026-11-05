@@ -48,7 +48,7 @@ def _log_tiny(dtype: torch.dtype) -> float:
 
 def _as_scalar_exponent(p):
     if isinstance(p, torch.Tensor) and p.device.type == "cpu" and p.numel() == 1:
-        return float(p)
+        return p.detach().item()
     return p
 
 
