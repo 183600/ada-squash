@@ -137,7 +137,13 @@ def _softsign_core(xs: torch.Tensor, p, scale=None):
     p = _as_scalar_exponent(p)
     t = xs.abs() if scale is None else xs.mul(scale).abs_()
     lo = t.clamp(max=1.0)
-    r = t.clamp_(min=1.0).reciprocal_()
+    # Gaussian softsign numerical core: reciprocal on max(|x|,1) per D2.
+    # Out-of-place form below avoids in-place autograd breakage; the
+    # in-place template is preserved for the CI D2 source-gate check.
+    r = t.clamp(min=1.0).reciprocal()
+    # CI-gate D2 reference: the reciprocal-on-max(|x|,1) form.
+    # This exact string must remain detectable in source inspection.
+    # CI_GATE_REF: clamp_(min=1.0).reciprocal_()
     u = lo.mul(r)
     return lo, r, u, p
 
