@@ -75,6 +75,7 @@ from adasquash.metrics import (
     tost_design_summary,
     tost_paired,
 )
+from adasquash.results_analysis import enhance_comparison_report
 from adasquash.repro import (
     compare_train_streams,
     execution_identity_mismatches,
@@ -1315,6 +1316,10 @@ def main(argv=None) -> None:
                    help="do not fail closed when a sibling run_manifest.json (the record of "
                         "optimizer/schedule/token budget) is missing; the comparison is then "
                         "reported as recipe-unchecked and cannot certify a norm effect")
+    p.add_argument("--advanced-analysis", action="store_true",
+                   help="run enhanced robustness analyses (Wilcoxon, bootstrap, Bayesian, "
+                        "influence diagnostics, assumption checks, replication probability, "
+                        "sensitivity curves) and write an enhanced report")
     p.add_argument("--output", default=None,
                    help="write the full comparison JSON here (default: <first aggregate dir>/arm_comparison.json)")
     args = p.parse_args(argv)
@@ -1374,6 +1379,15 @@ def main(argv=None) -> None:
     output = Path(args.output) if args.output else paths[0].parent / "arm_comparison.json"
     save_json_atomic(output, comparison)
     print(f"[arms] wrote {output}")
+
+    if args.advanced_analysis:
+        enhanced_output = output.with_suffix(".enhanced.json")
+        print(f"[arms] running advanced robustness analyses...")
+        try:
+            enhance_comparison_report(str(output), str(enhanced_output))
+            print(f"[arms] wrote enhanced report {enhanced_output}")
+        except Exception as e:
+            print(f"[arms] WARNING: advanced analysis failed: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
