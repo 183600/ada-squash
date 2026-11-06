@@ -1153,6 +1153,13 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
     follow-ups, so a pooled main effect cannot hide an effect that reverses
     sign across contexts. Returns None when no design has all cells.
     """
+    # Deadband for the interaction direction and certification: the
+    # pre-specified tolerance. Without it, a floating-point residue in an
+    # exactly additive design (or a zero-variance paired delta of ~1e-16,
+    # for which the degenerate t limit returns p = 0) would be certified as
+    # a real synergy/antagonism finding. "within margin" refers to the
+    # equivalence margin.
+    direction_band = max(margin, equivalence_margin)
     spec = FACTORIAL_SPEC if spec is None else spec
     usable = {r["name"]: r for r in summaries
               if isinstance(r, dict) and "name" in r and _finite_metric(r.get("val_loss"))}
@@ -1264,9 +1271,9 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                          n=test["n"])
             if effect["kind"] == "interaction":
                 delta = effect["delta_seed_mean"]
-                if delta < -margin:
+                if delta < -direction_band:
                     entry["interaction_direction"] = "synergy"
-                elif delta > margin:
+                elif delta > direction_band:
                     entry["interaction_direction"] = "antagonism"
                 else:
                     entry["interaction_direction"] = "additive_or_within_margin"
@@ -1322,8 +1329,13 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
         [entry.get("p_two_sided") for entry in interaction_family])
     for entry, p_holm in zip(interaction_family, interaction_adjusted):
         entry["p_two_sided_holm"] = p_holm
+        # A delta inside the pre-specified tolerance is the pre-registered
+        # null ("additive_or_within_margin"): it is tested and reported, but
+        # never certified as a synergy/antagonism finding, whatever the
+        # degenerate zero-variance p-value says.
         entry["interaction_differs_significantly"] = bool(
-            p_holm is not None and p_holm < alpha)
+            p_holm is not None and p_holm < alpha
+            and abs(entry["delta_seed_mean"]) > direction_band)
     conditional_rows: list = []
     for main in rows:
         if main.get("skipped") or main.get("kind") != "main_effect":
@@ -1505,6 +1517,13 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
     Simple effects of each factor in every context of the other two are added
     as interaction-gated conditional follow-ups.
     """
+    # Deadband for the interaction direction and certification: the
+    # pre-specified tolerance. Without it, a floating-point residue in an
+    # exactly additive design (or a zero-variance paired delta of ~1e-16,
+    # for which the degenerate t limit returns p = 0) would be certified as
+    # a real cross-axis finding. "within margin" refers to the equivalence
+    # margin.
+    direction_band = max(margin, equivalence_margin)
     spec = THREE_WAY_FACTORIAL_SPEC if spec is None else spec
     usable = {r["name"]: r for r in summaries
               if isinstance(r, dict) and "name" in r
@@ -1617,9 +1636,9 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
                 n=test["n"])
             if kind == "interaction":
                 delta = entry["delta_seed_mean"]
-                if delta < -margin:
+                if delta < -direction_band:
                     entry["interaction_direction"] = "negative"
-                elif delta > margin:
+                elif delta > direction_band:
                     entry["interaction_direction"] = "positive"
                 else:
                     entry["interaction_direction"] = "additive_or_within_margin"
@@ -1691,8 +1710,13 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
         [entry.get("p_two_sided") for entry in interaction_family])
     for entry, p_holm in zip(interaction_family, interaction_adjusted):
         entry["p_two_sided_holm"] = p_holm
+        # A delta inside the pre-specified tolerance is the pre-registered
+        # null ("additive_or_within_margin"): it is tested and reported, but
+        # never certified as a cross-axis finding, whatever the degenerate
+        # zero-variance p-value says.
         entry["interaction_differs_significantly"] = bool(
-            p_holm is not None and p_holm < alpha)
+            p_holm is not None and p_holm < alpha
+            and abs(entry["delta_seed_mean"]) > direction_band)
     follow_up = _finalize_conditional_effects(rows, conditional_rows, alpha)
     rows.extend(conditional_rows)
     conditional_summary = _conditional_effects_summary(
