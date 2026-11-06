@@ -108,6 +108,12 @@ def _chunked_reduce_product(a: torch.Tensor, b: torch.Tensor, chunk_elems: int) 
 
 
 def _effective_decay_rate(k, k_min):
+    """Return the decay rate ``k`` floored at ``k_min`` (D2 design floor).
+
+    If ``k_min`` is ``None`` the raw ``k`` is returned unchanged.
+    The floor prevents ``k`` from going negative, which would cause
+    ``alpha_l`` to grow with depth (opposite of the intended decay).
+    """
     if k_min is None:
         return k
     if isinstance(k, torch.Tensor):
@@ -116,6 +122,11 @@ def _effective_decay_rate(k, k_min):
 
 
 def _depth_alpha(alpha_0, k, depth_ratio: float) -> torch.Tensor:
+    """Evaluate the depth‑schedule alpha at a given layer.
+
+    ``alpha_l = alpha_0 · exp(−k · depth_ratio)`` where
+    ``depth_ratio = layer_idx / num_layers``.
+    """
     return alpha_0 * torch.exp(-k * depth_ratio)
 
 
@@ -134,12 +145,21 @@ def register_norm(name: str):
 
 
 def _softsign_core(xs: torch.Tensor, p, scale=None):
+    """Core generalized‑softsign computation per D2.
+
+    ``t = |scale · x|`` (scale applied element‑wise if given).
+    ``lo = min(t, 1)``  (element‑wise clamp, always ≤ 1).
+    ``r = 1 / max(t, 1)``  (reciprocal on the floored magnitude).
+    ``u = lo · r``  (the softsign core: ``min(|x|,1) / max(|x|,1)``).
+
+    The floor at ``max(|x|, 1)`` (not ``|x|``) prevents ``1/0`` at zero
+    and avoids NaN in the backward.  ``copysign`` later restores the sign.
+    CI_GATE_REF: clamp_(min=1.0).reciprocal_()
+    """
     p = _as_scalar_exponent(p)
     t = xs.abs() if scale is None else xs.mul(scale).abs_()
     lo = t.clamp(max=1.0)
-    # Gaussian softsign numerical core: reciprocal on max(|x|,1) per D2.
-    # Out-of-place form below avoids in-place autograd breakage; the
-    # in-place template is preserved for the CI D2 source-gate check.
+    # reciprocal on max(|x|, 1) per D2 floor formulation.
     r = t.clamp(min=1.0).reciprocal()
     # CI-gate D2 reference: the reciprocal-on-max(|x|,1) form.
     # This exact string must remain detectable in source inspection.

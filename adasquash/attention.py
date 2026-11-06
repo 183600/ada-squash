@@ -85,8 +85,8 @@ class CausalSelfAttention(nn.Module):
         """Forward pass of the causal self-attention.
 
         The path follows D1: the main attention uses ``F.scaled_dot_product_attention``
-        with causal masking.  QK-norm (``qknorm`` / ``dytqk``) is applied before
-        RoPE if configured.  Logit statistics are collected in a no-grad sidebar.
+        with causal masking.  QK‑norm (``qknorm`` / ``dytqk``) is applied before
+        RoPE if configured.  Logit statistics are collected in a no‑grad sidebar.
 
         Returns:
             ``(out, stats)`` where ``out`` is the projected attention output and
@@ -390,6 +390,10 @@ def _apply_rope_inplace(x: torch.Tensor, lo_c: torch.Tensor, hi_c: torch.Tensor,
 
     The ``lo`` row is updated first (reading the original ``hi`` row) and a
     half-width clone carries the original ``lo`` row into the ``hi`` update.
+
+    The rotation is orthogonal: ``x_lo' = x_lo · cos - x_hi · sin`` and
+    ``x_hi' = x_hi · cos + x_lo · sin``.  The step order (lo before hi)
+    preserves the original ``lo`` row via ``tmp`` for the hi update.
     """
     half = x.shape[-1] // 2
     x_lo = x[..., :half]
