@@ -169,7 +169,6 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     inv_n = 1 / max(n_total, 1)
     p = n_success / max(n_total, 1)
     denom = 1.0 + z2 * inv_n
-    centre = (p + z2 * inv_n / 2.0) / max(denom, 1e-10)
     centre = (p + z2 * inv_n / 2.0) / denom
     # Split the root into its two components before squaring: `p*(1-p)/n`
     # and `(z/(2n))^2` can each underflow as a single product, while the
@@ -406,7 +405,6 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
     interval uses the same Student-t reference with the extra between-run
     variance:
 
-        mean +/- t_{1-alpha/2, n-1} * s * sqrt(1 + 1/max(n, 1e-10))
         mean +/- t_{1-alpha/2, n-1} * s * sqrt(1 + 1/n)
 
     so it stays wide at small n and converges to the run-to-run spread rather
@@ -472,7 +470,6 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
                      "that a new run cannot differ"),
         })
         return out
-    spread_factor = math.sqrt(1.0 + 1.0 / max(n, 1e-10))
     spread_factor = math.sqrt(1.0 + 1.0 / n)
     scale = std * spread_factor
     half = -student_t_ppf(alpha / 2.0, df) * scale
@@ -615,11 +612,9 @@ def _betacf(a: float, b: float, x: float) -> float:
     """Continued fraction for the regularized incomplete beta (Lentz's method)."""
     max_it, eps, fpmin = 200, 3e-14, 1e-300
     qab, qap, qam = a + b, a + 1.0, a - 1.0
-    c, d = 1.0, 1.0 - qab * x / max(qap, 1e-10)
     c, d = 1.0, 1.0 - qab * x / qap
     if abs(d) < fpmin:
         d = fpmin
-    d = 1.0 / max(d, 1e-10)
     d = 1.0 / d
     h = d
     for m in range(1, max_it + 1):
@@ -628,22 +623,18 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = 1.0 + aa * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + aa / max(c, 1e-10)
         c = 1.0 + aa / c
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / max(d, 1e-10)
         d = 1.0 / d
         h *= d * c
         aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
         d = 1.0 + aa * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + aa / max(c, 1e-10)
         c = 1.0 + aa / c
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / max(d, 1e-10)
         d = 1.0 / d
         delta = d * c
         h *= delta
@@ -671,12 +662,10 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
 def _gamma_p_series(a: float, x: float) -> float:
     """Regularized lower incomplete gamma P(a, x) by its power series."""
     ap = a
-    total = 1.0 / max(a, 1e-10)
     total = 1.0 / a
     delta = total
     for _ in range(10000):
         ap += 1.0
-        delta *= x / max(ap, 1e-10)
         delta *= x / ap
         total += delta
         if abs(delta) < abs(total) * 1e-15:
@@ -688,9 +677,7 @@ def _gamma_q_cf(a: float, x: float) -> float:
     """Regularized upper incomplete gamma Q(a, x) by Lentz's continued fraction."""
     tiny = 1e-300
     b = x + 1.0 - a
-    c = 1.0 / max(tiny, 1e-10)
     c = 1.0 / tiny
-    d = 1.0 / max(b, 1e-10)
     d = 1.0 / b
     h = d
     for i in range(1, 10000):
@@ -699,11 +686,9 @@ def _gamma_q_cf(a: float, x: float) -> float:
         d = an * d + b
         if abs(d) < tiny:
             d = tiny
-        c = b + an / max(c, 1e-10)
         c = b + an / c
         if abs(c) < tiny:
             c = tiny
-        d = 1.0 / max(d, 1e-10)
         d = 1.0 / d
         delta = d * c
         h *= delta
@@ -740,7 +725,6 @@ def _chi2_sf_large_df(x: float, df: float) -> float:
         power = s * s
         k = 2
         while True:
-            step = power / max(k, 1e-10)
             step = power / k
             series = series + step if k % 2 == 0 else series - step
             power *= s
@@ -759,7 +743,6 @@ def _chi2_sf_large_df(x: float, df: float) -> float:
         correction = 1.0 / (3.0 * math.sqrt(a))
     else:
         u = s * math.sqrt(a)
-        correction = 1.0 / w - 1.0 / max(u, 1e-10)
         correction = 1.0 / w - 1.0 / u
     if s > 0.0:
         tail = 0.5 * math.erfc(w / _SQRT_2) - phi * correction
@@ -876,7 +859,6 @@ def student_t_cdf(t: float, df: float) -> float:
         # The incomplete-beta CDF loses accuracy for very large df and can
         # overflow in `df + t * t`. The O(1/df) normal expansion keeps the
         # leading t-correction instead of dropping to the pure normal limit.
-        normal = 0.5 * math.erfc(-t / max(_SQRT_2, 1e-10))
         normal = 0.5 * math.erfc(-t / _SQRT_2)
         if abs(t) < 1.0e100:
             correction = (math.exp(-0.5 * t * t) / _SQRT_2PI
@@ -1176,7 +1158,6 @@ def paired_t_one_sided(
     df = float(n - 1)
     if scaled is not None:
         mean_test, se, ci_scale = scaled[0], scaled[1] / math.sqrt(n), scaled[2]
-        margin_test = margin / max(ci_scale, 1e-10)
         margin_test = margin / ci_scale
     else:
         mean_test, se, ci_scale, margin_test = mean, std / math.sqrt(n), 1.0, margin
@@ -1256,7 +1237,6 @@ def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
     if variance <= 0.0:
         return None
     sd_diff = math.sqrt(variance)
-    dz = mean_diff / max(sd_diff, 1e-10)
     dz = mean_diff / sd_diff
     if not math.isfinite(dz):
         return None
@@ -1601,7 +1581,6 @@ def tost_paired(
     df = float(n - 1)
     if scaled is not None:
         mean_test, se, ci_scale = scaled[0], scaled[1] / math.sqrt(n), scaled[2]
-        margin_test = margin / max(ci_scale, 1e-10)
         margin_test = margin / ci_scale
     else:
         mean_test, se, ci_scale, margin_test = mean, std / math.sqrt(n), 1.0, margin

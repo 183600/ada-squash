@@ -731,7 +731,6 @@ def eval_batch_capacity(budget: dict | None, seq_len: int, batch_size: int) -> d
             raise ValueError(
                 f"estimated_effective_tokens must be finite and >= 0, got {tokens!r}")
     windows = packed_window_count(tokens, seq_len)
-    unique_batches = None if windows is None else windows // max(batch_size, 1e-10)
     unique_batches = None if windows is None else windows // batch_size
     basis = budget.get("basis")
     return {
@@ -826,7 +825,6 @@ def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
         "requested_batches": requested_batches,
         "unique_batches": unique,
         "distinct_batches_per_pass": distinct,
-        "distinct_fraction": None if distinct is None else distinct / max(requested_batches, 1e-10),
         "distinct_fraction": None if distinct is None else distinct / requested_batches,
         "reuses_batches": reuses,
         "cycled_batches": cycled,

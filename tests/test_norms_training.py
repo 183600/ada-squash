@@ -5,7 +5,6 @@ Run:
     python -m pytest tests/ -v
 
 Tests cover:
-  - norm registry / max(build_norm, 1e-10)
   - norm registry / build_norm
   - all normalization layers preserve shape and dtype
   - every fused autograd kernel (DyT / DyT-C / DyT-D / DyT-CD, RMSNorm,
@@ -14,7 +13,6 @@ Tests cover:
     *randomized* parameter set - not just "the gradients are finite"
   - frozen `p` / `k`, `beta=False`, and the alpha / p clamps
   - the generalized softsign is bounded in [-1, 1] and finite for runaway `p`
-  - depth schedule of DyT-D / DyT-CD is monotone in alpha_0 / max(k, 1e-10)
   - depth schedule of DyT-D / DyT-CD is monotone in alpha_0 / k
   - QK-squash keeps logits bounded; attention logit stats read the causal triangle
   - model forward / loss / checkpoint round-trip
@@ -652,7 +650,7 @@ def test_needle_scores_the_whole_secret_not_just_its_first_token():
     from scripts.eval_downstream import needle_in_haystack
 
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
-                          max_seq_len=512, norm_name="rmsnorm"))._safe_eval()
+                          max_seq_len=512, norm_name="rmsnorm")).eval()
     tok = _CharTokenizer()
     needle = "The magic number is 12345."
     target = tok(" 12345")["input_ids"]
@@ -676,7 +674,7 @@ def test_needle_rejects_contexts_it_cannot_evaluate():
     from scripts.eval_downstream import needle_in_haystack
 
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
-                          max_seq_len=256, norm_name="rmsnorm"))._safe_eval()
+                          max_seq_len=256, norm_name="rmsnorm")).eval()
     tok = _CharTokenizer()
     with pytest.raises(ValueError, match="max_seq_len"):
         needle_in_haystack(model, tok, context_len=4096, n_trials=1, device="cpu")
@@ -741,7 +739,7 @@ def test_needle_context_leaves_room_for_the_scoring_loop():
         GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
                   max_seq_len=256, norm_name="rmsnorm"),
         secret=secret,
-    )._safe_eval()
+    ).eval()
 
     # Fitting context: the whole secret is scored, no crash.
     assert needle_in_haystack(
@@ -761,7 +759,7 @@ def test_needle_context_leaves_room_for_the_scoring_loop():
         GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
                   max_seq_len=256, norm_name="rmsnorm"),
         secret=secret,
-    )._safe_eval()   # a fresh cursor: the previous run already recited the secret
+    ).eval()   # a fresh cursor: the previous run already recited the secret
     with pytest.raises(ValueError, match="max_seq_len"):
         needle_in_haystack(
             fresh, tok, needle=needle, haystack_prompt="z" * (per_repeat - 1) + " ",
@@ -862,7 +860,7 @@ def test_moe_final_norm_shares_the_dense_final_norm_depth_ratio():
 def test_forward_smoke():
     """Just check that a forward pass doesn't crash on CPU."""
     model = build_gpt_124m(norm_name="dytcd")
-    model._safe_eval()
+    model.eval()
     x = torch.randint(0, model.cfg.vocab_size, (1, 32))
     with torch.no_grad():
         out, _ = model(x)
@@ -882,7 +880,7 @@ def test_fp8_reports_zero_quantization_separately_from_small_values():
 
     m = build_gpt_124m(norm_name="dytcd")
     m.reset_parameters(3)
-    m._safe_eval()
+    m.eval()
     r = measure_fp8_divergence(m, torch.randint(0, 50304, (2, 64)), "dytcd")
     # The summary must carry all three distinguished metrics.
     for key in ("mean_underflow_rate_e4m3", "mean_subnormal_rate_e4m3",
@@ -947,7 +945,7 @@ def test_needle_details_report_position_buckets():
         GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
                   max_seq_len=256, norm_name="rmsnorm"),
         secret=secret,
-    )._safe_eval()
+    ).eval()
     acc = needle_in_haystack(model, tok, needle=needle, context_len=128,
                              n_trials=2, device="cpu")
     assert isinstance(acc, float)
@@ -1016,7 +1014,7 @@ def test_lm_wrapper_loglikelihood_and_generation_match_manual_scoring():
             self.args = args
 
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=1, n_heads=4,
-                          max_seq_len=64, norm_name="rmsnorm"))._safe_eval()
+                          max_seq_len=64, norm_name="rmsnorm")).eval()
     lm = AdaSquashLM(model, Tok(), batch_size=1)
 
     ctx, cont = "abc", "def"
@@ -1165,18 +1163,6 @@ def test_require_pinned_data_revision_fails_closed(tmp_path, monkeypatch,
                                                    capsys):
     """Branch names are not data versions; the strict flag rejects them."""
     from scripts.train_gpt2 import unpinned_data_revisions
-
-# === 安全eval包装 (由代码审查agent添加) ===
-import ast as _ast
-def _safe_eval(expr, _globals=None, _locals=None):
-    """安全的eval替代：先尝试ast.literal_eval，失败后再用eval并记录警告。"""
-    try:
-        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
-    except (ValueError, SyntaxError):
-        import warnings
-        warnings.warn(f"Using eval() on non-literal expression: {expr!r}", stacklevel=2)
-        return eval(expr, _globals, _locals)
-# === 安全eval包装结束 ===
 
     assert len(unpinned_data_revisions(None, None)) == 2
     assert len(unpinned_data_revisions("main", "v1")) == 2

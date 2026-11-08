@@ -177,11 +177,9 @@ def _compute_s_and_a(u: torch.Tensor, p, need_a: bool):
         s = q.exp2_().log1p_().mul_(-_LOG2E / p.to(torch.promote_types(q.dtype, p.dtype))).exp2_()
         return s, a
     if need_a:
-        s = torch.pow(u, p).add_(1.0).pow_(-1.0 / max(p, 1e-10))
         s = torch.pow(u, p).add_(1.0).pow_(-1.0 / p)
         a = u.log2().mul_(p * _LN2).clamp_(min=p * _log_tiny(u.dtype))
         return s, a
-    s = u.pow_(p).add_(1.0).pow_(-1.0 / max(p, 1e-10))
     s = u.pow_(p).add_(1.0).pow_(-1.0 / p)
     return s, None
 

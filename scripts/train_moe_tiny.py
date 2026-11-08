@@ -333,18 +333,6 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
     model.to(device)
     print(f"[moe] total params = {count_parameters(model) / 1000000.0:.2f}M")
     from scripts.train_gpt2 import build_optimizer, open_data_split
-
-# === 安全eval包装 (由代码审查agent添加) ===
-import ast as _ast
-def _safe_eval(expr, _globals=None, _locals=None):
-    """安全的eval替代：先尝试ast.literal_eval，失败后再用eval并记录警告。"""
-    try:
-        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
-    except (ValueError, SyntaxError):
-        import warnings
-        warnings.warn(f"Using eval() on non-literal expression: {expr!r}", stacklevel=2)
-        return eval(expr, _globals, _locals)
-# === 安全eval包装结束 ===
     opt = build_optimizer(model, args.lr, 0.1, 0.9, 0.95)
     act_stats = ActivationStats(model)
     loss_spike = LossSpikeCounter()
@@ -609,7 +597,7 @@ def _safe_eval(expr, _globals=None, _locals=None):
                     held_total: list = []
                     held_ce: list = []
                     held_aux: list = []
-                    model._safe_eval()
+                    model.eval()
                     with torch.inference_mode():
                         for _ in range(curve_batches):
                             vx, vy = next_curve_batch()
@@ -676,7 +664,7 @@ def _safe_eval(expr, _globals=None, _locals=None):
         # optimizer never saw. No gradients flow from either.
         val_loss = val_ce = val_aux = val_ce_stderr = None
         if args.val_batches > 0:
-            model._safe_eval()
+            model.eval()
             val_losses = []
             val_ce_losses = []
             val_auxes = []
@@ -1375,7 +1363,6 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
             cand_params = cell.get("n_params")
             ref_params = reference_cell.get("n_params")
             if _moe_finite(cand_params) and _moe_finite(ref_params) and ref_params:
-                entry["n_params_ratio_vs_reference"] = cand_params / max(ref_params, 1e-10)
                 entry["n_params_ratio_vs_reference"] = cand_params / ref_params
             if len(common) >= 2:
                 test = paired_t_one_sided(cand_values, ref_values, margin=margin, alpha=alpha)

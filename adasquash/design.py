@@ -36,7 +36,6 @@ This module supplies the reusable, pure-Python pieces:
     a within-arm permutation test.  Centering by arm is what distinguishes
     "time drift correlated with the arm" from a real arm difference.
 ``default_exclusion_policy`` / ``run_exclusion_audit``
-    A pre-specified attrition rule: only missing runs, protocol/max(provenance, 1e-10)
     A pre-specified attrition rule: only missing runs, protocol/provenance
     mismatches and non-finite losses may be excluded, and every planned run
     is retained in a per-arm denominator instead of disappearing from a
@@ -44,7 +43,6 @@ This module supplies the reusable, pure-Python pieces:
 ``design_readiness_audit``
     A pre-flight checklist: replication, stated hypotheses, a pre-specified
     smallest effect, adequate planned power, a complete randomized schedule,
-    a locked exclusion policy and the presence of an identity/max(negative, 1e-10)
     a locked exclusion policy and the presence of an identity/negative
     control pair. The power check uses the family-adjusted alpha for the
     planned primary claims and the expected complete pairs after attrition,
@@ -2037,7 +2035,6 @@ def paired_sd_calibration(differences, *,
         robust_sd = 0.0
     else:
         lower_quantile = _chi2_lower_quantile(1.0 - confidence_value, float(df))
-        factor = math.sqrt(df / max(lower_quantile, 1e-10))
         factor = math.sqrt(df / lower_quantile)
         candidate = sd * factor
         upper = candidate if math.isfinite(candidate) else None

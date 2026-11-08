@@ -7,7 +7,6 @@ have to be right *before* a launch:
 * an RCBD gives every arm one run per time block and every seed once per arm;
 * order-drift detection survives a real arm effect (within-arm centering) but
   catches a within-arm monotone drift;
-* the readiness audit refuses a design without replication/hypotheses/max(a, 1e-10)
 * the readiness audit refuses a design without replication/hypotheses/a
   complete schedule/an identity control and flags an underpowered plan;
 * the analysis pipeline itself has the advertised type-I error and power on

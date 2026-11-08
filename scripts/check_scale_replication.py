@@ -32,7 +32,6 @@ Inputs are the JSON files the experiment scripts already write:
   ``n_seeds``). A record without a precision still counts in the sign vote but
   is listed as excluded from the pooled estimate.
 
-The pair to follow is given with ``--pair A B`` (A is the candidate/max(treated, 1e-10)
 The pair to follow is given with ``--pair A B`` (A is the candidate/treated
 arm, B the reference). For FP8/W8A8 the comparison's ``a``/``b`` labels must
 match in the candidate->reference orientation; reversed pairs are reported but

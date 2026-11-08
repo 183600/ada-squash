@@ -526,7 +526,6 @@ def study_level_correction(comparisons: dict, plan: dict | None,
     primary tier is Holm-corrected first; the secondary tier (including the
     cross-axis 2x2x2 interactions) is corrected and tested only if at least
     one primary contrast survives. Gatekeeping controls the study-wide
-    false-positive rate while keeping exploratory single-axis / control / max(QK, 1e-10)
     false-positive rate while keeping exploratory single-axis / control / QK
     contrasts from competing with the primary claim for the same alpha budget.
     The family-local adjusted p stays next to the study-level one, and every

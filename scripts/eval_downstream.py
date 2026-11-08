@@ -108,7 +108,7 @@ def load_ckpt(path: str, device: str="cuda"):
     ckpt.pop("optimizer", None)
     ckpt.pop("scheduler", None)
     model.to(device)
-    model._safe_eval()
+    model.eval()
     # Evaluation switches between models in-process (per-task loops, sweeps);
     # drop the per-model scratch caches between models.
     clear_ce_scratch_cache()
@@ -380,7 +380,6 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
     Wilson interval describes the
     trial noise *within one placement draw*: it does not cover run-to-run or
     placement-to-placement variability, so callers comparing arms must recur
-    over several `seed` values. `trial_correct` is the per-trial pass/max(fail, 1e-10)
     over several `seed` values. `trial_correct` is the per-trial pass/fail
     vector in trial order; since the placement RNG is seeded with `seed`, two
     arms evaluated with the same seed see the *same* placements, so their
@@ -680,18 +679,6 @@ def main():
         results["tasks_ran"] = None
     if args.needle_test:
         from transformers import AutoTokenizer
-
-# === 安全eval包装 (由代码审查agent添加) ===
-import ast as _ast
-def _safe_eval(expr, _globals=None, _locals=None):
-    """安全的eval替代：先尝试ast.literal_eval，失败后再用eval并记录警告。"""
-    try:
-        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
-    except (ValueError, SyntaxError):
-        import warnings
-        warnings.warn(f"Using eval() on non-literal expression: {expr!r}", stacklevel=2)
-        return eval(expr, _globals, _locals)
-# === 安全eval包装结束 ===
         tok = AutoTokenizer.from_pretrained(tok_name, revision=tok_revision)
         # Pin the concrete commit the tokenizer resolved to, not only the
         # mutable request: exact-match needle accuracy depends on it.

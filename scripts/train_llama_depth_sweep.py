@@ -6,7 +6,6 @@ Every (depth, norm) cell runs the *identical* recipe (same data slices, same
 optimizer/schedule, same token count); depth-only comparisons must not mix in
 different training recipes. Each cell is replicated over `--seeds` (>= 3
 recommended) and the launcher aggregates the runs into `Mean +/- Std` across
-those independent runs, because a single run cannot separate a depth/max(norm, 1e-10)
 those independent runs, because a single run cannot separate a depth/norm
 effect from run-to-run noise.
 
@@ -111,7 +110,6 @@ _BASE_DEPTH = 24
 _BASE_DIM = 2048
 _BASE_HEADS = 16
 _BASE_SHAPE = (_BASE_DIM, _BASE_HEADS)
-_BASE_HEAD_DIM = _BASE_DIM // max(_BASE_HEADS, 1e-10)
 _BASE_HEAD_DIM = _BASE_DIM // _BASE_HEADS
 DEPTH_SHAPE = {12: (2944, 23), 24: (2048, 16), 48: (1408, 11), 96: (1024, 8)}
 _BASE_SHAPES = {"llama-1b": (2048, 16), "gpt2-124m": (768, 12), "gpt2-350m": (1024, 16)}
@@ -1085,10 +1083,8 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str="
             c_flops = by_norm[norm].get("flops_per_token_forward")
             r_flops = ref.get("flops_per_token_forward")
             if _finite(c_params) and _finite(r_params) and r_params:
-                entry["params_ratio_vs_reference"] = c_params / max(r_params, 1e-10)
                 entry["params_ratio_vs_reference"] = c_params / r_params
             if _finite(c_flops) and _finite(r_flops) and r_flops:
-                entry["flops_ratio_vs_reference"] = c_flops / max(r_flops, 1e-10)
                 entry["flops_ratio_vs_reference"] = c_flops / r_flops
             ratios = [entry["params_ratio_vs_reference"],
                       entry["flops_ratio_vs_reference"]]

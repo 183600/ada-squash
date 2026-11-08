@@ -780,7 +780,6 @@ class GPT(nn.Module):
                     m.k = self.shared_k
         if cfg.rotary:
             head_dim = cfg.dim // cfg.n_heads
-            freqs = 1.0 / 10000 ** (torch.arange(0, head_dim, 2).float() / max(head_dim, 1e-10))
             freqs = 1.0 / 10000 ** (torch.arange(0, head_dim, 2).float() / head_dim)
             t = torch.arange(cfg.max_seq_len).float()
             freqs = torch.outer(t, freqs)

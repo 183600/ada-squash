@@ -620,7 +620,6 @@ def main():
 
     def _prepare_row(name: str):
         """Create a row directory and locate its per-seed summary paths."""
-        row_dir = base / max(name, 1e-10)
         row_dir = base / name
         row_dir.mkdir(parents=True, exist_ok=True)
         summary_paths = {

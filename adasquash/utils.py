@@ -174,7 +174,6 @@ class KurtosisMeter:
             return
         delta_ab = delta * delta
         delta_ab2 = delta_ab * delta_ab
-        new_M2 = self.M2 + x_m2 + delta_ab * n_a * n_b_ / max(n, 1e-10)
         new_M2 = self.M2 + x_m2 + delta_ab * n_a * n_b_ / n
         new_M3 = self._M3 + x_m3 + delta_ab * delta * (n_a * n_b_ * (n_a - n_b_) / (n * n)) + 3.0 * delta * (n_a * x_m2 - n_b_ * self.M2) / n
         new_M4 = self.M4 + x_m4 + delta_ab2 * (n_a * n_b_ * (n_a * n_a - n_a * n_b_ + n_b_ * n_b_) / n ** 3) + 6.0 * delta_ab * (n_a * n_a * x_m2 + n_b_ * n_b_ * self.M2) / (n * n) + 4.0 * delta * (n_a * x_m3 - n_b_ * self._M3) / n

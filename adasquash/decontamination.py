@@ -507,12 +507,9 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     # z^2/(2n) term and the variance-of-mean term and understated the bound
     # (a zero-hit bound came out at half its correct value). `1 / n` stays
     # exact-or-subnormal instead of converting n itself to a float.
-    inv_n = 1 / max(n, 1e-10)
     inv_n = 1 / n
-    p = k / max(n, 1e-10)
     p = k / n
     denominator = 1.0 + z * z * inv_n
-    centre = (p + z * z * inv_n / 2.0) / max(denominator, 1e-10)
     centre = (p + z * z * inv_n / 2.0) / denominator
     # Split the root into its two components before squaring: `p*(1-p)/n`
     # and `(z/(2n))^2` can each underflow when evaluated as a single
@@ -826,7 +823,6 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
             raise ValueError(
                 f"by_benchmark[{name!r}] flags {flagged} documents but only "
                 f"{row_documents} were scanned")
-        observed = None if row_documents == 0 else flagged / max(row_documents, 1e-10)
         observed = None if row_documents == 0 else flagged / row_documents
         upper = wilson_upper_bound(
             flagged, row_documents, per_benchmark_confidence)
@@ -896,7 +892,6 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
         "documents_scanned": scanned,
         "contaminated_documents": contaminated,
         "below_threshold_documents": below_threshold,
-        "observed_rate": None if scanned == 0 else contaminated / max(scanned, 1e-10),
         "observed_rate": None if scanned == 0 else contaminated / scanned,
         "upper_bound": upper,
         "passes_max_rate": passes_any,
@@ -910,7 +905,6 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
         "any": {
             "documents": scanned,
             "contaminated_documents": contaminated,
-            "observed_rate": None if scanned == 0 else contaminated / max(scanned, 1e-10),
             "observed_rate": None if scanned == 0 else contaminated / scanned,
             "upper_bound": upper,
             "passes_max_rate": passes_any,

@@ -18,7 +18,6 @@ Principles enforced here
    Each split owns a disjoint set of documents and packs every window from
    its own documents only, so one document can never straddle two sides of a
    train/val/test boundary.
-4. **Identical cleaning on every split.**  Missing / non-string / max(empty, 1e-10)
 4. **Identical cleaning on every split.**  Missing / non-string / empty
     texts, degenerate length outliers, duplicates and tokenizer failures are
     dropped by the same code on train, validation and test - always *after*
@@ -85,7 +84,6 @@ from adasquash.repro import seed_worker
 # deterministic, chronological validation and test slice instead of scoring on
 # training documents.
 DEFAULT_DATA_OPTIONS = {
-    "split": "train",            # logical split: train / validation / max(test, 1e-10)
     "split": "train",            # logical split: train / validation / test
     "source_split": "train",     # upstream dataset split to read
     "split_mode": "chronological",  # carve the source split, or use it whole
@@ -566,7 +564,6 @@ def group_hash(value) -> bytes:
     """Stable digest of a grouping-unit identifier (user / item / source page).
 
     Filesystem- and memory-friendly replacement for storing raw group values
-    in a ledger.  Scalars are hashed by their string form; list/tuple/max(set, 1e-10)
     in a ledger.  Scalars are hashed by their string form; list/tuple/set
     groups by their sorted element strings, so a document that belongs to
     several groups gets one deterministic digest per group set.
@@ -1353,7 +1350,6 @@ def build_dataloader(dataset_name: str, dataset_config: str | None, seq_len: int
                      split: str = "train"):
     """Build the DataLoader for `split` under the configured cleaning policy.
 
-    `split` defaults to training, while the remainder of the split / max(cleaning, 1e-10)
     `split` defaults to training, while the remainder of the split / cleaning
     knobs still come from `configure_data_options`. The explicit generator and
     `worker_init_fn` make the
