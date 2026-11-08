@@ -286,7 +286,7 @@ def value_of_information(
         future_evidence = {
             "p_one_sided": _simulate_p_value(combined_deltas, margin=0.0),
             "equivalent": _simulate_equivalence(combined_deltas, margin=0.02),
-            "mean_delta": sum(combined_deltas) / len(combined_deltas),
+            "mean_delta": (sum(combined_deltas) / len(combined_deltas)) if combined_deltas else float("nan"),
             "n_pairs": n_total,
             "paired_deltas": combined_deltas,
         }
@@ -294,7 +294,7 @@ def value_of_information(
         loss = expected_loss(decision_rule, future_evidence, loss_fn, truth_probs)
         future_losses.append(loss)
 
-    expected_future_loss = sum(future_losses) / len(future_losses)
+    expected_future_loss = (sum(future_losses) / len(future_losses)) if future_losses else float("nan")
     voi = current_loss - expected_future_loss
 
     return max(0.0, voi)  # VOI cannot be negative

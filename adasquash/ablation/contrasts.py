@@ -1005,7 +1005,7 @@ def _conditional_effect_entry(base: dict, effect: str, factor: str, context: dic
     test = paired_t_one_sided(values, [0.0] * len(values), margin=margin,
                               alpha=alpha)
     replicated = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
-    mean_delta = sum(values) / len(values)
+    mean_delta = (sum(values) / len(values)) if values else float("nan")
     entry = dict(
         base, effect=effect, kind="simple_effect", term_factors=[factor],
         conditional_factor=factor, conditional_context=dict(context),
@@ -1206,12 +1206,12 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                 "kind": "main_effect",
                 "term_factors": [factor],
                 "formula": "mean over both arms of the other factor: on - off",
-                "arm_effects": {name: {"mean_delta": sum(vals) / len(vals),
+                "arm_effects": ({name: {"mean_delta": sum(vals) / len(vals)) if vals else float("nan"),
                                        "per_seed_delta": dict(zip(map(str, common), vals))}
                                 for name, vals in arm_values.items()},
                 "per_seed_values": dict(zip(map(str, common), main_values)),
                 "mean_arm_deltas": arm_means,
-                "delta_seed_mean": sum(main_values) / len(main_values),
+                "delta_seed_mean": (sum(main_values) / len(main_values)) if main_values else float("nan"),
                 "per_seed_delta": dict(zip(map(str, common), main_values)),
             }
         if len(factor_names) == 2:
@@ -1228,7 +1228,7 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                 "formula": (f"effect of {first} with {second} on minus effect of {first} "
                             f"with {second} off; negative = synergy"),
                 "per_seed_values": dict(zip(map(str, common), interaction_values)),
-                "delta_seed_mean": sum(interaction_values) / len(interaction_values),
+                "delta_seed_mean": (sum(interaction_values) / len(interaction_values)) if interaction_values else float("nan"),
                 "per_seed_delta": dict(zip(map(str, common), interaction_values)),
             }
         for effect_name, effect in effects.items():

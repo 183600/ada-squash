@@ -591,7 +591,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                 # not divisible by curve_every leaves the diagnosis one window
                 # behind the weights that are actually reported.
                 if (step + 1) % curve_every == 0 or step + 1 == args.max_steps:
-                    train_point = sum(train_ce_window) / len(train_ce_window)
+                    train_point = (sum(train_ce_window) / len(train_ce_window)) if train_ce_window else float("nan")
                     train_ce_window = []
                     held_total: list = []
                     held_ce: list = []
@@ -638,8 +638,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                         "train_window_ce": train_point,
                         "val_ce": curve_val[-1],
                         "val_ce_stderr": held_stderr,
-                        "val_total": sum(held_total) / len(held_total),
-                        "val_aux": sum(held_aux) / len(held_aux),
+                        "val_total": (sum(held_total) / len(held_total)) if held_total else float("nan"),
+                        "val_aux": (sum(held_aux) / len(held_aux)) if held_aux else float("nan"),
                         "val_noise_threshold": diagnosis["evidence"].get("val_noise_threshold"),
                         "val_change_within_noise": diagnosis["evidence"].get("val_change_within_noise"),
                         "gap_change_within_noise": diagnosis["evidence"].get("gap_change_within_noise"),
@@ -719,9 +719,9 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                     val_ce_losses.append(total_val - model.AUX_LOSS_COEF * vaux)
                     val_auxes.append(vaux)
             model.train()
-            val_loss = sum(val_losses) / len(val_losses)
-            val_ce = sum(val_ce_losses) / len(val_ce_losses)
-            val_aux = sum(val_auxes) / len(val_auxes)
+            val_loss = (sum(val_losses) / len(val_losses)) if val_losses else float("nan")
+            val_ce = (sum(val_ce_losses) / len(val_ce_losses)) if val_ce_losses else float("nan")
+            val_aux = (sum(val_auxes) / len(val_auxes)) if val_auxes else float("nan")
             val_ce_stats = mean_std_stderr(val_ce_losses)
             val_ce_stderr = (val_ce_stats["stderr"]
                              if val_ce_stats and val_ce_stats["n"] >= 2 else None)

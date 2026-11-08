@@ -331,7 +331,7 @@ def trimmed_mean_ci(
     boot_means = []
     for _ in range(bootstrap_samples):
         sample = [trimmed[rng.randrange(len(trimmed))] for _ in trimmed]
-        boot_means.append(sum(sample) / len(sample))
+        boot_means.append((sum(sample) / len(sample)) if sample else float("nan"))
     boot_means.sort()
     lo_idx = int(math.floor(bootstrap_samples * alpha / 2.0))
     hi_idx = int(math.ceil(bootstrap_samples * (1.0 - alpha / 2.0))) - 1
@@ -372,7 +372,7 @@ def bootstrap_ci(
     def _compute_stat(pa: list[float], pb: list[float]) -> float:
         diffs = [x - y for x, y in zip(pa, pb)]
         if statistic == "mean_diff":
-            return sum(diffs) / len(diffs)
+            return (sum(diffs) / len(diffs)) if diffs else float("nan")
         if statistic == "median_diff":
             s = sorted(diffs)
             m = len(s)
@@ -382,8 +382,8 @@ def bootstrap_ci(
             td = sorted(diffs)[k:len(diffs) - k]
             return sum(td) / len(td) if td else 0.0
         if statistic == "ratio":
-            ma = sum(pa) / len(pa)
-            mb = sum(pb) / len(pb)
+            ma = (sum(pa) / len(pa)) if pa else float("nan")
+            mb = (sum(pb) / len(pb)) if pb else float("nan")
             return ma / mb if mb != 0 else float("inf")
         if statistic == "ppl_ratio":
             return math.exp(sum(diffs) / len(diffs))

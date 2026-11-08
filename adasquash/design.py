@@ -914,7 +914,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
     ordinary_ok = True
     try:
         for arm, records in usable.items():
-            mean = sum(record["value"] for record in records) / len(records)
+            mean = (sum(record["value"] for record in records) / len(records)) if records else float("nan")
             if not math.isfinite(mean):
                 ordinary_ok = False
                 break
@@ -940,7 +940,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
         else:
             for arm, records in usable.items():
                 scaled = [record["value"] / residual_scale for record in records]
-                mean_scaled = math.fsum(scaled) / len(scaled)
+                mean_scaled = (math.fsum(scaled) / len(scaled)) if scaled else float("nan")
                 for record in records:
                     record["residual"] = (
                         record["value"] / residual_scale - mean_scaled)
@@ -981,7 +981,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
         per_arm.append({
             "arm": arm,
             "count": len(records),
-            "mean_position": sum(positions) / len(positions),
+            "mean_position": (sum(positions) / len(positions)) if positions else float("nan"),
             "position_span": max(positions) - min(positions),
             "mean_residual": (
                 math.fsum(record["residual"] for record in records)
@@ -3093,7 +3093,7 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
                                 margin=test_margin, alpha=alpha_value)
             if equiv.get("equivalent") is True:
                 equivalence += 1
-    mean_scaled = sum(means) / len(means)
+    mean_scaled = (sum(means) / len(means)) if means else float("nan")
     mean_estimate = mean_scaled * scale
     if len(means) > 1:
         variance_scaled = (

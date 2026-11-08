@@ -287,7 +287,7 @@ def _split_position_sensitivity(
                 "min_delta": min(deltas),
                 "max_delta": max(deltas),
                 "max_abs_delta": max(abs(delta) for delta in deltas),
-                "mean_delta": sum(deltas) / len(deltas),
+                "mean_delta": (sum(deltas) / len(deltas)) if deltas else float("nan"),
             }
     return sensitivity
 
