@@ -956,9 +956,9 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
     mcnemar = mcnemar_test(n_fixed, n_broken)
     summary = {
         "n_tokens": n_tokens,
-        "reference_accuracy": (n_tokens - n_fixed - n_both_wrong) / n_tokens,
-        "candidate_accuracy": (n_tokens - n_broken - n_both_wrong) / n_tokens,
-        "accuracy_delta_candidate_minus_reference": (n_fixed - n_broken) / n_tokens,
+        "reference_accuracy": (n_tokens - n_fixed - n_both_wrong) / max(n_tokens, 1),
+        "candidate_accuracy": (n_tokens - n_broken - n_both_wrong) / max(n_tokens, 1),
+        "accuracy_delta_candidate_minus_reference": (n_fixed - n_broken) / max(n_tokens, 1),
         "fixed": n_fixed,
         "broken": n_broken,
         "both_wrong": n_both_wrong,
@@ -970,7 +970,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         "shared_blind_spot_confident": n_both_wrong_confident,
         "reference_errors_total": n_fixed + n_both_wrong,
         "candidate_errors_total": n_broken + n_both_wrong,
-        "majority_class_accuracy": float(target_counts.max().item()) / n_tokens,
+        "majority_class_accuracy": float(target_counts.max().item()) / max(n_tokens, 1),
         "bigram_majority_accuracy": bigram_correct / max(n_tokens, 1),
         "uniform_random_accuracy": 1.0 / vocab,
         "copy_input_accuracy": (copy_input_correct / max(n_tokens, 1)) if n_positional else None,
