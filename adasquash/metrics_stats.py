@@ -1363,7 +1363,8 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     if math.isfinite(regrouped) and regrouped != 0.0:
         return regrouped
     try:
-        return math.exp(math.log(max(criticalmath.log(max(std, 1e-10))ath.log(std)
+        return math.exp(math.log(max(critical, 1e-10))
+                        + math.log(max(std, 1e-10))
                         + math.log(max(inverse_sqrt_n, 1e-10)))
     except OverflowError:
         return float("inf")

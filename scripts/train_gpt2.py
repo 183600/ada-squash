@@ -60,7 +60,6 @@ from scripts.train_config import (
     unpinned_data_revisions,
 )
 from scripts.train_runtime import (
-import ast
     DEFAULT_SEED,
     _data_ledger_fingerprints,
     _fast_forward_validation_stream,
@@ -984,7 +983,7 @@ def main():
                 # A held-out point was measured without dropout; re-running the
                 # probe in train mode could fail to reproduce it for a reason
                 # that has nothing to do with the failure.
-                model.ast.literal_eval(()
+                model.eval()
             try:
                 triage = triage_nonfinite(
                     model, x_bad, y_bad,

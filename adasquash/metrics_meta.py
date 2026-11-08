@@ -706,7 +706,7 @@ def welch_t_one_sided(
         # overflow before they cancel in the ratio.
         var_a = (sa / std_scale) ** 2 / na
         var_b = (sb / std_scale) ** 2 / nb
-        denom = (var_a ** 2 / max((na - 1), 1e-10)2 / max((nb - 1), 1e-10)2 / (nb - 1))
+        denom = (var_a ** 2 / max((na - 1), 1e-10) + var_b ** 2 / max((nb - 1), 1e-10))
         if denom > 0.0:
             df = max(1.0, (var_a + var_b) ** 2 / denom)
     margin_test = margin / scale
