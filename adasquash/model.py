@@ -418,11 +418,11 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             buf = probs[:rows]
             if cast_buf is None:
                 torch.mm(hc, w_t, out=buf)
-                torch.softmax(buf, -1, out=buf, dim=-1)
+                torch.softmax(buf, -1, out=buf)
             else:
                 cast = cast_buf[:rows]
                 torch.mm(hc, w_t, out=cast)
-                torch.softmax(cast, -1, dtype=acc, out=buf, dim=-1)
+                torch.softmax(cast, -1, dtype=acc, out=buf)
             buf.mul_(keep[start:end])
             buf.scatter_add_(-1, gold[start:end], neg_keep[start:end])
             if need_h:

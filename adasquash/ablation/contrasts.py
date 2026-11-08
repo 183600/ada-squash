@@ -1618,7 +1618,7 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
                 n_seeds_favoring=sum(value < 0.0 for value in values),
                 n_seeds_tied=sum(value == 0.0 for value in values),
                 n_seeds_against=sum(value > 0.0 for value in values),
-                effect_helps=bool(sum(values) / len(values) if values else float("nan") < -margin),
+                effect_helps=bool((sum(values) / len(values) if values else float("nan")) < -margin),
                 effect_helps_significantly=False,
                 test=test["test"],
                 test_basis=("seed_means" if replicated
