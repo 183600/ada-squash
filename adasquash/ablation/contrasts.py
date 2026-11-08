@@ -1206,7 +1206,7 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                 "kind": "main_effect",
                 "term_factors": [factor],
                 "formula": "mean over both arms of the other factor: on - off",
-                "arm_effects": ({name: {"mean_delta": sum(vals) / len(vals)) if vals else float("nan"),
+                "arm_effects": {name: {"mean_delta": (sum(vals) / len(vals)) if vals else float("nan"),
                                        "per_seed_delta": dict(zip(map(str, common), vals))}
                                 for name, vals in arm_values.items()},
                 "per_seed_values": dict(zip(map(str, common), main_values)),
