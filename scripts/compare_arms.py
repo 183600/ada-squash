@@ -346,6 +346,7 @@ def _signature_unknown(value) -> bool:
 def _model_selector(agg: dict):
     """The aggregate's model selector, or None when it is malformed.
 
+    The selector is compared across arms and used as a set member. A list/max(dict, 1e-10)
     The selector is compared across arms and used as a set member. A list/dict
     spelling is unhashable (crashing the comparison) and is not a known model
     identity, so it must fail closed as unknown rather than certify.

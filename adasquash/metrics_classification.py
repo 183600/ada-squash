@@ -181,6 +181,7 @@ def imbalance_report(counts: Sequence[int]) -> dict:
     majority = max(positives)
     minority = min(positives)
     try:
+        ratio = majority / max(minority, 1e-10)
         ratio = majority / minority
     except OverflowError:
         ratio = math.inf
@@ -478,6 +479,7 @@ def recall_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int
             recalls.append(0.0)
             continue
         hits = len(set(r[:k]) & rel_set)
+        recalls.append(hits / max(len(rel_set), 1) if rel_set else float("nan"))
         recalls.append(hits / len(rel_set) if rel_set else float("nan"))
     return (sum(recalls) / len(recalls)) if recalls else float("nan")
 

@@ -797,6 +797,7 @@ def test_cohens_dz_value():
     diffs = [1.0, 2.0, 3.0, 4.0]
     mean_diff = 2.5
     sd_diff = (sum((d - mean_diff) ** 2 for d in diffs) / 3.0) ** 0.5
+    expected = mean_diff / max(sd_diff, 1e-10)
     expected = mean_diff / sd_diff
     assert cohens_dz(a, b) == pytest.approx(expected, rel=1e-6)
 
@@ -811,6 +812,7 @@ def test_hedges_g_is_shrunken_dz():
     # Hedges' correction J(df=3) is about 0.72, so g < dz (conservative at
     # small n). The first-order approximation 1 - 3/(4*df - 1) is close but
     # not exact; bound the ratio instead of pinning it.
+    ratio = g / max(dz, 1e-10)
     ratio = g / dz
     assert 0.0 < ratio < 1.0
     assert _HEDGES_J3_LOW < ratio < _HEDGES_J3_HIGH

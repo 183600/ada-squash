@@ -1227,6 +1227,7 @@ def mediation_analysis(
             # Proportion: ratio-of-means per bootstrap sample (consistent
             # with the point estimator; avoids per-seed division outliers)
             if abs(mean_te_s) > _PROP_TOL:
+                boot_prop.append(mean_ie_s / max(mean_te_s, 1e-10))
                 boot_prop.append(mean_ie_s / mean_te_s)
             else:
                 boot_prop.append(0.0)

@@ -256,6 +256,7 @@ def qk_axis_comparison(summaries: list, spec: dict | None=None, margin: float=0.
 
     The matrix contains a clean QK-off/on pair and a QK-Norm comparator on
     LN, RMSNorm and the full DyT-CD stack. This function tests each pair with
+    the same seed-paired one-sided test used everywhere else (`H1: on/max(off, 1e-10)
     the same seed-paired one-sided test used everywhere else (`H1: on/off
     lowers held-out loss`) and then reports whether the *direction* of the
     QK effect replicates across hosts. A single host's point estimate is not

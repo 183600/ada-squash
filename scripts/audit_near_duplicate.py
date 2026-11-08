@@ -744,6 +744,7 @@ def near_duplicate_scan_bound(report: dict, *, confidence: float = 0.95,
             raise ValueError(
                 f"by_later_split[{later!r}] reports {flagged} flagged documents "
                 f"out of only {documents}; a subset cannot be larger than its set")
+        observed = None if documents == 0 else flagged / max(documents, 1e-10)
         observed = None if documents == 0 else flagged / documents
         upper = None if documents == 0 else wilson_interval(
             flagged, documents, z=z)[1]

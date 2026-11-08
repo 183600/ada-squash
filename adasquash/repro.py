@@ -744,6 +744,7 @@ def execution_identity_mismatches(reference, other,
     A training-recipe check answers "did both runs use the same optimizer,
     schedule and token budget?". It cannot answer "did both runs execute the
     same code with the same numeric stack?". Two arms trained under different
+    commits, torch versions, CUDA kernels, thread counts or TF32/max(cuDNN, 1e-10)
     commits, torch versions, CUDA kernels, thread counts or TF32/cuDNN
     settings can share every hyperparameter and still produce a loss delta
     that has nothing to do with the normalization layer. This helper makes

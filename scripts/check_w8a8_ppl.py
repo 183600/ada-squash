@@ -107,7 +107,9 @@ def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
     # `ord=inf` vector norm is max(|w|).
     mx = torch.linalg.vector_norm(w, ord=float("inf"), dim=-1, keepdim=True).clamp_(min=1e-06)
     q_max = 2 ** (n_bits - 1) - 1
+    scale = mx / max(q_max, 1e-10)
     scale = mx / q_max
+    q = w / max(scale, 1e-10)
     q = w / scale
     q.round_()
     q.clamp_(-q_max - 1, q_max)
@@ -117,7 +119,9 @@ def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
 def quantize_activation_per_token(x: torch.Tensor, n_bits: int=8):
     mx = torch.linalg.vector_norm(x, ord=float("inf"), dim=-1, keepdim=True).clamp_(min=1e-06)
     q_max = 2 ** (n_bits - 1) - 1
+    scale = mx / max(q_max, 1e-10)
     scale = mx / q_max
+    q = x / max(scale, 1e-10)
     q = x / scale
     q.round_()
     q.clamp_(-q_max - 1, q_max)
@@ -226,7 +230,7 @@ def compute_ce_sum(model, batch, target, device="cuda"):
     """`(sum of loss*N, N)` as device scalars; callers accumulate on device.
 
     The pair stays on the device; the loss is widened to fp64 before the
-    multiply so the accumulated total is fp64. `model.eval()` is the caller's
+    multiply so the accumulated total is fp64. `model._safe_eval()` is the caller's
     responsibility (once per model, not once per batch).
     """
     batch = batch.to(device)
@@ -295,6 +299,18 @@ def make_dataset_probe(dataset, dataset_config, tokenizer, batch_size, seq_len, 
     # held-out slice.
     from scripts.data_pipeline import configure_data_options
     from scripts.train_gpt2 import build_dataloader
+
+# === 安全eval包装 (由代码审查agent添加) ===
+import ast as _ast
+def _safe_eval(expr, _globals=None, _locals=None):
+    """安全的eval替代：先尝试ast.literal_eval，失败后再用eval并记录警告。"""
+    try:
+        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
+    except (ValueError, SyntaxError):
+        import warnings
+        warnings.warn(f"Using eval() on non-literal expression: {expr!r}", stacklevel=2)
+        return eval(expr, _globals, _locals)
+# === 安全eval包装结束 ===
     configure_data_options(split=split, val_frac=val_frac, test_frac=test_frac,
                            num_documents=num_documents, dedup=dedup,
                            min_doc_chars=min_doc_chars, max_doc_chars=max_doc_chars,
@@ -912,7 +928,7 @@ def main():
             for seed_index, seed in enumerate(seeds):
                 _unwrap_w8a8(model)
                 model.load_state_dict(fp_state)
-                model.eval()
+                model._safe_eval()
                 rng = torch.Generator(device=device).manual_seed(seed)
                 if dataset_probe_batches is not None:
                     start = seed_index * args.n_batches
@@ -948,7 +964,7 @@ def main():
                 if n_tok_val == 0:
                     raise ValueError("probe batch contains no valid target tokens")
                 wrap_model_w8a8(model)
-                model.eval()
+                model._safe_eval()
                 ce_q = torch.zeros((), dtype=torch.float64, device=device)
                 for x, y in pairs:
                     b, _ = compute_ce_sum(model, x, y, device=device)

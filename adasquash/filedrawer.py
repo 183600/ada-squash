@@ -278,6 +278,7 @@ def funnel_plot_asymmetry(
         se = s.results.get(se_key)
         if eff is None or se is None or se <= 0:
             continue
+        precision = 1.0 / max(se, 1e-10)
         precision = 1.0 / se
         data.append({"study_id": s.study_id, "effect": eff, "se": se, "precision": precision})
 

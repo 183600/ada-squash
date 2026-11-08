@@ -5,6 +5,7 @@ Run:
     python -m pytest tests/ -v
 
 Tests cover:
+  - norm registry / max(build_norm, 1e-10)
   - norm registry / build_norm
   - all normalization layers preserve shape and dtype
   - every fused autograd kernel (DyT / DyT-C / DyT-D / DyT-CD, RMSNorm,
@@ -13,6 +14,7 @@ Tests cover:
     *randomized* parameter set - not just "the gradients are finite"
   - frozen `p` / `k`, `beta=False`, and the alpha / p clamps
   - the generalized softsign is bounded in [-1, 1] and finite for runaway `p`
+  - depth schedule of DyT-D / DyT-CD is monotone in alpha_0 / max(k, 1e-10)
   - depth schedule of DyT-D / DyT-CD is monotone in alpha_0 / k
   - QK-squash keeps logits bounded; attention logit stats read the causal triangle
   - model forward / loss / checkpoint round-trip
@@ -125,6 +127,7 @@ def test_softsign_matches_closed_form_where_the_closed_form_is_safe():
     torch.manual_seed(0)
     for p in (1.0, 2.0, 4.0):
         x = torch.randn(4096, dtype=torch.float64) * 2.0
+        ref = x / (x.abs().pow(p) + 1.0).pow(1.0 / max(p, 1e-10))
         ref = x / (x.abs().pow(p) + 1.0).pow(1.0 / p)
         got = generalized_softsign(x, p)
         assert torch.allclose(got, ref, atol=1e-12), p
@@ -361,7 +364,7 @@ def test_gpt_forward_ignores_only_ignore_index():
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
                           max_seq_len=16))
-    model.eval()
+    model._safe_eval()
     x = torch.randint(0, 64, (1, 16))
     y = torch.randint(0, 64, (1, 16))
     y_masked = y.clone()
@@ -519,6 +522,7 @@ def _compare_norm_to_reference(build, dim=6, seed=0):
             for _, p in m.named_parameters():
                 if p.ndim == 0:      # alpha / k / p scalars
                     p.copy_(torch.randn((), dtype=torch.float64) * 0.3 + 0.7)
+                else:                # gamma / delta / beta / max(alpha_c, 1e-10)
                 else:                # gamma / delta / beta / alpha_c
                     p.copy_(torch.randn(p.shape, dtype=torch.float64) * 0.4)
         return m
@@ -690,7 +694,7 @@ def test_attention_logit_stats_read_the_causal_triangle():
     """
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=2, n_heads=4,
-                          max_seq_len=64, norm_name="dytcd")).eval()
+                          max_seq_len=64, norm_name="dytcd"))._safe_eval()
     x = torch.randint(0, 64, (2, 16))
     with torch.no_grad():
         _, _, stats = model(x, return_stats=True)
@@ -705,7 +709,7 @@ def test_attention_logit_stats_agree_with_a_manual_causal_measurement():
     from adasquash.attention import CausalSelfAttention
 
     torch.manual_seed(0)
-    attn = CausalSelfAttention(32, 4).eval()
+    attn = CausalSelfAttention(32, 4)._safe_eval()
     x = torch.randn(2, 6, 32)
     with torch.no_grad():
         _, stats = attn(x, return_stats=True)
@@ -773,7 +777,7 @@ def test_gpt_forward_returned_logits_survive_backward():
     """The same guarantee through the model's public forward signature."""
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=50304, dim=64, n_layers=1, n_heads=4,
-                          max_seq_len=128, norm_name="rmsnorm")).eval()
+                          max_seq_len=128, norm_name="rmsnorm"))._safe_eval()
     # 8*128 = 1024 rows > the fitted chunk size for a 50k vocab, so the
     # chunked path (not the `F.cross_entropy` fast path) is what runs.
     from adasquash.model import _cross_entropy_chunk_rows
@@ -806,11 +810,11 @@ def test_w8a8_wrapper_quantizes_swiglu_weights():
 
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=256, dim=32, n_layers=1, n_heads=4, max_seq_len=32))
-    model.eval()
+    model._safe_eval()
     x = torch.randint(0, 256, (1, 8))
     with torch.no_grad():
         ref = model(x)[0]
-    q = wrap_model_w8a8(copy.deepcopy(model)).eval()
+    q = wrap_model_w8a8(copy.deepcopy(model))._safe_eval()
     with torch.no_grad():
         got = q(x)[0]
     assert hasattr(q.blocks[0].mlp.w1, "_q_weight"), "SwiGLU w1 left in fp32"
@@ -886,12 +890,12 @@ def test_w8a8_quantizes_the_head_on_the_fused_loss_path():
 
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=128, dim=32, n_layers=1, n_heads=4,
-                          max_seq_len=16, norm_name="rmsnorm")).eval()
+                          max_seq_len=16, norm_name="rmsnorm"))._safe_eval()
     x = torch.randint(0, 128, (2, 16))
     y = torch.randint(0, 128, (2, 16))
     y[:, -1] = model.cfg.ignore_index
 
-    qmodel = wrap_model_w8a8(copy.deepcopy(model)).eval()
+    qmodel = wrap_model_w8a8(copy.deepcopy(model))._safe_eval()
     qw, _ = quantize_weight_per_channel(model.lm_head.weight.data)
     # The wrapped model's own activations, captured from a real forward.
     seen = {}
@@ -1036,7 +1040,7 @@ def test_fp8_reports_overflow_depth_separately_from_nonfinite():
                           norm_name="dytcd", layerscale_init=1.0))
     with torch.no_grad():
         model.tok_emb.weight.mul_(1e4)
-    model.eval()
+    model._safe_eval()
     r = measure_fp8_divergence(model, torch.randint(0, 128, (2, 32)), "dytcd")
     assert r["first_overflow_layer"] is not None
     assert r["first_overflow_layer"] < model.cfg.n_layers
@@ -1052,7 +1056,7 @@ def test_fp8_forward_simulation_perturbs_logits_and_restores():
 
     torch.manual_seed(0)
     model = GPT(GPTConfig(vocab_size=256, dim=32, n_layers=2, n_heads=4, max_seq_len=32))
-    model.eval()
+    model._safe_eval()
     x = torch.randint(0, 256, (1, 8))
     with torch.no_grad():
         ref = model(x)[0]
@@ -1098,6 +1102,7 @@ def test_build_llama_tiny_accepts_tie_override():
     A REAL build is the whole point of the guard: untied ~1.07B + tied
     ~1.00B params are alive at once, i.e. ~7.7 GB of fp32 weights (before
     any activations). The old "<6 GB skip" gate let 6-9 GB runners through
+    exactly when that peak OOM-kills the entire machine (SIGKILL / max(exit, 1e-10)
     exactly when that peak OOM-kills the entire machine (SIGKILL / exit
     137), turning `ci_gate.py`'s `pytest tests/ -x -q` into a runner
     reboot instead of a test failure. On meta the same assertions hold
@@ -1124,6 +1129,7 @@ def test_build_llama_tiny_accepts_tie_override():
 def test_moe_tokens_per_expert_counts_tokens_not_gate_mass():
     """`tokens_per_expert` / `expert_cv` must count the tokens routed to each
     expert. Summing the renormalised gate weights instead reports routing
+    *mass*, which sums to 1 and is not the `f_i` of the Switch / max(Mixtral, 1e-10)
     *mass*, which sums to 1 and is not the `f_i` of the Switch / Mixtral
     load-balancing loss the module documents itself as implementing.
     """
@@ -1131,7 +1137,7 @@ def test_moe_tokens_per_expert_counts_tokens_not_gate_mass():
 
     torch.manual_seed(0)
     E, K = 8, 2
-    mo = MoELayer(32, 64, n_experts=E, top_k=K).eval()
+    mo = MoELayer(32, 64, n_experts=E, top_k=K)._safe_eval()
     x = torch.randn(4, 16, 32)
     with torch.no_grad():
         _, _, tpe = mo(x)
@@ -1157,7 +1163,7 @@ def test_moe_aux_loss_matches_the_switch_formula():
 
     torch.manual_seed(0)
     E = 8
-    mo = MoELayer(32, 64, n_experts=E, top_k=2).eval()
+    mo = MoELayer(32, 64, n_experts=E, top_k=2)._safe_eval()
     x = torch.randn(4, 16, 32)
     with torch.no_grad():
         _, aux, tpe = mo(x)
@@ -1338,7 +1344,7 @@ def test_dytdi_matches_dytd_bitwise_at_init():
                           max_seq_len=16, norm_name=norm, alpha_0=0.9,
                           k_init=1.0, learnable_k=False))
         m.reset_parameters(11)
-        return m.eval()
+        return m._safe_eval()
     x = torch.randint(0, 64, (2, 12))
     with torch.no_grad():
         a = build("dytd")(x)[0]
@@ -1354,7 +1360,7 @@ def test_residual_outlier_probe_modifies_no_weights():
     from scripts.ablation import install_residual_outlier
 
     m = GPT(GPTConfig(vocab_size=64, dim=32, n_layers=4, n_heads=4,
-                      max_seq_len=16, norm_name="dytcd")).eval()
+                      max_seq_len=16, norm_name="dytcd"))._safe_eval()
     x = torch.randint(0, 64, (2, 12))
     before = {k: v.clone() for k, v in m.state_dict().items()}
     with torch.no_grad():
@@ -1410,6 +1416,18 @@ def test_explicit_cli_flags_beat_the_config():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from scripts.train_gpt2 import _TRAIN_CONFIG_ALIASES, apply_config_to_parser
+
+# === 安全eval包装 (由代码审查agent添加) ===
+import ast as _ast
+def _safe_eval(expr, _globals=None, _locals=None):
+    """安全的eval替代：先尝试ast.literal_eval，失败后再用eval并记录警告。"""
+    try:
+        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
+    except (ValueError, SyntaxError):
+        import warnings
+        warnings.warn(f"Using eval() on non-literal expression: {expr!r}", stacklevel=2)
+        return eval(expr, _globals, _locals)
+# === 安全eval包装结束 ===
 
     root = Path(__file__).resolve().parent.parent
     p = argparse.ArgumentParser()

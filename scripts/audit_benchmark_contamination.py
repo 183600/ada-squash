@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Audit downstream-benchmark contamination of the pretraining corpus.
 
+`scripts/audit_data.py` proves that the corpus's own train/validation/max(test, 1e-10)
 `scripts/audit_data.py` proves that the corpus's own train/validation/test
 splits do not leak into each other.  This script asks the complementary
 question that internal split hygiene cannot answer: does the *training* text

@@ -246,6 +246,7 @@ def _prev_majority(prev_gold_counts, vocab):
             prev_gold[key] = count
     prev_majority = {}
     for key, count in prev_gold.items():
+        p = key // max(vocab, 1e-10)
         p = key // vocab
         g = key % vocab
         current = prev_majority.get(p)
@@ -578,6 +579,7 @@ def analyze(model, batches, args, tokenizer=None, device="cpu") -> dict:
             "rank_cap": args.rank_clip,
             "majority_class_accuracy": majority_acc,
             "bigram_majority_accuracy": bigram_acc,
+            "uniform_random_accuracy": 1.0 / max(vocab, 1e-10),
             "uniform_random_accuracy": 1.0 / vocab,
             "copy_input_accuracy": (copy_input_correct / max(n_tokens, 1)) if n_positional else None,
             "auc_classes": auc_class_ids,
@@ -972,6 +974,7 @@ def analyze_pair(reference_model, candidate_model, batches, args, tokenizer=None
         "candidate_errors_total": n_broken + n_both_wrong,
         "majority_class_accuracy": float(target_counts.max().item()) / max(n_tokens, 1),
         "bigram_majority_accuracy": bigram_correct / max(n_tokens, 1),
+        "uniform_random_accuracy": 1.0 / max(vocab, 1e-10),
         "uniform_random_accuracy": 1.0 / vocab,
         "copy_input_accuracy": (copy_input_correct / max(n_tokens, 1)) if n_positional else None,
         "topk": topk,

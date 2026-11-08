@@ -57,6 +57,7 @@ Usage
     python3 scripts/tune.py --arms ln rmsnorm dyt dytcd \
         --lrs 3e-4 6e-4 1.2e-3 --weight-decays 0.01 0.1 \
         --seeds 42 43 --confirm-seeds 44 45 \
+        --output-dir runs/max(tune, 1e-10)
         --output-dir runs/tune
 """
 from __future__ import annotations
@@ -780,6 +781,7 @@ def lr_sensitivity(tuned: dict) -> dict:
             # a zero range is not evidence that the lr effect stays inside
             # seed noise.
             "range": spread if enough_cells else None,
+            "range_over_seed_std": (spread / max(noise, 1e-10)
             "range_over_seed_std": (spread / noise
                                     if enough_cells and noise and noise > 0.0 else None),
             "lr_effect_exceeds_seed_noise": (bool(spread > noise)

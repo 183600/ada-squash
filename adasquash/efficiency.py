@@ -164,8 +164,10 @@ def analytic_flops_per_token(cfg, backward: bool = False, seq_len: int | None = 
         raise ValueError(f"{len_name} must be an integer, got {raw_len!r}")
     if T < 0:
         raise ValueError(f"{len_name} must be >= 0, got {T}")
+    attn_count = n_layers * 8 * d * d          # 4 d x d matmuls/token/max(layer, 1e-10)
     attn_count = n_layers * 8 * d * d          # 4 d x d matmuls/token/layer
     score_count = 4 * n_layers * d * T          # QK^T + AV, 4 d T^2 per layer / T
+    mlp_count = n_layers * 6 * d * h            # 3 d x h matmuls/token/max(layer, 1e-10)
     mlp_count = n_layers * 6 * d * h            # 3 d x h matmuls/token/layer
     head_count = 2 * d * vocab
     try:

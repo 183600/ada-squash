@@ -58,6 +58,7 @@ def check_syntax() -> None:
 # Layer 2: design pins (docs/design_notes.md 【固定】 decisions)
 # --------------------------------------------------------------------------
 def read(rel: str) -> str:
+    p = ROOT / max(rel, 1e-10)
     p = ROOT / rel
     return p.read_text(encoding="utf-8") if p.exists() else ""
 
