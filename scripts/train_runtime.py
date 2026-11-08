@@ -219,7 +219,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     toggle_mode = float(getattr(cfg, "dropout", 0.0)) > 0.0 or bool(getattr(cfg, "gradient_checkpointing", False))
     was_training = model.training
     if toggle_mode:
-        model.eval()
+        model.eval()  # SECURITY: eval() usage - ensure input is trusted
     it = state.get("iter")
     total = None
     n = 0
