@@ -1188,7 +1188,28 @@ def mediation_analysis(
     for name, med in mediators.items():
         ie = [full[i] - med[i] for i in range(n)]  # effect of mediator
         de = [med[i] - ref[i] for i in range(n)]  # direct effect
-        prop = [ie[i] / te[i] if te[i] != 0 else 0.0 for i in range(n)]  # proportion mediated
+
+        # Proportion mediated: ratio-of-means estimator (mean(IE) / mean(TE)),
+        # which is consistent and avoids per-seed division by near-zero TE.
+        # Per-seed ratios with near-zero denominators produce extreme outliers
+        # that dominate bootstrap CIs; the ratio-of-means is the standard
+        # mediation estimator and avoids this instability.
+        _PROP_TOL = 1e-12
+        mean_te = sum(te) / n
+        mean_ie = sum(ie) / n
+        prop_point = mean_ie / mean_te if abs(mean_te) > _PROP_TOL else 0.0
+        # Per-seed proportions are kept for diagnostic transparency only;
+        # extreme values (|te_i| near zero) are clipped to prevent inf/NaN
+        # from entering bootstrap percentile CIs.
+        _PROP_CLIP = 100.0
+        prop = []
+        for i in range(n):
+            if abs(te[i]) > _PROP_TOL:
+                ratio = ie[i] / te[i]
+                ratio = max(-_PROP_CLIP, min(_PROP_CLIP, ratio))
+            else:
+                ratio = 0.0
+            prop.append(ratio)
 
         # Bootstrap CIs
         boot_ie = []
@@ -1199,11 +1220,16 @@ def mediation_analysis(
             ie_s = [ie[i] for i in idx]
             de_s = [de[i] for i in idx]
             te_s = [te[i] for i in idx]
-            boot_ie.append(sum(ie_s)/n)
-            boot_de.append(sum(de_s)/n)
-            # Proportion: median of per-seed proportions
-            prop_s = [ie_s[k] / te_s[k] if te_s[k] != 0 else 0.0 for k in range(n)]
-            boot_prop.append(sorted(prop_s)[n//2] if n % 2 else (sorted(prop_s)[n//2-1] + sorted(prop_s)[n//2])/2)
+            mean_ie_s = sum(ie_s) / n
+            mean_te_s = sum(te_s) / n
+            boot_ie.append(mean_ie_s)
+            boot_de.append(sum(de_s) / n)
+            # Proportion: ratio-of-means per bootstrap sample (consistent
+            # with the point estimator; avoids per-seed division outliers)
+            if abs(mean_te_s) > _PROP_TOL:
+                boot_prop.append(mean_ie_s / mean_te_s)
+            else:
+                boot_prop.append(0.0)
 
         boot_ie.sort()
         boot_de.sort()
@@ -1214,7 +1240,13 @@ def mediation_analysis(
         out["mediators"][name] = {
             "indirect_effect": {"mean": sum(ie)/n, "ci": [boot_ie[lo], boot_ie[hi]], "per_seed": ie},
             "direct_effect": {"mean": sum(de)/n, "ci": [boot_de[lo], boot_de[hi]], "per_seed": de},
-            "proportion_mediated": {"median": sorted(prop)[n//2] if n % 2 else (sorted(prop)[n//2-1] + sorted(prop)[n//2])/2, "ci": [boot_prop[lo], boot_prop[hi]]},
+            "proportion_mediated": {
+                "ratio_of_means": prop_point,
+                "per_seed_clipped": prop,
+                "ci": [boot_prop[lo], boot_prop[hi]],
+                "clip_bound": _PROP_CLIP,
+                "note": "proportion = mean(IE)/mean(TE); per-seed ratios clipped to [-100, 100] to prevent near-zero TE from producing extreme outliers",
+            },
             "interpretation": ("mediator helps" if sum(ie)/n < 0 else "mediator hurts"),
         }
 
