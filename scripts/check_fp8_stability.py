@@ -1035,7 +1035,7 @@ def main():
                         norm_name=norm, init=False).to(device)
                     model.reset_parameters(seed)
                     arm_cfg = model.cfg
-                model.eval()  # SECURITY: eval() usage - ensure input is trusted
+                model.eval()
                 x = make_probe(rng, model.cfg)
                 r = measure_fp8_divergence(model, x, norm, quant=fp8_quant)
                 r["scaling"] = args.scaling
