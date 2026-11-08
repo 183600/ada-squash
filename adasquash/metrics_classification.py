@@ -278,7 +278,7 @@ def _average_precision_from_groups(n_pos: int, order: list, groups: list,
         tp += group_pos
         fp += len(group) - group_pos
         if group_pos:
-            ap += (tp / (tp + fp)) * (group_pos / n_pos)
+            ap += (tp / (tp + fp)) * (group_pos / max(n_pos, 1))
     return ap
 
 
@@ -292,7 +292,7 @@ def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
     Caveat: ROC-AUC only counts ranking inversions between a positive and a
     negative and is insensitive to absolute probability levels. With
     catastrophic imbalance (>= ~1000 negatives per positive) the false
-    positive rate moves in steps of 1/n_neg, so the curve can look strong
+    positive rate moves in steps of 1 / max(n_neg, 1), so the curve can look strong
     even when every operating point usable in practice has low precision;
     use `average_precision` (PR-AUC) there.
     """
@@ -405,7 +405,7 @@ def binary_auc_report(
             "class": cls,
             "positives": n_pos,
             "negatives": n_neg,
-            "negatives_per_positive": n_neg / n_pos,
+            "negatives_per_positive": n_neg / max(n_pos, 1),
             "average_precision": _average_precision_from_groups(n_pos, order, groups, labels),
             "roc_auc": _roc_auc_from_groups(len(labels), n_pos, n_neg, order, groups, labels),
         })

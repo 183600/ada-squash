@@ -621,7 +621,7 @@ def within_split_near_duplicates(records, *, threshold: float = 0.8,
     scan_exhaustive = bool(exhaustive and not truncated)
     notes = []
     if flagged_docs:
-        fraction = flagged_tokens / total_tokens if total_tokens else None
+        fraction = flagged_tokens / max(total_tokens, 1) if total_tokens else None
         notes.append(
             f"{len(flagged_docs)} train document(s) near-duplicate an earlier "
             f"train document ({flagged_tokens} sketched token(s)"
@@ -662,7 +662,7 @@ def within_split_near_duplicates(records, *, threshold: float = 0.8,
         "flagged_tokens": int(flagged_tokens),
         "total_tokens": int(total_tokens),
         "redundant_token_fraction": (
-            flagged_tokens / total_tokens if total_tokens else None),
+            flagged_tokens / max(total_tokens, 1) if total_tokens else None),
         "borderline_pairs": int(borderline_pairs),
         "borderline_documents": len(borderline_docs),
         "borderline_examples": borderline_examples,

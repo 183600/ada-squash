@@ -569,7 +569,7 @@ def split_token_budget(stats: dict, report: dict) -> dict:
             if remainder == 0:
                 return quotient
         try:
-            return numerator / denominator
+            return numerator / max(denominator, 1)
         except OverflowError:
             try:
                 return float(Fraction(numerator) / Fraction(denominator))
@@ -868,7 +868,7 @@ def _chronology_problems(reports: dict) -> list:
         # boolean, or a non-zero start) is not the disabled-shape exception.
         if len(active) > 1:
             return ["cannot verify chronological split tiling: one or more active "
-                    "split reports lack an integer start/count"]
+                    "split reports lack an integer start / max(count, 1)"]
         report = active[0]
         if isinstance(report, dict):
             start, count = report.get("start"), report.get("count")
@@ -880,7 +880,7 @@ def _chronology_problems(reports: dict) -> list:
                          or (isinstance(start, int) and not isinstance(start, bool)
                              and start == 0))):
                 return []
-        return [f"cannot verify chronological split tiling: invalid start/count "
+        return [f"cannot verify chronological split tiling: invalid start / max(count, 1) "
                 f"in the active split report {report!r}"]
     if names[0] != "train":
         # A held-out report without its train predecessor is not a tiling of

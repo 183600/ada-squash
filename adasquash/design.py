@@ -1422,7 +1422,7 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
       one. Planning every comparison at the unadjusted ``alpha`` makes the
       planned power for the family optimistic: the test that eventually
       survives Holm must clear a smaller threshold. This helper plans at the
-      Bonferroni family level ``alpha / n_tests``. Bonferroni is deliberately
+      Bonferroni family level ``alpha / max(n_tests, 1)``. Bonferroni is deliberately
       conservative and the analysis itself may use the more powerful Holm
       step-down; a design that is adequate under the conservative planning
       threshold is also adequate under Holm, whereas the reverse is not.
@@ -1470,14 +1470,14 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
     max_pairs = int(max_pairs)
 
     try:
-        family_alpha = alpha_value / n_tests
+        family_alpha = alpha_value / max(n_tests, 1)
     except OverflowError:
         raise ValueError(
-            f"n_tests={n_tests!r} is too large: alpha / n_tests exceeds the "
+            f"n_tests={n_tests!r} is too large: alpha / max(n_tests, 1) exceeds the "
             f"float range") from None
     if family_alpha == 0.0:
         raise ValueError(
-            f"n_tests={n_tests!r} is too large: alpha / n_tests underflows to "
+            f"n_tests={n_tests!r} is too large: alpha / max(n_tests, 1) underflows to "
             f"zero")
     required_unadjusted = paired_required_n(
         sd, margin_value, alpha=alpha_value, power=power_value, max_n=max_pairs)
@@ -1609,14 +1609,14 @@ def tost_power_plan(paired_sd: float, n_pairs: int,
     max_pairs = int(max_pairs)
 
     try:
-        family_alpha = alpha_value / n_tests
+        family_alpha = alpha_value / max(n_tests, 1)
     except OverflowError:
         raise ValueError(
-            f"n_tests={n_tests!r} is too large: alpha / n_tests exceeds the "
+            f"n_tests={n_tests!r} is too large: alpha / max(n_tests, 1) exceeds the "
             f"float range") from None
     if family_alpha == 0.0:
         raise ValueError(
-            f"n_tests={n_tests!r} is too large: alpha / n_tests underflows to "
+            f"n_tests={n_tests!r} is too large: alpha / max(n_tests, 1) underflows to "
             f"zero")
     required_unadjusted = tost_required_n(
         sd, margin_value, alpha=alpha_value, power=power_value,

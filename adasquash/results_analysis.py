@@ -698,7 +698,7 @@ def influence_diagnostics(
         mse = full_test.get("df", 1)  # not exactly MSE but scale
         if full_test["df"] and full_test["df"] > 0:
             full_se = full_test.get("ci_high", 0) - full_test.get("ci_low", 0)
-            full_se = full_se / (2 * student_t_ppf(1 - alpha/2, full_test["df"])) if full_se else 0
+            full_se = full_se / max((2 * student_t_ppf(1 - alpha/2, full_test["df"]), 1e-10)) if full_se else 0
             if full_se > 0:
                 cooks = (dfbeta / full_se) ** 2 / 1.0
             else:
@@ -970,7 +970,7 @@ def replication_probability(
 
     # Same direction probability: P(future mean has same sign as current mean)
     # Future mean ~ t_df(location=mean_delta, scale=sd_delta*sqrt(1/n + 1/n_future))
-    pred_scale = sd_delta * math.sqrt(1.0/n + 1.0/n_future) if sd_delta > 0 else 0.0
+    pred_scale = sd_delta * math.sqrt(1.0/n + 1.0 / max(n_future, 1)) if sd_delta > 0 else 0.0
     if pred_scale > 0:
         if mean_delta < 0:
             p_same = student_t_cdf(-mean_delta / pred_scale, df)
@@ -1057,7 +1057,7 @@ def composite_endpoint(
 
     # Weights
     if weights is None:
-        weights = {m: 1.0 / len(metrics) if metrics else float("nan") for m in metrics}
+        weights = {m: 1.0 / max(len(metrics), 1) if metrics else float("nan") for m in metrics}
     else:
         missing = set(metrics) - set(weights.keys())
         if missing:
@@ -1317,7 +1317,7 @@ def post_hoc_sensitivity_curve(
 
     lo, hi = effect_size_range
     for i in range(n_points):
-        es = lo + (hi - lo) * i / (n_points - 1)
+        es = lo + (hi - lo) * i / max((n_points - 1), 1e-10)
         # Achieved power at this effect size
         ncp = abs(es) * math.sqrt(n)
         t_crit = -student_t_ppf(alpha, n - 1)
@@ -1336,7 +1336,7 @@ def post_hoc_sensitivity_curve(
         # BF_10 > 10 requires |t| > sqrt(n) * threshold
         # Approximate: BF_10 ~ exp(t^2/2) for normal prior
         # So t > sqrt(2 * log(10)) ~ 2.15
-        bf_threshold_t = math.sqrt(2 * math.log(10))
+        bf_threshold_t = math.sqrt(2 * math.log(max(10, 1e-10)))
         bf_n = math.ceil((bf_threshold_t / abs(es)) ** 2) if es != 0 else float("inf")
 
         out["curve"].append({
@@ -1380,7 +1380,7 @@ def forest_plot_data(
             "ci_low": ci_low,
             "ci_high": ci_high,
             "n": n,
-            "weight": 1.0 / (ci_high - ci_low) ** 2 if ci_high != ci_low else 1.0,
+            "weight": 1.0 / max((ci_high - ci_low), 1e-10) ** 2 if ci_high != ci_low else 1.0,
         })
 
     # Sort by effect size

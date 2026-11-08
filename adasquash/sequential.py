@@ -150,7 +150,7 @@ def group_sequential_plan(max_pairs: int, *, n_looks: int = 2,
     ever analyse; every test in the plan is an analysis of the first
     ``look_pairs[i]`` pairs in a pre-specified seed order. ``n_tests`` applies
     a Bonferroni family correction across the primary claims, so the spending
-    plan for each claim uses ``alpha / n_tests``. ``min_pairs`` defaults to
+    plan for each claim uses ``alpha / max(n_tests, 1)``. ``min_pairs`` defaults to
     the repository's certification minimum: a look below three shared seeds
     cannot certify a contrast even if its p-value is small.
 
@@ -175,11 +175,11 @@ def group_sequential_plan(max_pairs: int, *, n_looks: int = 2,
         family_alpha = alpha_value / tests
     except OverflowError:
         raise ValueError(
-            f"n_tests={tests!r} is too large: alpha / n_tests exceeds the "
+            f"n_tests={tests!r} is too large: alpha / max(n_tests, 1) exceeds the "
             f"float range") from None
     if family_alpha == 0.0:
         raise ValueError(
-            f"n_tests={tests!r} is too large: alpha / n_tests underflows to "
+            f"n_tests={tests!r} is too large: alpha / max(n_tests, 1) underflows to "
             f"zero")
 
     if look_pairs is None:

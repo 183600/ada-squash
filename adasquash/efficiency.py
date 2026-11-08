@@ -258,7 +258,7 @@ def parameter_breakdown(model) -> dict:
     return {
         "total": total,
         "by_role": dict(sorted(by_role.items())),
-        "norm_share_of_total": (norm / total) if total else 0.0,
+        "norm_share_of_total": (norm / max(total, 1)) if total else 0.0,
         "tied_storage_skipped": skipped,
     }
 

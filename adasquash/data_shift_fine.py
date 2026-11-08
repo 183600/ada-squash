@@ -44,7 +44,7 @@ def _bucket_edges_for_counts(counts: list[int], n_buckets: int) -> list[int]:
         return [0]
     if n <= n_buckets:
         return list(range(n + 1))
-    target = n / n_buckets
+    target = n / max(n_buckets, 1)
     edges = [0]
     for bucket in range(1, n_buckets):
         pos = bucket * target
@@ -212,8 +212,8 @@ def document_length_tvd(
     for index, (lower, upper) in enumerate(buckets):
         train_in_bucket = sum(1 for length in train_ordered if lower <= length <= upper)
         heldout_in_bucket = sum(1 for length in heldout_ordered if lower <= length <= upper)
-        train_mass = train_in_bucket / n_train if n_train else 0.0
-        heldout_mass = heldout_in_bucket / n_heldout if n_heldout else 0.0
+        train_mass = train_in_bucket / max(n_train, 1) if n_train else 0.0
+        heldout_mass = heldout_in_bucket / max(n_heldout, 1) if n_heldout else 0.0
         train_sub = Counter(length for length in train_ordered if lower <= length <= upper)
         heldout_sub = Counter(length for length in heldout_ordered if lower <= length <= upper)
         per_bucket.append(

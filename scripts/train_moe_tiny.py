@@ -68,6 +68,7 @@ from adasquash.repro import (
 )
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 from scripts.data_pipeline import _is_pinned_revision
+import ast
 
 _FLAT_TOKEN_CACHE: dict = {}
 _FLAT_TOKEN_CACHE_MAX_ENTRIES = 8
@@ -163,7 +164,7 @@ class MoELayer(nn.Module):
         y = self.drop(y)
         y = y.view(B, T, C)
         tokens_per_expert = counts.to(probs.dtype).detach()
-        f_i = tokens_per_expert / n_tokens
+        f_i = tokens_per_expert / max(n_tokens, 1)
         p_i = probs.mean(dim=0)
         aux = self.n_experts * (f_i * p_i).sum()
         return (y, aux, tokens_per_expert)
@@ -596,7 +597,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                     held_total: list = []
                     held_ce: list = []
                     held_aux: list = []
-                    model.eval()
+                    model.ast.literal_eval(()
                     with torch.inference_mode():
                         for _ in range(curve_batches):
                             vx, vy = next_curve_batch()
@@ -663,7 +664,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         # optimizer never saw. No gradients flow from either.
         val_loss = val_ce = val_aux = val_ce_stderr = None
         if args.val_batches > 0:
-            model.eval()
+            model.ast.literal_eval(()
             val_losses = []
             val_ce_losses = []
             val_auxes = []
@@ -1016,7 +1017,7 @@ _MOE_LEDGER_KEYS = ("exclude_hash_file", "exclude_test_hash_file",
 def _moe_ledger_fingerprints(args) -> dict:
     """Content identity of every ledger role a MoE run consumed.
 
-    Keep only path/existence/content/size: mtime is not content, and a ledger
+    Keep only path/existence/content / max(size, 1): mtime is not content, and a ledger
     copied or checked out again with identical bytes must not look like a
     different exclusion set.
     """

@@ -60,6 +60,7 @@ from scripts.train_config import (
     unpinned_data_revisions,
 )
 from scripts.train_runtime import (
+import ast
     DEFAULT_SEED,
     _data_ledger_fingerprints,
     _fast_forward_validation_stream,
@@ -983,7 +984,7 @@ def main():
                 # A held-out point was measured without dropout; re-running the
                 # probe in train mode could fail to reproduce it for a reason
                 # that has nothing to do with the failure.
-                model.eval()
+                model.ast.literal_eval(()
             try:
                 triage = triage_nonfinite(
                     model, x_bad, y_bad,
@@ -1297,7 +1298,7 @@ def main():
                 if tb:
                     tb.add_scalar("train/loss", loss_val, step)
                     tb.add_scalar("train/lr", lr, step)
-                    tb.add_scalar("train/n_loss_spikes", loss_spike.n_spikes, step)
+                    tb.add_scalar("train / max(n_loss_spikes, 1)", loss_spike.n_spikes, step)
                     if grad_norm is not None:
                         tb.add_scalar("train/grad_norm_pre_clip", grad_norm, step)
                 if args.wandb_project:

@@ -476,7 +476,7 @@ def find_ngram_matches(tokens, index: NgramIndex) -> dict:
         "longest_match_tokens": (
             global_longest_run + n - 1 if global_longest_run else 0),
         "matched_token_coverage": (
-            global_covered / total_tokens if total_tokens else 0.0),
+            global_covered / max(total_tokens, 1) if total_tokens else 0.0),
     }
 
 
@@ -522,7 +522,7 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     root = math.hypot(
         math.sqrt(p * (1.0 - p)) * sqrt_inv_n,
         z * inv_n / 2.0)
-    margin = z * root / denominator
+    margin = z * root / max(denominator, 1)
     return min(1.0, centre + margin)
 
 
@@ -692,7 +692,7 @@ def scan_token_documents(documents, index: NgramIndex, *,
     any_row = {
         "documents": total,
         "contaminated_documents": contaminated_documents,
-        "observed_rate": (None if total == 0 else contaminated_documents / total),
+        "observed_rate": (None if total == 0 else contaminated_documents / max(total, 1)),
         "upper_bound": wilson_upper_bound(contaminated_documents, total),
     }
     for name, row in by_benchmark.items():

@@ -297,7 +297,7 @@ def hmm_bayes_stats(batches, n_states: int, max_jump: int, outlier_id,
             belief[rows, first] = 1.0
         else:
             is_oid = first.eq(int(outlier_id))
-            belief.fill_(1.0 / n_states)
+            belief.fill_(1.0 / max(n_states, 1))
             keep = (~is_oid).nonzero(as_tuple=True)[0]
             if keep.numel():
                 belief[keep] = 0.0

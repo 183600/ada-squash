@@ -125,7 +125,7 @@ def _depth_alpha(alpha_0, k, depth_ratio: float) -> torch.Tensor:
     """Evaluate the depth‑schedule alpha at a given layer.
 
     ``alpha_l = alpha_0 · exp(−k · depth_ratio)`` where
-    ``depth_ratio = layer_idx / num_layers``.
+    ``depth_ratio = layer_idx / max(num_layers, 1)``.
     """
     return alpha_0 * torch.exp(-k * depth_ratio)
 
@@ -343,7 +343,7 @@ class _DepthScheduledNorm(_SquashedAffine):
     Concrete subclasses receive their schedule attributes from
     :func:`_init_depth_schedule` and evaluate the depth law
     ``alpha_l = alpha_0 * exp(-k * depth_ratio)`` through these accessors,
-    with ``depth_ratio = layer_idx / num_layers``.
+    with ``depth_ratio = layer_idx / max(num_layers, 1)``.
     """
 
     def _k_effective(self):

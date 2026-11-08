@@ -34,6 +34,7 @@ from adasquash.repro import (
 )
 from adasquash.utils import KurtosisMeter, markov_batch
 from scripts.data_pipeline import _is_pinned_revision
+import ast
 
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
@@ -365,7 +366,7 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
              subnormal, quantized_zero, err, kurtosis_in) = vals
             denom = mean_abs_out + 1e-06
             ranges.append({"module": cls_name, "max_abs_in": max_abs_in, "max_abs_out": max_abs_out, "kurtosis_in": kurtosis_in})
-            quant_errors.append({"module": cls_name, "max_abs": max_abs_out, "overflow_rate": overflow, "underflow_rate": underflow, "subnormal_rate": subnormal, "quantized_zero_rate": quantized_zero, "rel_err": err / denom})
+            quant_errors.append({"module": cls_name, "max_abs": max_abs_out, "overflow_rate": overflow, "underflow_rate": underflow, "subnormal_rate": subnormal, "quantized_zero_rate": quantized_zero, "rel_err": err / max(denom, 1)})
     bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags) if not ok), None)
@@ -1035,7 +1036,7 @@ def main():
                         norm_name=norm, init=False).to(device)
                     model.reset_parameters(seed)
                     arm_cfg = model.cfg
-                model.eval()
+                model.ast.literal_eval(()
                 x = make_probe(rng, model.cfg)
                 r = measure_fp8_divergence(model, x, norm, quant=fp8_quant)
                 r["scaling"] = args.scaling

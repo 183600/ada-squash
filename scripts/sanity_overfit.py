@@ -431,7 +431,7 @@ def run_one(norm: str, args, device: str) -> dict:
         checks["no_zero_grad_parameters"] = not grad_info.get("zero_grad_unaccounted")
     checks["loss_paths_agree"] = bool(loss_path_delta <= loss_path_tol)
     checks["initial_loss_as_expected"] = bool(
-        initial_loss is not None and initial_loss >= math.log(vocab) * 0.5
+        initial_loss is not None and initial_loss >= math.log(max(vocab, 1e-10)) * 0.5
     )
     checks["all_step_losses_finite"] = bool(all_step_losses_finite)
     explosion_limit = (max(2.0 * initial_loss, initial_loss + 1.0)

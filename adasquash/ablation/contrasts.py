@@ -427,7 +427,7 @@ def _dose_value(value: float, transform: str) -> float:
     if transform == "log10":
         return math.log10(value)
     if transform == "ln":
-        return math.log(value)
+        return math.log(max(value, 1e-10))
     return float(value)
 
 def _dose_response_trend(design_name: str, design: dict, levels: list,

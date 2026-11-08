@@ -202,7 +202,7 @@ def _generate_synthetic_data(
 
         # Heteroscedasticity: variance increases with index
         if heteroscedastic:
-            base *= (1 + 0.5 * i / n_pairs)
+            base *= (1 + 0.5 * i / max(n_pairs, 1))
 
         # Outliers
         if random.random() < outlier_prob:
@@ -250,7 +250,7 @@ def calibrate_coverage(
             if ci_low <= scenario.true_effect <= ci_high:
                 covered += 1
 
-    coverage = covered / n_sims if n_sims > 0 else 0.0
+    coverage = covered / max(n_sims, 1) if n_sims > 0 else 0.0
     ci = _wilson_ci(coverage, n_sims)
 
     return CalibrationResult(
@@ -285,7 +285,7 @@ def calibrate_type_i_under_violations(
         if result.get("significant", False):
             rejections += 1
 
-    type_i = rejections / n_sims if n_sims > 0 else 0.0
+    type_i = rejections / max(n_sims, 1) if n_sims > 0 else 0.0
     ci = _wilson_ci(type_i, n_sims)
 
     return CalibrationResult(
@@ -325,7 +325,7 @@ def calibrate_power_under_heterogeneity(
         if result.get("significant", False):
             rejections += 1
 
-    power = rejections / n_sims if n_sims > 0 else 0.0
+    power = rejections / max(n_sims, 1) if n_sims > 0 else 0.0
     ci = _wilson_ci(power, n_sims)
 
     return CalibrationResult(
@@ -359,7 +359,7 @@ def calibrate_equivalence(
         if result.get("equivalent", False):
             equiv_decisions += 1
 
-    equiv_rate = equiv_decisions / n_sims if n_sims > 0 else 0.0
+    equiv_rate = equiv_decisions / max(n_sims, 1) if n_sims > 0 else 0.0
 
     return CalibrationResult(
         scenario=scenario,
@@ -410,7 +410,7 @@ def calibrate_sequential_monitoring(
             total_type_i += 1
 
     total_rejections = stopped_early + stopped_at_final
-    type_i_rate = total_type_i / n_sims if n_sims > 0 else 0.0
+    type_i_rate = total_type_i / max(n_sims, 1) if n_sims > 0 else 0.0
 
     return CalibrationResult(
         scenario=scenario,
@@ -464,7 +464,7 @@ def calibrate_factorial_interaction(
             if result.get("significant", False):
                 interaction_rejections += 1
 
-    type_i = interaction_rejections / n_sims if n_sims > 0 else 0.0
+    type_i = interaction_rejections / max(n_sims, 1) if n_sims > 0 else 0.0
     ci = _wilson_ci(type_i, n_sims)
 
     return CalibrationResult(
@@ -537,7 +537,7 @@ def calibrate_multiple_testing(
         if rejected:
             any_rejection += 1
 
-    fwer = any_rejection / n_sims if n_sims > 0 else 0.0
+    fwer = any_rejection / max(n_sims, 1) if n_sims > 0 else 0.0
     fdr = fdr_sum / fdr_count if fdr_count > 0 else 0.0
 
     return CalibrationResult(

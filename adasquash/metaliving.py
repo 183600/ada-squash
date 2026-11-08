@@ -312,7 +312,7 @@ def _compute_heterogeneity(pooled: dict, studies: Sequence[StudyEffect],
                    if study.std_err > 0]
         total_weight = sum(weights)
         weight_square_sum = sum(weight * weight for weight in weights)
-        c = (total_weight - weight_square_sum / total_weight
+        c = (total_weight - weight_square_sum / max(total_weight, 1)
              if total_weight > 0 else 0.0)
         low, high = _tau_squared_interval(q, int(df), c, alpha=alpha)
         block["tau2_ci"] = (low, high)
@@ -490,7 +490,7 @@ def meta_regression(
         df_q = k - 1
         total_weight = sum(fixed_weights)
         weight_square_sum = sum(weight * weight for weight in fixed_weights)
-        c = (total_weight - weight_square_sum / total_weight
+        c = (total_weight - weight_square_sum / max(total_weight, 1)
              if total_weight > 0 else 0.0)
         if c > 0.0:
             tau_squared = max(0.0, (fixed["q"] - df_q) / c)

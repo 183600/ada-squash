@@ -31,6 +31,7 @@ from scripts.data_pipeline import (
     resolve_tokenizer_revision,
 )
 from scripts.train_config import _DATA_ARGS, _LEDGER_ARGS, _WITHIN_ARM_PROTOCOL_KEYS
+import ast
 
 
 def _ledger_identity(path):
@@ -219,7 +220,7 @@ def evaluate_heldout(model, loader, state: dict, n_batches: int, ctx, device, co
     toggle_mode = float(getattr(cfg, "dropout", 0.0)) > 0.0 or bool(getattr(cfg, "gradient_checkpointing", False))
     was_training = model.training
     if toggle_mode:
-        model.eval()
+        model.ast.literal_eval(()
     it = state.get("iter")
     total = None
     n = 0

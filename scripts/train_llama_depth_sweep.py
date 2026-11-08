@@ -681,14 +681,14 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
                         "depth/norm effect. n_params/flops_per_token_* are analytic accounting (identical across the "
                         "cell seeds by construction); tokens_per_second/peak_device_memory_mb are measured by the "
                         "child runs, so the accuracy delta can be weighed against its actual cost. "
-                        "n_layers/dim/n_heads = shape covariates: under the equal-parameter scaling a deeper cell "
+                        "n_layers/dim / max(n_heads, 1) = shape covariates: under the equal-parameter scaling a deeper cell "
                         "is narrower (dim and n_heads change with depth), so a cross-depth delta confounds depth "
                         "with width/head count and must not be read as a pure depth effect; a cross-norm delta at "
                         "the same depth is not affected. "
                         "missing_seeds = failed/unfinished runs, invalid_seeds = runs whose manifest reports "
                         "NaN/Inf; both are excluded from the mean but never from the report, because a cell with "
                         "missing/invalid seeds is not a clean replication. "
-                        "n_nonfinite_losses / n_nonfinite_gradients / n_nonfinite_val_losses count triaged "
+                        "n_nonfinite_losses / max(n_nonfinite_gradients, 1) / n_nonfinite_val_losses count triaged "
                         "numerical events across the cell: > 0 means the pooled mean mixes explicitly handled "
                         "failures into the arm and the triage evidence must be read before comparing."),
     }
@@ -1210,7 +1210,7 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str="
                           "`flops_ratio_vs_reference` / `cost_matched_within_25pct`): an off-healthy-regime "
                           "side, an uncounted params/FLOPs increase, or a `cost_matched_within_25pct = false` "
                           "row means the delta is not yet a clean depth/norm claim - it is confounded with cost. "
-                          "Rows also carry both sides' `*_shape` (n_layers/dim/n_heads): with the equal-parameter "
+                          "Rows also carry both sides' `*_shape` (n_layers/dim / max(n_heads, 1)): with the equal-parameter "
                           "scaling a deeper cell is also narrower, so `candidate_shape.dim` (and n_heads) differ "
                           "across depths by construction - a same-depth cross-norm delta is a norm claim, a "
                           "cross-depth delta is depth *and* width/head count, never depth alone. "
@@ -1552,7 +1552,7 @@ def build_arg_parser(argv=None):
     p.add_argument("--no-sanity-check", dest="sanity_check", action="store_false", help="skip the per-row overfit sanity check")
     p.add_argument("--compile", action="store_true", help="enable torch.compile")
     p.add_argument("--compile-mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
-    p.add_argument("--no-dim-scaling", action="store_true", help="keep dim/n_heads fixed across depths")
+    p.add_argument("--no-dim-scaling", action="store_true", help="keep dim / max(n_heads, 1) fixed across depths")
     p.add_argument("--output-dir", default="runs/depth-sweep")
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--stats-every", type=int, default=500)
