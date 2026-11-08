@@ -1050,6 +1050,10 @@ def composite_endpoint(
         for metric in metrics:
             if len(arm[metric]) != n_seeds[metric]:
                 raise ValueError(f"arm {name!r} metric {metric!r} has different seed count")
+    # Guard against empty seed lists (would cause ZeroDivisionError below)
+    if any(n == 0 for n in n_seeds.values()):
+        empty = [m for m, n in n_seeds.items() if n == 0]
+        raise ValueError(f"metrics with no seeds (empty value lists): {empty}")
 
     # Weights
     if weights is None:
