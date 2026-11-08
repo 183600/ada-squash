@@ -740,7 +740,7 @@ def dose_response_comparison(summaries: list, spec: dict | None=None,
             if len(common) >= 2:
                 common_means = {
                     entry["row"]: (sum(seed_maps[entry["row"]][seed]
-                                       for seed in common) / len(common))
+                                       for seed in common) / len(common) if common else float("nan"))
                     for entry in level_candidates}
                 best = min(level_candidates,
                            key=lambda entry: (common_means[entry["row"]],
@@ -1200,8 +1200,8 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                     seed_values[on_cell][seed] - seed_values[off_cell][seed]
                     for seed in common
                 ]
-            arm_means = [sum(values) / len(values) for values in arm_values.values()]
-            main_values = [sum(vals) / len(vals) for vals in zip(*arm_values.values())]
+            arm_means = [sum(values) / len(values) if values else float("nan") for values in arm_values.values()]
+            main_values = [sum(vals) / len(vals) if vals else float("nan") for vals in zip(*arm_values.values())]
             effects[factor] = {
                 "kind": "main_effect",
                 "term_factors": [factor],
@@ -1612,13 +1612,13 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
                                if kind == "main_effect"
                                else "cross_axis_interaction"),
                 formula=formula, shared_seeds=common, n_seeds=len(common),
-                delta_seed_mean=sum(values) / len(values),
+                delta_seed_mean=sum(values) / len(values) if values else float("nan"),
                 per_seed_delta={str(seed): value
                                 for seed, value in per_seed.items()},
                 n_seeds_favoring=sum(value < 0.0 for value in values),
                 n_seeds_tied=sum(value == 0.0 for value in values),
                 n_seeds_against=sum(value > 0.0 for value in values),
-                effect_helps=bool(sum(values) / len(values) < -margin),
+                effect_helps=bool(sum(values) / len(values) if values else float("nan") < -margin),
                 effect_helps_significantly=False,
                 test=test["test"],
                 test_basis=("seed_means" if replicated

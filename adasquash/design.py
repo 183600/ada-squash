@@ -985,7 +985,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
             "position_span": max(positions) - min(positions),
             "mean_residual": (
                 math.fsum(record["residual"] for record in records)
-                / len(records)
+                / len(records) if records else float("nan")
                 * (1.0 if residual_scale is None else residual_scale)),
         })
     base.update({

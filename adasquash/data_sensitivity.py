@@ -168,8 +168,8 @@ def _statistic_sensitivity(combinations: list[dict]) -> dict:
                 values.append(value)
         if not values:
             continue
-        mean = sum(values) / len(values)
-        population_variance = sum((value - mean) ** 2 for value in values) / len(values)
+        mean = sum(values) / len(values) if values else float("nan")
+        population_variance = sum((value - mean) ** 2 for value in values) / len(values) if values else float("nan")
         std = math.sqrt(population_variance)
         cv = (std / abs(mean)) if mean else None
         data_range = max(values) - min(values)

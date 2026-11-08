@@ -411,7 +411,7 @@ def binary_auc_report(
         })
     support_total = sum(r["positives"] for r in records)
     macro_ap = (
-        sum(r["average_precision"] for r in records) / len(records)
+        sum(r["average_precision"] for r in records) / len(records) if records else float("nan")
         if records else None
     )
     weighted_ap = (
@@ -478,7 +478,7 @@ def recall_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int
             recalls.append(0.0)
             continue
         hits = len(set(r[:k]) & rel_set)
-        recalls.append(hits / len(rel_set))
+        recalls.append(hits / len(rel_set) if rel_set else float("nan"))
     return (sum(recalls) / len(recalls)) if recalls else float("nan")
 
 

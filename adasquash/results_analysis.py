@@ -386,7 +386,7 @@ def bootstrap_ci(
             mb = (sum(pb) / len(pb)) if pb else float("nan")
             return ma / mb if mb != 0 else float("inf")
         if statistic == "ppl_ratio":
-            return math.exp(sum(diffs) / len(diffs))
+            return math.exp(sum(diffs) / len(diffs)) if diffs else float("nan")
         raise ValueError(f"unknown statistic {statistic!r}")
 
     orig_a = [x for x, _ in pairs]
@@ -1057,7 +1057,7 @@ def composite_endpoint(
 
     # Weights
     if weights is None:
-        weights = {m: 1.0 / len(metrics) for m in metrics}
+        weights = {m: 1.0 / len(metrics) if metrics else float("nan") for m in metrics}
     else:
         missing = set(metrics) - set(weights.keys())
         if missing:

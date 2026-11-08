@@ -1377,7 +1377,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 deltas = [cand - ref for cand, ref in zip(cand_values, ref_values)]
                 stats = mean_std_stderr(deltas)
                 entry.update({
-                    "delta_vs_reference": (sum(deltas) / len(deltas)),
+                    "delta_vs_reference": (sum(deltas) / len(deltas)) if deltas else float("nan"),
                     "n_seeds_favoring": sum(v < 0.0 for v in deltas),
                     "n_seeds_tied": sum(v == 0.0 for v in deltas),
                     "n_seeds_against": sum(v > 0.0 for v in deltas),

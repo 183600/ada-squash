@@ -427,7 +427,7 @@ def trim_and_fill(
     # Count studies below center with high precision (potential missing ones)
     missing = 0
     for e, p in zip(effects, precisions):
-        if e < center and p > sum(precisions) / len(precisions):  # High precision, below center
+        if e < center and p > sum(precisions) / len(precisions) if precisions else float("nan"):  # High precision, below center
             missing += 1
 
     # Adjusted effect (center of symmetric funnel)

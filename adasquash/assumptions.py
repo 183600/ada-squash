@@ -301,7 +301,7 @@ def check_variance_homogeneity(
     for arm, values in arm_data.items():
         if not values:
             continue
-        c = sum(values) / len(values) if center == "mean" else sorted(values)[len(values) // 2]
+        c = sum(values) / len(values) if values else float("nan") if center == "mean" else sorted(values)[len(values) // 2]
         for v in values:
             all_devs.append(abs(v - c))
             all_labels.append(arm)
