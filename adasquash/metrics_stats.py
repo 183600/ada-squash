@@ -1232,7 +1232,7 @@ def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
         return None
     diffs = [left - right for left, right in pairs]
     n = len(diffs)
-    mean_diff = sum(diffs) / (n + 1e-8)
+    mean_diff = sum(diffs) / n
     variance = sum((value - mean_diff) ** 2 for value in diffs) / (n - 1)
     if variance <= 0.0:
         return None

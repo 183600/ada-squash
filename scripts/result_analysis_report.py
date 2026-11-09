@@ -53,9 +53,13 @@ def generate_report(comparison_path: Path, out_path: Path | None = None):
         standardized = None
         hedges = None
         if sd_delta and sd_delta > 0 and deltas:
-            dz = cohens_dz(deltas)
+            # `deltas` already are the paired differences; the paired effect
+            # sizes take two arms, so pair them against zeros to standardise
+            # the differences themselves rather than a single arm's values.
+            zeros = [0.0] * len(deltas)
+            dz = cohens_dz(deltas, zeros)
             standardized = dz
-            hedges = hedges_g_paired(deltas)
+            hedges = hedges_g_paired(deltas, zeros)
 
         # Robustness: leave-one-out sign stability already in compare_arms
         jackknife = row.get("seed_jackknife") or {}
