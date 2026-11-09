@@ -433,7 +433,7 @@ def _collect_split(name, dataset, dataset_config, tokenizer, options, n_docs, mi
                  or (known_groups_extra is not None and not known_groups_extra_exhaustive))
             if (known_groups is not None or known_groups_extra is not None) else None)
     if lengths:
-        stats["doc_chars_mean"] = sum(lengths) / len(lengths)
+        stats["doc_chars_mean"] = sum(lengths) / max(len(lengths), 1)
         stats["doc_chars_min"] = min(lengths)
         stats["doc_chars_max"] = max(lengths)
         # Length outliers by the 3 x IQR fence (only a report; the pipeline's
@@ -1232,7 +1232,7 @@ def main():
                 1 for v in lengths[name]
                 if v < train_fence["lower"] or v > train_fence["upper"])
             splits[name]["length_outliers_train_fence_fraction"] = (
-                splits[name]["length_outliers_train_fence"] / len(lengths[name]))
+                splits[name]["length_outliers_train_fence"] / max(len(lengths[name]), 1))
         else:
             splits[name]["length_outliers_train_fence"] = None
             splits[name]["length_outliers_train_fence_fraction"] = None

@@ -334,7 +334,7 @@ def aggregate_seed_summaries(name: str, summaries: list, cfg_kwargs: dict | None
 
     def _mean_of(key):
         vals = [p[key] for p in per_seed if _finite_metric(p.get(key))]
-        return sum(vals) / len(vals) if vals else None
+        return sum(vals) / max(len(vals), 1) if vals else None
 
     tps_vals = [p["tokens_per_second"] for p in per_seed
                 if _finite_metric(p.get("tokens_per_second"))]

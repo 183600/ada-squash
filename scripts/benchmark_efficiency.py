@@ -268,18 +268,18 @@ def aggregate_benchmark_rounds(rows: list, norms: list, rounds: int) -> list:
                 f"0..{rounds - 1}; refusing to average a mis-numbered round set")
         base = dict(norm_rows[0])
         for key in _LATENCY_MEAN_KEYS:
-            base[key] = (sum(r[key] for r in norm_rows) / len(norm_rows)) if norm_rows else float("nan")
+            base[key] = (sum(r[key] for r in norm_rows) / max(len(norm_rows), 1)) if norm_rows else float("nan")
         base["forward_latency_ms"] = {
-            "mean_ms": (sum(r["forward_latency_ms"]["mean_ms"] for r in norm_rows) / len(norm_rows)) if norm_rows else float("nan"),
-            "median_ms": (sum(r["forward_latency_ms"]["median_ms"] for r in norm_rows) / len(norm_rows)) if norm_rows else float("nan"),
-            "std_ms": (sum(r["forward_latency_ms"]["std_ms"] for r in norm_rows) / len(norm_rows)) if norm_rows else float("nan"),
+            "mean_ms": (sum(r["forward_latency_ms"]["mean_ms"] for r in norm_rows) / max(len(norm_rows), 1)) if norm_rows else float("nan"),
+            "median_ms": (sum(r["forward_latency_ms"]["median_ms"] for r in norm_rows) / max(len(norm_rows), 1)) if norm_rows else float("nan"),
+            "std_ms": (sum(r["forward_latency_ms"]["std_ms"] for r in norm_rows) / max(len(norm_rows), 1)) if norm_rows else float("nan"),
             "n_iters": norm_rows[0]["forward_latency_ms"]["n_iters"],
             "n_rounds": len(norm_rows),
         }
         base["training_latency_ms"] = {
-            "mean_ms": (sum(r["training_latency_ms"]["mean_ms"] for r in norm_rows) / len(norm_rows)) if norm_rows else float("nan"),
-            "median_ms": (sum(r["training_latency_ms"]["median_ms"] for r in norm_rows) / len(norm_rows)) if norm_rows else float("nan"),
-            "std_ms": (sum(r["training_latency_ms"]["std_ms"] for r in norm_rows) / len(norm_rows)) if norm_rows else float("nan"),
+            "mean_ms": (sum(r["training_latency_ms"]["mean_ms"] for r in norm_rows) / max(len(norm_rows), 1)) if norm_rows else float("nan"),
+            "median_ms": (sum(r["training_latency_ms"]["median_ms"] for r in norm_rows) / max(len(norm_rows), 1)) if norm_rows else float("nan"),
+            "std_ms": (sum(r["training_latency_ms"]["std_ms"] for r in norm_rows) / max(len(norm_rows), 1)) if norm_rows else float("nan"),
             "n_iters": norm_rows[0]["training_latency_ms"]["n_iters"],
             "n_rounds": len(norm_rows),
         }

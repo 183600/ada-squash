@@ -659,7 +659,7 @@ def compare_w8a8_checkpoints(results: list, metric: str="ppl_drop_pct", alpha: f
                 t["basis"] = "probe_paired_single_train_run"
                 t["certifiable"] = False
                 if len(shared) < 2:
-                    t["mean_delta"] = (sum(av) - sum(bv)) / len(shared) if shared else None
+                    t["mean_delta"] = (sum(av) - sum(bv)) / max(len(shared), 1) if shared else None
                     t["p_one_sided"] = None
                     t["reason"] = "need >= 2 shared samples to pair a test"
                 else:
@@ -1053,7 +1053,7 @@ def main():
                     value = rec.get(key)
                     if _finite_metric(value):
                         bucket[key].append(float(value))
-        r["per_train_seed"] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
+        r["per_train_seed"] = {ts: {key: sum(vals) / max(len(vals), 1) for key, vals in bucket.items() if vals}
                                for ts, bucket in per_train_seed.items()}
         if arm_protocol_mismatches:
             print(f"[w8a8][warn] {label}: checkpoints disagree on the training recipe/model "

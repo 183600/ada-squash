@@ -957,7 +957,7 @@ def test_needle_details_report_position_buckets():
     for d in details:
         assert 0.0 <= d["pos_frac"] <= 1.0
         assert isinstance(d["correct"], bool)
-    assert acc2 == sum(d["correct"] for d in details) / len(details)
+    assert acc2 == sum(d["correct"] for d in details) / max(len(details), 1)
 
 
 def test_train_loop_logs_held_out_validation_loss(tmp_path, monkeypatch, capsys):

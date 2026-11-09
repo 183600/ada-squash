@@ -102,7 +102,7 @@ def brute_f1(pred, gold, n_classes):
         correct += tp
         denom = 2 * tp + fp + fn
         per_class[cls] = (2 * tp / max(denom, 1)) if denom else 0.0
-    macro = sum(per_class.values()) / len(per_class) if per_class else 0.0
+    macro = sum(per_class.values()) / max(len(per_class), 1) if per_class else 0.0
     weighted = sum(per_class[g] for g in gold) / support if support else 0.0
     return macro, weighted, correct / support if support else 0.0
 
@@ -122,7 +122,7 @@ def brute_ndcg(ranked, relevant, k):
                 seen.add(item)
         ideal = sum(1.0 / math.log2(i + 2) for i in range(min(len(rel_set), k)))
         query_scores.append(min(1.0, dcg / ideal) if ideal else 0.0)
-    return sum(query_scores) / len(query_scores) if query_scores else None
+    return sum(query_scores) / max(len(query_scores), 1) if query_scores else None
 
 
 def brute_binomial_tail(n, at_least):

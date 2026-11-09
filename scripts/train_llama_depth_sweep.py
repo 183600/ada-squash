@@ -61,6 +61,15 @@ from adasquash.repro import (
     save_run_manifest,
 )
 from scripts.data_pipeline import _is_pinned_revision
+# Ensure reproducibility
+import random as _rnd
+_rnd.seed(42)
+try:
+    import numpy as _np
+    _np.random.seed(42)
+except ImportError:
+    pass
+
 
 
 def _cosine_lr(step, max_steps, warmup, min_lr_ratio):
@@ -635,8 +644,8 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         "final_val_loss_std_basis": "seeds" if len(final_vals) >= 2 else "single_run",
         "curve_classification_counts": curve_counts,
         "curve_classifications_by_seed": {p["seed"]: p.get("curve_classification") for p in per_seed},
-        "curve_generalization_gap": (sum(gaps) / len(gaps)) if gaps else None,
-        "n_params": (sum(params) / len(params)) if params else None,
+        "curve_generalization_gap": (sum(gaps) / max(len(gaps), 1)) if gaps else None,
+        "n_params": (sum(params) / max(len(params), 1)) if params else None,
         "n_params_by_seed": {p["seed"]: p.get("n_params") for p in per_seed},
         # Shape covariates: under the equal-parameter scaling (shape_for_depth)
         # a deeper cell is also a narrower one, so depth, dim and n_heads move
@@ -644,16 +653,16 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         # are pooled and flagged instead of left to be guessed from the cell
         # name.
         "n_layers": layers[0] if layers else None,
-        "dim": (sum(dims) / len(dims)) if dims else None,
+        "dim": (sum(dims) / max(len(dims), 1)) if dims else None,
         "n_heads": heads[0] if heads else None,
         "shape_by_seed": {p["seed"]: {"n_layers": p.get("n_layers"), "dim": p.get("dim"),
                                       "n_heads": p.get("n_heads")} for p in per_seed},
         "unknown_shape_seeds": sorted(unknown_shape_seeds),
         "shapes_complete": shapes_complete,
         "shape_consistent_across_seeds": shape_consistent,
-        "norm_share_of_params": (sum(norm_shares) / len(norm_shares)) if norm_shares else None,
-        "flops_per_token_forward": (sum(flops_fwd) / len(flops_fwd)) if flops_fwd else None,
-        "flops_per_token_training_est": (sum(flops_train) / len(flops_train)) if flops_train else None,
+        "norm_share_of_params": (sum(norm_shares) / max(len(norm_shares), 1)) if norm_shares else None,
+        "flops_per_token_forward": (sum(flops_fwd) / max(len(flops_fwd), 1)) if flops_fwd else None,
+        "flops_per_token_training_est": (sum(flops_train) / max(len(flops_train), 1)) if flops_train else None,
         # Measured cost from the child manifests. Unlike the analytic FLOPs,
         # throughput and peak memory include the actual kernels and allocator,
         # so a depth/norm delta is read next to what it cost on this device.
@@ -1686,7 +1695,7 @@ def main():
     failed_jobs = []
 
     def _gpu_for(idx: int):
-        return gpus[idx % len(gpus)] if gpus else None
+        return gpus[idx % max(len(gpus), 1)] if gpus else None
 
     def _reap(proc, depth, norm, seed):
         rc = proc.wait()

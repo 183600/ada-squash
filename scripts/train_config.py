@@ -17,6 +17,15 @@ from torch.optim import AdamW
 from adasquash.diagnostics import parameter_finite_report, tensor_finite_report
 from adasquash.repro import TRAINING_RECIPE_KEYS
 from scripts.data_pipeline import _is_pinned_revision
+# Ensure reproducibility
+import random as _rnd
+_rnd.seed(42)
+try:
+    import numpy as _np
+    _np.random.seed(42)
+except ImportError:
+    pass
+
 
 
 def load_yaml_config(path: str) -> dict:

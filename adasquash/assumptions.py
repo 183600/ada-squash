@@ -304,13 +304,13 @@ def check_variance_homogeneity(
     for arm, values in arm_data.items():
         if not values:
             continue
-        c = sum(values) / len(values) if values else float("nan") if center == "mean" else sorted(values)[len(values) // 2]
+        c = sum(values) / max(len(values), 1) if values else float("nan") if center == "mean" else sorted(values)[len(values) // 2]
         for v in values:
             all_devs.append(abs(v - c))
             all_labels.append(arm)
 
     # One-way ANOVA on absolute deviations
-    grand_mean = (sum(all_devs) / len(all_devs)) if all_devs else float("nan")
+    grand_mean = (sum(all_devs) / max(len(all_devs), 1)) if all_devs else float("nan")
     ss_between = 0.0
     ss_within = 0.0
 
@@ -472,7 +472,7 @@ def check_outlier_influence(
     jackknife_means = []
     for i in range(n):
         loo = [paired_deltas[j] for j in range(n) if j != i]
-        jackknife_means.append((sum(loo) / len(loo)) if loo else float("nan"))
+        jackknife_means.append((sum(loo) / max(len(loo), 1)) if loo else float("nan"))
 
     max_change = max(abs(jm - full_mean) for jm in jackknife_means)
     relative_influence = max_change / (abs(full_mean) + 1e-12)

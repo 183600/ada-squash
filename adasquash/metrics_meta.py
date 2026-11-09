@@ -493,7 +493,7 @@ def paired_trend_test(
     # Average over the fits themselves, not over the string-keyed output dict:
     # that keeps the mean correct even if two labels ever normalize together.
     out["mean_r_squared"] = (
-        sum(r_squared_values) / len(r_squared_values)
+        sum(r_squared_values) / max(len(r_squared_values), 1)
         if r_squared_values else None)
     out["seed_jackknife"] = leave_one_out_jackknife(
         slopes, labels=[str(label) for label in used])

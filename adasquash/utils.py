@@ -256,7 +256,7 @@ class ActivationStats:
             # exactly the corruption the meter exposes.
             mean_kurt = (float("nan")
                          if any(not math.isfinite(v) for v in all_kurt)
-                         else (sum(all_kurt) / len(all_kurt) if all_kurt else 0.0))
+                         else (sum(all_kurt) / max(len(all_kurt), 1) if all_kurt else 0.0))
             out["__summary__"] = {"mean_max_abs": sum(all_max) / max(1, len(all_max)), "max_max_abs": peak, "max_abs_pre_norm": peak, "mean_excess_kurtosis_pre_norm": mean_kurt}
         return out
 

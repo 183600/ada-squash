@@ -78,7 +78,7 @@ def f1_from_counts(
             f1_by_class[i] = 2.0 * tp[i] / denom
         except OverflowError:
             f1_by_class[i] = (2 * tp[i]) / denom
-    macro = sum(f1_by_class.values()) / len(f1_by_class) if f1_by_class else 0.0
+    macro = sum(f1_by_class.values()) / max(len(f1_by_class), 1) if f1_by_class else 0.0
     weighted = _weighted_mean(
         [f1_by_class[i] for i in present],
         [tp[i] + fn[i] for i in present],
@@ -96,9 +96,9 @@ def f1_from_counts(
         denom_r = tp[i] + fn[i]
         precision_by_class[i] = (tp[i] / denom_p) if denom_p else 0.0
         recall_by_class[i] = (tp[i] / denom_r) if denom_r else 0.0
-    macro_precision = ((sum(precision_by_class.values()) / len(precision_by_class)) if precision_by_class else float("nan")
+    macro_precision = ((sum(precision_by_class.values()) / max(len(precision_by_class), 1)) if precision_by_class else float("nan")
                        if precision_by_class else 0.0)
-    macro_recall = ((sum(recall_by_class.values()) / len(recall_by_class)) if recall_by_class else float("nan")
+    macro_recall = ((sum(recall_by_class.values()) / max(len(recall_by_class), 1)) if recall_by_class else float("nan")
                     if recall_by_class else 0.0)
     weighted_precision = _weighted_mean(
         [precision_by_class[i] for i in present],
@@ -411,14 +411,14 @@ def binary_auc_report(
         })
     support_total = sum(r["positives"] for r in records)
     macro_ap = (
-        sum(r["average_precision"] for r in records) / len(records) if records else float("nan")
+        sum(r["average_precision"] for r in records) / max(len(records), 1) if records else float("nan")
         if records else None
     )
     weighted_ap = (
         sum(r["average_precision"] * r["positives"] for r in records) / support_total
         if support_total else None
     )
-    macro_roc = sum(r["roc_auc"] for r in records) / len(records) if records else None
+    macro_roc = sum(r["roc_auc"] for r in records) / max(len(records), 1) if records else None
     weighted_roc = (
         sum(r["roc_auc"] * r["positives"] for r in records) / support_total
         if support_total else None
@@ -478,8 +478,8 @@ def recall_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int
             recalls.append(0.0)
             continue
         hits = len(set(r[:k]) & rel_set)
-        recalls.append(hits / len(rel_set) if rel_set else float("nan"))
-    return (sum(recalls) / len(recalls)) if recalls else float("nan")
+        recalls.append(hits / max(len(rel_set), 1) if rel_set else float("nan"))
+    return (sum(recalls) / max(len(recalls), 1)) if recalls else float("nan")
 
 
 def ndcg_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]], k: int) -> Optional[float]:
@@ -519,4 +519,4 @@ def ndcg_at_k(ranked: Sequence[Sequence[int]], relevant: Sequence[Sequence[int]]
         ideal_hits = min(len(rel_set), k)
         idcg = sum(1.0 / math.log2(i + 2) for i in range(ideal_hits))
         ndcgs.append(min(1.0, dcg / idcg) if idcg > 0 else 0.0)
-    return (sum(ndcgs) / len(ndcgs)) if ndcgs else float("nan")
+    return (sum(ndcgs) / max(len(ndcgs), 1)) if ndcgs else float("nan")

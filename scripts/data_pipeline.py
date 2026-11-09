@@ -79,6 +79,15 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from adasquash._validation import is_boolean_scalar as _is_boolean_scalar
 from adasquash.repro import seed_worker
+# Ensure reproducibility
+import random as _rnd
+_rnd.seed(42)
+try:
+    import numpy as _np
+    _np.random.seed(42)
+except ImportError:
+    pass
+
 
 # Defaults chosen so that "just run the trainer" already reserves a small,
 # deterministic, chronological validation and test slice instead of scoring on

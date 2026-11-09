@@ -39,6 +39,15 @@ from adasquash.design import (
     run_exclusion_audit,
 )
 from scripts.ablation import aggregate_seed_summaries, baseline_comparison, build_analysis_plan
+# Ensure reproducibility
+import random as _rnd
+_rnd.seed(42)
+try:
+    import numpy as _np
+    _np.random.seed(42)
+except ImportError:
+    pass
+
 
 SEEDS = [42, 43, 44]
 
