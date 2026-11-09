@@ -194,9 +194,12 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     var_g2 = 24.0 * n * (n - 2) * (n - 3) / ((n + 1) ** 2 * (n + 3) * (n + 5))
     a = 6.0 + 8.0 / var_g2 * (2.0 * var_g2 + 6.0 / (n + 1) * (n - 2) / (n - 3))
     # Anscombe-Glynn (1983) transform: coefficient is 1 - 2/(9a), not 1 - 2/a.
-    # The original formula produced z-scores that were too large for small n,
-    # inflating type-I error of the normality test on small samples.
-    z2 = ((1.0 - 2.0 / (9.0 * a)) * (1.0 + g2 / math.sqrt(var_g2)) ** (1.0 / 3.0) - 1.0) * math.sqrt(a) * math.sqrt(2.0 / (9.0 * a))
+    # z2 = ((1 - 2/(9a)) * (1 + g2/sqrt(var_g2))^(1/3) - 1) / sqrt(2/(9a))
+    # The denominator sqrt(2/(9a)) standardises z2 to be approximately
+    # N(0,1) under normality; multiplying by sqrt(a)*sqrt(2/(9a)) instead
+    # of dividing by sqrt(2/(9a)) shrinks |z2| by a factor of 2/(3*sqrt(a)),
+    # biasing K2 downward and inflating the normality p-value.
+    z2 = ((1.0 - 2.0 / (9.0 * a)) * (1.0 + g2 / math.sqrt(var_g2)) ** (1.0 / 3.0) - 1.0) / math.sqrt(2.0 / (9.0 * a))
 
     # Chi-squared combination
     K2 = z1 * z1 + z2 * z2
