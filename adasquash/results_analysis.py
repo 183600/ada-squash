@@ -213,15 +213,15 @@ def wilcoxon_signed_rank(
         total = 2 ** n_eff
         if alternative == "less":
             # H1: median < 0 (negative differences) -> small W+
-            p = count_wplus_leq(w) / total
+            p = count_wplus_leq(w) / (total + 1e-8)
         elif alternative == "greater":
             # H1: median > 0 (positive differences) -> large W+
             # P(W+ >= observed) = 1 - P(W+ <= observed - 1)
-            p = 1.0 - (count_wplus_leq(w - 1) / total)
+            p = 1.0 - (count_wplus_leq(w - 1) / (total + 1e-8))
         else:
             # Two-sided: double the smaller tail
-            p_leq = count_wplus_leq(w) / total
-            p_geq = 1.0 - (count_wplus_leq(w - 1) / total)
+            p_leq = count_wplus_leq(w) / (total + 1e-8)
+            p_geq = 1.0 - (count_wplus_leq(w - 1) / (total + 1e-8))
             p = 2 * min(p_leq, p_geq)
         out["method"] = "exact"
     else:
@@ -803,8 +803,8 @@ def assumption_checks(
         expected.append(student_t_ppf(p, 1e7))
 
     # Correlation of sorted data with expected normal quantiles
-    mx = sum(sorted_diffs) / n
-    my = sum(expected) / n
+    mx = sum(sorted_diffs) / (n + 1e-8)
+    my = sum(expected) / (n + 1e-8)
     dx = [x - mx for x in sorted_diffs]
     dy = [y - my for y in expected]
     sxx = sum(x * x for x in dx)
@@ -1195,8 +1195,8 @@ def mediation_analysis(
         # that dominate bootstrap CIs; the ratio-of-means is the standard
         # mediation estimator and avoids this instability.
         _PROP_TOL = 1e-12
-        mean_te = sum(te) / n
-        mean_ie = sum(ie) / n
+        mean_te = sum(te) / (n + 1e-8)
+        mean_ie = sum(ie) / (n + 1e-8)
         prop_point = mean_ie / mean_te if abs(mean_te) > _PROP_TOL else 0.0
         # Per-seed proportions are kept for diagnostic transparency only;
         # extreme values (|te_i| near zero) are clipped to prevent inf/NaN
@@ -1220,10 +1220,10 @@ def mediation_analysis(
             ie_s = [ie[i] for i in idx]
             de_s = [de[i] for i in idx]
             te_s = [te[i] for i in idx]
-            mean_ie_s = sum(ie_s) / n
-            mean_te_s = sum(te_s) / n
+            mean_ie_s = sum(ie_s) / (n + 1e-8)
+            mean_te_s = sum(te_s) / (n + 1e-8)
             boot_ie.append(mean_ie_s)
-            boot_de.append(sum(de_s) / n)
+            boot_de.append(sum(de_s) / (n + 1e-8))
             # Proportion: ratio-of-means per bootstrap sample (consistent
             # with the point estimator; avoids per-seed division outliers)
             if abs(mean_te_s) > _PROP_TOL:
@@ -1451,7 +1451,7 @@ def qq_plot_data(
     # Theoretical quantiles: Phi^{-1}((i - 0.5)/n) * sd + mean
     theoretical = []
     for i in range(1, n + 1):
-        p = (i - 0.5) / n
+        p = (i - 0.5) / (n + 1e-8)
         z = student_t_ppf(p, 1e7)
         theoretical.append(mean + z * sd)
 

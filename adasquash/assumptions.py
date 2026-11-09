@@ -170,8 +170,8 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
 
     mean = sum(data) / n
     m2 = sum((x - mean) ** 2 for x in data) / n
-    m3 = sum((x - mean) ** 3 for x in data) / n
-    m4 = sum((x - mean) ** 4 for x in data) / n
+    m3 = sum((x - mean) ** 3 for x in data) / (n + 1e-8)
+    m4 = sum((x - mean) ** 4 for x in data) / (n + 1e-8)
 
     if m2 == 0:
         return 0.0, 1.0
@@ -404,8 +404,8 @@ def check_independence(
         )
 
     # Simple autocorrelation at lags 1..max_lag
-    mean = sum(ordered_observations) / n
-    c0 = sum((x - mean) ** 2 for x in ordered_observations) / n
+    mean = sum(ordered_observations) / (n + 1e-8)
+    c0 = sum((x - mean) ** 2 for x in ordered_observations) / (n + 1e-8)
 
     if c0 == 0:
         return AssumptionCheck(
@@ -468,7 +468,7 @@ def check_outlier_influence(
             recommendation=f"Need at least 3 observations for jackknife; have {n}.",
         )
 
-    full_mean = sum(paired_deltas) / n
+    full_mean = sum(paired_deltas) / (n + 1e-8)
     jackknife_means = []
     for i in range(n):
         loo = [paired_deltas[j] for j in range(n) if j != i]

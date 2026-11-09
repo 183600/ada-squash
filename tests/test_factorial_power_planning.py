@@ -86,7 +86,7 @@ def test_empirical_interaction_noise_matches_the_planned_scale():
                    for index in range(n_seeds)]
 
     def _sd(values):
-        mean = sum(values) / len(values)
+        mean = sum(values) / max(len(values), 1)
         return math.sqrt(sum((value - mean) ** 2 for value in values)
                          / (len(values) - 1))
 

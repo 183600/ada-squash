@@ -396,6 +396,7 @@ def run_one(norm: str, args, device: str) -> dict:
                                else max(worst_step_loss, loss_val))
         else:
             all_step_losses_finite = False
+        optimizer.zero_grad()
         loss.backward()
         if step == 1:
             grad_info = gradient_report(model)

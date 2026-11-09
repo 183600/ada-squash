@@ -1086,7 +1086,7 @@ def main():
                 vals = [c["per_seed"][j][key] for c in per_ckpt
                         if _finite_metric(c["per_seed"][j].get(key))]
                 if vals:
-                    record[key] = sum(vals) / len(vals)
+                    record[key] = sum(vals) / max(len(vals), 1)
             flags = [c["per_seed"][j] for c in per_ckpt]
             nonfinite = [f["first_nonfinite_layer"] for f in flags
                          if isinstance(f.get("first_nonfinite_layer"), int)

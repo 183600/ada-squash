@@ -55,7 +55,7 @@ def _row(name, values, **extra):
     """A minimal seed-aggregate summary in the shape the comparisons expect."""
     items = sorted(values.items())
     vals = [value for _, value in items]
-    mean = sum(vals) / len(vals)
+    mean = sum(vals) / max(len(vals), 1)
     std = statistics.stdev(vals) if len(vals) > 1 else 0.0
     row = {
         "name": name,
@@ -693,7 +693,7 @@ def test_paired_trend_reports_excluded_seeds_and_bad_input():
 
 def _trend_cell(values, **extra):
     items = sorted(values.items())
-    mean = sum(value for _, value in items) / len(items)
+    mean = sum(value for _, value in items) / max(len(items), 1)
     cell = {
         "seeds": list(values),
         "per_seed": [{"seed": seed, "final_val_loss": value}

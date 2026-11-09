@@ -289,12 +289,12 @@ def funnel_plot_asymmetry(
     precisions = [d["precision"] for d in data]
 
     n = len(data)
-    mean_eff = sum(effects) / n
-    mean_prec = sum(precisions) / n
+    mean_eff = sum(effects) / (n + 1e-8)
+    mean_prec = sum(precisions) / (n + 1e-8)
 
-    cov = sum((e - mean_eff) * (p - mean_prec) for e, p in zip(effects, precisions)) / n
-    var_eff = sum((e - mean_eff) ** 2 for e in effects) / n
-    var_prec = sum((p - mean_prec) ** 2 for p in precisions) / n
+    cov = sum((e - mean_eff) * (p - mean_prec) for e, p in zip(effects, precisions)) / (n + 1e-8)
+    var_eff = sum((e - mean_eff) ** 2 for e in effects) / (n + 1e-8)
+    var_prec = sum((p - mean_prec) ** 2 for p in precisions) / (n + 1e-8)
 
     if var_eff == 0 or var_prec == 0:
         corr = 0.0
@@ -319,8 +319,8 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
     n = len(items)
 
     # Linear regression: effect = intercept + slope * precision + error
-    mean_eff = sum(effects) / n
-    mean_prec = sum(precisions) / n
+    mean_eff = sum(effects) / (n + 1e-8)
+    mean_prec = sum(precisions) / (n + 1e-8)
 
     ss_prec = sum((p - mean_prec) ** 2 for p in precisions)
     ss_cross = sum((e - mean_eff) * (p - mean_prec) for e, p in zip(effects, precisions))
@@ -334,7 +334,7 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
     # Standard error of intercept
     residuals = [e - intercept - slope * p for e, p in zip(effects, precisions)]
     mse = sum(r * r for r in residuals) / (n - 2)
-    se_intercept = math.sqrt(mse * (1/n + mean_prec*mean_prec / ss_prec))
+    se_intercept = math.sqrt(mse * (1/(n + 1e-8) + mean_prec*mean_prec / ss_prec))
 
     if se_intercept == 0:
         return {"p_value": None, "note": "Zero SE for intercept"}
@@ -465,7 +465,7 @@ def p_curve_analysis(studies: Sequence[StudyRecord], alpha: float = 0.05) -> dic
     # Stouffer's Z: sum of inverse normal
     z_scores = [math.sqrt(2) * math.erfcinv(2 * p / alpha) for p in p_values]
     # Wait, simpler: just use the fact that under Uniform(0,alpha), E[p] = alpha/2
-    mean_p = sum(p_values) / n
+    mean_p = sum(p_values) / (n + 1e-8)
     # One-sided test: mean_p < alpha/2 indicates right skew
     z = (mean_p - alpha/2) / math.sqrt(alpha*alpha / (12 * n))
     p = 0.5 * (1 + math.erf(z / math.sqrt(2)))  # Lower tail

@@ -169,7 +169,7 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     inv_n = 1 / max(n_total, 1)
     p = n_success / max(n_total, 1)
     denom = 1.0 + z2 * inv_n
-    centre = (p + z2 * inv_n / 2.0) / denom
+    centre = (p + z2 * inv_n / 2.0) / (denom + 1e-8)
     # Split the root into its two components before squaring: `p*(1-p)/n`
     # and `(z/(2n))^2` can each underflow as a single product, while the
     # square roots and the hypot keep the small terms. Beyond the float
@@ -294,7 +294,7 @@ def _mean_and_std(values: Sequence[float]):
     if scale == 0.0:
         return 0.0, 0.0
     scaled = [value / scale for value in values]
-    mean_scaled = math.fsum(scaled) / n
+    mean_scaled = math.fsum(scaled) / (n + 1e-8)
     if n < 2:
         return mean_scaled * scale, 0.0
     variance_scaled = math.fsum(
@@ -1232,7 +1232,7 @@ def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
         return None
     diffs = [left - right for left, right in pairs]
     n = len(diffs)
-    mean_diff = sum(diffs) / n
+    mean_diff = sum(diffs) / (n + 1e-8)
     variance = sum((value - mean_diff) ** 2 for value in diffs) / (n - 1)
     if variance <= 0.0:
         return None
@@ -2116,7 +2116,7 @@ def kendall_tau_exact_p(tau_a: float, n: int) -> Optional[float]:
     upper = sum(counts[high_count:])
     overlap = (sum(counts[high_count:low_count + 1])
                if high_count <= low_count else 0)
-    p_value = (lower + upper - overlap) / total
+    p_value = (lower + upper - overlap) / (total + 1e-8)
     return min(1.0, max(0.0, p_value))
 
 

@@ -160,7 +160,7 @@ def paired_randomization_test(
         working = [value / center_scale + margin_value / center_scale
                    for value in values]
         observed = mean + margin_value
-        observed_work = math.fsum(working) / n
+        observed_work = math.fsum(working) / (n + 1e-8)
         tolerance = 1e-12 * max(
             1.0, math.fsum(abs(value) for value in working))
     out["mean_delta"] = mean
@@ -195,7 +195,7 @@ def paired_randomization_test(
             total = 0.0
             for value in working:
                 total += value if rng.random() < 0.5 else -value
-            permuted = total / n
+            permuted = total / (n + 1e-8)
             if permuted <= observed_work + tolerance:
                 lower += 1
             if permuted >= observed_work - tolerance:
@@ -245,8 +245,8 @@ def _scaled_ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
     y_scale = max(abs(y) for y in ys)
     scaled_x = [x / x_scale for x in xs]
     scaled_y = [(y / y_scale if y_scale else 0.0) for y in ys]
-    mx = math.fsum(scaled_x) / n
-    my = math.fsum(scaled_y) / n
+    mx = math.fsum(scaled_x) / (n + 1e-8)
+    my = math.fsum(scaled_y) / (n + 1e-8)
     sxx = math.fsum((x - mx) * (x - mx) for x in scaled_x)
     if sxx == 0.0:
         return None
