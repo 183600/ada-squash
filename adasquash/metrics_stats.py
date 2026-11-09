@@ -273,7 +273,7 @@ def _mean_and_std(values: Sequence[float]):
         return None, None
     mean = std = float("nan")
     try:
-        mean = sum(values) / n
+        mean = sum(values) / max(n, 1)
         if n < 2:
             return mean, 0.0
         variance = sum((value - mean) * (value - mean)
@@ -470,7 +470,7 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
                      "that a new run cannot differ"),
         })
         return out
-    spread_factor = math.sqrt(1.0 + 1.0 / n)
+    spread_factor = math.sqrt(1.0 + 1.0 / max(n, 1))
     scale = std * spread_factor
     half = -student_t_ppf(alpha / 2.0, df) * scale
     out["prediction_low"] = mean - half
@@ -602,7 +602,7 @@ def _int_over_sqrt(value: int, n: int) -> float:
     if value == 0:
         return 0.0
     try:
-        magnitude = math.exp(math.log(abs(value)) - 0.5 * math.log(n))
+        magnitude = math.exp(math.log(abs(value)) - 0.5 * math.log(n + 1e-8))
     except OverflowError:
         magnitude = math.inf
     return -magnitude if value < 0 else magnitude
@@ -1232,7 +1232,7 @@ def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
         return None
     diffs = [left - right for left, right in pairs]
     n = len(diffs)
-    mean_diff = sum(diffs) / n
+    mean_diff = sum(diffs) / max(n, 1)
     variance = sum((value - mean_diff) ** 2 for value in diffs) / (n - 1)
     if variance <= 0.0:
         return None
@@ -1349,7 +1349,7 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     try:
         inverse_sqrt_n = 1.0 / math.sqrt(n)
     except OverflowError:
-        inverse_sqrt_n = math.exp(-0.5 * math.log(n))
+        inverse_sqrt_n = math.exp(-0.5 * math.log(n + 1e-8))
     result = critical * std * inverse_sqrt_n
     if math.isfinite(result) and result != 0.0:
         return result
@@ -1644,7 +1644,7 @@ def _tost_inverse_sqrt_n(n: int) -> float:
     try:
         return 1.0 / math.sqrt(n)
     except OverflowError:
-        return math.exp(-0.5 * math.log(n))
+        return math.exp(-0.5 * math.log(n + 1e-8))
 
 
 def _tost_power_at_n(std: float, n: int, margin: float, alpha: float,

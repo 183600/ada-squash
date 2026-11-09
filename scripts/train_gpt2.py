@@ -1228,7 +1228,7 @@ def main():
                     # training loss over the interval it covers, then classify the
                     # regime (overfit / underfit / diverging / healthy) and print
                     # the concrete remedy.
-                    train_point = (sum(train_window) / len(train_window)) if train_window else loss_val
+                    train_point = (sum(train_window) / max(len(train_window), 1)) if train_window else loss_val
                     train_window = []
                     curve_train.append(train_point)
                     curve_val.append(val_loss)

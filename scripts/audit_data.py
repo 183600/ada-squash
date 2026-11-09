@@ -628,7 +628,7 @@ def _safe_ratio(numerator, denominator):
     if denominator == 0:
         return None
     try:
-        return numerator / denominator
+        return numerator / max(denominator, 1)
     except OverflowError:
         try:
             return float(Fraction(numerator) / Fraction(denominator))

@@ -109,7 +109,7 @@ def _shapiro_wilk_statistic(data: Sequence[float]) -> tuple[float, float]:
         return 1.0, 1.0  # Cannot compute reliably
 
     sorted_data = sorted(data)
-    mean = sum(sorted_data) / n
+    mean = sum(sorted_data) / max(n, 1)
 
     # Coefficients approximation (Royston 1992)
     # For simplicity, use a basic approximation
@@ -139,8 +139,8 @@ def _shapiro_wilk_statistic(data: Sequence[float]) -> tuple[float, float]:
     # Very rough p-value approximation for diagnostic purposes
     # In practice, use scipy.stats.shapiro
     log_w = math.log(1.0 - W)
-    mu = -1.5861 - 0.31082 * math.log(n) - 0.083751 * (math.log(n)) ** 2 + 0.0038915 * (math.log(n)) ** 3
-    sigma = math.exp(-0.4803 - 0.082676 * math.log(n) + 0.0030302 * (math.log(n)) ** 2)
+    mu = -1.5861 - 0.31082 * math.log(n + 1e-8) - 0.083751 * (math.log(n + 1e-8)) ** 2 + 0.0038915 * (math.log(n + 1e-8)) ** 3
+    sigma = math.exp(-0.4803 - 0.082676 * math.log(n + 1e-8) + 0.0030302 * (math.log(n + 1e-8)) ** 2)
     z = (log_w - mu) / sigma
     p = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
 
@@ -156,7 +156,7 @@ def _approx_normal_ppf(p: float) -> float:
     if p > 0.5:
         return -_approx_normal_ppf(1 - p)
     # Rational approximation for p < 0.5
-    t = math.sqrt(-2 * math.log(p))
+    t = math.sqrt(-2 * math.log(p + 1e-8))
     c0, c1, c2 = 2.515517, 0.802853, 0.010328
     d1, d2, d3 = 1.432788, 0.189269, 0.001308
     return t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t)
@@ -168,10 +168,10 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     if n < 8:
         return 0.0, 1.0
 
-    mean = sum(data) / n
-    m2 = sum((x - mean) ** 2 for x in data) / n
-    m3 = sum((x - mean) ** 3 for x in data) / n
-    m4 = sum((x - mean) ** 4 for x in data) / n
+    mean = sum(data) / max(n, 1)
+    m2 = sum((x - mean) ** 2 for x in data) / max(n, 1)
+    m3 = sum((x - mean) ** 3 for x in data) / max(n, 1)
+    m4 = sum((x - mean) ** 4 for x in data) / max(n, 1)
 
     if m2 == 0:
         return 0.0, 1.0
@@ -185,7 +185,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     # Skewness transform
     beta1 = 3.0 * (n + 1) * (n + 3) / ((n - 2) * (n + 5) * (n + 7) * (n + 9))
     W2 = math.sqrt(2.0 * beta1) - 1.0
-    delta = 1.0 / math.sqrt(math.log(W2)) if W2 > 1 else 1.0
+    delta = 1.0 / math.sqrt(math.log(W2 + 1e-8)) if W2 > 1 else 1.0
     y = g1 * math.sqrt((n + 1) * (n + 3) / (6.0 * (n - 2)))
     z1 = delta * math.log(y + math.sqrt(y * y + 1.0))
 

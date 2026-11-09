@@ -518,7 +518,7 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     # `sqrt(1 / n)` is still representable, so take the square root through
     # the logarithm instead of through the underflowed reciprocal.
     sqrt_inv_n = (math.sqrt(inv_n) if inv_n > 0.0
-                  else math.exp(-0.5 * math.log(n)))
+                  else math.exp(-0.5 * math.log(n + 1e-8)))
     root = math.hypot(
         math.sqrt(p * (1.0 - p)) * sqrt_inv_n,
         z * inv_n / 2.0)

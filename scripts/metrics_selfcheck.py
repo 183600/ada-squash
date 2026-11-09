@@ -316,7 +316,7 @@ def check_meta_analysis():
     i_squared = 100.0 * max(0.0, (q - df) / q)
     tau2 = max(0.0, (q - df) / (sum_w - sum(wi ** 2 for wi in w) / sum_w))
     wr = [1.0 / (se ** 2 + tau2) for se in ses]
-    random_pooled = sum(wi * y for wi, y in zip(wr, ys)) / sum(wr)
+    random_pooled = sum(wi * y for wi, y in zip(wr, ys)) / max(sum(wr), 1e-8)
 
     close(out["fixed_effect"]["pooled_effect"], pooled,
           label="meta fixed pooled")

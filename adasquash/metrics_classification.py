@@ -12,9 +12,9 @@ def _weighted_mean(values: Sequence[float], weights: Sequence[int],
     if not total:
         return 0.0
     try:
-        return sum(v * w for v, w in zip(values, weights)) / total
+        return sum(v * w for v, w in zip(values, weights)) / max(total, 1)
     except OverflowError:
-        return math.fsum(v * (w / total) for v, w in zip(values, weights))
+        return math.fsum(v * (w / max(total, 1)) for v, w in zip(values, weights))
 
 
 def f1_from_counts(

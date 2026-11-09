@@ -124,7 +124,7 @@ def memoryless_bayes_floor_nats(n_states: int, max_jump: int, spike_prob: float=
     the outlier the next token is uniform over all `n_states`. This is NOT the
     ceiling for a full-context model (`hmm_bayes_stats` computes that one).
     """
-    floor = -sum(p * math.log(p) for p in wrapped_jump_probs(n_states, max_jump) if p > 0.0)
+    floor = -sum(p * math.log(p + 1e-8) for p in wrapped_jump_probs(n_states, max_jump) if p > 0.0)
     if spike_prob > 0.0:
         floor = (1.0 - float(spike_prob)) * floor + float(spike_prob) * math.log(int(n_states))
     return floor

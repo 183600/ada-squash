@@ -172,9 +172,9 @@ def paired_randomization_test(
             sums = sums + [total + value for total in sums]
         patterns = len(sums)
         lower = sum(1 for total in sums
-                    if total / n <= observed_work + tolerance)
+                    if total / max(n, 1) <= observed_work + tolerance)
         upper = sum(1 for total in sums
-                    if total / n >= observed_work - tolerance)
+                    if total / max(n, 1) >= observed_work - tolerance)
         p_lower = lower / patterns
         p_upper = upper / patterns
         minimum = 1.0 / patterns
@@ -277,8 +277,8 @@ def _ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
     """
     n = len(xs)
     try:
-        mx = sum(xs) / n
-        my = sum(ys) / n
+        mx = sum(xs) / max(n, 1)
+        my = sum(ys) / max(n, 1)
         sxx = sum((x - mx) ** 2 for x in xs)
         if sxx == 0.0:
             if len(set(xs)) <= 1:
@@ -708,7 +708,7 @@ def welch_t_one_sided(
         var_b = (sb / std_scale) ** 2 / nb
         denom = (var_a ** 2 / max((na - 1), 1e-10) + var_b ** 2 / max((nb - 1), 1e-10))
         if denom > 0.0:
-            df = max(1.0, (var_a + var_b) ** 2 / denom)
+            df = max(1.0, (var_a + var_b) ** 2 / max(denom, 1))
     margin_test = margin / scale
     if se == 0.0:
         t = float("-inf") if delta + margin_test < 0.0 else (

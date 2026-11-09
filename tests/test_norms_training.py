@@ -210,7 +210,7 @@ def test_markov_corpus_has_learnable_next_token_signal():
     # unrankable. A real walk over 64 states with jumps in {0,1,2} carries
     # log(64) - log(3) ~ 3.06 nats.
     assert mi > 2.5, f"I(x;y) = {mi:.3f} nats, the corpus has no signal"
-    assert abs(mi - (math.log(64) - math.log(3))) < 0.2
+    assert abs(mi - (math.log(64 + 1e-8) - math.log(3))) < 0.2
 
 
 def test_markov_corpus_shapes_and_masking():
