@@ -561,7 +561,6 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             # Predictive quality without the router's aux penalty. This is the
             # quantity the held-out curve and the final val_ce are compared on.
             ce_val = loss_val - model.AUX_LOSS_COEF * aux_val
-            optimizer.zero_grad()
             loss.backward()
             if step % args.stats_every == 0:
                 act_stats.detach()

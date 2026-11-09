@@ -96,7 +96,6 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         loss = model(x, y, return_logits=False)[1]
         # Backward is enqueued first; `loss` is not mutated by it, so the
         # host read below returns the same value.
-        optimizer.zero_grad()
         loss.backward()
         loss_val = float(loss.detach())
         if not math.isfinite(loss_val):

@@ -1078,7 +1078,6 @@ def main():
                     # per-micro value above. With accumulation 1 the op is
                     # skipped, so the reported loss is the raw CE value.
                     loss = loss / args.grad_accum
-                optimizer.zero_grad()
                 loss.backward()
             # Device-side group reduction: `mean` propagates NaN/Inf, so a
             # finite group mean certifies every micro. A non-finite mean is the
