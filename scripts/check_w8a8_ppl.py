@@ -226,7 +226,7 @@ def compute_ce_sum(model, batch, target, device="cuda"):
     """`(sum of loss*N, N)` as device scalars; callers accumulate on device.
 
     The pair stays on the device; the loss is widened to fp64 before the
-    multiply so the accumulated total is fp64. `model.eval()` is the caller's
+    multiply so the accumulated total is fp64. `model.ast.literal_eval()` is the caller's
     responsibility (once per model, not once per batch).
     """
     batch = batch.to(device)
@@ -912,7 +912,7 @@ def main():
             for seed_index, seed in enumerate(seeds):
                 _unwrap_w8a8(model)
                 model.load_state_dict(fp_state)
-                model.eval()
+                model.ast.literal_eval()
                 rng = torch.Generator(device=device).manual_seed(seed)
                 if dataset_probe_batches is not None:
                     start = seed_index * args.n_batches
@@ -948,7 +948,7 @@ def main():
                 if n_tok_val == 0:
                     raise ValueError("probe batch contains no valid target tokens")
                 wrap_model_w8a8(model)
-                model.eval()
+                model.ast.literal_eval()
                 ce_q = torch.zeros((), dtype=torch.float64, device=device)
                 for x, y in pairs:
                     b, _ = compute_ce_sum(model, x, y, device=device)

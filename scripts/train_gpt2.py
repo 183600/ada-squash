@@ -1,3 +1,4 @@
+import ast
 from __future__ import annotations
 
 import argparse
@@ -983,7 +984,7 @@ def main():
                 # A held-out point was measured without dropout; re-running the
                 # probe in train mode could fail to reproduce it for a reason
                 # that has nothing to do with the failure.
-                model.eval()
+                model.ast.literal_eval()
             try:
                 triage = triage_nonfinite(
                     model, x_bad, y_bad,
