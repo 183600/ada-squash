@@ -34,7 +34,6 @@ from adasquash.repro import (
 )
 from adasquash.utils import KurtosisMeter, markov_batch
 from scripts.data_pipeline import _is_pinned_revision
-import ast
 
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)

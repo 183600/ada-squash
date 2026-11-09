@@ -33,7 +33,6 @@ from adasquash.repro import (
 )
 from scripts.data_pipeline import _is_pinned_revision
 from scripts.eval_downstream import load_ckpt
-import ast
 
 DEFAULT_SEEDS = (42, 43, 44)
 # One probe draw is one sample: the PPL drop is aggregated as Mean +/- Std

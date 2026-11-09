@@ -68,7 +68,6 @@ from adasquash.repro import (
 )
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 from scripts.data_pipeline import _is_pinned_revision
-import ast
 
 _FLAT_TOKEN_CACHE: dict = {}
 _FLAT_TOKEN_CACHE_MAX_ENTRIES = 8

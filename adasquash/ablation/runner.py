@@ -27,7 +27,6 @@ from scripts.train_gpt2 import build_optimizer
 
 from .common import _finite_metric, _is_integer_scalar, _is_seed_id
 from .matrix import _MODEL_BUILDERS, DEFAULT_SEEDS, install_residual_outlier
-import ast
 
 
 def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: dict | None=None, hypothesis: str | None=None, seed: int | None=None, order_info: dict | None=None):
