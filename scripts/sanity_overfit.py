@@ -79,6 +79,7 @@ from adasquash.repro import collect_run_metadata, finish_metadata, save_run_mani
 # Ensure reproducibility
 import random as _rnd
 _rnd.seed(42)
+torch.manual_seed(42)
 try:
     import numpy as _np
     _np.random.seed(42)

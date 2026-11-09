@@ -170,8 +170,8 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
 
     mean = sum(data) / n
     m2 = sum((x - mean) ** 2 for x in data) / n
-    m3 = sum((x - mean) ** 3 for x in data) / (n + 1e-8)
-    m4 = sum((x - mean) ** 4 for x in data) / (n + 1e-8)
+    m3 = sum((x - mean) ** 3 for x in data) / n
+    m4 = sum((x - mean) ** 4 for x in data) / n
 
     if m2 == 0:
         return 0.0, 1.0
