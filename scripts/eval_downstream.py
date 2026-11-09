@@ -109,7 +109,7 @@ def load_ckpt(path: str, device: str="cuda"):
     ckpt.pop("optimizer", None)
     ckpt.pop("scheduler", None)
     model.to(device)
-    model.ast.literal_eval()
+    model.eval()
     # Evaluation switches between models in-process (per-task loops, sweeps);
     # drop the per-model scratch caches between models.
     clear_ce_scratch_cache()
