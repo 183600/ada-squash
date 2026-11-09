@@ -34,6 +34,7 @@ from adasquash.repro import (
 )
 from adasquash.utils import KurtosisMeter, markov_batch
 from scripts.data_pipeline import _is_pinned_revision
+import ast
 
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
@@ -365,7 +366,7 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
              subnormal, quantized_zero, err, kurtosis_in) = vals
             denom = mean_abs_out + 1e-06
             ranges.append({"module": cls_name, "max_abs_in": max_abs_in, "max_abs_out": max_abs_out, "kurtosis_in": kurtosis_in})
-            quant_errors.append({"module": cls_name, "max_abs": max_abs_out, "overflow_rate": overflow, "underflow_rate": underflow, "subnormal_rate": subnormal, "quantized_zero_rate": quantized_zero, "rel_err": err / denom})
+            quant_errors.append({"module": cls_name, "max_abs": max_abs_out, "overflow_rate": overflow, "underflow_rate": underflow, "subnormal_rate": subnormal, "quantized_zero_rate": quantized_zero, "rel_err": err / max(denom, 1)})
     bad_flags = torch.stack([f for _, f in first_bad]).tolist() if first_bad else []
     over_vals = torch.stack([v for _, v in first_over]).tolist() if first_over else []
     first_bad_idx = next((i for i, ok in zip([i for i, _ in first_bad], bad_flags) if not ok), None)
@@ -402,8 +403,8 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
     max_overflow = max(e["overflow_rate"] for e in quant_errors)
     mean_underflow = sum(e["underflow_rate"] for e in quant_errors) / len(quant_errors)
     mean_subnormal = sum(e["subnormal_rate"] for e in quant_errors) / len(quant_errors)
-    mean_quantized_zero = sum(e["quantized_zero_rate"] for e in quant_errors) / len(quant_errors)
-    mean_rel_err = sum(e["rel_err"] for e in quant_errors) / len(quant_errors)
+    mean_quantized_zero = (sum(e["quantized_zero_rate"] for e in quant_errors) / len(quant_errors)) if quant_errors else float("nan")
+    mean_rel_err = (sum(e["rel_err"] for e in quant_errors) / len(quant_errors)) if quant_errors else float("nan")
     max_max = max(e["max_abs"] for e in quant_errors)
     max_in = max(r["max_abs_in"] for r in ranges) if ranges else 0.0
     mean_kurt = sum(r["kurtosis_in"] for r in ranges) / len(ranges) if ranges else 0.0
@@ -1085,7 +1086,7 @@ def main():
                 vals = [c["per_seed"][j][key] for c in per_ckpt
                         if _finite_metric(c["per_seed"][j].get(key))]
                 if vals:
-                    record[key] = sum(vals) / len(vals)
+                    record[key] = sum(vals) / max(len(vals), 1)
             flags = [c["per_seed"][j] for c in per_ckpt]
             nonfinite = [f["first_nonfinite_layer"] for f in flags
                          if isinstance(f.get("first_nonfinite_layer"), int)

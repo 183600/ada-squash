@@ -34,7 +34,7 @@ SEEDS = [42, 43, 44]
 def _row(name, values, **extra):
     items = sorted(values.items())
     vals = [value for _, value in items]
-    mean = sum(vals) / len(vals)
+    mean = sum(vals) / max(len(vals), 1)
     std = (sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
     row = {
         "name": name,

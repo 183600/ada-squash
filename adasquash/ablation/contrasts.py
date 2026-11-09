@@ -427,7 +427,7 @@ def _dose_value(value: float, transform: str) -> float:
     if transform == "log10":
         return math.log10(value)
     if transform == "ln":
-        return math.log(value)
+        return math.log(max(value, 1e-10))
     return float(value)
 
 def _dose_response_trend(design_name: str, design: dict, levels: list,
@@ -740,7 +740,7 @@ def dose_response_comparison(summaries: list, spec: dict | None=None,
             if len(common) >= 2:
                 common_means = {
                     entry["row"]: (sum(seed_maps[entry["row"]][seed]
-                                       for seed in common) / len(common))
+                                       for seed in common) / len(common) if common else float("nan"))
                     for entry in level_candidates}
                 best = min(level_candidates,
                            key=lambda entry: (common_means[entry["row"]],
@@ -1005,7 +1005,7 @@ def _conditional_effect_entry(base: dict, effect: str, factor: str, context: dic
     test = paired_t_one_sided(values, [0.0] * len(values), margin=margin,
                               alpha=alpha)
     replicated = len(common) >= MIN_SEEDS_FOR_SIGNIFICANCE
-    mean_delta = sum(values) / len(values)
+    mean_delta = (sum(values) / len(values)) if values else float("nan")
     entry = dict(
         base, effect=effect, kind="simple_effect", term_factors=[factor],
         conditional_factor=factor, conditional_context=dict(context),
@@ -1200,18 +1200,18 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                     seed_values[on_cell][seed] - seed_values[off_cell][seed]
                     for seed in common
                 ]
-            arm_means = [sum(values) / len(values) for values in arm_values.values()]
-            main_values = [sum(vals) / len(vals) for vals in zip(*arm_values.values())]
+            arm_means = [sum(values) / len(values) if values else float("nan") for values in arm_values.values()]
+            main_values = [sum(vals) / len(vals) if vals else float("nan") for vals in zip(*arm_values.values())]
             effects[factor] = {
                 "kind": "main_effect",
                 "term_factors": [factor],
                 "formula": "mean over both arms of the other factor: on - off",
-                "arm_effects": {name: {"mean_delta": sum(vals) / len(vals),
+                "arm_effects": {name: {"mean_delta": (sum(vals) / len(vals)) if vals else float("nan"),
                                        "per_seed_delta": dict(zip(map(str, common), vals))}
                                 for name, vals in arm_values.items()},
                 "per_seed_values": dict(zip(map(str, common), main_values)),
                 "mean_arm_deltas": arm_means,
-                "delta_seed_mean": sum(main_values) / len(main_values),
+                "delta_seed_mean": (sum(main_values) / len(main_values)) if main_values else float("nan"),
                 "per_seed_delta": dict(zip(map(str, common), main_values)),
             }
         if len(factor_names) == 2:
@@ -1228,7 +1228,7 @@ def factorial_comparison(summaries: list, spec: dict | None=None, margin: float=
                 "formula": (f"effect of {first} with {second} on minus effect of {first} "
                             f"with {second} off; negative = synergy"),
                 "per_seed_values": dict(zip(map(str, common), interaction_values)),
-                "delta_seed_mean": sum(interaction_values) / len(interaction_values),
+                "delta_seed_mean": (sum(interaction_values) / len(interaction_values)) if interaction_values else float("nan"),
                 "per_seed_delta": dict(zip(map(str, common), interaction_values)),
             }
         for effect_name, effect in effects.items():
@@ -1612,13 +1612,13 @@ def three_way_factorial_comparison(summaries: list, spec: dict | None=None,
                                if kind == "main_effect"
                                else "cross_axis_interaction"),
                 formula=formula, shared_seeds=common, n_seeds=len(common),
-                delta_seed_mean=sum(values) / len(values),
+                delta_seed_mean=sum(values) / len(values) if values else float("nan"),
                 per_seed_delta={str(seed): value
                                 for seed, value in per_seed.items()},
                 n_seeds_favoring=sum(value < 0.0 for value in values),
                 n_seeds_tied=sum(value == 0.0 for value in values),
                 n_seeds_against=sum(value > 0.0 for value in values),
-                effect_helps=bool(sum(values) / len(values) < -margin),
+                effect_helps=bool((sum(values) / len(values) if values else float("nan")) < -margin),
                 effect_helps_significantly=False,
                 test=test["test"],
                 test_basis=("seed_means" if replicated

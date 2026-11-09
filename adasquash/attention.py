@@ -228,8 +228,8 @@ class CausalSelfAttention(nn.Module):
         del k_t, block
         total, signed, sq, peak_v = torch.stack(
             (acc_abs, acc_x, acc_sq, peak.to(torch.float64))).tolist()
-        mean_abs = total / n_valid
-        var = ((sq - signed * signed / n_valid) / (n_valid - 1)
+        mean_abs = total / max(n_valid, 1)
+        var = ((sq - signed * signed / max(n_valid, 1)) / (n_valid - 1)
                if n_valid > 1 else 0.0)
         # A NaN/Inf variance must not be reported as a perfect zero spread:
         # this statistics path exists to expose exactly that blow-up. Only the

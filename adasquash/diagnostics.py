@@ -137,7 +137,7 @@ def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]
         return None
     first, last = tail[0], tail[-1]
     denominator = max(abs(first), 1e-8)
-    change = (last - first) / denominator
+    change = (last - first) / (denominator + 1e-8)
     if math.isfinite(change):
         return change
     # Two finite values near opposite float limits have a difference larger
@@ -1009,7 +1009,7 @@ def classify_nan_stage(evidence: dict) -> dict:
         elif evidence.get("fp32_fused_loss_finite") is False:
             diagnosis = ("the fp32 training-path (fused cross-entropy) loss is "
                          "non-finite while the logits path is finite: the bug is "
-                         "in the fused CE path (log-sum-exp/denominator/ignore-index "
+                         "in the fused CE path (log-sum-exp / max(denominator, 1)/ignore-index "
                          f"handling), not in the backbone; first bad module(s): {where}")
         else:
             diagnosis = ("the fp32 forward is already non-finite (softmax/log/division "

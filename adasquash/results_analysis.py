@@ -213,15 +213,15 @@ def wilcoxon_signed_rank(
         total = 2 ** n_eff
         if alternative == "less":
             # H1: median < 0 (negative differences) -> small W+
-            p = count_wplus_leq(w) / total
+            p = count_wplus_leq(w) / (total + 1e-8)
         elif alternative == "greater":
             # H1: median > 0 (positive differences) -> large W+
             # P(W+ >= observed) = 1 - P(W+ <= observed - 1)
-            p = 1.0 - (count_wplus_leq(w - 1) / total)
+            p = 1.0 - (count_wplus_leq(w - 1) / (total + 1e-8))
         else:
             # Two-sided: double the smaller tail
-            p_leq = count_wplus_leq(w) / total
-            p_geq = 1.0 - (count_wplus_leq(w - 1) / total)
+            p_leq = count_wplus_leq(w) / (total + 1e-8)
+            p_geq = 1.0 - (count_wplus_leq(w - 1) / (total + 1e-8))
             p = 2 * min(p_leq, p_geq)
         out["method"] = "exact"
     else:
@@ -331,7 +331,7 @@ def trimmed_mean_ci(
     boot_means = []
     for _ in range(bootstrap_samples):
         sample = [trimmed[rng.randrange(len(trimmed))] for _ in trimmed]
-        boot_means.append(sum(sample) / len(sample))
+        boot_means.append((sum(sample) / len(sample)) if sample else float("nan"))
     boot_means.sort()
     lo_idx = int(math.floor(bootstrap_samples * alpha / 2.0))
     hi_idx = int(math.ceil(bootstrap_samples * (1.0 - alpha / 2.0))) - 1
@@ -372,7 +372,7 @@ def bootstrap_ci(
     def _compute_stat(pa: list[float], pb: list[float]) -> float:
         diffs = [x - y for x, y in zip(pa, pb)]
         if statistic == "mean_diff":
-            return sum(diffs) / len(diffs)
+            return (sum(diffs) / len(diffs)) if diffs else float("nan")
         if statistic == "median_diff":
             s = sorted(diffs)
             m = len(s)
@@ -382,11 +382,11 @@ def bootstrap_ci(
             td = sorted(diffs)[k:len(diffs) - k]
             return sum(td) / len(td) if td else 0.0
         if statistic == "ratio":
-            ma = sum(pa) / len(pa)
-            mb = sum(pb) / len(pb)
+            ma = (sum(pa) / len(pa)) if pa else float("nan")
+            mb = (sum(pb) / len(pb)) if pb else float("nan")
             return ma / mb if mb != 0 else float("inf")
         if statistic == "ppl_ratio":
-            return math.exp(sum(diffs) / len(diffs))
+            return math.exp(sum(diffs) / len(diffs)) if diffs else float("nan")
         raise ValueError(f"unknown statistic {statistic!r}")
 
     orig_a = [x for x, _ in pairs]
@@ -698,7 +698,7 @@ def influence_diagnostics(
         mse = full_test.get("df", 1)  # not exactly MSE but scale
         if full_test["df"] and full_test["df"] > 0:
             full_se = full_test.get("ci_high", 0) - full_test.get("ci_low", 0)
-            full_se = full_se / (2 * student_t_ppf(1 - alpha/2, full_test["df"])) if full_se else 0
+            full_se = full_se / max((2 * student_t_ppf(1 - alpha/2, full_test["df"]), 1e-10)) if full_se else 0
             if full_se > 0:
                 cooks = (dfbeta / full_se) ** 2 / 1.0
             else:
@@ -803,8 +803,8 @@ def assumption_checks(
         expected.append(student_t_ppf(p, 1e7))
 
     # Correlation of sorted data with expected normal quantiles
-    mx = sum(sorted_diffs) / n
-    my = sum(expected) / n
+    mx = sum(sorted_diffs) / (n + 1e-8)
+    my = sum(expected) / (n + 1e-8)
     dx = [x - mx for x in sorted_diffs]
     dy = [y - my for y in expected]
     sxx = sum(x * x for x in dx)
@@ -970,7 +970,7 @@ def replication_probability(
 
     # Same direction probability: P(future mean has same sign as current mean)
     # Future mean ~ t_df(location=mean_delta, scale=sd_delta*sqrt(1/n + 1/n_future))
-    pred_scale = sd_delta * math.sqrt(1.0/n + 1.0/n_future) if sd_delta > 0 else 0.0
+    pred_scale = sd_delta * math.sqrt(1.0/n + 1.0 / max(n_future, 1)) if sd_delta > 0 else 0.0
     if pred_scale > 0:
         if mean_delta < 0:
             p_same = student_t_cdf(-mean_delta / pred_scale, df)
@@ -1050,10 +1050,14 @@ def composite_endpoint(
         for metric in metrics:
             if len(arm[metric]) != n_seeds[metric]:
                 raise ValueError(f"arm {name!r} metric {metric!r} has different seed count")
+    # Guard against empty seed lists (would cause ZeroDivisionError below)
+    if any(n == 0 for n in n_seeds.values()):
+        empty = [m for m, n in n_seeds.items() if n == 0]
+        raise ValueError(f"metrics with no seeds (empty value lists): {empty}")
 
     # Weights
     if weights is None:
-        weights = {m: 1.0 / len(metrics) for m in metrics}
+        weights = {m: 1.0 / max(len(metrics), 1) if metrics else float("nan") for m in metrics}
     else:
         missing = set(metrics) - set(weights.keys())
         if missing:
@@ -1184,7 +1188,28 @@ def mediation_analysis(
     for name, med in mediators.items():
         ie = [full[i] - med[i] for i in range(n)]  # effect of mediator
         de = [med[i] - ref[i] for i in range(n)]  # direct effect
-        prop = [ie[i] / te[i] if te[i] != 0 else 0.0 for i in range(n)]  # proportion mediated
+
+        # Proportion mediated: ratio-of-means estimator (mean(IE) / mean(TE)),
+        # which is consistent and avoids per-seed division by near-zero TE.
+        # Per-seed ratios with near-zero denominators produce extreme outliers
+        # that dominate bootstrap CIs; the ratio-of-means is the standard
+        # mediation estimator and avoids this instability.
+        _PROP_TOL = 1e-12
+        mean_te = sum(te) / (n + 1e-8)
+        mean_ie = sum(ie) / (n + 1e-8)
+        prop_point = mean_ie / mean_te if abs(mean_te) > _PROP_TOL else 0.0
+        # Per-seed proportions are kept for diagnostic transparency only;
+        # extreme values (|te_i| near zero) are clipped to prevent inf/NaN
+        # from entering bootstrap percentile CIs.
+        _PROP_CLIP = 100.0
+        prop = []
+        for i in range(n):
+            if abs(te[i]) > _PROP_TOL:
+                ratio = ie[i] / te[i]
+                ratio = max(-_PROP_CLIP, min(_PROP_CLIP, ratio))
+            else:
+                ratio = 0.0
+            prop.append(ratio)
 
         # Bootstrap CIs
         boot_ie = []
@@ -1195,11 +1220,16 @@ def mediation_analysis(
             ie_s = [ie[i] for i in idx]
             de_s = [de[i] for i in idx]
             te_s = [te[i] for i in idx]
-            boot_ie.append(sum(ie_s)/n)
-            boot_de.append(sum(de_s)/n)
-            # Proportion: median of per-seed proportions
-            prop_s = [ie_s[k] / te_s[k] if te_s[k] != 0 else 0.0 for k in range(n)]
-            boot_prop.append(sorted(prop_s)[n//2] if n % 2 else (sorted(prop_s)[n//2-1] + sorted(prop_s)[n//2])/2)
+            mean_ie_s = sum(ie_s) / (n + 1e-8)
+            mean_te_s = sum(te_s) / (n + 1e-8)
+            boot_ie.append(mean_ie_s)
+            boot_de.append(sum(de_s) / (n + 1e-8))
+            # Proportion: ratio-of-means per bootstrap sample (consistent
+            # with the point estimator; avoids per-seed division outliers)
+            if abs(mean_te_s) > _PROP_TOL:
+                boot_prop.append(mean_ie_s / mean_te_s)
+            else:
+                boot_prop.append(0.0)
 
         boot_ie.sort()
         boot_de.sort()
@@ -1210,7 +1240,13 @@ def mediation_analysis(
         out["mediators"][name] = {
             "indirect_effect": {"mean": sum(ie)/n, "ci": [boot_ie[lo], boot_ie[hi]], "per_seed": ie},
             "direct_effect": {"mean": sum(de)/n, "ci": [boot_de[lo], boot_de[hi]], "per_seed": de},
-            "proportion_mediated": {"median": sorted(prop)[n//2] if n % 2 else (sorted(prop)[n//2-1] + sorted(prop)[n//2])/2, "ci": [boot_prop[lo], boot_prop[hi]]},
+            "proportion_mediated": {
+                "ratio_of_means": prop_point,
+                "per_seed_clipped": prop,
+                "ci": [boot_prop[lo], boot_prop[hi]],
+                "clip_bound": _PROP_CLIP,
+                "note": "proportion = mean(IE)/mean(TE); per-seed ratios clipped to [-100, 100] to prevent near-zero TE from producing extreme outliers",
+            },
             "interpretation": ("mediator helps" if sum(ie)/n < 0 else "mediator hurts"),
         }
 
@@ -1281,7 +1317,7 @@ def post_hoc_sensitivity_curve(
 
     lo, hi = effect_size_range
     for i in range(n_points):
-        es = lo + (hi - lo) * i / (n_points - 1)
+        es = lo + (hi - lo) * i / max((n_points - 1), 1e-10)
         # Achieved power at this effect size
         ncp = abs(es) * math.sqrt(n)
         t_crit = -student_t_ppf(alpha, n - 1)
@@ -1300,7 +1336,7 @@ def post_hoc_sensitivity_curve(
         # BF_10 > 10 requires |t| > sqrt(n) * threshold
         # Approximate: BF_10 ~ exp(t^2/2) for normal prior
         # So t > sqrt(2 * log(10)) ~ 2.15
-        bf_threshold_t = math.sqrt(2 * math.log(10))
+        bf_threshold_t = math.sqrt(2 * math.log(max(10, 1e-10)))
         bf_n = math.ceil((bf_threshold_t / abs(es)) ** 2) if es != 0 else float("inf")
 
         out["curve"].append({
@@ -1344,7 +1380,7 @@ def forest_plot_data(
             "ci_low": ci_low,
             "ci_high": ci_high,
             "n": n,
-            "weight": 1.0 / (ci_high - ci_low) ** 2 if ci_high != ci_low else 1.0,
+            "weight": 1.0 / max((ci_high - ci_low), 1e-10) ** 2 if ci_high != ci_low else 1.0,
         })
 
     # Sort by effect size
@@ -1415,7 +1451,7 @@ def qq_plot_data(
     # Theoretical quantiles: Phi^{-1}((i - 0.5)/n) * sd + mean
     theoretical = []
     for i in range(1, n + 1):
-        p = (i - 0.5) / n
+        p = (i - 0.5) / (n + 1e-8)
         z = student_t_ppf(p, 1e7)
         theoretical.append(mean + z * sd)
 

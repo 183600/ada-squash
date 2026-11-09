@@ -58,6 +58,7 @@ from adasquash import (
 from adasquash.attention import apply_rope
 from adasquash.model import cross_entropy_mean
 from adasquash.norms import QKSquash
+import ast
 
 
 # ---------------------------------------------------------------------------

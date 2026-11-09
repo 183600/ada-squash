@@ -157,7 +157,7 @@ def load_result(path) -> dict:
             f"[compare] {p} recorded test_batches_seen={seen} but has {len(losses)} "
             "per-batch losses; the sealed-test record is internally inconsistent")
     reported = data.get("test_loss")
-    mean = sum(losses) / len(losses)
+    mean = sum(losses) / len(losses) if losses else float("nan")
     reported_value = _finite_number(reported)
     if reported_value is None:
         raise SystemExit(f"[compare] {p} has no finite 'test_loss' to cross-check")

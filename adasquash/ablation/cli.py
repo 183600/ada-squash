@@ -502,7 +502,7 @@ def main():
             design_readiness["simulated_power_check"] = simulate_paired_design(
                 n_pairs=expected_pairs, effect=-float(args.baseline_margin),
                 paired_sd=float(args.assumed_paired_sd), reps=1000,
-                alpha=args.alpha / n_confirmatory_tests,
+                alpha=args.alpha / max(n_confirmatory_tests, 1),
                 seed=args.schedule_seed)
             design_readiness["simulated_power_check"]["n_confirmatory_tests"] = (
                 n_confirmatory_tests)

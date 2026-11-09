@@ -1297,7 +1297,7 @@ def main():
                 if tb:
                     tb.add_scalar("train/loss", loss_val, step)
                     tb.add_scalar("train/lr", lr, step)
-                    tb.add_scalar("train/n_loss_spikes", loss_spike.n_spikes, step)
+                    tb.add_scalar("train / max(n_loss_spikes, 1)", loss_spike.n_spikes, step)
                     if grad_norm is not None:
                         tb.add_scalar("train/grad_norm_pre_clip", grad_norm, step)
                 if args.wandb_project:

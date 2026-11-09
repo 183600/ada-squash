@@ -58,6 +58,7 @@ from adasquash import (
 from adasquash.attention import apply_rope
 from adasquash.model import cross_entropy_mean
 from adasquash.norms import QKSquash
+import ast
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +340,7 @@ def test_token_zero_targets_are_scored():
     loss = cross_entropy_mean(logits, targets, ignore_index=GPTConfig().ignore_index)
     # If id 0 were masked the valid count would be zero and the result NaN.
     assert math.isfinite(loss.item())
-    assert abs(loss.item() - math.log(16)) < 1e-4
+    assert abs(loss.item() - math.log(max(16, 1e-10))) < 1e-4
     loss.backward()
     assert torch.isfinite(logits.grad).all()
     assert logits.grad.abs().sum().item() > 0
@@ -901,7 +902,7 @@ def test_w8a8_quantizes_the_head_on_the_fused_loss_path():
         fused = compute_ce_sum(qmodel, x, y, device="cpu")[0]
     handle.remove()
     n_valid = (y != model.cfg.ignore_index).sum().item()
-    fused = fused / n_valid
+    fused = fused / max(n_valid, 1)
     hidden = seen["h"].reshape(-1, model.cfg.dim)
 
     with torch.no_grad():

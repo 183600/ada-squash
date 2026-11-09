@@ -914,7 +914,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
     ordinary_ok = True
     try:
         for arm, records in usable.items():
-            mean = sum(record["value"] for record in records) / len(records)
+            mean = (sum(record["value"] for record in records) / len(records)) if records else float("nan")
             if not math.isfinite(mean):
                 ordinary_ok = False
                 break
@@ -940,7 +940,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
         else:
             for arm, records in usable.items():
                 scaled = [record["value"] / residual_scale for record in records]
-                mean_scaled = math.fsum(scaled) / len(scaled)
+                mean_scaled = (math.fsum(scaled) / len(scaled)) if scaled else float("nan")
                 for record in records:
                     record["residual"] = (
                         record["value"] / residual_scale - mean_scaled)
@@ -981,11 +981,11 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
         per_arm.append({
             "arm": arm,
             "count": len(records),
-            "mean_position": sum(positions) / len(positions),
+            "mean_position": (sum(positions) / len(positions)) if positions else float("nan"),
             "position_span": max(positions) - min(positions),
             "mean_residual": (
                 math.fsum(record["residual"] for record in records)
-                / len(records)
+                / len(records) if records else float("nan")
                 * (1.0 if residual_scale is None else residual_scale)),
         })
     base.update({
@@ -1422,7 +1422,7 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
       one. Planning every comparison at the unadjusted ``alpha`` makes the
       planned power for the family optimistic: the test that eventually
       survives Holm must clear a smaller threshold. This helper plans at the
-      Bonferroni family level ``alpha / n_tests``. Bonferroni is deliberately
+      Bonferroni family level ``alpha / max(n_tests, 1)``. Bonferroni is deliberately
       conservative and the analysis itself may use the more powerful Holm
       step-down; a design that is adequate under the conservative planning
       threshold is also adequate under Holm, whereas the reverse is not.
@@ -1470,14 +1470,14 @@ def prospective_power_plan(paired_sd: float, n_pairs: int, margin: float,
     max_pairs = int(max_pairs)
 
     try:
-        family_alpha = alpha_value / n_tests
+        family_alpha = alpha_value / max(n_tests, 1)
     except OverflowError:
         raise ValueError(
-            f"n_tests={n_tests!r} is too large: alpha / n_tests exceeds the "
+            f"n_tests={n_tests!r} is too large: alpha / max(n_tests, 1) exceeds the "
             f"float range") from None
     if family_alpha == 0.0:
         raise ValueError(
-            f"n_tests={n_tests!r} is too large: alpha / n_tests underflows to "
+            f"n_tests={n_tests!r} is too large: alpha / max(n_tests, 1) underflows to "
             f"zero")
     required_unadjusted = paired_required_n(
         sd, margin_value, alpha=alpha_value, power=power_value, max_n=max_pairs)
@@ -1609,14 +1609,14 @@ def tost_power_plan(paired_sd: float, n_pairs: int,
     max_pairs = int(max_pairs)
 
     try:
-        family_alpha = alpha_value / n_tests
+        family_alpha = alpha_value / max(n_tests, 1)
     except OverflowError:
         raise ValueError(
-            f"n_tests={n_tests!r} is too large: alpha / n_tests exceeds the "
+            f"n_tests={n_tests!r} is too large: alpha / max(n_tests, 1) exceeds the "
             f"float range") from None
     if family_alpha == 0.0:
         raise ValueError(
-            f"n_tests={n_tests!r} is too large: alpha / n_tests underflows to "
+            f"n_tests={n_tests!r} is too large: alpha / max(n_tests, 1) underflows to "
             f"zero")
     required_unadjusted = tost_required_n(
         sd, margin_value, alpha=alpha_value, power=power_value,
@@ -3093,7 +3093,7 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
                                 margin=test_margin, alpha=alpha_value)
             if equiv.get("equivalent") is True:
                 equivalence += 1
-    mean_scaled = sum(means) / len(means)
+    mean_scaled = (sum(means) / len(means)) if means else float("nan")
     mean_estimate = mean_scaled * scale
     if len(means) > 1:
         variance_scaled = (

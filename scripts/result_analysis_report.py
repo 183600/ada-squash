@@ -54,10 +54,12 @@ def generate_report(comparison_path: Path, out_path: Path | None = None):
         hedges = None
         if sd_delta and sd_delta > 0 and deltas:
             # cohens_dz/hedges_g_paired take two arms and standardize a - b.
-            # The per-seed values here are already paired differences, so the
-            # reference arm is an all-zero vector of the same length.
+            # `deltas` already are the paired differences, so pair them against
+            # an all-zero reference arm of the same length to standardise the
+            # differences themselves rather than a single arm's values.
             zeros = [0.0] * len(deltas)
-            standardized = cohens_dz(deltas, zeros)
+            dz = cohens_dz(deltas, zeros)
+            standardized = dz
             hedges = hedges_g_paired(deltas, zeros)
 
         # Robustness: leave-one-out sign stability already in compare_arms

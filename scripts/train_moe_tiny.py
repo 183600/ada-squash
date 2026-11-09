@@ -68,6 +68,7 @@ from adasquash.repro import (
 )
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 from scripts.data_pipeline import _is_pinned_revision
+import ast
 
 _FLAT_TOKEN_CACHE: dict = {}
 _FLAT_TOKEN_CACHE_MAX_ENTRIES = 8
@@ -163,7 +164,7 @@ class MoELayer(nn.Module):
         y = self.drop(y)
         y = y.view(B, T, C)
         tokens_per_expert = counts.to(probs.dtype).detach()
-        f_i = tokens_per_expert / n_tokens
+        f_i = tokens_per_expert / max(n_tokens, 1)
         p_i = probs.mean(dim=0)
         aux = self.n_experts * (f_i * p_i).sum()
         return (y, aux, tokens_per_expert)
@@ -591,7 +592,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                 # not divisible by curve_every leaves the diagnosis one window
                 # behind the weights that are actually reported.
                 if (step + 1) % curve_every == 0 or step + 1 == args.max_steps:
-                    train_point = sum(train_ce_window) / len(train_ce_window)
+                    train_point = (sum(train_ce_window) / len(train_ce_window)) if train_ce_window else float("nan")
                     train_ce_window = []
                     held_total: list = []
                     held_ce: list = []
@@ -638,8 +639,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                         "train_window_ce": train_point,
                         "val_ce": curve_val[-1],
                         "val_ce_stderr": held_stderr,
-                        "val_total": sum(held_total) / len(held_total),
-                        "val_aux": sum(held_aux) / len(held_aux),
+                        "val_total": (sum(held_total) / len(held_total)) if held_total else float("nan"),
+                        "val_aux": (sum(held_aux) / len(held_aux)) if held_aux else float("nan"),
                         "val_noise_threshold": diagnosis["evidence"].get("val_noise_threshold"),
                         "val_change_within_noise": diagnosis["evidence"].get("val_change_within_noise"),
                         "gap_change_within_noise": diagnosis["evidence"].get("gap_change_within_noise"),
@@ -719,9 +720,9 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                     val_ce_losses.append(total_val - model.AUX_LOSS_COEF * vaux)
                     val_auxes.append(vaux)
             model.train()
-            val_loss = sum(val_losses) / len(val_losses)
-            val_ce = sum(val_ce_losses) / len(val_ce_losses)
-            val_aux = sum(val_auxes) / len(val_auxes)
+            val_loss = (sum(val_losses) / len(val_losses)) if val_losses else float("nan")
+            val_ce = (sum(val_ce_losses) / len(val_ce_losses)) if val_ce_losses else float("nan")
+            val_aux = (sum(val_auxes) / len(val_auxes)) if val_auxes else float("nan")
             val_ce_stats = mean_std_stderr(val_ce_losses)
             val_ce_stderr = (val_ce_stats["stderr"]
                              if val_ce_stats and val_ce_stats["n"] >= 2 else None)
@@ -1016,7 +1017,7 @@ _MOE_LEDGER_KEYS = ("exclude_hash_file", "exclude_test_hash_file",
 def _moe_ledger_fingerprints(args) -> dict:
     """Content identity of every ledger role a MoE run consumed.
 
-    Keep only path/existence/content/size: mtime is not content, and a ledger
+    Keep only path/existence/content / max(size, 1): mtime is not content, and a ledger
     copied or checked out again with identical bytes must not look like a
     different exclusion set.
     """
@@ -1377,7 +1378,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 deltas = [cand - ref for cand, ref in zip(cand_values, ref_values)]
                 stats = mean_std_stderr(deltas)
                 entry.update({
-                    "delta_vs_reference": (sum(deltas) / len(deltas)),
+                    "delta_vs_reference": (sum(deltas) / len(deltas)) if deltas else float("nan"),
                     "n_seeds_favoring": sum(v < 0.0 for v in deltas),
                     "n_seeds_tied": sum(v == 0.0 for v in deltas),
                     "n_seeds_against": sum(v > 0.0 for v in deltas),

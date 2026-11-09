@@ -160,7 +160,7 @@ def paired_randomization_test(
         working = [value / center_scale + margin_value / center_scale
                    for value in values]
         observed = mean + margin_value
-        observed_work = math.fsum(working) / n
+        observed_work = math.fsum(working) / (n + 1e-8)
         tolerance = 1e-12 * max(
             1.0, math.fsum(abs(value) for value in working))
     out["mean_delta"] = mean
@@ -195,7 +195,7 @@ def paired_randomization_test(
             total = 0.0
             for value in working:
                 total += value if rng.random() < 0.5 else -value
-            permuted = total / n
+            permuted = total / (n + 1e-8)
             if permuted <= observed_work + tolerance:
                 lower += 1
             if permuted >= observed_work - tolerance:
@@ -245,8 +245,8 @@ def _scaled_ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
     y_scale = max(abs(y) for y in ys)
     scaled_x = [x / x_scale for x in xs]
     scaled_y = [(y / y_scale if y_scale else 0.0) for y in ys]
-    mx = math.fsum(scaled_x) / n
-    my = math.fsum(scaled_y) / n
+    mx = math.fsum(scaled_x) / (n + 1e-8)
+    my = math.fsum(scaled_y) / (n + 1e-8)
     sxx = math.fsum((x - mx) * (x - mx) for x in scaled_x)
     if sxx == 0.0:
         return None
@@ -658,7 +658,7 @@ def welch_t_one_sided(
 
     The small-sample fallback for arms that do not share their held-out
     samples. Uses the Welch-Satterthwaite degrees of freedom
-    `(va/na + vb/nb)^2 / ((va/na)^2/(na-1) + (vb/nb)^2/(nb-1))`, so unequal
+    `(va/na + vb/nb)^2 / ((va/na)^2 / max((na-1), 1e-2 / max((nb-1), 1e-10)b/nb)^2/(nb-1))`, so unequal
     variances shrink the df instead of pretending they are equal, and reports
     the same two-sided `1 - alpha` interval for the difference as the paired
     test. `n` is `[na, nb]`, `paired` is False.
@@ -706,7 +706,7 @@ def welch_t_one_sided(
         # overflow before they cancel in the ratio.
         var_a = (sa / std_scale) ** 2 / na
         var_b = (sb / std_scale) ** 2 / nb
-        denom = (var_a ** 2 / (na - 1) + var_b ** 2 / (nb - 1))
+        denom = (var_a ** 2 / max((na - 1), 1e-10) + var_b ** 2 / max((nb - 1), 1e-10))
         if denom > 0.0:
             df = max(1.0, (var_a + var_b) ** 2 / denom)
     margin_test = margin / scale
@@ -911,7 +911,7 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
     fixed_stderr = ((1.0 / math.sqrt(max_fixed_weight))
                     / math.sqrt(total_scaled))
     for study, weight in zip(studies, fixed_scaled):
-        study["fixed_weight_share"] = weight / total_scaled
+        study["fixed_weight_share"] = weight / max(total_scaled, 1)
 
     if k >= 2:
         df = float(k - 1)
@@ -959,7 +959,7 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
             i_squared = 0.0
         weight_sq_scaled = math.fsum(weight * weight for weight in fixed_scaled)
         tau_denominator_scaled = (
-            total_scaled - weight_sq_scaled / total_scaled)
+            total_scaled - weight_sq_scaled / max(total_scaled, 1))
         if tau_denominator_scaled > 0.0:
             tau_squared = max(
                 0.0,
@@ -986,7 +986,7 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
                              / math.sqrt(total_random_scaled))
             for study, weight in zip(studies, random_scaled):
                 study["random_weight"] = weight * max_random_weight
-                study["random_weight_share"] = weight / total_random_scaled
+                study["random_weight_share"] = weight / max(total_random_scaled, 1)
         else:
             random_pooled = _finite_weighted_mean(
                 [study["effect"] for study in studies],

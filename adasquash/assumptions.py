@@ -170,8 +170,8 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
 
     mean = sum(data) / n
     m2 = sum((x - mean) ** 2 for x in data) / n
-    m3 = sum((x - mean) ** 3 for x in data) / n
-    m4 = sum((x - mean) ** 4 for x in data) / n
+    m3 = sum((x - mean) ** 3 for x in data) / (n + 1e-8)
+    m4 = sum((x - mean) ** 4 for x in data) / (n + 1e-8)
 
     if m2 == 0:
         return 0.0, 1.0
@@ -193,7 +193,10 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     E_g2 = -6.0 / (n + 1)
     var_g2 = 24.0 * n * (n - 2) * (n - 3) / ((n + 1) ** 2 * (n + 3) * (n + 5))
     a = 6.0 + 8.0 / var_g2 * (2.0 * var_g2 + 6.0 / (n + 1) * (n - 2) / (n - 3))
-    z2 = ((1.0 - 2.0 / a) * (1.0 + g2 / math.sqrt(var_g2)) ** (1.0 / 3.0) - 1.0) * math.sqrt(a) * math.sqrt(2.0 / (9.0 * a))
+    # Anscombe-Glynn (1983) transform: coefficient is 1 - 2/(9a), not 1 - 2/a.
+    # The original formula produced z-scores that were too large for small n,
+    # inflating type-I error of the normality test on small samples.
+    z2 = ((1.0 - 2.0 / (9.0 * a)) * (1.0 + g2 / math.sqrt(var_g2)) ** (1.0 / 3.0) - 1.0) * math.sqrt(a) * math.sqrt(2.0 / (9.0 * a))
 
     # Chi-squared combination
     K2 = z1 * z1 + z2 * z2
@@ -301,13 +304,13 @@ def check_variance_homogeneity(
     for arm, values in arm_data.items():
         if not values:
             continue
-        c = sum(values) / len(values) if center == "mean" else sorted(values)[len(values) // 2]
+        c = sum(values) / len(values) if values else float("nan") if center == "mean" else sorted(values)[len(values) // 2]
         for v in values:
             all_devs.append(abs(v - c))
             all_labels.append(arm)
 
     # One-way ANOVA on absolute deviations
-    grand_mean = sum(all_devs) / len(all_devs)
+    grand_mean = (sum(all_devs) / len(all_devs)) if all_devs else float("nan")
     ss_between = 0.0
     ss_within = 0.0
 
@@ -401,8 +404,8 @@ def check_independence(
         )
 
     # Simple autocorrelation at lags 1..max_lag
-    mean = sum(ordered_observations) / n
-    c0 = sum((x - mean) ** 2 for x in ordered_observations) / n
+    mean = sum(ordered_observations) / (n + 1e-8)
+    c0 = sum((x - mean) ** 2 for x in ordered_observations) / (n + 1e-8)
 
     if c0 == 0:
         return AssumptionCheck(
@@ -465,11 +468,11 @@ def check_outlier_influence(
             recommendation=f"Need at least 3 observations for jackknife; have {n}.",
         )
 
-    full_mean = sum(paired_deltas) / n
+    full_mean = sum(paired_deltas) / (n + 1e-8)
     jackknife_means = []
     for i in range(n):
         loo = [paired_deltas[j] for j in range(n) if j != i]
-        jackknife_means.append(sum(loo) / len(loo))
+        jackknife_means.append((sum(loo) / len(loo)) if loo else float("nan"))
 
     max_change = max(abs(jm - full_mean) for jm in jackknife_means)
     relative_influence = max_change / (abs(full_mean) + 1e-12)

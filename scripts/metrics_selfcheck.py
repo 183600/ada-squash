@@ -85,7 +85,7 @@ def brute_ap(scores, labels):
         tp = sum(1 for _, y in selected if y)
         fp = len(selected) - tp
         precision = tp / (tp + fp)
-        recall = tp / n_pos
+        recall = tp / max(n_pos, 1)
         ap += precision * (recall - previous_recall)
         previous_recall = recall
     return ap
@@ -101,7 +101,7 @@ def brute_f1(pred, gold, n_classes):
         fn = sum(1 for p, g in zip(pred, gold) if p != cls and g == cls)
         correct += tp
         denom = 2 * tp + fp + fn
-        per_class[cls] = (2 * tp / denom) if denom else 0.0
+        per_class[cls] = (2 * tp / max(denom, 1)) if denom else 0.0
     macro = sum(per_class.values()) / len(per_class) if per_class else 0.0
     weighted = sum(per_class[g] for g in gold) / support if support else 0.0
     return macro, weighted, correct / support if support else 0.0

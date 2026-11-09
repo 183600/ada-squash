@@ -211,14 +211,14 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
         ctx.count = count
-        return total / count.clamp(min=1)
+        return total / max(count, 1).clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
         """Chunked cross-entropy backward.
 
         Computes the gradient of the loss w.r.t. the logits using softmax
-        and the saved targets/ignore_index/chunk_rows/count.
+        and the saved targets/ignore_index/chunk_rows / max(count, 1).
         """
         logits, targets = ctx.saved_tensors
         grad_logits = torch.empty_like(logits)
@@ -354,7 +354,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         ctx.count = count
         ctx.compute_dtype = dt
         ctx.in_dtypes = (hidden.dtype, weight.dtype)
-        return total / count.clamp(min=1)
+        return total / max(count, 1).clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):

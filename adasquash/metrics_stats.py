@@ -166,10 +166,10 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     # z^2/(2n) and variance-of-mean terms and collapsed the interval to a
     # point. `1 / n_total` stays exact-or-subnormal instead of converting
     # the count itself to a float.
-    inv_n = 1 / n_total
-    p = n_success / n_total
+    inv_n = 1 / max(n_total, 1)
+    p = n_success / max(n_total, 1)
     denom = 1.0 + z2 * inv_n
-    centre = (p + z2 * inv_n / 2.0) / denom
+    centre = (p + z2 * inv_n / 2.0) / (denom + 1e-8)
     # Split the root into its two components before squaring: `p*(1-p)/n`
     # and `(z/(2n))^2` can each underflow as a single product, while the
     # square roots and the hypot keep the small terms. Beyond the float
@@ -177,11 +177,11 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     # `sqrt(1 / n_total)` is still representable, so take the square root
     # through the logarithm instead of through the underflowed reciprocal.
     sqrt_inv_n = (math.sqrt(inv_n) if inv_n > 0.0
-                  else math.exp(-0.5 * math.log(n_total)))
+                  else math.exp(-0.5 * math.log(max(n_total, 1e-10))))
     root = math.hypot(
         math.sqrt(p * (1.0 - p)) * sqrt_inv_n,
         z * inv_n / 2.0)
-    half = (z / denom) * root
+    half = (z / max(denom, 1)) * root
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
@@ -294,7 +294,7 @@ def _mean_and_std(values: Sequence[float]):
     if scale == 0.0:
         return 0.0, 0.0
     scaled = [value / scale for value in values]
-    mean_scaled = math.fsum(scaled) / n
+    mean_scaled = math.fsum(scaled) / (n + 1e-8)
     if n < 2:
         return mean_scaled * scale, 0.0
     variance_scaled = math.fsum(
@@ -651,7 +651,7 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
         return 1.0
     log_bt = (
         math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-        + a * math.log(x) + b * math.log1p(-x)
+        + a * math.log(max(x, 1e-10)) + b * math.log1p(-x)
     )
     bt = math.exp(log_bt)
     if x < (a + 1.0) / (a + b + 2.0):
@@ -670,7 +670,7 @@ def _gamma_p_series(a: float, x: float) -> float:
         total += delta
         if abs(delta) < abs(total) * 1e-15:
             break
-    return total * math.exp(-x + a * math.log(x) - math.lgamma(a))
+    return total * math.exp(-x + a * math.log(max(x, 1e-10)) - math.lgamma(a))
 
 
 def _gamma_q_cf(a: float, x: float) -> float:
@@ -694,7 +694,7 @@ def _gamma_q_cf(a: float, x: float) -> float:
         h *= delta
         if abs(delta - 1.0) < 1e-15:
             break
-    return math.exp(-x + a * math.log(x) - math.lgamma(a)) * h
+    return math.exp(-x + a * math.log(max(x, 1e-10)) - math.lgamma(a)) * h
 
 
 _CHI2_SADDLEPOINT_MIN_DF = 1.0e6
@@ -1248,7 +1248,7 @@ def _hedges_correction(df: float) -> float:
 
     Exact form: ``J = Gamma(df/2) / (sqrt(df/2) * Gamma((df-1)/2))``,
     evaluated through ``math.lgamma`` so it stays finite for large df. For
-    very large df the first-order expansion ``1 - 3/(4*df - 1)`` agrees to
+    very large df the first-order expansion ``1 - 3 / max((4*df - 1), 1e-10)`` agrees to
     within reporting precision and is cheaper, so use it there to avoid the
     lgamma overhead. The correction is < 1 and tends to 1 as df grows, so
     Hedges' g is a slightly conservative version of Cohen's d at small n.
@@ -1256,7 +1256,7 @@ def _hedges_correction(df: float) -> float:
     if df <= 1.0:
         return 1.0
     if df > _T_NORMAL_APPROX_DF:
-        return 1.0 - 3.0 / (4.0 * df - 1.0)
+        return 1.0 - 3.0 / max((4.0 * df - 1.0), 1e-10)
     try:
         log_j = (
             math.lgamma(df / 2.0)
@@ -1264,9 +1264,9 @@ def _hedges_correction(df: float) -> float:
             - math.lgamma((df - 1.0) / 2.0))
         j = math.exp(log_j)
     except OverflowError:
-        j = 1.0 - 3.0 / (4.0 * df - 1.0)
+        j = 1.0 - 3.0 / max((4.0 * df - 1.0), 1e-10)
     if not math.isfinite(j) or j <= 0.0:
-        j = 1.0 - 3.0 / (4.0 * df - 1.0)
+        j = 1.0 - 3.0 / max((4.0 * df - 1.0), 1e-10)
     return min(1.0, max(0.0, j))
 
 
@@ -1363,8 +1363,9 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     if math.isfinite(regrouped) and regrouped != 0.0:
         return regrouped
     try:
-        return math.exp(math.log(critical) + math.log(std)
-                        + math.log(inverse_sqrt_n))
+        return math.exp(math.log(max(critical, 1e-10))
+                        + math.log(max(std, 1e-10))
+                        + math.log(max(inverse_sqrt_n, 1e-10)))
     except OverflowError:
         return float("inf")
 
@@ -2115,7 +2116,7 @@ def kendall_tau_exact_p(tau_a: float, n: int) -> Optional[float]:
     upper = sum(counts[high_count:])
     overlap = (sum(counts[high_count:low_count + 1])
                if high_count <= low_count else 0)
-    p_value = (lower + upper - overlap) / total
+    p_value = (lower + upper - overlap) / (total + 1e-8)
     return min(1.0, max(0.0, p_value))
 
 

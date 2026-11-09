@@ -33,6 +33,7 @@ from adasquash.repro import (
 )
 from scripts.data_pipeline import _is_pinned_revision
 from scripts.eval_downstream import load_ckpt
+import ast
 
 DEFAULT_SEEDS = (42, 43, 44)
 # One probe draw is one sample: the PPL drop is aggregated as Mean +/- Std
@@ -1001,7 +1002,7 @@ def main():
                 vals = [c["per_seed"][j][key] for c in per_ckpt
                         if _finite_metric(c["per_seed"][j].get(key))]
                 if vals:
-                    record[key] = sum(vals) / len(vals)
+                    record[key] = sum(vals) / max(len(vals), 1)
             record["seed"] = seed
             record["n_checkpoints"] = len(per_ckpt)
             per_seed.append(record)

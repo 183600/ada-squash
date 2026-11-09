@@ -270,23 +270,22 @@ def value_of_information(
     current_loss = expected_loss(decision_rule, current_evidence, loss_fn, truth_probs)
 
     # Simulate future evidence
+    existing_deltas = list(current_evidence.get("paired_deltas", []))
     future_losses = []
     for _ in range(n_simulations):
-        # Simulate additional paired differences
-        # Assuming true effect = effect_size, noise = prior_sd
-        n_total = len(current_evidence.get("paired_deltas", [])) + additional_seeds
-        # For simplicity, assume current evidence is summarized by its mean/std
-        current_mean = current_evidence.get("mean_delta", effect_size)
-        current_n = current_evidence.get("n_pairs", 0)
-
-        # Generate synthetic future data
-        combined_deltas = [random.gauss(effect_size, prior_sd) for _ in range(n_total)]
+        # Generate only the additional new samples and combine with existing
+        # observations.  The previous implementation regenerated all n_total
+        # samples from scratch, discarding the already-observed data and
+        # making the VOI estimate condition on nothing.
+        new_deltas = [random.gauss(effect_size, prior_sd) for _ in range(additional_seeds)]
+        combined_deltas = existing_deltas + new_deltas
+        n_total = len(combined_deltas)
 
         # Simulate analysis result
         future_evidence = {
             "p_one_sided": _simulate_p_value(combined_deltas, margin=0.0),
             "equivalent": _simulate_equivalence(combined_deltas, margin=0.02),
-            "mean_delta": sum(combined_deltas) / len(combined_deltas),
+            "mean_delta": (sum(combined_deltas) / len(combined_deltas)) if combined_deltas else float("nan"),
             "n_pairs": n_total,
             "paired_deltas": combined_deltas,
         }
@@ -294,7 +293,7 @@ def value_of_information(
         loss = expected_loss(decision_rule, future_evidence, loss_fn, truth_probs)
         future_losses.append(loss)
 
-    expected_future_loss = sum(future_losses) / len(future_losses)
+    expected_future_loss = (sum(future_losses) / len(future_losses)) if future_losses else float("nan")
     voi = current_loss - expected_future_loss
 
     return max(0.0, voi)  # VOI cannot be negative
