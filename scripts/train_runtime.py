@@ -31,16 +31,6 @@ from scripts.data_pipeline import (
     resolve_tokenizer_revision,
 )
 from scripts.train_config import _DATA_ARGS, _LEDGER_ARGS, _WITHIN_ARM_PROTOCOL_KEYS
-# Ensure reproducibility
-import random as _rnd
-_rnd.seed(42)
-torch.manual_seed(42)
-try:
-    import numpy as _np
-    _np.random.seed(42)
-except ImportError:
-    pass
-
 
 
 def _ledger_identity(path):

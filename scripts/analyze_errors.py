@@ -93,16 +93,6 @@ from adasquash.repro import (
 )
 from adasquash.utils import markov_batch
 from scripts.eval_downstream import load_ckpt
-# Ensure reproducibility
-import random as _rnd
-_rnd.seed(42)
-torch.manual_seed(42)
-try:
-    import numpy as _np
-    _np.random.seed(42)
-except ImportError:
-    pass
-
 
 
 def _decode(token_ids, tokenizer) -> str:
