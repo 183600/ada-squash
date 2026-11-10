@@ -139,8 +139,10 @@ def _shapiro_wilk_statistic(data: Sequence[float]) -> tuple[float, float]:
     # Very rough p-value approximation for diagnostic purposes
     # In practice, use scipy.stats.shapiro
     log_w = math.log(1.0 - W)
-    mu = -1.5861 - 0.31082 * math.log(n + 1e-8) - 0.083751 * (math.log(n + 1e-8)) ** 2 + 0.0038915 * (math.log(n + 1e-8)) ** 3
-    sigma = math.exp(-0.4803 - 0.082676 * math.log(n + 1e-8) + 0.0030302 * (math.log(n + 1e-8)) ** 2)
+    # n >= 3 guaranteed by early return; no epsilon needed for log(n)
+    _ln = math.log(n)
+    mu = -1.5861 - 0.31082 * _ln - 0.083751 * _ln ** 2 + 0.0038915 * _ln ** 3
+    sigma = math.exp(-0.4803 - 0.082676 * _ln + 0.0030302 * _ln ** 2)
     z = (log_w - mu) / sigma
     p = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
 

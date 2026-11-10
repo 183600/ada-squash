@@ -579,7 +579,7 @@ def schedule_balance_report(schedule: dict, arm_of=None) -> dict:
     extreme_counts: dict[str, int] = {}
     for arm, bucket in per_arm.items():
         bucket["mean_position"] = (
-            sum(bucket["positions"]) / len(bucket["positions"])
+            (sum(bucket["positions"]) / len(bucket["positions"]) if bucket["positions"] else float("nan"))
             if bucket["positions"] else None)
         bucket["position_span"] = (max(bucket["positions"]) - min(bucket["positions"])
                                    if bucket["positions"] else None)
