@@ -1180,7 +1180,7 @@ def mediation_analysis(
     out = {
         "test": "mediation_analysis",
         "n_seeds": n,
-        "total_effect": {"mean": sum(te)/n, "per_seed": te},
+        "total_effect": {"mean": sum(te)/ max(n, 1), "per_seed": te},
         "mediators": {},
     }
 
@@ -1239,8 +1239,8 @@ def mediation_analysis(
         hi = int(math.ceil(bootstrap_samples * (1 - alpha / 2))) - 1
 
         out["mediators"][name] = {
-            "indirect_effect": {"mean": sum(ie)/n, "ci": [boot_ie[lo], boot_ie[hi]], "per_seed": ie},
-            "direct_effect": {"mean": sum(de)/n, "ci": [boot_de[lo], boot_de[hi]], "per_seed": de},
+            "indirect_effect": {"mean": sum(ie)/ max(n, 1), "ci": [boot_ie[lo], boot_ie[hi]], "per_seed": ie},
+            "direct_effect": {"mean": sum(de)/ max(n, 1), "ci": [boot_de[lo], boot_de[hi]], "per_seed": de},
             "proportion_mediated": {
                 "ratio_of_means": prop_point,
                 "per_seed_clipped": prop,

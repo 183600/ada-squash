@@ -413,7 +413,7 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
 
     ``same_direction_probability`` is the model-based predictive probability
     that a new observation has the same sign as the observed mean, i.e.
-    ``P(T_{n-1} <= |mean| / (s * sqrt(1 + 1/n)))``. It is a descriptive
+    ``P(T_{n-1} <= |mean| / (s * sqrt(1 + 1/ max(n, 1))))``. It is a descriptive
     predictive quantity, not a p-value and not a substitute for the
     pre-specified superiority test; it assumes exchangeable, approximately
     normal seed-level measurements.
@@ -432,7 +432,7 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
        degenerate (n=1); do not use it to claim "the next run will...".
      - ``same_direction_probability`` near 0.5 means the sign is essentially
        unpredictable given the current data; near 0 or 1 the sign is reliable.
-     - The PI is *necessarily wider* than the CI (by factor sqrt(1+1/n)),
+     - The PI is *necessarily wider* than the CI (by factor sqrt(1+1/ max(n, 1))),
        so a narrow CI does not imply a narrow PI.
      - A claim of "replication" or "generalization" should be read against
        the PI, not the CI: even if the CI excludes zero, the PI may still

@@ -1165,7 +1165,7 @@ def test_moe_aux_loss_matches_the_switch_formula():
         n = logits.shape[0]
         f_i = torch.zeros(E).scatter_add_(
             0, indices.reshape(-1), torch.ones(indices.numel())
-        ) / n
+        ) / max(n, 1)
         p_i = logits.softmax(-1).mean(dim=0)
         expected = E * (f_i * p_i).sum()
     assert torch.allclose(aux, expected, atol=1e-6), (

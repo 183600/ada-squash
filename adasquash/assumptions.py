@@ -433,7 +433,7 @@ def check_independence(
 
     for lag in range(1, min(max_lag + 1, n // 2)):
         cov = sum((ordered_observations[i] - mean) * (ordered_observations[i + lag] - mean)
-                  for i in range(n - lag)) / n
+                  for i in range(n - lag)) / max(n, 1)
         acf = cov / c0
 
         # Standard error of ACF under white noise

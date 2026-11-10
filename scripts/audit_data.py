@@ -688,7 +688,7 @@ def packed_window_count(tokens, seq_len: int) -> int | None:
 
     `PackedStream` advances by `seq_len` tokens per window and needs
     `seq_len + 1` tokens to produce the next label, so a split with T usable
-    tokens yields ``floor((T - 1) / seq_len)`` windows.  Those are the *unique*
+    tokens yields ``floor((T - 1) / max(seq_len, 1))`` windows.  Those are the *unique*
     held-out windows: an evaluation that asks for more batches than this
     necessarily revisits earlier windows.  `None` means the token count is
     unknown; 0 means no window can be formed.
@@ -701,7 +701,7 @@ def packed_window_count(tokens, seq_len: int) -> int | None:
     seq_len = _strict_int_option(seq_len, "seq_len", 1)
     if tokens < 1:
         return 0
-    return (tokens - 1) // seq_len
+    return (tokens - 1) // max(seq_len, 1)
 
 
 def eval_batch_capacity(budget: dict | None, seq_len: int, batch_size: int) -> dict:
@@ -731,7 +731,7 @@ def eval_batch_capacity(budget: dict | None, seq_len: int, batch_size: int) -> d
             raise ValueError(
                 f"estimated_effective_tokens must be finite and >= 0, got {tokens!r}")
     windows = packed_window_count(tokens, seq_len)
-    unique_batches = None if windows is None else windows // batch_size
+    unique_batches = None if windows is None else windows // max(batch_size, 1)
     basis = budget.get("basis")
     return {
         "estimated_effective_tokens": tokens,
