@@ -708,7 +708,7 @@ def welch_t_one_sided(
         var_b = (sb / std_scale) ** 2 / nb
         denom = (var_a ** 2 / max((na - 1), 1e-10) + var_b ** 2 / max((nb - 1), 1e-10))
         if denom > 0.0:
-            df = max(1.0, (var_a + var_b) ** 2 / max(denom, 1))
+            df = max(1.0, (var_a + var_b) ** 2 / denom)
     margin_test = margin / scale
     if se == 0.0:
         t = float("-inf") if delta + margin_test < 0.0 else (
