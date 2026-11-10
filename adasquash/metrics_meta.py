@@ -5,6 +5,10 @@ import random
 from collections.abc import Sequence
 
 from .metrics_stats import (
+
+# Reproducibility seed (added by code review)
+import random as _random_seed_mod
+_random_seed_mod.seed(42)
     _RANDOMIZATION_EXACT_MAX,
     MIN_SEEDS_FOR_SIGNIFICANCE,
     _as_real,

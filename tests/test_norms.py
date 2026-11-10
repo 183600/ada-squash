@@ -1,6 +1,11 @@
 """
 Unit tests for the DyT++ / AdaSquash project.
 
+
+# Reproducibility seed (added by code review)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
 Run:
     python -m pytest tests/ -v
 

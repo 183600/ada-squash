@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+
+# Reproducibility seed (added by code review)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
 """Fail-fast overfit sanity check: can the model memorize one small batch?
 
 Run this before any full-scale training. It freezes one small batch (a few
