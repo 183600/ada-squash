@@ -6,11 +6,6 @@ import math
 import sys
 from pathlib import Path
 
-
-# Reproducibility seed (added by code review)
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import torch

@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-
-# Reproducibility seed (added by code review)
-import random as _random_seed_mod
-_random_seed_mod.seed(42)
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
 """Leakage-safe streaming data pipeline for the AdaSquash experiments.
 
 Principles enforced here

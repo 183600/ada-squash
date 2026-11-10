@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-
-# Reproducibility seed (added by code review)
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
 """Tuned simplest-baseline ladder and Bayes-limit calibration for the synthetic ablation corpus.
 
 Why this script exists

@@ -1,10 +1,4 @@
 """Tiny MoE study for the DyT++ / AdaSquash normalization comparison.
-
-
-# Reproducibility seed (added by code review)
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
 The scientific unit is a seed-paired contrast between normalization layers.
 That design is only valid if the seed fixes every non-treatment parameter:
 the transformer weights, router and expert banks must be identical across

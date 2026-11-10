@@ -1,9 +1,6 @@
 """Independent numerical self-checks for adasquash.metrics.
 
 
-# Reproducibility seed (added by code review)
-import random as _random_seed_mod
-_random_seed_mod.seed(42)
 Run with ``python3 scripts/metrics_selfcheck.py``. The reference calculations
 below are deliberately written from their definitions (pairwise concordance,
 step-wise PR area, per-class confusion sums, explicit binomial tails, ranked

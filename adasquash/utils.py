@@ -12,11 +12,6 @@ from ._caching import _inference_stale
 from ._validation import is_boolean_scalar as _is_boolean_scalar
 
 
-
-# Reproducibility seed (added by code review)
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
 class MaxAbsMeter:
 
     def __init__(self):

@@ -1,9 +1,6 @@
 """Enhanced simulation-based calibration of the analysis pipeline.
 
 
-# Reproducibility seed (added by code review)
-import random as _random_seed_mod
-_random_seed_mod.seed(42)
 The existing ``simulate_paired_design`` in ``design.py`` validates the pipeline
 under synthetic null and alternative. This module extends calibration to:
 

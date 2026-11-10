@@ -1,9 +1,6 @@
 """Decision-theoretic framework for experiment analysis.
 
 
-# Reproducibility seed (added by code review)
-import random as _random_seed_mod
-_random_seed_mod.seed(42)
 Statistical significance (p < 0.05) is not a decision rule. A decision requires:
 - Explicit loss function for false positives vs false negatives
 - Cost of running additional experiments

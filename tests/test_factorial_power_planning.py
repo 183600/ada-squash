@@ -1,9 +1,6 @@
 """Prospective power planning for the factorial (interaction) claims.
 
 
-# Reproducibility seed (added by code review)
-import random as _random_seed_mod
-_random_seed_mod.seed(42)
 The ablation matrix makes two kinds of claim. The arm-vs-arm claim ("the
 proposal lowers the held-out loss") is a simple paired contrast, and the
 existing power planner sizes it. The factorial claim ("the per-channel and

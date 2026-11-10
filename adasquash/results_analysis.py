@@ -1,9 +1,6 @@
 """Advanced results analysis for the DyT++ / AdaSquash studies.
 
 
-# Reproducibility seed (added by code review)
-import random as _random_seed_mod
-_random_seed_mod.seed(42)
 This module complements the frequentist paired-test framework in `metrics.py`
 and `compare_arms.py` with additional analysis perspectives:
 

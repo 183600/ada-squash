@@ -1,10 +1,4 @@
 """Statistic-free adaptive squashing normalization layers.
-
-
-# Reproducibility seed (added by code review)
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
 This module implements the DyT++ normalization family:
 
 * **Statistic-based baselines**: ``LayerNorm``, ``RMSNorm``

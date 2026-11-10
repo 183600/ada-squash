@@ -1,9 +1,6 @@
 """Experimental-design preparation for the training studies.
 
 
-# Reproducibility seed (added by code review)
-import random as _random_seed_mod
-_random_seed_mod.seed(42)
 The comparison reports answer statistical questions *after* the runs exist:
 paired t-tests, equivalence, multiplicity, power and jackknife checks. They do
 not answer the design questions that have to be settled *before* a run starts:
