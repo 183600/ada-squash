@@ -336,7 +336,7 @@ def trimmed_mean_ci(
     lo_idx = int(math.floor(bootstrap_samples * alpha / 2.0))
     hi_idx = int(math.ceil(bootstrap_samples * (1.0 - alpha / 2.0))) - 1
     out["ci"] = [boot_means[lo_idx], boot_means[hi_idx]]
-    out["bootstrap_se"] = math.sqrt(sum((m - trimmed_mean) ** 2 for m in boot_means) / (bootstrap_samples - 1))
+    out["bootstrap_se"] = math.sqrt(sum((m - trimmed_mean) ** 2 for m in boot_means) / max(bootstrap_samples - 1, 1))
     return out
 
 
@@ -421,7 +421,7 @@ def bootstrap_ci(
     lo_idx = int(math.floor(bootstrap_samples * alpha / 2.0))
     hi_idx = int(math.ceil(bootstrap_samples * (1.0 - alpha / 2.0))) - 1
     out["ci"] = [boot_stats[lo_idx], boot_stats[hi_idx]]
-    out["bootstrap_se"] = math.sqrt(sum((s - obs) ** 2 for s in boot_stats) / (bootstrap_samples - 1))
+    out["bootstrap_se"] = math.sqrt(sum((s - obs) ** 2 for s in boot_stats) / max(bootstrap_samples - 1, 1))
     return out
 
 
@@ -683,7 +683,7 @@ def influence_diagnostics(
         loo_diffs = diffs[:i] + diffs[i+1:]
         loo_n = len(loo_diffs)
         loo_mean = sum(loo_diffs) / loo_n
-        loo_sd = math.sqrt(sum((d - loo_mean) ** 2 for d in loo_diffs) / (loo_n - 1)) if loo_n > 1 else 0.0
+        loo_sd = math.sqrt(sum((d - loo_mean) ** 2 for d in loo_diffs) / max(loo_n - 1, 1)) if loo_n > 1 else 0.0
         loo_se = loo_sd / math.sqrt(loo_n) if loo_n > 0 else 0.0
         loo_t = loo_mean / loo_se if loo_se > 0 else (float("-inf") if loo_mean < 0 else float("inf"))
         df = loo_n - 1
@@ -728,7 +728,7 @@ def influence_diagnostics(
             lpo_diffs = [diffs[k] for k in range(n) if k not in (i, j)]
             lpo_n = len(lpo_diffs)
             lpo_mean = sum(lpo_diffs) / lpo_n
-            lpo_sd = math.sqrt(sum((d - lpo_mean) ** 2 for d in lpo_diffs) / (lpo_n - 1)) if lpo_n > 1 else 0.0
+            lpo_sd = math.sqrt(sum((d - lpo_mean) ** 2 for d in lpo_diffs) / max(lpo_n - 1, 1)) if lpo_n > 1 else 0.0
             lpo_se = lpo_sd / math.sqrt(lpo_n)
             lpo_t = lpo_mean / lpo_se if lpo_se > 0 else (float("-inf") if lpo_mean < 0 else float("inf"))
             df = lpo_n - 1
@@ -1414,7 +1414,7 @@ def bland_altman_data(
         return {"note": "no finite paired observations"}
 
     mean_diff = sum(diffs) / max(n, 1)
-    sd_diff = math.sqrt(sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)) if n > 1 else 0.0
+    sd_diff = math.sqrt(sum((d - mean_diff) ** 2 for d in diffs) / max(n - 1, 1)) if n > 1 else 0.0
     loa_low = mean_diff - 1.96 * sd_diff
     loa_high = mean_diff + 1.96 * sd_diff
 
@@ -1446,7 +1446,7 @@ def qq_plot_data(
 
     sorted_diffs = sorted(diffs)
     mean = sum(diffs) / max(n, 1)
-    sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / (n - 1)) if n > 1 else 0.0
+    sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / max(n - 1, 1)) if n > 1 else 0.0
 
     # Theoretical quantiles: Phi^{-1}((i - 0.5)/n) * sd + mean
     theoretical = []

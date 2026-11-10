@@ -942,7 +942,7 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
         entry["excess_over_tuned_simple_nats"] = val_loss - tuned_ce
         entry["beats_tuned_simple_baseline"] = bool(val_loss < tuned_ce)
         if log_vocab is not None and ceiling is not None and log_vocab > ceiling:
-            entry["signal_captured_fraction"] = (log_vocab - val_loss) / (log_vocab - ceiling)
+            entry["signal_captured_fraction"] = (log_vocab - val_loss) / max(log_vocab - ceiling, 1)
         row_seeds = {}
         for seed, value in (entry.get("per_seed_val_loss") or {}).items():
             # JSON object keys are strings; only a canonical integer spelling

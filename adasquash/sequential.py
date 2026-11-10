@@ -128,7 +128,7 @@ def _default_look_pairs(max_pairs: int, n_looks: int,
             f"{n_looks} looks need {n_looks - 1} distinct additional seed "
             f"pair(s) above {min_pairs}, but only {span} are available before "
             f"{max_pairs}")
-    pairs = [min_pairs + int(math.floor(i * span / (n_looks - 1)))
+    pairs = [min_pairs + int(math.floor(i * span / max(n_looks - 1, 1)))
              for i in range(n_looks - 1)]
     pairs.append(max_pairs)
     if len(set(pairs)) != len(pairs) or any(

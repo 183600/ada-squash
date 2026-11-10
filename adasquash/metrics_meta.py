@@ -851,7 +851,7 @@ def _finite_weighted_mean(values: Sequence[float],
         return 0.0
     scaled = math.fsum(
         weight * (value / scale)
-        for value, weight in zip(values, weights)) / total
+        for value, weight in zip(values, weights)) / max(total, 1)
     scaled = max(-1.0, min(1.0, scaled))
     return scaled * scale
 

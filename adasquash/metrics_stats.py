@@ -277,7 +277,7 @@ def _mean_and_std(values: Sequence[float]):
         if n < 2:
             return mean, 0.0
         variance = sum((value - mean) * (value - mean)
-                       for value in values) / (n - 1)
+                       for value in values) / max(n - 1, 1)
         std = math.sqrt(variance)
         if math.isfinite(mean) and math.isfinite(std):
             # A zero standard deviation is the correct answer for a constant
@@ -299,7 +299,7 @@ def _mean_and_std(values: Sequence[float]):
         return mean_scaled * scale, 0.0
     variance_scaled = math.fsum(
         (value - mean_scaled) * (value - mean_scaled)
-        for value in scaled) / (n - 1)
+        for value in scaled) / max(n - 1, 1)
     return mean_scaled * scale, math.sqrt(variance_scaled) * scale
 
 
@@ -1233,7 +1233,7 @@ def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
     diffs = [left - right for left, right in pairs]
     n = len(diffs)
     mean_diff = sum(diffs) / max(n, 1)
-    variance = sum((value - mean_diff) ** 2 for value in diffs) / (n - 1)
+    variance = sum((value - mean_diff) ** 2 for value in diffs) / max(n - 1, 1)
     if variance <= 0.0:
         return None
     sd_diff = math.sqrt(variance)
@@ -2040,7 +2040,7 @@ def kendall_tau(x: Sequence[float], y: Sequence[float]) -> dict:
     n_pairs = n * (n - 1) // 2
     tau_a = (concordant - discordant) / n_pairs
     denominator = math.sqrt((n_pairs - ties_x) * (n_pairs - ties_y))
-    tau_b = ((concordant - discordant) / denominator
+    tau_b = ((concordant - discordant) / max(denominator, 1)
              if denominator > 0.0 else None)
     return {
         "n": n,

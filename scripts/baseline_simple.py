@@ -683,7 +683,7 @@ def calibrate_ablation_rows(rows: list, memoryless_floor: float, ceiling, tuned_
                 entry["excess_over_tuned_simple_nats"] = val_loss - tuned_ce
                 entry["beats_tuned_simple_baseline"] = bool(val_loss < tuned_ce)
             if log_vocab is not None and ceiling is not None and log_vocab > ceiling:
-                entry["signal_captured_fraction"] = (log_vocab - val_loss) / (log_vocab - ceiling)
+                entry["signal_captured_fraction"] = (log_vocab - val_loss) / max(log_vocab - ceiling, 1)
         row_duplicates: set = set()
         per_seed_val_loss = _row_seed_losses(row, row_duplicates)
         entry.update({

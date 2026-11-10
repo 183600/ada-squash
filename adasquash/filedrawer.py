@@ -333,7 +333,7 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
 
     # Standard error of intercept
     residuals = [e - intercept - slope * p for e, p in zip(effects, precisions)]
-    mse = sum(r * r for r in residuals) / (n - 2)
+    mse = sum(r * r for r in residuals) / max(n - 2, 1)
     se_intercept = math.sqrt(mse * (1/(n + 1e-8) + mean_prec*mean_prec / ss_prec))
 
     if se_intercept == 0:

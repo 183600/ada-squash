@@ -192,7 +192,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     # Kurtosis transform
     E_g2 = -6.0 / (n + 1)
     var_g2 = 24.0 * n * (n - 2) * (n - 3) / ((n + 1) ** 2 * (n + 3) * (n + 5))
-    a = 6.0 + 8.0 / var_g2 * (2.0 * var_g2 + 6.0 / (n + 1) * (n - 2) / (n - 3))
+    a = 6.0 + 8.0 / var_g2 * (2.0 * var_g2 + 6.0 / (n + 1) * (n - 2) / max(n - 3, 1))
     # Anscombe-Glynn (1983) transform: coefficient is 1 - 2/(9a), not 1 - 2/a.
     # z2 = ((1 - 2/(9a)) * cbrt(1 + g2/sqrt(var_g2)) - 1) / sqrt(2/(9a))
     # Two corrections vs. the original buggy implementation:
