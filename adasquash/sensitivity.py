@@ -551,10 +551,13 @@ def analysis_pipeline_sensitivity(
     # Alternative 1: Welch's t-test (unpaired, conservative)
     welch = welch_t_one_sided(paired_deltas, [0.0] * len(paired_deltas), margin=margin, alpha=alpha)
 
-    # Alternative 2: Paired randomization test (exact)
+    # Alternative 2: Paired randomization test (exact, sign-flip).
+    # Its signature is (deltas, margin, alpha, exact_max, permutations, seed):
+    # it consumes the paired differences themselves, so passing a second arm
+    # or `alternative`/`n_permutations` raises TypeError.
     rand_test = paired_randomization_test(
-        paired_deltas, [0.0] * len(paired_deltas),
-        margin=margin, alternative="less", n_permutations=n_permutations
+        paired_deltas, margin=margin, alpha=alpha,
+        permutations=n_permutations
     )
 
     alternatives = [
@@ -562,10 +565,23 @@ def analysis_pipeline_sensitivity(
         ("randomization_test", f"Paired randomization test ({n_permutations} perms)", rand_test),
     ]
 
+    def _significant(result: dict, p: Any) -> bool:
+        # The paired t / Welch / randomization tests report `p_one_sided` and
+        # expose no `significant`/`rejects_null` flag. Reading only that flag
+        # pins both sides to False, so `conclusion_changed` can never fire and
+        # the robustness check silently reports every result as stable.
+        if "significant" in result:
+            return bool(result["significant"])
+        if "rejects_null" in result:
+            return bool(result["rejects_null"])
+        return p is not None and p < alpha
+
     for alt_name, alt_desc, alt_result in alternatives:
         # Compare superiority
-        base_sig = baseline.get("significant", False)
-        alt_sig = alt_result.get("significant", False) or alt_result.get("rejects_null", False)
+        base_p = baseline.get("p_one_sided", 1.0)
+        alt_p = alt_result.get("p_value", alt_result.get("p_one_sided", 1.0))
+        base_sig = _significant(baseline, base_p)
+        alt_sig = _significant(alt_result, alt_p)
 
         # Compare equivalence (using baseline TOST)
         base_eq = baseline_tost.get("equivalent", None)
