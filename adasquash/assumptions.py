@@ -156,7 +156,7 @@ def _approx_normal_ppf(p: float) -> float:
     if p > 0.5:
         return -_approx_normal_ppf(1 - p)
     # Rational approximation for p < 0.5
-    t = math.sqrt(-2 * math.log(p + 1e-8))
+    t = math.sqrt(-2 * math.log(p))
     c0, c1, c2 = 2.515517, 0.802853, 0.010328
     d1, d2, d3 = 1.432788, 0.189269, 0.001308
     return t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t)
