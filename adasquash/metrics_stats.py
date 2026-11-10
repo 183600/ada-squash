@@ -653,7 +653,21 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
         math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
         + a * math.log(max(x, 1e-10)) + b * math.log1p(-x)
     )
-    bt = math.exp(log_bt)
+    if log_bt > 709.0:
+        # Prefactor overflows; compute result in log-space to preserve
+        # cancellation with the tiny continued fraction.  I_x ∈ [0,1].
+        if x < (a + 1.0) / (a + b + 2.0):
+            cf = _betacf(a, b, x)
+            if cf <= 0.0:
+                return 0.0
+            lr = log_bt + math.log(cf) - math.log(a)
+            return min(1.0, math.exp(lr)) if lr > -745.0 else 0.0
+        cf = _betacf(b, a, 1.0 - x)
+        if cf <= 0.0:
+            return 1.0
+        lr = log_bt + math.log(cf) - math.log(b)
+        return 1.0 - (min(1.0, math.exp(lr)) if lr > -745.0 else 0.0)
+    bt = math.exp(log_bt) if log_bt > -745.0 else 0.0
     if x < (a + 1.0) / (a + b + 2.0):
         return bt * _betacf(a, b, x) / a
     return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
