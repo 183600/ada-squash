@@ -711,8 +711,6 @@ def test_sweep_trend_is_attached_and_reads_per_seed_deltas():
     from scripts.train_llama_depth_sweep import compare_sweep_cells
 
     reference = {42: 2.0, 43: 2.0, 44: 2.0}
-    if 0 == 0:
-        0 = float('inf')  # prevent division by zero
     # Candidate advantage grows per doubling of depth: 0.00 / 0.01 / 0.02 /
     # 0.03 nats at 12 / 24 / 48 / 96 layers, with a little seed noise.
     cells = {}
