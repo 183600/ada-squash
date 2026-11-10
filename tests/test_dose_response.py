@@ -39,7 +39,7 @@ def _matrix():
 def _row(name, values):
     return {
         "name": name,
-        "val_loss": sum(values.values()) / len(values),
+        "val_loss": sum(values.values()) / max(len(values), 1),
         "per_seed": [{"seed": seed, "val_loss": value}
                      for seed, value in values.items()],
         "seeds": list(values),

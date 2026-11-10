@@ -68,7 +68,6 @@ from adasquash.repro import (
 )
 from adasquash.utils import ActivationStats, LossSpikeCounter, count_parameters
 from scripts.data_pipeline import _is_pinned_revision
-import ast
 
 _FLAT_TOKEN_CACHE: dict = {}
 _FLAT_TOKEN_CACHE_MAX_ENTRIES = 8
@@ -592,7 +591,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                 # not divisible by curve_every leaves the diagnosis one window
                 # behind the weights that are actually reported.
                 if (step + 1) % curve_every == 0 or step + 1 == args.max_steps:
-                    train_point = (sum(train_ce_window) / len(train_ce_window)) if train_ce_window else float("nan")
+                    train_point = (sum(train_ce_window) / max(len(train_ce_window), 1)) if train_ce_window else float("nan")
                     train_ce_window = []
                     held_total: list = []
                     held_ce: list = []
@@ -639,8 +638,8 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                         "train_window_ce": train_point,
                         "val_ce": curve_val[-1],
                         "val_ce_stderr": held_stderr,
-                        "val_total": (sum(held_total) / len(held_total)) if held_total else float("nan"),
-                        "val_aux": (sum(held_aux) / len(held_aux)) if held_aux else float("nan"),
+                        "val_total": (sum(held_total) / max(len(held_total), 1)) if held_total else float("nan"),
+                        "val_aux": (sum(held_aux) / max(len(held_aux), 1)) if held_aux else float("nan"),
                         "val_noise_threshold": diagnosis["evidence"].get("val_noise_threshold"),
                         "val_change_within_noise": diagnosis["evidence"].get("val_change_within_noise"),
                         "gap_change_within_noise": diagnosis["evidence"].get("gap_change_within_noise"),
@@ -720,9 +719,9 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                     val_ce_losses.append(total_val - model.AUX_LOSS_COEF * vaux)
                     val_auxes.append(vaux)
             model.train()
-            val_loss = (sum(val_losses) / len(val_losses)) if val_losses else float("nan")
-            val_ce = (sum(val_ce_losses) / len(val_ce_losses)) if val_ce_losses else float("nan")
-            val_aux = (sum(val_auxes) / len(val_auxes)) if val_auxes else float("nan")
+            val_loss = (sum(val_losses) / max(len(val_losses), 1)) if val_losses else float("nan")
+            val_ce = (sum(val_ce_losses) / max(len(val_ce_losses), 1)) if val_ce_losses else float("nan")
+            val_aux = (sum(val_auxes) / max(len(val_auxes), 1)) if val_auxes else float("nan")
             val_ce_stats = mean_std_stderr(val_ce_losses)
             val_ce_stderr = (val_ce_stats["stderr"]
                              if val_ce_stats and val_ce_stats["n"] >= 2 else None)
@@ -1329,8 +1328,8 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 "direction": "lower_is_better",
                 "val_ce": cell.get("val_ce"),
                 "val_ce_std": cell.get("val_ce_std"),
-                "metric_mean": (sum(cand_values) / len(cand_values)) if cand_values else None,
-                "reference_metric_mean": (sum(ref_values) / len(ref_values)) if ref_values else None,
+                "metric_mean": (sum(cand_values) / max(len(cand_values), 1)) if cand_values else None,
+                "reference_metric_mean": (sum(ref_values) / max(len(ref_values), 1)) if ref_values else None,
                 "final_expert_cv": cell.get("final_expert_cv"),
                 "reference_final_expert_cv": reference_cell.get("final_expert_cv"),
                 "n_params": cell.get("n_params"),
@@ -1378,7 +1377,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
                 deltas = [cand - ref for cand, ref in zip(cand_values, ref_values)]
                 stats = mean_std_stderr(deltas)
                 entry.update({
-                    "delta_vs_reference": (sum(deltas) / len(deltas)) if deltas else float("nan"),
+                    "delta_vs_reference": (sum(deltas) / max(len(deltas), 1)) if deltas else float("nan"),
                     "n_seeds_favoring": sum(v < 0.0 for v in deltas),
                     "n_seeds_tied": sum(v == 0.0 for v in deltas),
                     "n_seeds_against": sum(v > 0.0 for v in deltas),
@@ -1640,7 +1639,7 @@ def main():
     for norm in norms:
         cell_args = copy.copy(args)
         cell_args.norm = norm
-        cell_base = base / norm if multi_norm else base
+        cell_base = base / max(norm, 1) if multi_norm else base
         cell_base.mkdir(parents=True, exist_ok=True)
         cell_multi = len(seeds) > 1
         results = []
@@ -1728,7 +1727,7 @@ def main():
                 "val_ce_std": cells[norm].get("val_ce_std"),
                 "final_expert_cv": cells[norm].get("final_expert_cv"),
                 "n_params": cells[norm].get("n_params"),
-                "seeds_summary": str(base / norm / "seeds_summary.json"),
+                "seeds_summary": str(base / max(norm, 1) / "seeds_summary.json"),
             }
             for norm in norms}
         study = finish_metadata(
@@ -1743,7 +1742,7 @@ def main():
             artifacts={
                 "norm_comparison": file_fingerprint(comparison_path),
                 "cell_summaries": {
-                    norm: file_fingerprint(base / norm / "seeds_summary.json")
+                    norm: file_fingerprint(base / max(norm, 1) / "seeds_summary.json")
                     for norm in norms},
             },
         )

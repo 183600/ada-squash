@@ -172,9 +172,9 @@ def paired_randomization_test(
             sums = sums + [total + value for total in sums]
         patterns = len(sums)
         lower = sum(1 for total in sums
-                    if total / n <= observed_work + tolerance)
+                    if total / max(n, 1) <= observed_work + tolerance)
         upper = sum(1 for total in sums
-                    if total / n >= observed_work - tolerance)
+                    if total / max(n, 1) >= observed_work - tolerance)
         p_lower = lower / patterns
         p_upper = upper / patterns
         minimum = 1.0 / patterns
@@ -277,8 +277,8 @@ def _ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
     """
     n = len(xs)
     try:
-        mx = sum(xs) / n
-        my = sum(ys) / n
+        mx = sum(xs) / max(n, 1)
+        my = sum(ys) / max(n, 1)
         sxx = sum((x - mx) ** 2 for x in xs)
         if sxx == 0.0:
             if len(set(xs)) <= 1:
@@ -493,7 +493,7 @@ def paired_trend_test(
     # Average over the fits themselves, not over the string-keyed output dict:
     # that keeps the mean correct even if two labels ever normalize together.
     out["mean_r_squared"] = (
-        sum(r_squared_values) / len(r_squared_values)
+        sum(r_squared_values) / max(len(r_squared_values), 1)
         if r_squared_values else None)
     out["seed_jackknife"] = leave_one_out_jackknife(
         slopes, labels=[str(label) for label in used])

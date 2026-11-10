@@ -34,7 +34,6 @@ from adasquash.repro import (
 )
 from adasquash.utils import KurtosisMeter, markov_batch
 from scripts.data_pipeline import _is_pinned_revision
-import ast
 
 FP8_E4M3_MAX = 448.0
 DEFAULT_SEEDS = (42, 43, 44)
@@ -399,15 +398,15 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
         logit_nan = True
     if not quant_errors:
         return {"norm": norm_name, "n_layers": int(getattr(model.cfg, "n_layers", 0)), "n_norm_hooks": 0, "max_abs_pre_norm": 0.0, "max_abs_post_norm": 0.0, "mean_excess_kurtosis_pre_norm": 0.0, "mean_overflow_rate_e4m3": 0.0, "max_overflow_rate_e4m3": 0.0, "mean_underflow_rate_e4m3": 0.0, "mean_subnormal_rate_e4m3": 0.0, "mean_quantized_zero_rate_e4m3": 0.0, "mean_rel_quant_err_e4m3": 0.0, "logit_rel_divergence": rel, "logit_nan_under_fp8": logit_nan, "first_nonfinite_layer": first_bad_idx, "first_overflow_layer": first_over_idx}
-    mean_overflow = sum(e["overflow_rate"] for e in quant_errors) / len(quant_errors)
+    mean_overflow = sum(e["overflow_rate"] for e in quant_errors) / max(len(quant_errors), 1)
     max_overflow = max(e["overflow_rate"] for e in quant_errors)
-    mean_underflow = sum(e["underflow_rate"] for e in quant_errors) / len(quant_errors)
-    mean_subnormal = sum(e["subnormal_rate"] for e in quant_errors) / len(quant_errors)
-    mean_quantized_zero = (sum(e["quantized_zero_rate"] for e in quant_errors) / len(quant_errors)) if quant_errors else float("nan")
-    mean_rel_err = (sum(e["rel_err"] for e in quant_errors) / len(quant_errors)) if quant_errors else float("nan")
+    mean_underflow = sum(e["underflow_rate"] for e in quant_errors) / max(len(quant_errors), 1)
+    mean_subnormal = sum(e["subnormal_rate"] for e in quant_errors) / max(len(quant_errors), 1)
+    mean_quantized_zero = (sum(e["quantized_zero_rate"] for e in quant_errors) / max(len(quant_errors), 1)) if quant_errors else float("nan")
+    mean_rel_err = (sum(e["rel_err"] for e in quant_errors) / max(len(quant_errors), 1)) if quant_errors else float("nan")
     max_max = max(e["max_abs"] for e in quant_errors)
     max_in = max(r["max_abs_in"] for r in ranges) if ranges else 0.0
-    mean_kurt = sum(r["kurtosis_in"] for r in ranges) / len(ranges) if ranges else 0.0
+    mean_kurt = sum(r["kurtosis_in"] for r in ranges) / max(len(ranges), 1) if ranges else 0.0
     return {"norm": norm_name, "n_layers": int(getattr(model.cfg, "n_layers", 0)), "n_norm_hooks": len(quant_errors), "max_abs_pre_norm": max_in, "max_abs_post_norm": max_max, "mean_excess_kurtosis_pre_norm": mean_kurt, "mean_overflow_rate_e4m3": mean_overflow, "max_overflow_rate_e4m3": max_overflow, "mean_underflow_rate_e4m3": mean_underflow, "mean_subnormal_rate_e4m3": mean_subnormal, "mean_quantized_zero_rate_e4m3": mean_quantized_zero, "mean_rel_quant_err_e4m3": mean_rel_err, "logit_rel_divergence": rel, "logit_nan_under_fp8": logit_nan, "first_nonfinite_layer": first_bad_idx, "first_overflow_layer": first_over_idx}
 
 def _excess_kurtosis(x: torch.Tensor):
@@ -771,7 +770,7 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                     # record the number but never certify it as a norm effect.
                     t.update({"basis": "cross_scale", "certifiable": False,
                               "significant": False, "p_one_sided": None,
-                              "mean_delta": ((sum(av) - sum(bv)) / len(shared)
+                              "mean_delta": ((sum(av) - sum(bv)) / max(len(shared), 1)
                                              if shared else None),
                               "n_shared_seeds": len(shared),
                               "shared_seeds": shared,
@@ -829,7 +828,7 @@ def compare_fp8_norms(results: list, metrics: tuple=FP8_COMPARISON_METRICS, alph
                     t["n_shared_seeds"] = len(shared)
                     t["shared_seeds"] = shared
                     if len(shared) < 2:
-                        t["mean_delta"] = (sum(av) - sum(bv)) / len(shared) if shared else None
+                        t["mean_delta"] = (sum(av) - sum(bv)) / max(len(shared), 1) if shared else None
                         t["p_one_sided"] = None
                         t["reason"] = "need >= 2 shared samples to pair a test"
                     else:
@@ -1143,7 +1142,7 @@ def main():
                     value = rec.get(key)
                     if _finite_metric(value):
                         bucket[key].append(float(value))
-        r["per_train_seed"] = {ts: {key: sum(vals) / len(vals) for key, vals in bucket.items() if vals}
+        r["per_train_seed"] = {ts: {key: sum(vals) / max(len(vals), 1) for key, vals in bucket.items() if vals}
                                for ts, bucket in per_train_seed.items()}
         if arm_protocol_mismatches:
             print(f"[fp8][warn] {norm}: checkpoints disagree on the training recipe/model "

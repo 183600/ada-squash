@@ -553,8 +553,10 @@ def analysis_pipeline_sensitivity(
 
     # Alternative 2: Paired randomization test (exact, sign-flip).
     # Its signature is (deltas, margin, alpha, exact_max, permutations, seed):
-    # it consumes the paired differences themselves, so passing a second arm
-    # or `alternative`/`n_permutations` raises TypeError.
+    # it takes the paired differences directly (its one-sided "less" direction
+    # is built in) and names the permutation budget `permutations`; there is
+    # no second arm or `alternative` argument, and passing a second arm or
+    # `alternative`/`n_permutations` raises TypeError.
     rand_test = paired_randomization_test(
         paired_deltas, margin=margin, alpha=alpha,
         permutations=n_permutations
@@ -566,10 +568,14 @@ def analysis_pipeline_sensitivity(
     ]
 
     def _significant(result: dict, p: Any) -> bool:
-        # The paired t / Welch / randomization tests report `p_one_sided` and
-        # expose no `significant`/`rejects_null` flag. Reading only that flag
-        # pins both sides to False, so `conclusion_changed` can never fire and
-        # the robustness check silently reports every result as stable.
+        """Read an explicit flag when present, else derive it from the p-value.
+
+        paired_t_one_sided / welch_t_one_sided / paired_randomization_test all
+        report ``p_one_sided`` and expose no ``significant``/``rejects_null``
+        flag. Reading only that flag made both sides False, so
+        ``conclusion_changed`` could never fire and the robustness check
+        silently reported every result as stable.
+        """
         if "significant" in result:
             return bool(result["significant"])
         if "rejects_null" in result:

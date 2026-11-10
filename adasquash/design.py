@@ -780,8 +780,8 @@ def _pearson(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
     if n < 2 or len(y) != n:
         return None
     try:
-        mx = sum(x) / n
-        my = sum(y) / n
+        mx = sum(x) / max(n, 1)
+        my = sum(y) / max(n, 1)
         dx = [value - mx for value in x]
         dy = [value - my for value in y]
         sx = math.sqrt(sum(value * value for value in dx))
@@ -805,8 +805,8 @@ def _pearson(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
     if not (all(math.isfinite(value) for value in scaled_x)
             and all(math.isfinite(value) for value in scaled_y)):
         return None
-    mx = math.fsum(scaled_x) / n
-    my = math.fsum(scaled_y) / n
+    mx = math.fsum(scaled_x) / max(n, 1)
+    my = math.fsum(scaled_y) / max(n, 1)
     dx = [value - mx for value in scaled_x]
     dy = [value - my for value in scaled_y]
     sx = math.sqrt(math.fsum(value * value for value in dx))
@@ -914,7 +914,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
     ordinary_ok = True
     try:
         for arm, records in usable.items():
-            mean = (sum(record["value"] for record in records) / len(records)) if records else float("nan")
+            mean = (sum(record["value"] for record in records) / max(len(records), 1)) if records else float("nan")
             if not math.isfinite(mean):
                 ordinary_ok = False
                 break
@@ -940,7 +940,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
         else:
             for arm, records in usable.items():
                 scaled = [record["value"] / residual_scale for record in records]
-                mean_scaled = (math.fsum(scaled) / len(scaled)) if scaled else float("nan")
+                mean_scaled = (math.fsum(scaled) / max(len(scaled), 1)) if scaled else float("nan")
                 for record in records:
                     record["residual"] = (
                         record["value"] / residual_scale - mean_scaled)
@@ -3093,7 +3093,7 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
                                 margin=test_margin, alpha=alpha_value)
             if equiv.get("equivalent") is True:
                 equivalence += 1
-    mean_scaled = (sum(means) / len(means)) if means else float("nan")
+    mean_scaled = (sum(means) / max(len(means), 1)) if means else float("nan")
     mean_estimate = mean_scaled * scale
     if len(means) > 1:
         variance_scaled = (

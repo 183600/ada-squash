@@ -285,7 +285,7 @@ def value_of_information(
         future_evidence = {
             "p_one_sided": _simulate_p_value(combined_deltas, margin=0.0),
             "equivalent": _simulate_equivalence(combined_deltas, margin=0.02),
-            "mean_delta": (sum(combined_deltas) / len(combined_deltas)) if combined_deltas else float("nan"),
+            "mean_delta": (sum(combined_deltas) / max(len(combined_deltas), 1)) if combined_deltas else float("nan"),
             "n_pairs": n_total,
             "paired_deltas": combined_deltas,
         }
@@ -293,7 +293,7 @@ def value_of_information(
         loss = expected_loss(decision_rule, future_evidence, loss_fn, truth_probs)
         future_losses.append(loss)
 
-    expected_future_loss = (sum(future_losses) / len(future_losses)) if future_losses else float("nan")
+    expected_future_loss = (sum(future_losses) / max(len(future_losses), 1)) if future_losses else float("nan")
     voi = current_loss - expected_future_loss
 
     return max(0.0, voi)  # VOI cannot be negative
@@ -374,7 +374,7 @@ def run_decision_analysis(
     if decision_rule is None:
         decision_rule = ThresholdDecisionRule(alpha=0.05, equivalence_margin=0.02)
     if effect_size is None:
-        effect_size = sum(paired_deltas) / len(paired_deltas) if paired_deltas else 0.0
+        effect_size = sum(paired_deltas) / max(len(paired_deltas), 1) if paired_deltas else 0.0
 
     current_evidence = {
         "paired_deltas": list(paired_deltas),

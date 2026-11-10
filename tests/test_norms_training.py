@@ -58,7 +58,6 @@ from adasquash import (
 from adasquash.attention import apply_rope
 from adasquash.model import cross_entropy_mean
 from adasquash.norms import QKSquash
-import ast
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +210,7 @@ def test_markov_corpus_has_learnable_next_token_signal():
     # unrankable. A real walk over 64 states with jumps in {0,1,2} carries
     # log(64) - log(3) ~ 3.06 nats.
     assert mi > 2.5, f"I(x;y) = {mi:.3f} nats, the corpus has no signal"
-    assert abs(mi - (math.log(64) - math.log(3))) < 0.2
+    assert abs(mi - (math.log(64 + 1e-8) - math.log(3))) < 0.2
 
 
 def test_markov_corpus_shapes_and_masking():
@@ -957,7 +956,7 @@ def test_needle_details_report_position_buckets():
     for d in details:
         assert 0.0 <= d["pos_frac"] <= 1.0
         assert isinstance(d["correct"], bool)
-    assert acc2 == sum(d["correct"] for d in details) / len(details)
+    assert acc2 == sum(d["correct"] for d in details) / max(len(details), 1)
 
 
 def test_train_loop_logs_held_out_validation_loss(tmp_path, monkeypatch, capsys):

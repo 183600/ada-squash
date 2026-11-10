@@ -236,6 +236,11 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             torch.softmax(logits[start:end], dim=-1, out=probs)
             probs.mul_(keep[start:end])
             probs.scatter_add_(-1, gold[start:end], neg_keep[start:end])
+            # Ignored positions must receive zero gradient (matching
+            # F.cross_entropy with ignore_index semantics).  Without this,
+            # ignored positions incorrectly get softmax * grad_scale, which
+            # biases the gradient and can degrade training.
+            probs[~valid[start:end]] = 0.0
         return (grad_logits, None, None, None)
 
 def cross_entropy_mean(logits: torch.Tensor, targets: torch.Tensor,

@@ -53,9 +53,10 @@ def generate_report(comparison_path: Path, out_path: Path | None = None):
         standardized = None
         hedges = None
         if sd_delta and sd_delta > 0 and deltas:
-            # `deltas` already are the paired differences; the paired effect
-            # sizes take two arms, so pair them against zeros to standardise
-            # the differences themselves rather than a single arm's values.
+            # cohens_dz/hedges_g_paired take two arms and standardize a - b.
+            # `deltas` already are the paired differences, so pair them against
+            # an all-zero reference arm of the same length to standardise the
+            # differences themselves rather than a single arm's values.
             zeros = [0.0] * len(deltas)
             dz = cohens_dz(deltas, zeros)
             standardized = dz

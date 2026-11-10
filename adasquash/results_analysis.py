@@ -309,7 +309,7 @@ def trimmed_mean_ci(
     sorted_vals = sorted(vals)
     trimmed = sorted_vals[k:n - k] if k > 0 else sorted_vals
     n_trimmed = n - len(trimmed)
-    trimmed_mean = sum(trimmed) / len(trimmed) if trimmed else None
+    trimmed_mean = sum(trimmed) / max(len(trimmed), 1) if trimmed else None
 
     out = {
         "test": "trimmed_mean_bootstrap",
@@ -331,7 +331,7 @@ def trimmed_mean_ci(
     boot_means = []
     for _ in range(bootstrap_samples):
         sample = [trimmed[rng.randrange(len(trimmed))] for _ in trimmed]
-        boot_means.append((sum(sample) / len(sample)) if sample else float("nan"))
+        boot_means.append((sum(sample) / max(len(sample), 1)) if sample else float("nan"))
     boot_means.sort()
     lo_idx = int(math.floor(bootstrap_samples * alpha / 2.0))
     hi_idx = int(math.ceil(bootstrap_samples * (1.0 - alpha / 2.0))) - 1
@@ -372,7 +372,7 @@ def bootstrap_ci(
     def _compute_stat(pa: list[float], pb: list[float]) -> float:
         diffs = [x - y for x, y in zip(pa, pb)]
         if statistic == "mean_diff":
-            return (sum(diffs) / len(diffs)) if diffs else float("nan")
+            return (sum(diffs) / max(len(diffs), 1)) if diffs else float("nan")
         if statistic == "median_diff":
             s = sorted(diffs)
             m = len(s)
@@ -380,13 +380,13 @@ def bootstrap_ci(
         if statistic == "trimmed_mean_diff":
             k = int(math.floor(len(diffs) * 0.2))
             td = sorted(diffs)[k:len(diffs) - k]
-            return sum(td) / len(td) if td else 0.0
+            return sum(td) / max(len(td), 1) if td else 0.0
         if statistic == "ratio":
-            ma = (sum(pa) / len(pa)) if pa else float("nan")
-            mb = (sum(pb) / len(pb)) if pb else float("nan")
+            ma = (sum(pa) / max(len(pa), 1)) if pa else float("nan")
+            mb = (sum(pb) / max(len(pb), 1)) if pb else float("nan")
             return ma / mb if mb != 0 else float("inf")
         if statistic == "ppl_ratio":
-            return math.exp(sum(diffs) / len(diffs)) if diffs else float("nan")
+            return math.exp(sum(diffs) / max(len(diffs), 1)) if diffs else float("nan")
         raise ValueError(f"unknown statistic {statistic!r}")
 
     orig_a = [x for x, _ in pairs]
@@ -828,15 +828,15 @@ def assumption_checks(
 
     # Symmetry check: compare median to mean, and tail balance
     median = sorted_diffs[n // 2] if n % 2 else (sorted_diffs[n // 2 - 1] + sorted_diffs[n // 2]) / 2.0
-    mean = sum(diffs) / n
+    mean = sum(diffs) / max(n, 1)
     # Tail balance: proportion above median vs below
     n_below = sum(1 for d in diffs if d < median)
     n_above = sum(1 for d in diffs if d > median)
-    tail_balance = n_above / n if n > 0 else 0.5
+    tail_balance = n_above / max(n, 1) if n > 0 else 0.5
     # Skewness (moment)
     if n >= 3:
-        m2 = sum((d - mean) ** 2 for d in diffs) / n
-        m3 = sum((d - mean) ** 3 for d in diffs) / n
+        m2 = sum((d - mean) ** 2 for d in diffs) / max(n, 1)
+        m3 = sum((d - mean) ** 3 for d in diffs) / max(n, 1)
         skew = m3 / (m2 ** 1.5) if m2 > 0 else 0.0
     else:
         skew = 0.0
@@ -970,7 +970,7 @@ def replication_probability(
 
     # Same direction probability: P(future mean has same sign as current mean)
     # Future mean ~ t_df(location=mean_delta, scale=sd_delta*sqrt(1/n + 1/n_future))
-    pred_scale = sd_delta * math.sqrt(1.0/n + 1.0 / max(n_future, 1)) if sd_delta > 0 else 0.0
+    pred_scale = sd_delta * math.sqrt(1.0 / max(n, 1) + 1.0 / max(n_future, 1)) if sd_delta > 0 else 0.0
     if pred_scale > 0:
         if mean_delta < 0:
             p_same = student_t_cdf(-mean_delta / pred_scale, df)
@@ -1413,7 +1413,7 @@ def bland_altman_data(
     if n == 0:
         return {"note": "no finite paired observations"}
 
-    mean_diff = sum(diffs) / n
+    mean_diff = sum(diffs) / max(n, 1)
     sd_diff = math.sqrt(sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)) if n > 1 else 0.0
     loa_low = mean_diff - 1.96 * sd_diff
     loa_high = mean_diff + 1.96 * sd_diff
@@ -1445,7 +1445,7 @@ def qq_plot_data(
         return {"note": "no finite paired observations"}
 
     sorted_diffs = sorted(diffs)
-    mean = sum(diffs) / n
+    mean = sum(diffs) / max(n, 1)
     sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / (n - 1)) if n > 1 else 0.0
 
     # Theoretical quantiles: Phi^{-1}((i - 0.5)/n) * sd + mean

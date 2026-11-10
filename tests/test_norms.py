@@ -58,7 +58,6 @@ from adasquash import (
 from adasquash.attention import apply_rope
 from adasquash.model import cross_entropy_mean
 from adasquash.norms import QKSquash
-import ast
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +309,7 @@ def test_checkpoint_roundtrip():
     model = build_gpt_124m(norm_name="dytcd")
     with tempfile.NamedTemporaryFile(suffix=".pt") as f:
         torch.save({"model": model.state_dict()}, f.name)
-        ckpt = torch.load(f.name)
+        ckpt = torch.load(f.name, weights_only=True)
         model2 = build_gpt_124m(norm_name="dytcd")
         model2.load_state_dict(ckpt["model"])
     # forward should match

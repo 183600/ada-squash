@@ -109,7 +109,7 @@ def _shapiro_wilk_statistic(data: Sequence[float]) -> tuple[float, float]:
         return 1.0, 1.0  # Cannot compute reliably
 
     sorted_data = sorted(data)
-    mean = sum(sorted_data) / n
+    mean = sum(sorted_data) / max(n, 1)
 
     # Coefficients approximation (Royston 1992)
     # For simplicity, use a basic approximation
@@ -139,8 +139,8 @@ def _shapiro_wilk_statistic(data: Sequence[float]) -> tuple[float, float]:
     # Very rough p-value approximation for diagnostic purposes
     # In practice, use scipy.stats.shapiro
     log_w = math.log(1.0 - W)
-    mu = -1.5861 - 0.31082 * math.log(n) - 0.083751 * (math.log(n)) ** 2 + 0.0038915 * (math.log(n)) ** 3
-    sigma = math.exp(-0.4803 - 0.082676 * math.log(n) + 0.0030302 * (math.log(n)) ** 2)
+    mu = -1.5861 - 0.31082 * math.log(n + 1e-8) - 0.083751 * (math.log(n + 1e-8)) ** 2 + 0.0038915 * (math.log(n + 1e-8)) ** 3
+    sigma = math.exp(-0.4803 - 0.082676 * math.log(n + 1e-8) + 0.0030302 * (math.log(n + 1e-8)) ** 2)
     z = (log_w - mu) / sigma
     p = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
 
@@ -168,10 +168,10 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     if n < 8:
         return 0.0, 1.0
 
-    mean = sum(data) / n
-    m2 = sum((x - mean) ** 2 for x in data) / n
-    m3 = sum((x - mean) ** 3 for x in data) / (n + 1e-8)
-    m4 = sum((x - mean) ** 4 for x in data) / (n + 1e-8)
+    mean = sum(data) / max(n, 1)
+    m2 = sum((x - mean) ** 2 for x in data) / max(n, 1)
+    m3 = sum((x - mean) ** 3 for x in data) / max(n, 1)
+    m4 = sum((x - mean) ** 4 for x in data) / max(n, 1)
 
     if m2 == 0:
         return 0.0, 1.0
@@ -185,7 +185,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     # Skewness transform
     beta1 = 3.0 * (n + 1) * (n + 3) / ((n - 2) * (n + 5) * (n + 7) * (n + 9))
     W2 = math.sqrt(2.0 * beta1) - 1.0
-    delta = 1.0 / math.sqrt(math.log(W2)) if W2 > 1 else 1.0
+    delta = 1.0 / math.sqrt(math.log(W2 + 1e-8)) if W2 > 1 else 1.0
     y = g1 * math.sqrt((n + 1) * (n + 3) / (6.0 * (n - 2)))
     z1 = delta * math.log(y + math.sqrt(y * y + 1.0))
 
@@ -194,9 +194,17 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     var_g2 = 24.0 * n * (n - 2) * (n - 3) / ((n + 1) ** 2 * (n + 3) * (n + 5))
     a = 6.0 + 8.0 / var_g2 * (2.0 * var_g2 + 6.0 / (n + 1) * (n - 2) / (n - 3))
     # Anscombe-Glynn (1983) transform: coefficient is 1 - 2/(9a), not 1 - 2/a.
-    # The original formula produced z-scores that were too large for small n,
-    # inflating type-I error of the normality test on small samples.
-    z2 = ((1.0 - 2.0 / (9.0 * a)) * (1.0 + g2 / math.sqrt(var_g2)) ** (1.0 / 3.0) - 1.0) * math.sqrt(a) * math.sqrt(2.0 / (9.0 * a))
+    # z2 = ((1 - 2/(9a)) * cbrt(1 + g2/sqrt(var_g2)) - 1) / sqrt(2/(9a))
+    # Two corrections vs. the original buggy implementation:
+    #   (1) Denominator: divide by sqrt(2/(9a)), not multiply by
+    #       sqrt(a)*sqrt(2/(9a)).  The wrong multiplier shrinks |z2|
+    #       by 2/(3*sqrt(a)), biasing K2 downward.
+    #   (2) Real cube root: ``base ** (1/3)`` returns complex for
+    #       negative bases (platykurtic data: g2/sqrt(var_g2) < -1).
+    #       Use sign(base) * |base|^(1/3) to stay in the reals.
+    _ag_base = 1.0 + g2 / math.sqrt(var_g2)
+    _ag_cbrt = math.copysign(abs(_ag_base) ** (1.0 / 3.0), _ag_base)
+    z2 = ((1.0 - 2.0 / (9.0 * a)) * _ag_cbrt - 1.0) / math.sqrt(2.0 / (9.0 * a))
 
     # Chi-squared combination
     K2 = z1 * z1 + z2 * z2
@@ -304,13 +312,13 @@ def check_variance_homogeneity(
     for arm, values in arm_data.items():
         if not values:
             continue
-        c = sum(values) / len(values) if values else float("nan") if center == "mean" else sorted(values)[len(values) // 2]
+        c = sum(values) / max(len(values), 1) if values else float("nan") if center == "mean" else sorted(values)[len(values) // 2]
         for v in values:
             all_devs.append(abs(v - c))
             all_labels.append(arm)
 
     # One-way ANOVA on absolute deviations
-    grand_mean = (sum(all_devs) / len(all_devs)) if all_devs else float("nan")
+    grand_mean = (sum(all_devs) / max(len(all_devs), 1)) if all_devs else float("nan")
     ss_between = 0.0
     ss_within = 0.0
 
@@ -472,7 +480,7 @@ def check_outlier_influence(
     jackknife_means = []
     for i in range(n):
         loo = [paired_deltas[j] for j in range(n) if j != i]
-        jackknife_means.append((sum(loo) / len(loo)) if loo else float("nan"))
+        jackknife_means.append((sum(loo) / max(len(loo), 1)) if loo else float("nan"))
 
     max_change = max(abs(jm - full_mean) for jm in jackknife_means)
     relative_influence = max_change / (abs(full_mean) + 1e-12)

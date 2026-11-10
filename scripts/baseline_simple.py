@@ -435,7 +435,7 @@ def build_calibration(aggregate: dict, memoryless_floor: float, tuned: dict | No
         "best_count_model_minus_full_context_nats": (None if not tuned or not full
                                                      else tuned["mean_ce_nats"] - full["mean_ce_nats"]),
         "rule_target_mismatches_total": sum(r["walk_rule"]["rule_target_mismatches"] for r in records),
-        "outlier_input_fraction": (sum(r["walk_rule"]["outlier_input_fraction"] for r in records) / len(records)
+        "outlier_input_fraction": (sum(r["walk_rule"]["outlier_input_fraction"] for r in records) / max(len(records), 1)
                                    if records else None),
         "reading": ("walk_rule must match the closed-form memoryless floor (corpus model check); the HMM "
                     "filter is the exact causal full-context ceiling and must sit at or below that floor "

@@ -455,7 +455,7 @@ def run_one(norm: str, args, device: str) -> dict:
     # A vocabulary of one has a uniform-guess loss of exactly zero; the usual
     # strict `< log(vocab)` would reject a perfect zero-loss model.
     checks["loss_below_uniform_baseline"] = bool(
-        final_loss <= 0.0 if vocab <= 1 else final_loss < math.log(vocab))
+        final_loss <= 0.0 if vocab <= 1 else final_loss < math.log(vocab + 1e-8))
     checks["accuracy_above_threshold"] = bool(final_acc >= thresholds["acc"])
     majority = final_metrics["majority_class_accuracy"]
     # When every valid target is the same class, the majority predictor is

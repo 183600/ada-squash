@@ -31,7 +31,6 @@ from scripts.data_pipeline import (
     resolve_tokenizer_revision,
 )
 from scripts.train_config import _DATA_ARGS, _LEDGER_ARGS, _WITHIN_ARM_PROTOCOL_KEYS
-import ast
 
 
 def _ledger_identity(path):

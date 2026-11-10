@@ -528,7 +528,7 @@ def meta_regression(
         }
 
     total_q = sum(weights[i] * effects[i] ** 2 for i in range(k))
-    mean_effect = sum(weights[i] * effects[i] for i in range(k)) / sum(weights)
+    mean_effect = sum(weights[i] * effects[i] for i in range(k)) / max(sum(weights), 1e-8)
     total_q = sum(weights[i] * (effects[i] - mean_effect) ** 2
                   for i in range(k))
     explained = max(0.0, 1.0 - fitted["q"] / total_q) if total_q > 0.0 else 0.0

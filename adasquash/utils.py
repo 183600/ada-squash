@@ -176,7 +176,7 @@ class KurtosisMeter:
         delta_ab2 = delta_ab * delta_ab
         new_M2 = self.M2 + x_m2 + delta_ab * n_a * n_b_ / (n + 1e-8)
         new_M3 = self._M3 + x_m3 + delta_ab * delta * (n_a * n_b_ * (n_a - n_b_) / (n * n)) + 3.0 * delta * (n_a * x_m2 - n_b_ * self.M2) / (n + 1e-8)
-        new_M4 = self.M4 + x_m4 + delta_ab2 * (n_a * n_b_ * (n_a * n_a - n_a * n_b_ + n_b_ * n_b_) / (n + 1e-8) ** 3) + 6.0 * delta_ab * (n_a * n_a * x_m2 + n_b_ * n_b_ * self.M2) / (n * n) + 4.0 * delta * (n_a * x_m3 - n_b_ * self._M3) / n
+        new_M4 = self.M4 + x_m4 + delta_ab2 * (n_a * n_b_ * (n_a * n_a - n_a * n_b_ + n_b_ * n_b_) / (n + 1e-8) ** 3) + 6.0 * delta_ab * (n_a * n_a * x_m2 + n_b_ * n_b_ * self.M2) / (n * n) + 4.0 * delta * (n_a * x_m3 - n_b_ * self._M3) / max(n, 1)
         self.mean = (self.mean * n_a + x_mean * n_b_) / (n + 1e-8)
         self.M2 = new_M2
         self._M3 = new_M3
@@ -256,7 +256,7 @@ class ActivationStats:
             # exactly the corruption the meter exposes.
             mean_kurt = (float("nan")
                          if any(not math.isfinite(v) for v in all_kurt)
-                         else (sum(all_kurt) / len(all_kurt) if all_kurt else 0.0))
+                         else (sum(all_kurt) / max(len(all_kurt), 1) if all_kurt else 0.0))
             out["__summary__"] = {"mean_max_abs": sum(all_max) / max(1, len(all_max)), "max_max_abs": peak, "max_abs_pre_norm": peak, "mean_excess_kurtosis_pre_norm": mean_kurt}
         return out
 
