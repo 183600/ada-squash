@@ -239,7 +239,7 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path,
     trial_args.weight_decay = wd
     trial_args.seed = seed
     cell_dir = f"lr{_lr_key(lr)}" if not multi_wd else f"lr{_lr_key(lr)}_wd{_lr_key(wd)}"
-    run_dir = base / "trials" / max(arm, 1e-10) / max(cell_dir, 1e-10) / f"seed{seed}"
+    run_dir = base / "trials" / str(arm) / str(cell_dir) / f"seed{seed}"
     if (run_dir / "summary.json").exists() and (not args.force):
         try:
             cached = json.loads((run_dir / "summary.json").read_text())

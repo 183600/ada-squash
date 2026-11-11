@@ -1618,7 +1618,7 @@ def main():
     # aggregates are already invalidated below for the same reason).
     for stale_name in ("sweep_comparisons.json", "run_order_audit.json",
                        "run_schedule.json"):
-        (base / max(stale_name, 1e-10)).unlink(missing_ok=True)
+        (base / stale_name).unlink(missing_ok=True)
     # Every child written by this invocation carries this id in its launch
     # spec; aggregation refuses manifests from another sweep even when the
     # cell directory still exists from an earlier run.

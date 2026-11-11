@@ -1638,7 +1638,7 @@ def main():
     for norm in norms:
         cell_args = copy.copy(args)
         cell_args.norm = norm
-        cell_base = base / max(norm, 1) if multi_norm else base
+        cell_base = base / str(norm) if multi_norm else base
         cell_base.mkdir(parents=True, exist_ok=True)
         cell_multi = len(seeds) > 1
         results = []
@@ -1726,7 +1726,7 @@ def main():
                 "val_ce_std": cells[norm].get("val_ce_std"),
                 "final_expert_cv": cells[norm].get("final_expert_cv"),
                 "n_params": cells[norm].get("n_params"),
-                "seeds_summary": str(base / max(norm, 1) / "seeds_summary.json"),
+                "seeds_summary": str(base / str(norm) / "seeds_summary.json"),
             }
             for norm in norms}
         study = finish_metadata(
@@ -1741,7 +1741,7 @@ def main():
             artifacts={
                 "norm_comparison": file_fingerprint(comparison_path),
                 "cell_summaries": {
-                    norm: file_fingerprint(base / max(norm, 1) / "seeds_summary.json")
+                    norm: file_fingerprint(base / str(norm) / "seeds_summary.json")
                     for norm in norms},
             },
         )
