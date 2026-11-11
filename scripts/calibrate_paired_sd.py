@@ -28,19 +28,9 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.design import paired_sd_calibration
 from adasquash.jsonio import save_json_atomic
-# Reproducibility: Set random seeds
-import random
-import numpy as np
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-try:
-    import torch
-    torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-except ImportError:
-    pass
+# NOTE: Module-level seed setting removed to prevent silent RNG state
+# reset on import. Use the centralized seed function at the experiment
+# entry point instead (e.g., repro.set_all_seeds / seed_everything).
 
 
 def _seed_list(value):

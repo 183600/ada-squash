@@ -34,19 +34,9 @@ import math
 import numbers
 import unicodedata
 from statistics import NormalDist
-# Reproducibility: Set random seeds
-import random
-import numpy as np
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-try:
-    import torch
-    torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-except ImportError:
-    pass
+# NOTE: Module-level seed setting removed to prevent silent RNG state
+# reset on import. Use the centralized seed function at the experiment
+# entry point instead (e.g., repro.set_all_seeds / seed_everything).
 
 DECONTAMINATION_VERSION = 2
 DEFAULT_NGRAM_SIZE = 13
