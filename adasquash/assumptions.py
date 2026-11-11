@@ -355,8 +355,8 @@ def check_variance_homogeneity(
             recommendation="Degenerate test: zero within-group variance or insufficient df.",
         )
 
-    ms_between = ss_between / df_between
-    ms_within = ss_within / df_within
+    ms_between = ss_between / max(df_between, 1e-10)
+    ms_within = ss_within / max(df_within, 1e-10)
     F = ms_between / ms_within if ms_within > 0 else float("inf")
 
     # Approximate p-value from F-distribution
@@ -445,7 +445,7 @@ def check_independence(
     for lag in range(1, min(max_lag + 1, n // 2)):
         cov = sum((ordered_observations[i] - mean) * (ordered_observations[i + lag] - mean)
                   for i in range(n - lag)) / max(n, 1)
-        acf = cov / c0
+        acf = cov / max(c0, 1e-10)
 
         # Standard error of ACF under white noise
         se = 1.0 / math.sqrt(n - lag)

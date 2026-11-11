@@ -188,7 +188,7 @@ def next_token_metrics(model, x, y, topk: int = 3, ctx=None) -> dict:
             "macro_f1": 0.0, "weighted_f1": 0.0, "micro_f1": 0.0,
             "n_classes_present": 0, "n_valid_tokens": 0,
             "majority_class_accuracy": 0.0,
-            "uniform_random_accuracy": 1.0 / vocab,
+            "uniform_random_accuracy": 1.0 / max(vocab, 1e-10),
             "copy_input_accuracy": None,
             "macro_average_precision": None, "weighted_average_precision": None,
             "macro_roc_auc": None, "weighted_roc_auc": None,
@@ -198,7 +198,7 @@ def next_token_metrics(model, x, y, topk: int = 3, ctx=None) -> dict:
     pred = logits.argmax(-1)[mask]
     accuracy = float((pred == gold).float().mean().item())
     counts = torch.bincount(gold, minlength=vocab)
-    majority = float(counts.max().item() / n_valid)
+    majority = float(counts.max().item() / max(n_valid, 1e-10))
     # Count-based F1: the three confusion marginals come from device
     # bincounts, so the |valid| predictions/targets are never round-tripped
     # through Python lists (the metric is identical to `macro_weighted_f1`).
@@ -235,7 +235,7 @@ def next_token_metrics(model, x, y, topk: int = 3, ctx=None) -> dict:
         "n_classes_present": f1["n_classes_present"],
         "n_valid_tokens": n_valid,
         "majority_class_accuracy": majority,
-        "uniform_random_accuracy": 1.0 / vocab,
+        "uniform_random_accuracy": 1.0 / max(vocab, 1e-10),
         "copy_input_accuracy": copy_input,
         "macro_average_precision": auc["macro_average_precision"],
         "weighted_average_precision": auc["weighted_average_precision"],

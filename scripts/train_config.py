@@ -244,7 +244,7 @@ def _snapshot_rng_state() -> dict:
     try:
         import numpy as _np
     except ImportError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in train_config.py:246")
     else:
         state["numpy"] = _np.random.get_state()
     if torch.cuda.is_available():
@@ -267,7 +267,7 @@ def _atomic_torch_save(obj, path: Path) -> None:
             try:
                 tmp.unlink()
             except OSError:
-                pass
+                import logging as _logging; _logging.warning("Suppressed exception in train_config.py:269")
 
 def _checkpoint_nonfinite(model, opt) -> list:
     """Non-finite weights or optimizer moments that must never be persisted.

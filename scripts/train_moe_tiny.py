@@ -1361,7 +1361,7 @@ def compare_moe_norms(cells: dict, baselines, protocols: dict, metrics=_MOE_COMP
             cand_params = cell.get("n_params")
             ref_params = reference_cell.get("n_params")
             if _moe_finite(cand_params) and _moe_finite(ref_params) and ref_params:
-                entry["n_params_ratio_vs_reference"] = cand_params / ref_params
+                entry["n_params_ratio_vs_reference"] = cand_params / max(ref_params, 1e-10)
             if len(common) >= 2:
                 test = paired_t_one_sided(cand_values, ref_values, margin=margin, alpha=alpha)
                 entry["test"] = test["test"]

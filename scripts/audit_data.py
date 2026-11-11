@@ -825,7 +825,7 @@ def evaluation_reuse_status(capacity: dict | None, requested_batches: int, *,
         "requested_batches": requested_batches,
         "unique_batches": unique,
         "distinct_batches_per_pass": distinct,
-        "distinct_fraction": None if distinct is None else distinct / requested_batches,
+        "distinct_fraction": None if distinct is None else distinct / max(requested_batches, 1e-10),
         "reuses_batches": reuses,
         "cycled_batches": cycled,
         "cycles_per_pass": cycles,
@@ -964,7 +964,7 @@ def _total_variation(a: Counter, b: Counter) -> float:
         # 1.0 is the maximal divergence and trips any finite TVD cap.
         return 1.0
     keys = set(a) | set(b)
-    return 0.5 * sum(abs(a.get(k, 0) / total_a - b.get(k, 0) / total_b) for k in keys)
+    return 0.5 * sum(abs(a.get(k, 0) / max(total_a, 1e-10) - b.get(k, 0) / max(total_b, 1e-10)) for k in keys)
 
 
 def _top_shifted(a: Counter, b: Counter, k=10):
@@ -972,7 +972,7 @@ def _top_shifted(a: Counter, b: Counter, k=10):
     if not total_a or not total_b:
         return []
     keys = set(a) | set(b)
-    scored = ((abs(a.get(t, 0) / total_a - b.get(t, 0) / total_b), t) for t in keys)
+    scored = ((abs(a.get(t, 0) / total_a - b.get(t, 0) / max(total_b, 1e-10)), t) for t in keys)
     return [{"token_id": t, "abs_shift": d} for d, t in sorted(scored, reverse=True)[:k]]
 
 

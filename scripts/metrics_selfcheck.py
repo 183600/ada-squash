@@ -311,11 +311,11 @@ def check_meta_analysis():
     ])
     w = [1.0 / se ** 2 for se in ses]
     sum_w = sum(w)
-    pooled = sum(wi * y for wi, y in zip(w, ys)) / sum_w
+    pooled = sum(wi * y for wi, y in zip(w, ys)) / max(sum_w, 1e-10)
     q = sum(wi * (y - pooled) ** 2 for wi, y in zip(w, ys))
     df = len(ys) - 1.0
-    i_squared = 100.0 * max(0.0, (q - df) / q)
-    tau2 = max(0.0, (q - df) / (sum_w - sum(wi ** 2 for wi in w) / sum_w))
+    i_squared = 100.0 * max(0.0, (q - df) / max(q, 1e-10))
+    tau2 = max(0.0, (q - df) / (sum_w - sum(wi ** 2 for wi in w) / max(sum_w, 1e-10)))
     wr = [1.0 / (se ** 2 + tau2) for se in ses]
     random_pooled = sum(wi * y for wi, y in zip(wr, ys)) / max(sum(wr), 1e-8)
 

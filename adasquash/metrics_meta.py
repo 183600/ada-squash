@@ -176,9 +176,9 @@ def paired_randomization_test(
                     if total / max(n, 1) <= observed_work + tolerance)
         upper = sum(1 for total in sums
                     if total / max(n, 1) >= observed_work - tolerance)
-        p_lower = lower / patterns
-        p_upper = upper / patterns
-        minimum = 1.0 / patterns
+        p_lower = lower / max(patterns, 1e-10)
+        p_upper = upper / max(patterns, 1e-10)
+        minimum = 1.0 / max(patterns, 1e-10)
         out.update({
             "basis": "exact_enumeration",
             "n_permutations_evaluated": patterns,
@@ -254,7 +254,7 @@ def _scaled_ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
     sxy = math.fsum((x - mx) * (y - my)
                     for x, y in zip(scaled_x, scaled_y))
     slope_scaled = sxy / sxx
-    slope = slope_scaled * y_scale / x_scale
+    slope = slope_scaled * y_scale / max(x_scale, 1e-10)
     ss_tot = math.fsum((y - my) * (y - my) for y in scaled_y)
     residuals = [(y - my) - slope_scaled * (x - mx)
                  for x, y in zip(scaled_x, scaled_y)]
@@ -638,7 +638,7 @@ def welch_z_one_sided(
     ma, sa, mb, sb, scale = _welch_arm_statistics(a, b)
     se = math.hypot(sa / math.sqrt(na), sb / math.sqrt(nb))
     delta = ma - mb
-    margin_test = margin / scale
+    margin_test = margin / max(scale, 1e-10)
     if se == 0.0:
         z = float("-inf") if delta + margin_test < 0.0 else (
             float("inf") if delta + margin_test > 0.0 else 0.0)
@@ -705,7 +705,7 @@ def welch_t_one_sided(
         # Welch-Satterthwaite is scale invariant; normalize the arm standard
         # deviations so squared variances near the float limit do not
         # overflow before they cancel in the ratio.
-        var_a = (sa / std_scale) ** 2 / na
+        var_a = (sa / max(std_scale, 1e-10)) ** 2 / max(na, 1e-10)
         var_b = (sb / std_scale) ** 2 / nb
         denom = (var_a ** 2 / max((na - 1), 1e-10) + var_b ** 2 / max((nb - 1), 1e-10))
         if denom > 0.0:
@@ -904,7 +904,7 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
     for study in studies:
         study["fixed_weight"] = 1.0 / study["stderr"] ** 2
     max_fixed_weight = max(study["fixed_weight"] for study in studies)
-    fixed_scaled = [study["fixed_weight"] / max_fixed_weight
+    fixed_scaled = [study["fixed_weight"] / max(max_fixed_weight, 1e-10)
                     for study in studies]
     total_scaled = math.fsum(fixed_scaled)
     fixed_pooled = _finite_weighted_mean(
@@ -920,7 +920,7 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
         fixed.update({
             "ci_low": fixed_pooled - critical * fixed_stderr,
             "ci_high": fixed_pooled + critical * fixed_stderr,
-            "t": fixed_pooled / fixed_stderr,
+            "t": fixed_pooled / max(fixed_stderr, 1e-10),
             "df": df,
         })
         fixed["p_one_sided"] = student_t_cdf(fixed["t"], df)
@@ -964,7 +964,7 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
         if tau_denominator_scaled > 0.0:
             tau_squared = max(
                 0.0,
-                (q_scaled - df_q / max_fixed_weight) / tau_denominator_scaled)
+                (q_scaled - df_q / max(max_fixed_weight, 1e-10)) / tau_denominator_scaled)
         heterogeneity.update({
             "q": q,
             "df": df_q,
@@ -1002,7 +1002,7 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
             "df": df,
         })
         if math.isfinite(random_stderr):
-            random_effects["t"] = random_pooled / random_stderr
+            random_effects["t"] = random_pooled / max(random_stderr, 1e-10)
             random_effects["p_one_sided"] = student_t_cdf(
                 random_effects["t"], df)
             random_effects["p_two_sided"] = two_sided_p_from_t(

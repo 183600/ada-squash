@@ -146,7 +146,7 @@ class StudyRegistry:
                         record = StudyRecord.from_json(f.read())
                     self._records[record.study_id] = record
                 except (json.JSONDecodeError, KeyError):
-                    pass
+                    import logging as _logging; _logging.warning("Suppressed exception in filedrawer.py:148")
 
     def register(self, record: StudyRecord) -> str:
         """Register a study record."""
@@ -278,7 +278,7 @@ def funnel_plot_asymmetry(
         se = s.results.get(se_key)
         if eff is None or se is None or se <= 0:
             continue
-        precision = 1.0 / se
+        precision = 1.0 / max(se, 1e-10)
         data.append({"study_id": s.study_id, "effect": eff, "se": se, "precision": precision})
 
     if len(data) < 3:
@@ -463,7 +463,7 @@ def p_curve_analysis(studies: Sequence[StudyRecord], alpha: float = 0.05) -> dic
     # Under H0 (null), p-values ~ Uniform(0, alpha)
     n = len(p_values)
     # Stouffer's Z: sum of inverse normal
-    z_scores = [math.sqrt(2) * math.erfcinv(2 * p / alpha) for p in p_values]
+    z_scores = [math.sqrt(2) * math.erfcinv(2 * p / max(alpha, 1e-10)) for p in p_values]
     # Wait, simpler: just use the fact that under Uniform(0,alpha), E[p] = alpha/2
     mean_p = sum(p_values) / (n + 1e-8)
     # One-sided test: mean_p < alpha/2 indicates right skew

@@ -806,7 +806,7 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
     # probability that *any* per-benchmark interval misses is at most alpha.
     # This does not require the benchmark rows to be independent.
     per_benchmark_confidence = (
-        1.0 - (1.0 - confidence) / n_benchmarks
+        1.0 - (1.0 - confidence) / max(n_benchmarks, 1e-10)
         if familywise_benchmark_bounds and n_benchmarks else confidence)
     for name in sorted(raw_benchmarks, key=str):
         if not isinstance(name, str) or not name.strip():
