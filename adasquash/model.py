@@ -70,7 +70,7 @@ _CE_SCRATCH_MAX_ENTRIES = 2
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
     if vocab_size not in _CROSS_ENTROPY_CHUNK_ROWS_CACHE:
         row_bytes = max(1, vocab_size) * 4
-        _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // max(row_bytes, 1e-10))
+        _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // max(row_bytes, 1))
     return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
 
 _FUSED_LINEAR_CHUNK_ROWS_CACHE: dict[tuple, int] = {}

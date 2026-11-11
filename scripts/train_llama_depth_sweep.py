@@ -121,7 +121,7 @@ _SWEEP_CONFIG_ALIASES = {"use_layerscale": ("no_layerscale", True), "learnable_p
 def shape_for_depth(depth: int, base_dim: int, base_heads: int):
     if (base_dim, base_heads) == _BASE_SHAPE and depth in DEPTH_SHAPE:
         return DEPTH_SHAPE[depth]
-    base_head_dim = max(1, base_dim // max(base_heads, 1e-10))
+    base_head_dim = max(1, base_dim // max(base_heads, 1))
     dim = int(round(base_dim * math.sqrt(_BASE_DEPTH / max(1, depth))))
     heads = max(1, int(round(dim / max(base_head_dim, 1e-10))))
     dim = heads * base_head_dim

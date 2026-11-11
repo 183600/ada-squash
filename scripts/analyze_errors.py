@@ -246,7 +246,7 @@ def _prev_majority(prev_gold_counts, vocab):
             prev_gold[key] = count
     prev_majority = {}
     for key, count in prev_gold.items():
-        p = key // max(vocab, 1e-10)
+        p = key // max(vocab, 1)
         g = key % vocab
         current = prev_majority.get(p)
         if current is None or count > current[1]:

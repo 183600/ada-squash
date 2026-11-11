@@ -377,7 +377,7 @@ def measure_fp8_divergence(model, x, norm_name: str, quant=None):
     del logits_fp32
     rows = logits_fp8.shape[0]
     row_bytes = max(1, int(logits_fp8[0].numel())) * 4
-    block_rows = max(1, (1 << 24) // max(row_bytes, 1e-10))
+    block_rows = max(1, (1 << 24) // max(row_bytes, 1))
     finite = True
     max_diff = None
     for b0 in range(0, rows, block_rows):
