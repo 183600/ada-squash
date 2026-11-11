@@ -111,7 +111,7 @@ def wrapped_jump_probs(n_states: int, max_jump: int) -> list[float]:
     counts = [0] * n_states
     for j in range(max_jump):
         counts[j % n_states] += 1
-    return [c / max_jump for c in counts]
+    return [c / max(max_jump, 1e-10) for c in counts]
 
 def memoryless_bayes_floor_nats(n_states: int, max_jump: int, spike_prob: float=0.0) -> float:
     """Closed-form CE of the best predictor that sees only the current token.

@@ -793,7 +793,7 @@ def _pearson(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
         if math.isfinite(rho):
             return rho
     except OverflowError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in design.py:795")
     # Finite values near the float limit can overflow the raw sums even when
     # the correlation is ordinary. Scale both inputs by their largest
     # magnitude; the coefficient is invariant to positive rescaling.
@@ -944,7 +944,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
                 mean_scaled = (math.fsum(scaled) / max(len(scaled), 1)) if scaled else float("nan")
                 for record in records:
                     record["residual"] = (
-                        record["value"] / residual_scale - mean_scaled)
+                        record["value"] / max(residual_scale, 1e-10) - mean_scaled)
     x = [record["position"] for record in flat]
     y = [record["residual"] for record in flat]
     rho = _spearman(x, y)
@@ -2036,7 +2036,7 @@ def paired_sd_calibration(differences, *,
         robust_sd = 0.0
     else:
         lower_quantile = _chi2_lower_quantile(1.0 - confidence_value, float(df))
-        factor = math.sqrt(df / lower_quantile)
+        factor = math.sqrt(df / max(lower_quantile, 1e-10))
         candidate = sd * factor
         upper = candidate if math.isfinite(candidate) else None
         try:

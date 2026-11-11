@@ -70,7 +70,7 @@ _CE_SCRATCH_MAX_ENTRIES = 2
 def _cross_entropy_chunk_rows(vocab_size: int) -> int:
     if vocab_size not in _CROSS_ENTROPY_CHUNK_ROWS_CACHE:
         row_bytes = max(1, vocab_size) * 4
-        _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // row_bytes)
+        _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size] = max(1, _CROSSENTROPY_CHUNK_BYTES // max(row_bytes, 1e-10))
     return _CROSS_ENTROPY_CHUNK_ROWS_CACHE[vocab_size]
 
 _FUSED_LINEAR_CHUNK_ROWS_CACHE: dict[tuple, int] = {}
@@ -785,7 +785,7 @@ class GPT(nn.Module):
                     m.k = self.shared_k
         if cfg.rotary:
             head_dim = cfg.dim // cfg.n_heads
-            freqs = 1.0 / 10000 ** (torch.arange(0, head_dim, 2).float() / head_dim)
+            freqs = 1.0 / 10000 ** (torch.arange(0, head_dim, 2).float() / max(head_dim, 1e-10))
             t = torch.arange(cfg.max_seq_len).float()
             freqs = torch.outer(t, freqs)
             freqs_cis = torch.polar(torch.ones_like(freqs), freqs)

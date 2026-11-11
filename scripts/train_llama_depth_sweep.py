@@ -121,9 +121,9 @@ _SWEEP_CONFIG_ALIASES = {"use_layerscale": ("no_layerscale", True), "learnable_p
 def shape_for_depth(depth: int, base_dim: int, base_heads: int):
     if (base_dim, base_heads) == _BASE_SHAPE and depth in DEPTH_SHAPE:
         return DEPTH_SHAPE[depth]
-    base_head_dim = max(1, base_dim // base_heads)
+    base_head_dim = max(1, base_dim // max(base_heads, 1e-10))
     dim = int(round(base_dim * math.sqrt(_BASE_DEPTH / max(1, depth))))
-    heads = max(1, int(round(dim / base_head_dim)))
+    heads = max(1, int(round(dim / max(base_head_dim, 1e-10))))
     dim = heads * base_head_dim
     return (dim, heads)
 
@@ -383,7 +383,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         try:
             manifest = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in train_llama_depth_sweep.py:385")
         # A finished, readable manifest and the requested protocol are part of
         # the aggregation contract regardless of whether this call has a
         # launch id. A missing/legacy manifest is unknown, not an empty run,
@@ -1083,9 +1083,9 @@ def compare_sweep_cells(cells_by_depth: dict, reference_norm: str, metric: str="
             c_flops = by_norm[norm].get("flops_per_token_forward")
             r_flops = ref.get("flops_per_token_forward")
             if _finite(c_params) and _finite(r_params) and r_params:
-                entry["params_ratio_vs_reference"] = c_params / r_params
+                entry["params_ratio_vs_reference"] = c_params / max(r_params, 1e-10)
             if _finite(c_flops) and _finite(r_flops) and r_flops:
-                entry["flops_ratio_vs_reference"] = c_flops / r_flops
+                entry["flops_ratio_vs_reference"] = c_flops / max(r_flops, 1e-10)
             ratios = [entry["params_ratio_vs_reference"],
                       entry["flops_ratio_vs_reference"]]
             if all(r is not None for r in ratios):
@@ -1463,7 +1463,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
     try:
         manifest_path.unlink()
     except FileNotFoundError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in train_llama_depth_sweep.py:1465")
     spec = {
         "launch_id": launch_id,
         "depth": int(depth),
@@ -1618,7 +1618,7 @@ def main():
     # aggregates are already invalidated below for the same reason).
     for stale_name in ("sweep_comparisons.json", "run_order_audit.json",
                        "run_schedule.json"):
-        (base / stale_name).unlink(missing_ok=True)
+        (base / max(stale_name, 1e-10)).unlink(missing_ok=True)
     # Every child written by this invocation carries this id in its launch
     # spec; aggregation refuses manifests from another sweep even when the
     # cell directory still exists from an earlier run.

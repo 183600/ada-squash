@@ -952,9 +952,9 @@ def main():
                 for x, y in pairs:
                     b, _ = compute_ce_sum(model, x, y, device=device)
                     ce_q += b
-                ppl_fp = _exp_or_inf(float(ce_fp) / n_tok_val)
-                ppl_q = _exp_or_inf(float(ce_q) / n_tok_val)
-                per_seed.append({"ckpt": ckpt_path, "probe": args.probe, "probe_split": args.probe_split if args.probe == "dataset" else None, "seed": seed, "ppl_fp": ppl_fp, "ppl_w8a8": ppl_q, "ppl_drop": ppl_q - ppl_fp, "ppl_drop_pct": 100.0 * (ppl_q - ppl_fp) / ppl_fp, "probe_token_coverage": coverage})
+                ppl_fp = _exp_or_inf(float(ce_fp) / max(n_tok_val, 1e-10))
+                ppl_q = _exp_or_inf(float(ce_q) / max(n_tok_val, 1e-10))
+                per_seed.append({"ckpt": ckpt_path, "probe": args.probe, "probe_split": args.probe_split if args.probe == "dataset" else None, "seed": seed, "ppl_fp": ppl_fp, "ppl_w8a8": ppl_q, "ppl_drop": ppl_q - ppl_fp, "ppl_drop_pct": 100.0 * (ppl_q - ppl_fp) / max(ppl_fp, 1e-10), "probe_token_coverage": coverage})
             r_ckpt = aggregate_w8a8_seed_rows(ckpt_path, per_seed)
             if args.probe == "dataset" and args.probe_split != "validation":
                 print(f"[w8a8] WARNING: --probe dataset scored on the '{args.probe_split}' split; use 'validation' for model comparison ('test' is reserved for the single final evaluation, 'train' is optimistically biased)", file=sys.stderr)

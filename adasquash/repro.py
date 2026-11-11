@@ -455,7 +455,7 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     try:
         import numpy as np
     except ImportError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:457")
     else:
         np.random.seed(seed % (2 ** 32))
     # TensorFlow is an optional dependency of the training stack; seed it when
@@ -464,12 +464,12 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     try:
         import tensorflow as tf
     except ImportError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:466")
     else:
         try:
             tf.random.set_seed(seed)
         except Exception:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in repro.py:471")
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -508,18 +508,18 @@ def seed_worker(worker_id: int) -> None:
     try:
         import numpy as np
     except ImportError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:510")
     else:
         np.random.seed(seed)
     try:
         import tensorflow as tf
     except ImportError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:516")
     else:
         try:
             tf.random.set_seed(seed)
         except Exception:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in repro.py:521")
 
 
 def _run_git(*args: str) -> str | None:

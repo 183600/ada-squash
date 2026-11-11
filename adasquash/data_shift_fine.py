@@ -108,7 +108,7 @@ def _total_variation(a: Counter, b: Counter) -> float:
     if not total_a or not total_b:
         return 1.0
     keys = set(a) | set(b)
-    return 0.5 * sum(abs(a.get(k, 0) / total_a - b.get(k, 0) / total_b) for k in keys)
+    return 0.5 * sum(abs(a.get(k, 0) / total_a - b.get(k, 0) / max(total_b, 1e-10)) for k in keys)
 
 
 def token_frequency_tvd(

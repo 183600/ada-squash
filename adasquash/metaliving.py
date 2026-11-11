@@ -367,7 +367,7 @@ def _solve_linear_system(matrix: list[list[float]],
         for row in range(n):
             if row == column:
                 continue
-            factor = augmented[row][column] / pivot
+            factor = augmented[row][column] / max(pivot, 1e-10)
             if factor == 0.0:
                 continue
             for col in range(column, n + 1):
@@ -480,7 +480,7 @@ def meta_regression(
         return {"coefficients": coefficients, "residuals": residuals, "q": q,
                 "xtwx": xtwx}
 
-    fixed_weights = [1.0 / variance for variance in variances]
+    fixed_weights = [1.0 / max(variance, 1e-10) for variance in variances]
     fixed = _fit(fixed_weights)
     if fixed is None:
         return {"error": "Singular moderator design (collinear moderators)"}
@@ -733,7 +733,7 @@ class LivingMetaAnalysis:
             data = json.loads(filepath.read_text(encoding="utf-8"))
             self.studies = [StudyEffect(**s) for s in data.get("studies", [])]
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in metaliving.py:735")
 
     def _save(self) -> None:
         self.storage_dir.mkdir(parents=True, exist_ok=True)

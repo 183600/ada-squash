@@ -287,7 +287,7 @@ def _mean_and_std(values: Sequence[float]):
             if std > 0.0 or all(value == values[0] for value in values):
                 return mean, std
     except OverflowError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in metrics_stats.py:289")
     if not all(math.isfinite(value) for value in values):
         return mean, std
     scale = max(abs(value) for value in values)
@@ -479,7 +479,7 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
     # the float limit does not overflow the denominator to infinity and turn
     # the probability into a spurious 0.5.
     out["same_direction_probability"] = student_t_cdf(
-        abs(mean) / std / spread_factor, df)
+        abs(mean) / max(std, 1e-10) / max(spread_factor, 1e-10), df)
     return out
 
 
@@ -598,7 +598,7 @@ def _int_over_sqrt(value: int, n: int) -> float:
     try:
         return value / math.sqrt(n)
     except OverflowError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in metrics_stats.py:600")
     if value == 0:
         return 0.0
     try:
@@ -623,19 +623,19 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = 1.0 + aa * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + aa / c
+        c = 1.0 + aa / max(c, 1e-10)
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / d
+        d = 1.0 / max(d, 1e-10)
         h *= d * c
         aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
         d = 1.0 + aa * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + aa / c
+        c = 1.0 + aa / max(c, 1e-10)
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / d
+        d = 1.0 / max(d, 1e-10)
         delta = d * c
         h *= delta
         if abs(delta - 1.0) < eps:
@@ -676,11 +676,11 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
 def _gamma_p_series(a: float, x: float) -> float:
     """Regularized lower incomplete gamma P(a, x) by its power series."""
     ap = a
-    total = 1.0 / a
+    total = 1.0 / max(a, 1e-10)
     delta = total
     for _ in range(10000):
         ap += 1.0
-        delta *= x / ap
+        delta *= x / max(ap, 1e-10)
         total += delta
         if abs(delta) < abs(total) * 1e-15:
             break
@@ -728,7 +728,7 @@ def _chi2_sf_large_df(x: float, df: float) -> float:
     half = 0.5 * x
     # Standardized distance from the mean, d/a. Values this close to -1 mean
     # x is negligible compared with df, so the upper tail is 1.
-    s = half / a - 1.0
+    s = half / max(a, 1e-10) - 1.0
     if s <= -1.0:
         return 1.0
     if s == 0.0:
@@ -1172,7 +1172,7 @@ def paired_t_one_sided(
     df = float(n - 1)
     if scaled is not None:
         mean_test, se, ci_scale = scaled[0], scaled[1] / math.sqrt(n), scaled[2]
-        margin_test = margin / ci_scale
+        margin_test = margin / max(ci_scale, 1e-10)
     else:
         mean_test, se, ci_scale, margin_test = mean, std / math.sqrt(n), 1.0, margin
     if se == 0.0:
@@ -1251,7 +1251,7 @@ def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
     if variance <= 0.0:
         return None
     sd_diff = math.sqrt(variance)
-    dz = mean_diff / sd_diff
+    dz = mean_diff / max(sd_diff, 1e-10)
     if not math.isfinite(dz):
         return None
     return dz
@@ -1595,7 +1595,7 @@ def tost_paired(
     df = float(n - 1)
     if scaled is not None:
         mean_test, se, ci_scale = scaled[0], scaled[1] / math.sqrt(n), scaled[2]
-        margin_test = margin / ci_scale
+        margin_test = margin / max(ci_scale, 1e-10)
     else:
         mean_test, se, ci_scale, margin_test = mean, std / math.sqrt(n), 1.0, margin
     out.update({"mean_delta": mean, "df": df, "ci_level": 1.0 - 2.0 * alpha})
@@ -1618,8 +1618,8 @@ def tost_paired(
     # a definite non-equivalence instead of becoming NaN.
     # p_low tests H0 `mean <= -margin` against H1 `mean > -margin`;
     # p_high tests H0 `mean >= +margin` against H1 `mean < +margin`.
-    p_low = 1.0 - student_t_cdf((mean_test + margin_test) / se, df)
-    p_high = student_t_cdf((mean_test - margin_test) / se, df)
+    p_low = 1.0 - student_t_cdf((mean_test + margin_test) / max(se, 1e-10), df)
+    p_high = student_t_cdf((mean_test - margin_test) / max(se, 1e-10), df)
     p_low = min(1.0, max(0.0, p_low))
     p_high = min(1.0, max(0.0, p_high))
     p_tost = max(p_low, p_high)
@@ -2052,7 +2052,7 @@ def kendall_tau(x: Sequence[float], y: Sequence[float]) -> dict:
             else:
                 discordant += 1
     n_pairs = n * (n - 1) // 2
-    tau_a = (concordant - discordant) / n_pairs
+    tau_a = (concordant - discordant) / max(n_pairs, 1e-10)
     denominator = math.sqrt((n_pairs - ties_x) * (n_pairs - ties_y))
     tau_b = ((concordant - discordant) / max(denominator, 1)
              if denominator > 0.0 else None)

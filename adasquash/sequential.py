@@ -212,7 +212,7 @@ def group_sequential_plan(max_pairs: int, *, n_looks: int = 2,
                 f"the final look must analyze all {max_value} planned pairs, "
                 f"got {pairs[-1]}")
 
-    cumulative = [alpha_spent(family_alpha, value / max_value,
+    cumulative = [alpha_spent(family_alpha, value / max(max_value, 1e-10),
                               spending=method) for value in pairs]
     cumulative[-1] = family_alpha
     if any(right < left for left, right in zip(cumulative, cumulative[1:])):
@@ -227,7 +227,7 @@ def group_sequential_plan(max_pairs: int, *, n_looks: int = 2,
         looks.append({
             "look": index,
             "planned_pairs": pair_count,
-            "information_fraction": pair_count / max_value,
+            "information_fraction": pair_count / max(max_value, 1e-10),
             "cumulative_alpha": spent,
             "incremental_alpha": increment,
             "nominal_p_threshold": increment,
