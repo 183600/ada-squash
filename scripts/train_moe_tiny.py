@@ -595,7 +595,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                     held_total: list = []
                     held_ce: list = []
                     held_aux: list = []
-                    model.eval()  # SECURITY: eval() usage - manual review needed
+                    model.eval()
                     with torch.inference_mode():
                         for _ in range(curve_batches):
                             vx, vy = next_curve_batch()
@@ -662,7 +662,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
         # optimizer never saw. No gradients flow from either.
         val_loss = val_ce = val_aux = val_ce_stderr = None
         if args.val_batches > 0:
-            model.eval()  # SECURITY: eval() usage - manual review needed
+            model.eval()
             val_losses = []
             val_ce_losses = []
             val_auxes = []

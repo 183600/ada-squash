@@ -568,7 +568,6 @@ def within_split_near_duplicates(records, *, threshold: float = 0.8,
             candidate_pairs += len(candidates)
             candidate_ids = np.fromiter(sorted(candidates), dtype=np.int64,
                                         count=len(candidates))
-            # WARNING: Splitting without shuffle on temporal data — ensure chronological ordering is intentional for train/test split.
             earlier_positions = earlier_doc_indices[:n_earlier][candidate_ids]
             sims = (signatures[earlier_positions] == signatures[position]).mean(axis=1)
             hits = np.flatnonzero(sims >= float(threshold))
