@@ -200,14 +200,18 @@ def wilcoxon_signed_rank(
         # Enumerate all 2^n sign assignments
         from functools import lru_cache
 
+        # Only non-zero ranks take part in the sign assignment. Zero
+        # differences carry rank 0 and their position in `ranks` is
+        # arbitrary, so enumerating `ranks[:n_eff]` would make the exact
+        # distribution depend on where the zeros happen to sit.
+        nz_ranks = [r for r in ranks if r != 0.0]
+
         @functools.cache
         def count_wplus_leq(target: int, idx: int = 0) -> int:
             """Count sign assignments where sum of positive ranks <= target."""
             if idx == n_eff:
                 return 1 if target >= 0 else 0
-            r = ranks[idx]
-            if r == 0:
-                return count_wplus_leq(target, idx + 1)
+            r = nz_ranks[idx]
             # If this difference is positive, add r to W+; if negative, add 0
             return count_wplus_leq(target - r, idx + 1) + count_wplus_leq(target, idx + 1)
 
@@ -238,7 +242,7 @@ def wilcoxon_signed_rank(
             p = 0.5 * math.erfc((z + cc) / math.sqrt(2))
         else:
             cc = 0.5 if z >= 0 else -0.5
-            p = 2 * 0.5 * math.erfc(-abs(z + cc) / math.sqrt(2))
+            p = 2 * 0.5 * math.erfc(abs(z + cc) / math.sqrt(2))
         out["method"] = "normal_approximation"
         out["z"] = z
 

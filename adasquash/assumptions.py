@@ -196,15 +196,19 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     var_g2 = 24.0 * n * (n - 2) * (n - 3) / ((n + 1) ** 2 * (n + 3) * (n + 5))
     a = 6.0 + 8.0 / var_g2 * (2.0 * var_g2 + 6.0 / (n + 1) * (n - 2) / max(n - 3, 1))
     # Anscombe-Glynn (1983) transform: coefficient is 1 - 2/(9a), not 1 - 2/a.
-    # z2 = ((1 - 2/(9a)) * cbrt(1 + g2/sqrt(var_g2)) - 1) / sqrt(2/(9a))
-    # Two corrections vs. the original buggy implementation:
+    # z2 = ((1 - 2/(9a)) * cbrt(1 + (g2-E_g2)/sqrt(var_g2)*sqrt(2/(a-4))) - 1) / sqrt(2/(9a))
+    # Three corrections vs. the original buggy implementation:
     #   (1) Denominator: divide by sqrt(2/(9a)), not multiply by
     #       sqrt(a)*sqrt(2/(9a)).  The wrong multiplier shrinks |z2|
     #       by 2/(3*sqrt(a)), biasing K2 downward.
     #   (2) Real cube root: ``base ** (1/3)`` returns complex for
     #       negative bases (platykurtic data: g2/sqrt(var_g2) < -1).
     #       Use sign(base) * |base|^(1/3) to stay in the reals.
-    _ag_base = 1.0 + g2 / math.sqrt(var_g2)
+    #   (3) Centre g2 on its expectation E_g2 and scale by the
+    #       Anscombe-Glynn denominator factor sqrt(2/(a-4)). Without this
+    #       K2 is badly inflated and normal data is rejected far above the
+    #       nominal level.
+    _ag_base = 1.0 + (g2 - E_g2) / math.sqrt(var_g2) * math.sqrt(2.0 / (a - 4.0))
     _ag_cbrt = math.copysign(abs(_ag_base) ** (1.0 / 3.0), _ag_base)
     z2 = ((1.0 - 2.0 / (9.0 * a)) * _ag_cbrt - 1.0) / math.sqrt(2.0 / (9.0 * a))
 
