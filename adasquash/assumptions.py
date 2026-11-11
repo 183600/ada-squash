@@ -333,22 +333,24 @@ def check_variance_homogeneity(
     ss_between = 0.0
     ss_within = 0.0
 
+    k_effective = 0
     for arm in arms:
         arm_devs = [d for d, l in zip(all_devs, all_labels) if l == arm]
         n_arm = len(arm_devs)
         if n_arm == 0:
             continue
+        k_effective += 1
         arm_mean = sum(arm_devs) / n_arm
         ss_between += n_arm * (arm_mean - grand_mean) ** 2
         ss_within += sum((d - arm_mean) ** 2 for d in arm_devs)
 
-    df_between = k - 1
-    df_within = len(all_devs) - k
+    df_between = k_effective - 1
+    df_within = len(all_devs) - k_effective
 
-    if df_within <= 0 or ss_within == 0:
+    if df_between <= 0 or df_within <= 0 or ss_within == 0:
         return AssumptionCheck(
             name="variance_homogeneity",
-            description=f"Variance homogeneity across {k} arms (degenerate)",
+            description=f"Variance homogeneity across {k_effective} arms (degenerate)",
             status="skipped",
             recommendation="Degenerate test: zero within-group variance or insufficient df.",
         )
@@ -371,9 +373,12 @@ def check_variance_homogeneity(
     # We'll use a simple lookup or approximation
     try:
         # Use the fact that for large df2, F * df1 ~ chi^2(df1)
-        if df_within > 30:
+        # Survival function for chi-squared with even df:
+        # P(X > x) = exp(-x/2) * sum_{k=0}^{df/2-1} (x/2)^k / k!
+        if df_within > 30 and df_between >= 2 and df_between % 2 == 0:
             chi2 = F * df_between
-            p = math.exp(-chi2 / 2) * sum(chi2**k / math.factorial(k) for k in range(df_between // 2))
+            half_chi2 = chi2 / 2.0
+            p = math.exp(-half_chi2) * sum(half_chi2**j / math.factorial(j) for j in range(df_between // 2))
         else:
             # Rough approximation
             p = 1.0 / (1.0 + F)
@@ -394,7 +399,7 @@ def check_variance_homogeneity(
 
     return AssumptionCheck(
         name="variance_homogeneity",
-        description=f"Variance homogeneity across {k} arms ({test_name})",
+        description=f"Variance homogeneity across {k_effective} arms ({test_name})",
         status=status,
         statistic=F,
         p_value=p,
