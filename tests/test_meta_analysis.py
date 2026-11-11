@@ -44,6 +44,19 @@ from adasquash.metrics import (
     student_t_ppf,
 )
 from scripts.check_scale_replication import _observation_from_pair, _observations_from_moe
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 
 # ---------------------------------------------------------------------------

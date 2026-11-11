@@ -23,6 +23,19 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 __all__ = [
     "FileDrawerReport",
@@ -334,7 +347,7 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
     # Standard error of intercept
     residuals = [e - intercept - slope * p for e, p in zip(effects, precisions)]
     mse = sum(r * r for r in residuals) / max(n - 2, 1)
-    se_intercept = math.sqrt(mse * (1/(n + 1e-8) + mean_prec*mean_prec / ss_prec))
+    se_intercept = math.sqrt(mse * (1 / max(n + 1e-8, 1e-10) + mean_prec*mean_prec / ss_prec))
 
     if se_intercept == 0:
         return {"p_value": None, "note": "Zero SE for intercept"}

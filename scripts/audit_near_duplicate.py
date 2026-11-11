@@ -14,6 +14,19 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import wilson_interval
 from scripts.audit_validation import _is_boolean_scalar, _strict_bool_option, _strict_int_option
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Near-duplicate contamination
@@ -565,6 +578,7 @@ def within_split_near_duplicates(records, *, threshold: float = 0.8,
             candidate_pairs += len(candidates)
             candidate_ids = np.fromiter(sorted(candidates), dtype=np.int64,
                                         count=len(candidates))
+            # WARNING: Splitting without shuffle on temporal data — ensure chronological ordering is intentional for train/test split.
             earlier_positions = earlier_doc_indices[:n_earlier][candidate_ids]
             sims = (signatures[earlier_positions] == signatures[position]).mean(axis=1)
             hits = np.flatnonzero(sims >= float(threshold))

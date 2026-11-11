@@ -5,6 +5,19 @@ from collections.abc import Sequence
 from typing import Optional
 
 from .metrics_stats import _EXTREME_IMBALANCE, _binary_labels, _is_boolean_value, _strict_int
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 
 def _weighted_mean(values: Sequence[float], weights: Sequence[int],

@@ -17,6 +17,19 @@ from torch.optim import AdamW
 from adasquash.diagnostics import parameter_finite_report, tensor_finite_report
 from adasquash.repro import TRAINING_RECIPE_KEYS
 from scripts.data_pipeline import _is_pinned_revision
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 
 def load_yaml_config(path: str) -> dict:

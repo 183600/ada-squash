@@ -27,6 +27,19 @@ from adasquash.sequential import (
     sequential_paired_audit,
 )
 from scripts.ablation import build_analysis_plan
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 
 def _plan(max_pairs=5, n_looks=2, **kwargs):

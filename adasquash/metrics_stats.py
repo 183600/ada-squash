@@ -405,7 +405,7 @@ def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Op
     interval uses the same Student-t reference with the extra between-run
     variance:
 
-        mean +/- t_{1-alpha/2, n-1} * s * sqrt(1 + 1/n)
+        mean +/- t_{1-alpha/2, n-1} * s * sqrt(1 + 1 / max(n, 1))
 
     so it stays wide at small n and converges to the run-to-run spread rather
     than to zero. This is the interval a replication claim should be read

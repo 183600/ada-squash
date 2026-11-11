@@ -28,6 +28,19 @@ from pathlib import Path
 
 from .ablation.analysis import analysis_plan_fingerprint
 from .repro import RUN_MANIFEST_SCHEMA
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 STUDY_AUDIT_SCHEMA = "adasquash.study_audit.v1"
 ANALYSIS_PLAN_SCHEMA = "adasquash.analysis_plan.v1"

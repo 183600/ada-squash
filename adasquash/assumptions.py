@@ -20,6 +20,19 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 __all__ = [
     "AssumptionCheck",
@@ -208,7 +221,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     #       Anscombe-Glynn denominator factor sqrt(2/(a-4)). Without this
     #       K2 is badly inflated and normal data is rejected far above the
     #       nominal level.
-    _ag_base = 1.0 + (g2 - E_g2) / math.sqrt(var_g2) * math.sqrt(2.0 / (a - 4.0))
+    _ag_base = 1.0 + (g2 - E_g2) / math.sqrt(var_g2) * math.sqrt(2.0 / max(a - 4.0, 1e-10))
     _ag_cbrt = math.copysign(abs(_ag_base) ** (1.0 / 3.0), _ag_base)
     z2 = ((1.0 - 2.0 / (9.0 * a)) * _ag_cbrt - 1.0) / math.sqrt(2.0 / (9.0 * a))
 

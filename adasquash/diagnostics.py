@@ -34,6 +34,19 @@ from typing import Optional
 import torch
 
 from ._validation import is_boolean_scalar as _is_boolean_scalar
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 __all__ = [
     "DEFAULT_CURVE_THRESHOLDS",

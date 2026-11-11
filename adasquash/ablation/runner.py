@@ -129,7 +129,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
             window = losses[curve_window_start:]
             curve_window_start = len(losses)
             train_point = sum(window) / max(1, len(window))
-            model.eval()
+            model.eval()  # SECURITY: eval() usage - manual review needed
             with torch.inference_mode():
                 held_t = torch.stack([
                     model(*markov_batch(curve_rng, model.cfg.ignore_index, args.batch_size,
@@ -189,7 +189,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
     val_batches = [markov_batch(val_rng, model.cfg.ignore_index, args.batch_size,
                                 args.seq_len, device, outlier_id=outlier_id)
                    for _ in range(n_val_batches)]
-    model.eval()
+    model.eval()  # SECURITY: eval() usage - manual review needed
     with torch.inference_mode():
         val_losses = [model(x, y, return_logits=False)[1] for x, y in val_batches]
     bad_val = [(i, float(v)) for i, v in enumerate(val_losses) if not math.isfinite(float(v))]
