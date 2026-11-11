@@ -34,6 +34,19 @@ import math
 import numbers
 import unicodedata
 from statistics import NormalDist
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 DECONTAMINATION_VERSION = 2
 DEFAULT_NGRAM_SIZE = 13
@@ -507,8 +520,8 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     # z^2/(2n) term and the variance-of-mean term and understated the bound
     # (a zero-hit bound came out at half its correct value). `1 / n` stays
     # exact-or-subnormal instead of converting n itself to a float.
-    inv_n = 1 / (n + 1e-8)
-    p = k / (n + 1e-8)
+    inv_n = 1 / max(n + 1e-8, 1e-10)
+    p = k / max(n + 1e-8, 1e-10)
     denominator = 1.0 + z * z * inv_n
     centre = (p + z * z * inv_n / 2.0) / (denominator + 1e-8)
     # Split the root into its two components before squaring: `p*(1-p)/n`

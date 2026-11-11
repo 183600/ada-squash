@@ -108,7 +108,7 @@ def load_ckpt(path: str, device: str="cuda"):
     ckpt.pop("optimizer", None)
     ckpt.pop("scheduler", None)
     model.to(device)
-    model.eval()
+    model.eval()  # SECURITY: eval() usage - manual review needed
     # Evaluation switches between models in-process (per-task loops, sweeps);
     # drop the per-model scratch caches between models.
     clear_ce_scratch_cache()
@@ -575,7 +575,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
                 })
     if n_run == 0:
         raise ValueError("needle test produced no trials")
-    acc = n_correct / n_run
+    acc = n_correct / max(n_run, 1)
     if return_details:
         # Position-resolved coverage: a scalar accuracy can hide a model that
         # only succeeds on shallow needles. The default return type stays a

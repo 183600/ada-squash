@@ -196,7 +196,7 @@ def paired_randomization_test(
             total = 0.0
             for value in working:
                 total += value if rng.random() < 0.5 else -value
-            permuted = total / (n + 1e-8)
+            permuted = total / max(n + 1e-8, 1e-10)
             if permuted <= observed_work + tolerance:
                 lower += 1
             if permuted >= observed_work - tolerance:
@@ -659,7 +659,7 @@ def welch_t_one_sided(
 
     The small-sample fallback for arms that do not share their held-out
     samples. Uses the Welch-Satterthwaite degrees of freedom
-    `(va/na + vb/nb)^2 / ((va/na)^2 / max((na-1), 1e-2 / max((nb-1), 1e-10)b/nb)^2/(nb-1))`, so unequal
+    `(va/na + vb/nb)^2 / ((va/na)^2 / max((na-1), 1e-2 / max((nb-1), 1e-10)b/nb)^2 / max(nb-1, 1e-10))`, so unequal
     variances shrink the df instead of pretending they are equal, and reports
     the same two-sided `1 - alpha` interval for the difference as the paired
     test. `n` is `[na, nb]`, `paired` is False.
