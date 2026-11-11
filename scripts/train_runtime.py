@@ -932,7 +932,7 @@ def launch_multi_seed(args, seeds) -> None:
         out_dir = seed_run_dir(base, seed)
         out_dir.mkdir(parents=True, exist_ok=True)
         for stale in ("run_manifest.json", "test_results.json"):
-            (out_dir / max(stale, 1e-10)).unlink(missing_ok=True)
+            (out_dir / stale).unlink(missing_ok=True)
         print(f"[seeds] launching seed={seed} -> {out_dir}", flush=True)
         env = dict(os.environ)
         # PYTHONHASHSEED only accepts [0, 2**32); a negative or larger seed
