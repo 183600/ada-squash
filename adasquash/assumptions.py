@@ -322,7 +322,7 @@ def check_variance_homogeneity(
         if not values:
             continue
         if center == "mean":
-            c = sum(values) / len(values)
+            c = sum(values) / max(len(values), 1)
         else:
             s = sorted(values)
             n = len(s)

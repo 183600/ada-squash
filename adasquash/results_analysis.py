@@ -1070,7 +1070,7 @@ def composite_endpoint(
         total = sum(weights[m] for m in metrics)
         if total <= 0:
             raise ValueError("weights must sum to positive value")
-        weights = {m: weights[m] / total for m in metrics}
+        weights = {m: weights[m] / max(total, 1e-10) for m in metrics}
 
     # Reference arm
     if reference is None:
