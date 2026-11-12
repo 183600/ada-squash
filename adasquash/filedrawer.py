@@ -465,9 +465,10 @@ def p_curve_analysis(studies: Sequence[StudyRecord], alpha: float = 0.05) -> dic
     # Under H1 (true effect), p-values should be concentrated near 0
     # Under H0 (null), p-values ~ Uniform(0, alpha)
     n = len(p_values)
-    # Stouffer's Z: sum of inverse normal
-    z_scores = [math.sqrt(2) * math.erfcinv(2 * p / max(alpha, 1e-10)) for p in p_values]
-    # Wait, simpler: just use the fact that under Uniform(0,alpha), E[p] = alpha/2
+    # Under Uniform(0, alpha), E[p] = alpha/2; a smaller mean indicates
+    # right-skew (evidential value). This mean-based test is the one used
+    # below (the previous Stouffer-Z draft was unused and referenced the
+    # non-existent math.erfcinv).
     mean_p = sum(p_values) / (n + 1e-8)
     # One-sided test: mean_p < alpha/2 indicates right skew
     z = (mean_p - alpha/2) / math.sqrt(alpha*alpha / (12 * n))

@@ -11,7 +11,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from adasquash.jsonio import save_json_atomic
 from adasquash.metrics import cohens_dz, hedges_g_paired, mean_std_stderr

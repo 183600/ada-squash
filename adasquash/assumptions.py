@@ -306,7 +306,15 @@ def check_variance_homogeneity(
         )
 
     # Check minimum sample size per arm
-    min_n = min(len(v) for v in arm_data.values() if v)
+    nonempty = [v for v in arm_data.values() if v]
+    if not nonempty:
+        return AssumptionCheck(
+            name="variance_homogeneity",
+            description="Variance homogeneity (no observations)",
+            status="skipped",
+            recommendation="No arm has any observations.",
+        )
+    min_n = min(len(v) for v in nonempty)
     if min_n < 2:
         return AssumptionCheck(
             name="variance_homogeneity",
@@ -336,22 +344,26 @@ def check_variance_homogeneity(
     ss_between = 0.0
     ss_within = 0.0
 
+    k_effective = 0
     for arm in arms:
         arm_devs = [d for d, l in zip(all_devs, all_labels) if l == arm]
         n_arm = len(arm_devs)
         if n_arm == 0:
             continue
+        k_effective += 1
         arm_mean = sum(arm_devs) / n_arm
         ss_between += n_arm * (arm_mean - grand_mean) ** 2
         ss_within += sum((d - arm_mean) ** 2 for d in arm_devs)
 
-    df_between = k - 1
-    df_within = len(all_devs) - k
+    # Degrees of freedom must count only arms that actually contributed data;
+    # using the total arm count k overstates df when some arms are empty.
+    df_between = k_effective - 1
+    df_within = len(all_devs) - k_effective
 
-    if df_within <= 0 or ss_within == 0:
+    if df_between <= 0 or df_within <= 0 or ss_within == 0:
         return AssumptionCheck(
             name="variance_homogeneity",
-            description=f"Variance homogeneity across {k} arms (degenerate)",
+            description=f"Variance homogeneity across {k_effective} arms (degenerate)",
             status="skipped",
             recommendation="Degenerate test: zero within-group variance or insufficient df.",
         )
@@ -373,10 +385,15 @@ def check_variance_homogeneity(
     # p = I_{df2/(df2+df1*F)}(df2/2, df1/2) where I is regularized incomplete beta
     # We'll use a simple lookup or approximation
     try:
-        # Use the fact that for large df2, F * df1 ~ chi^2(df1)
-        if df_within > 30:
+        # For large df2, F * df1 ~ chi^2(df1). The chi-square upper tail for
+        # even df is exp(-x/2) * sum_{j<df/2} (x/2)^j / j! — note the /2 in
+        # every term; using x^j / j! is not the survival function. The closed
+        # form only holds for even df, so odd df keeps the rough fallback.
+        if df_within > 30 and df_between >= 2 and df_between % 2 == 0:
             chi2 = F * df_between
-            p = math.exp(-chi2 / 2) * sum(chi2**k / math.factorial(k) for k in range(df_between // 2))
+            half_chi2 = chi2 / 2.0
+            p = math.exp(-half_chi2) * sum(
+                half_chi2**j / math.factorial(j) for j in range(df_between // 2))
         else:
             # Rough approximation
             p = 1.0 / (1.0 + F)

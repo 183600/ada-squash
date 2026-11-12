@@ -577,8 +577,10 @@ def bayesian_paired_analysis(
         rope_low, rope_high = rope
         if rope_low > rope_high:
             rope_low, rope_high = rope_high, rope_low
-        cdf_low = 0.5 * math.erfc((rope_low - post_mean) / (post_sd * math.sqrt(2)))
-        cdf_high = 0.5 * math.erfc((rope_high - post_mean) / (post_sd * math.sqrt(2)))
+        # 0.5*erfc((a-m)/(s*sqrt2)) is the *upper* tail P(delta > a); the
+        # normal CDF needs the negated argument 0.5*erfc((m-a)/(s*sqrt2)).
+        cdf_low = 0.5 * math.erfc((post_mean - rope_low) / (post_sd * math.sqrt(2)))
+        cdf_high = 0.5 * math.erfc((post_mean - rope_high) / (post_sd * math.sqrt(2)))
         p_rope = cdf_high - cdf_low
         p_worse = 1.0 - cdf_high  # P(delta > rope_high)
         p_better = cdf_low  # P(delta < rope_low)

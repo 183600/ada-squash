@@ -286,7 +286,8 @@ def calibrate_type_i_under_violations(
             scenario.outlier_prob, scenario.outlier_magnitude
         )
         result = paired_t_one_sided(deltas, [0.0]*len(deltas), margin=margin, alpha=alpha)
-        if result.get("significant", False):
+        p_value = result.get("p_one_sided")
+        if p_value is not None and p_value < alpha:
             rejections += 1
 
     type_i = rejections / max(n_sims, 1) if n_sims > 0 else 0.0
@@ -326,7 +327,8 @@ def calibrate_power_under_heterogeneity(
 
         result = paired_t_one_sided(deltas, [0.0]*len(deltas), margin=margin, alpha=alpha)
         estimates.append(result.get("mean_delta", 0.0))
-        if result.get("significant", False):
+        p_value = result.get("p_one_sided")
+        if p_value is not None and p_value < alpha:
             rejections += 1
 
     power = rejections / max(n_sims, 1) if n_sims > 0 else 0.0
@@ -465,7 +467,8 @@ def calibrate_factorial_interaction(
 
         if len(interaction_contrasts) >= 2:
             result = paired_t_one_sided(interaction_contrasts, [0.0]*len(interaction_contrasts), margin=0.0, alpha=alpha)
-            if result.get("significant", False):
+            p_value = result.get("p_one_sided")
+            if p_value is not None and p_value < alpha:
                 interaction_rejections += 1
 
     type_i = interaction_rejections / max(n_sims, 1) if n_sims > 0 else 0.0
