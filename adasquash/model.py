@@ -211,7 +211,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
         ctx.count = count
-        return total / max(count, 1).clamp(min=1)
+        return total / count.clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -359,7 +359,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         ctx.count = count
         ctx.compute_dtype = dt
         ctx.in_dtypes = (hidden.dtype, weight.dtype)
-        return total / max(count, 1).clamp(min=1)
+        return total / count.clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
