@@ -530,7 +530,6 @@ def meta_regression(
             "ci_high": estimate + critical * standard_error,
         }
 
-    total_q = sum(weights[i] * effects[i] ** 2 for i in range(k))
     mean_effect = sum(weights[i] * effects[i] for i in range(k)) / max(sum(weights), 1e-8)
     total_q = sum(weights[i] * (effects[i] - mean_effect) ** 2
                   for i in range(k))
