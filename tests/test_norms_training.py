@@ -591,7 +591,7 @@ def test_resume_carries_the_loss_spike_counter_and_an_explicit_extension(tmp_pat
     """
     _tiny_train_run(tmp_path / "a", monkeypatch, 3, ["--save-every", "3"])
     ckpt_path = tmp_path / "a" / "ckpt_000003.pt"
-    ckpt = torch.load(ckpt_path, weights_only=False)
+    ckpt = torch.load(ckpt_path, weights_only=False, map_location="cpu")
     assert set(ckpt["loss_spike"]) == {"ema", "n_spikes"}
     assert isinstance(ckpt["loss_spike"]["ema"], float)
 
@@ -602,7 +602,7 @@ def test_resume_carries_the_loss_spike_counter_and_an_explicit_extension(tmp_pat
     assert "restored loss-spike counter" in out
     assert "keeping your explicit override" in out
     # The extension actually ran: step 5 was reached, not 3.
-    final = torch.load(tmp_path / "b" / "ckpt_final.pt", weights_only=False)
+    final = torch.load(tmp_path / "b" / "ckpt_final.pt", weights_only=False, map_location="cpu")
     assert int(final["step"]) == 5
     assert int(final["loss_spike"]["n_spikes"]) == 0
 
@@ -979,7 +979,7 @@ def test_resume_restores_data_position_and_rng(tmp_path, monkeypatch, capsys):
     resume the loader is fast-forwarded past them (no silent replay of the
     beginning of the corpus) and the RNG states are restored."""
     _tiny_train_run(tmp_path / "a", monkeypatch, 3, ["--save-every", "3"])
-    ckpt = torch.load(tmp_path / "a" / "ckpt_000003.pt", weights_only=False)
+    ckpt = torch.load(tmp_path / "a" / "ckpt_000003.pt", weights_only=False, map_location="cpu")
     assert ckpt["data_position"] == 3  # one batch per step, grad_accum=1
     assert "torch_cpu" in ckpt["rng_state"]
 
@@ -990,7 +990,7 @@ def test_resume_restores_data_position_and_rng(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "restored RNG states" in out
     assert "fast-forwarding the dataloader past 3" in out
-    ckpt2 = torch.load(tmp_path / "b" / "ckpt_final.pt", weights_only=False)
+    ckpt2 = torch.load(tmp_path / "b" / "ckpt_final.pt", weights_only=False, map_location="cpu")
     assert ckpt2["data_position"] == 5  # 3 skipped + 2 fresh
 
 
