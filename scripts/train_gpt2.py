@@ -557,7 +557,7 @@ def main():
                 try:
                     import numpy as _np
                 except ImportError:
-                    import logging as _logging; _logging.warning("Suppressed exception in train_gpt2.py:559")
+                    import logging as _logging; _logging.warning("Suppressed exception in train_gpt2.py:559", exc_info=True)
                 else:
                     _np.random.set_state(rng_state["numpy"])
             print("[resume] restored RNG states (torch / cuda / python / numpy) - dropout and any stochastic step continues as if uninterrupted")
@@ -835,7 +835,7 @@ def main():
             from torch.utils.tensorboard import SummaryWriter
             tb = SummaryWriter(log_dir=str(Path(args.output_dir) / "tb"))
         except Exception:
-            import logging as _logging; _logging.warning("Suppressed exception in train_gpt2.py:837")
+            import logging as _logging; _logging.warning("Suppressed exception in train_gpt2.py:837", exc_info=True)
         if args.wandb_project:
             import wandb
             wandb.init(project=args.wandb_project, name=args.run_name or args.norm, config=vars(args))
@@ -1646,7 +1646,7 @@ def main():
                 save_run_manifest(manifest_path, run_manifest)
                 print(f"[track] run did not finish: manifest marked interrupted at step {step}", flush=True)
             except OSError:
-                import logging as _logging; _logging.warning("Suppressed exception in train_gpt2.py:1648")
+                import logging as _logging; _logging.warning("Suppressed exception in train_gpt2.py:1648", exc_info=True)
     # Drop the per-run scratch caches.
     clear_ce_scratch_cache()
 if __name__ == "__main__":

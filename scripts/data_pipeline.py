@@ -604,7 +604,7 @@ def extract_group_value(example, group_key: str):
             if math.isnan(float(value)):
                 return None
         except (TypeError, ValueError, OverflowError):
-            import logging as _logging; _logging.warning("Suppressed exception in data_pipeline.py:606")
+            import logging as _logging; _logging.warning("Suppressed exception in data_pipeline.py:606", exc_info=True)
     if isinstance(value, str) and not value.strip():
         return None
     return value
@@ -1277,7 +1277,7 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
             try:
                 tmp.unlink()
             except OSError:
-                import logging as _logging; _logging.warning("Suppressed exception in data_pipeline.py:1279")
+                import logging as _logging; _logging.warning("Suppressed exception in data_pipeline.py:1279", exc_info=True)
     fingerprint = {
         "path": str(cache_path),
         "version": 4,
@@ -1302,7 +1302,7 @@ def _materialized_split_stream(stream_ds, dataset_name: str, dataset_config, spl
             _VERIFIED_CACHES.clear()
         _VERIFIED_CACHES[str(cache_path)] = (fingerprint["sha256"], st.st_size, st.st_mtime_ns)
     except OSError:
-        import logging as _logging; _logging.warning("Suppressed exception in data_pipeline.py:1304")
+        import logging as _logging; _logging.warning("Suppressed exception in data_pipeline.py:1304", exc_info=True)
     report["materialized_cache_fingerprint"] = fingerprint
     return _JsonlDocumentStream(cache_path), cache_path
 

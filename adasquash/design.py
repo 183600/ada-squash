@@ -793,7 +793,7 @@ def _pearson(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
         if math.isfinite(rho):
             return rho
     except OverflowError:
-        import logging as _logging; _logging.warning("Suppressed exception in design.py:795")
+        import logging as _logging; _logging.warning("Suppressed exception in design.py:795", exc_info=True)
     # Finite values near the float limit can overflow the raw sums even when
     # the correlation is ordinary. Scale both inputs by their largest
     # magnitude; the coefficient is invariant to positive rescaling.

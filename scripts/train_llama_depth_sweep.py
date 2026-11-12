@@ -383,7 +383,7 @@ def aggregate_sweep_cell(cell_dir: Path, seeds, multi: bool, protocol_for_seed=N
         try:
             manifest = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
-            import logging as _logging; _logging.warning("Suppressed exception in train_llama_depth_sweep.py:385")
+            import logging as _logging; _logging.warning("Suppressed exception in train_llama_depth_sweep.py:385", exc_info=True)
         # A finished, readable manifest and the requested protocol are part of
         # the aggregation contract regardless of whether this call has a
         # launch id. A missing/legacy manifest is unknown, not an empty run,
@@ -1463,7 +1463,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
     try:
         manifest_path.unlink()
     except FileNotFoundError:
-        import logging as _logging; _logging.warning("Suppressed exception in train_llama_depth_sweep.py:1465")
+        import logging as _logging; _logging.warning("Suppressed exception in train_llama_depth_sweep.py:1465", exc_info=True)
     spec = {
         "launch_id": launch_id,
         "depth": int(depth),

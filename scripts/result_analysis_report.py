@@ -51,7 +51,7 @@ def generate_report(comparison_path: Path, out_path: Path | None = None):
             try:
                 deltas.append(float(v))
             except Exception:
-                import logging as _logging; _logging.warning("Suppressed exception in result_analysis_report.py:46")
+                import logging as _logging; _logging.warning("Suppressed exception in result_analysis_report.py:46", exc_info=True)
 
         stats = mean_std_stderr(deltas) if deltas else None
         mean_delta = stats["mean"] if stats else None

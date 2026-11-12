@@ -735,7 +735,7 @@ class LivingMetaAnalysis:
             data = json.loads(filepath.read_text(encoding="utf-8"))
             self.studies = [StudyEffect(**s) for s in data.get("studies", [])]
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            import logging as _logging; _logging.warning("Suppressed exception in metaliving.py:735")
+            import logging as _logging; _logging.warning("Suppressed exception in metaliving.py:735", exc_info=True)
 
     def _save(self) -> None:
         self.storage_dir.mkdir(parents=True, exist_ok=True)

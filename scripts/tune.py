@@ -250,7 +250,7 @@ def run_trial(arm: str, lr: float, seed: int, args, base: Path,
             print(f"[tune][stale] {arm} lr={lr:g} wd={wd:g} seed={seed}: cached trial ran under "
                   f"a different protocol (max_steps/batch/seq/lr/wd/model); retraining and overwriting")
         except (OSError, json.JSONDecodeError):
-            import logging as _logging; _logging.warning("Suppressed exception in tune.py:252")
+            import logging as _logging; _logging.warning("Suppressed exception in tune.py:252", exc_info=True)
     summary = run_one(
         f"{arm}|lr={lr:g}|wd={wd:g}|seed={seed}", {"norm_name": arm}, trial_args, run_dir, seed=seed,
         run_metadata=run_metadata,

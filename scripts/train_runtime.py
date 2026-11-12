@@ -148,7 +148,7 @@ def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
     try:
         out_path.unlink()
     except FileNotFoundError:
-        import logging as _logging; _logging.warning("Suppressed exception in train_runtime.py:150")
+        import logging as _logging; _logging.warning("Suppressed exception in train_runtime.py:150", exc_info=True)
     except OSError as exc:
         print(f"[errors][warn] could not remove stale {out_path}: {exc}",
               file=sys.stderr)

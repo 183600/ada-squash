@@ -149,7 +149,7 @@ class StudyRegistry:
                         record = StudyRecord.from_json(f.read())
                     self._records[record.study_id] = record
                 except (json.JSONDecodeError, KeyError):
-                    import logging as _logging; _logging.warning("Suppressed exception in filedrawer.py:148")
+                    import logging as _logging; _logging.warning("Suppressed exception in filedrawer.py:148", exc_info=True)
 
     def register(self, record: StudyRecord) -> str:
         """Register a study record."""

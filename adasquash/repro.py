@@ -455,7 +455,7 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     try:
         import numpy as np
     except ImportError:
-        import logging as _logging; _logging.warning("Suppressed exception in repro.py:457")
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:457", exc_info=True)
     else:
         np.random.seed(seed % (2 ** 32))
     # TensorFlow is an optional dependency of the training stack; seed it when
@@ -464,12 +464,12 @@ def set_all_seeds(seed: int, deterministic: bool = True) -> int:
     try:
         import tensorflow as tf
     except ImportError:
-        import logging as _logging; _logging.warning("Suppressed exception in repro.py:466")
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:466", exc_info=True)
     else:
         try:
             tf.random.set_seed(seed)
         except Exception:
-            import logging as _logging; _logging.warning("Suppressed exception in repro.py:471")
+            import logging as _logging; _logging.warning("Suppressed exception in repro.py:471", exc_info=True)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -508,18 +508,18 @@ def seed_worker(worker_id: int) -> None:
     try:
         import numpy as np
     except ImportError:
-        import logging as _logging; _logging.warning("Suppressed exception in repro.py:510")
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:510", exc_info=True)
     else:
         np.random.seed(seed)
     try:
         import tensorflow as tf
     except ImportError:
-        import logging as _logging; _logging.warning("Suppressed exception in repro.py:516")
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:516", exc_info=True)
     else:
         try:
             tf.random.set_seed(seed)
         except Exception:
-            import logging as _logging; _logging.warning("Suppressed exception in repro.py:521")
+            import logging as _logging; _logging.warning("Suppressed exception in repro.py:521", exc_info=True)
 
 
 def _run_git(*args: str) -> str | None:

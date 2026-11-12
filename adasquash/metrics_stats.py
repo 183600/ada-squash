@@ -287,7 +287,7 @@ def _mean_and_std(values: Sequence[float]):
             if std > 0.0 or all(value == values[0] for value in values):
                 return mean, std
     except OverflowError:
-        import logging as _logging; _logging.warning("Suppressed exception in metrics_stats.py:289")
+        import logging as _logging; _logging.warning("Suppressed exception in metrics_stats.py:289", exc_info=True)
     if not all(math.isfinite(value) for value in values):
         return mean, std
     scale = max(abs(value) for value in values)
@@ -598,7 +598,7 @@ def _int_over_sqrt(value: int, n: int) -> float:
     try:
         return value / math.sqrt(n)
     except OverflowError:
-        import logging as _logging; _logging.warning("Suppressed exception in metrics_stats.py:600")
+        import logging as _logging; _logging.warning("Suppressed exception in metrics_stats.py:600", exc_info=True)
     if value == 0:
         return 0.0
     try:
