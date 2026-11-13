@@ -398,7 +398,7 @@ def paired_trend_test(
                        "dose there is no slope to estimate")
         return out
 
-    labels = sorted((per_seed_values or {}), key=str)
+    labels = sorted((per_seed_values or {}), key=lambda k: (0, k) if isinstance(k, (int, float)) else (1, str(k)))
     # Different Python keys can stringify to the same seed id (JSON gives
     # `"42"`, a direct caller may pass `42`). The per-seed output is keyed by
     # the string form, so accepting both would silently overwrite one fitted

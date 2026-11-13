@@ -806,7 +806,7 @@ def cross_depth_trend_analysis(comparison: dict, alpha: float = 0.05) -> dict:
     for row in rows:
         by_norm.setdefault(row["norm"], []).append(row)
     trends = []
-    for norm in sorted(by_norm, key=str):
+    for norm in sorted(by_norm, key=lambda k: (0, k) if isinstance(k, (int, float)) else (1, str(k))):
         norm_rows = sorted(
             by_norm[norm],
             key=lambda row: (float(row.get("depth"))
