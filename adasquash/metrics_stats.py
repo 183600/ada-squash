@@ -980,6 +980,7 @@ def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
 
     A matrix run scans many rows against one reference, so an uncorrected
     alpha = 0.05 makes a "significant" win almost guaranteed by chance (with
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     19 rows the family-wise error rate approaches 1 - 0.95^19 ~ 62%). Holm's
     step-down is uniformly more powerful than plain Bonferroni and needs no
     assumption beyond validity of the individual p-values: sort ascending and

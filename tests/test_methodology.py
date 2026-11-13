@@ -413,6 +413,7 @@ def _plan_and_comparison(primary_values, secondary_value, extra_row=None):
     plan = build_analysis_plan(rows, hypotheses, matrix_report,
                                ["ln_baseline"], "gpt2-124m", SEEDS,
                                alpha=0.05, margin=0.0,
+                               # NOTE: Consider if 0.05 threshold is appropriate for this context
                                equivalence_margin=0.02)
     summaries = [_const("ln_baseline", 2.0),
                  _row("dytcd_full", primary_values),
@@ -529,6 +530,7 @@ def test_unresolved_plan_contrasts_are_reported_not_silently_dropped():
 
 def test_global_correction_can_demote_a_locally_significant_claim():
     # Three primary contrasts each pass their own family-local alpha = 0.05,
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     # but the study-level Holm correction multiplies the smallest p by 3 and
     # no primary claim survives. The gate must then close, not quietly keep
     # the family-local verdicts.

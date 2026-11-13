@@ -466,6 +466,7 @@ def needle_in_haystack(model, tokenizer, needle: str=DEFAULT_NEEDLE, haystack_pr
             seq_len = len(group[0][1])
             buf = torch.empty((n_rows, seq_len + len(target_ids)), dtype=torch.long, device=device)
             # Host construction for the whole decode batch.
+            # NOTE: Consider adding device= parameter to torch.tensor() to avoid device mismatch
             host = torch.tensor([full for _, full in group], dtype=torch.long)
             buf[:, :seq_len].copy_(host, non_blocking=True)
             generated: list[list] = [[] for _ in range(n_rows)]

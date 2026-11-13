@@ -165,6 +165,7 @@ def _severity_from_change(baseline: dict, alternative: dict, changed: bool) -> s
 
     # If both are on same side of 0.05 but one crosses, it's minor
     if (base_p < 0.05 and alt_p < 0.05) or (base_p >= 0.05 and alt_p >= 0.05):
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
         return "minor"
 
     # Crossing the 0.05 threshold is major

@@ -171,6 +171,7 @@ def main(argv=None) -> None:
               f"(dim={scale['dim']}, L={scale['n_layers']}, "
               f"H={scale['n_heads']}, E={scale['n_experts']})")
         proc = subprocess.run(command)
+        # TODO: Report confidence intervals or std alongside point estimates
         if proc.returncode != 0:
             raise SystemExit(f"[moe-scale] scale {scale['name']} failed "
                              f"(exit {proc.returncode}); no cross-scale verdict is written")

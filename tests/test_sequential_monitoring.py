@@ -71,6 +71,7 @@ def test_alpha_spending_rejects_unknown_methods(spending):
 
 def test_plan_freezes_looks_family_alpha_and_incremental_thresholds():
     plan = _plan(max_pairs=5, n_looks=2, alpha=0.05, n_tests=2)
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     assert plan["schema"] == "adasquash.sequential_plan.v1"
     assert plan["look_pairs"] == [3, 5]
     assert plan["family_alpha"] == pytest.approx(0.025)

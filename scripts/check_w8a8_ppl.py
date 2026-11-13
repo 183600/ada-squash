@@ -226,6 +226,7 @@ def compute_ce_sum(model, batch, target, device="cuda"):
 
     The pair stays on the device; the loss is widened to fp64 before the
     multiply so the accumulated total is fp64. `model.eval()` is the caller's
+    # WARNING: Consider wrapping inference in torch.no_grad() to save memory
     responsibility (once per model, not once per batch).
     """
     batch = batch.to(device)

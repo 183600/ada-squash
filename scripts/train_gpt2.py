@@ -1079,6 +1079,7 @@ def main():
                     # skipped, so the reported loss is the raw CE value.
                     loss = loss / args.grad_accum
                 loss.backward()
+                # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
             # Device-side group reduction: `mean` propagates NaN/Inf, so a
             # finite group mean certifies every micro. A non-finite mean is the
             # rare path and uses the `.tolist()` to locate the bad micro for

@@ -125,6 +125,7 @@ def test_an_infeasible_budget_is_reported_instead_of_shrinking_the_design():
 def test_every_candidate_carries_the_power_of_the_primary_claim():
     plan = study_budget_plan(_runs(), budget_hours=1.0, min_seeds=3,
                               paired_sd=0.1, margin=0.05, alpha=0.05,
+                              # NOTE: Consider if 0.05 threshold is appropriate for this context
                               power=0.8, n_tests=4)
     for candidate in plan["candidates"]:
         power = candidate["primary_power"]

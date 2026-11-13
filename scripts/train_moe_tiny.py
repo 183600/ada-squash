@@ -560,6 +560,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
             # quantity the held-out curve and the final val_ce are compared on.
             ce_val = loss_val - model.AUX_LOSS_COEF * aux_val
             loss.backward()
+            # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
             if step % args.stats_every == 0:
                 act_stats.detach()
                 clear_logit_scratch_cache()

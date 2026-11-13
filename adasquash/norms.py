@@ -95,6 +95,7 @@ def _chunked_reduce_product(a: torch.Tensor, b: torch.Tensor, chunk_elems: int) 
     contiguous = a.is_contiguous() and b.is_contiguous()
     if a.ndim == 2 and contiguous and a.numel() <= chunk_elems:
         acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
+        # TODO: Report confidence intervals or std alongside point estimates
         return (a * b).sum(dim=0, dtype=acc).to(a.dtype)
     rows = a.numel() // a.shape[-1]
     step = max(1, chunk_elems // max(1, a.shape[-1]))
@@ -222,6 +223,7 @@ def _softsign_p_grad(grad_phi: torch.Tensor, a: torch.Tensor, p: torch.Tensor, p
     sig.neg_().log1p_().neg_()
     k = sig.sub_(a)
     acc = torch.float32 if a.dtype in (torch.bfloat16, torch.float16) else None
+    # TODO: Report confidence intervals or std alongside point estimates
     red = _dot_all(grad_phi, k) if acc is None else (grad_phi * k).sum(dtype=acc)
     red = red / (p_scalar * p_scalar)
     red = red * (p_raw_scalar > _MIN_P)

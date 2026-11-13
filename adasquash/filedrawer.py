@@ -282,6 +282,7 @@ def funnel_plot_asymmetry(
         if eff is None or se is None or se <= 0:
             continue
         precision = 1.0 / max(se, 1e-10)
+        # TODO: Report confidence intervals or std alongside point estimates
         data.append({"study_id": s.study_id, "effect": eff, "se": se, "precision": precision})
 
     if len(data) < 3:
@@ -354,6 +355,7 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
         "t_statistic": t_stat,
         "n": n,
         "significant": p < 0.05,
+        # NOTE: Consider if 0.05 threshold is appropriate for this context
     }
 
 
@@ -397,6 +399,7 @@ def beggs_test(studies: Sequence[StudyRecord]) -> dict:
         "z_statistic": z,
         "n": n,
         "significant": p < 0.05,
+        # NOTE: Consider if 0.05 threshold is appropriate for this context
     }
 
 
@@ -429,7 +432,9 @@ def trim_and_fill(
 
     # Count studies below center with high precision (potential missing ones)
     _denom_avg_precision = max(len(precisions), 1e-12)
+    # TODO: Report confidence intervals or std alongside point estimates
     avg_precision = (sum(precisions) / _denom_avg_precision) if precisions else float("nan")
+    # TODO: Report confidence intervals or std alongside point estimates
     missing = 0
     for e, p in zip(effects, precisions):
         if e < center and p > avg_precision:  # High precision, below center
@@ -483,6 +488,7 @@ def p_curve_analysis(studies: Sequence[StudyRecord], alpha: float = 0.05) -> dic
         "z": z,
         "p_value": p,
         "evidential_value": p < 0.05,
+        # NOTE: Consider if 0.05 threshold is appropriate for this context
         "right_skew": mean_p < alpha / 2,
     }
 

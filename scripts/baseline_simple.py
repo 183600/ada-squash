@@ -248,6 +248,7 @@ def walk_rule_stats(split: dict, n_states: int, max_jump: int, outlier_id) -> di
         is_outlier = torch.zeros_like(x_raw, dtype=torch.bool)
     else:
         is_outlier = x_raw.eq(int(outlier_id))
+    # NOTE: Consider adding device= parameter to torch.tensor() to avoid device mismatch
     jump_p = torch.tensor(wrapped_jump_probs(n_states, max_jump), dtype=torch.float64,
                           device=x_raw.device)
     step = (y_raw - x_raw).remainder(int(n_states))

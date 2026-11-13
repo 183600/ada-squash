@@ -96,6 +96,7 @@ def run_one(name: str, cfg_kwargs: dict, args, output_dir: Path, run_metadata: d
         # Backward is enqueued first; `loss` is not mutated by it, so the
         # host read below returns the same value.
         loss.backward()
+        # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
         loss_val = float(loss.detach())
         if not math.isfinite(loss_val):
             triage = triage_nonfinite(model, x, y, device_type=device,

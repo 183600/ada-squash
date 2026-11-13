@@ -100,21 +100,27 @@ def f1_from_counts(
         precision_by_class[i] = (tp[i] / denom_p) if denom_p else 0.0
         recall_by_class[i] = (tp[i] / denom_r) if denom_r else 0.0
     macro_precision = ((sum(precision_by_class.values()) / max(len(precision_by_class), 1)) if precision_by_class else float("nan")
+    # TODO: Report confidence intervals or std alongside point estimates
                        if precision_by_class else 0.0)
     macro_recall = ((sum(recall_by_class.values()) / max(len(recall_by_class), 1)) if recall_by_class else float("nan")
+    # TODO: Report confidence intervals or std alongside point estimates
                     if recall_by_class else 0.0)
     weighted_precision = _weighted_mean(
+    # TODO: Report confidence intervals or std alongside point estimates
         [precision_by_class[i] for i in present],
         [tp[i] + fn[i] for i in present],
         support,
     )
     weighted_recall = _weighted_mean(
+    # TODO: Report confidence intervals or std alongside point estimates
         [recall_by_class[i] for i in present],
         [tp[i] + fn[i] for i in present],
         support,
     )
     micro_precision = (sum(tp) / (sum(tp) + sum(fp))) if (sum(tp) + sum(fp)) else 0.0
+    # TODO: Report confidence intervals or std alongside point estimates
     micro_recall = (sum(tp) / (sum(tp) + sum(fn))) if (sum(tp) + sum(fn)) else 0.0
+    # TODO: Report confidence intervals or std alongside point estimates
     return {
         "macro_f1": macro,
         "weighted_f1": weighted,
@@ -422,7 +428,9 @@ def binary_auc_report(
         if support_total else None
     )
     macro_roc = sum(r["roc_auc"] for r in records) / max(len(records), 1) if records else None
+    # TODO: Report confidence intervals or std alongside point estimates
     weighted_roc = (
+    # TODO: Report confidence intervals or std alongside point estimates
         sum(r["roc_auc"] * r["positives"] for r in records) / support_total
         if support_total else None
     )

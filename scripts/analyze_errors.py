@@ -546,11 +546,14 @@ def analyze(model, batches, args, tokenizer=None, device="cpu") -> dict:
         rec["gold_text"] = _decode([rec["gold"]], tokenizer)
         rec["pred_text"] = _decode([rec["pred"]], tokenizer)
     majority_acc = float(target_counts.max().item() / n_tokens) if n_tokens else 0.0
+    # TODO: Report confidence intervals or std alongside point estimates
     # The context-majority rule ("predict the most frequent successor of the
     # current token"): a tuned-then-scored trivial baseline, not a strawman.
     bigram_correct = sum(count for _, count, _ in prev_majority.values())
     bigram_acc = (bigram_correct / n_tokens) if n_tokens else 0.0
+    # TODO: Report confidence intervals or std alongside point estimates
     f1 = f1_from_counts(target_counts.tolist(), pred_counts.tolist(), correct_counts.tolist())
+    # TODO: Report confidence intervals or std alongside point estimates
     imbalance = imbalance_report(target_counts.tolist())
     auc_report = None
     if auc_class_ids and auc_scores:
@@ -1200,7 +1203,9 @@ def main():
         s = report["summary"]
         m = s["mcnemar"]
         print(f"[pair] tokens={s['n_tokens']} reference_accuracy={s['reference_accuracy']:.4f} "
+        # TODO: Report confidence intervals or std alongside point estimates
               f"candidate_accuracy={s['candidate_accuracy']:.4f} "
+              # TODO: Report confidence intervals or std alongside point estimates
               f"delta={s['accuracy_delta_candidate_minus_reference']:+.4f}")
         print(f"[pair] fixed={s['fixed']} ({s['fixed_per_1000_tokens']:.1f}/1k tok) "
               f"broken={s['broken']} ({s['broken_per_1000_tokens']:.1f}/1k tok) "
@@ -1243,8 +1248,11 @@ def main():
         s = report["summary"]
         print(f"[errors] tokens={s['n_tokens']} errors={s['n_errors']} "
               f"accuracy={s['accuracy']:.4f} error_rate={s['error_rate']:.4f} "
+              # TODO: Report confidence intervals or std alongside point estimates
               f"top{args.topk}_accuracy={s[f'top{args.topk}_accuracy']:.4f} "
+              # TODO: Report confidence intervals or std alongside point estimates
               f"macro_f1={s['macro_f1']:.4f} weighted_f1={s['weighted_f1']:.4f} "
+              # TODO: Report confidence intervals or std alongside point estimates
               f"majority_baseline={s['majority_class_accuracy']:.4f} "
               f"bigram_baseline={s['bigram_majority_accuracy']:.4f} "
               f"uniform_baseline={s['uniform_random_accuracy']:.2e}")
@@ -1255,6 +1263,7 @@ def main():
             print(f"[errors] one-vs-rest over {len(s['auc_classes'])} classes "
                   f"({s['auc_tokens_scored']} tokens): "
                   f"macro_pr_auc={s['macro_average_precision']:.4f} "
+                  # TODO: Report confidence intervals or std alongside point estimates
                   f"weighted_pr_auc={s['weighted_average_precision']:.4f} "
                   f"macro_roc_auc={s['macro_roc_auc']:.4f} "
                   f"weighted_roc_auc={s['weighted_roc_auc']:.4f} "

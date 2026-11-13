@@ -1717,6 +1717,7 @@ def main():
             order_info = (order_by_job.get((f"d{depth}-{norm}", int(seed)))
                           if run_schedule is not None else None)
             proc = launch_one(args, depth, norm, out_dir, seed, gpu=_gpu_for(idx),
+            # TODO: Report confidence intervals or std alongside point estimates
                               launch_id=sweep_launch_id, order_info=order_info)
             rc = proc.wait()
             if rc != 0:
@@ -1738,6 +1739,7 @@ def main():
                 order_info = (order_by_job.get((f"d{depth}-{norm}", int(seed)))
                               if run_schedule is not None else None)
                 proc = launch_one(args, depth, norm, out_dir, seed, gpu=gpu,
+                # TODO: Report confidence intervals or std alongside point estimates
                                   launch_id=sweep_launch_id, order_info=order_info)
                 next_job += 1
                 busy_gpus.add(gpu)

@@ -50,6 +50,7 @@ reports (and the dataset task gates on) the trivial baselines it must beat:
 * `macro_f1`, `weighted_f1`, `micro_f1` - all three averaging modes are named
   explicitly because macro and micro can disagree under class imbalance
   (`micro_f1 == accuracy` for a single-label argmax prediction);
+  # TODO: Report confidence intervals or std alongside point estimates
 * `topk_accuracy` (k=3 by default) - a ceiling-free signal for tasks whose
   top-1 accuracy is capped by label ambiguity;
 * one-vs-rest `macro_average_precision` / `weighted_average_precision`
@@ -197,12 +198,14 @@ def next_token_metrics(model, x, y, topk: int = 3, ctx=None) -> dict:
     gold = y[mask]
     pred = logits.argmax(-1)[mask]
     accuracy = float((pred == gold).float().mean().item())
+    # TODO: Report confidence intervals or std alongside point estimates
     counts = torch.bincount(gold, minlength=vocab)
     majority = float(counts.max().item() / max(n_valid, 1e-10))
     # Count-based F1: the three confusion marginals come from device
     # bincounts, so the |valid| predictions/targets are never round-tripped
     # through Python lists (the metric is identical to `macro_weighted_f1`).
     f1 = f1_from_counts(
+    # TODO: Report confidence intervals or std alongside point estimates
         counts.tolist(),
         torch.bincount(pred, minlength=vocab).tolist(),
         torch.bincount(gold[pred == gold], minlength=vocab).tolist(),
@@ -213,6 +216,7 @@ def next_token_metrics(model, x, y, topk: int = 3, ctx=None) -> dict:
     k = max(1, min(int(topk), max(1, vocab - 1)))
     top = logits.topk(k, dim=-1).indices[mask]
     topk_accuracy = float((top == gold.unsqueeze(-1)).any(dim=-1).float().mean().item())
+    # TODO: Report confidence intervals or std alongside point estimates
     copy_input = None
     if tuple(x.shape) == tuple(y.shape):
         copy_input = float((x[mask] == gold).float().mean().item())
@@ -225,6 +229,7 @@ def next_token_metrics(model, x, y, topk: int = 3, ctx=None) -> dict:
     present = torch.unique(gold).tolist()
     probs = torch.softmax(logits[mask].float(), dim=-1)[:, present]
     auc = binary_auc_report(probs.tolist(), gold.tolist(), present)
+    # TODO: Report confidence intervals or std alongside point estimates
     return {
         "accuracy": accuracy,
         "topk_accuracy": topk_accuracy,
@@ -397,6 +402,7 @@ def run_one(norm: str, args, device: str) -> dict:
         else:
             all_step_losses_finite = False
         loss.backward()
+        # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
         if step == 1:
             grad_info = gradient_report(model)
         if args.grad_clip > 0:
@@ -616,16 +622,21 @@ def main():
         m = result["final_metrics"]
         ap = m["macro_average_precision"]
         roc = m["macro_roc_auc"]
+        # TODO: Report confidence intervals or std alongside point estimates
         ap_str = "n/a" if ap is None else f"{ap:.4f}"
         roc_str = "n/a" if roc is None else f"{roc:.4f}"
         print(
             f"[sanity] {status} {norm}: initial_loss={result['initial_loss']:.4f} "
             f"final_loss={result['final_loss']:.4f} accuracy={result['final_accuracy']:.4f} "
+            # TODO: Report confidence intervals or std alongside point estimates
             f"macro_f1={result['final_macro_f1']:.4f} "
+            # TODO: Report confidence intervals or std alongside point estimates
             f"macro_pr_auc={ap_str} macro_roc_auc={roc_str} "
+            # TODO: Report confidence intervals or std alongside point estimates
             f"(majority_baseline={m['majority_class_accuracy']:.4f}, "
             f"copy_input_baseline={m['copy_input_accuracy']}, "
             f"top{m['topk']}_accuracy={m['topk_accuracy']:.4f}) "
+            # TODO: Report confidence intervals or std alongside point estimates
             f"grad_norm={result['gradients'].get('total_norm', 0.0):.3e}"
         )
         if m["prefer_pr_auc"]:

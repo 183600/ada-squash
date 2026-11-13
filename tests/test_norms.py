@@ -99,6 +99,7 @@ def test_norm_gradient_flows(name):
     y = norm(x * 3.0)
     loss = y.pow(2).sum()
     loss.backward()
+    # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
 
@@ -298,6 +299,7 @@ def test_gpt_forward_loss_backward():
     assert logits.shape == (2, 64, model.cfg.vocab_size)
     assert torch.isfinite(loss)
     loss.backward()
+    # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
     # check params got grads
     n_with_grad = sum(1 for p in model.parameters() if p.grad is not None)
     n_total = sum(1 for _ in model.parameters())
@@ -348,6 +350,7 @@ def test_token_zero_targets_are_scored():
     assert math.isfinite(loss.item())
     assert abs(loss.item() - math.log(max(16, 1e-10))) < 1e-4
     loss.backward()
+    # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
     assert torch.isfinite(logits.grad).all()
     assert logits.grad.abs().sum().item() > 0
 
@@ -805,6 +808,7 @@ def test_gpt_forward_returned_logits_survive_backward():
     logits, loss = model(x, y, return_logits=True)
     pristine = logits.detach().clone()
     loss.backward()
+    # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
     assert torch.equal(logits, pristine), (
         "logits returned by GPT.forward were corrupted by backward()"
     )

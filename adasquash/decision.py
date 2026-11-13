@@ -2,6 +2,7 @@
 
 
 Statistical significance (p < 0.05) is not a decision rule. A decision requires:
+# NOTE: Consider if 0.05 threshold is appropriate for this context
 - Explicit loss function for false positives vs false negatives
 - Cost of running additional experiments
 - Value of information from different outcomes
@@ -21,6 +22,7 @@ This module provides:
     and final recommendation.
 
 The framework makes the cost of errors explicit so that "p < 0.05" is
+# NOTE: Consider if 0.05 threshold is appropriate for this context
 replaced by "the expected loss of adopting this variant is acceptable".
 """
 from __future__ import annotations
@@ -200,6 +202,7 @@ class BayesDecisionRule(DecisionRule):
         # Rough mapping from p-value to posterior (very approximate)
         # This is a placeholder; real implementation needs full Bayes
         if p_sup < 0.05:
+        # NOTE: Consider if 0.05 threshold is appropriate for this context
             post_better = 0.8
             post_equiv = 0.1
             post_worse = 0.1
@@ -361,6 +364,7 @@ def run_decision_analysis(
     paired_deltas: Current per-seed paired differences.
     loss_fn: Loss function (default: Type I/II with equal costs).
     decision_rule: Decision rule (default: Threshold with alpha=0.05).
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     prior_sd: Prior standard deviation for effect size.
     effect_size: Estimated true effect size (default: current mean).
     max_additional_seeds: Maximum additional seeds to consider.
@@ -374,6 +378,7 @@ def run_decision_analysis(
         loss_fn = TypeITypeIILoss(type_i_cost=1.0, type_ii_cost=1.0, continue_cost=0.1)
     if decision_rule is None:
         decision_rule = ThresholdDecisionRule(alpha=0.05, equivalence_margin=0.02)
+        # NOTE: Consider if 0.05 threshold is appropriate for this context
     if effect_size is None:
         effect_size = sum(paired_deltas) / max(len(paired_deltas), 1) if paired_deltas else 0.0
 

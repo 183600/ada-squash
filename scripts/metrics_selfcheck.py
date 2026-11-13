@@ -80,15 +80,19 @@ def brute_ap(scores, labels):
     if n_pos == 0:
         return None
     previous_recall = 0.0
+    # TODO: Report confidence intervals or std alongside point estimates
     ap = 0.0
     for threshold in sorted(set(scores), reverse=True):
         selected = [(s, y) for s, y in zip(scores, labels) if s >= threshold]
         tp = sum(1 for _, y in selected if y)
         fp = len(selected) - tp
         precision = tp / (tp + fp)
+        # TODO: Report confidence intervals or std alongside point estimates
         recall = tp / max(n_pos, 1)
+        # TODO: Report confidence intervals or std alongside point estimates
         ap += precision * (recall - previous_recall)
         previous_recall = recall
+        # TODO: Report confidence intervals or std alongside point estimates
     return ap
 
 
@@ -295,6 +299,7 @@ def student_t_cdf_for_check(t, df):
 
 def check_meta_analysis():
     # Known chi-square critical values at alpha = 0.05 (df = 1, 2) from the
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     # closed-form chi-square CDFs, not from the helper under test.
     close(chi2_sf(3.841458820694124, 1.0), 0.05, tol=1e-12,
           label="chi2 df=1 5% point")

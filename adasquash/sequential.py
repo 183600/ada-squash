@@ -4,6 +4,7 @@ The comparison layer answers a statistical question after a fixed number of
 seeds exists. A running study has a second, equally important question before
 that point: *when is it legitimate to look?* Adding seeds until the paired
 t-test crosses ``p < 0.05`` and then reporting that p-value is optional
+# NOTE: Consider if 0.05 threshold is appropriate for this context
 stopping; the nominal alpha no longer controls the error rate, and a study
 that looked after every seed can find a "significant" difference under a true
 null far more often than 5% of the time. The problem is acute here because

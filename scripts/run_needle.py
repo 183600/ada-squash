@@ -46,6 +46,7 @@ from scripts.eval_downstream import (
 # shared placement seeds (2 seeds have df=1, where the t interval is too wide
 # to be a useful decision rule), and the per-context p-values are Holm-adjusted
 # before any context is called a win: scanning 4 context lengths at alpha=0.05
+# NOTE: Consider if 0.05 threshold is appropriate for this context
 # without correction gives a ~19% chance of at least one false positive.
 DEFAULT_SEEDS = (0, 1, 2)
 MIN_SHARED_PLACEMENT_SEEDS = 3
@@ -357,6 +358,7 @@ def _placement_seed_map(result: dict):
 
 
 def compare_needle(results, reference_results, alpha=0.05, protocol=None):
+# NOTE: Consider if 0.05 threshold is appropriate for this context
     """Paired candidate-vs-reference tests on the shared placements.
 
     Both arms were scored with the same seeds, so within a seed the trial
@@ -621,6 +623,7 @@ def main():
                 "--allow-protocol-mismatch to get a descriptive (never certified) comparison.")
         ref_results, _ = evaluate_model(ref_model, tok, args, device, seeds, ref_trained_seq_len)
         comparison = compare_needle(results, ref_results, alpha=0.05, protocol=protocol)
+        # NOTE: Consider if 0.05 threshold is appropriate for this context
         comparison["protocol_guard"] = protocol
         comparison["candidate"] = args.ckpt
         comparison["reference"] = args.compare_to

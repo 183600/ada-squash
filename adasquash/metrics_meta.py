@@ -41,6 +41,7 @@ def paired_randomization_test(
     seed-level differences are approximately normal. With the 3-5 seeds the
     experiments actually run, that assumption is doing real work: the t-test
     can return ``p < 0.05`` from three consistent runs, while a
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     distribution-free test cannot. This function supplies the model-free
     counterpart. It tests H0 "the paired differences are symmetric about
     ``-margin``" against H1 "the mean difference is below ``-margin``" by
@@ -487,6 +488,7 @@ def paired_trend_test(
             slope_replication["same_direction_probability"])
     slope_replication_95 = (slope_replication if float(alpha) == 0.05
                             else mean_prediction_interval(slopes, alpha=0.05))
+                            # NOTE: Consider if 0.05 threshold is appropriate for this context
     if slope_replication_95 is not None:
         out["slope_prediction_interval_95"] = [
             slope_replication_95["prediction_low"],
@@ -532,6 +534,7 @@ def paired_trend_test(
                               test["ci_high"] * test_scale]
     elif test.get("df"):
         test_95 = paired_t_one_sided(test_slopes, [0.0] * n, alpha=0.05)
+        # NOTE: Consider if 0.05 threshold is appropriate for this context
         out["slope_ci_95"] = [test_95["ci_low"] * test_scale,
                               test_95["ci_high"] * test_scale]
     if stats is not None and stats["stderr"] is not None and test["df"]:

@@ -148,6 +148,7 @@ def test_analysis_plan_freezes_the_pilot_evidence():
     hypotheses = dict.fromkeys(rows, "h")
     matrix_report = {"leave_one_out": {}, "factorial": {}, "qk_axis": {}}
     kwargs = dict(alpha=0.05, margin=0.0, equivalence_margin=0.0)
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     without = build_analysis_plan(
         rows, hypotheses, matrix_report, ["ln_baseline"], "gpt2-124m",
         [42, 43, 44], **kwargs)

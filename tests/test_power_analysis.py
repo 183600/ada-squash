@@ -106,6 +106,7 @@ def test_ablation_report_exposes_the_design_block():
     noisy = _row("dytcd_full", {42: 1.90, 43: 1.95, 44: 2.05})
     out = baseline_comparison([baseline, noisy], ["ln_baseline"],
                               margin=0.05, alpha=0.05)
+                              # NOTE: Consider if 0.05 threshold is appropriate for this context
     entry = out["rows"][0]
     design = entry["design_power"]
     assert design["paired_sd"] > 0.0

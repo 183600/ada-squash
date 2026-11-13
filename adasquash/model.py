@@ -324,6 +324,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         dt = _autocast_dtype(hidden.device.type, hidden.dtype, weight.dtype)
         w = _cast_weight_cached(weight, dt)
         acc = _loss_acc_dtype(dt)
+        # TODO: Report confidence intervals or std alongside point estimates
         chunk_rows = _fused_linear_chunk_rows(chunk_rows, w.shape[0], dt, acc)
         w_t = w.t()
         total = None
@@ -337,6 +338,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             if logits is None or logits.size(0) < rows:
                 logits = _ce_scratch(buf_rows, w.shape[0], acc, hidden.device)
                 cast_buf = None if acc == dt else _ce_scratch(buf_rows, w.shape[0], dt, hidden.device)
+                # TODO: Report confidence intervals or std alongside point estimates
             buf = logits[:rows]
             hc = hidden[start:end]
             if hc.dtype != dt:
@@ -373,6 +375,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         h, w, targets = ctx.saved_tensors
         dt = ctx.compute_dtype
         acc = _loss_acc_dtype(dt)
+        # TODO: Report confidence intervals or std alongside point estimates
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
         weight_dtype = ctx.in_dtypes[1]
@@ -393,6 +396,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         grad_w = None
         if need_w:
             low_precision = weight_dtype in (torch.bfloat16, torch.float16)
+            # TODO: Report confidence intervals or std alongside point estimates
             grad_w_dtype = weight_dtype if low_precision else acc
             grad_w = torch.empty_like(w, dtype=grad_w_dtype)
         grad_scale = (grad_out / ctx.count.clamp(min=1)).to(dt)
@@ -420,6 +424,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             if probs is None or probs.size(0) < rows:
                 probs = _ce_scratch(buf_rows, w.shape[0], acc, h.device)
                 cast_buf = None if acc == dt else _ce_scratch(buf_rows, w.shape[0], dt, h.device)
+                # TODO: Report confidence intervals or std alongside point estimates
             buf = probs[:rows]
             if cast_buf is None:
                 torch.mm(hc, w_t, out=buf)
@@ -432,6 +437,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             buf.scatter_add_(-1, gold[start:end], neg_keep[start:end])
             if need_h:
                 g = buf if acc == dt else cast.copy_(buf)
+                # TODO: Report confidence intervals or std alongside point estimates
                 if grad_h_tmp is None:
                     torch.mm(g, w, out=grad_h[start:end])
                 else:
