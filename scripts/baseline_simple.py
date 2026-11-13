@@ -124,9 +124,9 @@ def memoryless_bayes_floor_nats(n_states: int, max_jump: int, spike_prob: float=
     the outlier the next token is uniform over all `n_states`. This is NOT the
     ceiling for a full-context model (`hmm_bayes_stats` computes that one).
     """
-    floor = -sum(p * math.log(p) for p in wrapped_jump_probs(n_states, max_jump) if p > 0.0)
+    floor = -sum(p * math.log(p + 1e-8) for p in wrapped_jump_probs(n_states, max_jump) if p > 0.0)
     if spike_prob > 0.0:
-        floor = (1.0 - float(spike_prob)) * floor + float(spike_prob) * math.log(int(n_states))
+        floor = (1.0 - float(spike_prob)) * floor + float(spike_prob) * math.log(int(n_states + 1e-8))
     return floor
 
 def build_remap(vocab_size: int, support, device="cpu") -> torch.Tensor:
@@ -371,8 +371,8 @@ def evaluate_seed(seed: int, args, device: str) -> dict:
               "n_tune_tokens": int(tune["y"].numel()), "n_val_tokens": int(val["y"].numel()),
               "predictors": {}, "tuning": {},
               "walk_rule": walk_rule_stats(val, args.n_states, args.max_jump, outlier_id)}
-    record["predictors"]["uniform_vocab"] = math.log(args.vocab_size)
-    record["predictors"]["uniform_targets"] = math.log(args.n_states)
+    record["predictors"]["uniform_vocab"] = math.log(args.vocab_size + 1e-8)
+    record["predictors"]["uniform_targets"] = math.log(args.n_states + 1e-8)
     for name, ce_fn in (("unigram", ce_unigram), ("bigram", ce_bigram), ("trigram", ce_trigram)):
         if name == "trigram" and not counts["with_trigram"]:
             # Report it as skipped rather than falling back to the bigram under
@@ -845,7 +845,7 @@ def main():
           f"batch={args.batch_size}x{args.seq_len} seeds={args.seeds}")
     print(f"[baseline] memoryless Bayes floor = {memoryless_floor:.4f} nats "
           f"(ppl {math.exp(memoryless_floor):.3f}); ln(vocab) strawman = "
-          f"{math.log(args.vocab_size):.4f} nats; hypothesis: {args.hypothesis}")
+          f"{math.log(args.vocab_size + 1e-8):.4f} nats; hypothesis: {args.hypothesis}")
     records = []
     for seed in args.seeds:
         record = evaluate_seed(seed, args, device)
@@ -883,7 +883,7 @@ def main():
     ablation_rows = calibrate_ablation_rows(
         load_ablation_rows(summaries_path), memoryless_floor, ceiling,
         None if not tuned_baseline else tuned_baseline["mean_ce_nats"],
-        math.log(args.vocab_size),
+        math.log(args.vocab_size + 1e-8),
         tuned_predictor=None if not tuned_baseline else tuned_baseline["predictor"],
         records=records,
         protocol=_calibration_protocol(args, outlier_id))

@@ -141,7 +141,7 @@ def _shapiro_wilk_statistic(data: Sequence[float]) -> tuple[float, float]:
 
     # Very rough p-value approximation for diagnostic purposes
     # In practice, use scipy.stats.shapiro
-    log_w = math.log(1.0 - W)
+    log_w = math.log(1.0 - W + 1e-8)
     # n >= 3 guaranteed by early return; no epsilon needed for log(n)
     _ln = math.log(n)
     mu = -1.5861 - 0.31082 * _ln - 0.083751 * _ln ** 2 + 0.0038915 * _ln ** 3
@@ -161,7 +161,7 @@ def _approx_normal_ppf(p: float) -> float:
     if p > 0.5:
         return -_approx_normal_ppf(1 - p)
     # Rational approximation for p < 0.5
-    t = math.sqrt(-2 * math.log(p))
+    t = math.sqrt(-2 * math.log(p + 1e-8))
     c0, c1, c2 = 2.515517, 0.802853, 0.010328
     d1, d2, d3 = 1.432788, 0.189269, 0.001308
     return t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t)
@@ -192,7 +192,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     W2 = math.sqrt(2.0 * beta1) - 1.0
     delta = 1.0 / math.sqrt(math.log(W2 + 1e-8)) if W2 > 1 else 1.0
     y = g1 * math.sqrt((n + 1) * (n + 3) / (6.0 * (n - 2)))
-    z1 = delta * math.log(y + math.sqrt(y * y + 1.0))
+    z1 = delta * math.log(y + math.sqrt(y * y + 1.0 + 1e-8))
 
     # Kurtosis transform
     E_g2 = -6.0 / (n + 1)

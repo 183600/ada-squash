@@ -660,12 +660,12 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
             cf = _betacf(a, b, x)
             if cf <= 0.0:
                 return 0.0
-            lr = log_bt + math.log(cf) - math.log(a)
+            lr = log_bt + math.log(cf + 1e-8) - math.log(a + 1e-8)
             return min(1.0, math.exp(lr)) if lr > -745.0 else 0.0
         cf = _betacf(b, a, 1.0 - x)
         if cf <= 0.0:
             return 1.0
-        lr = log_bt + math.log(cf) - math.log(b)
+        lr = log_bt + math.log(cf + 1e-8) - math.log(b + 1e-8)
         return 1.0 - (min(1.0, math.exp(lr)) if lr > -745.0 else 0.0)
     bt = math.exp(log_bt) if log_bt > -745.0 else 0.0
     if x < (a + 1.0) / (a + b + 2.0):
@@ -1274,7 +1274,7 @@ def _hedges_correction(df: float) -> float:
     try:
         log_j = (
             math.lgamma(df / 2.0)
-            - 0.5 * math.log(df / 2.0)
+            - 0.5 * math.log(df / 2.0 + 1e-8)
             - math.lgamma((df - 1.0) / 2.0))
         j = math.exp(log_j)
     except OverflowError:
