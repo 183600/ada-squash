@@ -982,7 +982,7 @@ def order_drift_report(observations: Sequence[dict], alpha: float = 0.05,
         per_arm.append({
             "arm": arm,
             "count": len(records),
-            "mean_position": (sum(positions) / len(positions)) if positions else float("nan"),
+            "mean_position": (sum(positions) / max(len(positions), 1)) if positions else float("nan"),
             "position_span": max(positions) - min(positions),
             "mean_residual": (
                 math.fsum(record["residual"] for record in records)
