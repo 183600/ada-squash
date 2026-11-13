@@ -26,6 +26,7 @@ from adasquash.results_analysis import (
     replication_probability,
     trimmed_mean_ci,
     wilcoxon_signed_rank,
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
 )
 
 # Fixed seeds for reproducibility
@@ -34,65 +35,83 @@ SEEDS = (42, 43, 44, 45, 46)
 
 class TestWilcoxonSignedRank:
     def test_wilcoxon_basic_less(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         """One-sided test where all differences are negative (candidate better)."""
         a = [1.0, 1.1, 0.9, 1.05, 0.95]  # candidate
         b = [1.5, 1.6, 1.4, 1.55, 1.45]  # reference
         out = wilcoxon_signed_rank(a, b, alternative="less")
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         # All negative -> W+ = 0 (sum of positive ranks)
         assert out["p_value"] < 0.05
         assert out["statistic"] == 0  # W+ = 0 when all negative
         assert out["method"] == "exact"
 
     def test_wilcoxon_basic_greater(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         """One-sided test where all differences are positive (reference better)."""
         a = [1.5, 1.6, 1.4, 1.55, 1.45]
         b = [1.0, 1.1, 0.9, 1.05, 0.95]
         out = wilcoxon_signed_rank(a, b, alternative="greater")
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         assert out["p_value"] < 0.05
         assert out["statistic"] == 15  # W+ = 15 when all positive
 
     def test_wilcoxon_two_sided(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         """Two-sided test."""
         a = [1.0, 1.1, 0.9, 1.05, 0.95]
         b = [1.5, 1.6, 1.4, 1.55, 1.45]
         out = wilcoxon_signed_rank(a, b, alternative="two-sided")
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         # n=5 all negative -> min two-sided p = 2/32 = 0.0625
         assert out["p_value"] == pytest.approx(0.0625)
 
     def test_wilcoxon_with_zeros_pratt(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         """Pratt method handles zeros."""
         a = [1.0, 1.0, 1.1, 0.9]
         b = [1.0, 1.5, 1.4, 1.0]  # one zero diff
         out = wilcoxon_signed_rank(a, b, zero_method="pratt")
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         assert out["n"] == 4  # zeros kept
         assert out["zero_method"] == "pratt"
 
     def test_wilcoxon_wilcoxon_method_discards_zeros(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         """Wilcoxon method discards zeros."""
         a = [1.0, 1.0, 1.1, 0.9]
         b = [1.0, 1.5, 1.4, 1.0]
         out = wilcoxon_signed_rank(a, b, zero_method="wilcoxon")
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         assert out["n"] == 3  # one zero discarded
 
     def test_wilcoxon_hl_estimator(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         """Hodges-Lehmann estimator is the pseudo-median."""
         a = [1.0, 1.1, 0.9, 1.05, 0.95]
         b = [1.5, 1.6, 1.4, 1.55, 1.45]
         out = wilcoxon_signed_rank(a, b)
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         assert out["hodges_lehmann"] is not None
         assert out["hl_ci"][0] <= out["hodges_lehmann"] <= out["hl_ci"][1]
 
     def test_wilcoxon_invalid_alternative(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         with pytest.raises(ValueError):
             wilcoxon_signed_rank([1,2], [3,4], alternative="invalid")
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
 
     def test_wilcoxon_invalid_zero_method(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         with pytest.raises(ValueError):
             wilcoxon_signed_rank([1,2], [3,4], zero_method="invalid")
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
 
     def test_wilcoxon_mismatched_lengths(self):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         with pytest.raises(ValueError):
             wilcoxon_signed_rank([1,2,3], [4,5])
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
 
 
 class TestTrimmedMeanCI:

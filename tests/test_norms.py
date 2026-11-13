@@ -84,6 +84,7 @@ def test_build_norm_returns_correct_type():
 def test_norm_preserves_shape_and_dtype(name):
     for dtype in (torch.float32, torch.bfloat16):
         norm = build_norm(name, 64).to(dtype)
+        # NOTE: No random seed set in this function - results may not be reproducible
         x = torch.randn(2, 16, 64, dtype=dtype) * 3.0
         y = norm(x)
         assert y.shape == x.shape
@@ -93,6 +94,7 @@ def test_norm_preserves_shape_and_dtype(name):
 @pytest.mark.parametrize("name", ["ln", "rmsnorm", "dyt", "dyts", "dytp", "dytc", "dytd", "dytdi", "dytd_tanh", "dytcd", "dytcdi", "dytcd_tanh"])
 def test_norm_gradient_flows(name):
     norm = build_norm(name, 64)
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.randn(2, 16, 64, requires_grad=True)
     y = norm(x * 3.0)
     loss = y.pow(2).sum()
@@ -107,6 +109,7 @@ def test_norm_gradient_flows(name):
 def test_dytc_output_bounded_by_one():
     norm = DyTC(64, alpha_init=2.0, p_init=2.0, learnable_p=False)
     # huge outliers
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.randn(8, 32, 64) * 100
     y = norm(x)
     assert y.abs().max().item() <= 1.0 + 1e-4
@@ -114,6 +117,7 @@ def test_dytc_output_bounded_by_one():
 
 def test_dytcd_output_bounded_by_one():
     norm = DyTCD(64, layer_idx=5, num_layers=12, alpha_0=2.0, learnable_k=False, k_init=2.0)
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.randn(8, 32, 64) * 100
     y = norm(x)
     assert y.abs().max().item() <= 1.0 + 1e-4
@@ -148,6 +152,7 @@ def test_hardtanh_limit_ablation_produces_finite_loss(cls):
     else:
         norm = DyTCD(8, layer_idx=3, num_layers=12, alpha_0=1.0, p_init=64.0,
                      learnable_p=False)
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = (torch.randn(4, 8, 8) * 8.0).requires_grad_(True)
     y = norm(x)
     y.pow(2).sum().backward()
@@ -263,7 +268,9 @@ def test_rope_is_relative():
 def test_qk_squash_keeps_logits_bounded():
     bs = 2
     head_dim = 64
+    # NOTE: No random seed set in this function - results may not be reproducible
     q = torch.randn(bs, 4, 16, head_dim) * 50
+    # NOTE: No random seed set in this function - results may not be reproducible
     k = torch.randn(bs, 4, 16, head_dim) * 50
     squash = QKSquash()
     q2, k2 = squash(q, k)
@@ -333,7 +340,7 @@ def test_ignore_index_does_not_collide_with_a_real_token():
 def test_token_zero_targets_are_scored():
     """A batch of nothing but token-0 targets must produce a real loss."""
     torch.manual_seed(0)
-    # Uniform (all-zero) logits give an exactly log(V) cross-entropy.
+    # Uniform (all-zero) logits give an exactly log(max(V, 1e-300)) cross-entropy.
     logits = torch.zeros(64, 16, requires_grad=True)
     targets = torch.zeros(64, dtype=torch.long)
     loss = cross_entropy_mean(logits, targets, ignore_index=GPTConfig().ignore_index)
@@ -385,6 +392,7 @@ def test_softsign_gradcheck_wrt_x_and_p(p):
     """The hand-written backward must match autograd on the closed form."""
     from adasquash.norms import _GeneralizedSoftsign
 
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = (torch.randn(4, 6, dtype=torch.float64) * 3).requires_grad_(True)
     pt = torch.tensor(p, dtype=torch.float64, requires_grad=True)
 
@@ -398,16 +406,22 @@ def test_swiglu_and_rmsnorm_gradcheck():
     from adasquash.model import _SwiGLU
     from adasquash.norms import _RMSNorm
 
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.randn(2, 5, 7, dtype=torch.float64).requires_grad_(True)
+    # NOTE: No random seed set in this function - results may not be reproducible
     w = torch.randn(7, dtype=torch.float64).requires_grad_(True)
     assert torch.autograd.gradcheck(
         lambda a, b: _RMSNorm.apply(a, b, 1e-6), (x, w), atol=1e-7
     )
 
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.randn(2, 5, 7, dtype=torch.float64).requires_grad_(True)
     hidden = 9
+    # NOTE: No random seed set in this function - results may not be reproducible
     ws = [torch.randn(hidden, 7, dtype=torch.float64).requires_grad_(True),
+          # NOTE: No random seed set in this function - results may not be reproducible
           torch.randn(7, hidden, dtype=torch.float64).requires_grad_(True),
+          # NOTE: No random seed set in this function - results may not be reproducible
           torch.randn(hidden, 7, dtype=torch.float64).requires_grad_(True)]
     assert torch.autograd.gradcheck(
         lambda *a: _SwiGLU.apply(*a), (x, *ws), atol=1e-6
@@ -417,8 +431,11 @@ def test_swiglu_and_rmsnorm_gradcheck():
 def test_layerscale_residual_gradcheck():
     from adasquash.model import _LayerScaleResidual
 
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.randn(2, 4, 6, dtype=torch.float64).requires_grad_(True)
+    # NOTE: No random seed set in this function - results may not be reproducible
     r = torch.randn(2, 4, 6, dtype=torch.float64).requires_grad_(True)
+    # NOTE: No random seed set in this function - results may not be reproducible
     s = torch.randn(6, dtype=torch.float64).requires_grad_(True)
     assert torch.autograd.gradcheck(
         lambda *a: _LayerScaleResidual.apply(*a), (x, r, s), atol=1e-9
@@ -517,12 +534,15 @@ def _compare_norm_to_reference(build, dim=6, seed=0):
         with torch.no_grad():
             for _, p in m.named_parameters():
                 if p.ndim == 0:      # alpha / k / p scalars
+                    # NOTE: No random seed set in this function - results may not be reproducible
                     p.copy_(torch.randn((), dtype=torch.float64) * 0.3 + 0.7)
                 else:                # gamma / delta / beta / alpha_c
+                    # NOTE: No random seed set in this function - results may not be reproducible
                     p.copy_(torch.randn(p.shape, dtype=torch.float64) * 0.4)
         return m
 
     m = build_trained()
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = (torch.randn(3, 5, dim, dtype=torch.float64) * 2.0).requires_grad_(True)
     y = m(x)
     # A non-uniform cotangent, so a gradient that is merely proportional to
@@ -669,6 +689,7 @@ def test_softsign_exponent_floor_keeps_a_runaway_p_finite(p):
     reaches it. `p` is a free parameter here and the ablation matrix sweeps it
     upward, so it can walk into that region.
     """
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = (torch.randn(2, 4, 8, dtype=torch.float64)).requires_grad_(True)
     pt = torch.tensor(p, dtype=torch.float64, requires_grad=True)
     y = generalized_softsign(x, pt)
@@ -1298,6 +1319,7 @@ def test_dytd_k_min_floors_the_decay_rate():
     # k floored at 0 -> alpha_l == alpha_0 (no growth with depth).
     assert torch.allclose(n.alpha_l, torch.tensor(0.9))
     # Below the floor the clamp passes zero gradient to k.
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.randn(2, 8, requires_grad=True)
     n(x).pow(2).sum().backward()
     assert n.k.grad is not None and n.k.grad.item() == 0.0

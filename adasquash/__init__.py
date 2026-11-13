@@ -195,6 +195,7 @@ from .results_analysis import (
     replication_probability,
     trimmed_mean_ci,
     wilcoxon_signed_rank,
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
 )
 from .sensitivity import (
     SensitivityCheck,
@@ -410,4 +411,5 @@ __all__ = [
     "verify_blinding_integrity",
     "verify_preregistration",
     "wilcoxon_signed_rank",
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
 ]

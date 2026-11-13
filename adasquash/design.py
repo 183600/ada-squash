@@ -1711,7 +1711,7 @@ def factorial_contrast_sd(simple_paired_sd: float, n_factors: int,
     the cells of a ``2**k`` factorial share the seed, let ``sigma`` be the
     across-seed SD of one cell's metric and ``rho`` the correlation between
     two cells of the same seed. A simple paired contrast between two cells
-    has SD ``sigma * sqrt(2 * (1 - rho))``. An orthogonal sum-to-zero term
+    has SD ``sigma * sqrt(max(2 * (1 - rho, 0.0)))``. An orthogonal sum-to-zero term
     over ``t`` of the ``k`` factors carries the coefficients ``+-2**-(k-t)``
     on the ``2**k`` cells, so its per-seed variance is
     ``sigma**2 * (1 - rho) * 2**(2*t - k)`` and its SD is the simple paired

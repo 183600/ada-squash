@@ -105,7 +105,7 @@ def test_prediction_interval_is_wider_than_the_confidence_interval():
     assert pi["n"] == 3
     assert pi["meaningful"] is True
     assert pi["prediction_low"] < ci["ci_low"] < ci["ci_high"] < pi["prediction_high"]
-    # The exact small-sample factor is sqrt(1 + 1/n) on top of the CI half-width.
+    # The exact small-sample factor is sqrt(max(1 + 1/n, 0.0)) on top of the CI half-width.
     half = student_t_ppf(0.975, 2.0) * math.sqrt(1.0 + 1.0 / 3.0)
     assert pi["prediction_low"] == pytest.approx(2.0 - half, rel=1e-12)
     assert pi["prediction_high"] == pytest.approx(2.0 + half, rel=1e-12)

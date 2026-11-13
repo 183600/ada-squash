@@ -76,6 +76,7 @@ def test_kurtosis_matches_torch_on_normal():
 
 def test_kurtosis_high_for_outlier_distribution():
     # Heavy-tailed distribution should have positive excess kurtosis.
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.cat([torch.randn(2048) * 0.5, torch.randn(64) * 50.0])
     meter = KurtosisMeter()
     meter.update(x)
@@ -206,7 +207,7 @@ def test_markov_corpus_has_learnable_next_token_signal():
     x, y = markov_batch(rng, -100, 256, 512, "cpu", n_states=64)
     mi = _mutual_information(x, y, 64)
     # A per-position independent draw has I == 0 and pins the loss at
-    # log(vocab_size) for every variant, making the ablation matrix
+    # log(max(vocab_size, 1e-300)) for every variant, making the ablation matrix
     # unrankable. A real walk over 64 states with jumps in {0,1,2} carries
     # log(64) - log(3) ~ 3.06 nats.
     assert mi > 2.5, f"I(x;y) = {mi:.3f} nats, the corpus has no signal"
@@ -903,6 +904,7 @@ def test_fp8_dynamic_tensor_scaling_removes_clipping():
     no-scaling run as a stress test rather than a prediction."""
     from scripts.check_fp8_stability import FP8_E4M3_MAX, make_fp8_quant
 
+    # NOTE: No random seed set in this function - results may not be reproducible
     x = torch.randn(1000) * 1000.0
     none_q = make_fp8_quant("e4m3", "none")
     dyn_q = make_fp8_quant("e4m3", "dynamic-tensor")

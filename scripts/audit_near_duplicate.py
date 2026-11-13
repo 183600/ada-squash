@@ -209,7 +209,7 @@ def near_duplicate_leakage(records_by_split: dict, *, threshold: float = 0.8,
     genuinely cross-split.  LSH bands generate candidates cheaply; the
     MinHash signature then estimates Jaccard similarity, which is what the
     threshold is applied to.  The estimate has a standard error of roughly
-    `sqrt(J*(1-J)/240)` (about 0.026 at J=0.8), so a value just below the
+    `sqrt(max(J*(1-J, 0.0))/240)` (about 0.026 at J=0.8), so a value just below the
     threshold is not proof of independence - it is a reason to inspect the
     corpus, not a certificate.
     """

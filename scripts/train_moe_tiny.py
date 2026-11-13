@@ -1541,7 +1541,7 @@ def main():
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--stats-every", type=int, default=200)
     p.add_argument("--output-dir", default="runs/moe-tiny")
-    p.add_argument("--probe", default="markov", choices=["markov", "random"], help="corpus. 'random' is uniform token ids: it has no next-token signal, so the LM loss is pinned at log(vocab_size) and the run learns nothing")
+    p.add_argument("--probe", default="markov", choices=["markov", "random"], help="corpus. 'random' is uniform token ids: it has no next-token signal, so the LM loss is pinned at log(max(vocab_size, 1e-300)) and the run learns nothing")
     p.add_argument("--dataset", default=None, help="optional HF dataset name; when given, replaces the synthetic corpus with packed real text")
     p.add_argument("--dataset-config", default=None)
     p.add_argument("--val-frac", type=float, default=0.005, help="chronological validation fraction (real-data mode)")

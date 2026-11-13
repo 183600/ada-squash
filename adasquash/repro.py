@@ -1072,8 +1072,10 @@ def _self_test_seed_determinism() -> bool:
     def draw():
         return (
             random.random(),
+            # NOTE: No random seed set in this function - results may not be reproducible
             float(np.random.rand()),
             float(torch.rand(3).sum()),
+            # NOTE: No random seed set in this function - results may not be reproducible
             float(torch.randn(3).sum()),
         )
 

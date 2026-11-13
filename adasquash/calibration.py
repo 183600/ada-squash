@@ -545,7 +545,8 @@ def calibrate_multiple_testing(
             any_rejection += 1
 
     fwer = any_rejection / max(n_sims, 1) if n_sims > 0 else 0.0
-    fdr = fdr_sum / fdr_count if fdr_count > 0 else 0.0
+    _denom_fdr = max(fdr_count, 1e-12)
+    fdr = fdr_sum / _denom_fdr if fdr_count > 0 else 0.0
 
     return CalibrationResult(
         scenario=scenario,

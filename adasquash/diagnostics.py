@@ -67,7 +67,7 @@ DEFAULT_CURVE_THRESHOLDS = {
     "window": 3,
     # A validation move is only called a trend when it exceeds this many
     # standard errors of the difference. Two validation passes are independent
-    # sample means, so their difference has se = sqrt(se_first^2 + se_last^2).
+    # sample means, so their difference has se = sqrt(max(se_first^2 + se_last^2, 0.0)).
     "noise_z": 2.0,
 }
 
@@ -234,7 +234,7 @@ def diagnose_train_val_curve(
 
     `val_stderr` (same length as `val_losses`) is the per-pass standard error
     of the held-out mean. The validation curve is itself an estimate: a rise
-    smaller than `noise_z * sqrt(se_first^2 + se_last^2)` is reported as
+    smaller than `noise_z * sqrt(max(se_first^2 + se_last^2, 0.0))` is reported as
     ``noise_limited`` rather than ``overfitting``/``diverging``, because the
     measured change cannot support the stronger claim. Without stderr the
     classification is unchanged (the caller did not measure the noise).

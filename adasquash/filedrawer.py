@@ -428,7 +428,8 @@ def trim_and_fill(
     center = sum(e * w for e, w in zip(effects, weights)) / total_weight
 
     # Count studies below center with high precision (potential missing ones)
-    avg_precision = (sum(precisions) / len(precisions)) if precisions else float("nan")
+    _denom_avg_precision = max(len(precisions), 1e-12)
+    avg_precision = (sum(precisions) / _denom_avg_precision) if precisions else float("nan")
     missing = 0
     for e, p in zip(effects, precisions):
         if e < center and p > avg_precision:  # High precision, below center

@@ -54,6 +54,7 @@ __all__ = [
     "replication_probability",
     "trimmed_mean_ci",
     "wilcoxon_signed_rank",
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
 ]
 
 
@@ -62,6 +63,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 def wilcoxon_signed_rank(
+# TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
     a: Sequence[float],
     b: Sequence[float],
     alpha: float = 0.05,
@@ -87,7 +89,9 @@ def wilcoxon_signed_rank(
     if alternative not in ("less", "greater", "two-sided"):
         raise ValueError(f"alternative must be 'less', 'greater', or 'two-sided', got {alternative!r}")
     if zero_method not in ("wilcoxon", "pratt", "zsplit"):
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         raise ValueError(f"zero_method must be 'wilcoxon', 'pratt', or 'zsplit', got {zero_method!r}")
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
 
     a = _real_values(a, "a")
     b = _real_values(b, "b")
@@ -101,6 +105,7 @@ def wilcoxon_signed_rank(
 
     out = {
         "test": "wilcoxon_signed_rank",
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         "alternative": ("median(delta) < 0" if alternative == "less"
                         else "median(delta) > 0" if alternative == "greater"
                         else "median(delta) != 0"),
@@ -125,6 +130,7 @@ def wilcoxon_signed_rank(
 
     # Handle zeros according to method
     if zero_method == "wilcoxon":
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         # Discard zeros
         non_zero = [(d, i) for i, d in enumerate(deltas) if d != 0.0]
         n_nz = len(non_zero)
@@ -940,7 +946,7 @@ def replication_probability(
     n_future = future_n or n
     df_future = n_future - 1
 
-    # Predictive distribution for future mean: t with df = n-1, scale = sd * sqrt(1 + 1/n_future)
+    # Predictive distribution for future mean: t with df = n-1, scale = sd * sqrt(max(1 + 1/n_future, 0.0))
     # But we want: P(t_future < -margin - t_alpha * se_future)
     # where t_future ~ t_{df_future} centered at mean_delta with scale sd_delta/sqrt(n_future)
 
@@ -950,9 +956,9 @@ def replication_probability(
     # Critical value for future study
     t_crit = -student_t_ppf(alpha, df_future)  # negative for lower tail
 
-    # Under the predictive distribution, the future mean ~ t_df(location=mean_delta, scale=sd_delta*sqrt(1+1/n_future)/sqrt(n_future))
+    # Under the predictive distribution, the future mean ~ t_df(location=mean_delta, scale=sd_delta*sqrt(max(1+1/n_future, 0.0))/sqrt(n_future))
     # Wait, the prediction interval for a new *study mean* (not a new observation) is:
-    # mean_delta +/- t_{df} * sd_delta * sqrt(1/n + 1/n_future)
+    # mean_delta +/- t_{df} * sd_delta * sqrt(max(1/n + 1/n_future, 0.0))
     # The future test statistic is (mean_future + margin) / (sd_future / sqrt(n_future))
     # But sd_future is unknown and has its own distribution.
 
@@ -976,7 +982,7 @@ def replication_probability(
         p_sig = 1.0 if mean_delta + margin < 0 else 0.0
 
     # Same direction probability: P(future mean has same sign as current mean)
-    # Future mean ~ t_df(location=mean_delta, scale=sd_delta*sqrt(1/n + 1/n_future))
+    # Future mean ~ t_df(location=mean_delta, scale=sd_delta*sqrt(max(1/n + 1/n_future, 0.0)))
     pred_scale = sd_delta * math.sqrt(1.0 / max(n, 1) + 1.0 / max(n_future, 1)) if sd_delta > 0 else 0.0
     if pred_scale > 0:
         if mean_delta < 0:
@@ -1342,7 +1348,7 @@ def post_hoc_sensitivity_curve(
         # Bayes factor threshold
         # BF_10 > 10 requires |t| > sqrt(n) * threshold
         # Approximate: BF_10 ~ exp(t^2/2) for normal prior
-        # So t > sqrt(2 * log(10)) ~ 2.15
+        # So t > sqrt(max(2 * log(10, 0.0))) ~ 2.15
         bf_threshold_t = math.sqrt(2 * math.log(max(10, 1e-10)))
         bf_n = math.ceil((bf_threshold_t / abs(es)) ** 2) if es != 0 else float("inf")
 
@@ -1523,6 +1529,7 @@ def enhance_comparison_report(comparison_json_path: str, output_path: Optional[s
         if len(deltas) >= 2:
             # Wilcoxon on deltas vs 0
             enhanced["wilcoxon"] = wilcoxon_signed_rank(deltas, [0.0]*len(deltas))
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             # Bootstrap on deltas
             enhanced["bootstrap_mean"] = bootstrap_ci(deltas, [0.0]*len(deltas), statistic="mean_diff")
             # Bayesian

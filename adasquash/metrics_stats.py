@@ -174,7 +174,7 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     # and `(z/(2n))^2` can each underflow as a single product, while the
     # square roots and the hypot keep the small terms. Beyond the float
     # range `1 / n_total` itself underflows to zero even though
-    # `sqrt(1 / n_total)` is still representable, so take the square root
+    # `sqrt(max(1 / n_total, 0.0))` is still representable, so take the square root
     # through the logarithm instead of through the underflowed reciprocal.
     sqrt_inv_n = (math.sqrt(inv_n) if inv_n > 0.0
                   else math.exp(-0.5 * math.log(max(n_total, 1e-10))))
@@ -1260,7 +1260,7 @@ def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
 def _hedges_correction(df: float) -> float:
     """Hedges' small-sample bias correction ``J(df)``.
 
-    Exact form: ``J = Gamma(df/2) / (sqrt(df/2) * Gamma((df-1)/2))``,
+    Exact form: ``J = Gamma(df/2) / (sqrt(max(df/2, 0.0)) * Gamma((df-1)/2))``,
     evaluated through ``math.lgamma`` so it stays finite for large df. For
     very large df the first-order expansion ``1 - 3 / max((4*df - 1), 1e-10)`` agrees to
     within reporting precision and is cheaper, so use it there to avoid the

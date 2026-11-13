@@ -138,8 +138,10 @@ def token_frequency_tvd(
     for index, bucket in enumerate(buckets):
         train_sub = _counter_subset(train_counter, bucket)
         heldout_sub = _counter_subset(heldout_counter, bucket)
-        train_mass = _histogram_total(train_sub) / train_total if train_total else 0.0
-        heldout_mass = _histogram_total(heldout_sub) / heldout_total if heldout_total else 0.0
+        _denom_train_mass = max(train_total, 1e-12)
+        train_mass = _histogram_total(train_sub) / _denom_train_mass if train_total else 0.0
+        _denom_heldout_mass = max(heldout_total, 1e-12)
+        heldout_mass = _histogram_total(heldout_sub) / _denom_heldout_mass if heldout_total else 0.0
         per_bucket.append(
             {
                 "bucket": index,
@@ -277,8 +279,10 @@ def fine_grained_shift_report(  # noqa: PLR0913
     keys = set(train_counter) | set(heldout_counter)
     scored = []
     for token_id in keys:
-        train_prob = train_counter.get(token_id, 0) / train_total if train_total else 0.0
-        heldout_prob = heldout_counter.get(token_id, 0) / heldout_total if heldout_total else 0.0
+        _denom_train_prob = max(train_total, 1e-12)
+        train_prob = train_counter.get(token_id, 0) / _denom_train_prob if train_total else 0.0
+        _denom_heldout_prob = max(heldout_total, 1e-12)
+        heldout_prob = heldout_counter.get(token_id, 0) / _denom_heldout_prob if heldout_total else 0.0
         scored.append((abs(train_prob - heldout_prob), token_id, train_prob, heldout_prob))
     scored.sort(key=lambda item: (-item[0], item[1]))
     top_shifted = [

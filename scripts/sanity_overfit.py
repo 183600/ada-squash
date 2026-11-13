@@ -453,7 +453,7 @@ def run_one(norm: str, args, device: str) -> dict:
     # (imbalance) or a loss no better than guessing uniformly over the vocab
     # means the run learned nothing, whatever the threshold says.
     # A vocabulary of one has a uniform-guess loss of exactly zero; the usual
-    # strict `< log(vocab)` would reject a perfect zero-loss model.
+    # strict `< log(max(vocab, 1e-300))` would reject a perfect zero-loss model.
     checks["loss_below_uniform_baseline"] = bool(
         final_loss <= 0.0 if vocab <= 1 else final_loss < math.log(vocab + 1e-8))
     checks["accuracy_above_threshold"] = bool(final_acc >= thresholds["acc"])

@@ -262,7 +262,7 @@ def check_statistics():
           label="mean_ci high")
 
     # A prediction interval must be wider than the CI for the mean by the
-    # factor sqrt(1 + 1/n); the same t critical value is used.
+    # factor sqrt(max(1 + 1/n, 0.0)); the same t critical value is used.
     pi = mean_prediction_interval([1.0, 2.0, 3.0])
     half = student_t_ppf(0.975, 2) * 1.0 * math.sqrt(1.0 + 1.0 / 3.0)
     close(pi["prediction_low"], 2.0 - half, label="prediction low")

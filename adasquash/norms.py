@@ -484,6 +484,7 @@ class DyTC(_SquashedAffine):
         super().__init__()
         alpha = torch.full((dim,), float(alpha_init))
         if alpha_jitter > 0:
+            # NOTE: No random seed set in this function - results may not be reproducible
             alpha = alpha + alpha_jitter * torch.randn(dim) * alpha_init
         self.alpha = nn.Parameter(alpha)
         self.p = nn.Parameter(torch.tensor(float(p_init))) if learnable_p else float(p_init)
@@ -846,6 +847,7 @@ class DyTP(_SquashedAffine):
         super().__init__()
         alpha = torch.full((dim,), float(alpha_init))
         if alpha_jitter > 0:
+            # NOTE: No random seed set in this function - results may not be reproducible
             alpha = alpha + alpha_jitter * torch.randn(dim) * alpha_init
         self.alpha = nn.Parameter(alpha)
         self.gamma = nn.Parameter(torch.ones(dim))
