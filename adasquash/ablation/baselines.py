@@ -928,7 +928,7 @@ def attach_simple_baseline_calibration(comparison: dict, floor_data: dict, sourc
     seed_ce = _count_seed_ce(floor_data.get("per_seed") or [], tuned_predictor)
     protocol = floor_data.get("protocol") or {}
     vocab_size = protocol.get("vocab_size")
-    log_vocab = math.log(vocab_size + 1e-8) if isinstance(vocab_size, (int, float)) and vocab_size > 0 else None
+    log_vocab = math.log(vocab_size) if isinstance(vocab_size, (int, float)) and vocab_size > 0 else None
     annotated = []
     for entry in comparison["rows"]:
         val_loss = entry.get("val_loss")

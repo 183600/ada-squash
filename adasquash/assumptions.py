@@ -190,9 +190,9 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     # Skewness transform
     beta1 = 3.0 * (n + 1) * (n + 3) / ((n - 2) * (n + 5) * (n + 7) * (n + 9))
     W2 = math.sqrt(2.0 * beta1) - 1.0
-    delta = 1.0 / math.sqrt(math.log(W2 + 1e-8)) if W2 > 1 else 1.0
+    delta = 1.0 / math.sqrt(math.log(W2)) if W2 > 1 else 1.0
     y = g1 * math.sqrt((n + 1) * (n + 3) / (6.0 * (n - 2)))
-    z1 = delta * math.log(y + math.sqrt(y * y + 1.0 + 1e-8))
+    z1 = delta * math.log(y + math.sqrt(y * y + 1.0))
 
     # Kurtosis transform
     E_g2 = -6.0 / (n + 1)
@@ -443,8 +443,8 @@ def check_independence(
         )
 
     # Simple autocorrelation at lags 1..max_lag
-    mean = sum(ordered_observations) / (n + 1e-8)
-    c0 = sum((x - mean) ** 2 for x in ordered_observations) / (n + 1e-8)
+    mean = sum(ordered_observations) / n
+    c0 = sum((x - mean) ** 2 for x in ordered_observations) / n
 
     if c0 == 0:
         return AssumptionCheck(
@@ -507,7 +507,7 @@ def check_outlier_influence(
             recommendation=f"Need at least 3 observations for jackknife; have {n}.",
         )
 
-    full_mean = sum(paired_deltas) / (n + 1e-8)
+    full_mean = sum(paired_deltas) / n
     jackknife_means = []
     for i in range(n):
         loo = [paired_deltas[j] for j in range(n) if j != i]

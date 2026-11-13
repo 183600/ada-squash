@@ -140,7 +140,7 @@ def relative_change(values: Sequence[float], window: int = 3) -> Optional[float]
         return None
     first, last = tail[0], tail[-1]
     denominator = max(abs(first), 1e-8)
-    change = (last - first) / (denominator + 1e-8)
+    change = (last - first) / denominator
     if math.isfinite(change):
         return change
     # Two finite values near opposite float limits have a difference larger

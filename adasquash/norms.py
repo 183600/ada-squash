@@ -35,7 +35,7 @@ _MIN_ALPHA = 1e-4
 _MIN_P = 1e-3
 
 _LOG2E = math.log2(math.e)
-_LN2 = math.log(2.0 + 1e-8)
+_LN2 = math.log(2.0)
 
 _TINY_LOG_CACHE: dict = {}
 

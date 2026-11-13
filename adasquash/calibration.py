@@ -225,8 +225,8 @@ def _wilson_ci(p: float, n: int, alpha: float = 0.05) -> tuple[float, float]:
         return (0.0, 1.0)
     z = 1.96  # Approximate for 95%
     denom = 1 + z*z / max(n, 1)
-    center = (p + z*z/(2*n)) / (denom + 1e-8)
-    margin = z * math.sqrt(p*(1-p)/(n + 1e-8) + z*z/(4*n*n)) / denom
+    center = (p + z*z/(2*n)) / denom
+    margin = z * math.sqrt(p*(1-p)/n + z*z/(4*n*n)) / denom
     return (max(0, center - margin), min(1, center + margin))
 
 
