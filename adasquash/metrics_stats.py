@@ -865,9 +865,9 @@ def student_t_cdf(t: float, df: float) -> float:
     df = df_value
     if math.isnan(t):
         raise ValueError("student_t_cdf got a NaN statistic")
-    if t == float("inf"):
+    if math.isposinf(t):
         return 1.0
-    if t == float("-inf"):
+    if math.isneginf(t):
         return 0.0
     if df >= _T_NORMAL_APPROX_DF:
         # The incomplete-beta CDF loses accuracy for very large df and can
