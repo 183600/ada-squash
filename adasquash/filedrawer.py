@@ -23,6 +23,8 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from .metrics_stats import student_t_cdf
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).
@@ -293,12 +295,14 @@ def funnel_plot_asymmetry(
     precisions = [d["precision"] for d in data]
 
     n = len(data)
-    mean_eff = sum(effects) / (n + 1e-8)
-    mean_prec = sum(precisions) / (n + 1e-8)
+    # n is guaranteed >= 3 by the early-return guard above; using n directly
+    # avoids the systematic bias introduced by (n + epsilon) denominators.
+    mean_eff = sum(effects) / n
+    mean_prec = sum(precisions) / n
 
-    cov = sum((e - mean_eff) * (p - mean_prec) for e, p in zip(effects, precisions)) / (n + 1e-8)
-    var_eff = sum((e - mean_eff) ** 2 for e in effects) / (n + 1e-8)
-    var_prec = sum((p - mean_prec) ** 2 for p in precisions) / (n + 1e-8)
+    cov = sum((e - mean_eff) * (p - mean_prec) for e, p in zip(effects, precisions)) / n
+    var_eff = sum((e - mean_eff) ** 2 for e in effects) / n
+    var_prec = sum((p - mean_prec) ** 2 for p in precisions) / n
 
     if var_eff == 0 or var_prec == 0:
         corr = 0.0
@@ -323,8 +327,9 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
     n = len(items)
 
     # Linear regression: effect = intercept + slope * precision + error
-    mean_eff = sum(effects) / (n + 1e-8)
-    mean_prec = sum(precisions) / (n + 1e-8)
+    # n >= 3 guaranteed by funnel_plot_asymmetry's early-return guard.
+    mean_eff = sum(effects) / n
+    mean_prec = sum(precisions) / n
 
     ss_prec = sum((p - mean_prec) ** 2 for p in precisions)
     ss_cross = sum((e - mean_eff) * (p - mean_prec) for e, p in zip(effects, precisions))
@@ -338,15 +343,17 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
     # Standard error of intercept
     residuals = [e - intercept - slope * p for e, p in zip(effects, precisions)]
     mse = sum(r * r for r in residuals) / max(n - 2, 1)
-    se_intercept = math.sqrt(mse * (1 / max(n + 1e-8, 1e-10) + mean_prec*mean_prec / ss_prec))
+    se_intercept = math.sqrt(mse * (1 / n + mean_prec*mean_prec / ss_prec))
 
     if se_intercept == 0:
         return {"p_value": None, "note": "Zero SE for intercept"}
 
     t_stat = intercept / se_intercept
-    # Two-sided p-value from t-distribution
-    # Approximate with normal for simplicity
-    p = 2 * (1 - 0.5 * (1 + math.erf(abs(t_stat) / math.sqrt(2))))
+    # Two-sided p-value from t-distribution with n-2 degrees of freedom.
+    # Egger's regression uses t(n-2), not normal approximation: the normal
+    # limit is only valid as n -> inf and can be inaccurate for small n.
+    df = n - 2
+    p = 2 * (1 - student_t_cdf(abs(t_stat), df))
 
     return {
         "p_value": p,
@@ -476,7 +483,7 @@ def p_curve_analysis(studies: Sequence[StudyRecord], alpha: float = 0.05) -> dic
     # right-skew (evidential value). This mean-based test is the one used
     # below (the previous Stouffer-Z draft was unused and referenced the
     # non-existent math.erfcinv).
-    mean_p = sum(p_values) / (n + 1e-8)
+    mean_p = sum(p_values) / n
     # One-sided test: mean_p < alpha/2 indicates right skew
     z = (mean_p - alpha/2) / math.sqrt(alpha*alpha / (12 * n))
     p = 0.5 * (1 + math.erf(z / math.sqrt(2)))  # Lower tail
@@ -534,7 +541,14 @@ def generate_file_drawer_report(registry: StudyRegistry) -> FileDrawerReport:
     funnel = funnel_plot_asymmetry(completed)
     funnel_p = None
     if not funnel.get("insufficient"):
-        funnel_p = 2 * (1 - 0.5 * (1 + math.erf(abs(funnel["correlation"]) / math.sqrt(2))))
+        r = funnel["correlation"]
+        fn = funnel["n"]
+        if fn > 2 and abs(r) < 1.0:
+            # Proper t-test for correlation significance: t = r*sqrt((n-2)/(1-r^2))
+            t_corr = abs(r) * math.sqrt((fn - 2) / (1.0 - r * r))
+            funnel_p = 2 * (1 - student_t_cdf(t_corr, fn - 2))
+        elif abs(r) >= 1.0:
+            funnel_p = 0.0
 
     # Egger's test
     eggers = eggers_test(completed)
