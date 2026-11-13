@@ -2888,21 +2888,21 @@ def design_analysis_alignment_report(
     Returns a dict with ``"aligned"`` (bool), ``"deviations`` (list of strings)
     and ``"warnings`` (list of strings).
     """
-    from adasquash.repro import execution_identity_mismatches
+    # execution_identity_mismatches import removed: unused
 
     deviations: list[str] = []
     warnings: list[str] = []
 
     # Extract design readiness components
-    dr_checks = design_readiness.get("checks", [])
+    # dr_checks removed: unused variable (extracted but never consumed)
     dr_exclusion_fp = design_readiness.get("exclusion_policy_fingerprint")
     dr_schedule = design_readiness.get("schedule_integrity")
     dr_balance = design_readiness.get("schedule_replicate_block_alignment")
-    dr_min_seeds = design_readiness.get("min_seeds", min_seeds)
+    # dr_min_seeds removed: unused variable (extracted but never consumed)
 
     # Extract comparison components
     cmp_rows = comparison.get("rows", [])
-    cmp_protocol = comparison.get("protocol", {})
+    # cmp_protocol removed: unused variable (extracted but never consumed)
     cmp_reference = comparison.get("reference")
     cmp_reference_selection = comparison.get("reference_selection", {})
     cmp_metric = comparison.get("metric", "final_val_loss")
