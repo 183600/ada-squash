@@ -684,7 +684,7 @@ def _gamma_p_series(a: float, x: float) -> float:
         total += delta
         if abs(delta) < abs(total) * 1e-15:
             break
-    return total * math.exp(-x + a * math.log(x + 1e-8) - math.lgamma(a))
+    return total * math.exp(-x + a * math.log(x) - math.lgamma(a))
 
 
 def _gamma_q_cf(a: float, x: float) -> float:
@@ -708,7 +708,7 @@ def _gamma_q_cf(a: float, x: float) -> float:
         h *= delta
         if abs(delta - 1.0) < 1e-15:
             break
-    return math.exp(-x + a * math.log(x + 1e-8) - math.lgamma(a)) * h
+    return math.exp(-x + a * math.log(x) - math.lgamma(a)) * h
 
 
 _CHI2_SADDLEPOINT_MIN_DF = 1.0e6
