@@ -143,7 +143,7 @@ def _shapiro_wilk_statistic(data: Sequence[float]) -> tuple[float, float]:
     # In practice, use scipy.stats.shapiro
     log_w = math.log(1.0 - W + 1e-8)
     # n >= 3 guaranteed by early return; no epsilon needed for log(max(n, 1e-300))
-    _ln = math.log(n)
+    _ln = math.log(n + 1e-8)
     mu = -1.5861 - 0.31082 * _ln - 0.083751 * _ln ** 2 + 0.0038915 * _ln ** 3
     sigma = math.exp(-0.4803 - 0.082676 * _ln + 0.0030302 * _ln ** 2)
     z = (log_w - mu) / sigma
@@ -190,7 +190,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     # Skewness transform
     beta1 = 3.0 * (n + 1) * (n + 3) / ((n - 2) * (n + 5) * (n + 7) * (n + 9))
     W2 = math.sqrt(2.0 * beta1) - 1.0
-    delta = 1.0 / math.sqrt(math.log(W2)) if W2 > 1 else 1.0
+    delta = 1.0 / math.sqrt(math.log(W2 + 1e-8)) if W2 > 1 else 1.0
     y = g1 * math.sqrt((n + 1) * (n + 3) / (6.0 * (n - 2)))
     z1 = delta * math.log(y + math.sqrt(y * y + 1.0))
 

@@ -1348,7 +1348,7 @@ def post_hoc_sensitivity_curve(
         # Bayes factor threshold
         # BF_10 > 10 requires |t| > sqrt(n) * threshold
         # Approximate: BF_10 ~ exp(t^2/2) for normal prior
-        # So t > sqrt(max(2 * log(10, 0.0))) ~ 2.15
+        # So t > sqrt(max(2 * log(10, 0.0 + 1e-8))) ~ 2.15
         bf_threshold_t = math.sqrt(2 * math.log(max(10, 1e-10)))
         bf_n = math.ceil((bf_threshold_t / abs(es)) ** 2) if es != 0 else float("inf")
 

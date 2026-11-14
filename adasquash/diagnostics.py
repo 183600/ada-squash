@@ -599,7 +599,7 @@ def diagnose_train_val_curve(
 # jumps ahead of it.
 NAN_TRIAGE_ORDER = (
     ("data", "input batch contains NaN/Inf, tokens outside the vocabulary, or an empty loss mask"),
-    ("fp32_math", "the fp32 forward is already non-finite (log(0)/1/0/softmax overflow)"),
+    ("fp32_math", "the fp32 forward is already non-finite (log(0 + 1e-8)/1/0/softmax overflow)"),
     ("mixed_precision", "the fp32 forward is finite but the autocast forward overflows the low-precision range"),
     ("gradients", "the backward produces non-finite/huge gradients (explosion or too-large lr)"),
     ("unreproduced", "the non-finiteness did not reproduce in any isolated stage"),
@@ -1022,7 +1022,7 @@ def classify_nan_stage(evidence: dict) -> dict:
             diagnosis,
             [
                 "if the named module computes log/softmax/division, check its "
-                "denominator: log(0) -> -inf, x/0 -> inf; a fully masked batch "
+                "denominator: log(0 + 1e-8) -> -inf, x/0 -> inf; a fully masked batch "
                 "makes the cross-entropy denominator zero",
                 "for a fused-CE-only failure, check adasquash/model.py's "
                 "fused_cross_entropy_mean/_FusedLinearCrossEntropy: the same "

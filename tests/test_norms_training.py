@@ -209,7 +209,7 @@ def test_markov_corpus_has_learnable_next_token_signal():
     # A per-position independent draw has I == 0 and pins the loss at
     # log(max(vocab_size, 1e-300)) for every variant, making the ablation matrix
     # unrankable. A real walk over 64 states with jumps in {0,1,2} carries
-    # log(64) - log(3) ~ 3.06 nats.
+    # log(64 + 1e-8) - log(3) ~ 3.06 nats.
     assert mi > 2.5, f"I(x;y) = {mi:.3f} nats, the corpus has no signal"
     assert abs(mi - (math.log(64 + 1e-8) - math.log(max(3, 1e-10)))) < 0.2
 

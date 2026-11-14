@@ -602,7 +602,7 @@ def _int_over_sqrt(value: int, n: int) -> float:
     if value == 0:
         return 0.0
     try:
-        magnitude = math.exp(math.log(abs(value)) - 0.5 * math.log(n))
+        magnitude = math.exp(math.log(abs(value + 1e-8)) - 0.5 * math.log(n))
     except OverflowError:
         magnitude = math.inf
     return -magnitude if value < 0 else magnitude
@@ -651,7 +651,7 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
         return 1.0
     log_bt = (
         math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-        + a * math.log(x) + b * math.log1p(-x)
+        + a * math.log(x + 1e-8) + b * math.log1p(-x)
     )
     if log_bt > 709.0:
         # Prefactor overflows; compute result in log-space to preserve
@@ -660,12 +660,12 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
             cf = _betacf(a, b, x)
             if cf <= 0.0:
                 return 0.0
-            lr = log_bt + math.log(cf) - math.log(a)
+            lr = log_bt + math.log(cf + 1e-8) - math.log(a)
             return min(1.0, math.exp(lr)) if lr > -745.0 else 0.0
         cf = _betacf(b, a, 1.0 - x)
         if cf <= 0.0:
             return 1.0
-        lr = log_bt + math.log(cf) - math.log(b)
+        lr = log_bt + math.log(cf + 1e-8) - math.log(b)
         return 1.0 - (min(1.0, math.exp(lr)) if lr > -745.0 else 0.0)
     bt = math.exp(log_bt) if log_bt > -745.0 else 0.0
     if x < (a + 1.0) / (a + b + 2.0):
@@ -684,7 +684,7 @@ def _gamma_p_series(a: float, x: float) -> float:
         total += delta
         if abs(delta) < abs(total) * 1e-15:
             break
-    return total * math.exp(-x + a * math.log(x) - math.lgamma(a))
+    return total * math.exp(-x + a * math.log(x + 1e-8) - math.lgamma(a))
 
 
 def _gamma_q_cf(a: float, x: float) -> float:
@@ -708,7 +708,7 @@ def _gamma_q_cf(a: float, x: float) -> float:
         h *= delta
         if abs(delta - 1.0) < 1e-15:
             break
-    return math.exp(-x + a * math.log(x) - math.lgamma(a)) * h
+    return math.exp(-x + a * math.log(x + 1e-8) - math.lgamma(a)) * h
 
 
 _CHI2_SADDLEPOINT_MIN_DF = 1.0e6
@@ -1275,7 +1275,7 @@ def _hedges_correction(df: float) -> float:
     try:
         log_j = (
             math.lgamma(df / 2.0)
-            - 0.5 * math.log(df / 2.0)
+            - 0.5 * math.log(df / 2.0 + 1e-8)
             - math.lgamma((df - 1.0) / 2.0))
         j = math.exp(log_j)
     except OverflowError:
@@ -1364,7 +1364,7 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     try:
         inverse_sqrt_n = 1.0 / math.sqrt(n)
     except OverflowError:
-        inverse_sqrt_n = math.exp(-0.5 * math.log(n))
+        inverse_sqrt_n = math.exp(-0.5 * math.log(n + 1e-8))
     result = critical * std * inverse_sqrt_n
     if math.isfinite(result) and result != 0.0:
         return result
@@ -1659,7 +1659,7 @@ def _tost_inverse_sqrt_n(n: int) -> float:
     try:
         return 1.0 / math.sqrt(n)
     except OverflowError:
-        return math.exp(-0.5 * math.log(n))
+        return math.exp(-0.5 * math.log(n + 1e-8))
 
 
 def _tost_power_at_n(std: float, n: int, margin: float, alpha: float,
