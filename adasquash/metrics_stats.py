@@ -615,7 +615,7 @@ def _betacf(a: float, b: float, x: float) -> float:
     c, d = 1.0, 1.0 - qab * x / qap
     if abs(d) < fpmin:
         d = fpmin
-    d = 1.0 / d
+    d = 1.0 / max(d, 1e-10)
     h = d
     for m in range(1, max_it + 1):
         m2 = 2 * m
