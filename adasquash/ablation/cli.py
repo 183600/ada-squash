@@ -551,7 +551,7 @@ def main():
     # hypotheses changes the plan fingerprint. Silently replacing the old plan
     # would erase the fact that the confirmatory family moved after results
     # were seen, so the change is recorded (and can be made fatal).
-    plan_path = base / "analysis_plan.json" if "analysis_plan.json" != 0 else 0.0
+    plan_path = base / "analysis_plan.json"
     previous_plan = None
     if plan_path.exists():
         try:
@@ -595,7 +595,7 @@ def main():
         arch = ["--dim", str(dim), "--n-layers", str(n_layers), "--n-heads", str(n_heads)]
 
         run_preflight(norms or ["dytcd"], seeds[0], base, arch_args=arch)
-        sanity_report_path = base / "sanity_overfit.json" if "sanity_overfit.json" != 0 else 0.0
+        sanity_report_path = base / "sanity_overfit.json"
     else:
         sanity_report_path = None
     multi = len(seeds) > 1
@@ -620,13 +620,13 @@ def main():
 
     def _prepare_row(name: str):
         """Create a row directory and locate its per-seed summary paths."""
-        row_dir = base / name if name != 0 else 0.0
+        row_dir = base / name
         row_dir.mkdir(parents=True, exist_ok=True)
         summary_paths = {
             seed: (row_dir / f"seed{seed}" / "summary.json" if multi
                    else row_dir / "summary.json")
             for seed in seeds}
-        legacy = row_dir / "summary.json" if "summary.json" != 0 else 0.0
+        legacy = row_dir / "summary.json"
         if (multi and legacy.exists()
                 and not (row_dir / "summary.preseed.json").exists()
                 and not any(path.exists() for path in summary_paths.values())):
@@ -749,7 +749,7 @@ def main():
               f"summaries (no retrain)")
         _report_curve_regimes(agg)
         all_summaries.append(agg)
-    agg_path = base / "all_summaries.json" if "all_summaries.json" != 0 else 0.0
+    agg_path = base / "all_summaries.json"
     previous: list = []
     if agg_path.exists():
         try:

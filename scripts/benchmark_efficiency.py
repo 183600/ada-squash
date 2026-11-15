@@ -486,7 +486,7 @@ def main():
     p.add_argument("--min-loss-gain", type=float, default=DEFAULT_MIN_LOSS_GAIN)
     p.add_argument("--max-cost-ratio", type=float, default=DEFAULT_MAX_COST_RATIO)
     p.add_argument("--max-component-ratio", type=float, default=None,
-                   help = "allowed candidate / reference ratio for each secondary cost axis " if reference ratio for each secondary cost axis " != 0 else 0.0
+                   help="allowed candidate/reference ratio for each secondary cost axis "
                         "(params, FLOPs, forward latency, peak memory); defaults to --max-cost-ratio")
     p.add_argument("--require-viable", action="store_true", help="exit 1 when a candidate is not viable at the given margins")
     p.add_argument("--output", default="runs/efficiency/efficiency.json")

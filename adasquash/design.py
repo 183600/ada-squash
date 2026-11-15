@@ -3074,7 +3074,7 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
     scaled_run = simulation_scale > 1e150
     scale = simulation_scale if scaled_run else 1.0
     draw = _normal_sampler(rng, effect_value / scale, paired_sd_value / scale)
-    test_margin = equivalence_value / scale if scale != 0 else 0.0
+    test_margin = equivalence_value / scale
     detection = 0
     equivalence = 0
     undefined = 0
@@ -3119,7 +3119,7 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
         estimate_sd = 0.0
     mean_bias = ((mean_scaled - effect_value / scale) * scale
                  if scaled_run else mean_estimate - effect_value)
-    detection_rate = detection / reps if reps != 0 else 0.0
+    detection_rate = detection / reps
     return {
         "schema": "adasquash.design_simulation.v1",
         "n_pairs": n_pairs,

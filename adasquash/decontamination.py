@@ -826,7 +826,7 @@ def contamination_scan_bound(report: dict, *, confidence: float = 0.95,
             raise ValueError(
                 f"by_benchmark[{name!r}] flags {flagged} documents but only "
                 f"{row_documents} were scanned")
-        observed = None if row_documents == 0 else flagged / row_documents if row_documents != 0 else 0.0
+        observed = None if row_documents == 0 else flagged / row_documents
         upper = wilson_upper_bound(
             flagged, row_documents, per_benchmark_confidence)
         passes = None

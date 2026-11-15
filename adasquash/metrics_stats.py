@@ -615,7 +615,7 @@ def _betacf(a: float, b: float, x: float) -> float:
     c, d = 1.0, 1.0 - qab * x / qap
     if abs(d) < fpmin:
         d = fpmin
-    d = 1.0 / d if d != 0 else 0.0
+    d = 1.0 / d
     h = d
     for m in range(1, max_it + 1):
         m2 = 2 * m
@@ -694,8 +694,8 @@ def _gamma_q_cf(a: float, x: float) -> float:
     """Regularized upper incomplete gamma Q(a, x) by Lentz's continued fraction."""
     tiny = 1e-300
     b = x + 1.0 - a
-    c = 1.0 / tiny if tiny != 0 else 0.0
-    d = 1.0 / b if b != 0 else 0.0
+    c = 1.0 / tiny
+    d = 1.0 / b
     h = d
     for i in range(1, 10000):
         an = -i * (i - a)
@@ -703,10 +703,10 @@ def _gamma_q_cf(a: float, x: float) -> float:
         d = an * d + b
         if abs(d) < tiny:
             d = tiny
-        c = b + an / c if c != 0 else 0.0
+        c = b + an / c
         if abs(c) < tiny:
             c = tiny
-        d = 1.0 / d if d != 0 else 0.0
+        d = 1.0 / d
         delta = d * c
         h *= delta
         if abs(delta - 1.0) < 1e-15:
@@ -742,7 +742,7 @@ def _chi2_sf_large_df(x: float, df: float) -> float:
         power = s * s
         k = 2
         while True:
-            step = power / k if k != 0 else 0.0
+            step = power / k
             series = series + step if k % 2 == 0 else series - step
             power *= s
             k += 1

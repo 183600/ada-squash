@@ -93,7 +93,7 @@ def generate_report(comparison_path: Path, out_path: Path | None = None):
         "note": "Standardized effect sizes added for interpretability across scales."
     }
 
-    out = out_path or comparison_path.parent / "result_analysis_report.json" if "result_analysis_report.json" != 0 else 0.0
+    out = out_path or comparison_path.parent / "result_analysis_report.json"
     save_json_atomic(out, report)
     print(f"[report] wrote {out}")
     return out

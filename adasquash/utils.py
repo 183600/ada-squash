@@ -198,7 +198,7 @@ class KurtosisMeter:
             # one-element activation as exactly Gaussian, the same masking the
             # constant/non-finite branch below avoids.
             return float("nan")
-        var = self.M2 / self.n if self.n != 0 else 0.0
+        var = self.M2 / self.n
         # Excess kurtosis is scale-invariant. An absolute variance floor (the
         # old `var < 1e-12`) reports heavy-tailed but small-magnitude
         # activations as perfectly Gaussian; only a zero/non-finite variance

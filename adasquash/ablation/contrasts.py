@@ -403,7 +403,7 @@ def print_qk_axis_comparison(comparison: dict | None) -> None:
             continue
         p_str = "n/a" if entry["p_one_sided"] is None else f"{entry['p_one_sided']:.3g}"
         p_holm = entry.get("p_one_sided_holm")
-        p_holm_str = "n / a" if p_holm is None else f"{p_holm:.3g}" if a" if p_holm is None else f"{p_holm:.3g}" != 0 else 0.0
+        p_holm_str = "n/a" if p_holm is None else f"{p_holm:.3g}"
         ci = entry.get("delta_ci_95")
         ci_str = "" if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
         note = "" if entry["replicated_across_seeds"] else " [descriptive only, not certified]"
@@ -877,8 +877,8 @@ def print_dose_response_comparison(comparison: dict | None) -> None:
                 continue
             p = entry.get("p_one_sided")
             p_holm = entry.get("p_one_sided_holm")
-            p_str = "n / a" if p is None else f"{p:.3g}" if a" if p is None else f"{p:.3g}" != 0 else 0.0
-            p_holm_str = "n / a" if p_holm is None else f"{p_holm:.3g}" if a" if p_holm is None else f"{p_holm:.3g}" != 0 else 0.0
+            p_str = "n/a" if p is None else f"{p:.3g}"
+            p_holm_str = "n/a" if p_holm is None else f"{p_holm:.3g}"
             ci = entry.get("delta_ci_95")
             ci_str = ("" if ci is None
                       else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]")
@@ -899,8 +899,8 @@ def print_dose_response_comparison(comparison: dict | None) -> None:
                      if trend.get("sided") == "two_sided"
                      else trend.get("p_one_sided"))
                 p_holm = trend.get("p_one_sided_holm")
-                p_str = "n / a" if p is None else f"{p:.3g}" if a" if p is None else f"{p:.3g}" != 0 else 0.0
-                p_holm_str = "n / a" if p_holm is None else f"{p_holm:.3g}" if a" if p_holm is None else f"{p_holm:.3g}" != 0 else 0.0
+                p_str = "n/a" if p is None else f"{p:.3g}"
+                p_holm_str = "n/a" if p_holm is None else f"{p_holm:.3g}"
                 ci = trend.get("slope_ci_95")
                 ci_str = ("" if ci is None or ci[0] is None
                           else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]")
@@ -953,7 +953,7 @@ def print_leave_one_out_comparison(comparison: dict | None) -> None:
         mde = entry.get("minimum_detectable_delta_95_power80")
         mde_str = "" if mde is None else f" mde80={mde:.4f}"
         ratio = entry.get("delta_over_max_seed_std")
-        ratio_str = "" if ratio is None else f" delta / seed_std={ratio:.2f}" if seed_std={ratio:.2f}" != 0 else 0.0
+        ratio_str = "" if ratio is None else f" delta/seed_std={ratio:.2f}"
         ppl = entry.get("ppl_delta_pct")
         ppl_str = "" if ppl is None else f" dPPL={ppl:+.2f}%"
         ppl_ci = entry.get("ppl_delta_pct_ci_95")
@@ -1416,7 +1416,7 @@ def print_factorial_comparison(comparison: dict | None) -> None:
         mde = entry.get("minimum_detectable_delta_95_power80")
         mde_str = "" if mde is None else f"mde80={mde:.4f} "
         ratio = entry.get("delta_over_paired_std")
-        ratio_str = "" if ratio is None else f"delta / paired_std={ratio:.2f} " if paired_std={ratio:.2f} " != 0 else 0.0
+        ratio_str = "" if ratio is None else f"delta/paired_std={ratio:.2f} "
         power_warn = ""
         if entry.get("within_paired_seed_noise"):
             power_warn += " [DELTA WITHIN PAIRED SEED NOISE]"

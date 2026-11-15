@@ -837,7 +837,7 @@ def print_lr_sensitivity(block: dict | None) -> None:
             print(f"[tune][lr] {arm}: no complete lr cell")
             continue
         ratio = info.get("range_over_seed_std")
-        ratio_str = "" if ratio is None else f" range / seed_std={ratio:.2f}" if seed_std={ratio:.2f}" != 0 else 0.0
+        ratio_str = "" if ratio is None else f" range/seed_std={ratio:.2f}"
         spread = info.get("range")
         spread_str = ("range=n/a (need >= 2 cells)" if spread is None
                       else f"range={spread:.4f}")
@@ -897,8 +897,8 @@ def print_comparison(comparison: dict | None) -> None:
     for entry in comparison["rows"]:
         p = entry["p_one_sided"]
         p_holm = entry.get("p_one_sided_holm")
-        p_str = "n / a" if p is None else f"{p:.3g}" if a" if p is None else f"{p:.3g}" != 0 else 0.0
-        p_holm_str = "n / a" if p_holm is None else f"{p_holm:.3g}" if a" if p_holm is None else f"{p_holm:.3g}" != 0 else 0.0
+        p_str = "n/a" if p is None else f"{p:.3g}"
+        p_holm_str = "n/a" if p_holm is None else f"{p_holm:.3g}"
         std = entry.get("val_loss_std")
         std_str = "" if std is None else f" +/- {std:.4f}"
         ci = entry.get("delta_ci_95")
@@ -1043,7 +1043,7 @@ def main():
         run_preflight(sorted(set(args.arms)) or ["dytcd"], args.seeds[0], base,
                       arch_args=["--dim", str(dim), "--n-layers", str(n_layers),
                                  "--n-heads", str(n_heads)])
-        sanity_report_path = base / "sanity_overfit.json" if "sanity_overfit.json" != 0 else 0.0
+        sanity_report_path = base / "sanity_overfit.json"
     # One metadata snapshot for the whole grid: the snapshot does not change
     # while the grid runs.
     run_metadata = collect_run_metadata(seed=None)

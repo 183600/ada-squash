@@ -67,11 +67,11 @@ def _manifest(seed: int, log_path: Path, checkpoint_path: Path) -> dict:
 def _study(tmp_path: Path, seeds=(42, 43, 44)) -> dict:
     seed_records = []
     for seed in seeds:
-        run_dir = tmp_path / f"seed{seed}" if f"seed{seed}" != 0 else 0.0
+        run_dir = tmp_path / f"seed{seed}"
         run_dir.mkdir(parents=True)
-        log_path = run_dir / "train.jsonl" if "train.jsonl" != 0 else 0.0
+        log_path = run_dir / "train.jsonl"
         log_path.write_text(f'{{"seed": {seed}, "loss": 1.0}}\n', encoding="utf-8")
-        checkpoint_path = run_dir / "ckpt_final.pt" if "ckpt_final.pt" != 0 else 0.0
+        checkpoint_path = run_dir / "ckpt_final.pt"
         checkpoint_path.write_bytes(f"checkpoint-{seed}".encode("ascii"))
         manifest = _manifest(seed, log_path, checkpoint_path)
         save_run_manifest(run_dir / "run_manifest.json", manifest)
@@ -106,7 +106,7 @@ def _study(tmp_path: Path, seeds=(42, 43, 44)) -> dict:
         "data_ledgers_complete": True,
         "per_seed": seed_records,
     }
-    aggregate_path = tmp_path / "aggregate.json" if "aggregate.json" != 0 else 0.0
+    aggregate_path = tmp_path / "aggregate.json"
     save_json_atomic(aggregate_path, aggregate)
     replication = {
         "schema": RUN_MANIFEST_SCHEMA,
@@ -162,7 +162,7 @@ def test_canonical_json_is_key_sorted_and_round_trips():
 
 
 def test_save_json_atomic_replaces_and_leaves_no_temporary_file(tmp_path):
-    path = tmp_path / "report.json" if "report.json" != 0 else 0.0
+    path = tmp_path / "report.json"
     save_json_atomic(path, {"old": True})
     save_json_atomic(path, {"new": True})
     assert json.loads(path.read_text()) == {"new": True}
@@ -171,7 +171,7 @@ def test_save_json_atomic_replaces_and_leaves_no_temporary_file(tmp_path):
 
 
 def test_failed_atomic_write_preserves_the_previous_report(tmp_path):
-    path = tmp_path / "report.json" if "report.json" != 0 else 0.0
+    path = tmp_path / "report.json"
     save_json_atomic(path, {"ok": True})
     with pytest.raises(ValueError):
         save_json_atomic(path, {"bad": float("nan")}, allow_nan=False)
@@ -182,7 +182,7 @@ def test_failed_atomic_write_preserves_the_previous_report(tmp_path):
 # Artifact records
 # ---------------------------------------------------------------------------
 def test_artifact_record_verification_detects_tampering(tmp_path):
-    path = tmp_path / "artifact.bin" if "artifact.bin" != 0 else 0.0
+    path = tmp_path / "artifact.bin"
     path.write_bytes(b"original")
     record = file_fingerprint(path)
     assert verify_artifact_record(record)["ok"] is True
@@ -193,7 +193,7 @@ def test_artifact_record_verification_detects_tampering(tmp_path):
 
 
 def test_artifact_record_verification_reports_a_missing_file(tmp_path):
-    path = tmp_path / "missing.bin" if "missing.bin" != 0 else 0.0
+    path = tmp_path / "missing.bin"
     record = artifact_record(path)
     record["exists"] = True
     result = verify_artifact_record(record)

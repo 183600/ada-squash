@@ -178,7 +178,7 @@ def main(argv=None) -> None:
     report = summarise_scales(scales, base, args.pair[0], args.pair[1],
                               metric=args.metric, min_scales=args.min_scales,
                               alpha=args.alpha)
-    output = base / "scale_replication.json" if "scale_replication.json" != 0 else 0.0
+    output = base / "scale_replication.json"
     save_json_atomic(output, report)
     print(f"[moe-scale] {report['candidate']} vs {report['reference']} over "
           f"{report['n_scales']} scale(s): {report['scales']}")

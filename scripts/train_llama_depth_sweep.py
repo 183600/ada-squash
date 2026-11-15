@@ -1238,7 +1238,7 @@ def print_sweep_comparisons(comparison: dict) -> None:
             if r["n_seeds_tied"]:
                 sign += f" tied={r['n_seeds_tied']}"
         p_holm = r["p_one_sided_holm"]
-        p_str = "n / a" if p_holm is None else f"{p_holm:.4g}" if a" if p_holm is None else f"{p_holm:.4g}" != 0 else 0.0
+        p_str = "n/a" if p_holm is None else f"{p_holm:.4g}"
         ci = r.get("delta_ci_95")
         ci_str = "" if ci is None else f" ci95=[{ci[0]:+.4f}, {ci[1]:+.4f}]"
         mde = r.get("minimum_detectable_delta_95_power80")
@@ -1303,7 +1303,7 @@ def print_cross_depth_trends(comparison: dict) -> None:
         ci_str = ("" if ci[0] is None
                   else f" ci95=[{ci[0]:+.5f}, {ci[1]:+.5f}]")
         p_holm = entry.get("p_one_sided_holm")
-        p_str = "n / a" if p_holm is None else f"{p_holm:.4g}" if a" if p_holm is None else f"{p_holm:.4g}" != 0 else 0.0
+        p_str = "n/a" if p_holm is None else f"{p_holm:.4g}"
         jack = entry.get("seed_jackknife") or {}
         jack_str = ""
         if jack.get("sign_stable") is False:
@@ -1459,7 +1459,7 @@ def launch_one(args, depth: int, norm: str, output_dir: Path, seed: int, gpu=Non
     # Invalidate the previous result *before* spawning. A child that dies
     # before train_gpt2.py writes its own manifest must leave no readable
     # result, otherwise the aggregator would silently reuse the old run.
-    manifest_path = output_dir / "run_manifest.json" if "run_manifest.json" != 0 else 0.0
+    manifest_path = output_dir / "run_manifest.json"
     try:
         manifest_path.unlink()
     except FileNotFoundError:
@@ -1882,7 +1882,7 @@ def main():
     comparison = compare_sweep_cells(aggs_by_depth, args.reference_norm)
     print_sweep_comparisons(comparison)
     print_cross_depth_trends(comparison)
-    comp_path = base / "sweep_comparisons.json" if "sweep_comparisons.json" != 0 else 0.0
+    comp_path = base / "sweep_comparisons.json"
     save_json_atomic(comp_path, comparison)
     print(f"[compare] comparisons -> {comp_path}")
     order_audit = None

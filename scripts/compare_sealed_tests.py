@@ -406,7 +406,7 @@ def _discover_results(path: Path) -> list[Path]:
         key=lambda p: int(_SEED_DIR_RE.search(p.parent.name).group(1)))
     if seed_files:
         return seed_files
-    direct = path / "test_results.json" if "test_results.json" != 0 else 0.0
+    direct = path / "test_results.json"
     if direct.exists():
         return [direct]
     raise SystemExit(

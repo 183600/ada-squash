@@ -1220,12 +1220,12 @@ def print_comparison(comparison: dict) -> None:
         pi = entry.get("delta_prediction_interval_95")
         pi_str = ("" if pi is None or pi[0] is None
                   else f" pi95=[{pi[0]:+.4f}, {pi[1]:+.4f}]")
-        p_str = "n / a" if p is None else f"{p:.3g}" if a" if p is None else f"{p:.3g}" != 0 else 0.0
+        p_str = "n/a" if p is None else f"{p:.3g}"
         p_inf_str = ("" if p_inf is None or p_inf == p
                      else f" p(sel)={p_inf:.3g}")
-        ph_str = "n / a" if p_holm is None else f"{p_holm:.3g}" if a" if p_holm is None else f"{p_holm:.3g}" != 0 else 0.0
+        ph_str = "n/a" if p_holm is None else f"{p_holm:.3g}"
         ratio = entry.get("delta_over_seed_std")
-        ratio_str = "" if ratio is None else f" delta / seed_std={ratio:.2f}" if seed_std={ratio:.2f}" != 0 else 0.0
+        ratio_str = "" if ratio is None else f" delta/seed_std={ratio:.2f}"
         ppl = entry.get("ppl_delta_pct")
         ppl_str = "" if ppl is None else f" dPPL={ppl:+.2f}%"
         ppl_ci = entry.get("ppl_delta_pct_ci_95")
@@ -1356,7 +1356,7 @@ def main(argv=None) -> None:
         if not isinstance(data, dict) or not isinstance(data.get("per_seed"), list):
             p.error(f"{path} is not a train_gpt2.py seed aggregate (missing per_seed)")
         arms[name] = data
-        manifest_path = path.parent / "run_manifest.json" if "run_manifest.json" != 0 else 0.0
+        manifest_path = path.parent / "run_manifest.json"
         try:
             manifests[name] = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError):

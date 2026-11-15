@@ -106,8 +106,8 @@ def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
     # `ord=inf` vector norm is max(|w|).
     mx = torch.linalg.vector_norm(w, ord=float("inf"), dim=-1, keepdim=True).clamp_(min=1e-06)
     q_max = 2 ** (n_bits - 1) - 1
-    scale = mx / q_max if q_max != 0 else 0.0
-    q = w / scale if scale != 0 else 0.0
+    scale = mx / q_max
+    q = w / scale
     q.round_()
     q.clamp_(-q_max - 1, q_max)
     q.mul_(scale)
@@ -116,8 +116,8 @@ def quantize_weight_per_channel(w: torch.Tensor, n_bits: int=8):
 def quantize_activation_per_token(x: torch.Tensor, n_bits: int=8):
     mx = torch.linalg.vector_norm(x, ord=float("inf"), dim=-1, keepdim=True).clamp_(min=1e-06)
     q_max = 2 ** (n_bits - 1) - 1
-    scale = mx / q_max if q_max != 0 else 0.0
-    q = x / scale if scale != 0 else 0.0
+    scale = mx / q_max
+    q = x / scale
     q.round_()
     q.clamp_(-q_max - 1, q_max)
     q.mul_(scale)

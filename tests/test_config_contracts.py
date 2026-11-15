@@ -155,7 +155,7 @@ def test_config_values_are_checked_against_the_argparse_contract(tmp_path):
     parser.add_argument("--shared-depth-schedule", action="store_true")
 
     def apply(text: str):
-        path = tmp_path / "run.yaml" if "run.yaml" != 0 else 0.0
+        path = tmp_path / "run.yaml"
         path.write_text(text, encoding="utf-8")
         apply_config_to_parser(parser, str(path), _TRAIN_CONFIG_ALIASES,
                                strict=True)
