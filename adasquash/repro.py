@@ -1,0 +1,1466 @@
+from __future__ import annotations
+
+"""Reproducibility and experiment-tracking helpers.
+
+`set_all_seeds` fixes every RNG a run touches (Python, NumPy, torch, CUDA,
+cuDNN) and `seed_worker` extends that to DataLoader worker processes.
+`collect_run_metadata` / `save_run_manifest` record the code revision, the
+seed, the environment and any data fingerprints next to the run outputs so
+every experiment is traceable after the fact.
+
+The contract is same-machine reproducibility: bit-identical results across
+different hardware/frameworks are not promised, but a rerun on the same
+machine with the same manifest should reproduce its own curve and final
+metrics. Some CUDA kernels (flash-attention backward, `index_add_`,
+scatter reductions) are nondeterministic by implementation, so bit-identity
+is only guaranteed once those are routed to deterministic kernels: set
+`ADASQUASH_DETERMINISTIC_ALGORITHMS=warn` (warn but keep running) or
+`=strict` (raise on a nondeterministic op) to request
+`torch.use_deterministic_algorithms`; `set_all_seeds` picks the mode up.
+The manifest records whether that opt-in was active, so a mismatch can be
+diagnosed from the record instead of from memory. `environment_info` also
+records the rest of the *RNG/determinism configuration* the run actually
+used (cuDNN flags, TF32 flags, thread counts, hash seeds).
+
+`execution_identity_mismatches` is the cross-run counterpart: two arms are
+comparable only when their manifests agree on the source commit and the
+software/numeric stack that executed the recipe. A recorded difference or a
+dirty working tree is a hard incomparability; absent fields are unknown and
+must be made fatal explicitly by a confirmatory analysis.
+
+TensorFlow is not a dependency of this repository; the training stack is
+pure PyTorch, so no TF RNG is seeded here.
+
+`python3 -m adasquash.repro --self-test` runs the in-process regression
+check for this module (seed determinism across Python/NumPy/torch, worker
+seeding, DataLoader reproducibility, manifest round-trip, split-boundary
+invariants).
+"""
+import hashlib
+import json
+import numbers
+import os
+import platform
+import random
+import socket
+import subprocess
+import sys
+import time
+from collections.abc import Mapping
+from pathlib import Path
+
+import torch
+
+from ._validation import is_boolean_scalar as _is_boolean_scalar
+from .jsonio import save_json_atomic
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUN_MANIFEST_SCHEMA = "adasquash.run_manifest.v1"
+
+# `PYTHONHASHSEED` is only read by the interpreter at startup. Snapshotting
+# the environment here (import time, before `set_all_seeds` can overwrite it)
+# lets `environment_info` distinguish "this process really started with a
+# fixed hash seed" from "this process is randomizing and only exports a seed
+# for its children".
+_HASHSEED_AT_IMPORT = os.environ.get("PYTHONHASHSEED")
+_DETERMINISTIC_ALGO_ENV = "ADASQUASH_DETERMINISTIC_ALGORITHMS"
+
+
+def _requested_deterministic_algorithms() -> str | None:
+    """Parse `ADASQUASH_DETERMINISTIC_ALGORITHMS` into None / 'warn' / 'strict'."""
+    raw = os.environ.get(_DETERMINISTIC_ALGO_ENV)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in ("", "0", "false", "off", "none", "no"):
+        return None
+    if value in ("warn", "warn-only", "warn_only"):
+        return "warn"
+    if value in ("1", "true", "yes", "on", "strict"):
+        return "strict"
+    raise ValueError(
+        f"{_DETERMINISTIC_ALGO_ENV}={raw!r} is not understood; use 'warn' "
+        f"(warn on nondeterministic ops but keep running), 'strict' (raise), "
+        f"or '0' to leave torch's setting untouched"
+    )
+
+
+def apply_deterministic_algorithms(mode: str | None = None) -> str | None:
+    """Enable `torch.use_deterministic_algorithms` when the run asks for it.
+
+    The default (`mode=None` and no `ADASQUASH_DETERMINISTIC_ALGORITHMS`)
+    leaves torch's setting untouched: forcing the mode on would make known
+    nondeterministic kernels (flash-attention backward, `index_add_`) either
+    warn on every step or abort training on hardware where they are the only
+    implementation. When requested, 'warn' routes every op that has a
+    deterministic implementation to it and warns otherwise; 'strict' raises.
+    Returns the mode actually applied (None = not applied).
+    """
+    if mode is None:
+        mode = _requested_deterministic_algorithms()
+    if mode == "warn":
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    elif mode == "strict":
+        torch.use_deterministic_algorithms(True, warn_only=False)
+    elif mode is not None:
+        raise ValueError(f"unknown deterministic-algorithms mode {mode!r}")
+    return mode
+
+
+def deterministic_algorithms_context(mode: str | None = None):
+    """Context manager to temporarily enable deterministic algorithms.
+
+    Usage:
+        with deterministic_algorithms_context("warn"):
+            # training code here
+            pass
+        # original setting restored
+
+    The mode can be 'warn' (route to deterministic kernels where available,
+    warn otherwise) or 'strict' (raise on nondeterministic ops). If None,
+    reads from `ADASQUASH_DETERMINISTIC_ALGORITHMS` env var.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        previous_enabled = torch.are_deterministic_algorithms_enabled()
+        previous_warn_only = bool(
+            getattr(torch, "is_deterministic_algorithms_warn_only_enabled", lambda: False)()
+        )
+        applied = apply_deterministic_algorithms(mode)
+        try:
+            yield applied
+        finally:
+            torch.use_deterministic_algorithms(previous_enabled, warn_only=previous_warn_only)
+
+    return _ctx()
+
+
+
+# ---------------------------------------------------------------------------
+# Training-stream identity (paired-design evidence)
+# ---------------------------------------------------------------------------
+TRAIN_STREAM_FINGERPRINT_VERSION = 1
+TRAIN_STREAM_PREFIX_BATCHES = 64
+
+
+class TrainStreamFingerprint:
+    """Order-sensitive digest of the training batches a run actually consumed.
+
+    Two arms of a normalization comparison are paired only if the same seed
+    fed them the same token windows in the same order.  Recipe and data-version
+    checks cannot prove that: a worker-sharding change, a shuffle-buffer
+    change that did not make it into the recipe, or a different loader build
+    could all keep the recorded configuration identical while changing the
+    stream.  This class hashes every consumed input batch, so the manifest
+    carries an end-to-end fingerprint of the data the optimizer saw.
+
+    A fixed-size prefix digest is kept alongside the full digest.  The prefix
+    lets two arms that stopped at different steps still prove that their
+    streams agreed for the batches both consumed; the full digest proves
+    identity over the whole run when both runs consumed the same number of
+    batches.  `start_step` is recorded because a resumed run starts a new
+    digest at the resume point and is only comparable to another run that
+    resumed at the same step.
+    """
+
+    def __init__(self, start_step: int = 0,
+                 prefix_batches: int = TRAIN_STREAM_PREFIX_BATCHES):
+        if (isinstance(start_step, bool) or not isinstance(start_step, numbers.Integral)
+                or start_step < 0):
+            raise ValueError(f"start_step must be a non-negative integer, got {start_step!r}")
+        if (isinstance(prefix_batches, bool)
+                or not isinstance(prefix_batches, numbers.Integral)
+                or prefix_batches < 1):
+            raise ValueError(
+                f"prefix_batches must be a positive integer, got {prefix_batches!r}")
+        self.start_step = int(start_step)
+        self.prefix_batches_target = int(prefix_batches)
+        self._full = hashlib.blake2b(digest_size=16)
+        self._prefix = hashlib.blake2b(digest_size=16)
+        self._batches = 0
+        self._prefix_batches = 0
+        self._tokens = 0
+        self._prefix_tokens = 0
+
+    def update(self, x, y=None) -> None:
+        """Hash one consumed (input, target) batch before device transfer.
+
+        The target is hashed too: a packed window's final label is not part of
+        its input, so two streams with identical inputs can still differ in
+        the token the model is trained to predict.  `y` is optional only so a
+        caller that has no separate labels can still fingerprint the inputs.
+        """
+        if not torch.is_tensor(x):
+            raise ValueError(
+                f"TrainStreamFingerprint.update expects a tensor, got {type(x).__name__}")
+        batch_hasher = hashlib.blake2b(digest_size=16)
+        for name, tensor in (("x", x), ("y", y)):
+            if tensor is None:
+                continue
+            if not torch.is_tensor(tensor):
+                raise ValueError(
+                    f"TrainStreamFingerprint.update expects tensor {name}, got "
+                    f"{type(tensor).__name__}")
+            batch_hasher.update(
+                (name + ":" + str(tuple(tensor.shape)) + "|"
+                 + str(tensor.dtype)).encode("ascii"))
+            payload = tensor.detach().cpu().contiguous().reshape(-1)
+            batch_hasher.update(payload.view(torch.uint8).cpu().numpy().tobytes())
+        batch_digest = batch_hasher.digest()
+        self._full.update(batch_digest)
+        if self._batches < self.prefix_batches_target:
+            self._prefix.update(batch_digest)
+            self._prefix_batches += 1
+            self._prefix_tokens += int(x.numel())
+        self._batches += 1
+        self._tokens += int(x.numel())
+
+    def record(self) -> dict:
+        return {
+            "version": TRAIN_STREAM_FINGERPRINT_VERSION,
+            "start_step": self.start_step,
+            "prefix_batches_target": self.prefix_batches_target,
+            "prefix_batches": self._prefix_batches,
+            "prefix_tokens": self._prefix_tokens,
+            "batches": self._batches,
+            "tokens": self._tokens,
+            "prefix_fingerprint": self._prefix.hexdigest(),
+            "stream_fingerprint": self._full.hexdigest(),
+        }
+
+
+def _stream_count(record: dict, name: str, minimum: int = 0):
+    value = record.get(name)
+    if value is None:
+        return None
+    if (_is_boolean_scalar(value) or not isinstance(value, numbers.Integral)
+            or value < minimum):
+        raise ValueError(
+            f"train stream record field {name!r} must be an integer >= {minimum}, "
+            f"got {value!r}")
+    return int(value)
+
+
+def compare_train_streams(reference: dict, other: dict) -> dict:
+    """Do two runs' recorded training streams establish a paired design?
+
+    Missing records are *unknown*, not equal: an old manifest that never
+    recorded the stream cannot prove two arms saw the same batches.  The
+    caller decides whether unknown is fatal (`--require-train-stream-identity`)
+    or merely reported.  A recorded difference, or a different resume offset,
+    is always a pairing failure.
+    """
+    if not isinstance(reference, dict) or not isinstance(other, dict):
+        return {
+            "recorded": bool(reference or other),
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": [],
+            "reason": "training stream fingerprints were not recorded",
+        }
+    problems = []
+    version_a = reference.get("version")
+    version_b = other.get("version")
+    if version_a is None or version_b is None:
+        # An unversioned record cannot be interpreted: the field contract that
+        # makes two digests comparable is unknown. Treat it like a missing
+        # record, not as a version match.
+        problems.append(
+            "training stream fingerprint version is missing on at least one side; "
+            "the records are not comparable")
+    elif version_a != version_b:
+        problems.append(
+            f"training stream fingerprint versions differ: {version_a!r} vs {version_b!r}")
+    for name in ("start_step", "prefix_batches_target", "prefix_batches", "batches"):
+        try:
+            a = _stream_count(reference, name)
+            b = _stream_count(other, name)
+        except ValueError as exc:
+            problems.append(str(exc))
+            continue
+        if a is None or b is None:
+            # Missing fields are unknown, not equal. In particular a resumed
+            # run whose `start_step` was dropped must not look like a fresh
+            # full-run pair.
+            problems.append(
+                f"training stream record field {name!r} is missing on at least "
+                "one side; the records are not comparable")
+            continue
+        if name == "start_step" and a != b:
+            problems.append(
+                f"training stream starts at different steps: {a} vs {b}; a resumed "
+                "run is not the same data prefix as a fresh run")
+        if name == "prefix_batches_target" and a != b:
+            problems.append(
+                f"training stream prefix sizes differ: {a} vs {b}; the prefix "
+                "digests cover different numbers of batches")
+    if not problems:
+        # A prefix cannot cover more batches than the run consumed or than the
+        # fingerprint was configured to keep. Such a record is malformed, and
+        # treating it as a comparable shared prefix would overstate the scope
+        # of the digest comparison.
+        for label, record in (("reference", reference), ("other", other)):
+            prefix = _stream_count(record, "prefix_batches")
+            target = _stream_count(record, "prefix_batches_target")
+            batches = _stream_count(record, "batches")
+            if prefix > target:
+                problems.append(
+                    f"training stream {label} prefix_batches={prefix} exceeds "
+                    f"prefix_batches_target={target}; the record is malformed")
+            if prefix > batches:
+                problems.append(
+                    f"training stream {label} prefix_batches={prefix} exceeds "
+                    f"the {batches} batch(es) consumed; the record is malformed")
+    if problems:
+        return {
+            "recorded": True,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": problems,
+            "reason": "training stream records are not comparable",
+        }
+    a_prefix = reference.get("prefix_fingerprint")
+    b_prefix = other.get("prefix_fingerprint")
+    a_full = reference.get("stream_fingerprint")
+    b_full = other.get("stream_fingerprint")
+    for label, value in (("prefix_fingerprint", a_prefix),
+                         ("prefix_fingerprint", b_prefix),
+                         ("stream_fingerprint", a_full),
+                         ("stream_fingerprint", b_full)):
+        if value is not None and not isinstance(value, str):
+            return {
+                "recorded": True,
+                "comparable": False,
+                "identical": None,
+                "scope": None,
+                "full_stream_compared": False,
+                "problems": [f"training stream {label} is not a string: {value!r}"],
+                "reason": "training stream record is malformed",
+            }
+    if a_prefix is None or b_prefix is None:
+        return {
+            "recorded": True,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": ["training stream prefix fingerprint is missing"],
+            "reason": "training stream record is incomplete",
+        }
+    prefix_a = _stream_count(reference, "prefix_batches") or 0
+    prefix_b = _stream_count(other, "prefix_batches") or 0
+    if prefix_a != prefix_b:
+        return {
+            "recorded": True,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": [
+                f"training stream prefix covers {prefix_a} batch(es) in one run "
+                f"and {prefix_b} in the other; the prefix digests are not "
+                "over the same number of batches"],
+            "reason": "training stream prefix lengths differ",
+        }
+    if prefix_a == 0:
+        return {
+            "recorded": True,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "full_stream_compared": False,
+            "problems": ["neither run consumed a training batch to fingerprint"],
+            "reason": "training stream is empty",
+        }
+    identical = a_prefix == b_prefix
+    problems = [] if identical else [
+        "the first "
+        f"{prefix_a} training batch(es) differ between the two runs; they did "
+        "not consume the same token windows in the same order"]
+    batches_a = _stream_count(reference, "batches")
+    batches_b = _stream_count(other, "batches")
+    full_compared = False
+    scope = "shared_prefix"
+    if identical and batches_a == batches_b and a_full is not None and b_full is not None:
+        full_compared = True
+        scope = "full_run"
+        if a_full != b_full:
+            identical = False
+            problems.append(
+                f"the full training streams differ although the first "
+                f"{prefix_a} batch(es) match; the streams diverged later")
+    return {
+        "recorded": True,
+        "comparable": True,
+        "identical": identical,
+        "scope": scope,
+        "full_stream_compared": full_compared,
+        "problems": problems,
+        "reason": None,
+    }
+
+
+def _strict_seed(seed) -> int:
+    """A seed is an integer in torch's accepted range; other values are rejected.
+
+    ``int(1.9)`` silently seeds a different run while the manifest still
+    claims the requested seed, defeating the reproducibility contract.
+    Out-of-range integers are rejected here, before ``set_all_seeds`` mutates
+    the Python/NumPy/TF streams and then fails inside ``torch.manual_seed``.
+    """
+    if _is_boolean_scalar(seed) or not isinstance(seed, numbers.Integral):
+        # An integral float (1.0) or Decimal is not a seed identity even
+        # though ``int`` would accept it: the manifest would record a
+        # different type than the caller requested, and two spellings of the
+        # same run must not silently compare equal.
+        raise ValueError(f"seed must be an integer, got {seed!r}")
+    converted = int(seed)
+    if converted < -(2 ** 63) or converted > 2 ** 64 - 1:
+        raise ValueError(f"seed must be in [-2**63, 2**64 - 1], got {seed!r}")
+    return converted
+
+
+def set_all_seeds(seed: int, deterministic: bool = True) -> int:
+    """Seed the Python, NumPy, torch and CUDA RNGs from `seed`.
+
+    `deterministic=True` additionally pins cuDNN to its deterministic
+    algorithms (same-machine reproducibility). Torch workers spawned later
+    (DataLoader, subprocess launches) inherit the seed through `seed_worker`
+    / `PYTHONHASHSEED`.
+
+    When `ADASQUASH_DETERMINISTIC_ALGORITHMS` is set, the corresponding
+    `torch.use_deterministic_algorithms` mode is applied here as well, and
+    `environment_info` records it in the manifest.
+
+    Note on `PYTHONHASHSEED` (IMPORTANT): it is exported here so child processes
+    (DataLoader workers, subprocess launches) get a fixed string-hash seed
+    from interpreter startup. The *current* process already picked its hash
+    seed at startup (recorded as `pythonhashseed_at_process_start` in the
+    manifest), so **setting `PYTHONHASHSEED` here does NOT affect the current
+    process's hash randomization**. A launcher that spawns training subprocesses
+    (e.g. the depth sweep, multi-seed launcher) MUST also put
+    `PYTHONHASHSEED=<seed>` in the child environment explicitly - that is the
+    only point where it takes effect. This is handled automatically by
+    `launch_multi_seed` in `train_gpt2.py` and `_child_env` in
+    `train_llama_depth_sweep.py`.
+    """
+    seed = _strict_seed(seed)
+    random.seed(seed)
+    try:
+        import numpy as np
+    except ImportError:
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:457", exc_info=True)
+    else:
+        np.random.seed(seed % (2 ** 32))
+    # TensorFlow is an optional dependency of the training stack; seed it when
+    # it is importable so a run that mixes torch and tf code (or a downstream
+    # eval that does) reproduces. Failures to import are expected and ignored.
+    try:
+        import tensorflow as tf
+    except ImportError:
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:466", exc_info=True)
+    else:
+        try:
+            tf.random.set_seed(seed)
+        except Exception:
+            import logging as _logging; _logging.warning("Suppressed exception in repro.py:471", exc_info=True)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    # Honor an explicit ADASQUASH_DETERMINISTIC_ALGORITHMS request regardless
+    # of the cuDNN flag, so a caller can opt into deterministic kernels
+    # without forcing cuDNN determinism (and vice versa).
+    apply_deterministic_algorithms()
+    # cuBLAS needs a fixed workspace configuration for deterministic
+    # reductions to be available at all; pinning it unconditionally (rather
+    # than only under the deterministic flag) keeps the environment
+    # reproducible even when cuDNN determinism is left off, and is a no-op
+    # when the variable was already set by the launcher.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    os.environ["PYTHONHASHSEED"] = str(seed % (2 ** 32))
+    return seed
+
+
+def seed_worker(worker_id: int) -> None:
+    """DataLoader `worker_init_fn`: derive each worker's RNGs from its seed.
+
+    `torch.initial_seed()` in a worker is the loader's base seed (from the
+    explicit `generator` the pipeline passes) plus the worker id, so worker
+    randomness is a deterministic function of the run seed. Python and NumPy
+    are re-seeded from that same value; torch is re-seeded as well (idempotent
+    with the loader's own worker seeding) so the worker contract does not
+    depend on torch-version internals.
+    """
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        import numpy as np
+    except ImportError:
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:510", exc_info=True)
+    else:
+        np.random.seed(seed)
+    try:
+        import tensorflow as tf
+    except ImportError:
+        import logging as _logging; _logging.warning("Suppressed exception in repro.py:516", exc_info=True)
+    else:
+        try:
+            tf.random.set_seed(seed)
+        except Exception:
+            import logging as _logging; _logging.warning("Suppressed exception in repro.py:521", exc_info=True)
+
+
+def _run_git(*args: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), *args],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def git_revision() -> dict:
+    """Code version: commit, branch and whether the tree has uncommitted changes.
+
+    The branch and dirty flag come from one `git status --porcelain=v1
+    --branch` call (the default porcelain is already v1; the branch header
+    line names the checked-out branch); only the commit hash needs its own
+    call.
+    """
+    status = _run_git("status", "--porcelain=v1", "--branch")
+    branch = None
+    dirty = None
+    if status is not None:
+        lines = status.splitlines()
+        dirty = False
+        if lines and lines[0].startswith("## "):
+            header = lines[0][3:].strip()
+            if header.startswith("No commits yet"):
+                # Unborn repository: the header itself names the branch-to-be
+                # (`## No commits yet on master`). `rev-parse --abbrev-ref
+                # HEAD` fails because HEAD points at no commit, so parse the
+                # header and fall back to `symbolic-ref`.
+                marker = "No commits yet on "
+                branch = (header[len(marker):].strip()
+                          if header.startswith(marker) else None)
+                if not branch:
+                    branch = _run_git("symbolic-ref", "--short", "HEAD")
+            else:
+                name = header.split("...")[0].split(" ")[0]
+                branch = name or None
+            dirty = len(lines) > 1
+        else:
+            # No branch header (e.g. unborn repository): fall back to the
+            # tracked-only answer rather than dropping the fields.
+            branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
+            dirty = bool(status)
+    # Detached HEAD: `git status` says `## HEAD (no branch)` and
+    # `rev-parse --abbrev-ref HEAD` returns the literal "HEAD". There is no
+    # checked-out branch, and "HEAD" is not a valid branch name, so record
+    # None instead of a misleading label.
+    if branch == "HEAD":
+        branch = None
+    return {
+        "commit": _run_git("rev-parse", "HEAD"),
+        "branch": branch,
+        "dirty": dirty,
+    }
+
+
+def _module_version(name: str) -> str | None:
+    try:
+        module = __import__(name)
+    except Exception:
+        return None
+    return getattr(module, "__version__", None)
+
+
+def file_fingerprint(path) -> dict:
+    """Content fingerprint of a data file (e.g. a hash ledger): sha256 + size + mtime."""
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "exists": False}
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    st = p.stat()
+    return {
+        "path": str(p),
+        "exists": True,
+        "sha256": h.hexdigest(),
+        "bytes": st.st_size,
+        "mtime": st.st_mtime,
+    }
+
+
+# Training variables that must be identical when two arms are compared: a
+# different optimizer/schedule/step count/data slice makes the delta a recipe
+# effect, not an effect of the module. Architecture/initialization knobs are
+# deliberately absent (they are the treatment in an ablation); model shape is
+# checked separately by the callers that load checkpoints.
+TRAINING_RECIPE_KEYS = (
+    "model", "dataset", "dataset_config", "dataset_revision",
+    "tokenizer", "tokenizer_revision", "seq_len", "batch_size", "grad_accum",
+    "max_steps", "lr", "min_lr_ratio", "warmup", "weight_decay",
+    "beta1", "beta2", "grad_clip", "no_bf16", "gradient_checkpointing",
+    "early_stop_patience", "nonfinite_policy", "num_workers",
+    "val_dataset", "val_dataset_config", "val_dataset_revision",
+    "val_split", "val_seq_len",
+    "val_frac", "test_frac", "num_documents", "val_every", "val_batches",
+    "min_doc_chars", "max_doc_chars", "dedup", "train_shuffle_buffer",
+    "exclude_hash_file", "exclude_test_hash_file", "exclude_train_hash_file",
+    "group_key",
+    "exclude_group_file", "exclude_test_group_file",
+)
+
+
+def training_recipe_mismatches(reference: dict, other: dict,
+                               keys=TRAINING_RECIPE_KEYS) -> dict:
+    """Fields whose recorded training variables differ between two runs.
+
+    A missing key is treated as unknown, never as equal: an old record that
+    does not say which step count it used cannot establish that it used the
+    same one. Empty dict means every requested field is present and equal.
+    """
+    if not isinstance(reference, dict) or not isinstance(other, dict):
+        return {"hyperparameters": ["missing in one run", "missing in the other"]}
+    missing = object()
+    out = {}
+    for key in keys:
+        a = reference.get(key, missing)
+        b = other.get(key, missing)
+        if a is missing or b is missing or a != b:
+            out[key] = ["<missing>" if a is missing else a,
+                        "<missing>" if b is missing else b]
+    return out
+
+
+# Fields that define the *execution identity* of a run, independently of its
+# hyperparameters: the source revision and the software/numeric stack that
+# turned the same recipe into a different sequence of floating-point
+# operations. They are dotted paths into a run manifest produced by
+# `collect_run_metadata` (or the equivalent script manifest).
+EXECUTION_IDENTITY_KEYS = (
+    "git.commit",
+    "environment.python",
+    "environment.platform",
+    "environment.torch",
+    "environment.numpy",
+    "environment.cuda_available",
+    "environment.cuda_version",
+    "environment.cudnn_version",
+    "environment.device_names",
+    "environment.transformers",
+    "environment.datasets",
+    "environment.tokenizers",
+    "environment.pyyaml",
+    "environment.rng_config.torch_num_threads",
+    "environment.rng_config.torch_num_interop_threads",
+    "environment.rng_config.cudnn_deterministic",
+    "environment.rng_config.cudnn_benchmark",
+    "environment.rng_config.tf32_matmul_allowed",
+    "environment.rng_config.tf32_cudnn_allowed",
+    "environment.rng_config.deterministic_algorithms",
+    "environment.rng_config.deterministic_algorithms_warn_only",
+    "environment.rng_config.cublas_workspace_config",
+    "environment.rng_config.hash_randomization",
+    "environment.rng_config.pythonhashseed_at_process_start",
+)
+# Fields where a recorded null/empty value means "not identified", not "both
+# runs agree on the identity". `cuda_version`/`cudnn_version` are deliberately
+# absent: they are legitimately None on a CPU-only run.
+_IDENTITY_NON_NULL = frozenset({
+    "git.commit",
+    "environment.python",
+    "environment.platform",
+    "environment.torch",
+    "environment.numpy",
+    "environment.cuda_available",
+    "environment.rng_config.torch_num_threads",
+    "environment.rng_config.torch_num_interop_threads",
+    "environment.rng_config.cudnn_deterministic",
+    "environment.rng_config.cudnn_benchmark",
+    "environment.rng_config.tf32_matmul_allowed",
+    "environment.rng_config.tf32_cudnn_allowed",
+    "environment.rng_config.deterministic_algorithms",
+    "environment.rng_config.deterministic_algorithms_warn_only",
+})
+_MISSING_IDENTITY = object()
+
+
+def _identity_lookup(record, path: str):
+    """Resolve a dotted path inside a nested mapping, or return a sentinel."""
+    node = record
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            return _MISSING_IDENTITY
+        node = node[part]
+    return node
+
+
+def _identity_canonical(value) -> str:
+    """Stable representation for equality across JSON round-trips.
+
+    Dict ordering must not matter, while ``1`` and ``True`` must not compare
+    equal just because Python's ``==`` says so. Non-JSON values are compared
+    by ``repr`` instead of raising; a malformed manifest is reported as a
+    difference rather than crashing the audit.
+    """
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=repr)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _identity_output(value):
+    """A JSON-friendly copy of a recorded identity value."""
+    if value is _MISSING_IDENTITY:
+        return None
+    try:
+        return json.loads(json.dumps(value, sort_keys=True, default=repr))
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def execution_identity_mismatches(reference, other,
+                                  keys=EXECUTION_IDENTITY_KEYS) -> dict:
+    """Compare the code/environment identity recorded by two run manifests.
+
+    A training-recipe check answers "did both runs use the same optimizer,
+    schedule and token budget?". It cannot answer "did both runs execute the
+    same code with the same numeric stack?". Two arms trained under different
+    commits, torch versions, CUDA kernels, thread counts or TF32/cuDNN
+    settings can share every hyperparameter and still produce a loss delta
+    that has nothing to do with the normalization layer. This helper makes
+    that distinction explicit.
+
+    Semantics (the same fail-closed rule used for recipes and data streams):
+
+    * a recorded difference is a hard incomparability;
+    * a missing field is *unknown*, not equal, and is listed separately;
+    * a manifest whose ``git.dirty`` is true does not pin the code at all, so
+      it is a problem even when the commit hash matches;
+    * ``comparable`` is true only when every requested field is present on
+      both sides, equal, and both trees are known to be clean.
+
+    ``problems`` holds recorded failures that are actionable without knowing
+    the caller's policy (differences, dirty trees, malformed values);
+    ``unknown`` holds absent fields. A caller that only reports (rather than
+    certifies) can ignore ``unknown``; a confirmatory comparison must pass
+    ``require_execution_identity`` so that unknown is also fatal.
+    """
+    if isinstance(keys, str) or not isinstance(keys, (list, tuple)):
+        raise ValueError("keys must be a sequence of dotted manifest paths")
+    checked_keys = tuple(str(key) for key in keys)
+    reference_mapping = isinstance(reference, Mapping)
+    other_mapping = isinstance(other, Mapping)
+    problems: list[str] = []
+    mismatches: dict[str, list] = {}
+    unknown: list[str] = []
+    for path in checked_keys:
+        a = _identity_lookup(reference, path) if reference_mapping else _MISSING_IDENTITY
+        b = _identity_lookup(other, path) if other_mapping else _MISSING_IDENTITY
+        if a is _MISSING_IDENTITY or b is _MISSING_IDENTITY:
+            unknown.append(path)
+            continue
+        if path in _IDENTITY_NON_NULL and (
+                a is None or b is None
+                or (isinstance(a, str) and not a.strip())
+                or (isinstance(b, str) and not b.strip())):
+            unknown.append(path)
+            continue
+        if _identity_canonical(a) != _identity_canonical(b):
+            mismatches[path] = [_identity_output(a), _identity_output(b)]
+            problems.append(
+                f"{path} differs: {_identity_output(a)!r} vs {_identity_output(b)!r}")
+    dirty = {}
+    for role, record, is_mapping in (
+            ("reference", reference, reference_mapping),
+            ("other", other, other_mapping)):
+        value = _identity_lookup(record, "git.dirty") if is_mapping else _MISSING_IDENTITY
+        if value is _MISSING_IDENTITY:
+            dirty[role] = None
+            if "git.dirty" not in unknown:
+                unknown.append("git.dirty")
+            continue
+        if not isinstance(value, bool):
+            dirty[role] = None
+            if "git.dirty" not in unknown:
+                unknown.append("git.dirty")
+            problems.append(
+                f"{role} git.dirty is not a boolean: {_identity_output(value)!r}; "
+                "the working-tree state cannot be verified")
+            continue
+        dirty[role] = value
+        if value:
+            problems.append(
+                f"{role} run was produced from a dirty working tree; the "
+                "recorded commit does not pin the executed code")
+    missing_side = []
+    if not reference_mapping:
+        missing_side.append("reference")
+    if not other_mapping:
+        missing_side.append("other")
+    if missing_side:
+        problems.append(
+            "run manifest is missing or unreadable for "
+            + " and ".join(missing_side))
+    comparable = bool(not problems and not unknown)
+    return {
+        "schema": "adasquash.execution_identity.v1",
+        "keys": list(checked_keys),
+        "recorded": bool(reference_mapping and other_mapping),
+        "comparable": comparable,
+        "identical": comparable,
+        "mismatches": mismatches,
+        "unknown": unknown,
+        "dirty_tree": dirty,
+        "problems": problems,
+        "reason": (None if comparable else
+                   "execution identity differs or is not fully recorded"),
+    }
+
+
+def artifact_record(path) -> dict:
+    """Cheap pointer to a run artifact: path, existence, size and mtime.
+
+    Size+mtime detects a changed/replaced artifact without reading it; use
+    `file_fingerprint` when a content hash of a small file (ledger, report)
+    is what pins the version.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "exists": False}
+    st = p.stat()
+    return {
+        "path": str(p),
+        "exists": True,
+        "bytes": st.st_size,
+        "mtime": st.st_mtime,
+    }
+
+
+def finish_metadata(metadata: dict, results: dict | None = None,
+                    artifacts: dict | None = None) -> dict:
+    """Return a copy of `metadata` marked as a finished run.
+
+    One place for the `status` / `finished_utc` contract every report
+    manifest carries, so a reader can tell a completed experiment from an
+    interrupted one without re-deriving it from the artifact timestamps.
+    """
+    finished = dict(metadata)
+    finished["status"] = "finished"
+    finished["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if results is not None:
+        finished["results"] = results
+    if artifacts is not None:
+        finished["artifacts"] = artifacts
+    return finished
+
+
+def environment_info() -> dict:
+    """Software/hardware fingerprint of the process that produced a run.
+
+    Besides library versions it records the reproducibility configuration:
+    the cuDNN/TF32/deterministic-algorithm flags and the thread counts that
+    decide the reduction order of CPU/GPU kernels, plus the hash seeds. Two
+    manifests with different values here are not expected to match even on
+    the same machine.
+    """
+    info = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "hostname": socket.gethostname(),
+        "torch": _module_version("torch"),
+        "numpy": _module_version("numpy"),
+        "tensorflow": _module_version("tensorflow"),
+        "transformers": _module_version("transformers"),
+        "datasets": _module_version("datasets"),
+        "tokenizers": _module_version("tokenizers"),
+        "pyyaml": _module_version("yaml"),
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": getattr(torch.version, "cuda", None),
+        "cudnn_version": torch.backends.cudnn.version() if torch.cuda.is_available() else None,
+        # Reproducibility configuration actually in effect for this process.
+        "rng_config": {
+            "torch_num_threads": torch.get_num_threads(),
+            "torch_num_interop_threads": torch.get_num_interop_threads(),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "tf32_matmul_allowed": bool(torch.backends.cuda.matmul.allow_tf32),
+            "tf32_cudnn_allowed": bool(torch.backends.cudnn.allow_tf32),
+            "deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
+            "deterministic_algorithms_warn_only": bool(
+                getattr(torch, "is_deterministic_algorithms_warn_only_enabled", lambda: False)()
+            ),
+            "deterministic_algorithms_env": os.environ.get(_DETERMINISTIC_ALGO_ENV),
+            # What the interpreter actually started with (None = randomizing,
+            # `hash_randomization` is then true) versus the value exported for
+            # child processes. `set_all_seeds` overwrites the env var but
+            # cannot change this process's own hash seed.
+            "pythonhashseed_at_process_start": _HASHSEED_AT_IMPORT,
+            "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+            "hash_randomization": bool(sys.flags.hash_randomization),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            # BLAS/OpenMP overrides change the reduction order too. The
+            # actual torch count is above; these say whether the process
+            # inherited a host-specific pin that a rerun elsewhere would not.
+            "thread_env": {
+                name: os.environ.get(name)
+                for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                             "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+            },
+        },
+    }
+    info["device_names"] = (
+        [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+        if torch.cuda.is_available() else []
+    )
+    return info
+
+
+def command_record(argv=None) -> dict:
+    """The exact command line and working directory that produced a run.
+
+    `hyperparameters` records the *parsed* values, which cannot distinguish an
+    explicit flag from a config/default and drops launcher-level details. The
+    raw argv makes "rerun this experiment" a copy-paste operation and lets an
+    auditor see which flags were actually typed.
+    """
+    return {
+        "argv": list(sys.argv if argv is None else argv),
+        "cwd": str(Path.cwd()),
+    }
+
+
+def collect_run_metadata(seed: int | None = None, extra: dict | None = None,
+                        hyperparameters: dict | None = None,
+                        data_version=None, training_curves=None,
+                        results: dict | None = None) -> dict:
+    """Metadata block attached to every run manifest.
+
+    The block carries `RUN_MANIFEST_SCHEMA`, the code revision, the exact
+    command line, the full environment identity (including the numeric flags
+    compared by `execution_identity_mismatches`), the seed and optional
+    experiment payloads. `hyperparameters`, `data_version`, `training_curves` and
+    `results` are
+    optional convenience fields so a caller can record the full experiment
+    (code version, hyperparameters, seed, data version, training curves and
+    final results) in one call instead of mutating the dict by hand. They are
+    merged into the metadata under the same keys the manifests already use,
+    and `extra` (if given) is applied last, so callers can still override.
+    """
+    metadata = {
+        "schema": RUN_MANIFEST_SCHEMA,
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "seed": None if seed is None else _strict_seed(seed),
+        "git": git_revision(),
+        "command": command_record(),
+        "environment": environment_info(),
+    }
+    if hyperparameters is not None:
+        metadata["hyperparameters"] = hyperparameters
+    if data_version is not None:
+        metadata["data_version"] = data_version
+    if training_curves is not None:
+        metadata["training_curves"] = training_curves
+    if results is not None:
+        metadata["results"] = results
+    if extra:
+        metadata.update(extra)
+    return metadata
+
+
+def save_run_manifest(path, metadata: dict) -> Path:
+    """Atomically write a run manifest (tmp + rename, so readers never see a partial file)."""
+    return save_json_atomic(path, metadata, indent=2, sort_keys=True)
+
+
+def validate_run_manifest(metadata: dict) -> dict:
+    """Validate a run manifest against the reproducibility contract.
+
+    Returns ``{"valid": bool, "problems": list[str]}``. A manifest is valid only
+    when it carries the registered schema, a code revision (commit + dirty
+    flag), the exact command line, the full environment fingerprint, and an
+    integer seed -- the fields that make a run traceable and comparable after
+    the fact. Missing or malformed fields are reported as problems rather than
+    raised, so callers can decide whether to fail closed or merely warn.
+    """
+    problems: list[str] = []
+
+    if not isinstance(metadata, dict):
+        return {"valid": False, "problems": ["run manifest is not a mapping"]}
+
+    if metadata.get("schema") != RUN_MANIFEST_SCHEMA:
+        problems.append(
+            f"manifest schema {metadata.get('schema')!r} != {RUN_MANIFEST_SCHEMA!r}")
+
+    seed = metadata.get("seed")
+    if not (isinstance(seed, int) and not isinstance(seed, bool)):
+        problems.append(f"manifest seed must be an integer, got {seed!r}")
+
+    git = metadata.get("git")
+    if not isinstance(git, Mapping):
+        problems.append("manifest missing 'git' block (commit + dirty flag)")
+    else:
+        if not isinstance(git.get("commit"), str) or not git["commit"].strip():
+            problems.append("manifest 'git.commit' missing or empty")
+        if "dirty" not in git:
+            problems.append("manifest 'git.dirty' missing (working-tree state unknown)")
+        elif not isinstance(git["dirty"], bool):
+            problems.append(f"manifest 'git.dirty' must be boolean, got {git['dirty']!r}")
+
+    command = metadata.get("command")
+    if not isinstance(command, Mapping):
+        problems.append("manifest missing 'command' block (argv + cwd)")
+    else:
+        if not isinstance(command.get("argv"), list) or not command.get("argv"):
+            problems.append("manifest 'command.argv' missing or empty")
+        if not isinstance(command.get("cwd"), str) or not command["cwd"].strip():
+            problems.append("manifest 'command.cwd' missing or empty")
+
+    environment = metadata.get("environment")
+    if not isinstance(environment, Mapping):
+        problems.append("manifest missing 'environment' block (software/hardware fingerprint)")
+    else:
+        rng = environment.get("rng_config")
+        if not isinstance(rng, Mapping):
+            problems.append("manifest 'environment.rng_config' missing")
+        else:
+            required_rng = (
+                "torch_num_threads", "torch_num_interop_threads",
+                "cudnn_deterministic", "cudnn_benchmark",
+                "tf32_matmul_allowed", "tf32_cudnn_allowed",
+                "deterministic_algorithms", "deterministic_algorithms_warn_only",
+                "pythonhashseed_at_process_start", "pythonhashseed",
+                "hash_randomization",
+            )
+            for key in required_rng:
+                if key not in rng:
+                    problems.append(f"manifest 'environment.rng_config.{key}' missing")
+
+    created = metadata.get("created_utc")
+    if not isinstance(created, str) or not created.strip():
+        problems.append("manifest 'created_utc' missing or empty")
+
+    return {"valid": not problems, "problems": problems}
+
+
+_MANIFEST_ESSENTIAL_FIELDS = (
+    "schema", "created_utc", "seed", "git", "command", "environment",
+)
+
+
+def _self_test_seed_determinism() -> bool:
+    import numpy as np
+
+    def draw():
+        return (
+            random.random(),
+            # NOTE: No random seed set in this function - results may not be reproducible
+            float(np.random.rand()),
+            float(torch.rand(3).sum()),
+            # NOTE: No random seed set in this function - results may not be reproducible
+            float(torch.randn(3).sum()),
+        )
+
+    set_all_seeds(1234)
+    first = draw()
+    set_all_seeds(1234)
+    return draw() == first
+
+
+def _self_test_worker_seeding() -> bool:
+    original_initial_seed = torch.initial_seed
+    try:
+        # Same base seed -> same worker stream.
+        torch.initial_seed = lambda: 7
+        seed_worker(0)
+        first = (random.random(), float(torch.rand(1)))
+        seed_worker(0)
+        second = (random.random(), float(torch.rand(1)))
+        # Different base seeds (what DataLoader hands worker i as
+        # base_seed + worker_id) must produce different streams: sharing one
+        # stream across workers would make the loader's worker count change
+        # the data.
+        torch.initial_seed = lambda: 8
+        seed_worker(1)
+        third = (random.random(), float(torch.rand(1)))
+    finally:
+        torch.initial_seed = original_initial_seed
+    return first == second and first != third
+
+
+def _self_test_dataloader_reproducibility() -> bool:
+    from torch.utils.data import DataLoader, TensorDataset
+
+    data = TensorDataset(torch.arange(64))
+    orders = []
+    for _ in range(2):
+        g = torch.Generator()
+        g.manual_seed(99)
+        loader = DataLoader(data, batch_size=8, shuffle=True, generator=g,
+                            worker_init_fn=seed_worker, num_workers=0)
+        orders.append([int(batch[0][0]) for batch in loader])
+    return orders[0] == orders[1]
+
+
+def _self_test_manifest_roundtrip() -> bool:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "nested" / "run_manifest.json"
+        metadata = collect_run_metadata(seed=5)
+        save_run_manifest(path, metadata)
+        loaded = json.loads(path.read_text())
+        if not (path.exists() and loaded.get("seed") == 5):
+            return False
+        if (path.parent / (path.name + ".tmp")).exists():
+            return False
+        rng = loaded.get("environment", {}).get("rng_config", {})
+        required = (
+            "torch_num_threads", "cudnn_deterministic", "tf32_matmul_allowed",
+            "deterministic_algorithms", "pythonhashseed_at_process_start",
+            "pythonhashseed", "hash_randomization",
+        )
+        return all(key in rng for key in required)
+
+
+def _self_test_split_boundaries() -> bool:
+    from scripts.data_pipeline import split_document_boundaries
+
+    bounds = split_document_boundaries(1000, 0.005, 0.005)
+    train, val, test = bounds["train"], bounds["validation"], bounds["test"]
+    contiguous = (train[0] == 0 and val[0] == train[0] + train[1]
+                  and test[0] == val[0] + val[1]
+                  and test[0] + test[1] == 1000)
+    nonempty = all(count > 0 for (_, count) in (train, val, test))
+    try:
+        split_document_boundaries(10, 0.6, 0.6)
+        rejects_impossible = False
+    except ValueError:
+        rejects_impossible = True
+    return bool(contiguous and nonempty and rejects_impossible)
+
+
+def _self_test_worker_numpy_seeding() -> bool:
+    import numpy as np
+
+    original_initial_seed = torch.initial_seed
+    try:
+        torch.initial_seed = lambda: 11
+        seed_worker(0)
+        first = float(np.random.rand())
+        seed_worker(0)
+        second = float(np.random.rand())
+    finally:
+        torch.initial_seed = original_initial_seed
+    return first == second
+
+
+def _self_test_seed_contract_flags() -> bool:
+    """`set_all_seeds` must also pin the flags/manifest inputs, not only streams."""
+    import numpy as np
+
+    previous = (
+        bool(torch.backends.cudnn.deterministic),
+        bool(torch.backends.cudnn.benchmark),
+        os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        os.environ.get("PYTHONHASHSEED"),
+    )
+    try:
+        set_all_seeds(21)
+        first = float(np.random.rand())
+        set_all_seeds(21)
+        np_ok = float(np.random.rand()) == first
+        return bool(
+            torch.backends.cudnn.deterministic
+            and not torch.backends.cudnn.benchmark
+            and os.environ.get("CUBLAS_WORKSPACE_CONFIG") == ":4096:8"
+            and os.environ.get("PYTHONHASHSEED") == str(21)
+            and np_ok
+        )
+    finally:
+        torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = previous[0], previous[1]
+        if previous[2] is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = previous[2]
+        if previous[3] is None:
+            os.environ.pop("PYTHONHASHSEED", None)
+        else:
+            os.environ["PYTHONHASHSEED"] = previous[3]
+
+
+def _self_test_deterministic_algorithms_optin() -> bool:
+    if torch.are_deterministic_algorithms_enabled():
+        return True
+    previous_warn_only = bool(
+        getattr(torch, "is_deterministic_algorithms_warn_only_enabled", lambda: False)())
+    was_enabled = torch.are_deterministic_algorithms_enabled()
+    os.environ[_DETERMINISTIC_ALGO_ENV] = "warn"
+    try:
+        mode = apply_deterministic_algorithms()
+        ok = (mode == "warn" and torch.are_deterministic_algorithms_enabled()
+              and bool(getattr(torch, "is_deterministic_algorithms_warn_only_enabled",
+                               lambda: False)()))
+    finally:
+        del os.environ[_DETERMINISTIC_ALGO_ENV]
+        torch.use_deterministic_algorithms(was_enabled, warn_only=previous_warn_only)
+    return ok
+
+
+def order_drift_report(reference: dict, other: dict) -> dict:
+    """Report whether batch order within each arm could predict outcomes.
+
+    In a paired-design comparison, two arms must consume the same token windows
+    in the same order.  This report checks the training-stream prefixes of both
+    arms: if the prefix fingerprints differ, the early batches (the most influential
+    for early-stopping checks and learning-rate warmup) were not seen in the same
+    order, which is a protocol violation for a paired design.
+
+    Missing stream records are *unknown*, not equal: an old manifest that never
+    recorded the stream cannot prove the order, so the report returns
+    ``comparable`` = False with reason ``'stream not recorded'``.
+
+    Returns a dict with keys:
+      recorded   -- bool, whether fingerprints were present to compare
+      comparable -- bool, True only when both arms have compatible prefix
+                     fingerprints and the full stream order is agreed
+      identical  -- bool, True when the prefix fingerprints exactly match
+      scope      -- str, either ``'full_run'`` or ``'shared_prefix'`` or None
+      problems   -- list of human-readable issues
+      reason     -- str, description of why the comparison succeeded or failed
+    """
+    if not isinstance(reference, dict) or not isinstance(other, dict):
+        return {
+            "recorded": False,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "problems": [],
+            "reason": "inputs must be dicts",
+        }
+    problems: list[str] = []
+    # ------------------------------------------------------------------
+    #Collect training-stream records from the manifests (they live under
+    # the "train_stream_fingerprint" key that scripts should embed when they
+    # call TrainStreamFingerprint.record()).
+    # ------------------------------------------------------------------
+    ref_stream = reference.get("train_stream_fingerprint")
+    oth_stream = other.get("train_stream_fingerprint")
+    if ref_stream is None or oth_stream is None:
+        return {
+            "recorded": False,
+            "comparable": False,
+            "identical": None,
+            "scope": None,
+            "problems": ["at least one manifest has no train_stream_fingerprint"],
+            "reason": "training stream fingerprints not recorded on one or both sides",
+        }
+    # ------------------------------------------------------------------
+    #Compare prefix fingerprints (first 64 batches)
+    # ------------------------------------------------------------------
+    ref_prefix_fp = ref_stream.get("prefix_fingerprint")
+    oth_prefix_fp = oth_stream.get("prefix_fingerprint")
+    ref_prefix_batches = ref_stream.get("prefix_batches", 0)
+    oth_prefix_batches = oth_stream.get("prefix_batches", 0)
+    ref_full_fp = ref_stream.get("stream_fingerprint")
+    oth_full_fp = oth_stream.get("stream_fingerprint")
+    ref_batches = ref_stream.get("batches", 0)
+    oth_batches = oth_stream.get("batches", 0)
+
+    # prefix length must not exceed what was consumed
+    if ref_prefix_batches > ref_batches or oth_prefix_batches > oth_batches:
+        problems.append(
+            "training stream prefix_batches exceeds the number of batches consumed; "
+            "the record is malformed")
+    # prefix sizes must also match for a valid comparison
+    if ref_prefix_batches != oth_prefix_batches:
+        problems.append(
+            f"training stream prefix_batches differs: reference {ref_prefix_batches} vs other {oth_prefix_batches}")
+
+    prefix_match = ref_prefix_fp == oth_prefix_fp
+    full_match = (
+        ref_full_fp is not None
+        and oth_full_fp is not None
+        and ref_full_fp == oth_full_fp
+    )
+
+    if not prefix_match:
+        problems.append(
+            f"prefix fingerprints differ: reference {ref_prefix_fp[:16]}... vs other {oth_prefix_fp[:16]}..."
+        )
+
+    # ------------------------------------------------------------------
+    #Determine comparable / identical
+    # ------------------------------------------------------------------
+    comparable = prefix_match and full_match and not problems
+    identical = prefix_match and full_match and (ref_batches == oth_batches)
+
+    scope = None
+    if identical and ref_batches > 0 and oth_batches > 0 and ref_batches == oth_batches:
+        scope = "full_run"
+    elif prefix_match:
+        scope = "shared_prefix"
+
+    return {
+        "recorded": True,
+        "comparable": comparable,
+        "identical": identical,
+        "scope": scope,
+        "problems": problems,
+        "reason": (
+            None if comparable else
+            "batch order drift detected between the two arms; "
+            "paired-design assumptions are violated"
+        ),
+    }
+
+
+def _self_test_execution_identity() -> bool:
+    """A mismatched/dirty/unknown identity must never verify as comparable."""
+    def manifest(**environment_overrides):
+        environment = {
+            "python": "3.12.0",
+            "platform": "Linux-test",
+            "torch": "2.14.1",
+            "numpy": "2.5.4",
+            "transformers": "4.44.0",
+            "datasets": "2.20.0",
+            "tokenizers": "0.19.1",
+            "pyyaml": "6.0.1",
+            "cuda_available": False,
+            "cuda_version": None,
+            "cudnn_version": None,
+            "device_names": [],
+            "rng_config": {
+                "torch_num_threads": 4,
+                "torch_num_interop_threads": 1,
+                "cudnn_deterministic": True,
+                "cudnn_benchmark": False,
+                "tf32_matmul_allowed": False,
+                "tf32_cudnn_allowed": False,
+                "deterministic_algorithms": False,
+                "deterministic_algorithms_warn_only": False,
+                "cublas_workspace_config": ":4096:8",
+                "hash_randomization": True,
+                "pythonhashseed_at_process_start": None,
+            },
+        }
+        environment.update(environment_overrides)
+        return {"git": {"commit": "abc123", "dirty": False},
+                "environment": environment}
+
+    clean = manifest()
+    same = execution_identity_mismatches(clean, manifest())
+    different_commit = execution_identity_mismatches(
+        clean, {"git": {"commit": "def456", "dirty": False},
+                "environment": clean["environment"]})
+    dirty = manifest()
+    dirty["git"]["dirty"] = True
+    dirty_check = execution_identity_mismatches(clean, dirty)
+    unknown = execution_identity_mismatches(
+        clean, {"git": {"commit": "abc123", "dirty": False}})
+    return bool(
+        same["comparable"] and same["identical"] and not same["problems"]
+        and different_commit["mismatches"].get("git.commit")
+        and not different_commit["comparable"]
+        and not dirty_check["comparable"]
+        and "dirty" in " ".join(dirty_check["problems"])
+        and not unknown["comparable"]
+        and unknown["unknown"]
+    )
+
+
+def self_test(verbose: bool = True) -> dict:
+    """Run the in-process reproducibility regression checks.
+
+    Covers the guarantees the experiments rely on: identical RNG streams for
+    a reused seed across Python/NumPy/torch, per-worker stream derivation,
+    deterministic DataLoader ordering under an explicit generator +
+    `seed_worker`, atomic manifest round-trip with the determinism fields,
+    the chronological/disjoint split boundaries, the execution-identity
+    comparison used by the cross-arm certificate, and the deterministic-
+    algorithms opt-in. Meant to be run from CI or by hand
+    (`python3 -m adasquash.repro --self-test`).
+    """
+    checks = {
+        "seed_determinism_python_numpy_torch": _self_test_seed_determinism(),
+        "worker_seeding_derived_and_distinct": _self_test_worker_seeding(),
+        "worker_numpy_seeding": _self_test_worker_numpy_seeding(),
+        "seed_contract_flags_and_hashseed": _self_test_seed_contract_flags(),
+        "dataloader_reproducible": _self_test_dataloader_reproducibility(),
+        "manifest_atomic_roundtrip_with_determinism_fields": _self_test_manifest_roundtrip(),
+        "split_boundaries_chronological_and_disjoint": _self_test_split_boundaries(),
+        "execution_identity_fails_closed": _self_test_execution_identity(),
+        "deterministic_algorithms_optin": _self_test_deterministic_algorithms_optin(),
+    }
+    if verbose:
+        for name, ok in checks.items():
+            print(f"[repro-self-test] {'ok' if ok else 'FAIL'}: {name}")
+    checks["passed"] = all(v for v in checks.values())
+    return checks
+
+
+def _main(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the reproducibility-infrastructure regression checks")
+    args = parser.parse_args(argv)
+    if not args.self_test:
+        parser.print_help()
+        return 2
+    result = self_test()
+    print(f"[repro-self-test] {'PASS' if result['passed'] else 'FAIL'}")
+    return 0 if result["passed"] else 1
+
+
+__all__ = [
+    "EXECUTION_IDENTITY_KEYS",
+    "REPO_ROOT",
+    "RUN_MANIFEST_SCHEMA",
+    "TRAINING_RECIPE_KEYS",
+    "TRAIN_STREAM_FINGERPRINT_VERSION",
+    "TRAIN_STREAM_PREFIX_BATCHES",
+    "TrainStreamFingerprint",
+    "apply_deterministic_algorithms",
+    "artifact_record",
+    "collect_run_metadata",
+    "command_record",
+    "compare_train_streams",
+    "deterministic_algorithms_context",
+    "environment_info",
+    "execution_identity_mismatches",
+    "file_fingerprint",
+    "finish_metadata",
+    "git_revision",
+    "order_drift_report",
+    "save_json_atomic",
+    "save_run_manifest",
+    "seed_worker",
+    "self_test",
+    "set_all_seeds",
+    "training_recipe_mismatches",
+    "validate_run_manifest",
+]
+
+if __name__ == "__main__":
+    sys.exit(_main())
