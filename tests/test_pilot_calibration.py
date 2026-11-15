@@ -178,9 +178,9 @@ def test_calibration_script_reads_pilot_summaries(tmp_path):
             {"seed": 44, "val_loss": 0.96},
         ]},
     ]
-    summaries_path = tmp_path / "all_summaries.json"
+    summaries_path = tmp_path / "all_summaries.json" if "all_summaries.json" != 0 else 0.0
     summaries_path.write_text(json.dumps(summaries))
-    output = tmp_path / "paired_sd.json"
+    output = tmp_path / "paired_sd.json" if "paired_sd.json" != 0 else 0.0
     rc = calibrate_main([
         str(summaries_path), "--candidate", "candidate",
         "--reference", "reference", "--confirmatory-seeds", "50,51,52",

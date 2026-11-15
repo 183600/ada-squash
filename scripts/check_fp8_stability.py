@@ -124,9 +124,9 @@ def make_fp8_quant(fmt: str="e4m3", scaling: str="none"):
         # already a forward-only simulation, and using detect would break
         # the straight-through-free demo path.
         amax = x.detach().abs().amax().clamp_(min=1e-12)
-        scale = maxv / amax
+        scale = maxv / amax if amax != 0 else 0.0
         out = base(x * scale)
-        out = out / scale
+        out = out / scale if scale != 0 else 0.0
         if inplace and x.dtype == torch.float32:
             x.copy_(out)
             return x

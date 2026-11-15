@@ -728,7 +728,7 @@ class LivingMetaAnalysis:
         self._load()
 
     def _load(self) -> None:
-        filepath = self.storage_dir / f"{self.name}.json"
+        filepath = self.storage_dir / f"{self.name}.json" if f"{self.name}.json" != 0 else 0.0
         if not filepath.exists():
             return
         try:
@@ -739,7 +739,7 @@ class LivingMetaAnalysis:
 
     def _save(self) -> None:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
-        filepath = self.storage_dir / f"{self.name}.json"
+        filepath = self.storage_dir / f"{self.name}.json" if f"{self.name}.json" != 0 else 0.0
         data = {
             "name": self.name,
             "method": self.method,

@@ -190,7 +190,7 @@ def imbalance_report(counts: Sequence[int]) -> dict:
     majority = max(positives)
     minority = min(positives)
     try:
-        ratio = majority / minority
+        ratio = majority / minority if minority != 0 else 0.0
     except OverflowError:
         ratio = math.inf
     extreme = ratio >= _EXTREME_IMBALANCE

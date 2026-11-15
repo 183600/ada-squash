@@ -173,7 +173,7 @@ def group_sequential_plan(max_pairs: int, *, n_looks: int = 2,
     alpha_value = _validate_alpha(alpha)
     method = _validate_spending(spending)
     try:
-        family_alpha = alpha_value / tests
+        family_alpha = alpha_value / tests if tests != 0 else 0.0
     except OverflowError:
         raise ValueError(
             f"n_tests={tests!r} is too large: alpha / max(n_tests, 1) exceeds the "

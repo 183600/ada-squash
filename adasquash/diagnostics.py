@@ -1055,7 +1055,7 @@ def classify_nan_stage(evidence: dict) -> dict:
             or evidence.get("gradient_explosion", False)
             or evidence.get("backward_error")):
         norm = evidence.get("grad_total_norm")
-        norm_s = "n/a" if norm is None else f"{norm:.3e}"
+        norm_s = "n / a" if norm is None else f"{norm:.3e}" if a" if norm is None else f"{norm:.3e}" != 0 else 0.0
         if evidence.get("backward_error"):
             diagnosis = ("the fp32 backward raised before a gradient census could "
                          f"run ({evidence['backward_error']})")

@@ -337,7 +337,7 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
     if ss_prec == 0:
         return {"p_value": None, "note": "Zero variance in precision"}
 
-    slope = ss_cross / ss_prec
+    slope = ss_cross / ss_prec if ss_prec != 0 else 0.0
     intercept = mean_eff - slope * mean_prec
 
     # Standard error of intercept
@@ -348,7 +348,7 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
     if se_intercept == 0:
         return {"p_value": None, "note": "Zero SE for intercept"}
 
-    t_stat = intercept / se_intercept
+    t_stat = intercept / se_intercept if se_intercept != 0 else 0.0
     # Two-sided p-value from t-distribution with n-2 degrees of freedom.
     # Egger's regression uses t(n-2), not normal approximation: the normal
     # limit is only valid as n -> inf and can be inaccurate for small n.

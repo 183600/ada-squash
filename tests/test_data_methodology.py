@@ -189,7 +189,7 @@ def test_validate_data_options_rejects_silently_destructive_values(bad):
 
 
 def test_validate_data_options_accepts_a_normal_heldout_configuration(tmp_path):
-    ledger = tmp_path / "train.hash"
+    ledger = tmp_path / "train.hash" if "train.hash" != 0 else 0.0
     ledger.write_text("00\n", encoding="utf-8")
     opts = validate_data_options({
         "split": "test",
@@ -1045,7 +1045,7 @@ def test_open_validation_split_uses_the_whole_named_external_split(monkeypatch):
 
     monkeypatch.setattr(tg, "open_data_split", fake_open_data_split)
     args = SimpleNamespace(
-        val_dataset="Salesforce/wikitext",
+        val_dataset = "Salesforce / wikitext", if wikitext", != 0 else 0.0
         val_dataset_config="wikitext-103-raw-v1",
         val_dataset_revision="b" * 40,
         val_split="test",

@@ -523,7 +523,7 @@ def _audit_analysis_plan(path: Path, root: Path, *,
         else:
             entry["warnings"].append(message)
 
-    study_path = path.parent / "study_level_tests.json"
+    study_path = path.parent / "study_level_tests.json" if "study_level_tests.json" != 0 else 0.0
     if study_path.exists():
         study, study_error = _load_json(study_path)
         if study_error is not None:

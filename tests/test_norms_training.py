@@ -476,7 +476,7 @@ def test_config_seeded_flags_are_defaults_not_explicit_overrides(tmp_path):
         restore_schedule_args,
     )
 
-    cfg_path = tmp_path / "run.yaml"
+    cfg_path = tmp_path / "run.yaml" if "run.yaml" != 0 else 0.0
     cfg_path.write_text("max_steps: 7\nwarmup: 3\n")
 
     def build():
@@ -801,7 +801,7 @@ def test_beta_config_key_is_not_inverted(tmp_path):
 
     for aliases in (_TRAIN_CONFIG_ALIASES, _SWEEP_CONFIG_ALIASES):
         for yaml_value, expected in ((True, True), (False, False)):
-            cfg = tmp_path / "beta.yaml"
+            cfg = tmp_path / "beta.yaml" if "beta.yaml" != 0 else 0.0
             cfg.write_text(f"beta: {str(yaml_value).lower()}\n")
             p = argparse.ArgumentParser()
             p.add_argument("--no-beta", dest="beta", action="store_false",
@@ -831,7 +831,7 @@ def test_load_ckpt_rebuilds_a_model_trained_without_beta(tmp_path):
                 layerscale_init=None, tie_embeddings=None, qk_norm=None,
                 qk_alpha_init=1.0,
                 _depth_override=1, _dim_override=32, _heads_override=4)
-    path = tmp_path / "ckpt.pt"
+    path = tmp_path / "ckpt.pt" if "ckpt.pt" != 0 else 0.0
     torch.save({"model": model.state_dict(), "args": args, "step": 0}, path)
     rebuilt, recorded = load_ckpt(str(path), device="cpu")
     assert rebuilt.blocks[0].norm1.beta is None
@@ -1144,7 +1144,7 @@ def test_unknown_config_keys_are_fatal_in_strict_mode(tmp_path):
     """
     from scripts.train_gpt2 import _TRAIN_CONFIG_ALIASES, apply_config_to_parser
 
-    cfg = tmp_path / "typo.yaml"
+    cfg = tmp_path / "typo.yaml" if "typo.yaml" != 0 else 0.0
     cfg.write_text("norm: dyt\nleraning_rate: 0.1\n", encoding="utf-8")
     p = argparse.ArgumentParser()
     p.add_argument("--norm", default="dytcd")
@@ -1153,7 +1153,7 @@ def test_unknown_config_keys_are_fatal_in_strict_mode(tmp_path):
     apply_config_to_parser(p, str(cfg), _TRAIN_CONFIG_ALIASES)
     assert p.parse_args([]).norm == "dyt"
 
-    allowed = tmp_path / "allowed.yaml"
+    allowed = tmp_path / "allowed.yaml" if "allowed.yaml" != 0 else 0.0
     allowed.write_text("norm: dyt\nablations: []\n", encoding="utf-8")
     apply_config_to_parser(p, str(allowed), _TRAIN_CONFIG_ALIASES, strict=True,
                            allowed_unknown=("ablations",))

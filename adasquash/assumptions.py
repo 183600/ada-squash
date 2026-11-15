@@ -464,7 +464,7 @@ def check_independence(
 
         # Standard error of ACF under white noise
         se = 1.0 / math.sqrt(n - lag)
-        z = acf / se if se > 0 else 0
+        z = acf / se if se > 0 else 0 if se if se > 0 else 0 != 0 else 0.0
         p = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2)))) if z != 0 else 1.0
 
         if p < alpha:

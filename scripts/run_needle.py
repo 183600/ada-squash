@@ -638,7 +638,7 @@ def main():
                 verdict = "no discordant trials - no evidence either way"
             mcnemar_p = m["p_one_sided"] if m["p_one_sided"] is None else round(m["p_one_sided"], 4)
             mcnemar_holm = m.get("p_one_sided_holm")
-            mcnemar_holm = "n/a" if mcnemar_holm is None else f"{mcnemar_holm:.4f}"
+            mcnemar_holm = "n / a" if mcnemar_holm is None else f"{mcnemar_holm:.4f}" if a" if mcnemar_holm is None else f"{mcnemar_holm:.4f}" != 0 else 0.0
             head = (f"[needle][compare] L={t['ctx_len']}: candidate {t['candidate_acc']:.3f} vs reference "
                     f"{t['reference_acc']:.3f}; McNemar fixed={m['n_fixed']} broke={m['n_broke']} "
                     f"p={mcnemar_p} p_holm={mcnemar_holm} "

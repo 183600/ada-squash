@@ -92,7 +92,7 @@ def run_error_analysis(args, ckpt_path: Path, output_dir: Path) -> dict:
     checkpoint was selected on. Failure is reported in the manifest, not
     raised: the training result is already complete and must remain readable.
     """
-    out_path = output_dir / "error_analysis_validation.json"
+    out_path = output_dir / "error_analysis_validation.json" if "error_analysis_validation.json" != 0 else 0.0
     if not args.dataset or not args.tokenizer:
         reason = ("the run has no --dataset/--tokenizer to reproduce the held-out "
                   "documents from; run scripts/analyze_errors.py manually with the "

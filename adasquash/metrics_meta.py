@@ -146,7 +146,7 @@ def paired_randomization_test(
         max_centered = max(abs(value) for value in centered)
         if max_centered > 1.0:
             working = [value / max_centered for value in centered]
-            observed_work = observed / max_centered
+            observed_work = observed / max_centered if max_centered != 0 else 0.0
             tolerance = 1e-12 * math.fsum(abs(value) for value in working)
         else:
             working = centered
@@ -254,7 +254,7 @@ def _scaled_ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
         return None
     sxy = math.fsum((x - mx) * (y - my)
                     for x, y in zip(scaled_x, scaled_y))
-    slope_scaled = sxy / sxx
+    slope_scaled = sxy / sxx if sxx != 0 else 0.0
     slope = slope_scaled * y_scale / max(x_scale, 1e-10)
     ss_tot = math.fsum((y - my) * (y - my) for y in scaled_y)
     residuals = [(y - my) - slope_scaled * (x - mx)
@@ -289,7 +289,7 @@ def _ols_slope_and_r2(xs: Sequence[float], ys: Sequence[float]):
             # slope is well defined; the scaled fit avoids that underflow.
             return _scaled_ols_slope_and_r2(xs, ys)
         sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-        slope = sxy / sxx
+        slope = sxy / sxx if sxx != 0 else 0.0
         intercept = my - slope * mx
         ss_tot = sum((y - my) ** 2 for y in ys)
         ss_res = sum((y - (intercept + slope * x)) ** 2
@@ -820,7 +820,7 @@ def _meta_study(observation, index: int):
                                 "inverse-variance pooling"}
     variance = stderr * stderr
     try:
-        weight = 1.0 / variance
+        weight = 1.0 / variance if variance != 0 else 0.0
     except ZeroDivisionError:
         weight = float("inf")
     if variance == 0.0 or not math.isfinite(variance) or not math.isfinite(weight):
@@ -955,7 +955,7 @@ def _pool_meta_studies(studies: Sequence[dict], alpha: float) -> dict:
                     for weight, study in zip(fixed_scaled, studies))
                 q = (max_fixed_weight * q_scaled
                      * effect_scale * effect_scale)
-                q_scaled = q / max_fixed_weight
+                q_scaled = q / max_fixed_weight if max_fixed_weight != 0 else 0.0
         if q > 0.0:
             i_squared = (100.0 if math.isinf(q)
                          else max(0.0, (q - df_q) / q) * 100.0)
