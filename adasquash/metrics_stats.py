@@ -695,7 +695,7 @@ def _gamma_q_cf(a: float, x: float) -> float:
     tiny = 1e-300
     b = x + 1.0 - a
     c = 1.0 / tiny
-    d = 1.0 / b
+    d = 1.0 / max(b, 1e-10)
     h = d
     for i in range(1, 10000):
         an = -i * (i - a)
@@ -706,7 +706,7 @@ def _gamma_q_cf(a: float, x: float) -> float:
         c = b + an / c
         if abs(c) < tiny:
             c = tiny
-        d = 1.0 / d
+        d = 1.0 / max(d, 1e-10)
         delta = d * c
         h *= delta
         if abs(delta - 1.0) < 1e-15:
