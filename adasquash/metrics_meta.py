@@ -5,7 +5,6 @@ import random
 from collections.abc import Sequence
 
 from .metrics_stats import (
-
     _RANDOMIZATION_EXACT_MAX,
     MIN_SEEDS_FOR_SIGNIFICANCE,
     _as_real,

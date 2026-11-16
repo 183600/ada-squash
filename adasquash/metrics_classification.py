@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import Optional
 
 from .metrics_stats import _EXTREME_IMBALANCE, _binary_labels, _is_boolean_value, _strict_int
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).

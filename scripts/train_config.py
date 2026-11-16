@@ -17,6 +17,7 @@ from torch.optim import AdamW
 from adasquash.diagnostics import parameter_finite_report, tensor_finite_report
 from adasquash.repro import TRAINING_RECIPE_KEYS
 from scripts.data_pipeline import _is_pinned_revision
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).

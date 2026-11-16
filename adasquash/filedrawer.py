@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .metrics_stats import student_t_cdf
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).

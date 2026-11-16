@@ -48,6 +48,7 @@ import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -164,6 +165,15 @@ class TrainStreamFingerprint:
     digest at the resume point and is only comparable to another run that
     resumed at the same step.
     """
+
+    _full: Any
+    _prefix: Any
+    _batches: int
+    _prefix_batches: int
+    _tokens: int
+    _prefix_tokens: int
+    start_step: int
+    prefix_batches_target: int
 
     def __init__(self, start_step: int = 0,
                  prefix_batches: int = TRAIN_STREAM_PREFIX_BATCHES):
@@ -788,7 +798,7 @@ def execution_identity_mismatches(reference, other,
             mismatches[path] = [_identity_output(a), _identity_output(b)]
             problems.append(
                 f"{path} differs: {_identity_output(a)!r} vs {_identity_output(b)!r}")
-    dirty = {}
+    dirty: dict[str, object | None] = {}
     for role, record, is_mapping in (
             ("reference", reference, reference_mapping),
             ("other", other, other_mapping)):
@@ -1082,7 +1092,7 @@ def _self_test_seed_determinism() -> bool:
     set_all_seeds(1234)
     first = draw()
     set_all_seeds(1234)
-    return draw() == first
+    return bool(draw() == first)
 
 
 def _self_test_worker_seeding() -> bool:

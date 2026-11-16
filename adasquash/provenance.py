@@ -28,6 +28,7 @@ from pathlib import Path
 
 from .ablation.analysis import analysis_plan_fingerprint
 from .repro import RUN_MANIFEST_SCHEMA
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).
@@ -127,7 +128,7 @@ def verify_artifact_record(record, *, search_dirs=(), label: str | None = None) 
     a missing file the manifest claimed existed.
     """
     label = label or "artifact"
-    result = {
+    result: dict[str, object] = {
         "label": label,
         "path": None,
         "resolved_path": None,
@@ -287,7 +288,7 @@ def _manifest_data_version(manifest) -> dict | None:
 def _audit_manifest(path: Path, root: Path, *, require_finished: bool,
                     require_clean_tree: bool) -> tuple[dict, dict | None]:
     data, error = _load_json(path)
-    entry = {
+    entry: dict[str, object] = {
         "path": str(path),
         "relative_path": _relative(path, root),
         "seed": None,
@@ -351,7 +352,7 @@ def _audit_manifest(path: Path, root: Path, *, require_finished: bool,
 def _audit_aggregate(path: Path, root: Path, manifests_by_path: dict,
                      manifests_by_seed: dict) -> tuple[dict, dict | None]:
     data, error = _load_json(path)
-    entry = {
+    entry: dict[str, object] = {
         "path": str(path),
         "relative_path": _relative(path, root),
         "n_seeds": None,
@@ -479,7 +480,7 @@ def _audit_aggregate(path: Path, root: Path, manifests_by_path: dict,
 def _audit_analysis_plan(path: Path, root: Path, *,
                          require_plan_lock: bool) -> tuple[dict, dict | None]:
     data, error = _load_json(path)
-    entry = {
+    entry: dict[str, object] = {
         "path": str(path),
         "relative_path": _relative(path, root),
         "fingerprint": None,
@@ -588,7 +589,7 @@ def audit_study(root, *, require_finished: bool = True,
         report["problems"].append(
             f"no run_manifest.json found under {root}")
     manifests_by_path = {}
-    manifests_by_seed = {}
+    manifests_by_seed: dict[int, dict] = {}
     for path in manifest_paths:
         entry, data = _audit_manifest(
             path, root, require_finished=require_finished,

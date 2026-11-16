@@ -39,6 +39,7 @@ from typing import Any, Optional
 
 from .metrics_meta import meta_analysis
 from .metrics_stats import chi2_ppf, chi2_sf, student_t_ppf, two_sided_p_from_t
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).

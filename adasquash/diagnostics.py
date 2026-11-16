@@ -34,6 +34,7 @@ from typing import Optional
 import torch
 
 from ._validation import is_boolean_scalar as _is_boolean_scalar
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).

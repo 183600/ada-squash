@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.design import paired_sd_calibration
 from adasquash.jsonio import save_json_atomic
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).

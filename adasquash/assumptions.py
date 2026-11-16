@@ -20,6 +20,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).

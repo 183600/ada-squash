@@ -11,6 +11,7 @@ from torch.nn.utils import skip_init
 
 from ._caching import _inference_stale, _lru_scratch_buffer
 from .norms import QKSquash, _RMSNorm
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).

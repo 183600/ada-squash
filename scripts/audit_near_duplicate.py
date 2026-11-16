@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 from adasquash.metrics import wilson_interval
 from scripts.audit_validation import _is_boolean_scalar, _strict_bool_option, _strict_int_option
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).
