@@ -709,9 +709,6 @@ def dose_response_comparison(summaries: list, spec: dict | None=None,
         for entry, p_holm in zip(family, adjusted):
             entry["p_one_sided_holm"] = p_holm
             if entry.get("kind") == "trend":
-                p_claim = (entry["p_two_sided"]
-                           if entry.get("sided") == "two_sided"
-                           else entry["p_one_sided"])
                 entry["trend_significant"] = bool(
                     entry["direction_observed"] and p_holm is not None
                     and p_holm < alpha)

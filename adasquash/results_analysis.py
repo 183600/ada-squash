@@ -169,7 +169,6 @@ def wilcoxon_signed_rank(
     # Signed ranks
     signed_ranks = [r if d > 0 else -r for d, r in zip(deltas, ranks)]
     w_plus = sum(r for r in signed_ranks if r > 0)
-    w_minus = -sum(r for r in signed_ranks if r < 0)
     # Convention: W = sum of positive ranks
     w = w_plus
 
@@ -536,7 +535,6 @@ def bayesian_paired_analysis(
     stats = mean_std_stderr(diffs)
     sample_mean = stats["mean"]
     sample_sd = stats["std"] if stats["n"] >= 2 else 0.0
-    sample_se = stats["stderr"] if stats["n"] >= 2 else float("inf")
 
     # Treat near-zero SD as exactly zero to avoid numerical issues
     if sample_sd < 1e-15:
@@ -708,7 +706,6 @@ def influence_diagnostics(
 
         # Cook's distance analogue: (mean_change)^2 / (p * MSE)
         # For paired, p=1, MSE = se^2
-        mse = full_test.get("df", 1)  # not exactly MSE but scale
         if full_test["df"] and full_test["df"] > 0:
             full_se = full_test.get("ci_high", 0) - full_test.get("ci_low", 0)
             full_se = full_se / max((2 * student_t_ppf(1 - alpha/2, full_test["df"]), 1e-10)) if full_se else 0
@@ -857,6 +854,8 @@ def assumption_checks(
         "mean": mean,
         "median": median,
         "mean_minus_median": mean - median,
+        "n_below_median": n_below,
+        "n_above_median": n_above,
         "tail_balance": tail_balance,  # 0.5 = symmetric
         "skewness": skew,
         "interpretation": ("mean ≈ median, tail_balance ≈ 0.5 = symmetric"
@@ -940,7 +939,6 @@ def replication_probability(
     stats = mean_std_stderr(diffs)
     mean_delta = stats["mean"]
     sd_delta = stats["std"]
-    se_delta = stats["stderr"]
     df = n - 1
 
     n_future = future_n or n

@@ -973,8 +973,6 @@ def compare_arms(arms: dict[str, dict], reference: str | None=None,
                     candidate_values = [cand["values"][seed] for seed in common_m]
                     member_test = paired_t_one_sided(
                         candidate_values, member_values, margin=margin, alpha=alpha)
-                    member_deltas = [a - b for a, b in
-                                     zip(candidate_values, member_values)]
                     record.update({
                         "delta_paired_mean": member_test["mean_delta"],
                         "p_one_sided": member_test["p_one_sided"],
