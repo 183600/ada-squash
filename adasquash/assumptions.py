@@ -214,7 +214,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     #       nominal level.
     _ag_base = 1.0 + (g2 - E_g2) / math.sqrt(max(var_g2, 0.0)) * math.sqrt(2.0 / max(a - 4.0, 1e-10))
     _ag_cbrt = math.copysign(abs(_ag_base) ** (1.0 / 3.0), _ag_base)
-    z2 = ((1.0 - 2.0 / (9.0 * a)) * _ag_cbrt - 1.0) / math.sqrt(max(2.0 / (9.0 * a, 0.0)))
+    z2 = ((1.0 - 2.0 / (9.0 * a)) * _ag_cbrt - 1.0) / math.sqrt(max(2.0 / (9.0 * a), 0.0))
 
     # Chi-squared combination
     K2 = z1 * z1 + z2 * z2
