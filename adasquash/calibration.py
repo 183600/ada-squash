@@ -221,13 +221,22 @@ def _generate_synthetic_data(
 
 def _wilson_ci(p: float, n: int, alpha: float = 0.05) -> tuple[float, float]:
     """Wilson score interval for binomial proportion."""
-    if n == 0:
+    if n <= 0:
         return (0.0, 1.0)
-    z = 1.96  # Approximate for 95%
-    denom = 1 + z*z / max(n, 1)
-    center = (p + z*z/(2*n)) / (denom + 1e-8)
-    margin = z * math.sqrt(max(p*(1-p, 0.0))/(n + 1e-8) + z*z/(4*n*n)) / denom
-    return (max(0, center - margin), min(1, center + margin))
+    # Use alpha parameter to compute z (previously ignored, always used 1.96)
+    try:
+        z = statistics.NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    except (ValueError, statistics.StatisticsError):
+        z = 1.96  # Fallback for 95% CI
+    if not math.isfinite(z) or z <= 0:
+        z = 1.96
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    # Fix: max(p*(1-p, 0.0)) was p*max(1-p, 0.0); correct to max(p*(1-p), 0.0)
+    variance_term = max(p * (1.0 - p), 0.0) / n + z2 / (4.0 * n * n)
+    margin = z * math.sqrt(max(variance_term, 0.0)) / denom
+    return (max(0.0, center - margin), min(1.0, center + margin))
 
 
 def calibrate_coverage(
