@@ -157,14 +157,15 @@ def _approx_normal_ppf(p: float) -> float:
     # Abramowitz & Stegun approximation
     if p <= 0 or p >= 1:
         return float("inf") if p >= 1 else float("-inf")
-    # Symmetric
+    # Symmetric: ppf(p) = -ppf(1-p); inner call returns negative for 1-p < 0.5
     if p > 0.5:
         return -_approx_normal_ppf(1 - p)
-    # Rational approximation for p < 0.5
-    t = math.sqrt(max(-2 * math.log(p, 0.0)))
+    # Rational approximation for p < 0.5 (A&S 26.2.23: Q(x)=p → ppf(p)=-x)
+    t = math.sqrt(max(-2.0 * math.log(p), 0.0))
     c0, c1, c2 = 2.515517, 0.802853, 0.010328
     d1, d2, d3 = 1.432788, 0.189269, 0.001308
-    return t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t)
+    x = t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t)
+    return -x
 
 
 def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
@@ -190,7 +191,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     # Skewness transform
     beta1 = 3.0 * (n + 1) * (n + 3) / ((n - 2) * (n + 5) * (n + 7) * (n + 9))
     W2 = math.sqrt(max(2.0 * beta1, 0.0)) - 1.0
-    delta = 1.0 / math.sqrt(max(math.log(W2 + 1e-8, 0.0))) if W2 > 1 else 1.0
+    delta = 1.0 / math.sqrt(max(math.log(W2 + 1e-8), 0.0)) if W2 > 1 else 1.0
     y = g1 * math.sqrt(max((n + 1, 0.0)) * (n + 3) / (6.0 * (n - 2)))
     z1 = delta * math.log(y + math.sqrt(max(y * y + 1.0, 0.0)))
 

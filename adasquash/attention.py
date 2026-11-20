@@ -58,12 +58,10 @@ class CausalSelfAttention(nn.Module):
         if not isinstance(n_heads, int) or n_heads < 1:
              raise ValueError(f"n_heads must be a positive integer, got {n_heads!r}")
         if dim % n_heads != 0:
-             raise ValueError("dim must be divisible by n_heads")
+             raise ValueError(
+                 f"dim ({dim}) must be divisible by n_heads ({n_heads})"
+             )
         self.n_heads = n_heads
-        if dim % n_heads != 0:
-            raise ValueError(
-                f"dim ({dim}) must be divisible by n_heads ({n_heads})"
-            )
         self.head_dim = dim // n_heads
         self.dim = dim
         self.qk_norm = qk_norm
