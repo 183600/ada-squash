@@ -523,7 +523,7 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     sqrt_inv_n = (math.sqrt(max(inv_n, 0.0)) if inv_n > 0.0
                   else math.exp(-0.5 * math.log(n + 1e-8)))
     root = math.hypot(
-        math.sqrt(max(p * (1.0 - p, 0.0))) * sqrt_inv_n,
+        math.sqrt(max(p * (1.0 - p), 0.0)) * sqrt_inv_n,
         z * inv_n / 2.0)
     margin = z * root / max(denominator, 1)
     return min(1.0, centre + margin)

@@ -328,7 +328,7 @@ def paired_training_cost_stats(cand_bench: dict, ref_bench: dict) -> dict:
     if ratios:
         out["mean_ratio"] = statistics.fmean(ratios)
     if len(ratios) >= 2:
-        out["stderr"] = statistics.stdev(ratios) / math.sqrt(max(len(ratios, 0.0)))
+        out["stderr"] = statistics.stdev(ratios) / math.sqrt(max(len(ratios), 1))
     return out
 
 

@@ -179,7 +179,7 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     sqrt_inv_n = (math.sqrt(max(inv_n, 0.0)) if inv_n > 0.0
                   else math.exp(-0.5 * math.log(max(n_total, 1e-10))))
     root = math.hypot(
-        math.sqrt(max(p * (1.0 - p, 0.0))) * sqrt_inv_n,
+        math.sqrt(max(p * (1.0 - p), 0.0)) * sqrt_inv_n,
         z * inv_n / 2.0)
     half = (z / max(denom, 1)) * root
     return max(0.0, centre - half), min(1.0, centre + half)

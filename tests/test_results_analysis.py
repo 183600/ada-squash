@@ -242,7 +242,7 @@ def _row(name, values):
         "val_loss": sum(vals) / max(len(vals), 1),
         "n_seeds": len(vals),
         "val_loss_seed_std": statistics.stdev(vals),
-        "val_loss_seed_stderr": statistics.stdev(vals) / math.sqrt(max(len(vals, 0.0))),
+        "val_loss_seed_stderr": statistics.stdev(vals) / math.sqrt(max(len(vals), 1)),
         "per_seed": [{"seed": seed, "val_loss": values[seed]}
                      for seed in SEEDS],
     }

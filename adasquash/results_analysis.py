@@ -1073,7 +1073,7 @@ def composite_endpoint(
     # Reference arm
     if reference is None:
         # Use the arm with best (lowest) mean on first metric
-        ref_candidate = min(arm_names, key=lambda n: sum(arms[n][metrics[0]]) / max(n_seeds, 1)[metrics[0]])
+        ref_candidate = min(arm_names, key=lambda n: sum(arms[n][metrics[0]]) / max(n_seeds[metrics[0]], 1))
         reference = ref_candidate
 
     if reference not in arms:
