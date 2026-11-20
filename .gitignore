@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Data & checkpoints
+runs/
+*.pt
+*.ckpt
+wandb/
+mlruns/
+*.log
+
+# Experiment outputs (never commit)
+results/
+*_results.json
+REPORT*.md
+autodl_budget*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage artifacts (never commit)
+.coverage
+.coverage.*
+htmlcov/
