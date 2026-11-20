@@ -468,7 +468,7 @@ def p_curve_analysis(studies: Sequence[StudyRecord], alpha: float = 0.05) -> dic
     # Use mean-p test: under Uniform(0,alpha), E[p] = alpha/2
     mean_p = sum(p_values) / (n + 1e-8)
     # One-sided test: mean_p < alpha/2 indicates right skew
-    z = (mean_p - alpha/2) / math.sqrt(max(alpha*alpha / (12 * n, 0.0)))
+    z = (mean_p - alpha/2) / math.sqrt(max(alpha*alpha / (12 * n), 0.0))
     p = 0.5 * (1 + math.erf(z / math.sqrt(max(2, 0.0))))  # Lower tail
 
     return {
