@@ -1,0 +1,16 @@
+# CI-only dependency set (CPU wheels, Python 3.12).
+#
+# 只放本仓库 CI 真正用到的包（continuous-loop.yml 的 gate 步骤 import 的
+# torch / numpy / yaml / pytest，以及 ci_gate.py 跑全量 pytest 对拍所需）：
+#   - continuous-loop.yml 里预热一次，供质量门禁（gate_check）与测试门直接复用；
+#   - 同时作为 actions/setup-python 的 cache-dependency-path / pip 缓存键。
+# 固定版本可以避免每次 run 都去解析 requirements.txt 的宽版本范围、
+# 导致 pip 缓存频繁失效。
+#
+# 安装方式（CPU wheel）：
+#   python -m pip install -r requirements-ci.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cpu
+numpy==2.5.4
+torch==2.14.1
+PyYAML==6.0.3
+pytest==8.4.2

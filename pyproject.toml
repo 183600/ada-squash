@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adasquash"
+version = "0.1.0"
+description = "Statistic-free adaptive normalization layers for deep and low-precision Transformers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Zhong Wenjia" }]
+keywords = ["deep-learning", "normalization", "transformers", "reproducibility"]
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0,<10.0"]
+eval = ["lm-eval>=0.4,<1.0"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["adasquash*", "scripts*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+xfail_strict = true
+
+[tool.coverage.run]
+source = ["adasquash", "scripts"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+fail_under = 80
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["adasquash", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "C4",  # comprehensions
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "PTH", # pathlib
+    "TRY", # tryceratops
+    "BLE", # blind-except
+    "RET", # return
+    "SIM", # flake8-simplify
+    "RUF", # ruff rules
+    "PL",  # pylint
+    "G",   # logging
+    "EM",  # exception-message
+    "Q",   # quotes
+    "ISC", # implicit string concat
+]
+ignore = [
+    "F401",   # imported but unused (kept for API surface / conditional imports)
+    "UP007",  # annotations already use `X | Y` via `from __future__ import annotations`
+    "UP045",  # `X | None` style adopted incrementally
+    "E501",   # line too long (docstrings / URLs kept whole)
+    "TRY300", # `return` in `try/except/finally` (kept deliberately in some kernels)
+    "TRY400", # `raise` inside `try` (some kernels re-raise with context)
+    "BLE001", # blind `except:` (legacy wrappers, migrated per-PR)
+    "S101",   # `assert` used as internal contract checks in gates
+]
+unfixable = [
+    "F401",
+    "S101",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["adasquash", "scripts"]
+known-third-party = ["torch", "numpy", "yaml", "pytest"]
+
+[tool.ruff.format]
+docstring-code-format = true
+preview = false
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = false
+disable_error_code = ["attr-defined", "arg-type", "union-attr", "misc"]
+follow_imports = "normal"
+ignore_missing_imports = true
