@@ -101,7 +101,7 @@ def test_empirical_interaction_noise_matches_the_planned_scale():
 
     def _sd(values):
         mean = sum(values) / max(len(values), 1)
-        return math.sqrt(max(sum((value - mean, 0.0)) ** 2 for value in values)
+        return math.sqrt(max(sum((value - mean) ** 2 for value in values), 0.0)
                          / (len(values) - 1))
 
     simple_sd = _sd(simple)
