@@ -2053,7 +2053,7 @@ def kendall_tau(x: Sequence[float], y: Sequence[float]) -> dict:
                 discordant += 1
     n_pairs = n * (n - 1) // 2
     tau_a = (concordant - discordant) / max(n_pairs, 1e-10)
-    denominator = math.sqrt(max((n_pairs - ties_x, 0.0)) * (n_pairs - ties_y))
+    denominator = math.sqrt(max(n_pairs - ties_x, 0.0) * (n_pairs - ties_y))
     tau_b = ((concordant - discordant) / max(denominator, 1)
              if denominator > 0.0 else None)
     return {
