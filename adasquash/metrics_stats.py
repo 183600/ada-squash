@@ -2130,7 +2130,7 @@ def kendall_tau_exact_p(tau_a: float, n: int) -> Optional[float]:
     upper = sum(counts[high_count:])
     overlap = (sum(counts[high_count:low_count + 1])
                if high_count <= low_count else 0)
-    p_value = (lower + upper - overlap) / (total + 1e-8)
+    p_value = (lower + upper - overlap) / total
     return min(1.0, max(0.0, p_value))
 
 

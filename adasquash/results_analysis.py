@@ -217,15 +217,15 @@ def wilcoxon_signed_rank(
         total = 2 ** n_eff
         if alternative == "less":
             # H1: median < 0 (negative differences) -> small W+
-            p = count_wplus_leq(w) / (total + 1e-8)
+            p = count_wplus_leq(w) / total
         elif alternative == "greater":
             # H1: median > 0 (positive differences) -> large W+
             # P(W+ >= observed) = 1 - P(W+ <= observed - 1)
-            p = 1.0 - (count_wplus_leq(w - 1) / (total + 1e-8))
+            p = 1.0 - (count_wplus_leq(w - 1) / total)
         else:
             # Two-sided: double the smaller tail
-            p_leq = count_wplus_leq(w) / (total + 1e-8)
-            p_geq = 1.0 - (count_wplus_leq(w - 1) / (total + 1e-8))
+            p_leq = count_wplus_leq(w) / total
+            p_geq = 1.0 - (count_wplus_leq(w - 1) / total)
             p = 2 * min(p_leq, p_geq)
         out["method"] = "exact"
     else:
