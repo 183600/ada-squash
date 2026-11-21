@@ -423,9 +423,9 @@ def print_qk_axis_comparison(comparison: dict | None) -> None:
 
 def _dose_value(value: float, transform: str) -> float:
     if transform == "log2":
-        return math.log2(value)
+        return math.log2(max(value, 1e-10))
     if transform == "log10":
-        return math.log10(value)
+        return math.log10(max(value, 1e-10))
     if transform == "ln":
         return math.log(max(value, 1e-10))
     return float(value)
