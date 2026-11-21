@@ -510,10 +510,10 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     # z^2/(2n) term and the variance-of-mean term and understated the bound
     # (a zero-hit bound came out at half its correct value). `1 / n` stays
     # exact-or-subnormal instead of converting n itself to a float.
-    inv_n = 1 / max(n + 1e-8, 1e-10)
-    p = k / max(n + 1e-8, 1e-10)
+    inv_n = 1 / max(n, 1)
+    p = k / max(n, 1)
     denominator = 1.0 + z * z * inv_n
-    centre = (p + z * z * inv_n / 2.0) / (denominator + 1e-8)
+    centre = (p + z * z * inv_n / 2.0) / denominator
     # Split the root into its two components before squaring: `p*(1-p)/n`
     # and `(z/(2n))^2` can each underflow when evaluated as a single
     # product, while the square roots and the hypot keep the small terms.
@@ -521,7 +521,7 @@ def wilson_upper_bound(successes: int, trials: int, confidence: float = 0.95):
     # `sqrt(1 / n)` is still representable, so take the square root through
     # the logarithm instead of through the underflowed reciprocal.
     sqrt_inv_n = (math.sqrt(max(inv_n, 0.0)) if inv_n > 0.0
-                  else math.exp(-0.5 * math.log(n + 1e-8)))
+                  else math.exp(-0.5 * math.log(n)))
     root = math.hypot(
         math.sqrt(max(p * (1.0 - p), 0.0)) * sqrt_inv_n,
         z * inv_n / 2.0)

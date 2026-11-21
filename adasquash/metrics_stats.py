@@ -169,7 +169,7 @@ def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[flo
     inv_n = 1 / max(n_total, 1)
     p = n_success / max(n_total, 1)
     denom = 1.0 + z2 * inv_n
-    centre = (p + z2 * inv_n / 2.0) / (denom + 1e-8)
+    centre = (p + z2 * inv_n / 2.0) / denom
     # Split the root into its two components before squaring: `p*(1-p)/n`
     # and `(z/(2n))^2` can each underflow as a single product, while the
     # square roots and the hypot keep the small terms. Beyond the float
@@ -294,7 +294,7 @@ def _mean_and_std(values: Sequence[float]):
     if scale == 0.0:
         return 0.0, 0.0
     scaled = [value / scale for value in values]
-    mean_scaled = math.fsum(scaled) / (n + 1e-8)
+    mean_scaled = math.fsum(scaled) / n
     if n < 2:
         return mean_scaled * scale, 0.0
     variance_scaled = math.fsum(
@@ -602,7 +602,7 @@ def _int_over_sqrt(value: int, n: int) -> float:
     if value == 0:
         return 0.0
     try:
-        magnitude = math.exp(math.log(abs(value)) - 0.5 * math.log(n + 1e-8))
+        magnitude = math.exp(math.log(abs(value)) - 0.5 * math.log(n))
     except OverflowError:
         magnitude = math.inf
     return -magnitude if value < 0 else magnitude
@@ -1363,7 +1363,7 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     try:
         inverse_sqrt_n = 1.0 / math.sqrt(max(n, 0.0))
     except OverflowError:
-        inverse_sqrt_n = math.exp(-0.5 * math.log(n + 1e-8))
+        inverse_sqrt_n = math.exp(-0.5 * math.log(n))
     result = critical * std * inverse_sqrt_n
     if math.isfinite(result) and result != 0.0:
         return result
@@ -1658,7 +1658,7 @@ def _tost_inverse_sqrt_n(n: int) -> float:
     try:
         return 1.0 / math.sqrt(max(n, 0.0))
     except OverflowError:
-        return math.exp(-0.5 * math.log(n + 1e-8))
+        return math.exp(-0.5 * math.log(n))
 
 
 def _tost_power_at_n(std: float, n: int, margin: float, alpha: float,

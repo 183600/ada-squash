@@ -432,8 +432,8 @@ def check_independence(
         )
 
     # Simple autocorrelation at lags 1..max_lag
-    mean = sum(ordered_observations) / (n + 1e-8)
-    c0 = sum((x - mean) ** 2 for x in ordered_observations) / (n + 1e-8)
+    mean = sum(ordered_observations) / n
+    c0 = sum((x - mean) ** 2 for x in ordered_observations) / n
 
     if c0 == 0:
         return AssumptionCheck(
@@ -496,7 +496,7 @@ def check_outlier_influence(
             recommendation=f"Need at least 3 observations for jackknife; have {n}.",
         )
 
-    full_mean = sum(paired_deltas) / (n + 1e-8)
+    full_mean = sum(paired_deltas) / n
     jackknife_means = []
     for i in range(n):
         loo = [paired_deltas[j] for j in range(n) if j != i]
