@@ -1418,8 +1418,15 @@ def bland_altman_data(
 
     mean_diff = sum(diffs) / max(n, 1)
     sd_diff = math.sqrt(max(sum((d - mean_diff) ** 2 for d in diffs), 0.0) / max(n - 1, 1)) if n > 1 else 0.0
-    loa_low = mean_diff - 1.96 * sd_diff
-    loa_high = mean_diff + 1.96 * sd_diff
+    # 一致性界限使用 t 分布临界值（df = n-1）而非正态近似 1.96。
+    # Bland & Altman (1986) 原始方法对大样本使用 z=1.96，但小样本时
+    # t 临界值更宽，能给出更准确的不确定性估计。
+    if n > 1:
+        t_crit = student_t_ppf(0.975, float(n - 1))
+    else:
+        t_crit = 1.96  # 退化情形兜底
+    loa_low = mean_diff - t_crit * sd_diff
+    loa_high = mean_diff + t_crit * sd_diff
 
     return {
         "n": n,
