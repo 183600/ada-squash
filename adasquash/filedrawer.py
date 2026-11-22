@@ -305,7 +305,18 @@ def funnel_plot_asymmetry(
     else:
         corr = cov / math.sqrt(max(var_eff * var_prec, 0.0))
 
-    return {"n": n, "correlation": corr, "data": data}
+    # p-value for Pearson correlation using t-distribution with n-2 df.
+    # Under H0 (no correlation), t = r*sqrt((n-2)/(1-r^2)) ~ t_{n-2}.
+    # The normal approximation (z=r) severely underestimates p for small n
+    # (e.g., n=5, r=0.7: z-test p≈0.025 vs correct t-test p≈0.19).
+    r_clamped = max(-0.99999999, min(0.99999999, corr))
+    df_corr = max(n - 2, 1)
+    t_corr = abs(r_clamped) * math.sqrt(df_corr / max(1.0 - r_clamped * r_clamped, 1e-300))
+    funnel_p = 2.0 * min(student_t_cdf(-t_corr, df_corr),
+                         1.0 - student_t_cdf(-t_corr, df_corr))
+    funnel_p = max(0.0, min(1.0, funnel_p))
+
+    return {"n": n, "correlation": corr, "p_value": funnel_p, "data": data}
 
 
 def eggers_test(studies: Sequence[StudyRecord]) -> dict:
@@ -528,7 +539,7 @@ def generate_file_drawer_report(registry: StudyRegistry) -> FileDrawerReport:
     funnel = funnel_plot_asymmetry(completed)
     funnel_p = None
     if not funnel.get("insufficient"):
-        funnel_p = 2 * (1 - 0.5 * (1 + math.erf(abs(funnel["correlation"]) / math.sqrt(max(2, 0.0)))))
+        funnel_p = funnel.get("p_value")
 
     # Egger's test
     eggers = eggers_test(completed)
