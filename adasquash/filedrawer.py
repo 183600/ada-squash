@@ -23,6 +23,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from .metrics_stats import student_t_cdf
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).
@@ -343,9 +344,13 @@ def eggers_test(studies: Sequence[StudyRecord]) -> dict:
         return {"p_value": None, "note": "Zero SE for intercept"}
 
     t_stat = intercept / se_intercept
-    # Two-sided p-value from t-distribution
-    # Approximate with normal for simplicity
-    p = 2 * (1 - 0.5 * (1 + math.erf(abs(t_stat) / math.sqrt(max(2, 0.0)))))
+    # Two-sided p-value from t-distribution with n-2 df (Egger & Davey Smith, 2005).
+    # The normal approximation severely underestimates p-values for small
+    # meta-analyses (e.g., 3-10 studies), inflating false-positive rates.
+    df_egger = max(n - 2, 1)
+    p = 2.0 * min(student_t_cdf(-abs(t_stat), df_egger),
+                   1.0 - student_t_cdf(-abs(t_stat), df_egger))
+    p = max(0.0, min(1.0, p))
 
     return {
         "p_value": p,
