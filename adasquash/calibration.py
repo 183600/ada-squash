@@ -272,7 +272,7 @@ def calibrate_coverage(
         ci_coverage_ci=ci,
         mean_bias=statistics.mean(estimates) - scenario.true_effect if estimates else None,
         median_bias=statistics.median(estimates) - scenario.true_effect if estimates else None,
-        rmse=math.sqrt(max(statistics.mean((e - scenario.true_effect, 0.0))**2 for e in estimates)) if estimates else None,
+        rmse=math.sqrt(statistics.mean((e - scenario.true_effect) ** 2 for e in estimates)) if estimates else None,
     )
 
 
@@ -347,7 +347,7 @@ def calibrate_power_under_heterogeneity(
         empirical_power_ci=ci,
         mean_bias=statistics.mean(estimates) - scenario.true_effect if estimates else None,
         median_bias=statistics.median(estimates) - scenario.true_effect if estimates else None,
-        rmse=math.sqrt(max(statistics.mean((e - scenario.true_effect, 0.0))**2 for e in estimates)) if estimates else None,
+        rmse=math.sqrt(statistics.mean((e - scenario.true_effect) ** 2 for e in estimates)) if estimates else None,
     )
 
 
@@ -378,7 +378,7 @@ def calibrate_equivalence(
         scenario=scenario,
         empirical_equiv_rate=equiv_rate,
         mean_bias=statistics.mean(estimates) - scenario.true_effect if estimates else None,
-        rmse=math.sqrt(max(statistics.mean((e - scenario.true_effect, 0.0))**2 for e in estimates)) if estimates else None,
+        rmse=math.sqrt(statistics.mean((e - scenario.true_effect) ** 2 for e in estimates)) if estimates else None,
     )
 
 
