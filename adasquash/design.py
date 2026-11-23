@@ -2909,6 +2909,31 @@ def design_analysis_alignment_report(
     cmp_certifiable = comparison.get("certifiable", False)
     cmp_n_fail = design_readiness.get("n_fail", 0)
 
+    # 0. Pre-registration check summary
+    # Validate that all individual design-readiness checks passed.
+    # This catches failures not covered by the specific checks below
+    # (e.g. custom pre-registration gates).
+    for chk in dr_checks:
+        if isinstance(chk, dict):
+            chk_status = chk.get("status", chk.get("result"))
+            chk_name = chk.get("name", chk.get("check", "unnamed"))
+            if chk_status in ("fail", "FAIL", "error"):
+                deviations.append(
+                    f"pre-registration check '{chk_name}' failed")
+            elif chk_status in ("warn", "WARN"):
+                warnings.append(
+                    f"pre-registration check '{chk_name}': warning")
+
+    # 0b. Comparison protocol completeness
+    # Flag if the comparison protocol is missing required fields
+    # that the pre-registration demands.
+    if cmp_protocol and isinstance(cmp_protocol, dict):
+        proto_status = cmp_protocol.get("status")
+        if proto_status in ("fail", "incomplete"):
+            deviations.append(
+                f"comparison protocol status is '{proto_status}': "
+                "analysis may not follow the pre-registered protocol")
+
     # 1. Schedule integrity
     if dr_schedule is not None:
         sp_status = dr_schedule.get("status")
@@ -2946,12 +2971,17 @@ def design_analysis_alignment_report(
                     f"protocol problems detected in comparison: {'; '.join(proto_problems)}")
 
     # 4. Seed coverage vs planned minimum
+    # Use the pre-registered min_seeds (dr_min_seeds) when available,
+    # falling back to the function parameter. This ensures the alignment
+    # check validates against the *pre-registered* threshold rather than
+    # whatever the caller happens to pass.
+    effective_min_seeds = dr_min_seeds if dr_min_seeds is not None else min_seeds
     shared_seed_counts = {row.get("name"): row.get("n_shared_seeds")
                          for row in cmp_rows if row.get("n_shared_seeds") is not None}
     for name, n_shared in shared_seed_counts.items():
-        if n_shared is not None and n_shared < min_seeds:
+        if n_shared is not None and n_shared < effective_min_seeds:
             deviations.append(
-                f"arm {name!r}: only {n_shared} shared seed(s) < {min_seeds} "
+                f"arm {name!r}: only {n_shared} shared seed(s) < {effective_min_seeds} "
                 "planned minimum; result is descriptive only")
 
     # 5. Reference selection alignment
