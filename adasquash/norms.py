@@ -43,7 +43,7 @@ _TINY_LOG_CACHE: dict = {}
 def _log_tiny(dtype: torch.dtype) -> float:
     v = _TINY_LOG_CACHE.get(dtype)
     if v is None:
-        v = math.log(max(torch.finfo(dtype, 1e-10)).tiny)
+        v = math.log(max(torch.finfo(dtype).tiny, 1e-10))
         _TINY_LOG_CACHE[dtype] = v
     return v
 
