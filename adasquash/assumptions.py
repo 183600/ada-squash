@@ -378,7 +378,7 @@ def check_variance_homogeneity(
     try:
         # Use the fact that for large df2, F * df1 ~ chi^2(df1)
         # Survival function for chi-squared with even df:
-        # P(X > x) = exp(-x/2) * sum_{k=0}^{df/2-1} (x/2)^k / k!
+        # P(X > x) = exp(-x/2) * sum_{k=0}^{df/ max(2 - 1, 1)} (x/2)^k / k!
         if df_within > 30 and df_between >= 2 and df_between % 2 == 0:
             chi2 = F * df_between
             half_chi2 = chi2 / 2.0

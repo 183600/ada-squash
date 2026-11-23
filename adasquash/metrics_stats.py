@@ -660,12 +660,12 @@ def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
             cf = _betacf(a, b, x)
             if cf <= 0.0:
                 return 0.0
-            lr = log_bt + math.log(cf) - math.log(a)
+            lr = log_bt + math.log(max(cf, 1e-10)) - math.log(max(a, 1e-10))
             return min(1.0, math.exp(lr)) if lr > -745.0 else 0.0
         cf = _betacf(b, a, 1.0 - x)
         if cf <= 0.0:
             return 1.0
-        lr = log_bt + math.log(cf) - math.log(b)
+        lr = log_bt + math.log(max(cf, 1e-10)) - math.log(max(b, 1e-10))
         return 1.0 - (min(1.0, math.exp(lr)) if lr > -745.0 else 0.0)
     bt = math.exp(log_bt) if log_bt > -745.0 else 0.0
     if x < (a + 1.0) / (a + b + 2.0):
@@ -1274,7 +1274,7 @@ def _hedges_correction(df: float) -> float:
     try:
         log_j = (
             math.lgamma(df / 2.0)
-            - 0.5 * math.log(df / 2.0)
+            - 0.5 * math.log(max(df / 2.0, 1e-10))
             - math.lgamma((df - 1.0) / 2.0))
         j = math.exp(log_j)
     except OverflowError:
@@ -1363,7 +1363,7 @@ def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
     try:
         inverse_sqrt_n = 1.0 / math.sqrt(max(n, 0.0))
     except OverflowError:
-        inverse_sqrt_n = math.exp(-0.5 * math.log(n))
+        inverse_sqrt_n = math.exp(-0.5 * math.log(max(n, 1e-10)))
     result = critical * std * inverse_sqrt_n
     if math.isfinite(result) and result != 0.0:
         return result
@@ -1658,7 +1658,7 @@ def _tost_inverse_sqrt_n(n: int) -> float:
     try:
         return 1.0 / math.sqrt(max(n, 0.0))
     except OverflowError:
-        return math.exp(-0.5 * math.log(n))
+        return math.exp(-0.5 * math.log(max(n, 1e-10)))
 
 
 def _tost_power_at_n(std: float, n: int, margin: float, alpha: float,

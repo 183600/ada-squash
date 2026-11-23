@@ -259,7 +259,7 @@ def wilcoxon_signed_rank(
     if m % 2 == 1:
         hl = walsh_averages[m // 2]
     else:
-        hl = (walsh_averages[m // 2 - 1] + walsh_averages[m // 2]) / 2.0
+        hl = (walsh_averages[m // max(2 - 1, 1)] + walsh_averages[m // 2]) / 2.0
     out["hodges_lehmann"] = hl
 
     # Confidence interval for Hodges-Lehmann
@@ -829,7 +829,7 @@ def assumption_checks(
     }
 
     # Symmetry check: compare median to mean, and tail balance
-    median = sorted_diffs[n // 2] if n % 2 else (sorted_diffs[n // 2 - 1] + sorted_diffs[n // 2]) / 2.0
+    median = sorted_diffs[n // 2] if n % 2 else (sorted_diffs[n // max(2 - 1, 1)] + sorted_diffs[n // 2]) / 2.0
     mean = sum(diffs) / max(n, 1)
     # Tail balance: proportion above median vs below
     n_below = sum(1 for d in diffs if d < median)
