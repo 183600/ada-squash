@@ -292,7 +292,7 @@ def value_of_information(
         }
 
         loss = expected_loss(decision_rule, future_evidence, loss_fn, truth_probs)
-        future_losses.append(loss.detach())
+        future_losses.append(loss)
 
     expected_future_loss = (sum(future_losses) / max(len(future_losses), 1)) if future_losses else float("nan")
     voi = current_loss - expected_future_loss
