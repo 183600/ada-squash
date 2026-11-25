@@ -1,0 +1,2136 @@
+from __future__ import annotations
+
+import functools
+import math
+import numbers
+from collections.abc import Sequence
+from statistics import NormalDist
+from typing import Optional
+
+from ._validation import is_boolean_scalar as _is_boolean_value
+
+_Z_95 = 1.959963984540054
+MIN_SEEDS_FOR_SIGNIFICANCE = 3
+# Above this many degrees of freedom the first-order normal expansion below
+# is more accurate than the incomplete-beta CDF, which loses precision (and
+# eventually overflows) for very large df.
+_T_NORMAL_APPROX_DF = 1.0e6
+# Above this many observations the 2**n sign-flip enumeration is no
+# longer a cheap exact computation; use the seeded Monte-Carlo branch.
+_RANDOMIZATION_EXACT_MAX = 20
+# Above this many discordant pairs the incomplete-beta binomial tail loses
+# precision (and eventually overflows); the normal approximation with a
+# continuity correction is accurate to far better than the reporting precision.
+_MCNEMAR_NORMAL_MIN = 100000
+# Negatives-per-positive ratio above which the FPR denominator makes ROC-AUC
+# optimistic and PR-AUC (average precision) is the appropriate summary.
+_EXTREME_IMBALANCE = 1000.0
+
+
+def _as_real(value) -> Optional[float]:
+    """A Python/NumPy real scalar as a float, or None for non-numbers/bools.
+
+    The helpers below must accept every real numeric scalar the analysis
+    scripts can produce (NumPy integer/float scalars included) without
+    admitting a boolean as 0/1 or crashing on an overflowing integer.
+    """
+    if _is_boolean_value(value) or not isinstance(value, numbers.Real):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _real_values(values, name: str = "values") -> list[float]:
+    """Float observations, with an unrepresentable integer reported cleanly.
+
+    Booleans and strings are not observations: ``float(True)`` and
+    ``float("0.1")`` would silently turn a malformed sample into a number.
+    Numeric scalars (including NumPy/Decimal/Fraction values) are accepted.
+    """
+    out = []
+    for value in values:
+        if _is_boolean_value(value) or isinstance(value, (str, bytes, bytearray)):
+            raise ValueError(
+                f"{name} must contain real numbers, got {value!r}")
+        try:
+            out.append(float(value))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f"{name} must contain real numbers, got {value!r}") from None
+    return out
+
+
+def _strict_int(value, name: str, minimum: Optional[int] = None) -> int:
+    """An integer-valued count/id, rejecting bools and fractional values.
+
+    ``int(1.5)`` silently changes a sample count or class id while the report
+    still looks like it describes the requested measurement. Bools are not
+    counts either; a caller passing ``True`` almost certainly has a bug.
+    """
+    if _is_boolean_value(value):
+        raise ValueError(f"{name} must be an integer, got bool {value!r}")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    if converted != value:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if minimum is not None and converted < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {converted}")
+    return converted
+
+
+def _validate_alpha(alpha, name: str = "alpha") -> float:
+    """A significance level must be a finite probability in (0, 1).
+
+    ``student_t_ppf(1 - alpha/2, ...)`` needs a probability strictly inside
+    (0, 1). Without this guard an out-of-range alpha either raises from deep
+    inside the distribution helper (alpha = 0) or silently produces an
+    inverted interval (alpha > 1), which looks like a measured confidence
+    interval instead of a malformed request.
+    """
+    if _is_boolean_value(alpha):
+        raise ValueError(f"{name} must be a probability, got bool {alpha!r}")
+    if isinstance(alpha, (str, bytes, bytearray)):
+        # A numeric string is not a probability: `float("0.05")` would
+        # silently set the significance level from a malformed config value.
+        raise ValueError(f"{name} must be a probability, got {alpha!r}")
+    try:
+        value = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a probability, got {alpha!r}") from None
+    if not math.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(
+            f"{name} must be finite and strictly between 0 and 1, got {alpha!r}")
+    return value
+
+
+def _validate_margin(margin, name: str = "margin") -> float:
+    """A practical margin must be a finite real number.
+
+    ``margin=True`` would otherwise be used as a 1.0 margin and a NaN margin
+    would make the t/z statistic and its p-value NaN while the rest of the
+    report still looks measured. Strings and other non-numbers are rejected
+    instead of being coerced by ``float()``.
+    """
+    value = _as_real(margin)
+    if value is None or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {margin!r}")
+    return value
+
+
+def _binary_labels(labels, name: str = "labels") -> list[int]:
+    """0/1 labels without truthiness coercion.
+
+    ``int(bool("0"))`` is 1, so a malformed string label (or any other
+    non-numeric value) used to turn every row into a positive. Labels must be
+    the documented binary ids; booleans are accepted as their 0/1 values.
+    """
+    out = []
+    for value in labels:
+        if _is_boolean_value(value):
+            out.append(int(value))
+            continue
+        converted = _strict_int(value, name)
+        if converted not in (0, 1):
+            raise ValueError(f"{name} must be 0/1, got {value!r}")
+        out.append(converted)
+    return out
+
+
+def wilson_interval(n_success: int, n_total: int, z: float = _Z_95) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion.
+
+    Preferred over the normal approximation for the small trial counts used
+    by the needle evaluation, and for proportions near 0 or 1.
+    """
+    n_total = _strict_int(n_total, "n_total", minimum=1)
+    n_success = _strict_int(n_success, "n_success", minimum=0)
+    z_value = _as_real(z)
+    if z_value is None or not math.isfinite(z_value) or z_value < 0.0:
+        raise ValueError(
+            f"z must be a finite non-negative number, got {z!r}")
+    z = z_value
+    if n_success > n_total:
+        # 150 successes out of 100 trials is impossible evidence, not a
+        # proportion to clamp to 1. Clamping produced a valid-looking
+        # interval (0.963, 1.0) for a count that never existed.
+        raise ValueError(
+            f"wilson_interval needs 0 <= n_success <= n_total, got "
+            f"{n_success} successes out of {n_total} trials")
+    z2 = z * z
+    # Work in units of 1/n. `2.0 * n_total` / `4.0 * n_total * n_total`
+    # overflow to inf for huge counts without raising, which zeroed the
+    # z^2/(2n) and variance-of-mean terms and collapsed the interval to a
+    # point. `1 / n_total` stays exact-or-subnormal instead of converting
+    # the count itself to a float.
+    inv_n = 1 / max(n_total, 1)
+    p = n_success / max(n_total, 1)
+    denom = 1.0 + z2 * inv_n
+    centre = (p + z2 * inv_n / 2.0) / (denom + 1e-8)
+    # Split the root into its two components before squaring: `p*(1-p)/n`
+    # and `(z/(2n))^2` can each underflow as a single product, while the
+    # square roots and the hypot keep the small terms. Beyond the float
+    # range `1 / n_total` itself underflows to zero even though
+    # `sqrt(1 / n_total)` is still representable, so take the square root
+    # through the logarithm instead of through the underflowed reciprocal.
+    sqrt_inv_n = (math.sqrt(inv_n) if inv_n > 0.0
+                  else math.exp(-0.5 * math.log(max(n_total, 1e-10))))
+    root = math.hypot(
+        math.sqrt(p * (1.0 - p)) * sqrt_inv_n,
+        z * inv_n / 2.0)
+    half = (z / max(denom, 1)) * root
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def mcnemar_test(n_fixed: int, n_broke: int) -> dict:
+    """Exact McNemar test on the discordant pairs of a paired comparison.
+
+    Two classifiers evaluated on the *same* samples split into four cells:
+    both right, both wrong, and the two discordant cells - `n_fixed`
+    (reference wrong, candidate right) and `n_broke` (reference right,
+    candidate wrong). The question "is the candidate better?" lives entirely
+    in the discordant cells: under the null hypothesis that both classifiers
+    have the same error rate on these samples, each discordant pair is a fair
+    coin, so `n_fixed ~ Binomial(n_fixed + n_broke, 0.5)`.
+
+    The exact p-value is computed with the regularized incomplete beta (the
+    binomial CDF at p = 1/2), not the normal approximation: paired bad-case
+    analysis runs on a few hundred to a few thousand scanned errors, and at
+    the small discordant counts that survive there the normal tail is
+    anti-conservative. Above ``_MCNEMAR_NORMAL_MIN`` discordant pairs the
+    incomplete beta loses precision and eventually overflows, so the
+    continuity-corrected normal tail is used instead (its error is far below
+    the reporting precision at that sample size). `p_one_sided` is
+    P(X >= n_fixed) and supports "candidate better"; `p_two_sided` doubles the
+    smaller tail (capped at 1). `normal_z_continuity_corrected` is reported
+    for reference only.
+
+    Degenerate case `n_discordant = 0`: the models agree on every compared
+    sample, so there is no evidence either way and both p-values are `None`
+    (not 1.0, which would read as "no difference").
+    """
+    n_fixed = _strict_int(n_fixed, "n_fixed", minimum=0)
+    n_broke = _strict_int(n_broke, "n_broke", minimum=0)
+    n = n_fixed + n_broke
+    out = {
+        "n_fixed": n_fixed,
+        "n_broke": n_broke,
+        "n_discordant": n,
+        "p_one_sided": None,
+        "p_two_sided": None,
+        "favors": "tied",
+        "normal_z_continuity_corrected": None,
+        "test": "mcnemar_exact",
+    }
+    if n == 0:
+        out["note"] = (
+            "no discordant pairs: the two arms agreed on every compared sample, "
+            "so the comparison carries no evidence either way"
+        )
+        return out
+    if n > _MCNEMAR_NORMAL_MIN:
+        # Continuity-corrected normal tails. P(X >= n_fixed) uses the lower
+        # boundary n_fixed - 1/2; P(X <= n_fixed) uses the upper boundary
+        # n_fixed + 1/2. Both are evaluated through int/sqrt ratios so huge
+        # Python-int counts never need conversion to float.
+        z_ge = _int_over_sqrt(n_fixed - n_broke - 1, n)
+        z_le = _int_over_sqrt(n_fixed - n_broke + 1, n)
+        p_ge = _p_one_sided_from_z(-z_ge)
+        p_le = _p_one_sided_from_z(z_le)
+    else:
+        # P(X <= k) for X ~ Bin(n, 1/2) is I_{1/2}(n - k, k + 1); the one-sided
+        # p-value P(X >= n_fixed) is the mirror image I_{1/2}(n_fixed, n_broke + 1).
+        p_ge = _reg_incomplete_beta(n_fixed, n_broke + 1, 0.5) if n_fixed > 0 else 1.0
+        p_le = _reg_incomplete_beta(n_broke, n_fixed + 1, 0.5) if n_broke > 0 else 1.0
+    out["p_one_sided"] = p_ge
+    out["p_two_sided"] = min(1.0, 2.0 * min(p_ge, p_le))
+    out["favors"] = "candidate" if n_fixed > n_broke else ("reference" if n_broke > n_fixed else "tied")
+    difference = abs(n_fixed - n_broke)
+    out["normal_z_continuity_corrected"] = (
+        0.0 if difference <= 1 else _int_over_sqrt(difference - 1, n))
+    out["note"] = (
+        "p_one_sided = P(Binomial(n_discordant, 0.5) >= n_fixed); the exact test "
+        "is the small-discordant-count reference (the normal approximation is "
+        "anti-conservative there)"
+    )
+    return out
+
+
+def _mean_and_std(values: Sequence[float]):
+    """Mean and sample standard deviation without overflow of the sums.
+
+    Finite observations near the float limit can overflow a sum, a squared
+    deviation, or the sample variance even when both the mean and the standard
+    deviation are representable. The ordinary path is kept unchanged; if it
+    overflows or produces a non-finite result, the values are scaled by their
+    maximum magnitude and mapped back.
+    """
+    n = len(values)
+    if n == 0:
+        return None, None
+    mean = std = float("nan")
+    try:
+        mean = sum(values) / max(n, 1)
+        if n < 2:
+            return mean, 0.0
+        variance = sum((value - mean) * (value - mean)
+                       for value in values) / max(n - 1, 1)
+        std = math.sqrt(variance)
+        if math.isfinite(mean) and math.isfinite(std):
+            # A zero standard deviation is the correct answer for a constant
+            # sample, but tiny non-constant values can also square to zero and
+            # fake a constant sample. Fall through to the scaled path in that
+            # case so differences near the underflow limit keep their spread.
+            if std > 0.0 or all(value == values[0] for value in values):
+                return mean, std
+    except OverflowError:
+        import logging as _logging; _logging.warning("Suppressed exception in metrics_stats.py:289")
+    if not all(math.isfinite(value) for value in values):
+        return mean, std
+    scale = max(abs(value) for value in values)
+    if scale == 0.0:
+        return 0.0, 0.0
+    scaled = [value / scale for value in values]
+    mean_scaled = math.fsum(scaled) / (n + 1e-8)
+    if n < 2:
+        return mean_scaled * scale, 0.0
+    variance_scaled = math.fsum(
+        (value - mean_scaled) * (value - mean_scaled)
+        for value in scaled) / max(n - 1, 1)
+    return mean_scaled * scale, math.sqrt(variance_scaled) * scale
+
+
+def _paired_mean_std(a: Sequence[float], b: Sequence[float]):
+    """Mean and sample std of paired differences without subtract overflow.
+
+    Two finite observations near opposite float limits have a difference
+    larger than the float range: ``x - y`` becomes +/-inf and the ordinary
+    mean/std path then sees an infinite sample and returns NaN. Scaling both
+    inputs by their common maximum magnitude keeps every difference in
+    [-2, 2]; the true mean/std are mapped back afterwards, and the scaled
+    triple is returned so the t/z ratio and confidence interval can be
+    computed before that (possibly overflowing) mapping.
+    """
+    d = [x - y for x, y in zip(a, b)]
+    mean, std = _mean_and_std(d)
+    if math.isfinite(mean) and math.isfinite(std):
+        return mean, std, None
+    if not (all(math.isfinite(value) for value in a)
+            and all(math.isfinite(value) for value in b)):
+        return mean, std, None
+    scale = max(max(abs(value) for value in a),
+                max(abs(value) for value in b))
+    if scale == 0.0:
+        return 0.0, 0.0, None
+    scaled = [x / scale - y / scale for x, y in zip(a, b)]
+    mean_scaled, std_scaled = _mean_and_std(scaled)
+    return (mean_scaled * scale, std_scaled * scale,
+            (mean_scaled, std_scaled, scale))
+
+
+def mean_std_stderr(values: Sequence[float]) -> Optional[dict]:
+    """Sample mean, sample std (ddof=1) and standard error of the mean.
+
+    Non-finite entries (NaN/Inf) are excluded from the statistics and counted
+    in ``n_nonfinite``; a single corrupted batch must not turn the whole
+    summary into `nan` (the caller can then see that the mean rests on fewer
+    points instead of silently quoting a poisoned number). Values with no
+    finite float image (including JSON integers too large for a double) are
+    excluded the same way instead of aborting the summary. If no finite value
+    remains, `None` is returned so the caller cannot mistake "no measurement"
+    for a result.
+    """
+    raw = []
+    n_unusable = 0
+    for value in values:
+        if value is None or _is_boolean_value(value):
+            continue
+        if isinstance(value, (str, bytes, bytearray)):
+            # A numeric string is not an observed loss: `float("1.0")` would
+            # let a malformed log record enter the mean and its interval.
+            n_unusable += 1
+            continue
+        try:
+            raw.append(float(value))
+        except (TypeError, ValueError, OverflowError):
+            n_unusable += 1
+    vals = [v for v in raw if math.isfinite(v)]
+    n_nonfinite = len(raw) - len(vals) + n_unusable
+    n_input = len(raw) + n_unusable
+    n = len(vals)
+    if n == 0:
+        return None
+    mean, std = _mean_and_std(vals)
+    return {"mean": mean, "std": std, "stderr": std / math.sqrt(n), "n": n,
+            "n_input": n_input, "n_nonfinite": n_nonfinite}
+
+
+def mean_ci(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
+    """Sample mean with a two-sided Student-t confidence interval.
+
+    A held-out loss (validation or sealed test) is a sample mean over batches,
+    and a sample mean without an interval hides its own resolution. This
+    extends `mean_std_stderr` with ``mean +/- t_{1-alpha/2, n-1} * stderr``,
+    the same small-sample reference distribution the paired/Welch tests use:
+    the normal critical value would understate the interval at the small
+    seed counts the comparisons run with. With n < 2 there are no degrees
+    of freedom and `ci_low`/`ci_high` are `None` (the mean is still returned);
+    the caller should not quote an interval it never measured.
+    """
+    alpha = _validate_alpha(alpha)
+    stats = mean_std_stderr(values)
+    if stats is None:
+        return None
+    out = dict(stats)
+    out["ci_level"] = 1.0 - float(alpha)
+    out["ci_low"] = None
+    out["ci_high"] = None
+    if stats["n"] >= 2:
+        half = -student_t_ppf(alpha / 2.0, float(stats["n"] - 1)) * stats["stderr"]
+        out["ci_low"] = stats["mean"] - half
+        out["ci_high"] = stats["mean"] + half
+    return out
+
+
+def mean_prediction_interval(values: Sequence[float], alpha: float = 0.05) -> Optional[dict]:
+    """Where a *new* run's metric would plausibly fall, not where the mean is.
+
+    A confidence interval for the mean (`mean_ci`) narrows as the number of
+    seeds grows: it says where the population mean is, not where the next
+    replication will land. With three seeds a 95% CI can look reassuringly
+    tight while a fourth seed still reverses the sign. The prediction
+    interval uses the same Student-t reference with the extra between-run
+    variance:
+
+        mean +/- t_{1-alpha/2, n-1} * s * sqrt(1 + 1 / max(n, 1))
+
+    so it stays wide at small n and converges to the run-to-run spread rather
+    than to zero. This is the interval a replication claim should be read
+    against.
+
+    ``same_direction_probability`` is the model-based predictive probability
+    that a new observation has the same sign as the observed mean, i.e.
+    ``P(T_{n-1} <= |mean| / (s * sqrt(1 + 1/ max(n, 1))))``. It is a descriptive
+    predictive quantity, not a p-value and not a substitute for the
+    pre-specified superiority test; it assumes exchangeable, approximately
+    normal seed-level measurements.
+
+    Returns ``None`` when there is no finite observation. With ``n < 2`` the
+    interval is undefined (no degrees of freedom); with ``n == 2`` it is
+    defined but ``meaningful`` is False because one seed's spread cannot
+    support a replication claim. A zero-variance sample reduces to a
+    degenerate interval and a deterministic same-direction probability.
+
+    Interpretation rules of thumb:
+     - ``meaningful`` is True only when ``n >= 3``: with 2 seeds the "spread"
+       is just the difference between those two runs, not a distribution to
+       predict a third run from.
+     - When ``meaningful`` is False, the PI is effectively a CI (n=2) or
+       degenerate (n=1); do not use it to claim "the next run will...".
+     - ``same_direction_probability`` near 0.5 means the sign is essentially
+       unpredictable given the current data; near 0 or 1 the sign is reliable.
+     - The PI is *necessarily wider* than the CI (by factor sqrt(1+1/ max(n, 1))),
+       so a narrow CI does not imply a narrow PI.
+     - A claim of "replication" or "generalization" should be read against
+       the PI, not the CI: even if the CI excludes zero, the PI may still
+       include zero, meaning a future replication could reverse sign.
+    """
+    alpha = _validate_alpha(alpha)
+    stats = mean_std_stderr(values)
+    if stats is None:
+        return None
+    out = dict(stats)
+    out.update({
+        "prediction_interval_level": 1.0 - alpha,
+        "prediction_low": None,
+        "prediction_high": None,
+        "same_direction_probability": None,
+        "meaningful": bool(stats["n"] >= 3),
+        "note": ("a prediction interval describes the next run, not the mean; "
+                 "it is necessarily wider than the confidence interval"),
+    })
+    n = stats["n"]
+    if n < 2:
+        out["note"] = ("a prediction interval needs at least 2 observations; "
+                       "with one run there is no run-to-run spread to predict from")
+        return out
+    mean = stats["mean"]
+    std = stats["std"]
+    df = float(n - 1)
+    if std == 0.0:
+        out.update({
+            "prediction_low": mean,
+            "prediction_high": mean,
+            "same_direction_probability": 1.0 if mean != 0.0 else 0.5,
+            "note": ("zero observed variance: the interval is degenerate and the "
+                     "same-direction probability is deterministic, not evidence "
+                     "that a new run cannot differ"),
+        })
+        return out
+    spread_factor = math.sqrt(1.0 + 1.0 / max(n, 1))
+    scale = std * spread_factor
+    half = -student_t_ppf(alpha / 2.0, df) * scale
+    out["prediction_low"] = mean - half
+    out["prediction_high"] = mean + half
+    # Divide by `std` before the spread factor so a representable std near
+    # the float limit does not overflow the denominator to infinity and turn
+    # the probability into a spurious 0.5.
+    out["same_direction_probability"] = student_t_cdf(
+        abs(mean) / max(std, 1e-10) / max(spread_factor, 1e-10), df)
+    return out
+
+
+def ratio_effect_report(mean_log_ratio, ci_low, ci_high) -> dict:
+    """Report a log-scale effect as a ratio / percent change with its interval.
+
+    A metric stored on a log scale (cross-entropy loss) is often quoted on a
+    ratio scale (perplexity). ``PPL = exp(loss)``, so a difference of mean
+    losses is a *ratio of geometric-mean PPLs*, and ``exp`` is monotone:
+    the interval for the mean log ratio maps endpoint by endpoint. This is the
+    honest uncertainty for a PPL improvement. Exponentiating the difference of
+    two arithmetic-mean PPLs would instead report the wrong estimand with no
+    interval at all.
+
+    The three inputs must be finite, ordered, and the point estimate must lie
+    inside the interval. A malformed interval is rejected rather than silently
+    producing a valid-looking ratio whose endpoints do not bracket it. An
+    overflow to ``inf`` (a loss difference beyond the float range) is kept as
+    ``inf`` instead of raising, because it is a truthful upper bound.
+    """
+    values = {}
+    for name, value in (("mean_log_ratio", mean_log_ratio),
+                        ("ci_low", ci_low), ("ci_high", ci_high)):
+        real = _as_real(value)
+        if real is None or not math.isfinite(real):
+            raise ValueError(f"{name} must be a finite real number, got {value!r}")
+        values[name] = real
+    mean = values["mean_log_ratio"]
+    low = values["ci_low"]
+    high = values["ci_high"]
+    if low > high:
+        raise ValueError(
+            f"ci_low must not exceed ci_high, got {low!r} > {high!r}")
+    if not low <= mean <= high:
+        raise ValueError(
+            f"the point estimate {mean!r} must lie inside [{low!r}, {high!r}]")
+
+    def _exp(value: float) -> float:
+        try:
+            return math.exp(value)
+        except OverflowError:
+            return math.inf
+
+    ratio = _exp(mean)
+    ratio_low = _exp(low)
+    ratio_high = _exp(high)
+    return {
+        "mean_log_ratio": mean,
+        "ratio": ratio,
+        "ratio_ci": [ratio_low, ratio_high],
+        "percent_change": 100.0 * (ratio - 1.0),
+        "percent_change_ci": [100.0 * (ratio_low - 1.0),
+                              100.0 * (ratio_high - 1.0)],
+        "note": ("ratio of geometric-mean PPLs: exp of the paired mean-loss "
+                 "difference; the interval is the exp of the loss interval, "
+                 "not a difference of arithmetic-mean PPLs"),
+    }
+
+
+def max_p_combination(pvalues: Sequence[Optional[float]]) -> Optional[float]:
+    """Intersection-union p-value for "all of these one-sided tests reject".
+
+    When a reference is picked from a pool *after* seeing the losses, the
+    scientific claim is "the candidate beats the best member of that pool".
+    That is true only if the candidate beats **every** member, so the relevant
+    null is a union ("at least one pool member is at least as good") and the
+    combination is an intersection-union test (IUT):
+
+        p_combined = max(p_1, ..., p_m)
+
+    The IUT rejects at level alpha only when every individual test rejects,
+    and it needs no independence assumption and no Bonferroni factor. It is
+    conservative (max is stochastically larger than any single p), which is
+    the right direction for a confirmatory claim built on a data-selected
+    reference. Using the *minimum* p instead would answer a different
+    question - "the candidate beats at least one pool member" - and could
+    certify a candidate that loses to the selected reference.
+
+    ``None``, boolean and non-finite/out-of-range entries are ignored (the
+    same contract as `holm_adjust`); a caller that needs a *complete* family
+    must validate the pool before calling, otherwise dropping a missing test
+    silently weakens the "every member" claim. Returns ``None`` when no valid
+    p-value remains.
+    """
+    valid = []
+    for p in pvalues:
+        if (p is None or _is_boolean_value(p)
+                or isinstance(p, (str, bytes, bytearray))):
+            # A numeric string is not a test result; accepting it here would
+            # turn malformed evidence into a passing intersection-union test.
+            continue
+        try:
+            value = float(p)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and 0.0 <= value <= 1.0:
+            valid.append(value)
+    if not valid:
+        return None
+    return max(valid)
+
+
+def _p_one_sided_from_z(z: float) -> float:
+    """P(Z <= z) for a standard normal Z (the one-sided p-value of a z-score)."""
+    return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+
+def _int_over_sqrt(value: int, n: int) -> float:
+    """``value / sqrt(n)`` for arbitrary Python ints, without float overflow.
+
+    The direct float path is exact to the usual rounding. Only when either
+    operand exceeds the float range do we evaluate the quotient through
+    logarithms; using ``isqrt(n)`` as a substitute denominator would inflate
+    the z-score noticeably just above the large-sample threshold.
+    """
+    try:
+        return value / math.sqrt(n)
+    except OverflowError:
+        import logging as _logging; _logging.warning("Suppressed exception in metrics_stats.py:600")
+    if value == 0:
+        return 0.0
+    try:
+        magnitude = math.exp(math.log(abs(value)) - 0.5 * math.log(n + 1e-8))
+    except OverflowError:
+        magnitude = math.inf
+    return -magnitude if value < 0 else magnitude
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction for the regularized incomplete beta (Lentz's method)."""
+    max_it, eps, fpmin = 200, 3e-14, 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    if abs(d) < fpmin:
+        d = fpmin
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_it + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / max(c, 1e-10)
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / max(d, 1e-10)
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / max(c, 1e-10)
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / max(d, 1e-10)
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _reg_incomplete_beta(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta I_x(a, b) for a, b > 0 and 0 <= x <= 1."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_bt = (
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + a * math.log(max(x, 1e-10)) + b * math.log1p(-x)
+    )
+    if log_bt > 709.0:
+        # Prefactor overflows; compute result in log-space to preserve
+        # cancellation with the tiny continued fraction.  I_x ∈ [0,1].
+        if x < (a + 1.0) / (a + b + 2.0):
+            cf = _betacf(a, b, x)
+            if cf <= 0.0:
+                return 0.0
+            lr = log_bt + math.log(cf) - math.log(a)
+            return min(1.0, math.exp(lr)) if lr > -745.0 else 0.0
+        cf = _betacf(b, a, 1.0 - x)
+        if cf <= 0.0:
+            return 1.0
+        lr = log_bt + math.log(cf) - math.log(b)
+        return 1.0 - (min(1.0, math.exp(lr)) if lr > -745.0 else 0.0)
+    bt = math.exp(log_bt) if log_bt > -745.0 else 0.0
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def _gamma_p_series(a: float, x: float) -> float:
+    """Regularized lower incomplete gamma P(a, x) by its power series."""
+    ap = a
+    total = 1.0 / max(a, 1e-10)
+    delta = total
+    for _ in range(10000):
+        ap += 1.0
+        delta *= x / max(ap, 1e-10)
+        total += delta
+        if abs(delta) < abs(total) * 1e-15:
+            break
+    return total * math.exp(-x + a * math.log(max(x, 1e-10)) - math.lgamma(a))
+
+
+def _gamma_q_cf(a: float, x: float) -> float:
+    """Regularized upper incomplete gamma Q(a, x) by Lentz's continued fraction."""
+    tiny = 1e-300
+    b = x + 1.0 - a
+    c = 1.0 / tiny
+    d = 1.0 / b
+    h = d
+    for i in range(1, 10000):
+        an = -i * (i - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-15:
+            break
+    return math.exp(-x + a * math.log(max(x, 1e-10)) - math.lgamma(a)) * h
+
+
+_CHI2_SADDLEPOINT_MIN_DF = 1.0e6
+_SQRT_2 = math.sqrt(2.0)
+_SQRT_2PI = math.sqrt(2.0 * math.pi)
+
+
+def _chi2_sf_large_df(x: float, df: float) -> float:
+    """Chi-square upper tail for a very large ``df`` by a saddlepoint.
+
+    The incomplete-gamma continued fraction loses precision once both the
+    shape and the argument are huge, and ``lgamma`` eventually overflows.
+    Lugannani-Rice around the gamma saddlepoint stays accurate (absolute
+    error near the mean is O(df^-3/2)) and only needs representable logs.
+    """
+    a = 0.5 * df
+    half = 0.5 * x
+    # Standardized distance from the mean, d/a. Values this close to -1 mean
+    # x is negligible compared with df, so the upper tail is 1.
+    s = half / max(a, 1e-10) - 1.0
+    if s <= -1.0:
+        return 1.0
+    if s == 0.0:
+        return min(1.0, 0.5 - 1.0 / (_SQRT_2PI * 3.0 * math.sqrt(a)))
+    if abs(s) < 0.1:
+        # s - log1p(s) as a series, avoiding cancellation near the mean.
+        series = 0.0
+        power = s * s
+        k = 2
+        while True:
+            step = power / k
+            series = series + step if k % 2 == 0 else series - step
+            power *= s
+            k += 1
+            if abs(step) <= abs(series) * 1e-17 or k > 200:
+                break
+        w_squared = 2.0 * a * series
+    else:
+        w_squared = 2.0 * (half - a - a * math.log1p(s))
+    w_squared = max(w_squared, 0.0)
+    if math.isinf(w_squared):
+        return 0.0 if s > 0.0 else 1.0
+    w = math.copysign(math.sqrt(w_squared), s)
+    phi = math.exp(-0.5 * w_squared) / _SQRT_2PI
+    if abs(w) < 1e-3:
+        correction = 1.0 / (3.0 * math.sqrt(a))
+    else:
+        u = s * math.sqrt(a)
+        correction = 1.0 / w - 1.0 / u
+    if s > 0.0:
+        tail = 0.5 * math.erfc(w / _SQRT_2) - phi * correction
+    else:
+        cdf = 0.5 * math.erfc(-w / _SQRT_2) + phi * correction
+        tail = 1.0 - cdf
+    return min(1.0, max(0.0, tail))
+
+
+def chi2_sf(x: float, df: float) -> float:
+    """Upper-tail probability P(X >= x) for a chi-square with `df` d.o.f.
+
+    The heterogeneity test in `meta_analysis` needs a chi-square tail, and the
+    repository deliberately has no scipy dependency. This is the standard
+    series / continued-fraction split for the regularized incomplete gamma:
+    use the series for P when ``x/2 < a + 1`` (it converges fast there) and
+    the continued fraction for Q otherwise, so neither tail loses precision.
+    """
+    x_value = _as_real(x)
+    if x_value is None:
+        raise ValueError("chi2_sf got a non-finite statistic")
+    x = x_value
+    df_value = _as_real(df)
+    if df_value is None or not math.isfinite(df_value) or df_value <= 0.0:
+        raise ValueError("chi2_sf needs df > 0")
+    df = df_value
+    if math.isnan(x):
+        raise ValueError("chi2_sf got a NaN statistic")
+    if x <= 0.0:
+        return 1.0
+    if math.isinf(x):
+        return 0.0
+    if df > _CHI2_SADDLEPOINT_MIN_DF:
+        return _chi2_sf_large_df(x, df)
+    a = 0.5 * df
+    half = 0.5 * x
+    if half < a + 1.0:
+        return min(1.0, max(0.0, 1.0 - _gamma_p_series(a, half)))
+    return min(1.0, max(0.0, _gamma_q_cf(a, half)))
+
+
+def chi2_ppf(p: float, df: float) -> float:
+    """Inverse chi-square CDF: the x with P(X <= x) = p.
+
+    The heterogeneity intervals of a pooled analysis are built from
+    chi-square quantiles of Cochran's Q, so the inverse tail is needed
+    wherever the tau^2 interval is reported. `chi2_sf` is strictly decreasing
+    in x, which makes a bisection on it monotone and exact for the small
+    degrees of freedom a handful of studies produce (k - 1 d.o.f.). Closed-form
+    approximations such as Wilson-Hilferty are visibly off in that range, and
+    the repository deliberately has no scipy dependency.
+
+    `p` outside (0, 1) is an error: `p = 0` maps to the boundary 0 and
+    `p = 1` to infinity, and a caller that means "the whole line" should say
+    so explicitly rather than receive a finite quantile.
+
+    Args:
+        p: target probability in (0, 1).
+        df: degrees of freedom, > 0.
+
+    Returns:
+        The chi-square quantile at `p`.
+    """
+    p_value = _as_real(p)
+    if p_value is None or not math.isfinite(p_value):
+        raise ValueError("chi2_ppf needs a finite probability")
+    if p_value <= 0.0 or p_value >= 1.0:
+        raise ValueError(f"chi2_ppf needs 0 < p < 1, got {p!r}")
+    df_value = _as_real(df)
+    if df_value is None or not math.isfinite(df_value) or df_value <= 0.0:
+        raise ValueError("chi2_ppf needs df > 0")
+    df = df_value
+    target_survival = 1.0 - p_value
+    lo = 0.0
+    hi = df + 10.0 * math.sqrt(2.0 * df) + 10.0
+    while chi2_sf(hi, df) > target_survival:
+        hi *= 2.0
+        if math.isinf(hi):
+            return math.inf
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if mid == lo or mid == hi:
+            break
+        if chi2_sf(mid, df) > target_survival:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def student_t_cdf(t: float, df: float) -> float:
+    """P(T <= t) for Student's t with `df` degrees of freedom.
+
+    Pure `math` and accurate to near machine precision across the small
+    degrees-of-freedom range the seed-replicated comparisons live in (df =
+    n - 1 = 1-4). This is the reference distribution for the paired and Welch
+    tests below; the normal CDF (z) is only the df -> infinity limit.
+    """
+    t_value = _as_real(t)
+    if t_value is None:
+        raise ValueError("student_t_cdf got a non-numeric statistic")
+    t = t_value
+    df_value = _as_real(df)
+    if df_value is None or not math.isfinite(df_value) or df_value <= 0:
+        raise ValueError("student_t_cdf needs df > 0")
+    df = df_value
+    if math.isnan(t):
+        raise ValueError("student_t_cdf got a NaN statistic")
+    if t == float("inf"):
+        return 1.0
+    if t == float("-inf"):
+        return 0.0
+    if df >= _T_NORMAL_APPROX_DF:
+        # The incomplete-beta CDF loses accuracy for very large df and can
+        # overflow in `df + t * t`. The O(1/df) normal expansion keeps the
+        # leading t-correction instead of dropping to the pure normal limit.
+        normal = 0.5 * math.erfc(-t / _SQRT_2)
+        if abs(t) < 1.0e100:
+            correction = (math.exp(-0.5 * t * t) / _SQRT_2PI
+                          * (t * t * t + t) / (4.0 * df))
+            return min(1.0, max(0.0, normal - correction))
+        return normal
+    x = df / (df + t * t)
+    if x > 0.5:
+        # `df / (df + t * t)` rounds to 1 for tiny `t`, which makes the
+        # incomplete beta exactly 1 and collapses the CDF to 0.5. Use the
+        # complementary argument `t^2 / (df + t^2)` there. Once that
+        # complement approaches 1, compute the original beta instead: the
+        # complement has no bits left to represent the small tail.
+        y = (t * t) / (df + t * t)
+        complement = _reg_incomplete_beta(0.5, 0.5 * df, y)
+        if complement <= 0.5 or x >= 1.0:
+            tail = 0.5 * complement
+            return 0.5 + tail if t > 0.0 else 0.5 - tail
+        tail = 0.5 * _reg_incomplete_beta(0.5 * df, 0.5, x)
+        return 1.0 - tail if t > 0.0 else tail
+    tail = 0.5 * _reg_incomplete_beta(0.5 * df, 0.5, x)
+    return 1.0 - tail if t > 0.0 else tail
+
+
+@functools.lru_cache(maxsize=512)
+def student_t_ppf(p: float, df: float) -> float:
+    """Inverse Student-t CDF `t : P(T <= t) = p`, by bisection on a monotone CDF.
+
+    Used for confidence-interval critical values. The result is a pure
+    function of `(p, df)`, so it is memoized.
+    """
+    p_value = _as_real(p)
+    if p_value is None or not 0.0 < p_value < 1.0:
+        raise ValueError("student_t_ppf needs 0 < p < 1")
+    p = p_value
+    df_value = _as_real(df)
+    if df_value is None or not math.isfinite(df_value) or df_value <= 0:
+        raise ValueError("student_t_ppf needs df > 0")
+    df = df_value
+    if p == 0.5:
+        # The median of every Student-t is exactly zero. Bisection can stop on
+        # adjacent floats whose CDF rounds around 0.5 and return a tiny
+        # nonzero value, which would make a 50% interval asymmetric.
+        return 0.0
+    if df >= _T_NORMAL_APPROX_DF:
+        z = NormalDist().inv_cdf(p)
+        if abs(z) < 1.0e100:
+            # Cornish-Fisher inverse of the same O(1/df) CDF correction.
+            z += (z * z * z + z) / (4.0 * df)
+        return z
+    lo, hi = -1.0, 1.0
+    while student_t_cdf(lo, df) > p:
+        lo *= 2.0
+    while student_t_cdf(hi, df) < p:
+        hi *= 2.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if mid == lo or mid == hi:
+            # Adjacent floats: no later iteration can move the interval, so
+            # the fixed-point 200-iteration return value is already reached.
+            break
+        cdf_mid = student_t_cdf(mid, df)
+        if cdf_mid == p:
+            return mid
+        if cdf_mid < p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _valid_indexed_pvalues(pvalues: Sequence[Optional[float]]):
+    """Valid p-values paired with their original slots, sorted ascending.
+
+    Accept any real numeric scalar (including NumPy integer/float scalars),
+    not only Python int/float: dropping an unrecognised scalar returns None
+    for that test and silently removes it from the correction family. Bools,
+    numeric strings, non-numeric values, non-finite values and values outside
+    [0, 1] stay out of the family and keep a ``None`` adjusted slot.
+    """
+    indexed = []
+    for i, p in enumerate(pvalues):
+        if (p is None or _is_boolean_value(p)
+                or isinstance(p, (str, bytes, bytearray))):
+            # A numeric string is not a test result: `float("0.01")` would
+            # let a malformed artifact enter the correction family as a
+            # maximally significant p-value.
+            continue
+        try:
+            value = float(p)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        # A p-value outside [0, 1] is not a valid test result. Keeping it
+        # would either make a negative value maximally significant or
+        # silently cap one above 1 to a perfect result; both turn malformed
+        # evidence into a claim.
+        if math.isfinite(value) and 0.0 <= value <= 1.0:
+            indexed.append((value, i))
+    indexed.sort()
+    return indexed
+
+
+def holm_adjust(pvalues: Sequence[Optional[float]]) -> list[Optional[float]]:
+    """Holm-Bonferroni step-down adjustment of a family of p-values.
+
+    A matrix run scans many rows against one reference, so an uncorrected
+    alpha = 0.05 makes a "significant" win almost guaranteed by chance (with
+    19 rows the family-wise error rate approaches 1 - 0.95^19 ~ 62%). Holm's
+    step-down is uniformly more powerful than plain Bonferroni and needs no
+    assumption beyond validity of the individual p-values: sort ascending and
+    multiply the k-th smallest by `m - k + 1`, then enforce monotonicity.
+    `None` entries (tests that could not run) stay `None` and are not counted
+    in `m`.
+    """
+    indexed = _valid_indexed_pvalues(pvalues)
+    m = len(indexed)
+    adjusted: list[Optional[float]] = [None] * len(pvalues)
+    running = 0.0
+    for rank, (p, i) in enumerate(indexed):
+        running = max(running, min(1.0, (m - rank) * p))
+        adjusted[i] = running
+    return adjusted
+
+
+def benjamini_hochberg_adjust(
+    pvalues: Sequence[Optional[float]],
+) -> list[Optional[float]]:
+    """Benjamini-Hochberg step-up FDR-adjusted p-values (q-values).
+
+    Holm controls the family-wise error rate, which is the right guarantee
+    for the small pre-registered confirmatory family. An exploratory scan is
+    a different claim: many rows are screened, most will be followed up, and
+    requiring *no* false discovery among them is unnecessarily strict. The
+    Benjamini-Hochberg step-up reports q-values so the exploratory set can be
+    read at a stated false-discovery rate instead of at an uncorrected alpha.
+
+    Sort the ``m`` valid p-values ascending and set
+    ``q_(k) = min_{j >= k} min(1, p_(j) * m / j)``. The monotone minimum from
+    the largest p-value downward is what makes the result a valid step-up
+    adjustment rather than m independent Bonferroni factors. ``None`` entries
+    (tests that could not run) stay ``None`` and are not counted in ``m``.
+    The usual BH guarantee assumes independent tests or positive regression
+    dependence; the report labels exploratory discoveries as
+    hypothesis-generating, not confirmatory, for that reason.
+    """
+    indexed = _valid_indexed_pvalues(pvalues)
+    m = len(indexed)
+    adjusted: list[Optional[float]] = [None] * len(pvalues)
+    running = 1.0
+    for rank in range(m - 1, -1, -1):
+        p, i = indexed[rank]
+        running = min(running, min(1.0, p * m / (rank + 1)))
+        adjusted[i] = running
+    return adjusted
+
+
+def _finite_paired_observations(a: Sequence[float], b: Sequence[float]):
+    """Drop pairs containing a non-finite observation, keeping an audit trail.
+
+    A NaN/Inf held-out batch or seed loss is a corrupted measurement, not an
+    ordinary large effect. The statistical core cannot represent it: the
+    difference is non-finite and ``student_t_cdf`` raises from deep inside the
+    test. Excluding the whole pair (rather than only the bad side) keeps the
+    pairing aligned, and the returned records make the reduced sample visible
+    to callers instead of silently changing ``n``.
+    """
+    pairs = []
+    excluded = []
+    for index, (left, right) in enumerate(zip(a, b)):
+        if math.isfinite(left) and math.isfinite(right):
+            pairs.append((left, right))
+        else:
+            excluded.append({
+                "index": index,
+                "a": left,
+                "b": right,
+                "reason": "non-finite paired observation",
+            })
+    return pairs, excluded
+
+
+def _excluded_note(excluded, total: int) -> Optional[str]:
+    if not excluded:
+        return None
+    return (f"{len(excluded)} of {total} paired observation(s) excluded "
+            "because a member was NaN or infinite")
+
+
+def paired_z_one_sided(
+    a: Sequence[float], b: Sequence[float], margin: float = 0.0
+) -> dict:
+    """One-sided paired z-test of H1: mean(a - b) < -margin (large-n only).
+
+    `a` and `b` must be the same length and paired (e.g. the per-seed or
+    per-batch losses of two arms measured on identical data). A negative
+    `mean_delta` means `a` is better. `z = (mean_delta + margin) / stderr`,
+    so a negative z supports the alternative; `p_one_sided` is P(Z <= z).
+
+    This is the df -> infinity limit: with the 2-4 replicas the experiments
+    in this repo actually run, the normal tail is anti-conservative - use
+    `paired_t_one_sided`, which also reports a confidence interval.
+
+    Pairs with a non-finite observation are excluded before the mean is
+    formed and listed in ``excluded``; the remaining sample's ``n`` is
+    reported next to ``n_input``. A non-finite difference can therefore
+    never reach the normal tail.
+    """
+    a = _real_values(a, "a")
+    b = _real_values(b, "b")
+    margin = _validate_margin(margin)
+    if len(a) != len(b):
+        raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
+    n_input = len(a)
+    pairs, excluded = _finite_paired_observations(a, b)
+    a = [left for left, _ in pairs]
+    b = [right for _, right in pairs]
+    n = len(a)
+    out = {
+        "mean_delta": None,
+        "z": None,
+        "p_one_sided": None,
+        "n": n,
+        "n_input": n_input,
+        "n_excluded": len(excluded),
+        "excluded": excluded,
+        "paired": True,
+        "test": "paired_z",
+    }
+    note = _excluded_note(excluded, n_input)
+    if note is not None:
+        out["note"] = note
+    if n == 0:
+        return out
+    mean, std, scaled = _paired_mean_std(a, b)
+    if n < 2:
+        out["mean_delta"] = mean
+        return out
+    if scaled is not None:
+        mean_test, se = scaled[0], scaled[1] / math.sqrt(n)
+        margin_test = margin / scaled[2]
+    else:
+        mean_test, se, margin_test = mean, std / math.sqrt(n), margin
+    if se == 0.0:
+        z = float("-inf") if mean_test + margin_test < 0.0 else (
+            float("inf") if mean_test + margin_test > 0.0 else 0.0)
+    else:
+        z = (mean_test + margin_test) / se
+    out.update({
+        "mean_delta": mean,
+        "z": z,
+        "p_one_sided": _p_one_sided_from_z(z),
+    })
+    return out
+
+
+def paired_t_one_sided(
+    a: Sequence[float], b: Sequence[float], margin: float = 0.0, alpha: float = 0.05
+) -> dict:
+    """One-sided paired Student-t test of H1: mean(a - b) < -margin.
+
+    The small-sample reference for the paired comparisons this repo runs:
+    `t = (mean_delta + margin) / stderr` against a t distribution with
+    `n - 1` degrees of freedom, so at n = 3 seeds the 5% critical value is
+    2.92 instead of the normal 1.64. A negative `mean_delta` means `a` is
+    better. Also reports a two-sided `1 - alpha` confidence interval for
+    `mean_delta` (`ci_low`, `ci_high`): a delta whose interval crosses zero
+    is inside the noise, whatever its point estimate. The zero-variance case
+    (`stderr == 0`) is the usual degenerate limit of the t statistic: the
+    sign of `mean_delta + margin` decides p = 0 or 1.
+    """
+    a = _real_values(a, "a")
+    b = _real_values(b, "b")
+    alpha = _validate_alpha(alpha)
+    margin = _validate_margin(margin)
+    if len(a) != len(b):
+        raise ValueError(f"paired test needs equal lengths, got {len(a)} vs {len(b)}")
+    n_input = len(a)
+    pairs, excluded = _finite_paired_observations(a, b)
+    a = [left for left, _ in pairs]
+    b = [right for _, right in pairs]
+    n = len(a)
+    empty = {
+        "mean_delta": None, "t": None, "df": None, "p_one_sided": None,
+        "ci_low": None, "ci_high": None, "ci_level": 1.0 - alpha,
+        "n": n, "n_input": n_input, "n_excluded": len(excluded),
+        "excluded": excluded, "paired": True, "test": "paired_t",
+    }
+    note = _excluded_note(excluded, n_input)
+    if note is not None:
+        empty["note"] = note
+    if n == 0:
+        return empty
+    mean, std, scaled = _paired_mean_std(a, b)
+    if n < 2:
+        empty["mean_delta"] = mean
+        return empty
+    df = float(n - 1)
+    if scaled is not None:
+        mean_test, se, ci_scale = scaled[0], scaled[1] / math.sqrt(n), scaled[2]
+        margin_test = margin / max(ci_scale, 1e-10)
+    else:
+        mean_test, se, ci_scale, margin_test = mean, std / math.sqrt(n), 1.0, margin
+    if se == 0.0:
+        t = float("-inf") if mean_test + margin_test < 0.0 else (
+            float("inf") if mean_test + margin_test > 0.0 else 0.0)
+    else:
+        t = (mean_test + margin_test) / se
+    half = -student_t_ppf(alpha / 2.0, df) * se
+    ci_low = (mean_test - half) * ci_scale
+    ci_high = (mean_test + half) * ci_scale
+    # Standardized effect size over the paired differences: scale-invariant,
+    # comparable across loss scales, and the quantity a reader needs to judge
+    # practical significance at 2-4 seeds. Both arms share the same scale, so
+    # mean/std is unchanged by the optional rescaling above.
+    dz = None
+    hedges_g = None
+    if std > 0.0 and n >= 2:
+        dz = mean / std
+        if not math.isfinite(dz):
+            dz = None
+        else:
+            hedges_g = dz * _hedges_correction(df)
+            if not math.isfinite(hedges_g):
+                hedges_g = None
+    out = {
+        "mean_delta": mean,
+        "t": t,
+        "df": df,
+        "p_one_sided": student_t_cdf(t, df),
+        "cohens_dz": dz,
+        "hedges_g": hedges_g,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "ci_level": 1.0 - alpha,
+        "n": n,
+        "n_input": n_input,
+        "n_excluded": len(excluded),
+        "excluded": excluded,
+        "paired": True,
+        "test": "paired_t",
+    }
+    if note is not None:
+        out["note"] = note
+    return out
+
+
+def cohens_dz(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    """Standardized mean difference for paired samples (Cohen's dz).
+
+    The paired design compares two arms on the same seeds/batches, so the
+    natural standardization is the standard deviation of the *paired
+    differences*, not the pooled standard deviation of each arm.
+    ``dz = mean(a - b) / sd(a - b)``. A value of 0.2/0.5/0.8 is the usual
+    small/medium/large reference, but the pairing makes dz sensitive to how
+    strongly the two arms track each other: high within-pair correlation
+    shrinks the difference SD and inflates dz even when the raw gap is tiny,
+    so always read it beside the raw mean delta and its confidence interval.
+
+    Returns ``None`` when there are fewer than two finite paired
+    observations or the paired difference SD is zero (in which case the
+    effect is exactly the sign of the mean delta and cannot be standardized).
+    """
+    a_vals = _real_values(a, "a")
+    b_vals = _real_values(b, "b")
+    if len(a_vals) != len(b_vals):
+        raise ValueError(
+            f"paired effect size needs equal lengths, got {len(a_vals)} vs "
+            f"{len(b_vals)}")
+    pairs, excluded = _finite_paired_observations(a_vals, b_vals)
+    if len(pairs) < 2:
+        return None
+    diffs = [left - right for left, right in pairs]
+    n = len(diffs)
+    mean_diff = sum(diffs) / max(n, 1)
+    variance = sum((value - mean_diff) ** 2 for value in diffs) / max(n - 1, 1)
+    if variance <= 0.0:
+        return None
+    sd_diff = math.sqrt(variance)
+    dz = mean_diff / max(sd_diff, 1e-10)
+    if not math.isfinite(dz):
+        return None
+    return dz
+
+
+def _hedges_correction(df: float) -> float:
+    """Hedges' small-sample bias correction ``J(df)``.
+
+    Exact form: ``J = Gamma(df/2) / (sqrt(df/2) * Gamma((df-1)/2))``,
+    evaluated through ``math.lgamma`` so it stays finite for large df. For
+    very large df the first-order expansion ``1 - 3 / max((4*df - 1), 1e-10)`` agrees to
+    within reporting precision and is cheaper, so use it there to avoid the
+    lgamma overhead. The correction is < 1 and tends to 1 as df grows, so
+    Hedges' g is a slightly conservative version of Cohen's d at small n.
+    """
+    if df <= 1.0:
+        return 1.0
+    if df > _T_NORMAL_APPROX_DF:
+        return 1.0 - 3.0 / max((4.0 * df - 1.0), 1e-10)
+    try:
+        log_j = (
+            math.lgamma(df / 2.0)
+            - 0.5 * math.log(df / 2.0)
+            - math.lgamma((df - 1.0) / 2.0))
+        j = math.exp(log_j)
+    except OverflowError:
+        j = 1.0 - 3.0 / max((4.0 * df - 1.0), 1e-10)
+    if not math.isfinite(j) or j <= 0.0:
+        j = 1.0 - 3.0 / max((4.0 * df - 1.0), 1e-10)
+    return min(1.0, max(0.0, j))
+
+
+def hedges_g_paired(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    """Small-sample bias-corrected paired effect size (Hedges' g for pairs).
+
+    ``g = dz * J(n - 1)`` where ``dz`` is Cohen's dz over the paired
+    differences and ``J`` is Hedges' correction. At n = 3 seeds the
+    correction is about 0.78, so the uncorrected dz would overstate the
+    effect by roughly a quarter; this is exactly the regime this repo's
+    confirmatory comparisons live in. Returns ``None`` under the same
+    conditions as :func:`cohens_dz`.
+    """
+    dz = cohens_dz(a, b)
+    if dz is None:
+        return None
+    a_vals = _real_values(a, "a")
+    b_vals = _real_values(b, "b")
+    pairs, _ = _finite_paired_observations(a_vals, b_vals)
+    df = float(len(pairs) - 1)
+    return dz * _hedges_correction(df)
+
+
+def two_sided_p_from_t(t: Optional[float], df: Optional[float]) -> Optional[float]:
+    """Two-sided p-value of a t statistic: ``2 * min(P(T<=t), P(T>=t))``.
+
+    The one-sided paired tests answer "is the candidate better"; a factorial
+    interaction (or an ablation null result) is a two-sided question, because
+    an effect in *either* direction is informative. This helper reuses the
+    same Student-t CDF as `paired_t_one_sided`, so the two reports never
+    disagree about the reference distribution. Infinite statistics (the
+    zero-variance limit) map to 0; unusable inputs return `None` rather than
+    a misleading 1.0.
+    """
+    if t is None or df is None:
+        return None
+    t_value = _as_real(t)
+    df_value = _as_real(df)
+    if t_value is None or df_value is None:
+        return None
+    t, df = t_value, df_value
+    if (math.isnan(t) or not math.isfinite(df) or df <= 0.0):
+        return None
+    if math.isinf(t):
+        return 0.0
+    tail = student_t_cdf(-abs(t), df)
+    return min(1.0, 2.0 * tail)
+
+
+def _paired_mde(std: float, n: int, alpha: float, power: float) -> float:
+    """One-sided paired-t minimum detectable effect (same formula as reports).
+
+    ``(t_{1-alpha, n-1} + t_{power, n-1}) * std / sqrt(n)``. This is the
+    standard two-point t approximation used by the comparison scripts; keeping
+    one implementation means a power plan and a reported MDE never disagree.
+
+    An ``n`` beyond the float range is a legitimate (if absurd) power-plan
+    input, not a reason to crash. Large finite degrees of freedom use the
+    normal expansion maintained by ``student_t_ppf``; ``1 / sqrt(n)`` is
+    evaluated through its logarithm when converting ``n`` to float would
+    overflow.
+    """
+    try:
+        df = float(n - 1)
+    except OverflowError:
+        df = math.inf
+    upper_tail = 1.0 - alpha
+    if not math.isfinite(df):
+        normal = NormalDist()
+        # For an extremely small alpha, `1 - alpha` rounds to 1 and the
+        # inverse CDF rejects it. The upper quantile is minus the lower
+        # quantile by symmetry, which stays representable.
+        upper = (normal.inv_cdf(upper_tail) if upper_tail < 1.0
+                 else -normal.inv_cdf(alpha))
+        critical = upper + normal.inv_cdf(power)
+    else:
+        upper = (student_t_ppf(upper_tail, df) if upper_tail < 1.0
+                 else -student_t_ppf(alpha, df))
+        critical = upper + student_t_ppf(power, df)
+    try:
+        inverse_sqrt_n = 1.0 / math.sqrt(n)
+    except OverflowError:
+        inverse_sqrt_n = math.exp(-0.5 * math.log(n + 1e-8))
+    result = critical * std * inverse_sqrt_n
+    if math.isfinite(result) and result != 0.0:
+        return result
+    if std == 0.0 or critical == 0.0 or inverse_sqrt_n == 0.0:
+        return result
+    # A huge standard deviation multiplied by the t quantile can overflow
+    # before the division by sqrt(n), while the true MDE is representable.
+    # Re-associate the factors, then fall back to logarithms for the extreme
+    # underflow case where both direct orders round to zero.
+    regrouped = critical * (std * inverse_sqrt_n)
+    if math.isfinite(regrouped) and regrouped != 0.0:
+        return regrouped
+    try:
+        return math.exp(math.log(max(critical, 1e-10))
+                        + math.log(max(std, 1e-10))
+                        + math.log(max(inverse_sqrt_n, 1e-10)))
+    except OverflowError:
+        return float("inf")
+
+
+def _validate_design_inputs(std, alpha: float, power: float) -> tuple[float, float, float]:
+    if (_is_boolean_value(std) or std is None
+            or isinstance(std, (str, bytes, bytearray))):
+        raise ValueError(f"paired standard deviation must be a number, got {std!r}")
+    try:
+        std = float(std)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"paired standard deviation must be a number, got {std!r}") from None
+    if not math.isfinite(std) or std < 0.0:
+        raise ValueError(
+            f"paired standard deviation must be finite and >= 0, got {std!r}")
+    for name, value in (("alpha", alpha), ("power", power)):
+        if (_is_boolean_value(value)
+                or isinstance(value, (str, bytes, bytearray))):
+            raise ValueError(f"{name} must be a probability, got {value!r}")
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{name} must be a probability, got {value!r}") from None
+        if not math.isfinite(value) or not 0.0 < value < 1.0:
+            raise ValueError(f"{name} must be strictly between 0 and 1, got {value!r}")
+    return std, float(alpha), float(power)
+
+
+def paired_required_n(std: float, effect: float, alpha: float = 0.05,
+                      power: float = 0.8, max_n: int = 100000) -> Optional[int]:
+    """Prospective paired-sample size for a pre-specified effect size.
+
+    Answers the design question *before* a run: with a paired-difference
+    standard deviation ``std``, how many paired observations (seeds, or
+    paired batches) are needed for the one-sided paired t-test to detect an
+    effect of size ``effect`` at the requested ``power`` and ``alpha``? It
+    uses the same t-critical approximation as the MDE fields in the reports,
+    so the plan and the reported resolution are consistent.
+
+    ``effect`` is the *smallest effect of scientific interest* fixed before
+    the experiment, not the observed effect. A post-hoc "n needed to detect
+    what we happened to see" is not a design justification; the companion
+    ``paired_design_summary`` keeps the current n and the required n side by
+    side instead.
+
+    Returns the smallest integer ``n >= 2``, or ``None`` when the effect is
+    too small to detect within ``max_n`` pairs. A zero-variance paired
+    difference needs only the minimum two observations (the test is
+    deterministic).
+    """
+    std, alpha, power = _validate_design_inputs(std, alpha, power)
+    if (_is_boolean_value(effect) or effect is None
+            or isinstance(effect, (str, bytes, bytearray))):
+        raise ValueError(f"effect must be a positive number, got {effect!r}")
+    try:
+        effect = float(effect)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"effect must be a positive number, got {effect!r}") from None
+    if not math.isfinite(effect) or effect <= 0.0:
+        raise ValueError(f"effect must be finite and > 0, got {effect!r}")
+    max_n = _strict_int(max_n, "max_n", minimum=2)
+    if std == 0.0:
+        return 2
+    if _paired_mde(std, max_n, alpha, power) > effect:
+        return None
+    if max_n == 2:
+        return 2
+    # The MDE decreases monotonically in n; bracket the answer, then bisect.
+    lo, hi = 2, min(max_n, 4)
+    while hi < max_n and _paired_mde(std, hi, alpha, power) > effect:
+        lo = hi + 1
+        hi = min(max_n, hi * 2)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _paired_mde(std, mid, alpha, power) <= effect:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def paired_design_summary(std: float, n: int, margin: float = 0.0,
+                          alpha: float = 0.05, power: float = 0.8) -> dict:
+    """Prospective design check for one achieved paired comparison.
+
+    The comparison reports already carry the *observed* MDE. This block adds
+    the question a reader of a null result needs: with the observed paired
+    standard deviation, how many pairs would the pre-specified ``margin``
+    have required, and was the achieved ``n`` enough? It never changes the
+    significance verdict; it only makes underpowered designs visible.
+
+    ``margin <= 0`` means no smallest effect was pre-specified, so the
+    required-n fields stay ``None`` rather than inventing a target from the
+    observed delta.
+    """
+    std, alpha, power = _validate_design_inputs(std, alpha, power)
+    n = _strict_int(n, "n", minimum=2)
+    out = {
+        "paired_sd": std,
+        "n": n,
+        "alpha": float(alpha),
+        "power_target": float(power),
+        # The legacy key promises 95% confidence / 80% power, so it must not
+        # silently become the caller's alpha/power when those are overridden.
+        "minimum_detectable_delta_95_power80": _paired_mde(std, n, 0.05, 0.8),
+        "minimum_detectable_delta": _paired_mde(std, n, alpha, power),
+        "minimum_detectable_alpha": float(alpha),
+        "minimum_detectable_power": float(power),
+        "margin": None,
+        "required_pairs_for_margin": None,
+        "adequately_powered_for_margin": None,
+        "note": ("pass a positive pre-specified margin to compute the pairs "
+                 "needed for that smallest effect of interest"),
+    }
+    if (_is_boolean_value(margin) or margin is None
+            or isinstance(margin, (str, bytes, bytearray))):
+        return out
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError, OverflowError):
+        return out
+    if not math.isfinite(margin) or margin <= 0.0:
+        return out
+    required = paired_required_n(std, margin, alpha=alpha, power=power)
+    out.update({
+        "margin": margin,
+        "required_pairs_for_margin": required,
+        "adequately_powered_for_margin": (
+            None if required is None else bool(n >= required)),
+        "note": ("this design reaches the margin" if required is not None
+                 and n >= required else
+                 "underpowered for the pre-specified margin" if required is not None
+                 else "the margin is not detectable within the search cap"),
+    })
+    return out
+
+
+def tost_paired(
+    a: Sequence[float], b: Sequence[float], margin: float, alpha: float = 0.05
+) -> dict:
+    """Two one-sided paired t-tests (TOST) for *equivalence* within `margin`.
+
+    A non-significant superiority test is **not** evidence that two arms are
+    the same: it only says the design failed to see a difference. Several
+    ablation hypotheses are equivalence claims ("explicit init 1e-5 must
+    coincide with the default", "the two LayerScale settings should match"),
+    so they need a test whose alternative is "the mean paired difference is
+    inside ``+/- margin``":
+
+    * H0: ``|mean(a-b)| >= margin`` (not equivalent);
+    * H1: ``|mean(a-b)| <  margin`` (equivalent).
+
+    This is the intersection-union TOST: reject H0 only when *both* the
+    lower-bound and upper-bound one-sided tests reject, so
+    ``p_tost = max(p_low, p_high)``. The reported interval is the matching
+    ``1 - 2*alpha`` confidence interval (``mean +/- t_{1-alpha,df} * se``); it
+    must lie inside ``[-margin, margin]`` for the equivalence claim. `margin`
+    is a *scientific* smallest effect of interest, not a knob to tune until
+    the result looks equivalent, so it is recorded next to the p-value in
+    every comparison artifact.
+
+    Returns a dict with ``equivalent=None`` (and a ``note``) when the test
+    cannot run: no positive margin, fewer than two paired observations, or a
+    non-finite input. The zero-variance case reduces to a deterministic
+    comparison of ``|mean|`` with `margin`.
+
+    TOST needs ``alpha < 0.5``: its interval is the ``1 - 2*alpha`` one, so a
+    larger alpha would report a non-positive confidence level and a claimed
+    equivalence interval that does not exist.
+    """
+    alpha = _validate_alpha(alpha)
+    if alpha >= 0.5:
+        raise ValueError(
+            f"TOST needs alpha < 0.5 so the 1 - 2*alpha confidence interval "
+            f"is positive, got {alpha!r}")
+    out = {
+        "test": "tost_paired",
+        "margin": None,
+        "alpha": alpha,
+        "equivalent": None,
+        "p_tost": None,
+        "p_low": None,
+        "p_high": None,
+        "mean_delta": None,
+        "ci_low": None,
+        "ci_high": None,
+        "ci_level": None,
+        "n": 0,
+        "df": None,
+        "note": "equivalence not evaluated",
+    }
+    a = _real_values(a, "a")
+    b = _real_values(b, "b")
+    if len(a) != len(b):
+        raise ValueError(f"TOST needs equal lengths, got {len(a)} vs {len(b)}")
+    n = len(a)
+    out["n"] = n
+    margin_value = _as_real(margin)
+    if margin_value is None or not math.isfinite(margin_value) or margin_value <= 0.0:
+        out["note"] = ("equivalence margin must be a positive finite number; "
+                       "pass an explicit scientific margin to enable TOST")
+        return out
+    margin = margin_value
+    out["margin"] = margin
+    if n < 2:
+        out["note"] = "TOST needs at least 2 paired observations"
+        return out
+    mean, std, scaled = _paired_mean_std(a, b)
+    if scaled is None and not math.isfinite(mean):
+        out["note"] = "a non-finite paired difference makes the test undefined"
+        return out
+    df = float(n - 1)
+    if scaled is not None:
+        mean_test, se, ci_scale = scaled[0], scaled[1] / math.sqrt(n), scaled[2]
+        margin_test = margin / max(ci_scale, 1e-10)
+    else:
+        mean_test, se, ci_scale, margin_test = mean, std / math.sqrt(n), 1.0, margin
+    out.update({"mean_delta": mean, "df": df, "ci_level": 1.0 - 2.0 * alpha})
+    if se == 0.0:
+        equivalent = abs(mean_test) < margin_test
+        ci_low = ci_high = mean_test * ci_scale
+        out.update({
+            "p_low": 0.0 if equivalent else 1.0,
+            "p_high": 0.0 if equivalent else 1.0,
+            "p_tost": 0.0 if equivalent else 1.0,
+            "equivalent": bool(equivalent),
+            "ci_low": ci_low,
+            "ci_high": ci_high,
+            "note": ("zero-variance paired differences: equivalence is decided "
+                     "by |mean_delta| < margin"),
+        })
+        return out
+    # In the scaled branch the excess over +/-margin is compared before the
+    # (possibly overflowing) mapping back, so a huge finite difference stays
+    # a definite non-equivalence instead of becoming NaN.
+    # p_low tests H0 `mean <= -margin` against H1 `mean > -margin`;
+    # p_high tests H0 `mean >= +margin` against H1 `mean < +margin`.
+    p_low = 1.0 - student_t_cdf((mean_test + margin_test) / max(se, 1e-10), df)
+    p_high = student_t_cdf((mean_test - margin_test) / max(se, 1e-10), df)
+    p_low = min(1.0, max(0.0, p_low))
+    p_high = min(1.0, max(0.0, p_high))
+    p_tost = max(p_low, p_high)
+    half = -student_t_ppf(alpha, df) * se
+    ci_low = (mean_test - half) * ci_scale
+    ci_high = (mean_test + half) * ci_scale
+    out.update({
+        "p_low": p_low,
+        "p_high": p_high,
+        "p_tost": p_tost,
+        "equivalent": bool(p_tost < alpha),
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "note": ("equivalent" if p_tost < alpha else
+                 "not equivalent at this margin/alpha; this is not evidence of a difference"),
+    })
+    return out
+
+
+def _tost_df(n: int) -> float:
+    """Degrees of freedom for a count that may exceed the float range.
+
+    A huge Python-int pair count is a legitimate (if absurd) design input.
+    Beyond the float range the t distribution is indistinguishable from the
+    normal limit; use an enormous representable df so the existing normal
+    expansion stays in effect instead of crashing on ``float(n - 1)``.
+    """
+    try:
+        return float(n - 1)
+    except OverflowError:
+        return 1.0e300
+
+
+def _tost_inverse_sqrt_n(n: int) -> float:
+    """``1 / sqrt(n)`` for a count that may exceed the float range."""
+    try:
+        return 1.0 / math.sqrt(n)
+    except OverflowError:
+        return math.exp(-0.5 * math.log(n + 1e-8))
+
+
+def _tost_power_at_n(std: float, n: int, margin: float, alpha: float,
+                     true_delta: float = 0.0) -> float:
+    """Approximate power of a paired TOST at ``n`` pairs.
+
+    The TOST rejects only when both one-sided tests clear their
+    ``1 - alpha`` threshold. With a paired difference distributed as
+    ``N(true_delta, std**2)`` and the sample standard deviation treated as
+    fixed at its planning value, the rejection region is
+
+        -margin + c*se < mean < margin - c*se,   c = t_{1-alpha, n-1}
+
+    and the probability of that interval is the difference of two central-t
+    CDF values. This is the standard two-point approximation used by the
+    sample-size helper; it is deliberately a planning calculation, not a
+    post-hoc substitution for the exact TOST p-value.
+    """
+    df = _tost_df(n)
+    try:
+        se = std / math.sqrt(n)
+    except OverflowError:
+        se = std * _tost_inverse_sqrt_n(n)
+    if se == 0.0:
+        return 1.0 if abs(true_delta) < margin else 0.0
+    upper_tail = 1.0 - alpha
+    critical = (student_t_ppf(upper_tail, df) if upper_tail < 1.0
+                else -student_t_ppf(alpha, df))
+    upper = (margin - true_delta) / se - critical
+    lower = (-margin - true_delta) / se + critical
+    power = student_t_cdf(upper, df) - student_t_cdf(lower, df)
+    return min(1.0, max(0.0, power))
+
+
+def tost_power(std: float, n: int, margin: float, alpha: float = 0.05,
+               true_delta: float = 0.0) -> dict:
+    """Approximate power of a paired TOST at the achieved/planned ``n``.
+
+    Equivalence claims need their own design calculation: a superiority
+    power formula evaluated at the equivalence margin answers the wrong
+    question (it powers a test of "the difference exceeds the margin" rather
+    than "the confidence interval lies inside it"). ``true_delta`` is the
+    difference the planning assumes; the default zero is the usual
+    conservative planning value for an equivalence study.
+
+    ``tost_paired`` remains the certifying test. This helper only makes the
+    design's resolution visible before or after the run.
+    """
+    std_value, alpha_value, _ = _validate_design_inputs(std, alpha, 0.5)
+    n = _strict_int(n, "n", minimum=2)
+    margin_value = _validate_margin(margin)
+    true_value = _validate_margin(true_delta, "true_delta")
+    if margin_value <= 0.0:
+        raise ValueError(f"margin must be finite and > 0, got {margin!r}")
+    if alpha_value >= 0.5:
+        raise ValueError(
+            f"TOST needs alpha < 0.5 for a positive 1 - 2*alpha interval, "
+            f"got {alpha!r}")
+    power = _tost_power_at_n(std_value, n, margin_value, alpha_value,
+                             true_value)
+    return {
+        "test": "tost_paired_design",
+        "paired_sd": std_value,
+        "n": n,
+        "df": _tost_df(n),
+        "margin": margin_value,
+        "alpha": alpha_value,
+        "true_delta_assumed": true_value,
+        "approximate_power": power,
+        "note": ("two-point t approximation with the planning SD held fixed; "
+                 "the exact TOST p-value remains the certifying test"),
+    }
+
+
+def tost_required_n(std: float, margin: float, alpha: float = 0.05,
+                    power: float = 0.8, true_delta: float = 0.0,
+                    max_n: int = 100000) -> Optional[int]:
+    """Prospective paired sample size for a TOST equivalence claim.
+
+    Returns the smallest ``n >= 2`` whose approximate TOST power (see
+    ``tost_power``) reaches ``power`` at the planning difference
+    ``true_delta`` (default zero). ``margin`` is the pre-specified
+    equivalence bound, never a value tuned after seeing the observed
+    difference. A planning difference at or beyond the margin is not an
+    equivalence design (the rejection probability tends to zero or to
+    ``alpha`` rather than to one), so ``None`` is returned instead of a huge
+    or misleading n. Zero paired variance needs only the minimum two pairs
+    when the assumed difference is genuinely inside the margin.
+    """
+    std_value, alpha_value, power_value = _validate_design_inputs(
+        std, alpha, power)
+    margin_value = _validate_margin(margin)
+    true_value = _validate_margin(true_delta, "true_delta")
+    max_n = _strict_int(max_n, "max_n", minimum=2)
+    if margin_value <= 0.0:
+        raise ValueError(f"margin must be finite and > 0, got {margin!r}")
+    if alpha_value >= 0.5:
+        raise ValueError(
+            f"TOST needs alpha < 0.5 for a positive 1 - 2*alpha interval, "
+            f"got {alpha!r}")
+    if abs(true_value) >= margin_value:
+        return None
+    if std_value == 0.0:
+        return 2
+    if _tost_power_at_n(std_value, max_n, margin_value, alpha_value,
+                        true_value) < power_value:
+        return None
+    lo, hi = 2, max_n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _tost_power_at_n(std_value, mid, margin_value, alpha_value,
+                            true_value) >= power_value:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def tost_design_summary(std: float, n: int, margin: float,
+                        alpha: float = 0.05, power: float = 0.8,
+                        true_delta: float = 0.0) -> dict:
+    """Prospective TOST design check for one achieved equivalence contrast.
+
+    A non-significant superiority test is not an equivalence result, and a
+    TOST result without its design resolution is equally incomplete. This
+    block reports the approximate power at the achieved ``n``, the pairs the
+    pre-specified margin would have required, and the smallest equivalence
+    margin the current design could certify at the target power. It never
+    changes the TOST verdict in ``tost_paired``.
+    """
+    std_value, alpha_value, power_value = _validate_design_inputs(
+        std, alpha, power)
+    n = _strict_int(n, "n", minimum=2)
+    true_value = _validate_margin(true_delta, "true_delta")
+    out = {
+        "test": "tost_paired_design",
+        "paired_sd": std_value,
+        "n": n,
+        "df": _tost_df(n),
+        "alpha": alpha_value,
+        "power_target": power_value,
+        "true_delta_assumed": true_value,
+        "margin": None,
+        "required_pairs_for_margin": None,
+        "adequately_powered_for_equivalence": None,
+        "approximate_power_at_n": None,
+        "minimum_detectable_equivalence_margin": None,
+        "note": ("pass a positive pre-specified equivalence margin to compute "
+                 "the pairs needed for that bound"),
+    }
+    margin_value = _as_real(margin)
+    if margin_value is None or not math.isfinite(margin_value):
+        raise ValueError(f"margin must be a finite number > 0, got {margin!r}")
+    if margin_value <= 0.0:
+        return out
+    if alpha_value >= 0.5:
+        raise ValueError(
+            f"TOST needs alpha < 0.5 for a positive 1 - 2*alpha interval, "
+            f"got {alpha!r}")
+    out["margin"] = margin_value
+    out["approximate_power_at_n"] = _tost_power_at_n(
+        std_value, n, margin_value, alpha_value, true_value)
+    required = tost_required_n(
+        std_value, margin_value, alpha=alpha_value, power=power_value,
+        true_delta=true_value)
+    out["required_pairs_for_margin"] = required
+    out["adequately_powered_for_equivalence"] = (
+        None if required is None else bool(n >= required))
+    # Smallest margin whose TOST reaches the target power at this n under the
+    # conservative zero-difference planning assumption. When the assumed
+    # difference is nonzero this is a labelled approximation.
+    try:
+        df = _tost_df(n)
+        upper_tail = 1.0 - alpha_value
+        alpha_critical = (student_t_ppf(upper_tail, df)
+                          if upper_tail < 1.0
+                          else -student_t_ppf(alpha_value, df))
+        power_mid = (1.0 + power_value) / 2.0
+        power_critical = (student_t_ppf(power_mid, df)
+                          if power_mid < 1.0
+                          else -student_t_ppf(1.0 - power_mid, df))
+        critical = alpha_critical + power_critical
+        try:
+            detectable = critical * std_value / math.sqrt(n)
+        except OverflowError:
+            detectable = critical * std_value * _tost_inverse_sqrt_n(n)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        detectable = None
+    out["minimum_detectable_equivalence_margin"] = detectable
+    if out["adequately_powered_for_equivalence"]:
+        out["note"] = ("the design reaches the pre-specified equivalence "
+                       "margin at the target power")
+    elif required is not None:
+        out["note"] = ("underpowered for the pre-specified equivalence "
+                       f"margin: {required} pairs needed, {n} available")
+    else:
+        out["note"] = ("the pre-specified equivalence margin is not reachable "
+                       "within the search cap (or the assumed difference is "
+                       "outside the margin)")
+    return out
+
+
+def leave_one_out_jackknife(
+    values: Sequence[float], labels: Optional[Sequence] = None
+) -> dict | None:
+    """How dependent is a sample mean on any single observation?
+
+    With three seeds, one lucky or broken run can carry a delta. Dropping
+    each observation in turn (the leave-one-out jackknife) shows whether the
+    *sign* of the effect is a property of the set or of one point: if removing
+    seed 42 reverses the direction, the claim is not seed-robust even when the
+    full-sample t-test is significant. This is a descriptive robustness check
+    - it never replaces the pre-specified significance test - and it is
+    reported per comparison so a reader can see which seed is influential.
+
+    ``labels`` name the observations (the caller passes seed ids); they must
+    match `values` in length. Returns `None` for an empty input, and
+    ``meaningful=False`` when fewer than three observations make the
+    sign-change test vacuous (dropping one leaves a single point).
+    """
+    vals = _real_values(values)
+    n = len(vals)
+    # Validate the labels even on the early-return paths: a caller that
+    # supplies the wrong number of names has a programming error, and silently
+    # ignoring it for an empty/non-finite input makes the contract depend on
+    # the data value.
+    names = list(range(n)) if labels is None else list(labels)
+    if len(names) != n:
+        raise ValueError(
+            f"jackknife labels need {n} entries, got {len(names)}")
+    if n == 0:
+        return None
+    if any(not math.isfinite(v) for v in vals):
+        return {
+            "n": n,
+            "unit": "observation",
+            "full_mean": None,
+            "sign": None,
+            "meaningful": False,
+            "per_drop": [],
+            "sign_stable": None,
+            "influential_labels": [],
+            "delta_range": None,
+            "max_abs_change": None,
+            "note": "non-finite observation(s); jackknife skipped",
+        }
+    full, _ = _mean_and_std(vals)
+
+    def _sign(x: float) -> str:
+        return "negative" if x < 0.0 else ("positive" if x > 0.0 else "zero")
+
+    full_sign = _sign(full)
+    if n < 2:
+        # Dropping the only observation leaves nothing to average: there is
+        # no jackknife sample, only the point estimate.
+        return {
+            "n": n,
+            "unit": "observation",
+            "full_mean": full,
+            "sign": full_sign,
+            "meaningful": False,
+            "per_drop": [],
+            "sign_stable": None,
+            "influential_labels": [],
+            "delta_range": None,
+            "max_abs_change": None,
+            "note": "a jackknife needs at least 2 observations",
+        }
+    per_drop = []
+    for i in range(n):
+        rest = vals[:i] + vals[i + 1:]
+        mean, _ = _mean_and_std(rest)
+        drop_sign = _sign(mean)
+        if full_sign == "zero":
+            # There is no direction to stabilise; a mean that is exactly zero
+            # is not made "unstable" by any single point, it simply has no
+            # sign claim. Report `sign_stable=None` instead of a misleading
+            # True/False.
+            keeps = True
+        elif full_sign == "negative":
+            keeps = mean < 0.0
+        else:
+            keeps = mean > 0.0
+        per_drop.append({
+            "dropped": names[i],
+            "mean_without": mean,
+            "sign": drop_sign,
+            "keeps_full_sign": bool(keeps),
+        })
+    drop_means = [item["mean_without"] for item in per_drop]
+    influential = [item["dropped"] for item in per_drop
+                   if not item["keeps_full_sign"]]
+    return {
+        "n": n,
+        "unit": "observation",
+        "full_mean": full,
+        "sign": full_sign,
+        "meaningful": n >= 3,
+        "per_drop": per_drop,
+        "sign_stable": (None if full_sign == "zero" else not influential),
+        "influential_labels": influential,
+        "delta_range": [min(drop_means), max(drop_means)],
+        "max_abs_change": max(abs(m - full) for m in drop_means),
+        "note": ("the full-sample mean is zero, so there is no direction to "
+                 "check for stability; the equivalence test is the relevant "
+                 "claim here" if full_sign == "zero" else
+                 "descriptive robustness check; dropping one observation is "
+                 "not an independent replication and never certifies a result"),
+    }
+
+
+def normal_ppf(p: float) -> float:
+    """Standard-normal quantile: the z with P(Z <= z) = p.
+
+    Needed wherever a normal quantile enters a formula that has no
+    closed-form inverse in this dependency-free repository (the p-uniform
+    likelihood, for instance). The value comes from `statistics.NormalDist`,
+    which is part of the standard library, so no extra dependency is added.
+
+    Args:
+        p: target probability in (0, 1).
+
+    Returns:
+        The standard-normal quantile at `p`.
+    """
+    p_value = _as_real(p)
+    if p_value is None or not math.isfinite(p_value) or not 0.0 < p_value < 1.0:
+        raise ValueError(f"normal_ppf needs 0 < p < 1, got {p!r}")
+    return NormalDist().inv_cdf(p_value)
+
+
+def kendall_tau(x: Sequence[float], y: Sequence[float]) -> dict:
+    """Kendall's rank correlation between two samples.
+
+    The funnel-plot diagnostics of a publication-bias audit are rank based:
+    they ask whether the effect size moves with the precision of the study
+    regardless of how the effects are distributed. Kendall's tau is the
+    standard choice for that question and, unlike a Pearson correlation, it
+    is not driven by a single outlying study.
+
+    Both tau-a (which ignores ties and divides by the number of pairs) and
+    tau-b (which corrects for tied ranks in either variable) are reported.
+    The exact null distribution of tau-a is available through
+    `kendall_tau_exact_p`; tau-b needs a tie-corrected approximation, so the
+    caller should read `ties_x`/`ties_y` before choosing a reference
+    distribution.
+
+    Args:
+        x: first sample of real observations.
+        y: second sample, the same length as `x`.
+
+    Returns:
+        A dict with the pair counts, `tau_a`, `tau_b` (None when the tie
+        correction is undefined) and the number of tied pairs.
+    """
+    xs = _real_values(x, "x")
+    ys = _real_values(y, "y")
+    if len(xs) != len(ys):
+        raise ValueError(
+            f"kendall_tau needs two samples of equal length, got {len(xs)} "
+            f"and {len(ys)}")
+    n = len(xs)
+    if n < 2:
+        return {
+            "n": n,
+            "concordant": 0,
+            "discordant": 0,
+            "ties_x": 0,
+            "ties_y": 0,
+            "n_pairs": 0,
+            "tau_a": None,
+            "tau_b": None,
+            "note": "a rank correlation needs at least two observations",
+        }
+    concordant = 0
+    discordant = 0
+    ties_x = 0
+    ties_y = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = xs[i] - xs[j]
+            dy = ys[i] - ys[j]
+            if dx == 0.0:
+                ties_x += 1
+                if dy == 0.0:
+                    ties_y += 1
+            elif dy == 0.0:
+                ties_y += 1
+            elif dx * dy > 0.0:
+                concordant += 1
+            else:
+                discordant += 1
+    n_pairs = n * (n - 1) // 2
+    tau_a = (concordant - discordant) / max(n_pairs, 1e-10)
+    denominator = math.sqrt((n_pairs - ties_x) * (n_pairs - ties_y))
+    tau_b = ((concordant - discordant) / max(denominator, 1)
+             if denominator > 0.0 else None)
+    return {
+        "n": n,
+        "concordant": concordant,
+        "discordant": discordant,
+        "ties_x": ties_x,
+        "ties_y": ties_y,
+        "n_pairs": n_pairs,
+        "tau_a": tau_a,
+        "tau_b": tau_b,
+        "note": None,
+    }
+
+
+def _inversion_count_distribution(n: int) -> list[int]:
+    """Counts of permutations of `n` items by their number of inversions.
+
+    Inserting the k-th item into a permutation of k-1 items adds any number
+    of inversions from 0 to k-1, so the distribution is the product of the
+    polynomials ``1 + x + ... + x^(k-1)``. The dynamic program below builds
+    that product one factor at a time and keeps the counts exact (they are
+    integers, not floats), which is what makes the Kendall null distribution
+    exact rather than a normal approximation.
+    """
+    counts = [1]
+    for k in range(1, n + 1):
+        updated = [0] * (len(counts) + k - 1)
+        for index, count in enumerate(counts):
+            for added in range(k):
+                updated[index + added] += count
+        counts = updated
+    return counts
+
+
+def kendall_tau_exact_p(tau_a: float, n: int) -> Optional[float]:
+    """Exact two-sided null p-value of Kendall's tau-a.
+
+    Under the null of independence the ranks are a uniformly random
+    permutation, so the number of discordant pairs follows the Mahonian
+    (inversion-count) distribution. Enumerating that distribution gives the
+    exact two-sided p-value for any observed tau-a, with no normality
+    assumption and no asymptotic approximation. For the handful of studies a
+    publication-bias audit sees, the normal approximation to Kendall's tau is
+    noticeably anti-conservative, so the exact distribution is the reference
+    used here.
+
+    The two-sided p-value is the probability of a discordant-pair count at
+    least as extreme as the observed one in either direction. When the two
+    tails overlap (an observed tau of zero, for instance) the overlap is
+    subtracted so the result never exceeds one.
+
+    Args:
+        tau_a: the observed Kendall tau-a, in [-1, 1].
+        n: number of paired observations.
+
+    Returns:
+        The exact two-sided p-value, or None when `n` is too large for the
+        exact enumeration (the caller then uses an approximation).
+    """
+    n_value = _strict_int(n, "n", minimum=2)
+    if n_value > _RANDOMIZATION_EXACT_MAX:
+        return None
+    value = _as_real(tau_a)
+    if value is None or not math.isfinite(value):
+        raise ValueError("kendall_tau_exact_p needs a finite tau")
+    n_pairs = n_value * (n_value - 1) // 2
+    magnitude = min(1.0, abs(value))
+    low_count = math.floor((1.0 - magnitude) * n_pairs / 2.0 + 1e-9)
+    high_count = math.ceil((1.0 + magnitude) * n_pairs / 2.0 - 1e-9)
+    counts = _inversion_count_distribution(n_value)
+    total = sum(counts)
+    lower = sum(counts[:low_count + 1])
+    upper = sum(counts[high_count:])
+    overlap = (sum(counts[high_count:low_count + 1])
+               if high_count <= low_count else 0)
+    p_value = (lower + upper - overlap) / (total + 1e-8)
+    return min(1.0, max(0.0, p_value))
+
+

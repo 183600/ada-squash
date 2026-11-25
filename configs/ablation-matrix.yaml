@@ -1,0 +1,438 @@
+# Ablation matrix. Every row is a controlled comparison and must state the
+# scientific hypothesis it tests (`hypothesis:`); the runner refuses rows
+# without one. The two *_baseline rows are the simple statistic-based
+# references every DyT-family row is scored against (see the
+# `baseline_comparison` block the runner writes next to all_summaries.json).
+#
+# Every row runs under the identical optimizer/schedule/data recipe above;
+# rows may only set architectural / initialization knobs and the loader
+# rejects any row that tries to change lr, weight_decay, batch_size, ...
+# `python3 scripts/ablation.py --config configs/ablation-matrix.yaml
+# --check-matrix` additionally validates both 2x2 factorials (the main
+# softsign arm and the tanh control), the leave-one-out set, and the
+# independent QK-compression triple on every host norm.
+# Each row is replicated over `seeds` (>= 3) and reported as mean +/- std
+# across seeds, so a claim is not built on a single lucky run.
+model: gpt2-124m
+
+batch_size: 8
+seq_len: 512
+max_steps: 1000
+lr: 6.0e-4
+weight_decay: 0.1
+seeds: [42, 43, 44]
+
+log_every: 50
+stats_every: 200
+output_dir: runs/ablation
+
+ablations:
+
+  # --- Simple baselines: the strawman bar every variant must clear ---
+  - name: ln_baseline
+    norm: ln
+    hypothesis: >
+      Reference baseline: LayerNorm on the identical protocol. The DyT family
+      must beat this plain statistical normalization before its extra
+      machinery can be claimed to help.
+  - name: rmsnorm_baseline
+    norm: rmsnorm
+    hypothesis: >
+      Reference baseline: RMSNorm, the strongest simple no-mean
+      normalization in modern LLMs. A variant is only meaningfully better if
+      it also beats the *best* of the two baselines, not just the weaker one.
+
+  # --- Axis isolation: per-channel ---
+  - name: dyt_no_perchannel
+    norm: dyt
+    hypothesis: >
+      Original DyT (one scalar alpha, tanh) matches or beats the
+      LayerNorm/RMSNorm references at this scale, reproducing the paper
+      claim under our protocol.
+  - name: dytc_perchannel_tanh_k0
+    norm: dytcd_tanh
+    k_init: 0.0
+    learnable_k: false
+    hypothesis: >
+      Cross-activation per-channel isolation at flat depth: against
+      dytd_k0_no_depth_schedule this row changes exactly norm_name, keeping
+      frozen k=0, tanh, gamma/beta and LayerScale identical. A lower loss
+      here attributes the per-channel factor under tanh without the
+      activation-family change that confounds dytc_p2_softsign against scalar
+      tanh DyT.
+  - name: dytcd_full
+    norm: dytcd
+    hypothesis: >
+      Combining the per-channel and depth axes beats both single-axis
+      variants under the same protocol. The leave-one-out contrasts, not this
+      row's point estimate alone, identify which component is load-bearing;
+      no positive-interaction claim is made without a 2x2 factorial.
+  - name: dytcd_no_perchannel
+    norm: dytcd
+    learnable_delta: false
+    hypothesis: >
+      Leave-one-out for the main proposal's per-channel axis: delta is a
+      frozen zero buffer, so alpha_c == alpha_l exactly while the depth
+      schedule, the softsign family and the LayerScale residual stay
+      identical to dytcd_full. A loss increase here is attributable to the
+      per-channel deviation alone (the dytd_full row changes tanh -> softsign
+      as well and cannot isolate this axis).
+  - name: dytd_full
+    norm: dytd
+    hypothesis: >
+      Depth-axis reference: depth-conditioned tanh (plus LayerScale) against
+      the softsign family, run on the identical protocol so the dytd_full ->
+      dytcd_full bundle (activation family + per-channel axis) can be read
+      alongside the clean per-channel and activation-family contrasts above.
+  - name: dytcd_no_softsign
+    norm: dytcd_tanh
+    hypothesis: >
+      Leave-one-out for the main proposal's activation family: the
+      plain-autograd dytcd_tanh comparator (not part of the fused-kernel
+      family) keeps the per-channel x depth alpha with learnable delta, the
+      LayerScale residual and gamma/beta identical to dytcd_full and swaps
+      only the generalized softsign for tanh, so a loss increase here is
+      attributable to the activation family alone. This closes the gap the
+      dytd_full row leaves open, where the activation-family change is
+      bundled with the removal of the per-channel axis.
+  - name: dytcd_fixed_p
+    norm: dytcd
+    p_init: 2.0
+    learnable_p: false
+    hypothesis: >
+      Leave-one-out for the learnable saturation exponent of the main
+      proposal: with p frozen at its init (2.0, written explicitly so only
+      `learnable_p` differs from dytcd_full) every other mechanism stays
+      identical, so a loss increase here is attributable to the per-layer
+      adaptation of the softsign steepness alone.
+
+  # --- Axis isolation: depth conditioning ---
+  - name: dytcd_k0_no_depth_schedule
+    norm: dytcd
+    k_init: 0.0
+    learnable_k: false
+    hypothesis: >
+      Leave-one-out for the main proposal's depth axis: removing the depth
+      schedule from DyT-CD (k pinned at 0 and frozen; per-channel axis,
+      softsign and LayerScale kept) erases its advantage over the
+      single-axis and baseline rows, which would attribute the full model's
+      gain to depth decay.
+  - name: dytd_k0_no_depth_schedule
+    norm: dytd
+    k_init: 0.0
+    learnable_k: false
+    hypothesis: >
+      Depth decay is the source of DyT-D's gain: with k pinned at 0 and
+      frozen the advantage of dytd_full over scalar DyT should vanish.
+  - name: dytd_tanh_k0
+    norm: dytd_tanh
+    k_init: 0.0
+    learnable_k: false
+    hypothesis: >
+      Plain-autograd DyT-D at flat depth (k=0 frozen): the "neither" cell of
+      the clean per-channel x depth tanh factorial, matching
+      dytc_perchannel_tanh_k0 in implementation (both plain autograd).
+  - name: dytd_tanh_full
+    norm: dytd_tanh
+    hypothesis: >
+      Plain-autograd DyT-D with depth schedule: the "depth" cell of the clean
+      per-channel x depth tanh factorial, matching dytcd_no_softsign in
+      implementation (both plain autograd).
+  - name: dytcd_no_perchannel_no_depth
+    norm: dytcd
+    learnable_delta: false
+    k_init: 0.0
+    learnable_k: false
+    hypothesis: >
+      DyT-CD with per-channel off (delta frozen) and depth off (k=0 frozen):
+      the "neither" cell of the softsign arm in the 2x2x2 factorial.
+
+  # --- LayerScale residual gate ---
+  - name: dytcd_no_ls
+    norm: dytcd
+    use_layerscale: false
+    hypothesis: >
+      The LayerScale residual gate contributes to DyT-CD: removing it hurts
+      held-out loss.
+  - name: dytcd_ls1e5
+    norm: dytcd
+    layerscale_init: 1.0e-5
+    hypothesis: >
+      The default LayerScale init 1e-5 is a competitive residual-gate scale,
+      not an arbitrary strawman - explicit-vs-default rows must coincide.
+  - name: dytcd_ls1e3
+    norm: dytcd
+    layerscale_init: 1.0e-3
+    hypothesis: >
+      A larger LayerScale init (1e-3) changes early residual growth; the
+      default should not be beaten by it on this synthetic corpus.
+
+  # --- Attention logits axis: DyT-QK (Variant C) ---
+  - name: ln_qk
+    norm: ln
+    qk_norm: dytqk
+    hypothesis: >
+      Attention-logits axis, standalone on LayerNorm baseline: adding the
+      tanh Q/K scalar squashing to LayerNorm changes exactly qk_norm, so a
+      held-out-loss reduction is attributable to the QK squashing alone
+      rather than to an interaction with the DyT-CD stack. Mirrors rmsnorm_qk
+      for the other simple baseline.
+  - name: rmsnorm_qk
+    norm: rmsnorm
+    qk_norm: dytqk
+    hypothesis: >
+      Attention-logits axis, standalone: adding the tanh Q/K scalar
+      squashing to the strongest simple baseline (RMSNorm) changes exactly
+      qk_norm, so a held-out-loss reduction is attributable to the QK
+      squashing alone rather than to an interaction with the DyT-CD stack.
+      The mechanism bounds every pre-dot-product q/k coordinate to (-1, 1).
+  - name: ln_qknorm
+    norm: ln
+    qk_norm: qknorm
+    hypothesis: >
+      QK-Norm comparator on LayerNorm baseline: per-head RMSNorm on Q/K is
+      the standard alternative the DyT-QK variant claims to sharpen, run on
+      the identical protocol so a dytqk win on LayerNorm is only credited if
+      it also beats this comparator.
+  - name: rmsnorm_qknorm
+    norm: rmsnorm
+    qk_norm: qknorm
+    hypothesis: >
+      QK-Norm comparator on RMSNorm baseline: per-head RMSNorm on Q/K is the
+      standard alternative the DyT-QK variant claims to sharpen, run on the
+      identical protocol so a dytqk win on RMSNorm is only credited if it
+      also beats this comparator.
+  - name: dytcd_qk
+    norm: dytcd
+    qk_norm: dytqk
+    hypothesis: >
+      Leave-one-out for the attention-logits axis of the proposal (DyT-QK,
+      Variant C) in combination: with the norm stack, optimizer, data and
+      qk_alpha_init (shared default 1.0) identical to dytcd_full, the only
+      effective difference is qk_norm = dytqk, so the paired Full-minus-QK
+      contrast attributes any held-out-loss change to the tanh Q/K
+      squashing alone. At seq_len=512 the effect may be small; a
+      non-significant delta is reported as such rather than dropped.
+  - name: dytcd_qknorm
+    norm: dytcd
+    qk_norm: qknorm
+    hypothesis: >
+      QK-Norm comparator for the attention-logits axis: per-head RMSNorm on
+      Q/K is the standard alternative the DyT-QK variant claims to sharpen,
+      run on the identical protocol so a dytcd_qk win is only credited if it
+      also beats this comparator, not just the no-QK row.
+
+  # --- Softsign family (saturation sharpness p) ---
+  # Single variable: p, under dytc, LayerScale off.
+  - name: dytc_p1_softsign
+    norm: dytc
+    p_init: 1.0
+    learnable_p: false
+    alpha_jitter: 0.0
+    use_layerscale: false
+    hypothesis: >
+      Softsign sharpness matters: p=1 (classic softsign) is worse than p=2
+      on this outlier-heavy corpus.
+  - name: dytc_p2_softsign
+    norm: dytc
+    p_init: 2.0
+    learnable_p: false
+    alpha_jitter: 0.0
+    use_layerscale: false
+    hypothesis: >
+      p=2 (smooth softsign) is the best fixed saturation exponent of
+      {1, 2, 4}: enough outlier compression without gradient starvation.
+  - name: dytc_p4_softsign
+    norm: dytc
+    p_init: 4.0
+    learnable_p: false
+    alpha_jitter: 0.0
+    use_layerscale: false
+    hypothesis: >
+      p=4 saturates harder than p=2; the hypothesis is that this hurts
+      gradient flow through large activations and loses to p=2.
+  - name: dytc_plearnable
+    norm: dytc
+    p_init: 2.0
+    learnable_p: true
+    alpha_jitter: 0.0
+    use_layerscale: false
+    hypothesis: >
+      A learnable p adapts the saturation steepness per layer and beats
+      every fixed p in the sweep (otherwise fixing p is the simpler, better
+      design).
+  - name: dytc_hardtanh_eq
+    norm: dytc
+    p_init: 64.0
+    learnable_p: false
+    alpha_jitter: 0.0
+    use_layerscale: false
+    hypothesis: >
+      The p -> infinity limit (hard tanh) starves gradients outside [-1, 1]
+      and loses to finite p.
+
+  # --- DyT alpha initialization (never compare at an untuned init) ---
+  - name: dyt_alpha_0.3
+    norm: dyt
+    alpha_init: 0.3
+    hypothesis: >
+      DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best
+      must be reported so the family is not compared at a strawman init.
+  - name: dyt_alpha_0.5
+    norm: dyt
+    alpha_init: 0.5
+    hypothesis: >
+      DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best
+      must be reported so the family is not compared at a strawman init.
+  - name: dyt_alpha_1.0
+    norm: dyt
+    alpha_init: 1.0
+    hypothesis: >
+      DyT alpha init in {0.3, 0.5, 1.0} materially changes the run; the best
+      must be reported so the family is not compared at a strawman init.
+
+  # --- Reference single-variable factorial / depth-control rows ---
+  - name: ln
+    hypothesis: >
+      LayerNorm without LayerScale: the simple statistical baseline with the residual gate off.
+    norm: ln
+    use_layerscale: false
+
+  - name: ln_ls
+    hypothesis: >
+      LayerNorm plus LayerScale: ln -> ln_ls isolates the residual gate under the same normalization.
+    norm: ln
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: rmsnorm
+    hypothesis: >
+      RMSNorm without LayerScale: the strongest simple no-mean baseline with the residual gate off.
+    norm: rmsnorm
+    use_layerscale: false
+
+  - name: rmsnorm_ls
+    hypothesis: >
+      RMSNorm plus LayerScale: rmsnorm -> rmsnorm_ls isolates the residual gate under the same normalization.
+    norm: rmsnorm
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  # ---- Activation family x per-channel factorial (LayerScale OFF) ----
+  # {scalar, per-channel} alpha x {tanh, softsign}: the four cells of the
+  # 2x2. All four share alpha_init=0.5, jitter=0, p=2 (fixed) so the only
+  # moving parts are the two axes.
+
+  - name: dyt
+    hypothesis: >
+      Scalar-alpha tanh DyT without LayerScale: the scalar-tanh reference cell of the activation x per-channel factorial.
+    norm: dyt
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: false
+    use_layerscale: false
+
+  - name: dyts
+    hypothesis: >
+      Scalar-alpha generalized softsign without LayerScale: dyt -> dyts isolates the activation family at fixed scalar alpha.
+    norm: dyts
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: false
+    use_layerscale: false
+
+  - name: dytp
+    hypothesis: >
+      Per-channel-alpha tanh without LayerScale: dyt -> dytp isolates the per-channel axis under the tanh family.
+    norm: dytp
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: false
+    use_layerscale: false
+
+  - name: dytc
+    hypothesis: >
+      Per-channel-alpha generalized softsign without LayerScale: completes the scalar/per-channel x tanh/softsign 2x2 with single-variable contrasts.
+    norm: dytc
+    alpha_init: 0.5
+    alpha_jitter: 0.0
+    p_init: 2.0
+    learnable_p: false
+    use_layerscale: false
+
+  - name: dyt_ls
+    hypothesis: >
+      Plain DyT plus LayerScale: the LS-matched scalar-tanh reference for the depth-conditioned rows.
+    norm: dyt
+    alpha_init: 0.5
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytd
+    hypothesis: >
+      Depth-conditioned tanh plus LayerScale: dyt_ls -> dytd adds the (alpha_0, k) depth reparameterization at matched LayerScale.
+    norm: dytd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytdi
+    hypothesis: >
+      Depth-initialized but freely learned per-layer alpha: dytd -> dytdi isolates the init prior from the depth-decay reparameterization.
+    norm: dytdi
+    alpha_0: 0.9
+    k_init: 1.0
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytd_shared
+    hypothesis: >
+      One shared (alpha_0, k) pair for every layer: dytd -> dytd_shared isolates a genuine identifiable cross-layer depth law.
+    norm: dytd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    shared_depth_schedule: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytc_ls
+    hypothesis: >
+      Per-channel softsign plus LayerScale: the LS-matched reference for the main DyT-CD proposal.
+    norm: dytc
+    alpha_init: 0.5
+    p_init: 2.0
+    learnable_p: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytcd
+    hypothesis: >
+      Per-channel softsign plus depth schedule and LayerScale: dytc_ls -> dytcd isolates the depth reparameterization.
+    norm: dytcd
+    alpha_0: 0.9
+    k_init: 1.0
+    k_min: 0.0
+    learnable_k: true
+    p_init: 2.0
+    learnable_p: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
+
+  - name: dytcdi
+    hypothesis: >
+      Per-channel softsign with depth-initialized but freely learned alpha: dytcd -> dytcdi isolates the depth reparameterization from the init prior.
+    norm: dytcdi
+    alpha_0: 0.9
+    k_init: 1.0
+    p_init: 2.0
+    learnable_p: true
+    use_layerscale: true
+    layerscale_init: 1.0e-5
