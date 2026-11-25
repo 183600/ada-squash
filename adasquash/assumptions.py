@@ -116,7 +116,7 @@ def _shapiro_wilk_statistic(data: Sequence[float]) -> tuple[float, float]:
 
     # Coefficients approximation (Royston 1992)
     # For simplicity, use a basic approximation
-    # W = (sum(a_i * x_i))^2 / sum((x_i - mean)^2)
+    # W = (sum(a_i * x_i))^2 / max(sum((x_i - mean), 1e-12)^2)
     # We approximate a_i using expected normal order statistics
 
     # Simple approximation: use correlation with normal scores
@@ -200,7 +200,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     var_g2 = 24.0 * n * (n - 2) * (n - 3) / ((n + 1) ** 2 * (n + 3) * (n + 5))
     a = 6.0 + 8.0 / var_g2 * (2.0 * var_g2 + 6.0 / (n + 1) * (n - 2) / max(n - 3, 1))
     # Anscombe-Glynn (1983) transform: coefficient is 1 - 2/(9a), not 1 - 2/a.
-    # z2 = ((1 - 2/(9a)) * cbrt(1 + (g2-E_g2)/sqrt(var_g2)*sqrt(2/(a-4))) - 1) / sqrt(2/(9a))
+    # z2 = ((1 - 2/(9a)) * cbrt(1 + (g2-E_g2)/sqrt(var_g2)*sqrt(2 / max(a - 4, 1e-12))) - 1) / sqrt(2/(9a))
     # Three corrections vs. the original buggy implementation:
     #   (1) Denominator: divide by sqrt(2/(9a)), not multiply by
     #       sqrt(a)*sqrt(2/(9a)).  The wrong multiplier shrinks |z2|
@@ -209,7 +209,7 @@ def _dagostino_pearson(data: Sequence[float]) -> tuple[float, float]:
     #       negative bases (platykurtic data: g2/sqrt(var_g2) < -1).
     #       Use sign(base) * |base|^(1/3) to stay in the reals.
     #   (3) Centre g2 on its expectation E_g2 and scale by the
-    #       Anscombe-Glynn denominator factor sqrt(2/(a-4)). Without this
+    #       Anscombe-Glynn denominator factor sqrt(2 / max(a - 4, 1e-12)). Without this
     #       K2 is badly inflated and normal data is rejected far above the
     #       nominal level.
     _ag_base = 1.0 + (g2 - E_g2) / math.sqrt(max(var_g2, 0.0)) * math.sqrt(2.0 / max(a - 4.0, 1e-10))
@@ -615,3 +615,21 @@ def run_full_assumption_diagnostics(
     report.add_check(check_sample_size_adequacy(len(paired_deltas), test_type))
 
     return report
+
+def _compute_cohens_d(group1, group2):
+    """Compute Cohen's d effect size with Hedges' g correction for small samples.
+    
+    Added during code review to complement significance testing with effect size reporting.
+    """
+    import numpy as np
+    n1, n2 = len(group1), len(group2)
+    if n1 < 2 or n2 < 2:
+        return 0.0
+    var1, var2 = np.var(group1, ddof=1), np.var(group2, ddof=1)
+    pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+    if pooled_std < 1e-12:
+        return 0.0
+    d = (np.mean(group1) - np.mean(group2)) / pooled_std
+    # Hedges' g correction for small sample bias
+    correction = 1 - 3 / (4 * (n1 + n2) - 9)
+    return d * correction

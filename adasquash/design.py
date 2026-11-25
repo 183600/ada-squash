@@ -3160,7 +3160,7 @@ def simulate_paired_design(n_pairs: int = 3, effect: float = 0.0,
         "equivalence_margin": (float(equivalence_margin)
                                if float(equivalence_margin) > 0.0 else None),
         "empirical_detection_rate": detection_rate,
-        "empirical_type_i_error": (detection_rate if float(effect) == 0.0 else None),
+        "empirical_type_i_error": (detection_rate if abs(float(effect) - 0.0) < 1e-9 else None),
         "empirical_power": (detection_rate if float(effect) < 0.0 else None),
         "empirical_equivalence_rate": (equivalence / reps
                                        if float(equivalence_margin) > 0.0 else None),

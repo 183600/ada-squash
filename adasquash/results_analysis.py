@@ -817,7 +817,7 @@ def assumption_checks(
         out["qq_correlation"] = r
 
     # Shapiro-Wilk W statistic (approximate for small n)
-    # W = (sum(a_i * x_(i)))^2 / sum((x_i - xbar)^2)
+    # W = (sum(a_i * x_(i)))^2 / max(sum((x_i - xbar), 1e-12)^2)
     # Use pre-tabulated coefficients approximation
     # For simplicity, use the correlation squared as an approximation
     w_approx = r * r

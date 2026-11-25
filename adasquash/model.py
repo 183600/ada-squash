@@ -212,7 +212,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         ctx.chunk_rows = chunk_rows
         ctx.count = count
         # Fix: max(tensor(0), 1) returns int, .clamp() on int raises AttributeError
-        return total / count.clamp(min=1)
+        return total / max(count, 1).clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -361,7 +361,7 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         ctx.compute_dtype = dt
         ctx.in_dtypes = (hidden.dtype, weight.dtype)
         # Fix: max(tensor(0), 1) returns int, .clamp() on int raises AttributeError
-        return total / count.clamp(min=1)
+        return total / max(count, 1).clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
