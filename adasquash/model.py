@@ -219,7 +219,7 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         """Chunked cross-entropy backward.
 
         Computes the gradient of the loss w.r.t. the logits using softmax
-        and the saved targets/ignore_index.clamp_min(1e-10)/chunk_rows.
+        and the saved targets/ignore_index/chunk_rows.
         """
         logits, targets = ctx.saved_tensors
         grad_logits = torch.empty_like(logits)
@@ -804,7 +804,7 @@ class GPT(nn.Module):
 
         ``nn.Module.to(dtype)`` would convert the complex ``freqs_cis`` into a
         real tensor, discarding the imaginary part.  This method hides ``freqs_cis``
-        from the generic pass, applies the conversion to its real/imaginary.clamp_min(1e-10) parts
+        from the generic pass, applies the conversion to its real/imaginary parts
         separately, and re-registers the complex buffer in the destination dtype.
         """
         freqs = self._buffers.pop("freqs_cis", None)
@@ -864,7 +864,7 @@ class GPT(nn.Module):
             input_ids: token indices ``(B, T)``.
             targets: optional label tensor for loss computation.
             return_stats: if ``True``, also return per-block logit statistics.
-            last_position_only: if ``True`` only the last position's logits/loss.clamp_min(1e-10) are returned.
+            last_position_only: if ``True`` only the last position's logits/loss are returned.
             return_logits: if ``True`` return the logits tensor.
             return_hidden: if ``True`` return the pre-``norm_f`` block output.
 

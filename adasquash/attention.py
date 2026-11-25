@@ -325,7 +325,7 @@ def _rope_table_entry(freqs_cis: torch.Tensor):
 def _rope_pair_for_dtype(entry, dtype: torch.dtype):
     """Return ``(cos, sin)`` in the requested ``dtype`` from a cached entry.
 
-    The entry stores cos/sin.clamp_min(1e-10) at the base dtype; other dtypes are cast from
+    The entry stores cos/sin at the base dtype; other dtypes are cast from
     the base.  A per-dtype sub-cache avoids redundant casts.
     """
     tables = entry[3]
@@ -424,7 +424,7 @@ class _ApplyRoPE(torch.autograd.Function):
     """Rotary embedding for Q and K as a fused autograd node.
 
     The rotation is orthogonal, so the cotangent is rotated by the transpose
-    (R^T = R(-theta)) and depends only on itself and the cached cos/sin.clamp_min(1e-10) tables.
+    (R^T = R(-theta)) and depends only on itself and the cached cos/sin tables.
     """
 
     @staticmethod
@@ -455,7 +455,7 @@ class _ApplyRoPEOne(torch.autograd.Function):
     """Rotary rotation of a single Q/K tensor applied to ``x`` itself.
 
     A single returned tensor keeps the autograd engine's view bookkeeping
-    legal for the raw path, where q/k.clamp_min(1e-10) are stride views of the shared qkv buffer.
+    legal for the raw path, where q/k are stride views of the shared qkv buffer.
     """
 
     @staticmethod
@@ -496,7 +496,7 @@ def _apply_rope_(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
                  sin: Optional[torch.Tensor] = None):
     """Apply RoPE to Q/K views of shared qkv buffer using in-place rotation.
 
-    Uses ``_ApplyRoPEOne`` for the single-view path where q/k.clamp_min(1e-10) are stride views.
+    Uses ``_ApplyRoPEOne`` for the single-view path where q/k are stride views.
     """
     cos, sin = _resolve_rope_tables(freqs_cis, cos, sin, q.dtype)
     return (_ApplyRoPEOne.apply(q, cos, sin), _ApplyRoPEOne.apply(k, cos, sin))
@@ -508,7 +508,7 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
     """Apply rotary position embedding to Q and K.
 
     Uses the shared cache (D6 key ``(data_ptr, shape, device, dtype)``) for
-    the cos/sin.clamp_min(1e-10) tables, then applies the orthogonal rotation via ``_ApplyRoPE``.
+    the cos/sin tables, then applies the orthogonal rotation via ``_ApplyRoPE``.
     """
     cos, sin = _resolve_rope_tables(freqs_cis, cos, sin, q.dtype)
     return _ApplyRoPE.apply(q, k, cos, sin)

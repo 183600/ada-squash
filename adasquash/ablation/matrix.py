@@ -485,7 +485,7 @@ def _effective_cfg(model_name: str, cfg_kwargs: dict) -> dict:
 def effective_config_key(model_name: str, cfg_kwargs: dict, seed: int | None=None) -> str:
     """Canonical identity of the model a matrix row trains.
 
-    Rows may spell out builder/GPTConfig.clamp_min(1e-10) defaults explicitly (e.g.
+    Rows may spell out builder/GPTConfig defaults explicitly (e.g.
     ``layerscale_init: 1.0e-5`` or ``alpha_init: 0.5``); two rows with equal
     keys build the exact same GPTConfig and, under the same seed, produce
     bit-identical runs. The runner trains the first and reuses its summary

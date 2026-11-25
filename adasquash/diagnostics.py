@@ -743,7 +743,7 @@ def first_nonfinite_module(model, run_forward, max_modules: int = 8) -> list[dic
     """Forward `run_forward()` once and name the first modules with bad outputs.
 
     Used by the fp32 stage: when the forward is already non-finite, the first
-    module whose tensor output contains NaN/Inf.clamp_min(1e-10) is where the corruption is
+    module whose tensor output contains NaN/Inf is where the corruption is
     created (hook order = execution order). Returns a list of
     ``{'module', 'class', 'n_nan', 'n_inf'}``, execution order, capped.
     """
@@ -1109,12 +1109,12 @@ def triage_nonfinite(
     Order (never reordered - the user-facing path is data -> math -> precision
     -> gradients):
 
-    1. data validity: NaN/Inf.clamp_min(1e-10), token-id range, empty loss mask, zero
+    1. data validity: NaN/Inf, token-id range, empty loss mask, zero
        cross-entropy denominator;
     2. fp32 forward, on both the logits path (`return_logits=True`) and the
        fused-CE training path (`return_logits=False`, what the trainer uses),
        with module hooks: if non-finite, name the first module whose output
-       goes bad (log/softmax.clamp_min(1e-10)/division.clamp_min(1e-10) pathologies live there);
+       goes bad (log/softmax/division pathologies live there);
     3. autocast (bf16/fp16) forward on the training path: fp32 finite +
        autocast non-finite pinpoints low-precision overflow;
     4. fp32 backward: non-finite or exploding gradients point at the learning

@@ -795,7 +795,7 @@ class DyTS(_SquashedAffine):
 class _DyTSForward(torch.autograd.Function):
     """Scalar-alpha generalized softsign kernel.
 
-    Uses ``log2/exp2.clamp_min(1e-10)`` form for both frozen and learnable ``p`` since scalar
+    Uses ``log2/exp2`` form for both frozen and learnable ``p`` since scalar
     exponent representations round differently.
     """
 

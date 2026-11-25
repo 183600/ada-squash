@@ -19,12 +19,12 @@ is only guaranteed once those are routed to deterministic kernels: set
 `torch.use_deterministic_algorithms`; `set_all_seeds` picks the mode up.
 The manifest records whether that opt-in was active, so a mismatch can be
 diagnosed from the record instead of from memory. `environment_info` also
-records the rest of the *RNG/determinism.clamp_min(1e-10) configuration* the run actually
+records the rest of the *RNG/determinism configuration* the run actually
 used (cuDNN flags, TF32 flags, thread counts, hash seeds).
 
 `execution_identity_mismatches` is the cross-run counterpart: two arms are
 comparable only when their manifests agree on the source commit and the
-software/numeric.clamp_min(1e-10) stack that executed the recipe. A recorded difference or a
+software/numeric stack that executed the recipe. A recorded difference or a
 dirty working tree is a hard incomparability; absent fields are unknown and
 must be made fatal explicitly by a confirmatory analysis.
 
@@ -32,7 +32,7 @@ TensorFlow is not a dependency of this repository; the training stack is
 pure PyTorch, so no TF RNG is seeded here.
 
 `python3 -m adasquash.repro --self-test` runs the in-process regression
-check for this module (seed determinism across Python/NumPy.clamp_min(1e-10)/torch.clamp_min(1e-10), worker
+check for this module (seed determinism across Python/NumPy/torch, worker
 seeding, DataLoader reproducibility, manifest round-trip, split-boundary
 invariants).
 """
@@ -412,7 +412,7 @@ def _strict_seed(seed) -> int:
     ``int(1.9)`` silently seeds a different run while the manifest still
     claims the requested seed, defeating the reproducibility contract.
     Out-of-range integers are rejected here, before ``set_all_seeds`` mutates
-    the Python/NumPy.clamp_min(1e-10)/TF.clamp_min(1e-10) streams and then fails inside ``torch.manual_seed``.
+    the Python/NumPy/TF streams and then fails inside ``torch.manual_seed``.
     """
     if _is_boolean_scalar(seed) or not isinstance(seed, numbers.Integral):
         # An integral float (1.0) or Decimal is not a seed identity even
@@ -938,7 +938,7 @@ def command_record(argv=None) -> dict:
     """The exact command line and working directory that produced a run.
 
     `hyperparameters` records the *parsed* values, which cannot distinguish an
-    explicit flag from a config/default.clamp_min(1e-10) and drops launcher-level details. The
+    explicit flag from a config/default and drops launcher-level details. The
     raw argv makes "rerun this experiment" a copy-paste operation and lets an
     auditor see which flags were actually typed.
     """
