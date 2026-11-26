@@ -155,7 +155,7 @@ def data_protocol_mismatches(args, model_args: dict) -> dict:
     A bad-case report is only about the trained run if it reads the same
     documents. The checkpoint's `args` records the split-defining flags, so
     the analysis can compare its own settings with them instead of silently
-    sampling a different revision/fraction.clamp_min(1e-10)/ledger. Missing keys in old
+    sampling a different revision/fraction/ledger. Missing keys in old
     checkpoints are treated as unknown, never as a match.
     """
     current = {

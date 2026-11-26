@@ -615,7 +615,7 @@ def test_dytcd_trains_alpha0_and_k_when_x_and_delta_are_frozen():
     """`alpha_0` / `k` must receive gradients on their own merit.
 
     The backward used to compute the alpha chain only inside
-    `needs_input_grad[delta]`, and gated `need_softsign` on x/delta.clamp_min(1e-10) alone, so
+    `needs_input_grad[delta]`, and gated `need_softsign` on x/delta alone, so
     a run that freezes the input and `delta` (e.g. probing the depth schedule
     with the delta term ablated) silently got `None` gradients for `alpha_0`
     and `k` - the depth schedule would never train, with no error to say why.
@@ -667,7 +667,7 @@ def test_softsign_exponent_floor_keeps_a_runaway_p_finite(p):
 
     `phi_p` is only a finite family member for `p > 0`: as `p -> 0+` it
     collapses to 0 (a dead layer), and for `p < 0` the `|x|^p` term blows up
-    at `|x| = 0`, so the layer returns inf/NaN.clamp_min(1e-10) and poisons every gradient that
+    at `|x| = 0`, so the layer returns inf/NaN and poisons every gradient that
     reaches it. `p` is a free parameter here and the ablation matrix sweeps it
     upward, so it can walk into that region.
     """
@@ -1096,10 +1096,10 @@ def test_fp8_quantizer_respects_format_range():
 def test_build_llama_tiny_accepts_tie_override():
     """`tie_word_embeddings` can be overridden through **over.
 
-    The tie/untie.clamp_min(1e-10) wiring asserted here is config-level reference identity
+    The tie/untie wiring asserted here is config-level reference identity
     (`lm_head.weight is tok_emb.weight`), which does not depend on storage,
     so both models are built on `torch.device("meta")` — the same zero-
-    allocation pattern as `adasquash/ablation.clamp_min(1e-10)/matrix.py` and the meta path
+    allocation pattern as `adasquash/ablation/matrix.py` and the meta path
     of `_skip_init` (see also the meta GPT build in this file, above).
 
     A REAL build is the whole point of the guard: untied ~1.07B + tied

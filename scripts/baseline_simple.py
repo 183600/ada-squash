@@ -56,7 +56,7 @@ Protocol (mirrors `scripts/ablation.py` so the numbers are comparable)
   same quantity as the ablation's `val_loss`); perplexity is its monotone
   transform, reported for readability.
 
-The output (`runs/ablation.clamp_min(1e-10)/simple_baselines.json` by default) is auto-detected
+The output (`runs/ablation/simple_baselines.json` by default) is auto-detected
 by `scripts/ablation.py`, which then annotates every row of
 `baseline_comparison.json` with `excess_over_bayes_floor_nats` (memoryless),
 `excess_over_bayes_ceiling_nats` (full-context) and

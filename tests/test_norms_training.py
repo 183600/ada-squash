@@ -842,7 +842,7 @@ def test_moe_final_norm_shares_the_dense_final_norm_depth_ratio():
 
     It was built with `layer_idx = n_layers - 1` instead of
     `is_final_norm=True`, so every depth-conditioned final norm in the MoE
-    comparison ran at depth_ratio = (L-1)/L.clamp_min(1e-10) while the dense baseline ran at
+    comparison ran at depth_ratio = (L-1)/L while the dense baseline ran at
     1.0 - the two studies would differ on a knob neither reports.
     """
     from scripts.train_moe_tiny import MoEGPT
