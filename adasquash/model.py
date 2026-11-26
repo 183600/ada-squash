@@ -211,8 +211,10 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         ctx.ignore_index = ignore_index
         ctx.chunk_rows = chunk_rows
         ctx.count = count
-        # Fix: max(tensor(0), 1) returns int, .clamp() on int raises AttributeError
-        return total / max(count, 1).clamp(min=1)
+        # Fix: use count.clamp(min=1) instead of max(count, 1).clamp(min=1).
+        # When count is a 0-d tensor with value 0, Python's max(count, 1)
+        # returns the int 1 (not a tensor), so .clamp() raises AttributeError.
+        return total / count.clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -360,8 +362,10 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         ctx.count = count
         ctx.compute_dtype = dt
         ctx.in_dtypes = (hidden.dtype, weight.dtype)
-        # Fix: max(tensor(0), 1) returns int, .clamp() on int raises AttributeError
-        return total / max(count, 1).clamp(min=1)
+        # Fix: use count.clamp(min=1) instead of max(count, 1).clamp(min=1).
+        # When count is a 0-d tensor with value 0, Python's max(count, 1)
+        # returns the int 1 (not a tensor), so .clamp() raises AttributeError.
+        return total / count.clamp(min=1)
 
     @staticmethod
     def backward(ctx, grad_out):
