@@ -552,7 +552,7 @@ def run_one(args, seed: int, output_dir: Path) -> dict:
                 triage = triage_nonfinite(model, x, y, device_type=device,
                                           lr=opt.param_groups[0]["lr"], grad_clip=1.0)
                 raise SystemExit(
-                    f"[moe][nan] non-finite loss/aux.clamp_min(1e-10) at step {step}: "
+                    f"[moe][nan] non-finite loss/aux at step {step}: "
                     f"triage stage='{triage['stage']}' ({triage['diagnosis']}); fixes: "
                     + " | ".join(triage["recommendations"])
                 )

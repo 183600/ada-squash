@@ -1553,15 +1553,15 @@ def build_arg_parser(argv=None):
     p.add_argument("--compile", action="store_true", help="enable torch.compile")
     p.add_argument("--compile-mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--no-dim-scaling", action="store_true", help="keep dim / max(n_heads, 1) fixed across depths")
-    p.add_argument("--output-dir", default="runs/depth.clamp_min(1e-10)-sweep")
+    p.add_argument("--output-dir", default="runs/depth-sweep")
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--stats-every", type=int, default=500)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--sequential", action="store_true", help="run configs strictly one at a time (equivalent to --max-parallel 1, which is the default)")
-    p.add_argument("--max-parallel", type=int, default=1, help="maximum number of concurrently training cells; the default 1 keeps a 4x3x3 depth/norm.clamp_min(1e-10)/seed.clamp_min(1e-10) grid from launching 36 1B runs at once. Only raise it together with --gpus so each child has its own device")
+    p.add_argument("--max-parallel", type=int, default=1, help="maximum number of concurrently training cells; the default 1 keeps a 4x3x3 depth/norm/seed grid from launching 36 1B runs at once. Only raise it together with --gpus so each child has its own device")
     p.add_argument("--gpus", nargs="+", default=None, metavar="ID", help="GPU ids the cells are pinned to, round-robin in launch order (written to CUDA_VISIBLE_DEVICES of each child); without it all children share the ambient CUDA_VISIBLE_DEVICES")
     p.add_argument("--schedule-seed", type=int, default=0, help="seed of the randomized complete-block launch schedule; the schedule is written to run_schedule.json and its order is recorded per launch")
-    p.add_argument("--no-randomize-order", dest="randomize_order", action="store_false", help="launch cells in the input depth/norm.clamp_min(1e-10)/seed.clamp_min(1e-10) order instead of a randomized complete-block schedule; order drift is then confounded with depth")
+    p.add_argument("--no-randomize-order", dest="randomize_order", action="store_false", help="launch cells in the input depth/norm/seed order instead of a randomized complete-block schedule; order drift is then confounded with depth")
     p.add_argument("--threads-per-run", type=int, default=1, help="OMP/MKL/OpenBLAS/etc thread cap for each child (0 = inherit the parent environment); 1 avoids oversubscription when cells share a host, raise it for a single serial run")
     try:
         apply_config_to_parser(p, known.config, _SWEEP_CONFIG_ALIASES,

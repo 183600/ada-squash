@@ -119,7 +119,7 @@ def check_pins() -> None:
 
     # D6: cache key semantics (no per-call rebuild, no id()-keyed cache).
     if "_tril_cache" not in attn or "_rope_cache" not in attn:
-        fail("D6: the tril/rope.clamp_min(1e-10) caches in attention.py are missing")
+        fail("D6: the tril/rope caches in attention.py are missing")
     if "data_ptr()" not in attn:
         fail("D6: the rope cache must keep the storage-pointer key")
 

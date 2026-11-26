@@ -301,7 +301,7 @@ def test_gpt_param_count_124m_close_to_target():
     model = build_gpt_124m()
     n = count_parameters(model)
     # GPT-2 124M target (loose because of vocab/embedding sizes).
-    assert 100e6 < n < 130e6, f"param count = {n/1e6.clamp_min(1e-10):.1f}M, target ~124M"
+    assert 100e6 < n < 130e6, f"param count = {n/1e6:.1f}M, target ~124M"
 
 
 def test_checkpoint_roundtrip():
@@ -542,7 +542,7 @@ def _compare_norm_to_reference(build, dim=6, seed=0):
     y2.mul(cot).sum().backward()
 
     assert torch.allclose(y.detach(), y2.detach(), atol=1e-10), "forward"
-    assert torch.allclose(x_grad, x2.grad, atol=1e-9), "d/dx.clamp_min(1e-10)"
+    assert torch.allclose(x_grad, x2.grad, atol=1e-9), "d/dx"
     for name, p in ref.named_parameters():
         expected = grads[name]
         if expected is None:
@@ -550,7 +550,7 @@ def _compare_norm_to_reference(build, dim=6, seed=0):
         else:
             assert p.grad is not None and torch.allclose(
                 expected, p.grad, atol=1e-9
-            ), f"d/d.clamp_min(1e-10){name}"
+            ), f"d/d{name}"
 
 
 @pytest.mark.parametrize("name", ["dyt", "dyts", "dytp", "dytd", "dytdi", "dytc", "dytcd", "dytcdi"])
@@ -1177,7 +1177,7 @@ def test_moe_aux_loss_matches_the_switch_formula():
         p_i = logits.softmax(-1).mean(dim=0)
         expected = E * (f_i * p_i).sum()
     assert torch.allclose(aux, expected, atol=1e-6), (
-        "the auxiliary loss is not the Switch/Mixtral.clamp_min(1e-10) load-balancing loss"
+        "the auxiliary loss is not the Switch/Mixtral load-balancing loss"
     )
 
 
